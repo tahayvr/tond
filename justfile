@@ -75,6 +75,15 @@ version VER:
     cargo set-version --bump {{VER}}
     cd dashboard && pnpm version {{VER}}
 
+
+# Tag and push to trigger the CI release workflow (builds, packages, and publishes to GitHub Releases)
+release:
+    #!/usr/bin/env bash
+    version=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
+    echo "Tagging v$version and pushing to trigger CI release..."
+    git tag "v$version"
+    git push origin "v$version"
+
 # --------------------------------------------
 # ------ Remote dev server for testing -------
 # --------------------------------------------
@@ -152,13 +161,6 @@ htop-setup:
 # Check resource usage of tond processes
 ps:
     ssh {{ server }} "ps -eo pid,rss,comm | grep tond"
-
-# Tag and push to trigger the CI release workflow (builds, packages, and publishes to GitHub Releases)
-release:
-    @version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= "\(.*\)".*/\1/') && \
-    echo "Tagging v$$version and pushing to trigger CI release..." && \
-    git tag "v$$version" && \
-    git push origin "v$$version"
 
 # Restart both services on the server
 restart:
