@@ -87,7 +87,6 @@ jobs:
           path: |
             dist/tond-linux-x86_64.tar.gz
             dist/tond-linux-x86_64.tar.gz.sha256
-            CHANGELOG.md
       - name: Create Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v3
