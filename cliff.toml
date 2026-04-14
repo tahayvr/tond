@@ -4,6 +4,8 @@ header = """
 All notable changes to this project will be documented in this file.\n
 """
 body = """
+## {{ version | default(value="Unreleased") }}
+
 {% set features = commits | filter(attribute="group", value="Features") %}
 {% if features %}
 ### Features
