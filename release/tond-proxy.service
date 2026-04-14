@@ -1,0 +1,46 @@
+[Unit]
+Description=Tond Reverse Proxy (Pingora)
+Documentation=https://tond.io/docs
+After=network.target tond-server.service
+Wants=tond-server.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/tond
+ExecStart=/opt/tond/bin/tond-proxy
+Restart=on-failure
+RestartSec=5
+
+# Environment Configuration
+# These can be overridden with: systemctl edit tond-proxy
+
+# Database file path (shared with tond-server)
+Environment=TOND_DB_PATH=/opt/tond/data/tond.db
+
+# Data directory for certificates and ACME credentials
+Environment=TOND_DATA_DIR=/opt/tond/data
+
+# Upstream server address (tond-server)
+Environment=TOND_SERVER_ADDR=127.0.0.1:3001
+
+# Dashboard domain (optional)
+# Set this to serve the dashboard on a subdomain via HTTPS
+# Example: dash.yourdomain.com
+# Environment=TOND_DASHBOARD_DOMAIN=
+
+# ACME/Let's Encrypt configuration
+# Use staging for testing to avoid rate limits
+# Environment=TOND_ACME_STAGING=false
+
+# Logging level: trace, debug, info, warn, error
+Environment=RUST_LOG=info
+
+# Security
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/tond/data
+
+[Install]
+WantedBy=multi-user.target

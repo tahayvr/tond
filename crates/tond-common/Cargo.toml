@@ -1,0 +1,22 @@
+[package]
+name = "tond-common"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+anyhow = { workspace = true }
+serde_with = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

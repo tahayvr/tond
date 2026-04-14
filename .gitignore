@@ -1,0 +1,22 @@
+# Rust
+/target/
+
+# Data
+/data/
+
+# Dashboard
+dashboard/node_modules/
+dashboard/.svelte-kit/
+dashboard/build/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.*

@@ -1,0 +1,41 @@
+// models/mod.rs — module declarations and flat re-exports
+//
+// All domain types are split into focused sub-modules. Everything is
+// re-exported here so that consumers can still write `use tond_common::App`
+// (or `use tond_common::*`) without knowing which sub-module a type lives in.
+
+pub mod api;
+pub mod apps;
+pub mod auth;
+pub mod backup;
+pub mod certificates;
+pub mod cron;
+pub mod databases;
+pub mod deployments;
+pub mod github;
+pub mod gitlab;
+pub mod monitoring;
+pub mod notifications;
+pub mod projects;
+pub mod registry;
+pub mod settings;
+pub mod storage;
+pub mod templates;
+
+pub use api::*;
+pub use apps::*;
+pub use auth::*;
+pub use backup::*;
+pub use certificates::*;
+pub use cron::*;
+pub use databases::*;
+pub use deployments::*;
+pub use github::*;
+pub use gitlab::*;
+pub use monitoring::*;
+pub use notifications::*;
+pub use projects::*;
+pub use registry::*;
+pub use settings::*;
+pub use storage::*;
+pub use templates::*;

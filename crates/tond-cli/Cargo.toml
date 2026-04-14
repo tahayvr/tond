@@ -1,0 +1,28 @@
+[package]
+name = "tond-cli"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "tond"
+path = "src/main.rs"
+
+[dependencies]
+tond-common = { path = "../tond-common" }
+tond-scanner = { path = "../tond-scanner" }
+tokio = { workspace = true }
+clap = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+futures = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-tungstenite = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }

@@ -1,0 +1,1927 @@
+<script lang="ts">
+	import { page } from '$app/state';
+	import {
+		getApp,
+		deployApp,
+		stopApp,
+		startApp,
+		restartApp,
+		deleteApp,
+		updateEnv,
+		updateDomain,
+		updateHealth,
+		updateDrainTimeout,
+		updateAppResources,
+		addVolume,
+		removeVolume,
+		listDeployments,
+		getDeploymentGeneratedDockerfile,
+		rollbackApp,
+		generateDeployKey,
+		getDeployKey,
+		setWebhookSecret,
+		setAutoDeploy,
+		updateSource,
+		listPreviews,
+		createPreview,
+		deletePreview,
+		updatePreviewConfig,
+		listOpenPRs,
+		getAppMetrics,
+		listRegistryCredentials,
+		createRegistryCredential,
+		deleteRegistryCredential,
+		setAppRegistryCredential,
+		listGitHubApps,
+		listGitHubRepos,
+		listGitHubBranches,
+		setAppGitHubApp,
+		type App,
+		type Deployment,
+		type DeployKey,
+		type PreviewDeployment,
+		type GithubPR,
+		type MetricPoint,
+		type RegistryCredential,
+		type GitHubApp,
+		type GitHubRepo,
+		type GitHubBranch
+	} from '$lib/api';
+	import { goto } from '$app/navigation';
+	import { setUiContext, clearUiContext, appContext, openFeedPanel } from '$lib/ui-context.svelte';
+	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
+	import ConfirmDeleteDialog from '$lib/components/dialogs/confirm-delete-dialog.svelte';
+	import * as Accordion from '$lib/components/ui/accordion/index.js';
+	import { Badge } from '$lib/components/ui/badge/index.js';
+	import { Button } from '$lib/components/ui/button/index.js';
+	import { Input } from '$lib/components/ui/input/index.js';
+	import { Label } from '$lib/components/ui/label/index.js';
+	import { Separator } from '$lib/components/ui/separator/index.js';
+	import * as Tabs from '$lib/components/ui/tabs/index.js';
+	import * as Select from '$lib/components/ui/select/index.js';
+	import Breadcrumb from '$lib/components/nav/breadcrumb.svelte';
+	import AppOverview from '$lib/components/tabs/app-page/app-overview.svelte';
+	import AppLogs from '$lib/components/tabs/app-page/app-logs.svelte';
+	import AppDeployments from '$lib/components/tabs/app-page/app-deployments.svelte';
+	import AppEnvironment from '$lib/components/tabs/app-page/app-environment.svelte';
+	import AppDomain from '$lib/components/tabs/app-page/app-domain.svelte';
+	import AppHealth from '$lib/components/tabs/app-page/app-health.svelte';
+	import AppVolumes from '$lib/components/tabs/app-page/app-volumes.svelte';
+	import AppPreviews from '$lib/components/tabs/app-page/app-previews.svelte';
+	import AppMetrics from '$lib/components/tabs/app-page/app-metrics.svelte';
+	import AppHistory from '$lib/components/tabs/app-page/app-history.svelte';
+	import { SecretInput } from '$lib/components/ui/secret-input/index.js';
+	import Check from '@lucide/svelte/icons/check';
+	import Github from '@lucide/svelte/icons/github';
+	import GitBranch from '@lucide/svelte/icons/git-branch';
+	import Unlink2 from '@lucide/svelte/icons/unlink-2';
+	import Lock from '@lucide/svelte/icons/lock';
+	import type { PageProps } from './$types';
+
+	let { data, params }: PageProps = $props();
+
+	let app = $derived(data.app as App | null);
+	let error = $state('');
+	let showDeleteDialog = $state(false);
+
+	// Status polling — auto-starts when app is building, stops on terminal status
+	let statusInterval: ReturnType<typeof setInterval> | null = null;
+
+	// Env form
+	let envSaving = $state(false);
+	let envError = $state('');
+
+	// Domain form
+	let domainInput = $state('');
+
+	// Health form
+	let healthPath = $state('');
+	let healthInterval = $state(30);
+	let healthThreshold = $state(3);
+	let drainTimeout = $state(30);
+
+	// Volume form
+	let volumeContainerPath = $state('');
+	let volumeError = $state('');
+
+	// Resources form
+	let resourceMemoryDraft = $state<number | null>(null);
+	let resourceMemoryUnit = $state<'mb' | 'gb'>('mb');
+	let resourceCpuDraft = $state<number | null>(null);
+	let savingResources = $state(false);
+	let resourcesError = $state('');
+	let resourcesSaved = $state(false);
+	let resourcesSavedTimeout: ReturnType<typeof setTimeout> | null = null;
+
+	// Deployments state
+	let deployments = $state<Deployment[]>([]);
+	let deploymentsLoading = $state(false);
+	let rollbackError = $state('');
+
+	// Git integration state
+	let deployKey = $state<DeployKey | null>(null);
+	let deployKeyLoading = $state(false);
+	let deployKeyError = $state('');
+	let gitError = $state('');
+	let gitSuccess = $state('');
+	let webhookSecretInput = $state('');
+	let watchBranchInput = $state('');
+	let sourceTypeInput = $state<'git' | 'image' | 'tarball'>('git');
+	let sourceUrlInput = $state('');
+	// Track which webhook URL was most recently copied (provider key → timestamp)
+	let copiedWebhook = $state<string | null>(null);
+
+	// Registry credentials state
+	let registryCredentials = $state<RegistryCredential[]>([]);
+	let registryCredentialsLoading = $state(false);
+	let selectedCredentialId = $state<string | null>(null);
+	let newCredName = $state('');
+	let newCredServer = $state('');
+	let newCredUsername = $state('');
+	let newCredPassword = $state('');
+	let addCredOpen = $state(false);
+	let addCredError = $state('');
+	let credError = $state('');
+
+	// GitHub App source picker state
+	let githubApps = $state<GitHubApp[]>([]);
+	let githubPickerRepos = $state<Record<string, GitHubRepo[]>>({});
+	let githubPickerBranches = $state<Record<string, GitHubBranch[]>>({});
+	let selectedGithubAppId = $state<string | null>(null);
+	let selectedGithubRepo = $state<GitHubRepo | null>(null);
+	let selectedGithubBranch = $state<string | null>(null);
+	let githubPickerReposLoading = $state(false);
+	let githubPickerBranchesLoading = $state(false);
+	let githubLinkError = $state('');
+	let githubLinkSaving = $state(false);
+
+	// Preview deployments state
+	let previews = $state<PreviewDeployment[]>([]);
+	let previewsLoading = $state(false);
+	let previewsError = $state('');
+	let previewTtl = $state(24);
+	let previewConfigSaving = $state(false);
+	let previewConfigError = $state('');
+
+	// Open PRs state (Load open PRs feature)
+	let openPRs = $state<GithubPR[]>([]);
+	let openPRsLoading = $state(false);
+	let openPRsError = $state('');
+	let deployingPR = $state<number | null>(null);
+
+	// Metrics state
+	let metrics = $state<MetricPoint[]>([]);
+	let metricsLoading = $state(false);
+	let metricsError = $state('');
+	let metricsPeriod = $state<'1h' | '24h' | '7d'>('1h');
+	let metricsInterval: ReturnType<typeof setInterval> | null = null;
+
+	// Logs state
+	import type { LogLine } from '$lib/components/tabs/app-page/app-logs.svelte';
+	let logLines = $state<LogLine[]>([]);
+	let logStreaming = $state(false);
+	let logSocket: WebSocket | null = null;
+
+	let appId = $derived(page.params.id || params.id);
+
+	async function loadApp() {
+		try {
+			app = await getApp(appId);
+			domainInput = app.domain || '';
+			healthPath = app.health_check_path || '';
+			healthInterval = app.health_check_interval;
+			healthThreshold = app.health_failure_threshold;
+			drainTimeout = app.drain_timeout;
+			// Git integration init
+			watchBranchInput = app.watch_branch || '';
+			sourceTypeInput = (app.source_type as 'git' | 'image' | 'tarball') || 'git';
+			sourceUrlInput = app.source_url || '';
+			selectedCredentialId = app.registry_credential_id;
+			initResourcesDraft();
+		} catch (e: any) {
+			error = e.message;
+		}
+	}
+
+	function stopStatusPolling() {
+		if (statusInterval !== null) {
+			clearInterval(statusInterval);
+			statusInterval = null;
+		}
+	}
+
+	async function pollStatus() {
+		try {
+			const latest = await getApp(appId);
+			// Only update the status-related field without resetting all form inputs
+			if (app) app.status = latest.status;
+			// Stop polling once we reach a terminal state
+			if (latest.status !== 'building') {
+				stopStatusPolling();
+				// Reload the full app data now that deploy finished
+				await loadApp();
+				// Update feed panel context so the badge reflects the new status
+				if (app) setUiContext(appContext(app));
+			}
+		} catch {
+			// Non-critical — keep polling
+		}
+	}
+
+	function startStatusPolling() {
+		stopStatusPolling();
+		statusInterval = setInterval(pollStatus, 2000);
+	}
+
+	function stopLogStream() {
+		if (logSocket) {
+			logSocket.close();
+			logSocket = null;
+		}
+		logStreaming = false;
+	}
+
+	function startLogStream() {
+		stopLogStream();
+		logLines = [];
+		logStreaming = true;
+
+		const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+		const ws = new WebSocket(`${proto}://${location.host}/api/apps/${appId}/logs/stream`);
+		logSocket = ws;
+
+		ws.onmessage = (evt) => {
+			try {
+				const msg = JSON.parse(evt.data);
+				if (msg.type === 'snapshot') {
+					const deployLogs: LogLine[] = (msg.deploy_logs ?? []).map(
+						(l: { level: string; trigger_source: string; message: string; ts: string }) => ({
+							kind: 'deploy' as const,
+							level: l.level,
+							trigger_source: l.trigger_source,
+							message: l.message,
+							ts: l.ts
+						})
+					);
+					const containerLogs: LogLine[] = (msg.container_logs ?? []).map(
+						(entry: { ts: string | null; line: string }) => ({
+							kind: 'container' as const,
+							line: entry.line,
+							ts: entry.ts ?? undefined
+						})
+					);
+					logLines = [...deployLogs, ...containerLogs];
+				} else if (msg.type === 'deploy') {
+					logLines = [
+						...logLines,
+						{
+							kind: 'deploy',
+							level: msg.level,
+							trigger_source: msg.trigger_source,
+							message: msg.message,
+							ts: msg.ts
+						}
+					];
+				} else if (msg.type === 'container') {
+					logLines = [...logLines, { kind: 'container', line: msg.line, ts: msg.ts ?? undefined }];
+				}
+			} catch {
+				// ignore parse errors
+			}
+		};
+
+		ws.onerror = () => {
+			logStreaming = false;
+		};
+
+		ws.onclose = () => {
+			logStreaming = false;
+			logSocket = null;
+		};
+	}
+
+	async function handleDeploy() {
+		try {
+			openFeedPanel();
+			await deployApp(appId);
+			await loadApp();
+			// Start polling to reflect building → running transition
+			startStatusPolling();
+		} catch (e: any) {
+			error = e.message;
+		}
+	}
+
+	async function handleStop() {
+		try {
+			openFeedPanel();
+			await stopApp(appId);
+			await loadApp();
+		} catch (e: any) {
+			error = e.message;
+		}
+	}
+
+	async function handleStart() {
+		try {
+			openFeedPanel();
+			await startApp(appId);
+			await loadApp();
+		} catch (e: any) {
+			error = e.message;
+		}
+	}
+
+	async function handleRestart() {
+		try {
+			openFeedPanel();
+			await restartApp(appId);
+			await loadApp();
+		} catch (e: any) {
+			error = e.message;
+		}
+	}
+
+	async function handleDelete() {
+		try {
+			await deleteApp(appId);
+			goto('/');
+		} catch (e: any) {
+			error = e.message;
+		}
+	}
+
+	async function handleSaveEnv(
+		envVars: Record<string, string>,
+		credentialId: string | null,
+		previewExcludedKeys: string[],
+		previewEnvVars: Record<string, string>
+	) {
+		envSaving = true;
+		envError = '';
+		try {
+			await updateEnv(appId, envVars);
+			// If source is image and credential changed, persist it too
+			if (app?.source_type === 'image' && credentialId !== app.registry_credential_id) {
+				await setAppRegistryCredential(appId, credentialId);
+			}
+			// Persist scoped secrets alongside the preview toggle state
+			await updatePreviewConfig(
+				appId,
+				app?.preview_enabled ?? false,
+				previewExcludedKeys,
+				previewEnvVars
+			);
+			await loadApp();
+		} catch (e: any) {
+			envError = e.message;
+		} finally {
+			envSaving = false;
+		}
+	}
+
+	async function handleUpdateDomain() {
+		try {
+			await updateDomain(appId, domainInput);
+			await loadApp();
+		} catch (e: any) {
+			error = e.message;
+		}
+	}
+
+	async function handleUpdateHealth() {
+		try {
+			await updateHealth(appId, healthPath.trim() || null, healthInterval, healthThreshold);
+			await loadApp();
+			error = '';
+		} catch (e: any) {
+			error = e.message;
+		}
+	}
+
+	async function handleDisableHealth() {
+		try {
+			await updateHealth(appId, null, 30, 3);
+			await loadApp();
+			error = '';
+		} catch (e: any) {
+			error = e.message;
+		}
+	}
+
+	async function handleUpdateDrainTimeout() {
+		try {
+			await updateDrainTimeout(appId, drainTimeout);
+			await loadApp();
+			error = '';
+		} catch (e: any) {
+			error = e.message;
+		}
+	}
+
+	async function handleAddVolume() {
+		volumeError = '';
+		const path = volumeContainerPath.trim();
+		if (!path || !path.startsWith('/')) {
+			volumeError = 'Container path must be an absolute path (e.g. /data)';
+			return;
+		}
+		try {
+			await addVolume(appId, path);
+			volumeContainerPath = '';
+			await loadApp();
+		} catch (e: any) {
+			volumeError = e.message;
+		}
+	}
+
+	async function handleRemoveVolume(containerPath: string) {
+		volumeError = '';
+		try {
+			await removeVolume(appId, containerPath);
+			await loadApp();
+		} catch (e: any) {
+			volumeError = e.message;
+		}
+	}
+
+	async function loadDeployments() {
+		deploymentsLoading = true;
+		try {
+			deployments = await listDeployments(appId);
+		} finally {
+			deploymentsLoading = false;
+		}
+	}
+
+	async function handleRollback() {
+		rollbackError = '';
+		try {
+			await rollbackApp(appId);
+			await loadApp();
+			await loadDeployments();
+		} catch (e: any) {
+			rollbackError = e.message;
+		}
+	}
+
+	async function handleViewGeneratedDockerfile(deploymentId: string): Promise<string> {
+		return getDeploymentGeneratedDockerfile(appId, deploymentId);
+	}
+
+	async function loadDeployKey() {
+		deployKeyLoading = true;
+		deployKeyError = '';
+		try {
+			deployKey = await getDeployKey(appId);
+		} catch {
+			deployKey = null;
+		} finally {
+			deployKeyLoading = false;
+		}
+	}
+
+	async function handleGenerateDeployKey() {
+		deployKeyError = '';
+		deployKeyLoading = true;
+		try {
+			deployKey = await generateDeployKey(appId);
+		} catch (e: any) {
+			deployKeyError = e.message;
+		} finally {
+			deployKeyLoading = false;
+		}
+	}
+
+	async function handleCopyWebhookUrl(provider: string, url: string) {
+		try {
+			await navigator.clipboard.writeText(window.location.origin + url);
+			copiedWebhook = provider;
+			setTimeout(() => {
+				if (copiedWebhook === provider) copiedWebhook = null;
+			}, 2000);
+		} catch {
+			// Clipboard API blocked (non-https dev env): select the text instead
+			copiedWebhook = null;
+		}
+	}
+
+	async function handleSetWebhookSecret() {
+		gitError = '';
+		gitSuccess = '';
+		try {
+			const secret = webhookSecretInput.trim() || null;
+			await setWebhookSecret(appId, secret);
+			await loadApp();
+			webhookSecretInput = '';
+			gitSuccess = secret ? 'Webhook secret updated.' : 'Webhook secret cleared.';
+		} catch (e: any) {
+			gitError = e.message;
+		}
+	}
+
+	async function handleSetAutoDeploy(enabled: boolean) {
+		gitError = '';
+		gitSuccess = '';
+		try {
+			await setAutoDeploy(appId, enabled, watchBranchInput.trim() || null);
+			await loadApp();
+			gitSuccess = enabled ? 'Auto-deploy enabled.' : 'Auto-deploy disabled.';
+		} catch (e: any) {
+			gitError = e.message;
+		}
+	}
+
+	async function handleSaveWatchBranch() {
+		gitError = '';
+		gitSuccess = '';
+		try {
+			const currentAutoDeploy = app?.auto_deploy ?? false;
+			await setAutoDeploy(appId, currentAutoDeploy, watchBranchInput.trim() || null);
+			await loadApp();
+			gitSuccess = 'Watch branch updated.';
+		} catch (e: any) {
+			gitError = e.message;
+		}
+	}
+
+	async function handleUpdateSource() {
+		gitError = '';
+		gitSuccess = '';
+		try {
+			await updateSource(appId, sourceTypeInput, sourceUrlInput.trim() || null);
+			await loadApp();
+			gitSuccess = 'Source updated.';
+		} catch (e: any) {
+			gitError = e.message;
+		}
+	}
+
+	async function loadRegistryCredentials() {
+		registryCredentialsLoading = true;
+		try {
+			registryCredentials = await listRegistryCredentials();
+		} catch {
+			// non-critical — silently ignore
+		} finally {
+			registryCredentialsLoading = false;
+		}
+	}
+
+	async function loadGitHubApps() {
+		try {
+			githubApps = await listGitHubApps();
+		} catch {
+			// non-critical — silently ignore
+		}
+	}
+
+	async function handleGithubAppChange(appId: string | null) {
+		selectedGithubAppId = appId;
+		selectedGithubRepo = null;
+		selectedGithubBranch = null;
+		if (!appId) return;
+		// Load repos for the selected app if not already cached
+		if (!githubPickerRepos[appId]) {
+			githubPickerReposLoading = true;
+			try {
+				githubPickerRepos[appId] = await listGitHubRepos(appId);
+			} catch {
+				githubPickerRepos[appId] = [];
+			} finally {
+				githubPickerReposLoading = false;
+			}
+		}
+	}
+
+	async function handleGithubRepoChange(repo: GitHubRepo | null) {
+		selectedGithubRepo = repo;
+		selectedGithubBranch = null;
+		if (!selectedGithubAppId || !repo) return;
+		const key = `${selectedGithubAppId}/${repo.full_name}`;
+		if (!githubPickerBranches[key]) {
+			githubPickerBranchesLoading = true;
+			const [owner, repoName] = repo.full_name.split('/');
+			try {
+				githubPickerBranches[key] = await listGitHubBranches(selectedGithubAppId, owner, repoName);
+			} catch {
+				githubPickerBranches[key] = [];
+			} finally {
+				githubPickerBranchesLoading = false;
+			}
+		}
+		// Pre-select the default branch
+		selectedGithubBranch = repo.default_branch;
+	}
+
+	async function handleGithubLink() {
+		if (!selectedGithubAppId || !selectedGithubRepo) return;
+		githubLinkSaving = true;
+		githubLinkError = '';
+		gitSuccess = '';
+		try {
+			// Set the clone URL in the source field
+			sourceUrlInput = selectedGithubRepo.clone_url;
+			// Save the source URL and github_app_id together
+			await updateSource(appId, 'git', selectedGithubRepo.clone_url);
+			await setAppGitHubApp(appId, selectedGithubAppId);
+			// Also save the watch branch if one is selected
+			if (selectedGithubBranch) {
+				watchBranchInput = selectedGithubBranch;
+				await setAutoDeploy(appId, app?.auto_deploy ?? false, selectedGithubBranch);
+			}
+			await loadApp();
+			gitSuccess = `Linked to ${selectedGithubRepo.full_name}`;
+		} catch (e: any) {
+			githubLinkError = e.message ?? 'Failed to link GitHub App';
+		} finally {
+			githubLinkSaving = false;
+		}
+	}
+
+	async function handleGithubUnlink() {
+		githubLinkSaving = true;
+		githubLinkError = '';
+		gitSuccess = '';
+		try {
+			await setAppGitHubApp(appId, null);
+			await loadApp();
+			selectedGithubAppId = null;
+			selectedGithubRepo = null;
+			selectedGithubBranch = null;
+			gitSuccess = 'GitHub App unlinked.';
+		} catch (e: any) {
+			githubLinkError = e.message ?? 'Failed to unlink GitHub App';
+		} finally {
+			githubLinkSaving = false;
+		}
+	}
+
+	async function handleSetRegistryCredential(credId: string | null) {
+		credError = '';
+		gitSuccess = '';
+		try {
+			await setAppRegistryCredential(appId, credId);
+			await loadApp();
+			selectedCredentialId = credId;
+			gitSuccess = credId ? 'Registry credential attached.' : 'Registry credential cleared.';
+		} catch (e: any) {
+			credError = e.message;
+		}
+	}
+
+	async function handleAddCredential() {
+		addCredError = '';
+		if (
+			!newCredName.trim() ||
+			!newCredServer.trim() ||
+			!newCredUsername.trim() ||
+			!newCredPassword.trim()
+		) {
+			addCredError = 'All fields are required.';
+			return;
+		}
+		try {
+			await createRegistryCredential({
+				name: newCredName.trim(),
+				server: newCredServer.trim(),
+				username: newCredUsername.trim(),
+				password: newCredPassword
+			});
+			newCredName = '';
+			newCredServer = '';
+			newCredUsername = '';
+			newCredPassword = '';
+			addCredOpen = false;
+			await loadRegistryCredentials();
+		} catch (e: any) {
+			addCredError = e.message;
+		}
+	}
+
+	async function handleDeleteCredential(credId: string) {
+		credError = '';
+		try {
+			await deleteRegistryCredential(credId);
+			// If the deleted credential was attached to this app, clear it
+			if (app?.registry_credential_id === credId) {
+				await setAppRegistryCredential(appId, null);
+				await loadApp();
+			}
+			await loadRegistryCredentials();
+		} catch (e: any) {
+			credError = e.message;
+		}
+	}
+
+	// ── Resources ──
+
+	function initResourcesDraft() {
+		if (!app) return;
+		if (app.memory_limit === null) {
+			resourceMemoryDraft = null;
+			resourceMemoryUnit = 'mb';
+		} else {
+			const mb = app.memory_limit / (1024 * 1024);
+			if (mb >= 1024 && mb % 1024 === 0) {
+				resourceMemoryDraft = mb / 1024;
+				resourceMemoryUnit = 'gb';
+			} else {
+				resourceMemoryDraft = mb;
+				resourceMemoryUnit = 'mb';
+			}
+		}
+		if (app.cpu_limit === null) {
+			resourceCpuDraft = null;
+		} else {
+			resourceCpuDraft = app.cpu_limit / 1_000_000_000;
+		}
+	}
+
+	async function handleSaveResources() {
+		savingResources = true;
+		resourcesError = '';
+		try {
+			let memoryLimitBytes: number | null = null;
+			if (resourceMemoryDraft !== null && resourceMemoryDraft > 0) {
+				memoryLimitBytes =
+					resourceMemoryUnit === 'gb'
+						? resourceMemoryDraft * 1024 * 1024 * 1024
+						: resourceMemoryDraft * 1024 * 1024;
+			}
+			let cpuLimitNano: number | null = null;
+			if (resourceCpuDraft !== null && resourceCpuDraft > 0) {
+				cpuLimitNano = Math.round(resourceCpuDraft * 1_000_000_000);
+			}
+			app = await updateAppResources(appId, memoryLimitBytes, cpuLimitNano);
+			if (app) setUiContext(appContext(app));
+			resourcesSaved = true;
+			if (resourcesSavedTimeout) clearTimeout(resourcesSavedTimeout);
+			resourcesSavedTimeout = setTimeout(() => (resourcesSaved = false), 2000);
+		} catch (e: any) {
+			resourcesError = e.message ?? 'Failed to save resources';
+		} finally {
+			savingResources = false;
+		}
+	}
+
+	async function loadPreviews() {
+		previewsLoading = true;
+		previewsError = '';
+		try {
+			previews = await listPreviews(appId);
+		} catch (e: any) {
+			previewsError = e.message;
+		} finally {
+			previewsLoading = false;
+		}
+	}
+
+	async function loadMetrics() {
+		if (metrics.length === 0) metricsLoading = true;
+		metricsError = '';
+		try {
+			metrics = await getAppMetrics(appId, metricsPeriod);
+		} catch (e: any) {
+			metricsError = e.message;
+		} finally {
+			metricsLoading = false;
+		}
+	}
+
+	function startMetricsPolling() {
+		stopMetricsPolling();
+		loadMetrics();
+		metricsInterval = setInterval(loadMetrics, 30_000);
+	}
+
+	function stopMetricsPolling() {
+		if (metricsInterval !== null) {
+			clearInterval(metricsInterval);
+			metricsInterval = null;
+		}
+	}
+
+	async function handleCreatePreview(options: Parameters<typeof createPreview>[1] = {}) {
+		previewsError = '';
+		try {
+			await createPreview(appId, { ttl_hours: previewTtl, ...options });
+			await loadPreviews();
+		} catch (e: any) {
+			previewsError = e.message;
+		}
+	}
+
+	async function handleLoadOpenPRs() {
+		openPRsLoading = true;
+		openPRsError = '';
+		try {
+			openPRs = await listOpenPRs(appId);
+		} catch (e: any) {
+			openPRsError = e.message;
+		} finally {
+			openPRsLoading = false;
+		}
+	}
+
+	async function handleDeployPR(pr: GithubPR) {
+		deployingPR = pr.number;
+		previewsError = '';
+		try {
+			await createPreview(appId, {
+				ttl_hours: previewTtl,
+				pr_number: pr.number,
+				head_sha: pr.head_sha,
+				head_ref: pr.head_ref,
+				pr_url: pr.pr_url
+			});
+			await loadPreviews();
+		} catch (e: any) {
+			previewsError = e.message;
+		} finally {
+			deployingPR = null;
+		}
+	}
+
+	async function handleDeletePreview(previewId: string) {
+		previewsError = '';
+		try {
+			await deletePreview(appId, previewId);
+			await loadPreviews();
+		} catch (e: any) {
+			previewsError = e.message;
+		}
+	}
+
+	async function handleTogglePreviewEnabled(enabled: boolean) {
+		previewConfigSaving = true;
+		previewConfigError = '';
+		try {
+			await updatePreviewConfig(appId, enabled);
+			await loadApp();
+		} catch (e: any) {
+			previewConfigError = e.message;
+		} finally {
+			previewConfigSaving = false;
+		}
+	}
+
+	function statusVariant(
+		status: string
+	): 'default' | 'secondary' | 'destructive' | 'outline' | undefined {
+		switch (status) {
+			case 'running':
+				return 'default';
+			case 'failed':
+				return 'destructive';
+			case 'unhealthy':
+				return 'destructive';
+			case 'stopped':
+				return 'secondary';
+			default:
+				return 'outline';
+		}
+	}
+
+	$effect(() => {
+		if (app) {
+			setUiContext(appContext(app));
+			if (app.status === 'building') {
+				startStatusPolling();
+			} else {
+				stopStatusPolling();
+			}
+		}
+
+		return () => {
+			stopLogStream();
+			stopMetricsPolling();
+			stopStatusPolling();
+			clearUiContext();
+		};
+	});
+</script>
+
+{#if app}
+	<div class="space-y-6">
+		<!-- Breadcrumb -->
+		<Breadcrumb items={[{ label: 'Apps', href: '/apps' }, { label: app.name }]} />
+
+		<!-- Error banner -->
+		{#if error}
+			<ErrorAlert title="Error" description={error} />
+		{/if}
+
+		<!-- App header -->
+		<div class="flex h-14 items-center justify-between">
+			<div>
+				<h2 class="text-3xl font-extrabold uppercase">{app.name}</h2>
+				<div class="mt-2 flex items-center gap-3 text-sm text-muted-foreground">
+					<Badge variant={statusVariant(app.status)}>{app.status}</Badge>
+					<span>Source: {app.source_type}</span>
+					{#if app.source_url}
+						<span class="max-w-xs truncate">{app.source_url}</span>
+					{/if}
+				</div>
+			</div>
+			<div class="flex gap-2">
+				{#if app.status === 'running' || app.status === 'unhealthy'}
+					<Button variant="outline" size="sm" onclick={handleRestart}>Restart</Button>
+					<Button variant="outline" size="sm" onclick={handleStop}>Stop</Button>
+				{:else if app.status === 'stopped'}
+					<Button variant="outline" size="sm" onclick={handleStart}>Start</Button>
+				{/if}
+				<Button size="sm" onclick={handleDeploy}>Re-deploy</Button>
+				<Button variant="destructive" size="sm" onclick={() => (showDeleteDialog = true)}>
+					Delete
+				</Button>
+			</div>
+		</div>
+
+		<Separator />
+
+		<!-- Tabs -->
+		<Tabs.Root
+			value="overview"
+			onValueChange={(v) => {
+				if (v === 'logs') {
+					startLogStream();
+					// Pause the feed panel stream to avoid two concurrent connections
+					// to the same WebSocket endpoint.
+					if (app)
+						setUiContext({ ...appContext(app), feed: { ...appContext(app).feed, wsUrl: null } });
+				} else {
+					stopLogStream();
+					// Restore the feed panel stream when leaving the Logs tab
+					if (app) setUiContext(appContext(app));
+				}
+				if (v === 'deployments') {
+					loadDeployments();
+				}
+				if (v === 'env') {
+					loadRegistryCredentials();
+				}
+				if (v === 'git') {
+					loadDeployKey();
+					loadRegistryCredentials();
+					loadGitHubApps();
+				}
+				if (v === 'previews') {
+					loadPreviews();
+				}
+				if (v === 'metrics') {
+					startMetricsPolling();
+				} else {
+					stopMetricsPolling();
+				}
+			}}
+		>
+			<Tabs.List>
+				<Tabs.Trigger value="overview">Overview</Tabs.Trigger>
+				<Tabs.Trigger value="logs">Logs</Tabs.Trigger>
+				<Tabs.Trigger value="deployments">Deployments</Tabs.Trigger>
+				<Tabs.Trigger value="env">Environment</Tabs.Trigger>
+				<Tabs.Trigger value="domain">Domain</Tabs.Trigger>
+				<Tabs.Trigger value="health">Health</Tabs.Trigger>
+				<Tabs.Trigger value="volumes">Volumes</Tabs.Trigger>
+				<Tabs.Trigger value="resources">Resources</Tabs.Trigger>
+				<Tabs.Trigger value="git">Git</Tabs.Trigger>
+				<Tabs.Trigger value="previews">Previews</Tabs.Trigger>
+				<Tabs.Trigger value="metrics">Metrics</Tabs.Trigger>
+				<Tabs.Trigger value="history">History</Tabs.Trigger>
+			</Tabs.List>
+
+			<!-- Overview tab -->
+			<Tabs.Content value="overview">
+				<AppOverview {app} />
+			</Tabs.Content>
+
+			<!-- Logs tab -->
+			<Tabs.Content value="logs">
+				<AppLogs
+					{logLines}
+					streaming={logStreaming}
+					onConnect={startLogStream}
+					onStop={stopLogStream}
+					onClear={() => (logLines = [])}
+				/>
+			</Tabs.Content>
+
+			<!-- Deployments tab -->
+			<Tabs.Content value="deployments">
+				<AppDeployments
+					{deployments}
+					loading={deploymentsLoading}
+					error={rollbackError}
+					onRollback={handleRollback}
+					onViewGeneratedDockerfile={handleViewGeneratedDockerfile}
+				/>
+			</Tabs.Content>
+
+			<!-- Environment tab -->
+			<Tabs.Content value="env">
+				<AppEnvironment
+					sourceType={app.source_type}
+					{registryCredentials}
+					registryCredentialId={app.registry_credential_id}
+					saving={envSaving}
+					saveError={envError}
+					previewEnabled={app.preview_enabled}
+					previewExcludedKeys={app.preview_excluded_keys}
+					previewEnvVars={app.preview_env_vars}
+					onSave={handleSaveEnv}
+				/>
+			</Tabs.Content>
+
+			<!-- Domain tab -->
+			<Tabs.Content value="domain">
+				<AppDomain bind:domainInput onUpdate={handleUpdateDomain} />
+			</Tabs.Content>
+
+			<!-- Health tab -->
+			<Tabs.Content value="health">
+				<AppHealth
+					{app}
+					bind:healthPath
+					bind:healthInterval
+					bind:healthThreshold
+					bind:drainTimeout
+					onUpdateHealth={handleUpdateHealth}
+					onDisableHealth={handleDisableHealth}
+					onUpdateDrainTimeout={handleUpdateDrainTimeout}
+				/>
+			</Tabs.Content>
+
+			<!-- Volumes tab -->
+			<Tabs.Content value="volumes">
+				<AppVolumes
+					{app}
+					bind:volumeContainerPath
+					{volumeError}
+					onAdd={handleAddVolume}
+					onRemove={handleRemoveVolume}
+				/>
+			</Tabs.Content>
+			<!-- Resources tab -->
+			<Tabs.Content value="resources" class="mt-4 space-y-6 pt-2">
+				<div class="max-w-sm space-y-6">
+					<div class="space-y-2">
+						<Label>Memory Limit</Label>
+						<div class="flex gap-2">
+							<Input
+								type="number"
+								bind:value={resourceMemoryDraft}
+								placeholder="Unlimited"
+								min={1}
+								disabled={savingResources}
+							/>
+							<Select.Root type="single" bind:value={resourceMemoryUnit}>
+								<Select.Trigger class="w-24" disabled={savingResources}>
+									{resourceMemoryUnit.toUpperCase()}
+								</Select.Trigger>
+								<Select.Content>
+									<Select.Item value="mb">MB</Select.Item>
+									<Select.Item value="gb">GB</Select.Item>
+								</Select.Content>
+							</Select.Root>
+						</div>
+						<p class="text-xs text-muted-foreground">
+							Leave empty for unlimited memory. Default: 256 MB.
+						</p>
+					</div>
+
+					<div class="space-y-2">
+						<Label>CPU Limit (cores)</Label>
+						<Input
+							type="number"
+							bind:value={resourceCpuDraft}
+							placeholder="Unlimited"
+							min={0.1}
+							step={0.1}
+							disabled={savingResources}
+						/>
+						<p class="text-xs text-muted-foreground">
+							Fractional cores allowed (e.g. 0.5, 1, 2). Leave empty for unlimited. Default: 0.5.
+						</p>
+					</div>
+
+					{#if resourcesError}
+						<p class="rounded bg-destructive/10 px-3 py-2 text-xs text-destructive">
+							{resourcesError}
+						</p>
+					{/if}
+
+					<div class="flex items-center gap-3">
+						<Button onclick={handleSaveResources} disabled={savingResources}>
+							{savingResources ? 'Saving...' : 'Save'}
+						</Button>
+						{#if resourcesSaved}
+							<span class="flex items-center gap-1 text-xs text-green-600 dark:text-green-400">
+								<Check class="h-3.5 w-3.5" /> Saved
+							</span>
+						{/if}
+					</div>
+				</div>
+			</Tabs.Content>
+			<!-- Git tab -->
+			<Tabs.Content value="git">
+				<div class="space-y-6 pt-4">
+					{#if gitError}
+						<ErrorAlert title="Error" description={gitError} />
+					{/if}
+					{#if gitSuccess}
+						<div class="rounded-md bg-success/10 p-3 text-sm text-success">
+							{gitSuccess}
+						</div>
+					{/if}
+
+					<!-- Source type & URL -->
+					<div class="grid gap-3">
+						<h3 class="text-sm font-medium">Source</h3>
+						<p class="text-sm text-muted-foreground">
+							How this app's deployable artifact is provided.
+						</p>
+						<div class="flex gap-3">
+							<div class="grid gap-2">
+								<Label for="source-type">Type</Label>
+								<Select.Root
+									type="single"
+									value={sourceTypeInput}
+									onValueChange={(v) => {
+										if (v === 'git' || v === 'image' || v === 'tarball') sourceTypeInput = v;
+									}}
+								>
+									<Select.Trigger id="source-type" class="w-32">
+										{sourceTypeInput}
+									</Select.Trigger>
+									<Select.Content>
+										<Select.Item value="git">git</Select.Item>
+										<Select.Item value="image">image</Select.Item>
+										<Select.Item value="tarball">tarball</Select.Item>
+									</Select.Content>
+								</Select.Root>
+							</div>
+							{#if sourceTypeInput !== 'tarball'}
+								<div class="grid flex-1 gap-2">
+									<Label for="source-url"
+										>{sourceTypeInput === 'image' ? 'Docker Image' : 'Git URL'}</Label
+									>
+									<Input
+										id="source-url"
+										type="text"
+										bind:value={sourceUrlInput}
+										placeholder={sourceTypeInput === 'image'
+											? 'registry.example.com/org/image:tag'
+											: 'https://github.com/org/repo.git'}
+										class="font-mono"
+									/>
+								</div>
+							{/if}
+							<Button onclick={handleUpdateSource} class="self-end">Save</Button>
+						</div>
+
+						<!-- ── GitHub App source picker ────────────────────────────────── -->
+						{#if sourceTypeInput === 'git'}
+							{@const installedApps = githubApps.filter((a) => a.installed)}
+							{#if app?.github_app_id}
+								<!-- Currently linked -->
+								{@const linkedApp = githubApps.find((a) => a.id === app?.github_app_id)}
+								<div class="flex items-center gap-3 rounded-md border bg-muted/20 px-4 py-3">
+									<Github class="h-4 w-4 shrink-0 text-muted-foreground" />
+									<div class="min-w-0 flex-1">
+										<p class="text-xs font-medium">
+											GitHub App: <span class="font-mono"
+												>{linkedApp?.name ?? app.github_app_id}</span
+											>
+										</p>
+										<p class="truncate font-mono text-[10px] text-muted-foreground">
+											{app.source_url}
+										</p>
+									</div>
+									<Button
+										variant="outline"
+										size="sm"
+										class="h-7 shrink-0 text-xs text-destructive uppercase hover:text-destructive"
+										disabled={githubLinkSaving}
+										onclick={handleGithubUnlink}
+									>
+										<Unlink2 class="h-3 w-3" />
+										Unlink
+									</Button>
+								</div>
+								{#if githubLinkError}
+									<p class="text-xs text-destructive">{githubLinkError}</p>
+								{/if}
+							{:else if installedApps.length > 0}
+								<!-- Picker: choose app → repo → branch -->
+								<div class="space-y-3 rounded-md border bg-muted/10 px-4 py-3">
+									<p class="text-xs font-medium text-muted-foreground uppercase">
+										Link a GitHub App (optional)
+									</p>
+									<p class="text-xs text-muted-foreground">
+										Select a connected GitHub App and repository to enable private repo access and
+										auto-fill the Git URL. The app will use the GitHub App's access token to clone
+										the repo.
+									</p>
+
+									{#if githubLinkError}
+										<p class="text-xs text-destructive">{githubLinkError}</p>
+									{/if}
+
+									<div class="flex flex-wrap gap-3">
+										<!-- App selector -->
+										<div class="grid gap-1.5">
+											<Label class="text-xs">GitHub App</Label>
+											<Select.Root
+												type="single"
+												value={selectedGithubAppId ?? ''}
+												onValueChange={(v) => handleGithubAppChange(v || null)}
+											>
+												<Select.Trigger class="h-8 w-44 text-xs">
+													{selectedGithubAppId
+														? (installedApps.find((a) => a.id === selectedGithubAppId)?.name ??
+															selectedGithubAppId)
+														: 'Select app…'}
+												</Select.Trigger>
+												<Select.Content>
+													{#each installedApps as ghApp (ghApp.id)}
+														<Select.Item value={ghApp.id} class="text-xs">{ghApp.name}</Select.Item>
+													{/each}
+												</Select.Content>
+											</Select.Root>
+										</div>
+
+										<!-- Repo selector -->
+										{#if selectedGithubAppId}
+											<div class="grid gap-1.5">
+												<Label class="text-xs">Repository</Label>
+												{#if githubPickerReposLoading}
+													<p class="text-xs text-muted-foreground">Loading…</p>
+												{:else}
+													<Select.Root
+														type="single"
+														value={selectedGithubRepo?.full_name ?? ''}
+														onValueChange={(v) => {
+															const repo =
+																githubPickerRepos[selectedGithubAppId ?? '']?.find(
+																	(r) => r.full_name === v
+																) ?? null;
+															handleGithubRepoChange(repo);
+														}}
+													>
+														<Select.Trigger class="h-8 w-52 font-mono text-xs">
+															{selectedGithubRepo?.full_name ?? 'Select repo…'}
+														</Select.Trigger>
+														<Select.Content>
+															{#each githubPickerRepos[selectedGithubAppId] ?? [] as repo (repo.id)}
+																<Select.Item value={repo.full_name} class="font-mono text-xs">
+																	{#if repo.private}
+																		<Lock class="mr-1 inline h-3 w-3 text-muted-foreground" />
+																	{/if}
+																	{repo.full_name}
+																</Select.Item>
+															{/each}
+														</Select.Content>
+													</Select.Root>
+												{/if}
+											</div>
+										{/if}
+
+										<!-- Branch selector -->
+										{#if selectedGithubRepo}
+											{@const branchKey = `${selectedGithubAppId}/${selectedGithubRepo.full_name}`}
+											<div class="grid gap-1.5">
+												<Label class="text-xs">Branch</Label>
+												{#if githubPickerBranchesLoading}
+													<p class="text-xs text-muted-foreground">Loading…</p>
+												{:else}
+													<Select.Root
+														type="single"
+														value={selectedGithubBranch ?? ''}
+														onValueChange={(v) => {
+															selectedGithubBranch = v || null;
+														}}
+													>
+														<Select.Trigger class="h-8 w-36 font-mono text-xs">
+															{#if selectedGithubBranch}
+																<GitBranch class="mr-1 inline h-3 w-3" />
+																{selectedGithubBranch}
+															{:else}
+																Select branch…
+															{/if}
+														</Select.Trigger>
+														<Select.Content>
+															{#each githubPickerBranches[branchKey] ?? [] as branch (branch.name)}
+																<Select.Item value={branch.name} class="font-mono text-xs">
+																	{branch.name}
+																	{#if branch.name === selectedGithubRepo.default_branch}
+																		<span class="ml-1 text-muted-foreground">(default)</span>
+																	{/if}
+																</Select.Item>
+															{/each}
+														</Select.Content>
+													</Select.Root>
+												{/if}
+											</div>
+										{/if}
+
+										<!-- Link button -->
+										{#if selectedGithubRepo}
+											<div class="grid gap-1.5">
+												<Label class="invisible text-xs">Link</Label>
+												<Button
+													size="sm"
+													class="h-8 text-xs uppercase"
+													disabled={githubLinkSaving}
+													onclick={handleGithubLink}
+												>
+													<Github class="h-3 w-3" />
+													{githubLinkSaving ? 'Linking…' : 'Link Repo'}
+												</Button>
+											</div>
+										{/if}
+									</div>
+								</div>
+							{/if}
+						{/if}
+					</div>
+
+					{#if sourceTypeInput === 'image'}
+						<Separator />
+
+						<!-- Registry Credentials -->
+						<div class="grid gap-3">
+							<h3 class="text-sm font-medium">Registry Credential</h3>
+							<p class="text-sm text-muted-foreground">
+								Attach a stored credential to authenticate pulls from a private registry.
+							</p>
+
+							{#if credError}
+								<ErrorAlert title="Error" description={credError} />
+							{/if}
+
+							<!-- Attach credential dropdown -->
+							<div class="flex gap-3">
+								<div class="grid flex-1 gap-2">
+									<Label for="reg-cred-select">Credential</Label>
+									<Select.Root
+										type="single"
+										value={selectedCredentialId ?? '__none__'}
+										onValueChange={(v) => {
+											selectedCredentialId = v === '__none__' ? null : v;
+										}}
+									>
+										<Select.Trigger id="reg-cred-select" class="w-full">
+											{#if selectedCredentialId}
+												{registryCredentials.find((c) => c.id === selectedCredentialId)?.name ??
+													selectedCredentialId}
+											{:else}
+												None (public image)
+											{/if}
+										</Select.Trigger>
+										<Select.Content>
+											<Select.Item value="__none__">None (public image)</Select.Item>
+											{#each registryCredentials as cred (cred.id)}
+												<Select.Item value={cred.id}>{cred.name}</Select.Item>
+											{/each}
+										</Select.Content>
+									</Select.Root>
+								</div>
+								<Button
+									onclick={() => handleSetRegistryCredential(selectedCredentialId)}
+									class="self-end"
+								>
+									Attach
+								</Button>
+							</div>
+
+							<!-- Stored credentials list -->
+							{#if registryCredentialsLoading}
+								<div class="py-2 text-center text-sm text-muted-foreground">Loading...</div>
+							{:else if registryCredentials.length > 0}
+								<div class="divide-y rounded-md border">
+									{#each registryCredentials as cred (cred.id)}
+										<div class="flex items-center gap-3 px-4 py-2">
+											<div class="min-w-0 flex-1">
+												<span class="text-sm font-medium">{cred.name}</span>
+												<span class="ml-2 font-mono text-xs text-muted-foreground"
+													>{cred.server}</span
+												>
+												<span class="ml-2 text-xs text-muted-foreground">({cred.username})</span>
+											</div>
+											{#if app.registry_credential_id === cred.id}
+												<span class="text-xs text-muted-foreground">attached</span>
+											{/if}
+											<Button
+												variant="ghost"
+												size="sm"
+												class="h-7 px-2 text-xs text-destructive hover:bg-destructive/10 hover:text-destructive"
+												onclick={() => handleDeleteCredential(cred.id)}
+											>
+												Remove
+											</Button>
+										</div>
+									{/each}
+								</div>
+							{/if}
+
+							<!-- Add credential form -->
+							{#if addCredOpen}
+								<div class="grid gap-3 rounded-md border p-4">
+									<h4 class="text-sm font-medium">Add credential</h4>
+									{#if addCredError}
+										<ErrorAlert title="Error" description={addCredError} />
+									{/if}
+									<div class="grid gap-2">
+										<Label for="cred-name">Name</Label>
+										<Input
+											id="cred-name"
+											type="text"
+											bind:value={newCredName}
+											placeholder="Docker Hub"
+										/>
+									</div>
+									<div class="grid gap-2">
+										<Label for="cred-server">Registry Server</Label>
+										<Input
+											id="cred-server"
+											type="text"
+											bind:value={newCredServer}
+											placeholder="registry-1.docker.io"
+											class="font-mono"
+										/>
+									</div>
+									<div class="grid gap-2">
+										<Label for="cred-username">Username</Label>
+										<Input
+											id="cred-username"
+											type="text"
+											bind:value={newCredUsername}
+											placeholder="myuser"
+										/>
+									</div>
+									<div class="grid gap-2">
+										<Label for="cred-password">Password / Token</Label>
+										<Input
+											id="cred-password"
+											type="password"
+											bind:value={newCredPassword}
+											placeholder="••••••••"
+										/>
+									</div>
+									<div class="flex gap-2">
+										<Button onclick={handleAddCredential}>Save Credential</Button>
+										<Button
+											variant="outline"
+											onclick={() => {
+												addCredOpen = false;
+												addCredError = '';
+											}}
+										>
+											Cancel
+										</Button>
+									</div>
+								</div>
+							{:else}
+								<Button
+									variant="outline"
+									size="sm"
+									class="self-start"
+									onclick={() => (addCredOpen = true)}
+								>
+									Add new credential
+								</Button>
+							{/if}
+						</div>
+					{/if}
+
+					<Separator />
+
+					<!-- Webhook URLs -->
+					<div class="grid gap-3">
+						<h3 class="text-sm font-medium">Webhook URLs</h3>
+						<p class="text-sm text-muted-foreground">
+							Configure your git provider to POST to one of these URLs on push events.
+						</p>
+						<div class="divide-y rounded-md border">
+							{#each [['GitHub', 'github'], ['Generic', 'generic']] as [label, provider] (provider)}
+								{@const webhookPath = `/api/webhooks/${provider}/${app.id}`}
+								<div class="flex items-center gap-2 px-4 py-2">
+									<span class="w-16 shrink-0 text-sm text-muted-foreground">{label}</span>
+									<code class="min-w-0 flex-1 truncate font-mono text-xs">{webhookPath}</code>
+									<Button
+										variant="ghost"
+										size="sm"
+										class="h-7 shrink-0 px-2 text-xs"
+										onclick={() => handleCopyWebhookUrl(provider, webhookPath)}
+									>
+										{#if copiedWebhook === provider}
+											Copied!
+										{:else}
+											Copy
+										{/if}
+									</Button>
+								</div>
+							{/each}
+						</div>
+					</div>
+
+					<!-- Setup instructions -->
+					<Accordion.Root type="single" class="w-full">
+						<Accordion.Item value="github-setup">
+							<Accordion.Trigger class="text-sm font-medium"
+								>GitHub setup instructions</Accordion.Trigger
+							>
+							<Accordion.Content>
+								<div class="space-y-3 pt-1 text-sm text-muted-foreground">
+									<p class="font-medium text-foreground">Method 1 — Public repo (HTTPS webhook)</p>
+									<ol class="list-decimal space-y-1 pl-5">
+										<li>
+											Go to your repository → <strong>Settings → Webhooks → Add webhook</strong>
+										</li>
+										<li>
+											Set <strong>Payload URL</strong> to the <em>GitHub</em> webhook URL above
+										</li>
+										<li>
+											Set <strong>Content type</strong> to
+											<code class="font-mono text-xs">application/json</code>
+										</li>
+										<li>Paste the webhook secret from the <em>Webhook Secret</em> field below</li>
+										<li>
+											Select <strong>Just the push event</strong> and click
+											<strong>Add webhook</strong>
+										</li>
+									</ol>
+									<p class="font-medium text-foreground">
+										Method 2 — Private repo (SSH deploy key)
+									</p>
+									<ol class="list-decimal space-y-1 pl-5">
+										<li>Generate a deploy key using the button below</li>
+										<li>
+											Go to your repository → <strong
+												>Settings → Deploy keys → Add deploy key</strong
+											>
+										</li>
+										<li>
+											Paste the public key; leave <strong>Allow write access</strong> unchecked
+										</li>
+										<li>
+											Set the app's Git URL to SSH format: <code class="font-mono text-xs"
+												>git@github.com:org/repo.git</code
+											>
+										</li>
+										<li>Follow the webhook setup steps above</li>
+									</ol>
+									<p class="font-medium text-foreground">Method 3 — External CI (GitHub Actions)</p>
+									<ol class="list-decimal space-y-1 pl-5">
+										<li>Create a Tond API token (Settings → API Tokens)</li>
+										<li>
+											In the repo → <strong>Settings → Secrets → Actions</strong>, add
+											<code class="font-mono text-xs">TOND_WEBHOOK</code>
+											(Generic URL above) and <code class="font-mono text-xs">TOND_TOKEN</code>
+										</li>
+										<li>In your workflow, after pushing the image, add a deploy step:</li>
+									</ol>
+									<pre
+										class="rounded-md bg-muted p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap">- name: Trigger Tond deploy
+  run: |
+    curl -sf -X POST "&#36;&#123;&#123; secrets.TOND_WEBHOOK }}" \
+      --header "Authorization: Bearer &#36;&#123;&#123; secrets.TOND_TOKEN }}"</pre>
+								</div>
+							</Accordion.Content>
+						</Accordion.Item>
+					</Accordion.Root>
+
+					<Separator />
+
+					<!-- Auto-deploy toggle -->
+					<div class="grid gap-3">
+						<div class="flex items-center justify-between">
+							<div>
+								<h3 class="text-sm font-medium">Auto-deploy</h3>
+								<p class="mt-1 text-sm text-muted-foreground">
+									Automatically deploy when a webhook push event is received.
+								</p>
+							</div>
+							<Badge variant={app.auto_deploy ? 'default' : 'secondary'}>
+								{app.auto_deploy ? 'Enabled' : 'Disabled'}
+							</Badge>
+						</div>
+						<div class="flex gap-2">
+							{#if !app.auto_deploy}
+								<Button size="sm" onclick={() => handleSetAutoDeploy(true)}
+									>Enable Auto-deploy</Button
+								>
+							{:else}
+								<Button variant="outline" size="sm" onclick={() => handleSetAutoDeploy(false)}
+									>Disable Auto-deploy</Button
+								>
+							{/if}
+						</div>
+					</div>
+
+					<!-- Watch branch -->
+					<div class="grid gap-3">
+						<h3 class="text-sm font-medium">Watch Branch</h3>
+						<p class="text-sm text-muted-foreground">
+							Only trigger deploys for pushes to this branch. Leave empty to deploy on any branch
+							push.
+						</p>
+						<div class="flex gap-3">
+							<div class="grid flex-1 gap-2">
+								<Label for="watch-branch">Branch</Label>
+								<Input
+									id="watch-branch"
+									type="text"
+									bind:value={watchBranchInput}
+									placeholder="main"
+									class="font-mono"
+								/>
+							</div>
+							<Button onclick={handleSaveWatchBranch} class="self-end">Save</Button>
+						</div>
+						{#if app.watch_branch}
+							<p class="text-xs text-muted-foreground">
+								Currently watching: <span class="font-mono">{app.watch_branch}</span>
+							</p>
+						{:else}
+							<p class="text-xs text-muted-foreground">Watching all branches.</p>
+						{/if}
+					</div>
+
+					<Separator />
+
+					<!-- Webhook secret -->
+					<div class="grid gap-3">
+						<h3 class="text-sm font-medium">Webhook Secret</h3>
+						<p class="text-sm text-muted-foreground">
+							Set an HMAC secret to validate incoming webhook payloads. GitHub uses
+							<code class="font-mono text-xs">X-Hub-Signature-256</code>.
+						</p>
+						<div class="flex gap-3">
+							<div class="grid flex-1 gap-2">
+								<Label for="webhook-secret">New secret</Label>
+								<SecretInput
+									id="webhook-secret"
+									bind:value={webhookSecretInput}
+									placeholder="Leave empty to clear"
+									copyable={false}
+								/>
+							</div>
+							<Button onclick={handleSetWebhookSecret} class="self-end">Update</Button>
+						</div>
+					</div>
+
+					<Separator />
+
+					<!-- Deploy key -->
+					<div class="grid gap-3">
+						<div class="flex items-center justify-between">
+							<div>
+								<h3 class="text-sm font-medium">SSH Deploy Key</h3>
+								<p class="mt-1 text-sm text-muted-foreground">
+									Add this Ed25519 public key to your repository's deploy keys (read-only access).
+								</p>
+							</div>
+							<Button
+								variant="outline"
+								size="sm"
+								onclick={handleGenerateDeployKey}
+								disabled={deployKeyLoading}
+							>
+								{deployKey ? 'Regenerate' : 'Generate Key'}
+							</Button>
+						</div>
+
+						{#if deployKeyError}
+							<ErrorAlert title="Error" description={deployKeyError} />
+						{/if}
+
+						{#if deployKeyLoading}
+							<div class="py-4 text-center text-sm text-muted-foreground">Loading...</div>
+						{:else if deployKey}
+							<SecretInput value={deployKey.public_key} readonly />
+							<p class="text-xs text-muted-foreground">
+								Copy this key and add it to your repository under Settings &rarr; Deploy Keys.
+							</p>
+						{:else}
+							<div class="rounded-md border py-6 text-center text-sm text-muted-foreground">
+								No deploy key generated yet. Click "Generate Key" to create one.
+							</div>
+						{/if}
+					</div>
+				</div>
+			</Tabs.Content>
+
+			<!-- Previews tab -->
+			<Tabs.Content value="previews">
+				<div class="space-y-6 pt-4">
+					<!-- PR Preview config -->
+					<div class="grid gap-3">
+						<div class="flex items-center justify-between">
+							<div>
+								<h3 class="text-sm font-medium">PR Preview Deployments</h3>
+								<p class="mt-1 text-sm text-muted-foreground">
+									Automatically deploy a preview environment for every pull request opened on the
+									linked GitHub repository.
+								</p>
+							</div>
+							<Badge variant={app.preview_enabled ? 'default' : 'secondary'}>
+								{app.preview_enabled ? 'Enabled' : 'Disabled'}
+							</Badge>
+						</div>
+
+						{#if previewConfigError}
+							<ErrorAlert title="Error" description={previewConfigError} />
+						{/if}
+
+						<div class="flex gap-2">
+							{#if !app.preview_enabled}
+								<Button
+									size="sm"
+									disabled={previewConfigSaving}
+									onclick={() => handleTogglePreviewEnabled(true)}
+								>
+									{previewConfigSaving ? 'Saving…' : 'Enable PR Previews'}
+								</Button>
+							{:else}
+								<Button
+									variant="outline"
+									size="sm"
+									disabled={previewConfigSaving}
+									onclick={() => handleTogglePreviewEnabled(false)}
+								>
+									{previewConfigSaving ? 'Saving…' : 'Disable PR Previews'}
+								</Button>
+							{/if}
+						</div>
+
+						{#if !app.github_app_id}
+							<p class="text-xs text-muted-foreground">
+								A GitHub App must be linked (Git tab) before PR previews can be triggered
+								automatically.
+							</p>
+						{/if}
+
+						<div class="rounded-md border border-dashed px-4 py-3 text-sm text-muted-foreground">
+							<strong class="text-foreground">Wildcard DNS required</strong> — add a
+							<code class="font-mono text-xs">*.yourdomain.com → &lt;server IP&gt;</code> A record so
+							preview subdomains resolve automatically.
+						</div>
+					</div>
+
+					<Separator />
+
+					<AppPreviews
+						{previews}
+						loading={previewsLoading}
+						error={previewsError}
+						onDelete={handleDeletePreview}
+					/>
+
+					<!-- Load open PRs section (only when preview enabled and GitHub App linked) -->
+					{#if app.preview_enabled && app.github_app_id}
+						<div class="grid gap-3">
+							<div class="flex items-center justify-between">
+								<div>
+									<h3 class="text-sm font-medium">Open Pull Requests</h3>
+									<p class="text-sm text-muted-foreground">
+										Load open PRs from the linked repository and deploy previews for them.
+									</p>
+								</div>
+								<Button
+									variant="outline"
+									size="sm"
+									disabled={openPRsLoading}
+									onclick={handleLoadOpenPRs}
+								>
+									{openPRsLoading ? 'Loading…' : 'Load open PRs'}
+								</Button>
+							</div>
+
+							{#if openPRsError}
+								<p class="text-xs text-destructive">{openPRsError}</p>
+							{/if}
+
+							{#if openPRs.length > 0}
+								<div class="overflow-hidden rounded border border-border">
+									<table class="w-full text-sm">
+										<thead>
+											<tr class="border-b border-border bg-muted/50">
+												<th
+													class="px-3 py-2 text-left font-mono text-xs font-medium text-muted-foreground uppercase"
+													>#</th
+												>
+												<th
+													class="px-3 py-2 text-left font-mono text-xs font-medium text-muted-foreground uppercase"
+													>Title</th
+												>
+												<th
+													class="px-3 py-2 text-left font-mono text-xs font-medium text-muted-foreground uppercase"
+													>Branch</th
+												>
+												<th class="w-36 px-3 py-2"></th>
+											</tr>
+										</thead>
+										<tbody>
+											{#each openPRs as pr, i (pr.number)}
+												{@const alreadyDeployed = previews.some((p) => p.pr_number === pr.number)}
+												<tr class={i < openPRs.length - 1 ? 'border-b border-border' : ''}>
+													<td class="px-3 py-2 font-mono text-xs text-muted-foreground"
+														>#{pr.number}</td
+													>
+													<td class="px-3 py-2 text-xs">
+														<a
+															href={pr.pr_url}
+															target="_blank"
+															rel="noopener noreferrer"
+															class="hover:underline">{pr.title}</a
+														>
+													</td>
+													<td class="px-3 py-2 font-mono text-xs text-muted-foreground"
+														>{pr.head_ref}</td
+													>
+													<td class="px-3 py-2">
+														<div class="flex items-center justify-end gap-2">
+															{#if alreadyDeployed}
+																<Badge variant="secondary" class="text-xs">Deployed</Badge>
+															{/if}
+															<Button
+																size="sm"
+																variant="outline"
+																disabled={deployingPR === pr.number}
+																onclick={() => handleDeployPR(pr)}
+															>
+																{deployingPR === pr.number ? 'Deploying…' : 'Deploy Preview'}
+															</Button>
+														</div>
+													</td>
+												</tr>
+											{/each}
+										</tbody>
+									</table>
+								</div>
+							{/if}
+						</div>
+					{/if}
+
+					<!-- Create preview form -->
+					<div class="grid gap-3">
+						<h3 class="text-sm font-medium">New Preview Deployment</h3>
+						<p class="text-sm text-muted-foreground">
+							Creates a temporary deployment from the current image with a unique subdomain. Useful
+							for PR review workflows.
+						</p>
+						<div class="flex items-end gap-3">
+							<div class="grid gap-2">
+								<Label for="preview-ttl">TTL (hours)</Label>
+								<Input
+									id="preview-ttl"
+									type="number"
+									bind:value={previewTtl}
+									min={1}
+									max={168}
+									class="w-28"
+								/>
+							</div>
+							<Button onclick={() => handleCreatePreview()}>Create Preview</Button>
+						</div>
+						<p class="text-xs text-muted-foreground">
+							The preview will be automatically removed after the TTL expires.
+						</p>
+					</div>
+				</div>
+			</Tabs.Content>
+
+			<!-- Metrics tab -->
+			<Tabs.Content value="metrics">
+				<AppMetrics
+					{metrics}
+					loading={metricsLoading}
+					error={metricsError}
+					period={metricsPeriod}
+					onPeriodChange={(p) => {
+						metricsPeriod = p;
+						startMetricsPolling();
+					}}
+				/>
+			</Tabs.Content>
+
+			<!-- History tab -->
+			<Tabs.Content value="history">
+				<AppHistory appName={app.name} />
+			</Tabs.Content>
+		</Tabs.Root>
+	</div>
+{:else}
+	<div class="py-12 text-center text-muted-foreground">App not found</div>
+{/if}
+
+<!-- Delete confirmation dialog -->
+<ConfirmDeleteDialog
+	bind:open={showDeleteDialog}
+	title={`Delete "${app?.name}"?`}
+	description="This cannot be undone. The app and its container will be permanently removed."
+	confirmation={app?.name ?? ''}
+	onconfirm={handleDelete}
+/>

@@ -1,0 +1,12 @@
+[package]
+name = "tond-scanner"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

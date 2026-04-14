@@ -1,0 +1,10 @@
+{
+  "name": "node-vite-static",
+  "private": true,
+  "dependencies": {
+    "vite": "5.4.19"
+  },
+  "scripts": {
+    "build": "vite build"
+  }
+}
