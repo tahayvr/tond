@@ -1,5 +1,4 @@
 # Most of these commands are designed for deploying to a test server.
-
 # Requires:
 # cargo-zigbuild for cross-compilation (https://github.com/messense/cargo-zigbuild)
 # pnpm for dashboard build and dev server (https://pnpm.io/installation)
@@ -18,10 +17,13 @@ alias v := version
 alias d := dev
 alias ds := dev-setup
 alias t := test
+alias cl := changelog
+alias clu := changelog-unreleased
 
 # List available recipes
+[default]
 default:
-    @just --list
+    @just --list --justfile {{ justfile() }}
 
 # Cross-compile tond CLI
 build-cli:
@@ -29,9 +31,10 @@ build-cli:
     cargo zigbuild -p tond-cli --target {{ target }} --release
 
 # Build the SvelteKit dashboard
+[working-directory('dashboard')]
 build-dashboard:
     @echo "--- Building dashboard ---"
-    cd dashboard && pnpm build
+    pnpm build
 
 # Cross-compile tond-proxy
 build-proxy:
@@ -47,42 +50,75 @@ build-server:
     cargo zigbuild -p tond-server --target {{ target }} --release
 
 # Run all checks: formatting, linting, and type checking for Rust and dashboard
-check:
+check: check-dashboard
     cargo fmt
     cargo check --quiet
     cargo clippy --all-targets --all-features -- -D warnings
-    cd dashboard/ && pnpm check && pnpm format && pnpm lint
+
+# Run dashboard type checks, formatting, and linting
+[working-directory('dashboard')]
+check-dashboard:
+    pnpm check
+    pnpm format
+    pnpm lint
 
 test PKG="":
     cargo test {{ if PKG != "" { "-p tond-" + PKG } else { "" } }} --doc --quiet
     cargo nextest run {{ if PKG != "" { "-p tond-" + PKG } else { "" } }} --show-progress=only
 
-
 # Run dev server for Dashboard
+[working-directory('dashboard')]
 dev:
-    cd dashboard && pnpm dev
+    pnpm dev
 
 # Run dev server with auth enabled and mock API
+[working-directory('dashboard')]
 dev-setup:
-    cd dashboard && pnpm dev:setup
+    pnpm dev:setup
 
 # Create SSH tunnel to the test server
 tunnel:
     ssh -L 3001:localhost:3001 $VPS
 
-# Bump version in cargo.toml (major, minor, patch)
-version VER:
-    cargo set-version --bump {{VER}}
-    cd dashboard && pnpm version {{VER}}
+# Bump version (major, minor, patch)
+[arg("VER", pattern='major|minor|patch')]
+version VER: (version-dashboard VER)
+    cargo set-version --bump {{ VER }}
 
+# Bump dashboard package version (major, minor, patch)
+[arg("VER", pattern='major|minor|patch')]
+[working-directory('dashboard')]
+version-dashboard VER:
+    pnpm version {{ VER }}
 
 # Tag and push to trigger the CI release workflow (builds, packages, and publishes to GitHub Releases)
 release:
     #!/usr/bin/env bash
+    set -euo pipefail
     version=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
-    echo "Tagging v$version and pushing to trigger CI release..."
-    git tag "v$version"
-    git push origin "v$version"
+    tag="v$version"
+    echo "Generating CHANGELOG.md for $tag..."
+    git-cliff -c cliff.toml --tag "$tag" --offline -o CHANGELOG.md
+    if ! git diff --quiet -- CHANGELOG.md; then
+        git add CHANGELOG.md
+        git commit -m "docs: update changelog for $tag"
+        git push origin main
+    fi
+    echo "Tagging $tag and pushing to trigger CI release..."
+    git tag "$tag"
+    git push origin "$tag"
+
+# Regenerate the full local changelog from tags without GitHub API calls
+changelog:
+    git-cliff -c cliff.toml --offline -o CHANGELOG.md
+
+# Generate CHANGELOG.md for a specific upcoming tag without creating the tag
+changelog-tag TAG:
+    git-cliff -c cliff.toml --tag {{ TAG }} --offline -o CHANGELOG.md
+
+# Preview the unreleased section without modifying CHANGELOG.md
+changelog-unreleased:
+    git-cliff -c cliff.toml --unreleased --strip header --offline
 
 # --------------------------------------------
 # ------ Remote dev server for testing -------
@@ -135,6 +171,7 @@ install-services:
     ssh {{ server }} "systemctl daemon-reload && systemctl enable tond-server tond-proxy && echo Done"
 
 # Stream live logs from both services (tond-server then tond-proxy)
+[arg("service", pattern='tond-server|tond-proxy')]
 logs service="tond-server":
     ssh {{ server }} "journalctl -fu {{ service }}"
 
@@ -200,13 +237,13 @@ uninstall:
     @echo "--- Done. Data in /opt/tond/data has been preserved. Run 'just uninstall-all' to also remove data. ---"
 
 # Remove tond from the server including all data (destructive!)
-uninstall-all:
-    just uninstall
+uninstall-all: uninstall
     ssh {{ server }} "rm -rf /opt/tond"
     @echo "--- Tond fully removed ---"
 
-# Full reinstall: wipe everything, create dirs, install services, and deploy (destructive!)
-reinstall: uninstall-all
+# Create remote directories required for install and deploy
+prepare-server-dirs:
     ssh {{ server }} "mkdir -p {{ bin_dir }} {{ dashboard_dir }} /opt/tond/data"
-    just install-services
-    just deploy
+
+# Full reinstall: wipe everything, create dirs, install services, and deploy (destructive!)
+reinstall: uninstall-all prepare-server-dirs install-services deploy
