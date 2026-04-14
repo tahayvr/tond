@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write # Required to create releases
+  pull-requests: read # Required by git-cliff when resolving GitHub PR metadata
 
 jobs:
   build:
@@ -97,14 +98,3 @@ jobs:
           body: ${{ steps.git-cliff.outputs.content }}
           draft: false
           prerelease: false
-
-      - name: Commit CHANGELOG.md
-        if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git fetch origin main
-          git checkout main
-          git add CHANGELOG.md
-          git diff --staged --quiet || git commit -m "chore(release): update CHANGELOG.md for ${{ github.ref_name }}"
-          git push origin main
