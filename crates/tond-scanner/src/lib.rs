@@ -796,8 +796,55 @@ mod tests {
     }
 
     #[test]
+    fn scan_returns_build_plan_for_plain_static_site_without_package_manager() {
+        let repo = create_repo();
+        fs::write(
+            repo.path().join("index.html"),
+            "<!doctype html><html><body><h1>Hello</h1></body></html>\n",
+        )
+        .unwrap_or_else(|err| panic!("failed to write index.html: {err}"));
+        fs::create_dir_all(repo.path().join("assets"))
+            .unwrap_or_else(|err| panic!("failed to create assets directory: {err}"));
+        fs::write(
+            repo.path().join("assets").join("app.js"),
+            "console.log('hi')\n",
+        )
+        .unwrap_or_else(|err| panic!("failed to write assets/app.js: {err}"));
+
+        let plan = scan(repo.path(), true).unwrap_or_else(|err| {
+            panic!("expected scan to succeed for a plain static site: {err}")
+        });
+
+        assert_eq!(
+            plan.profile_name, "Static HTML",
+            "plain static sites should be detected by the dedicated static-site profile"
+        );
+        assert_eq!(
+            plan.stack, "static-html",
+            "plain static sites should use a stable stack identifier"
+        );
+        assert_eq!(
+            plan.static_output_dir.as_deref(),
+            Some("."),
+            "plain static sites should serve the repository root directly"
+        );
+        assert!(
+            plan.dockerfile.contains("COPY . ./"),
+            "plain static site Dockerfiles should copy the repository contents directly, got: {}",
+            plan.dockerfile
+        );
+        assert!(
+            plan.dockerfile
+                .contains("CMD [\"npx\", \"--yes\", \"serve\", \"-s\", \".\", \"-l\", \"8080\"]"),
+            "plain static site Dockerfiles should serve the repository root, got: {}",
+            plan.dockerfile
+        );
+    }
+
+    #[test]
     fn fixture_dockerfiles_match_golden_outputs() {
         let cases = [
+            ("plain-static-html", true),
             ("node-vite-static", true),
             ("python-fastapi", false),
             ("python-django", false),
@@ -822,6 +869,7 @@ mod tests {
     #[test]
     fn highest_value_fixtures_build_and_serve_http() {
         let cases = [
+            ("plain-static-html", true),
             ("node-vite-static", true),
             ("python-fastapi", false),
             ("go-cmd-layout", false),

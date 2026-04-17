@@ -1,0 +1,11 @@
+# Stage 1: Static assets
+FROM node:22.20.0-bookworm-slim AS builder
+WORKDIR /app
+COPY . ./
+
+# Stage 2: Production (static file server)
+FROM node:22.20.0-bookworm-slim AS runner
+WORKDIR /app
+COPY --from=builder /app ./
+EXPOSE 8080
+CMD ["npx", "--yes", "serve", "-s", ".", "-l", "8080"]

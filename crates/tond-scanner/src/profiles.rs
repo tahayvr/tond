@@ -8,6 +8,7 @@ mod go;
 mod node;
 mod python;
 mod rust;
+mod static_html;
 
 use std::path::Path;
 
@@ -27,6 +28,7 @@ pub(crate) fn detect(repo_path: &Path) -> Vec<ProfileMatch> {
         Box::new(python::PythonProfile),
         Box::new(go::GoProfile),
         Box::new(rust::RustProfile),
+        Box::new(static_html::StaticHtmlProfile),
     ];
 
     let mut matches: Vec<ProfileMatch> = profiles
