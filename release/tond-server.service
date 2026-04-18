@@ -1,6 +1,6 @@
 [Unit]
 Description=Tond Server
-Documentation=https://tond.io/docs
+Documentation=https://docs.tond.io
 After=network.target docker.service
 Requires=docker.service
 
