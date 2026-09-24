@@ -19,8 +19,6 @@ VITE_MOCK_API=true          # start MSW service worker to intercept /api request
 
 ---
 
-**IMPORTANT**: Use Red/Green TDD for all new features and bug fixes. Write a failing test first, then implement the minimum code to pass it.
-
 ## Rust Code Style
 
 ### General
