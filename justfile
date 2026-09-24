@@ -9,7 +9,10 @@ server := "tond-dev"
 bin_dir := "/opt/tond/bin"
 dashboard_dir := "/opt/tond/dashboard"
 target := "x86_64-unknown-linux-gnu"
-release_dir := "target/" + target + "/release"
+# Cargo profile for dev deploys. `fast-release` skips LTO for quick rebuilds;
+# override with `just profile=release <recipe>` to build real release artefacts.
+profile := "fast-release"
+release_dir := "target/" + target + "/" + profile
 
 alias c := check
 alias b := build-rust
@@ -28,7 +31,7 @@ default:
 # Cross-compile tond CLI
 build-cli:
     @echo "--- Building tond CLI ---"
-    cargo zigbuild -p tond-cli --target {{ target }} --release
+    cargo zigbuild -p tond-cli --target {{ target }} --profile {{ profile }}
 
 # Build the SvelteKit dashboard
 [working-directory('dashboard')]
@@ -39,15 +42,17 @@ build-dashboard:
 # Cross-compile tond-proxy
 build-proxy:
     @echo "--- Building tond-proxy ---"
-    cargo zigbuild -p tond-proxy --target {{ target }} --release
+    cargo zigbuild -p tond-proxy --target {{ target }} --profile {{ profile }}
 
-# Cross-compile all Rust binaries for Linux
-build-rust: build-server build-proxy build-cli
+# Cross-compile all Rust binaries for Linux (one cargo invocation so shared deps build once)
+build-rust:
+    @echo "--- Building tond-server, tond-proxy, tond CLI ---"
+    cargo zigbuild -p tond-server -p tond-proxy -p tond-cli --target {{ target }} --profile {{ profile }}
 
 # Cross-compile tond-server
 build-server:
     @echo "--- Building tond-server ---"
-    cargo zigbuild -p tond-server --target {{ target }} --release
+    cargo zigbuild -p tond-server --target {{ target }} --profile {{ profile }}
 
 # Run all checks: formatting, linting, and type checking for Rust and dashboard
 check: check-dashboard

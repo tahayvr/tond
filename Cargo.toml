@@ -16,6 +16,16 @@ panic = "abort"     # removes unwinding machinery; fine for daemon/CLI binaries
 # opt-level intentionally left at default (3) — server and proxy are I/O-bound but
 # CPU hotpaths (argon2, AES-GCM, TLS) benefit from full optimisation, not size-shrinking
 
+# Fast optimised build for dev-server deploys (`just deploy*`). Same opt-level as
+# release, but skips LTO and enables incremental + parallel codegen so rebuilds after
+# small changes take seconds, not minutes. Binaries are somewhat larger/slower than
+# release — use `just profile=release deploy` to test the real release artefacts.
+[profile.fast-release]
+inherits = "release"
+lto = false
+codegen-units = 256
+incremental = true
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
