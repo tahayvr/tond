@@ -33,9 +33,9 @@
 	import ConfirmDeleteDialog from '$lib/components/dialogs/confirm-delete-dialog.svelte';
 	import CreateProjectPreviewDialog from '$lib/components/dialogs/create-project-preview-dialog.svelte';
 	import ProjectPreviewCard from '$lib/components/cards/project-preview-card/project-preview-card.svelte';
-	import Plus from '@lucide/svelte/icons/plus';
-	import ChevronUp from '@lucide/svelte/icons/chevron-up';
-	import ChevronRight from '@lucide/svelte/icons/chevron-right';
+	import Plus from '~icons/ri/add-line';
+	import ChevronUp from '~icons/ri/arrow-up-s-line';
+	import ChevronRight from '~icons/ri/arrow-right-s-line';
 	import type { PageProps } from './$types';
 
 	let { data, params }: PageProps = $props();

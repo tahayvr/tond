@@ -15,7 +15,7 @@
 		setTerminalTarget,
 		syncTerminalTarget
 	} from '$lib/ui-context.svelte';
-	import XIcon from '@lucide/svelte/icons/x';
+	import XIcon from '~icons/ri/close-line';
 	import { FitAddon } from '@xterm/addon-fit';
 	import '@xterm/xterm/css/xterm.css';
 

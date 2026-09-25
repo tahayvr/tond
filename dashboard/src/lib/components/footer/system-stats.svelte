@@ -1,13 +1,13 @@
 <script lang="ts">
 	import { getSystemMetrics, type SystemMetrics } from '$lib/api';
 	import * as Tooltip from '$lib/components/ui/tooltip/index.js';
-	import CpuIcon from '@lucide/svelte/icons/cpu';
-	import MemoryIcon from '@lucide/svelte/icons/memory-stick';
-	import BoxIcon from '@lucide/svelte/icons/box';
-	import LayersIcon from '@lucide/svelte/icons/layers';
-	import AlertCircleIcon from '@lucide/svelte/icons/alert-circle';
-	// import HardDriveIcon from '@lucide/svelte/icons/hard-drive';
-	// import Box from '@lucide/svelte/icons/box';
+	import CpuIcon from '~icons/ri/cpu-line';
+	import MemoryIcon from '~icons/ri/ram-2-line';
+	import BoxIcon from '~icons/ri/box-3-line';
+	import LayersIcon from '~icons/ri/stack-line';
+	import AlertCircleIcon from '~icons/ri/error-warning-line';
+	// import HardDriveIcon from '~icons/ri/hard-drive-3-line';
+	// import Box from '~icons/ri/box-3-line';
 
 	let metrics = $state<SystemMetrics | null>(null);
 	let loading = $state(true);

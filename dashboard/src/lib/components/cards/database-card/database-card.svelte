@@ -9,7 +9,7 @@
 	} from '$lib/ui-context.svelte';
 	import * as Card from '$lib/components/ui/card/index.js';
 	import { dbLogoUrl } from '$lib/components/brand-logos/db-logos.svelte';
-	import DatabaseIcon from '@lucide/svelte/icons/database';
+	import DatabaseIcon from '~icons/ri/database-2-line';
 
 	let { db }: { db: ManagedDatabase } = $props();
 

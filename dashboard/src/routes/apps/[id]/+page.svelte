@@ -71,11 +71,11 @@
 	import AppMetrics from '$lib/components/tabs/app-page/app-metrics.svelte';
 	import AppHistory from '$lib/components/tabs/app-page/app-history.svelte';
 	import { SecretInput } from '$lib/components/ui/secret-input/index.js';
-	import Check from '@lucide/svelte/icons/check';
-	import Github from '@lucide/svelte/icons/github';
-	import GitBranch from '@lucide/svelte/icons/git-branch';
-	import Unlink2 from '@lucide/svelte/icons/unlink-2';
-	import Lock from '@lucide/svelte/icons/lock';
+	import Check from '~icons/ri/check-line';
+	import Github from '~icons/ri/github-fill';
+	import GitBranch from '~icons/ri/git-branch-line';
+	import Unlink2 from '~icons/ri/link-unlink-m';
+	import Lock from '~icons/ri/lock-line';
 	import type { PageProps } from './$types';
 
 	let { data, params }: PageProps = $props();

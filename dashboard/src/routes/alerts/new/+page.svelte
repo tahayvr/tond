@@ -14,7 +14,7 @@
 	import { Checkbox } from '$lib/components/ui/checkbox/index.js';
 	import * as Select from '$lib/components/ui/select/index.js';
 	import { setUiContext, clearUiContext, alertsContext } from '$lib/ui-context.svelte';
-	import Bell from '@lucide/svelte/icons/bell';
+	import Bell from '~icons/ri/notification-3-line';
 	import Breadcrumb from '$lib/components/nav/breadcrumb.svelte';
 	import type { PageProps } from './$types';
 

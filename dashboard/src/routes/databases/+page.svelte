@@ -3,7 +3,7 @@
 	import { goto } from '$app/navigation';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { setUiContext, clearUiContext, databasesContext } from '$lib/ui-context.svelte';
-	import Database from '@lucide/svelte/icons/database';
+	import Database from '~icons/ri/database-2-line';
 	import DatabaseGrid from '$lib/components/cards/database-card/database-grid.svelte';
 	import ConfirmDeleteDialog from '$lib/components/dialogs/confirm-delete-dialog.svelte';
 	import type { PageProps } from './$types';

@@ -8,13 +8,13 @@
 	import { SvelteSet } from 'svelte/reactivity';
 	import { untrack } from 'svelte';
 	import type { RegistryCredential } from '$lib/api';
-	import Plus from '@lucide/svelte/icons/plus';
-	import Trash2 from '@lucide/svelte/icons/trash-2';
-	import Pencil from '@lucide/svelte/icons/pencil';
-	import Eye from '@lucide/svelte/icons/eye';
-	import EyeOff from '@lucide/svelte/icons/eye-off';
-	import Copy from '@lucide/svelte/icons/copy';
-	import Check from '@lucide/svelte/icons/check';
+	import Plus from '~icons/ri/add-line';
+	import Trash2 from '~icons/ri/delete-bin-line';
+	import Pencil from '~icons/ri/pencil-line';
+	import Eye from '~icons/ri/eye-line';
+	import EyeOff from '~icons/ri/eye-off-line';
+	import Copy from '~icons/ri/file-copy-line';
+	import Check from '~icons/ri/check-line';
 
 	interface Props {
 		/** Source type of the app — registry section only shown for image sources */

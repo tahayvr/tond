@@ -3,9 +3,9 @@
 	import { Badge } from '$lib/components/ui/badge/index.js';
 	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import type { PreviewDeployment } from '$lib/api';
-	import Github from '@lucide/svelte/icons/github';
-	import GitBranch from '@lucide/svelte/icons/git-branch';
-	import ExternalLink from '@lucide/svelte/icons/external-link';
+	import Github from '~icons/ri/github-fill';
+	import GitBranch from '~icons/ri/git-branch-line';
+	import ExternalLink from '~icons/ri/external-link-line';
 
 	interface Props {
 		previews: PreviewDeployment[];

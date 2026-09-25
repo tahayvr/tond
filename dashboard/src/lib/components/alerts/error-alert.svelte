@@ -1,6 +1,6 @@
 <script lang="ts">
 	import * as Alert from '$lib/components/ui/alert/index.js';
-	import AlertCircleIcon from '@lucide/svelte/icons/alert-circle';
+	import AlertCircleIcon from '~icons/ri/error-warning-line';
 
 	let { title, description }: { title: string; description: string } = $props();
 </script>

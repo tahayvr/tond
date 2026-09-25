@@ -2,7 +2,7 @@
 	import { listSnapshots, rollbackAppToSnapshot, type Snapshot } from '$lib/api';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
-	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
+	import RefreshCw from '~icons/ri/refresh-line';
 
 	interface Props {
 		appName: string;

@@ -3,8 +3,8 @@
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { setUiContext, clearUiContext, alertsContext } from '$lib/ui-context.svelte';
 	import { goto } from '$app/navigation';
-	import Bell from '@lucide/svelte/icons/bell';
-	import Plus from '@lucide/svelte/icons/plus';
+	import Bell from '~icons/ri/notification-3-line';
+	import Plus from '~icons/ri/add-line';
 	import AlertRuleGrid from '$lib/components/cards/alert-rule-card/alert-rule-grid.svelte';
 	import type { PageProps } from './$types';
 

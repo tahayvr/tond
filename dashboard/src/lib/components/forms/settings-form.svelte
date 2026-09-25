@@ -2,8 +2,8 @@
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
-	import Server from '@lucide/svelte/icons/server';
-	import Settings from '@lucide/svelte/icons/settings';
+	import Server from '~icons/ri/server-line';
+	import Settings from '~icons/ri/settings-3-line';
 
 	interface Props {
 		serverName: string;

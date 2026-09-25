@@ -17,9 +17,9 @@
 	import ProfilePassword from '$lib/components/tabs/profile-page/profile-password.svelte';
 	import ProfileTwoFactor from '$lib/components/tabs/profile-page/profile-two-factor.svelte';
 	import ProfileSessions from '$lib/components/tabs/profile-page/profile-sessions.svelte';
-	import KeyRound from '@lucide/svelte/icons/key-round';
-	import ShieldCheck from '@lucide/svelte/icons/shield-check';
-	import Monitor from '@lucide/svelte/icons/monitor';
+	import KeyRound from '~icons/ri/key-2-line';
+	import ShieldCheck from '~icons/ri/shield-check-line';
+	import Monitor from '~icons/ri/computer-line';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();

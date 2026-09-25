@@ -3,7 +3,7 @@
 	import { type App, type Project } from '$lib/api';
 	import { getUiContext, setUiContext, appContext, projectsContext } from '$lib/ui-context.svelte';
 	import * as Card from '$lib/components/ui/card/index.js';
-	import ExternalLink from '@lucide/svelte/icons/external-link';
+	import ExternalLink from '~icons/ri/external-link-line';
 
 	interface Props {
 		app: App;

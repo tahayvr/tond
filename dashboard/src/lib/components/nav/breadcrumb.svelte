@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
-	import ChevronRight from '@lucide/svelte/icons/chevron-right';
-	import Home from '@lucide/svelte/icons/home';
+	import ChevronRight from '~icons/ri/arrow-right-s-line';
+	import Home from '~icons/ri/home-4-line';
 
 	interface BreadcrumbItem {
 		label: string;

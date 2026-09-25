@@ -5,8 +5,8 @@
 	import CreateProjectDialog from '$lib/components/dialogs/create-project-dialog.svelte';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
-	import Search from '@lucide/svelte/icons/search';
-	import Plus from '@lucide/svelte/icons/plus';
+	import Search from '~icons/ri/search-line';
+	import Plus from '~icons/ri/add-line';
 	import { goto } from '$app/navigation';
 	import type { PageProps } from './$types';
 

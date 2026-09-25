@@ -9,17 +9,17 @@
 	} from '$lib/api';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Badge } from '$lib/components/ui/badge/index.js';
-	import Github from '@lucide/svelte/icons/github';
-	import Trash2 from '@lucide/svelte/icons/trash-2';
-	import ChevronDown from '@lucide/svelte/icons/chevron-down';
-	import ChevronRight from '@lucide/svelte/icons/chevron-right';
-	import GitBranch from '@lucide/svelte/icons/git-branch';
-	import ExternalLink from '@lucide/svelte/icons/external-link';
-	import Lock from '@lucide/svelte/icons/lock';
-	import Pencil from '@lucide/svelte/icons/pencil';
-	import Check from '@lucide/svelte/icons/check';
-	import X from '@lucide/svelte/icons/x';
-	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
+	import Github from '~icons/ri/github-fill';
+	import Trash2 from '~icons/ri/delete-bin-line';
+	import ChevronDown from '~icons/ri/arrow-down-s-line';
+	import ChevronRight from '~icons/ri/arrow-right-s-line';
+	import GitBranch from '~icons/ri/git-branch-line';
+	import ExternalLink from '~icons/ri/external-link-line';
+	import Lock from '~icons/ri/lock-line';
+	import Pencil from '~icons/ri/pencil-line';
+	import Check from '~icons/ri/check-line';
+	import X from '~icons/ri/close-line';
+	import RefreshCw from '~icons/ri/refresh-line';
 
 	interface Props {
 		app: GitHubApp;

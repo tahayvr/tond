@@ -2,7 +2,7 @@
 	import { listAuditLog, type AuditLogEntry, type App } from '$lib/api';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { setUiContext, clearUiContext, projectsContext } from '$lib/ui-context.svelte';
-	import Activity from '@lucide/svelte/icons/activity';
+	import Activity from '~icons/ri/pulse-line';
 	import ActivityFilterPanel from '$lib/components/activity/activity-filter-panel.svelte';
 	import ActivityLogTable from '$lib/components/activity/activity-log-table.svelte';
 	import type { PageProps } from './$types';

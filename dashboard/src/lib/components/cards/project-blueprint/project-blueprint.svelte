@@ -1,6 +1,6 @@
 <script lang="ts">
-	import ZapIcon from '@lucide/svelte/icons/zap';
-	import DatabaseIcon from '@lucide/svelte/icons/database';
+	import ZapIcon from '~icons/ri/flashlight-line';
+	import DatabaseIcon from '~icons/ri/database-2-line';
 	import { cn } from '$lib/utils';
 	import type { App, ManagedDatabase } from '$lib/api';
 
@@ -104,10 +104,7 @@
 								appStatusColor(app)
 							)}
 						>
-							<ZapIcon
-								class={cn('h-8 w-8 transition-colors', appIconColor(app))}
-								strokeWidth={1.5}
-							/>
+							<ZapIcon class={cn('h-8 w-8 transition-colors', appIconColor(app))} />
 						</div>
 						<!-- app name -->
 						<span
@@ -141,10 +138,7 @@
 								dbStatusColor(db)
 							)}
 						>
-							<DatabaseIcon
-								class={cn('h-8 w-8 transition-colors', dbIconColor(db))}
-								strokeWidth={1.5}
-							/>
+							<DatabaseIcon class={cn('h-8 w-8 transition-colors', dbIconColor(db))} />
 						</div>
 						<!-- db name -->
 						<span

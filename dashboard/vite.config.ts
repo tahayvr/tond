@@ -2,9 +2,10 @@ import { svelteTesting } from '@testing-library/svelte/vite';
 import tailwindcss from '@tailwindcss/vite';
 import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig } from 'vitest/config';
+import Icons from 'unplugin-icons/vite';
 
 export default defineConfig({
-	plugins: [tailwindcss(), sveltekit(), svelteTesting()],
+	plugins: [tailwindcss(), sveltekit(), Icons({ compiler: 'svelte' }), svelteTesting()],
 	test: {
 		environment: 'jsdom',
 		setupFiles: ['./src/test/setup.ts'],

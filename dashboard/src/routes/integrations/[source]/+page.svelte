@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { page } from '$app/state';
-	import Github from '@lucide/svelte/icons/github';
-	import Package from '@lucide/svelte/icons/package';
-	import ChevronLeft from '@lucide/svelte/icons/chevron-left';
+	import Github from '~icons/ri/github-fill';
+	import Package from '~icons/ri/archive-2-line';
+	import ChevronLeft from '~icons/ri/arrow-left-s-line';
 	import { setUiContext, clearUiContext, projectsContext } from '$lib/ui-context.svelte';
 	import GitHubAppList from '$lib/components/integrations/github-app-list.svelte';
 	import RegistryCredentialList from '$lib/components/integrations/registry-credential-list.svelte';

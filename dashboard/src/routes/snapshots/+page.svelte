@@ -16,12 +16,12 @@
 	import Badge from '$lib/components/ui/badge/badge.svelte';
 	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import { setUiContext, clearUiContext, snapshotsContext } from '$lib/ui-context.svelte';
-	import Trash2 from '@lucide/svelte/icons/trash-2';
-	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
-	import Download from '@lucide/svelte/icons/download';
-	import Settings2 from '@lucide/svelte/icons/settings-2';
-	import Plus from '@lucide/svelte/icons/plus';
-	import ChevronDown from '@lucide/svelte/icons/chevron-down';
+	import Trash2 from '~icons/ri/delete-bin-line';
+	import RefreshCw from '~icons/ri/refresh-line';
+	import Download from '~icons/ri/download-line';
+	import Settings2 from '~icons/ri/equalizer-line';
+	import Plus from '~icons/ri/add-line';
+	import ChevronDown from '~icons/ri/arrow-down-s-line';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();

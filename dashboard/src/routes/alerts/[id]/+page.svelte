@@ -23,8 +23,8 @@
 	import Breadcrumb from '$lib/components/nav/breadcrumb.svelte';
 	import ConfirmDeleteDialog from '$lib/components/dialogs/confirm-delete-dialog.svelte';
 	import IntegrationSelector from '$lib/components/integrations/integration-selector.svelte';
-	import Bell from '@lucide/svelte/icons/bell';
-	import Plug from '@lucide/svelte/icons/plug';
+	import Bell from '~icons/ri/notification-3-line';
+	import Plug from '~icons/ri/plug-line';
 	import type { PageProps } from './$types';
 
 	let { data, params }: PageProps = $props();

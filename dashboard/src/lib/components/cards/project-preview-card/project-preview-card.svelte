@@ -3,12 +3,12 @@
 	import { Button } from '$lib/components/ui/button/index.js';
 	import * as Card from '$lib/components/ui/card/index.js';
 	import type { App, ProjectPreview } from '$lib/api';
-	import ExternalLink from '@lucide/svelte/icons/external-link';
-	import Trash2 from '@lucide/svelte/icons/trash-2';
-	import ChevronDown from '@lucide/svelte/icons/chevron-down';
-	import ChevronRight from '@lucide/svelte/icons/chevron-right';
-	import Github from '@lucide/svelte/icons/github';
-	import GitBranch from '@lucide/svelte/icons/git-branch';
+	import ExternalLink from '~icons/ri/external-link-line';
+	import Trash2 from '~icons/ri/delete-bin-line';
+	import ChevronDown from '~icons/ri/arrow-down-s-line';
+	import ChevronRight from '~icons/ri/arrow-right-s-line';
+	import Github from '~icons/ri/github-fill';
+	import GitBranch from '~icons/ri/git-branch-line';
 
 	let {
 		preview,

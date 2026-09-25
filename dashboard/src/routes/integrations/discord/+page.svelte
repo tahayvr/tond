@@ -1,6 +1,6 @@
 <script lang="ts">
-	import ChevronLeft from '@lucide/svelte/icons/chevron-left';
-	import Webhook from '@lucide/svelte/icons/webhook';
+	import ChevronLeft from '~icons/ri/arrow-left-s-line';
+	import Webhook from '~icons/ri/webhook-line';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
 	import NotificationChannelList from '$lib/components/integrations/notification-channel-list.svelte';

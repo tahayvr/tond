@@ -1,8 +1,8 @@
 <script lang="ts">
-	import Server from '@lucide/svelte/icons/server';
-	import Cpu from '@lucide/svelte/icons/cpu';
-	import HardDrive from '@lucide/svelte/icons/hard-drive';
-	import Box from '@lucide/svelte/icons/box';
+	import Server from '~icons/ri/server-line';
+	import Cpu from '~icons/ri/cpu-line';
+	import HardDrive from '~icons/ri/hard-drive-3-line';
+	import Box from '~icons/ri/box-3-line';
 	import ResourceGauge from '$lib/components/system/resource-gauge.svelte';
 	import MetricCard from '$lib/components/system/metric-card.svelte';
 	import type { SystemMetrics } from '$lib/api';

@@ -3,7 +3,7 @@
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
 	import * as Select from '$lib/components/ui/select/index.js';
-	import Activity from '@lucide/svelte/icons/activity';
+	import Activity from '~icons/ri/pulse-line';
 	import type { App } from '$lib/api';
 
 	interface Props {

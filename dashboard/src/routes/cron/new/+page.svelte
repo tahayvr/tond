@@ -9,9 +9,9 @@
 	import * as Dialog from '$lib/components/ui/dialog/index.js';
 	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import { setUiContext, clearUiContext, projectsContext } from '$lib/ui-context.svelte';
-	import Clock from '@lucide/svelte/icons/clock';
-	import Plus from '@lucide/svelte/icons/plus';
-	import Trash2 from '@lucide/svelte/icons/trash-2';
+	import Clock from '~icons/ri/time-line';
+	import Plus from '~icons/ri/add-line';
+	import Trash2 from '~icons/ri/delete-bin-line';
 	import Breadcrumb from '$lib/components/nav/breadcrumb.svelte';
 	import type { PageProps } from './$types';
 

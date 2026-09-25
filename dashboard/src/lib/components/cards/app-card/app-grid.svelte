@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { Input } from '$lib/components/ui/input/index.js';
-	import Search from '@lucide/svelte/icons/search';
-	import Rocket from '@lucide/svelte/icons/rocket';
+	import Search from '~icons/ri/search-line';
+	import Rocket from '~icons/ri/rocket-line';
 	import AppCard from './app-card.svelte';
 	import type { App, Project } from '$lib/api';
 

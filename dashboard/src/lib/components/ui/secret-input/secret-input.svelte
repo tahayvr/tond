@@ -1,10 +1,10 @@
 <script lang="ts">
 	import type { HTMLInputAttributes } from 'svelte/elements';
 	import { cn, type WithElementRef } from '$lib/utils.js';
-	import Eye from '@lucide/svelte/icons/eye';
-	import EyeOff from '@lucide/svelte/icons/eye-off';
-	import Copy from '@lucide/svelte/icons/copy';
-	import Check from '@lucide/svelte/icons/check';
+	import Eye from '~icons/ri/eye-line';
+	import EyeOff from '~icons/ri/eye-off-line';
+	import Copy from '~icons/ri/file-copy-line';
+	import Check from '~icons/ri/check-line';
 
 	type Props = WithElementRef<Omit<HTMLInputAttributes, 'type'>> & {
 		/** Show the copy button (default: true) */

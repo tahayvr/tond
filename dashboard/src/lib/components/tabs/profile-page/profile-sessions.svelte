@@ -2,8 +2,8 @@
 	import type { SessionInfo } from '$lib/api';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Badge } from '$lib/components/ui/badge/index.js';
-	import Monitor from '@lucide/svelte/icons/monitor';
-	import User from '@lucide/svelte/icons/user';
+	import Monitor from '~icons/ri/computer-line';
+	import User from '~icons/ri/user-line';
 
 	interface Props {
 		sessions: SessionInfo[];

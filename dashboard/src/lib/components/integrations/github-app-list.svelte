@@ -8,7 +8,7 @@
 	import { Button } from '$lib/components/ui/button/index.js';
 	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import GitHubAppCard from './github-app-card.svelte';
-	import Plus from '@lucide/svelte/icons/plus';
+	import Plus from '~icons/ri/add-line';
 
 	interface Props {
 		initialApps?: GitHubApp[];

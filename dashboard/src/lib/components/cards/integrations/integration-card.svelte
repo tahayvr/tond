@@ -3,8 +3,8 @@
 	import Badge from '$lib/components/ui/badge/badge.svelte';
 	import * as Card from '$lib/components/ui/card/index.js';
 	import Button from '$lib/components/ui/button/button.svelte';
-	import Unlink from '@lucide/svelte/icons/unlink';
-	import ChevronRight from '@lucide/svelte/icons/chevron-right';
+	import Unlink from '~icons/ri/link-unlink';
+	import ChevronRight from '~icons/ri/arrow-right-s-line';
 
 	interface Props {
 		name: string;

@@ -10,14 +10,14 @@
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Badge } from '$lib/components/ui/badge/index.js';
 	import { goto } from '$app/navigation';
-	import Plus from '@lucide/svelte/icons/plus';
-	import Rocket from '@lucide/svelte/icons/rocket';
-	import Database from '@lucide/svelte/icons/database';
-	import Clock from '@lucide/svelte/icons/clock';
-	import Activity from '@lucide/svelte/icons/activity';
-	import Zap from '@lucide/svelte/icons/zap';
-	import Server from '@lucide/svelte/icons/server';
-	import Box from '@lucide/svelte/icons/box';
+	import Plus from '~icons/ri/add-line';
+	import Rocket from '~icons/ri/rocket-line';
+	import Database from '~icons/ri/database-2-line';
+	import Clock from '~icons/ri/time-line';
+	import Activity from '~icons/ri/pulse-line';
+	import Zap from '~icons/ri/flashlight-line';
+	import Server from '~icons/ri/server-line';
+	import Box from '~icons/ri/box-3-line';
 	import { cn } from '$lib/utils';
 	import type { PageProps } from './$types';
 

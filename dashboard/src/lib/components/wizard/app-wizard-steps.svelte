@@ -1,5 +1,5 @@
 <script lang="ts">
-	import CheckCircle from '@lucide/svelte/icons/check-circle';
+	import CheckCircle from '~icons/ri/checkbox-circle-line';
 	import type { Component } from 'svelte';
 
 	interface Step {

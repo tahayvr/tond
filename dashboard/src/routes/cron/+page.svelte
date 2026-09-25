@@ -3,8 +3,8 @@
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { setUiContext, clearUiContext, projectsContext } from '$lib/ui-context.svelte';
 	import { goto } from '$app/navigation';
-	import Clock from '@lucide/svelte/icons/clock';
-	import Plus from '@lucide/svelte/icons/plus';
+	import Clock from '~icons/ri/time-line';
+	import Plus from '~icons/ri/add-line';
 	import CronJobGrid from '$lib/components/cards/cron-job-card/cron-job-grid.svelte';
 	import type { PageProps } from './$types';
 

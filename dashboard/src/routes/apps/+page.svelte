@@ -3,8 +3,8 @@
 	import { setUiContext, clearUiContext, projectsContext } from '$lib/ui-context.svelte';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { goto } from '$app/navigation';
-	import Plus from '@lucide/svelte/icons/plus';
-	import Box from '@lucide/svelte/icons/box';
+	import Plus from '~icons/ri/add-line';
+	import Box from '~icons/ri/box-3-line';
 	import AppGrid from '$lib/components/cards/app-card/app-grid.svelte';
 	import type { PageProps } from './$types';
 

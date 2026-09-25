@@ -29,12 +29,12 @@
 	import Breadcrumb from '$lib/components/nav/breadcrumb.svelte';
 	import ConfirmDeleteDialog from '$lib/components/dialogs/confirm-delete-dialog.svelte';
 	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
-	import Play from '@lucide/svelte/icons/play';
-	import RotateCw from '@lucide/svelte/icons/rotate-cw';
-	import ChevronDown from '@lucide/svelte/icons/chevron-down';
-	import ChevronRight from '@lucide/svelte/icons/chevron-right';
-	import Plus from '@lucide/svelte/icons/plus';
-	import Trash2 from '@lucide/svelte/icons/trash-2';
+	import Play from '~icons/ri/play-line';
+	import RotateCw from '~icons/ri/restart-line';
+	import ChevronDown from '~icons/ri/arrow-down-s-line';
+	import ChevronRight from '~icons/ri/arrow-right-s-line';
+	import Plus from '~icons/ri/add-line';
+	import Trash2 from '~icons/ri/delete-bin-line';
 	import type { PageProps } from './$types';
 
 	let { data, params }: PageProps = $props();

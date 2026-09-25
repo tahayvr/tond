@@ -31,11 +31,11 @@
 	import ConfirmDeleteDialog from '$lib/components/dialogs/confirm-delete-dialog.svelte';
 	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import { SvelteSet } from 'svelte/reactivity';
-	import Eye from '@lucide/svelte/icons/eye';
-	import EyeOff from '@lucide/svelte/icons/eye-off';
-	import Copy from '@lucide/svelte/icons/copy';
-	import Check from '@lucide/svelte/icons/check';
-	import Pencil from '@lucide/svelte/icons/pencil';
+	import Eye from '~icons/ri/eye-line';
+	import EyeOff from '~icons/ri/eye-off-line';
+	import Copy from '~icons/ri/file-copy-line';
+	import Check from '~icons/ri/check-line';
+	import Pencil from '~icons/ri/pencil-line';
 	import type { PageProps } from './$types';
 
 	let { data, params }: PageProps = $props();

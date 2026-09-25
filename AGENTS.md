@@ -124,6 +124,10 @@ VITE_MOCK_API=true          # start MSW service worker to intercept /api request
 
 - Use **shadcn-svelte** components for all UI primitives.
   Add components: `pnpm dlx shadcn-svelte@latest add <component-name>`
+- Icons: **Remix Icon** via `unplugin-icons` + `@iconify-json/ri`, imported per icon as
+  `import SearchIcon from '~icons/ri/search-line';` (browse names at remixicon.com; prefer
+  `-line` variants). Size with Tailwind classes (`class="size-4"`). `shadcn-svelte add`
+  generates `@lucide/svelte` imports — replace them with the Remix equivalent.
 - Tailwind CSS v4 (CSS-first config). Theme customisation goes in
   `src/routes/layout.css` inside `@theme { … }` — there is no `tailwind.config.*`.
 - Use Tailwind utility classes directly on elements. No scoped `<style>` blocks or

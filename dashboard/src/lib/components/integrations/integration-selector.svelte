@@ -9,7 +9,7 @@
 	} from '$lib/api';
 	import { SvelteSet } from 'svelte/reactivity';
 	import { Checkbox } from '$lib/components/ui/checkbox/index.js';
-	import Plug from '@lucide/svelte/icons/plug';
+	import Plug from '~icons/ri/plug-line';
 
 	interface Props {
 		ruleId: string;

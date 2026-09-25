@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { cn } from '$lib/utils';
-	import Activity from '@lucide/svelte/icons/activity';
+	import Activity from '~icons/ri/pulse-line';
 	import type { AuditLogEntry, App } from '$lib/api';
 
 	interface Props {

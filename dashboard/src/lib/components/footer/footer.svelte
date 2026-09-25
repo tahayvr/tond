@@ -1,6 +1,6 @@
 <script lang="ts">
 	import SystemStats from './system-stats.svelte';
-	import TerminalIcon from '@lucide/svelte/icons/terminal';
+	import TerminalIcon from '~icons/ri/terminal-box-line';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { getTerminalOpen, setTerminalOpen } from '$lib/ui-context.svelte';
 	import * as Tooltip from '$lib/components/ui/tooltip/index.js';

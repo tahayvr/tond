@@ -3,15 +3,15 @@
 	import { Label } from '$lib/components/ui/label/index.js';
 	import * as Select from '$lib/components/ui/select/index.js';
 	import { Textarea } from '$lib/components/ui/textarea/index.js';
-	import GitBranch from '@lucide/svelte/icons/git-branch';
-	import Container from '@lucide/svelte/icons/container';
-	import LayoutTemplate from '@lucide/svelte/icons/layout-template';
-	import Github from '@lucide/svelte/icons/github';
-	import Lock from '@lucide/svelte/icons/lock';
-	import Globe from '@lucide/svelte/icons/globe';
-	import FileCode from '@lucide/svelte/icons/file-code';
-	import Layers from '@lucide/svelte/icons/layers';
-	import Box from '@lucide/svelte/icons/box';
+	import GitBranch from '~icons/ri/git-branch-line';
+	import Container from '~icons/ri/instance-line';
+	import LayoutTemplate from '~icons/ri/layout-masonry-line';
+	import Github from '~icons/ri/github-fill';
+	import Lock from '~icons/ri/lock-line';
+	import Globe from '~icons/ri/global-line';
+	import FileCode from '~icons/ri/file-code-line';
+	import Layers from '~icons/ri/stack-line';
+	import Box from '~icons/ri/box-3-line';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import {
 		listGitHubApps,

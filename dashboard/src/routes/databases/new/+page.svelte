@@ -5,7 +5,7 @@
 	import { Button } from '$lib/components/ui/button/index.js';
 	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import { setUiContext, clearUiContext, projectsContext } from '$lib/ui-context.svelte';
-	import Database from '@lucide/svelte/icons/database';
+	import Database from '~icons/ri/database-2-line';
 	import Breadcrumb from '$lib/components/nav/breadcrumb.svelte';
 	import DbWizardConfig from '$lib/components/wizard/db-wizard-config.svelte';
 	import type { DbType } from '$lib/components/wizard/db-wizard-config.svelte';

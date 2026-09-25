@@ -7,11 +7,11 @@
 	} from '$lib/api';
 	import IntegrationCard from '$lib/components/cards/integrations/integration-card.svelte';
 	import StorageProviderList from '$lib/components/integrations/storage-provider-list.svelte';
-	import Github from '@lucide/svelte/icons/github';
-	import Package from '@lucide/svelte/icons/package';
-	import Send from '@lucide/svelte/icons/send';
-	import Webhook from '@lucide/svelte/icons/webhook';
-	import Mail from '@lucide/svelte/icons/mail';
+	import Github from '~icons/ri/github-fill';
+	import Package from '~icons/ri/archive-2-line';
+	import Send from '~icons/ri/send-plane-line';
+	import Webhook from '~icons/ri/webhook-line';
+	import Mail from '~icons/ri/mail-line';
 	import { setUiContext, clearUiContext, integrationsContext } from '$lib/ui-context.svelte';
 	import type { PageProps } from './$types';
 

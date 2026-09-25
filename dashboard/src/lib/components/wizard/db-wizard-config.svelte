@@ -3,7 +3,7 @@
 	import { Label } from '$lib/components/ui/label/index.js';
 	import * as Select from '$lib/components/ui/select/index.js';
 	import { dbLogoUrl } from '$lib/components/brand-logos/db-logos.svelte';
-	import DatabaseIcon from '@lucide/svelte/icons/database';
+	import DatabaseIcon from '~icons/ri/database-2-line';
 	import type { Project } from '$lib/api';
 
 	export type DbType = 'postgres' | 'mysql' | 'mariadb' | 'redis' | 'keydb' | 'mongodb';

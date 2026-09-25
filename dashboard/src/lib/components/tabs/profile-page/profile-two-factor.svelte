@@ -5,7 +5,7 @@
 	import { Label } from '$lib/components/ui/label/index.js';
 	import * as InputOTP from '$lib/components/ui/input-otp/index.js';
 	import { REGEXP_ONLY_DIGITS } from 'bits-ui';
-	import ShieldCheck from '@lucide/svelte/icons/shield-check';
+	import ShieldCheck from '~icons/ri/shield-check-line';
 
 	interface Props {
 		phase: 'idle' | 'setup' | 'done' | 'disable';

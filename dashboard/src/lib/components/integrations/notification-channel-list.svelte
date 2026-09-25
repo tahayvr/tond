@@ -13,10 +13,10 @@
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
 	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
-	import Trash2 from '@lucide/svelte/icons/trash-2';
-	import Plus from '@lucide/svelte/icons/plus';
-	import Pencil from '@lucide/svelte/icons/pencil';
-	import FlaskConical from '@lucide/svelte/icons/flask-conical';
+	import Trash2 from '~icons/ri/delete-bin-line';
+	import Plus from '~icons/ri/add-line';
+	import Pencil from '~icons/ri/pencil-line';
+	import FlaskConical from '~icons/ri/flask-line';
 	import Badge from '$lib/components/ui/badge/badge.svelte';
 
 	interface Props {
