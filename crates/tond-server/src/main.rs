@@ -69,6 +69,7 @@ pub use state::AppState;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tond_common::install_crypto_provider();
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(

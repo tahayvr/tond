@@ -141,6 +141,7 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tond_common::install_crypto_provider();
     let cli = Cli::parse();
 
     // Connect lazily: `scanner` and `update` don't use the API, so they must work
@@ -337,8 +338,8 @@ mod tests {
                     "apps create should default drain_timeout to None"
                 );
                 assert_eq!(
-                    create.build_method, "tbuild",
-                    "apps create should default build_method to tbuild"
+                    create.build_method, None,
+                    "apps create should leave build_method to the server default"
                 );
                 assert!(!create.yes, "apps create should default yes to false");
             }

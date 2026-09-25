@@ -402,6 +402,16 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn acme_http_client_builds_with_both_rustls_backends_compiled_in() {
+        // Workspace builds unify features, compiling both rustls backends in (lettre →
+        // ring, instant-acme → aws-lc-rs). Without an explicit provider, building the
+        // ACME client panics — this crashed tond-proxy on its first certificate order.
+        tond_common::install_crypto_provider();
+
+        assert!(Account::builder().is_ok());
+    }
+
     async fn create_test_db(dir: &TempDir) -> SqlitePool {
         let db_url = format!("sqlite:{}?mode=rwc", dir.path().join("acme.db").display());
         let pool = SqlitePool::connect(&db_url)

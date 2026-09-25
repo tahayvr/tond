@@ -4939,6 +4939,7 @@ dependencies = [
  "chrono",
  "hex",
  "rand 0.10.3",
+ "rustls",
  "serde",
  "serde_json",
  "serde_with",

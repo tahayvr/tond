@@ -65,10 +65,11 @@ pub struct CreateAppOptions {
     #[arg(long)]
     pub drain_timeout: Option<i64>,
 
-    /// Build method: tbuild (default) or dockerfile
-    /// "tbuild" scans the repo and auto-generates a Dockerfile
-    #[arg(long, default_value = "tbuild")]
-    pub build_method: String,
+    /// Build method for git/tarball sources: tbuild (server default) or dockerfile.
+    /// "tbuild" scans the repo and auto-generates a Dockerfile. Only sent when given,
+    /// since the server rejects a build method for image sources.
+    #[arg(long)]
+    pub build_method: Option<String>,
 
     /// Skip interactive prompts and fail if required template inputs are missing.
     #[arg(long)]
@@ -371,7 +372,7 @@ pub async fn handle(client: &TondClient, action: AppsAction) -> Result<()> {
             let resolved_build_method = template_manifest
                 .as_ref()
                 .and_then(template_build_method)
-                .or(Some(build_method));
+                .or(build_method);
             let created_project = if let Some(template) = &template_manifest {
                 create_template_project(client, template).await?
             } else {
@@ -1306,7 +1307,7 @@ required = true
                 health_interval: None,
                 health_threshold: None,
                 drain_timeout: None,
-                build_method: "tbuild".to_string(),
+                build_method: None,
                 yes: true,
             })),
         )

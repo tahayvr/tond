@@ -21,3 +21,15 @@ pub use models::*;
 /// database path). The `tond` CLI connects here; requests on this socket are
 /// trusted without credentials, so it is created with mode 0600 (root only).
 pub const DEFAULT_SOCKET_PATH: &str = "/opt/tond/data/tond.sock";
+
+/// Install aws-lc-rs as the process-wide rustls crypto provider. Call first thing in `main`.
+///
+/// Dependencies disagree on rustls backends (lettre enables `ring`; instant-acme and
+/// reqwest enable `aws-lc-rs`). When the binaries are built in one cargo invocation,
+/// feature unification compiles both in, and rustls then refuses to pick a default and
+/// panics on first use — which crashed tond-proxy whenever it started ACME provisioning.
+/// Installing a provider explicitly makes every binary independent of how it was built.
+pub fn install_crypto_provider() {
+    // Err only means a provider is already installed, which is fine.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}

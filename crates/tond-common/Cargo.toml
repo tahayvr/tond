@@ -17,6 +17,7 @@ rand = { workspace = true }
 hex = { workspace = true }
 anyhow = { workspace = true }
 serde_with = { workspace = true }
+rustls = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

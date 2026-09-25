@@ -87,6 +87,8 @@ base64 = "0.23.1"
 
 # TLS / ACME
 instant-acme = "0.8.5"
+# Only used to pick the process-wide crypto provider (see tond_common::install_crypto_provider)
+rustls = { version = "0.23.45", default-features = false, features = ["aws_lc_rs", "std"] }
 rcgen = "0.14.7"
 openssl = "0.10.75"
 
