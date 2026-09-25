@@ -251,52 +251,17 @@ pre_update_checks() {
     info "Pre-update checks passed"
 }
 
-# Ensure ${SECRET_ENV_FILE} holds TOND_SECRET_KEY, the at-rest encryption key
-# for stored secrets. Never replaces an existing key. A key an operator already
-# set via `systemctl edit tond-server` is carried over; otherwise a random one
-# is generated. Secrets stored under the old insecure default key are
-# re-encrypted by tond-server on its next start.
+# The encryption key is created by install.sh and never generated here: a new
+# key would make every stored secret unreadable.
 ensure_secret_key() {
-    step "Configuring encryption key"
-
-    mkdir -p "${DATA_DIR}"
-
+    step "Checking encryption key"
     if [[ -f "$SECRET_ENV_FILE" ]] && grep -q '^TOND_SECRET_KEY=.' "$SECRET_ENV_FILE"; then
         chown root:root "$SECRET_ENV_FILE"
         chmod 600 "$SECRET_ENV_FILE"
-        info "Using existing encryption key from ${SECRET_ENV_FILE}"
+        info "Using encryption key from ${SECRET_ENV_FILE}"
         return 0
     fi
-
-    local key=""
-    key=$(systemctl show tond-server -p Environment --value 2>/dev/null \
-        | tr ' ' '\n' | sed -n 's/^TOND_SECRET_KEY=//p' | tail -1) || true
-
-    if [[ -n "$key" ]]; then
-        info "Moving existing TOND_SECRET_KEY from the tond-server unit into ${SECRET_ENV_FILE}"
-    else
-        if command -v openssl &> /dev/null; then
-            key=$(openssl rand -hex 32)
-        else
-            key=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
-        fi
-        [[ ${#key} -eq 64 ]] || fatal "Failed to generate encryption key"
-        if [[ -f "${DATA_DIR}/tond.db" ]]; then
-            info "Generated a new encryption key; existing secrets will be re-encrypted on startup"
-        else
-            info "Generated a new encryption key"
-        fi
-    fi
-
-    (
-        umask 077
-        printf 'TOND_SECRET_KEY=%s\n' "$key" > "${SECRET_ENV_FILE}.tmp"
-    )
-    chown root:root "${SECRET_ENV_FILE}.tmp"
-    mv -f "${SECRET_ENV_FILE}.tmp" "$SECRET_ENV_FILE"
-
-    info "Encryption key stored in ${SECRET_ENV_FILE} (mode 0600)"
-    warn "Back this file up: without it, stored credentials, tokens and 2FA secrets cannot be decrypted"
+    fatal "${SECRET_ENV_FILE} with TOND_SECRET_KEY is missing. Restore it from your backup; tond-server cannot start without it."
 }
 
 # Perform update with zero-downtime strategy

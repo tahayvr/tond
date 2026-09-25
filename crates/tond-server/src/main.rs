@@ -92,8 +92,8 @@ async fn main() -> Result<()> {
     // Run migrations
     db::migrate(&state.db).await?;
 
-    // Re-encrypt secrets stored under a previous key (e.g. the dev fallback)
-    secret_key::migrate_stored_secrets(&state.db).await?;
+    // Move stored secrets onto a rotated key (when TOND_PREVIOUS_SECRET_KEY is set)
+    secret_key::rotate_stored_secrets(&state.db).await?;
 
     tracing::info!("Database initialized");
 

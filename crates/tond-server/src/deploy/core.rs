@@ -30,7 +30,8 @@ use uuid::Uuid;
 
 use crate::backup::{self, SnapshotTrigger};
 use crate::docker;
-use crate::handlers::{github_apps, gitlab_tokens, registry_credentials};
+use crate::handlers::{github_apps, gitlab_tokens};
+use crate::secret_key::{self, Purpose};
 use crate::state::AppState;
 
 use super::build::{
@@ -1358,7 +1359,7 @@ async fn fetch_registry_credentials(
         return Ok(None);
     };
 
-    let password = registry_credentials::decrypt_password(&cred.password_enc)?;
+    let password = secret_key::decrypt(Purpose::RegistryPassword, &cred.password_enc)?;
 
     Ok(Some(bollard::auth::DockerCredentials {
         username: Some(cred.username),
@@ -1639,7 +1640,7 @@ mod tests {
             "fetch_registry_credentials should return None when the referenced credential does not exist"
         );
 
-        let encrypted = registry_credentials::encrypt_password("super-secret")
+        let encrypted = secret_key::encrypt(Purpose::RegistryPassword, "super-secret")
             .unwrap_or_else(|err| panic!("password encryption should succeed: {err}"));
         sqlx::query(
             "INSERT INTO registry_credentials (id, name, server, username, password_enc)

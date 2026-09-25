@@ -39,7 +39,7 @@ use uuid::Uuid;
 use crate::{
     auth::{RateLimit, RequireAuth},
     error::AppError,
-    handlers::registry_credentials::{decrypt_password, encrypt_password},
+    secret_key::{self, Purpose},
     state::AppState,
 };
 
@@ -121,7 +121,7 @@ pub async fn create_gitlab_token(
         .to_string();
 
     // Encrypt the PAT
-    let token_enc = encrypt_password(payload.token.trim())
+    let token_enc = secret_key::encrypt(Purpose::GitlabToken, payload.token.trim())
         .map_err(|e| AppError(TondError::Internal(e.to_string())))?;
 
     let id = Uuid::new_v4().to_string();
@@ -180,7 +180,7 @@ pub async fn list_gitlab_repos(
     Path(token_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let token = fetch_token(&state, &token_id).await?;
-    let pat = decrypt_password(&token.token_enc).map_err(|e| {
+    let pat = secret_key::decrypt(Purpose::GitlabToken, &token.token_enc).map_err(|e| {
         AppError(TondError::Internal(format!(
             "Failed to decrypt token: {}",
             e
@@ -282,7 +282,7 @@ pub async fn list_gitlab_branches(
     Path((token_id, project_id)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
     let token = fetch_token(&state, &token_id).await?;
-    let pat = decrypt_password(&token.token_enc).map_err(|e| {
+    let pat = secret_key::decrypt(Purpose::GitlabToken, &token.token_enc).map_err(|e| {
         AppError(TondError::Internal(format!(
             "Failed to decrypt token: {}",
             e
@@ -414,7 +414,7 @@ pub async fn build_clone_url_with_token(
     state: &AppState,
 ) -> anyhow::Result<String> {
     // Decrypt the PAT
-    let pat = decrypt_password(&token.token_enc)?;
+    let pat = secret_key::decrypt(Purpose::GitlabToken, &token.token_enc)?;
 
     // Inject credentials into the URL. Strip any existing `https://` prefix,
     // then prepend `https://oauth2:<pat>@`.
@@ -455,7 +455,7 @@ pub async fn post_gitlab_commit_status(
     description: &str,
     target_url: Option<&str>,
 ) -> anyhow::Result<()> {
-    let pat = decrypt_password(&token.token_enc)?;
+    let pat = secret_key::decrypt(Purpose::GitlabToken, &token.token_enc)?;
     let base = token.gitlab_url.trim_end_matches('/');
     let url = format!(
         "{}/api/v4/projects/{}/statuses/{}",
@@ -524,7 +524,7 @@ mod tests {
         GitLabToken {
             id: "token-1".to_string(),
             name: "GitLab PAT".to_string(),
-            token_enc: encrypt_password("secret-pat")
+            token_enc: secret_key::encrypt(Purpose::GitlabToken, "secret-pat")
                 .unwrap_or_else(|err| panic!("PAT encryption should succeed: {err}")),
             gitlab_url: "https://gitlab.example.com/".to_string(),
             username: "alice".to_string(),

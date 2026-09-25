@@ -315,10 +315,7 @@ create_directories() {
 }
 
 # Ensure ${SECRET_ENV_FILE} holds TOND_SECRET_KEY, the at-rest encryption key
-# for stored secrets. Never replaces an existing key. A key an operator already
-# set via `systemctl edit tond-server` is carried over; otherwise a random one
-# is generated. Secrets stored under the old insecure default key are
-# re-encrypted by tond-server on its next start.
+# for stored secrets. Never replaces an existing key (reinstalls keep it).
 ensure_secret_key() {
     step "Configuring encryption key"
 
@@ -332,24 +329,13 @@ ensure_secret_key() {
     fi
 
     local key=""
-    key=$(systemctl show tond-server -p Environment --value 2>/dev/null \
-        | tr ' ' '\n' | sed -n 's/^TOND_SECRET_KEY=//p' | tail -1) || true
-
-    if [[ -n "$key" ]]; then
-        info "Moving existing TOND_SECRET_KEY from the tond-server unit into ${SECRET_ENV_FILE}"
+    if command -v openssl &> /dev/null; then
+        key=$(openssl rand -hex 32)
     else
-        if command -v openssl &> /dev/null; then
-            key=$(openssl rand -hex 32)
-        else
-            key=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
-        fi
-        [[ ${#key} -eq 64 ]] || fatal "Failed to generate encryption key"
-        if [[ -f "${DATA_DIR}/tond.db" ]]; then
-            info "Generated a new encryption key; existing secrets will be re-encrypted on startup"
-        else
-            info "Generated a new encryption key"
-        fi
+        key=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
     fi
+    [[ ${#key} -eq 64 ]] || fatal "Failed to generate encryption key"
+    info "Generated a new encryption key"
 
     (
         umask 077

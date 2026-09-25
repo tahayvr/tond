@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::{auth::RateLimit, state::AppState};
 
 use super::helpers::{
-    aes_key, base32_encode, clear_session_cookie, create_session, decrypt_secret, encrypt_secret,
+    base32_encode, clear_session_cookie, create_session, decrypt_secret, encrypt_secret,
     extract_ip, extract_user_agent, hash_password, session_cookie, use_backup_code,
     verify_password, verify_totp_once,
 };
@@ -986,8 +986,7 @@ pub async fn totp_setup(
     };
 
     // Encrypt and persist the secret (2FA not yet enabled — pending confirmation)
-    let key = aes_key();
-    let encrypted = encrypt_secret(&secret_b32, &key);
+    let encrypted = encrypt_secret(&secret_b32);
 
     // A new secret starts with no accepted time step (replay tracking reset).
     let now = Utc::now().to_rfc3339();
@@ -1071,8 +1070,7 @@ pub async fn totp_confirm(
         }
     };
 
-    let key = aes_key();
-    let secret_b32 = match decrypt_secret(&encrypted, &key) {
+    let secret_b32 = match decrypt_secret(&encrypted) {
         Some(s) => s,
         None => {
             return (
@@ -1212,8 +1210,7 @@ pub async fn totp_disable(
 
     // Verify TOTP code (or backup code)
     let encrypted = user.totp_secret_enc.as_deref().unwrap_or("");
-    let key = aes_key();
-    let secret_b32 = decrypt_secret(encrypted, &key).unwrap_or_default();
+    let secret_b32 = decrypt_secret(encrypted).unwrap_or_default();
     let code_valid = match verify_totp_once(&state.db, &user.id, &secret_b32, &req.code).await {
         Ok(true) => true,
         Ok(false) => use_backup_code(&state.db, &user.id, &req.code).await,
@@ -1337,8 +1334,7 @@ pub async fn totp_verify(
 
     // Verify TOTP code or backup code
     let encrypted = user.totp_secret_enc.as_deref().unwrap_or("");
-    let key = aes_key();
-    let secret_b32 = decrypt_secret(encrypted, &key).unwrap_or_default();
+    let secret_b32 = decrypt_secret(encrypted).unwrap_or_default();
     let code_valid = match verify_totp_once(&state.db, &user.id, &secret_b32, &req.code).await {
         Ok(true) => true,
         Ok(false) => use_backup_code(&state.db, &user.id, &req.code).await,
@@ -1699,8 +1695,7 @@ mod tests {
     async fn login_sets_mfa_pending_cookie_when_2fa_is_enabled() {
         let state = test_state().await;
         let secret = super::super::helpers::base32_encode(b"12345678901234567890");
-        let encrypted =
-            super::super::helpers::encrypt_secret(&secret, &super::super::helpers::aes_key());
+        let encrypted = super::super::helpers::encrypt_secret(&secret);
         seed_user(
             &state,
             "user-1",

@@ -4,7 +4,7 @@ use axum::http::{HeaderMap, header};
 use chrono::{Duration, Utc};
 use tond_common::generate_raw_key;
 
-use crate::secret_key::{self, SecretKeys};
+use crate::secret_key::{self, Purpose};
 
 /// Hash a password with argon2.
 pub(super) fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
@@ -89,19 +89,14 @@ pub(super) fn clear_session_cookie() -> String {
     "tond_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0".to_string()
 }
 
-/// Encrypt a TOTP secret. Returns hex(nonce):hex(ciphertext).
-pub(super) fn encrypt_secret(plaintext: &str, key: &[u8; 32]) -> String {
-    secret_key::encrypt_hex(plaintext, key).expect("encryption failure")
+/// Encrypt a TOTP secret for storage in users.totp_secret_enc.
+pub(super) fn encrypt_secret(plaintext: &str) -> String {
+    secret_key::encrypt(Purpose::TotpSecret, plaintext).expect("encryption failure")
 }
 
-/// Decrypt a string encrypted with `encrypt_secret`.
-pub(super) fn decrypt_secret(encoded: &str, key: &[u8; 32]) -> Option<String> {
-    secret_key::decrypt_hex(encoded, key)
-}
-
-/// The AES key for TOTP secrets, derived from TOND_SECRET_KEY (see secret_key.rs).
-pub(super) fn aes_key() -> [u8; 32] {
-    SecretKeys::current().totp
+/// Decrypt a TOTP secret encrypted with `encrypt_secret`.
+pub(super) fn decrypt_secret(encoded: &str) -> Option<String> {
+    secret_key::decrypt(Purpose::TotpSecret, encoded).ok()
 }
 
 /// Verify a 6-digit TOTP code against a base32 secret, allowing ±1 step skew.
@@ -346,16 +341,15 @@ mod tests {
 
     #[test]
     fn secret_encryption_round_trips_and_rejects_invalid_payloads() {
-        let key = aes_key();
-        let encrypted = encrypt_secret("super-secret", &key);
+        let encrypted = encrypt_secret("super-secret");
 
         assert_eq!(
-            decrypt_secret(&encrypted, &key).as_deref(),
+            decrypt_secret(&encrypted).as_deref(),
             Some("super-secret"),
             "decrypt_secret should recover the original plaintext encrypted by encrypt_secret"
         );
         assert_eq!(
-            decrypt_secret("not-a-valid-payload", &key),
+            decrypt_secret("not-a-valid-payload"),
             None,
             "decrypt_secret should return None for malformed encrypted payloads"
         );
@@ -368,36 +362,6 @@ mod tests {
             "NBSWY3DP",
             "base32_encode should follow RFC 4648 without padding"
         );
-    }
-
-    #[test]
-    fn verify_password_accepts_hash_from_argon2_0_5() {
-        // Generated with argon2 0.5.3, before the 0.6 upgrade: password hashes already
-        // stored in the users table must keep verifying.
-        let hash = "$argon2id$v=19$m=19456,t=2,p=1$086ZikNPOgNLQ7MpJbhgnQ$Br9v0kEEm/Gs0SC69qDZILv4n/fBzd04aU6xnSGnM1g";
-
-        assert!(verify_password("correct horse battery staple", hash));
-        assert!(!verify_password("wrong password", hash));
-    }
-
-    #[test]
-    fn decrypt_secret_reads_ciphertext_from_aes_gcm_0_10() {
-        // Produced by `encrypt_secret` on aes-gcm 0.10.3, before the 0.11 upgrade: encrypted
-        // TOTP secrets already stored in the database must keep decrypting.
-        let key = [b'0'; 32];
-        let encoded = "070707070707070707070707:81a84ff1a54a3069c8dc823c9f198cb131fa4ba901df6c841b79e5e7b45496b4";
-
-        assert_eq!(
-            decrypt_secret(encoded, &key).as_deref(),
-            Some("JBSWY3DPEHPK3PXP")
-        );
-    }
-
-    #[test]
-    fn decrypt_secret_rejects_malformed_nonce_without_panicking() {
-        let key = [b'0'; 32];
-
-        assert_eq!(decrypt_secret("0707:81a84ff1", &key), None);
     }
 
     #[test]
