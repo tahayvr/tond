@@ -420,11 +420,12 @@ impl TondClient {
         Ok(())
     }
 
+    /// Set individual env vars. Variables that are not named are left unchanged.
     pub async fn update_env(&self, id: &str, env_vars: Value) -> Result<()> {
         let req = self
             .client
-            .put(format!("{}/api/apps/{}/env", self.base_url, id))
-            .json(&serde_json::json!({ "env_vars": env_vars }));
+            .patch(format!("{}/api/apps/{}/env", self.base_url, id))
+            .json(&serde_json::json!({ "set": env_vars }));
         let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
 
         if !resp.success {
