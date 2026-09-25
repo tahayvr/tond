@@ -170,6 +170,38 @@ deploy-server: build-server
     scp {{ release_dir }}/tond-server {{ server }}:{{ bin_dir }}/
     ssh {{ server }} "systemctl start tond-server && echo Done"
 
+# Build Linux binaries + dashboard and assemble the install bundle in dist/
+package: build-rust build-dashboard
+    release/package.sh --bin-dir {{ release_dir }} --version "$(git describe --tags --always --dirty)"
+
+# End-to-end smoke test on a throwaway Hetzner server (needs hcloud auth). Args go to e2e/hcloud.sh, e.g. --keep
+e2e-hcloud *args: package
+    e2e/hcloud.sh {{ args }}
+
+# Delete leftover e2e Hetzner servers/keys older than 3 hours
+e2e-hcloud-gc:
+    e2e/hcloud.sh --gc
+
+# Create the local OrbStack test VM (x86_64 Ubuntu). Deploy to it with: just server=root@tond-vm@orb deploy
+vm-create:
+    scripts/dev-vm.sh create
+
+# Install Tond into the local VM from a fresh bundle
+vm-install: package
+    scripts/dev-vm.sh install
+
+# Run the end-to-end smoke test in the local VM (local Pebble ACME CA)
+vm-e2e: package
+    scripts/dev-vm.sh e2e
+
+# Open a root shell in the local VM
+vm-shell:
+    scripts/dev-vm.sh shell
+
+# Delete the local VM
+vm-destroy:
+    scripts/dev-vm.sh destroy
+
 # Copy systemd service files to the server and reload
 install-services:
     scp release/tond-server.service release/tond-proxy.service {{ server }}:/etc/systemd/system/
@@ -218,7 +250,7 @@ restart-server:
 
 # Print the root API key from the server journal (first-run only)
 root-key:
-    ssh {{ server }} "journalctl -u tond-server --no-pager | grep 'ROOT API KEY' -A 1"
+    ssh {{ server }} "journalctl -u tond-server --no-pager | grep 'ROOT API KEY' -A 1 | grep -oE '[0-9a-f]{64}' | tail -1"
 
 # SSH into the server
 ssh:

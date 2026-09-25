@@ -49,21 +49,7 @@ jobs:
           pnpm build
 
       - name: Create release package
-        run: |
-          mkdir -p dist/tond-linux-x86_64/dashboard
-          cp target/release/tond-server dist/tond-linux-x86_64/
-          cp target/release/tond-proxy dist/tond-linux-x86_64/
-          cp target/release/tond dist/tond-linux-x86_64/
-          cp -r dashboard/build/* dist/tond-linux-x86_64/dashboard/
-          cp release/install.sh dist/tond-linux-x86_64/
-          cp release/update.sh dist/tond-linux-x86_64/
-          cp release/tond-server.service dist/tond-linux-x86_64/
-          cp release/tond-proxy.service dist/tond-linux-x86_64/
-          chmod +x dist/tond-linux-x86_64/install.sh
-          chmod +x dist/tond-linux-x86_64/update.sh
-          # Write VERSION so install.sh can persist it to /opt/tond/VERSION on the host.
-          echo "${GITHUB_REF_NAME#v}" > dist/tond-linux-x86_64/VERSION
-          cd dist && tar -czf tond-linux-x86_64.tar.gz tond-linux-x86_64
+        run: release/package.sh --bin-dir target/release --version "${GITHUB_REF_NAME#v}"
 
       - name: Generate checksums
         working-directory: dist

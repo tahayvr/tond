@@ -27,6 +27,9 @@
 //
 // TOND_ACME_STAGING=1 switches to the Let's Encrypt staging environment
 // (for testing without hitting rate limits).
+// TOND_ACME_DIRECTORY=<url> overrides the ACME directory entirely (takes
+// precedence over TOND_ACME_STAGING). Used by the end-to-end tests to point
+// the proxy at a local Pebble test CA.
 
 //! ACME HTTP-01 certificate provisioning via Let's Encrypt.
 //!
@@ -69,14 +72,24 @@ fn should_renew(days_until_expiry: Option<i64>) -> bool {
     }
 }
 
+/// The ACME directory to use: `TOND_ACME_DIRECTORY` if set, else Let's Encrypt
+/// (staging or production).
+fn acme_directory_url(staging: bool) -> String {
+    directory_url_from(std::env::var("TOND_ACME_DIRECTORY").ok(), staging)
+}
+
+fn directory_url_from(override_url: Option<String>, staging: bool) -> String {
+    match override_url.filter(|url| !url.trim().is_empty()) {
+        Some(url) => url,
+        None if staging => LetsEncrypt::Staging.url().to_string(),
+        None => LetsEncrypt::Production.url().to_string(),
+    }
+}
+
 /// Get or create an ACME account.
 async fn get_or_create_account(data_dir: &Path, staging: bool) -> Result<Account> {
     let creds_path = account_creds_path(data_dir);
-    let directory_url = if staging {
-        LetsEncrypt::Staging.url()
-    } else {
-        LetsEncrypt::Production.url()
-    };
+    let directory_url = acme_directory_url(staging);
 
     if creds_path.exists() {
         // Restore existing account
@@ -102,7 +115,7 @@ async fn get_or_create_account(data_dir: &Path, staging: bool) -> Result<Account
         };
 
         let (account, creds) = Account::builder()?
-            .create(&new_account, directory_url.to_string(), None)
+            .create(&new_account, directory_url, None)
             .await
             .context("creating ACME account")?;
 
@@ -410,6 +423,24 @@ mod tests {
         tond_common::install_crypto_provider();
 
         assert!(Account::builder().is_ok());
+    }
+
+    #[test]
+    fn directory_url_prefers_override_then_staging_then_production() {
+        assert_eq!(
+            directory_url_from(Some("https://localhost:14000/dir".to_string()), true),
+            "https://localhost:14000/dir",
+            "TOND_ACME_DIRECTORY should take precedence over staging"
+        );
+        assert_eq!(
+            directory_url_from(Some("  ".to_string()), true),
+            LetsEncrypt::Staging.url(),
+            "a blank override should be ignored"
+        );
+        assert_eq!(
+            directory_url_from(None, false),
+            LetsEncrypt::Production.url()
+        );
     }
 
     async fn create_test_db(dir: &TempDir) -> SqlitePool {

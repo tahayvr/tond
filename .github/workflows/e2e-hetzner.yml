@@ -1,0 +1,49 @@
+name: E2E (Hetzner)
+
+# Runs the smoke test on a throwaway Hetzner Cloud server with real public DNS
+# (<ip>.sslip.io) and real ACME (Let's Encrypt staging). The server is deleted
+# at the end of every run. Requires the HCLOUD_TOKEN repository secret.
+
+on:
+  workflow_dispatch:
+    inputs:
+      acme:
+        description: ACME mode
+        type: choice
+        default: letsencrypt-staging
+        options: [letsencrypt-staging, pebble]
+  schedule:
+    - cron: "17 3 * * *" # nightly, on the default branch
+
+concurrency:
+  group: e2e-hetzner
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+    steps:
+      - name: Require HCLOUD_TOKEN
+        run: |
+          if [[ -z "$HCLOUD_TOKEN" ]]; then
+            echo "::error::Set the HCLOUD_TOKEN repository secret (Hetzner Cloud API token, read/write)."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v6
+
+      - uses: hetznercloud/setup-hcloud@v1
+
+      - name: Delete stale e2e servers
+        run: e2e/hcloud.sh --gc
+
+      - uses: ./.github/actions/build-bundle
+
+      - name: Run smoke test on a throwaway server
+        run: e2e/hcloud.sh --bundle dist/tond-linux-x86_64 --acme "${{ inputs.acme || 'letsencrypt-staging' }}"

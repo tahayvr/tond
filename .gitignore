@@ -1,6 +1,9 @@
 # Rust
 /target/
 
+# Release bundles (release/package.sh)
+/dist/
+
 # Data
 /data/
 

@@ -32,6 +32,8 @@ Environment=TOND_SERVER_ADDR=127.0.0.1:3001
 # ACME/Let's Encrypt configuration
 # Use staging for testing to avoid rate limits
 # Environment=TOND_ACME_STAGING=false
+# Custom ACME directory URL (overrides TOND_ACME_STAGING; used by the e2e tests)
+# Environment=TOND_ACME_DIRECTORY=
 
 # Logging level: trace, debug, info, warn, error
 Environment=RUST_LOG=info

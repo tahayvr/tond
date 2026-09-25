@@ -1,0 +1,41 @@
+name: Build install bundle
+description: Build the Linux binaries and dashboard, then assemble dist/tond-linux-x86_64 with release/package.sh
+
+inputs:
+  profile:
+    description: Cargo profile for the binaries
+    default: fast-release
+
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@stable
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: bundle-${{ inputs.profile }}
+
+    - uses: pnpm/action-setup@v4
+      with:
+        package_json_file: dashboard/package.json
+
+    - uses: actions/setup-node@v6
+      with:
+        node-version: "24"
+        cache: pnpm
+        cache-dependency-path: dashboard/pnpm-lock.yaml
+
+    - name: Build binaries
+      shell: bash
+      run: cargo build -p tond-server -p tond-proxy -p tond-cli --profile ${{ inputs.profile }} --locked
+
+    - name: Build dashboard
+      shell: bash
+      working-directory: dashboard
+      run: |
+        pnpm install --frozen-lockfile
+        pnpm build
+
+    - name: Package bundle
+      shell: bash
+      run: release/package.sh --bin-dir target/${{ inputs.profile }} --version "ci-${GITHUB_SHA::12}"
