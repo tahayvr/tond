@@ -40,6 +40,11 @@ export default defineConfig(
 				parser: ts.parser,
 				svelteConfig
 			}
+		},
+		rules: {
+			// Core rule added to `recommended` in ESLint 10. It doesn't understand Svelte 5
+			// runes and flags `$bindable()` prop defaults, which parents write via `bind:`.
+			'no-useless-assignment': 'off'
 		}
 	}
 );

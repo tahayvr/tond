@@ -1894,7 +1894,7 @@ export const handlers = [
 
 		client.addEventListener('message', (event) => {
 			const raw = typeof event.data === 'string' ? event.data : '';
-			let frame: { type?: string; data?: string } = {};
+			let frame: { type?: string; data?: string };
 			try {
 				frame = JSON.parse(raw);
 			} catch {
