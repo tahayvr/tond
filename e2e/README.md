@@ -20,9 +20,9 @@ What the smoke test covers:
 
 | Where | Command | ACME | When |
 | --- | --- | --- | --- |
-| GitHub Actions runner | `ci.yml` → `e2e` job | Pebble (local test CA) | every push / PR |
-| Local OrbStack VM | `just vm-e2e` | Pebble | while developing |
-| Throwaway Hetzner server | `just e2e-hcloud` / `e2e-hetzner.yml` | Let's Encrypt staging, real DNS via `<ip>.sslip.io` | nightly, before releases |
+| Local OrbStack VM | `just vm-e2e` | Pebble | while developing (the default) |
+| GitHub Actions runner | `ci.yml` → `e2e` job | Pebble (local test CA) | manual only (Actions tab), to save minutes |
+| Throwaway Hetzner server | `just e2e-hcloud` / `e2e-hetzner.yml` | Let's Encrypt staging, real DNS via `<ip>.sslip.io` | manual, before releases |
 
 All three install the bundle built by `release/package.sh` (`just package`), the
 same packaging the release workflow publishes.
@@ -48,5 +48,5 @@ just e2e-hcloud --acme pebble   # same flow as CI, on Hetzner
 just e2e-hcloud-gc              # delete leftovers from killed runs (older than 3 h)
 ```
 
-For the nightly workflow, add a read/write Hetzner Cloud API token as the
+For the manual `e2e-hetzner.yml` workflow, add a read/write Hetzner Cloud API token as the
 `HCLOUD_TOKEN` repository secret.

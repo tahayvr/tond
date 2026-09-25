@@ -12,8 +12,6 @@ on:
         type: choice
         default: letsencrypt-staging
         options: [letsencrypt-staging, pebble]
-  schedule:
-    - cron: "17 3 * * *" # nightly, on the default branch
 
 concurrency:
   group: e2e-hetzner
