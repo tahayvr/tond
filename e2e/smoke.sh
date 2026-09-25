@@ -122,6 +122,10 @@ for svc in tond-server tond-proxy; do
 done
 wait_for 30 "API health" curl -sf http://127.0.0.1:3001/health
 pass "API health check"
+[[ "$(stat -c '%a %U' /opt/tond/data/tond.env)" == "600 root" ]] \
+    && grep -qE '^TOND_SECRET_KEY=[0-9a-f]{64}$' /opt/tond/data/tond.env \
+    || fail "install.sh must generate TOND_SECRET_KEY into /opt/tond/data/tond.env (0600 root)"
+pass "encryption key generated in tond.env (0600 root)"
 
 step "Authentication boundaries"
 [[ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3001/api/apps)" == 401 ]] \

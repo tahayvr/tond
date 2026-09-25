@@ -4,6 +4,8 @@ use axum::http::{HeaderMap, header};
 use chrono::{Duration, Utc};
 use tond_common::generate_raw_key;
 
+use crate::secret_key::{self, SecretKeys};
+
 /// Hash a password with argon2.
 pub(super) fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
     use argon2::{Argon2, PasswordHasher};
@@ -87,65 +89,64 @@ pub(super) fn clear_session_cookie() -> String {
     "tond_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0".to_string()
 }
 
-/// Encrypt a plaintext string using AES-256-GCM (same helper used for GitLab tokens).
+/// Encrypt a TOTP secret. Returns hex(nonce):hex(ciphertext).
 pub(super) fn encrypt_secret(plaintext: &str, key: &[u8; 32]) -> String {
-    use aes_gcm::aead::{Aead, Nonce};
-    use aes_gcm::{Aes256Gcm, KeyInit};
-    use rand::Rng;
-
-    let cipher = Aes256Gcm::new(&(*key).into());
-    let mut nonce_bytes = [0u8; 12];
-    rand::rng().fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::<Aes256Gcm>::from(nonce_bytes);
-    let ciphertext = cipher
-        .encrypt(&nonce, plaintext.as_bytes())
-        .expect("encryption failure");
-    // Encode as nonce_hex:ciphertext_hex
-    format!("{}:{}", hex::encode(nonce_bytes), hex::encode(ciphertext))
+    secret_key::encrypt_hex(plaintext, key).expect("encryption failure")
 }
 
 /// Decrypt a string encrypted with `encrypt_secret`.
 pub(super) fn decrypt_secret(encoded: &str, key: &[u8; 32]) -> Option<String> {
-    use aes_gcm::aead::{Aead, Nonce};
-    use aes_gcm::{Aes256Gcm, KeyInit};
-
-    let parts: Vec<&str> = encoded.splitn(2, ':').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    let nonce_bytes = hex::decode(parts[0]).ok()?;
-    let ciphertext = hex::decode(parts[1]).ok()?;
-    let cipher = Aes256Gcm::new(&(*key).into());
-    // A malformed nonce is rejected here instead of panicking.
-    let nonce = Nonce::<Aes256Gcm>::try_from(nonce_bytes.as_slice()).ok()?;
-    let plaintext = cipher.decrypt(&nonce, ciphertext.as_ref()).ok()?;
-    String::from_utf8(plaintext).ok()
+    secret_key::decrypt_hex(encoded, key)
 }
 
-/// Derive a 32-byte AES key from the TOND_SECRET_KEY env var (or a hard-coded
-/// dev default). In production the operator sets TOND_SECRET_KEY to a random
-/// 32-char hex string.
+/// The AES key for TOTP secrets, derived from TOND_SECRET_KEY (see secret_key.rs).
 pub(super) fn aes_key() -> [u8; 32] {
-    let raw = std::env::var("TOND_SECRET_KEY")
-        .unwrap_or_else(|_| "00000000000000000000000000000000".to_string());
-    let bytes = raw.as_bytes();
-    let mut key = [0u8; 32];
-    let len = bytes.len().min(32);
-    key[..len].copy_from_slice(&bytes[..len]);
-    key
+    SecretKeys::current().totp
 }
 
 /// Verify a 6-digit TOTP code against a base32 secret, allowing ±1 step skew.
-pub(super) fn verify_totp(secret_b32: &str, code: &str) -> bool {
+/// Returns the matched time step (unix_time / 30) so callers can reject replays
+/// with `accept_totp_step` (RFC 6238 §5.2); prefer `verify_totp_once`.
+pub(super) fn verify_totp(secret_b32: &str, code: &str) -> Option<u64> {
     use totp_rs::{Builder, Secret};
-    let Ok(secret) = Secret::try_from_base32(secret_b32) else {
-        return false;
-    };
+    let secret = Secret::try_from_base32(secret_b32).ok()?;
     // Builder defaults: SHA1, 6 digits, ±1 step skew, 30 s steps.
-    let Ok(totp) = Builder::new().with_secret(secret).build() else {
-        return false;
-    };
-    totp.check_current(code).is_some()
+    let totp = Builder::new().with_secret(secret).build().ok()?;
+    totp.check_current(code)
+}
+
+/// Atomically record `step` as the user's last accepted TOTP step. Returns
+/// false (replay) if a code for this step or a later one was already accepted.
+pub(super) async fn accept_totp_step(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    step: u64,
+) -> anyhow::Result<bool> {
+    let step = i64::try_from(step)?;
+    let result = sqlx::query(
+        "UPDATE users SET totp_last_step = ?
+         WHERE id = ? AND (totp_last_step IS NULL OR totp_last_step < ?)",
+    )
+    .bind(step)
+    .bind(user_id)
+    .bind(step)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Verify a TOTP code and consume its time step so it cannot be reused.
+/// Returns Ok(false) for an invalid or replayed code.
+pub(super) async fn verify_totp_once(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    secret_b32: &str,
+    code: &str,
+) -> anyhow::Result<bool> {
+    match verify_totp(secret_b32, code) {
+        Some(step) => accept_totp_step(pool, user_id, step).await,
+        None => Ok(false),
+    }
 }
 
 /// Simple base32 encoding (RFC 4648, no padding) for TOTP secrets.
@@ -411,13 +412,87 @@ mod tests {
         let code = totp.generate_current().to_string();
 
         assert!(
-            verify_totp(&secret_b32, &code),
+            verify_totp(&secret_b32, &code).is_some(),
             "verify_totp should accept the current valid TOTP code"
         );
         assert!(
-            !verify_totp(&secret_b32, "000000"),
+            verify_totp(&secret_b32, "000000").is_none(),
             "verify_totp should reject an incorrect TOTP code"
         );
+    }
+
+    async fn seed_totp_user(pool: &SqlitePool) {
+        sqlx::query(
+            "INSERT INTO users (id, email, password_hash, role, created_at, updated_at, totp_enabled) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind("user-1")
+        .bind("admin@example.com")
+        .bind("hash")
+        .bind("admin")
+        .bind("2026-01-01T00:00:00Z")
+        .bind("2026-01-01T00:00:00Z")
+        .bind(1)
+        .execute(pool)
+        .await
+        .unwrap_or_else(|err| panic!("failed to seed TOTP user: {err}"));
+    }
+
+    #[tokio::test]
+    async fn accept_totp_step_rejects_replayed_and_older_steps() {
+        let pool = test_pool().await;
+        seed_totp_user(&pool).await;
+
+        let accept = |step| {
+            let pool = pool.clone();
+            async move {
+                accept_totp_step(&pool, "user-1", step)
+                    .await
+                    .unwrap_or_else(|err| panic!("accept_totp_step failed: {err}"))
+            }
+        };
+
+        assert!(accept(100).await, "the first code should be accepted");
+        assert!(
+            !accept(100).await,
+            "replaying a code for the same step must be rejected"
+        );
+        assert!(
+            !accept(99).await,
+            "a code for an earlier step must be rejected once a later one was used"
+        );
+        assert!(
+            accept(101).await,
+            "a code for a later step should be accepted"
+        );
+        assert!(
+            !accept(100).await,
+            "an earlier step must still be rejected after a later one was used"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_totp_once_rejects_reuse_of_the_same_code() {
+        let pool = test_pool().await;
+        seed_totp_user(&pool).await;
+        let secret_b32 = base32_encode(b"12345678901234567890");
+        let secret = Secret::try_from_base32(&secret_b32)
+            .unwrap_or_else(|err| panic!("failed to decode base32 TOTP secret: {err}"));
+        let code = Builder::new()
+            .with_secret(secret)
+            .build()
+            .unwrap_or_else(|err| panic!("failed to construct TOTP generator: {err}"))
+            .generate_current()
+            .to_string();
+
+        let first = verify_totp_once(&pool, "user-1", &secret_b32, &code)
+            .await
+            .unwrap_or_else(|err| panic!("verify_totp_once failed: {err}"));
+        let replay = verify_totp_once(&pool, "user-1", &secret_b32, &code)
+            .await
+            .unwrap_or_else(|err| panic!("verify_totp_once failed: {err}"));
+
+        assert!(first, "a fresh valid code should be accepted");
+        assert!(!replay, "the same code must not be accepted twice");
     }
 
     #[tokio::test]

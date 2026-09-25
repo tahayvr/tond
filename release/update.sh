@@ -12,6 +12,7 @@ set -euo pipefail
 INSTALL_DIR="/opt/tond"
 DATA_DIR="${INSTALL_DIR}/data"
 BACKUP_DIR="${DATA_DIR}/backups"
+SECRET_ENV_FILE="${DATA_DIR}/tond.env"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Port tond-server listens on — read from environment or fall back to default.
@@ -250,6 +251,54 @@ pre_update_checks() {
     info "Pre-update checks passed"
 }
 
+# Ensure ${SECRET_ENV_FILE} holds TOND_SECRET_KEY, the at-rest encryption key
+# for stored secrets. Never replaces an existing key. A key an operator already
+# set via `systemctl edit tond-server` is carried over; otherwise a random one
+# is generated. Secrets stored under the old insecure default key are
+# re-encrypted by tond-server on its next start.
+ensure_secret_key() {
+    step "Configuring encryption key"
+
+    mkdir -p "${DATA_DIR}"
+
+    if [[ -f "$SECRET_ENV_FILE" ]] && grep -q '^TOND_SECRET_KEY=.' "$SECRET_ENV_FILE"; then
+        chown root:root "$SECRET_ENV_FILE"
+        chmod 600 "$SECRET_ENV_FILE"
+        info "Using existing encryption key from ${SECRET_ENV_FILE}"
+        return 0
+    fi
+
+    local key=""
+    key=$(systemctl show tond-server -p Environment --value 2>/dev/null \
+        | tr ' ' '\n' | sed -n 's/^TOND_SECRET_KEY=//p' | tail -1) || true
+
+    if [[ -n "$key" ]]; then
+        info "Moving existing TOND_SECRET_KEY from the tond-server unit into ${SECRET_ENV_FILE}"
+    else
+        if command -v openssl &> /dev/null; then
+            key=$(openssl rand -hex 32)
+        else
+            key=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+        fi
+        [[ ${#key} -eq 64 ]] || fatal "Failed to generate encryption key"
+        if [[ -f "${DATA_DIR}/tond.db" ]]; then
+            info "Generated a new encryption key; existing secrets will be re-encrypted on startup"
+        else
+            info "Generated a new encryption key"
+        fi
+    fi
+
+    (
+        umask 077
+        printf 'TOND_SECRET_KEY=%s\n' "$key" > "${SECRET_ENV_FILE}.tmp"
+    )
+    chown root:root "${SECRET_ENV_FILE}.tmp"
+    mv -f "${SECRET_ENV_FILE}.tmp" "$SECRET_ENV_FILE"
+
+    info "Encryption key stored in ${SECRET_ENV_FILE} (mode 0600)"
+    warn "Back this file up: without it, stored credentials, tokens and 2FA secrets cannot be decrypted"
+}
+
 # Perform update with zero-downtime strategy
 perform_update() {
     local new_version="$1"
@@ -262,7 +311,12 @@ perform_update() {
         info "  1. Stop tond-proxy (external traffic stops)"
         info "  2. Stop tond-server (API goes down briefly)"
         info "  3. Update binaries and dashboard"
-        info "  4. Start tond-server (database migrations run)"
+        if [[ -f "$SECRET_ENV_FILE" ]]; then
+            info "     (keep encryption key in ${SECRET_ENV_FILE})"
+        else
+            info "     (create encryption key in ${SECRET_ENV_FILE})"
+        fi
+        info "  4. Start tond-server (database migrations and secret re-encryption run)"
         info "  5. Start tond-proxy (traffic resumes)"
         info "  6. Verify services are healthy"
         return 0
@@ -289,6 +343,8 @@ perform_update() {
     mkdir -p "${INSTALL_DIR}/dashboard"
     cp -r "${download_path}/dashboard/." "${INSTALL_DIR}/dashboard/"
     
+    ensure_secret_key
+
     info "Updating service files..."
     cp "${download_path}/tond-server.service" /etc/systemd/system/tond-server.service
     cp "${download_path}/tond-proxy.service" /etc/systemd/system/tond-proxy.service

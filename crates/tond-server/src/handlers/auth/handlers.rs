@@ -16,7 +16,7 @@ use crate::{auth::RateLimit, state::AppState};
 use super::helpers::{
     aes_key, base32_encode, clear_session_cookie, create_session, decrypt_secret, encrypt_secret,
     extract_ip, extract_user_agent, hash_password, session_cookie, use_backup_code,
-    verify_password, verify_totp,
+    verify_password, verify_totp_once,
 };
 use super::session::{extract_session_token, validate_session};
 
@@ -989,13 +989,16 @@ pub async fn totp_setup(
     let key = aes_key();
     let encrypted = encrypt_secret(&secret_b32, &key);
 
+    // A new secret starts with no accepted time step (replay tracking reset).
     let now = Utc::now().to_rfc3339();
-    if let Err(e) = sqlx::query("UPDATE users SET totp_secret_enc = ?, updated_at = ? WHERE id = ?")
-        .bind(&encrypted)
-        .bind(&now)
-        .bind(&user.id)
-        .execute(&state.db)
-        .await
+    if let Err(e) = sqlx::query(
+        "UPDATE users SET totp_secret_enc = ?, totp_last_step = NULL, updated_at = ? WHERE id = ?",
+    )
+    .bind(&encrypted)
+    .bind(&now)
+    .bind(&user.id)
+    .execute(&state.db)
+    .await
     {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1080,8 +1083,18 @@ pub async fn totp_confirm(
         }
     };
 
-    // Verify the submitted code
-    if !verify_totp(&secret_b32, &req.code) {
+    // Verify the submitted code (and consume its time step)
+    let code_valid = match verify_totp_once(&state.db, &user.id, &secret_b32, &req.code).await {
+        Ok(valid) => valid,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<()>::err(e.to_string())),
+            )
+                .into_response();
+        }
+    };
+    if !code_valid {
         return (
             StatusCode::UNAUTHORIZED,
             Json(ApiResponse::<()>::err("Invalid TOTP code")),
@@ -1201,8 +1214,17 @@ pub async fn totp_disable(
     let encrypted = user.totp_secret_enc.as_deref().unwrap_or("");
     let key = aes_key();
     let secret_b32 = decrypt_secret(encrypted, &key).unwrap_or_default();
-    let code_valid = verify_totp(&secret_b32, &req.code)
-        || use_backup_code(&state.db, &user.id, &req.code).await;
+    let code_valid = match verify_totp_once(&state.db, &user.id, &secret_b32, &req.code).await {
+        Ok(true) => true,
+        Ok(false) => use_backup_code(&state.db, &user.id, &req.code).await,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<()>::err(e.to_string())),
+            )
+                .into_response();
+        }
+    };
 
     if !code_valid {
         return (
@@ -1214,7 +1236,8 @@ pub async fn totp_disable(
 
     let now = Utc::now().to_rfc3339();
     let _ = sqlx::query(
-        "UPDATE users SET totp_enabled = 0, totp_secret_enc = NULL, updated_at = ? WHERE id = ?",
+        "UPDATE users SET totp_enabled = 0, totp_secret_enc = NULL, totp_last_step = NULL,
+         updated_at = ? WHERE id = ?",
     )
     .bind(&now)
     .bind(&user.id)
@@ -1316,8 +1339,17 @@ pub async fn totp_verify(
     let encrypted = user.totp_secret_enc.as_deref().unwrap_or("");
     let key = aes_key();
     let secret_b32 = decrypt_secret(encrypted, &key).unwrap_or_default();
-    let code_valid = verify_totp(&secret_b32, &req.code)
-        || use_backup_code(&state.db, &user.id, &req.code).await;
+    let code_valid = match verify_totp_once(&state.db, &user.id, &secret_b32, &req.code).await {
+        Ok(true) => true,
+        Ok(false) => use_backup_code(&state.db, &user.id, &req.code).await,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<()>::err(e.to_string())),
+            )
+                .into_response();
+        }
+    };
 
     if !code_valid {
         return (

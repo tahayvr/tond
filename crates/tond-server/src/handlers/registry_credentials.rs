@@ -8,7 +8,7 @@
 //   POST   /api/registry-credentials
 //     Create a new credential. The password is encrypted with AES-256-GCM
 //     before storage. The key is derived from the TOND_SECRET_KEY env var
-//     (falls back to a fixed dev key if unset — warn loudly).
+//     (see secret_key.rs).
 //
 //   DELETE /api/registry-credentials/{id}
 //     Delete a credential. Also detaches it from any apps that reference it
@@ -19,18 +19,12 @@
 //     { "registry_credential_id": "<id>" } to attach, or
 //     { "registry_credential_id": null } to detach.
 
-use aes_gcm::{
-    Aes256Gcm, KeyInit,
-    aead::{Aead, Nonce},
-};
 use axum::{
     Json,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-use sha2::{Digest, Sha256};
 use tond_common::{
     ApiResponse, AppResponse, CreateRegistryCredentialRequest, RegistryCredential,
     RegistryCredentialResponse, SetRegistryCredentialRequest, TondError,
@@ -40,66 +34,21 @@ use uuid::Uuid;
 use crate::{
     auth::{RateLimit, RequireAuth},
     error::AppError,
+    secret_key::{self, SecretKeys},
     state::AppState,
 };
 
-// ── Key derivation ──────────────────────────────────────────────────────────
+// ── Encryption ──────────────────────────────────────────────────────────────
 
-/// Derive a 32-byte AES key from TOND_SECRET_KEY using SHA-256.
-/// Falls back to a fixed dev key with a loud warning.
-fn derive_key() -> [u8; 32] {
-    let secret = std::env::var("TOND_SECRET_KEY").unwrap_or_else(|_| {
-        tracing::warn!(
-            "TOND_SECRET_KEY not set — registry credential passwords are using the \
-             insecure dev key. Set TOND_SECRET_KEY in production!"
-        );
-        "tond-dev-insecure-key-do-not-use-in-prod".to_string()
-    });
-    let hash = Sha256::digest(secret.as_bytes());
-    hash.into()
-}
-
-/// Encrypt a plaintext password. Returns base64(nonce || ciphertext).
+/// Encrypt a plaintext password with the current TOND_SECRET_KEY.
+/// Returns base64(nonce || ciphertext).
 pub fn encrypt_password(plaintext: &str) -> anyhow::Result<String> {
-    let key = derive_key();
-    let cipher = Aes256Gcm::new_from_slice(&key)
-        .map_err(|e| anyhow::anyhow!("cipher init failed: {}", e))?;
-
-    let mut nonce_bytes = [0u8; 12];
-    rand::Rng::fill_bytes(&mut rand::rng(), &mut nonce_bytes);
-    let nonce = Nonce::<Aes256Gcm>::from(nonce_bytes);
-
-    let ciphertext = cipher
-        .encrypt(&nonce, plaintext.as_bytes())
-        .map_err(|e| anyhow::anyhow!("encryption failed: {}", e))?;
-
-    let mut combined = nonce_bytes.to_vec();
-    combined.extend_from_slice(&ciphertext);
-    Ok(B64.encode(&combined))
+    secret_key::encrypt(plaintext, &SecretKeys::current().aes)
 }
 
 /// Decrypt a stored password from base64(nonce || ciphertext).
 pub fn decrypt_password(encrypted: &str) -> anyhow::Result<String> {
-    let key = derive_key();
-    let cipher = Aes256Gcm::new_from_slice(&key)
-        .map_err(|e| anyhow::anyhow!("cipher init failed: {}", e))?;
-
-    let combined = B64
-        .decode(encrypted)
-        .map_err(|e| anyhow::anyhow!("base64 decode failed: {}", e))?;
-
-    if combined.len() < 12 {
-        anyhow::bail!("encrypted payload too short");
-    }
-    let (nonce_bytes, ciphertext) = combined.split_at(12);
-    let nonce = Nonce::<Aes256Gcm>::try_from(nonce_bytes)
-        .map_err(|e| anyhow::anyhow!("invalid nonce: {}", e))?;
-
-    let plaintext = cipher
-        .decrypt(&nonce, ciphertext)
-        .map_err(|e| anyhow::anyhow!("decryption failed: {}", e))?;
-
-    String::from_utf8(plaintext).map_err(|e| anyhow::anyhow!("utf8 decode failed: {}", e))
+    secret_key::decrypt(encrypted, &SecretKeys::current().aes)
 }
 
 // ── Handlers ────────────────────────────────────────────────────────────────

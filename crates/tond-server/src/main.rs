@@ -26,6 +26,9 @@
 //   TOND_BIND          — bind address (default: 127.0.0.1)
 //   TOND_PORT          — port (default: 3001)
 //   TOND_DASHBOARD_DIR — path to the built SvelteKit SPA (default: ./dashboard)
+//   TOND_SECRET_KEY    — at-rest encryption key (required in release builds;
+//                        see secret_key.rs)
+//   TOND_PREVIOUS_SECRET_KEY — old key to migrate from after a rotation
 //   TOND_SOCKET_PATH   — local Unix socket for the CLI (default: tond.sock next
 //                        to TOND_DB_PATH, i.e. /opt/tond/data/tond.sock)
 //
@@ -49,6 +52,7 @@ mod handlers;
 mod health;
 mod metrics;
 mod notifications;
+mod secret_key;
 mod state;
 mod storage;
 
@@ -79,11 +83,17 @@ async fn main() -> Result<()> {
 
     tracing::info!("Starting Tond server...");
 
+    // Refuse to run a release build with the public dev encryption key
+    secret_key::check_configured()?;
+
     // Initialize state (DB + Docker)
     let state = AppState::new().await?;
 
     // Run migrations
     db::migrate(&state.db).await?;
+
+    // Re-encrypt secrets stored under a previous key (e.g. the dev fallback)
+    secret_key::migrate_stored_secrets(&state.db).await?;
 
     tracing::info!("Database initialized");
 
