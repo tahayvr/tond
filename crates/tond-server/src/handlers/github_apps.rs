@@ -877,13 +877,9 @@ pub struct OpenPRResponse {
 ///   `https://github.com/org/repo.git`  → ("org", "repo")
 ///   `git@github.com:org/repo.git`      → ("org", "repo")
 fn parse_github_owner_repo(source_url: &str) -> Option<(String, String)> {
-    let path = if let Some(rest) = source_url.strip_prefix("https://github.com/") {
-        rest
-    } else if let Some(rest) = source_url.strip_prefix("git@github.com:") {
-        rest
-    } else {
-        return None;
-    };
+    let path = source_url
+        .strip_prefix("https://github.com/")
+        .or_else(|| source_url.strip_prefix("git@github.com:"))?;
     let path = path.strip_suffix(".git").unwrap_or(path);
     let mut parts = path.splitn(2, '/');
     let owner = parts.next()?.to_string();

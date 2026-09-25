@@ -23,12 +23,7 @@
 	} from '$lib/api';
 
 	export type SourceSubType =
-		| 'git-public'
-		| 'git-github-app'
-		| 'dockerfile'
-		| 'compose'
-		| 'image'
-		| 'template';
+		'git-public' | 'git-github-app' | 'dockerfile' | 'compose' | 'image' | 'template';
 
 	interface Props {
 		name: string;

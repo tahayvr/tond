@@ -746,10 +746,7 @@ export type AlertMetric = 'cpu' | 'memory' | 'app_down' | 'disk_usage';
 
 /** Valid event slugs for event-based alert subscriptions. */
 export type AlertEvent =
-	| 'deployment_success'
-	| 'deployment_failure'
-	| 'cron_success'
-	| 'cron_failure';
+	'deployment_success' | 'deployment_failure' | 'cron_success' | 'cron_failure';
 
 /** Groups of alert events/metrics shown in the UI. */
 export interface AlertGroup {

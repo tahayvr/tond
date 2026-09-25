@@ -226,7 +226,7 @@ pub async fn create_project_preview(
     let previews_for_task = inserted_previews.clone();
     let apps_for_task = apps.clone();
     tokio::spawn(async move {
-        for (app, mut preview) in apps_for_task.into_iter().zip(previews_for_task.into_iter()) {
+        for (app, mut preview) in apps_for_task.into_iter().zip(previews_for_task) {
             if let Err(e) = deploy::deploy_preview(&state_clone, &app, &mut preview).await {
                 tracing::error!("Project preview build failed for app {}: {}", app.name, e);
                 let _ =

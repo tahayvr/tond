@@ -14,10 +14,10 @@
 // Entry point: `run_metrics_collector(state)` — spawned once at startup.
 
 use crate::state::AppState;
-use bollard::query_parameters::StatsOptionsBuilder;
-use bollard::secret::{
+use bollard::models::{
     ContainerCpuStats, ContainerMemoryStats, ContainerNetworkStats, ContainerStatsResponse,
 };
+use bollard::query_parameters::StatsOptionsBuilder;
 use futures::StreamExt;
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -308,7 +308,7 @@ mod tests {
 
         ContainerStatsResponse {
             cpu_stats: Some(ContainerCpuStats {
-                cpu_usage: Some(bollard::secret::ContainerCpuUsage {
+                cpu_usage: Some(bollard::models::ContainerCpuUsage {
                     total_usage: Some(300),
                     ..Default::default()
                 }),
@@ -317,7 +317,7 @@ mod tests {
                 ..Default::default()
             }),
             precpu_stats: Some(ContainerCpuStats {
-                cpu_usage: Some(bollard::secret::ContainerCpuUsage {
+                cpu_usage: Some(bollard::models::ContainerCpuUsage {
                     total_usage: Some(100),
                     ..Default::default()
                 }),
@@ -347,7 +347,7 @@ mod tests {
         );
 
         let zero_delta = ContainerCpuStats {
-            cpu_usage: Some(bollard::secret::ContainerCpuUsage {
+            cpu_usage: Some(bollard::models::ContainerCpuUsage {
                 total_usage: Some(200),
                 ..Default::default()
             }),
@@ -356,7 +356,7 @@ mod tests {
             ..Default::default()
         };
         let prev = ContainerCpuStats {
-            cpu_usage: Some(bollard::secret::ContainerCpuUsage {
+            cpu_usage: Some(bollard::models::ContainerCpuUsage {
                 total_usage: Some(100),
                 ..Default::default()
             }),
