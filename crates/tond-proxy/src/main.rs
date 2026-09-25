@@ -14,6 +14,12 @@
 //     If no route is found, `request_filter` short-circuits and returns a
 //     friendly HTML 502 error page directly (no upstream connection made).
 //
+//     Preview isolation: hosts under preview_domain (a separate registrable
+//     domain, validated by tond-server) are answered ONLY from preview routes
+//     — never the dashboard/API or an app — and get a plain 404 when no
+//     preview matches. Preview routes are loaded only if they live under
+//     preview_domain, so a preview is never served on the dashboard domain.
+//
 //   TLS — TondTlsAccept (Pingora TlsAccept)
 //     Implements SNI-based certificate selection. On each TLS handshake
 //     it reads the server name from the ClientHello, looks up the cert
@@ -26,12 +32,12 @@
 //       everything else                     — 301 redirect to https://
 //
 //   Background thread (native OS thread + Tokio runtime):
-//     - Route refresh loop: every 5 s opens a read-only SQLite connection,
-//       queries running apps with a stored host_port, and atomically
-//       replaces the RouteMap. Also reads dashboard_domain from the
-//       settings table so changes made via the dashboard or CLI are picked
-//       up without a proxy restart. Falls back to Docker inspect for apps
-//       that were deployed before migration 006 (host_port IS NULL).
+//     - Route refresh loop: every 2 s opens a read-only SQLite connection,
+//       queries running apps and previews with a stored host_port, and
+//       atomically replaces the RouteMap. Also reads dashboard_domain and
+//       preview_domain from the settings table so changes made via the
+//       dashboard or CLI are picked up without a proxy restart. The proxy
+//       never talks to Docker (it runs unprivileged, see tond-proxy.service).
 //     - ACME renewal loop: waits 10 s then runs every 6 h. For any domain
 //       without a cert in CertStore, calls acme::provision_cert().
 //
@@ -72,6 +78,9 @@ type RouteMap = Arc<RwLock<HashMap<String, String>>>;
 
 /// Shared, live dashboard domain — updated on every DB poll.
 type DashboardDomain = Arc<RwLock<Option<String>>>;
+
+/// Shared, live preview domain — updated on every DB poll.
+type PreviewDomain = Arc<RwLock<Option<String>>>;
 
 // ── TLS Accept Callback ──
 
@@ -115,6 +124,9 @@ struct TondProxy {
     /// Live dashboard domain — reads from the DB on every 2 s poll.
     /// None means no dashboard domain is configured.
     dashboard_domain: DashboardDomain,
+    /// Live preview domain — previews are served only under it, and nothing
+    /// else is. None means previews are disabled.
+    preview_domain: PreviewDomain,
     /// Address of the tond-server instance (default: 127.0.0.1:3001).
     server_addr: String,
 }
@@ -123,7 +135,18 @@ struct TondProxy {
 enum RouteTarget {
     Dashboard,
     Upstream(String),
+    /// Unknown host: friendly 502 page.
     Missing,
+    /// Host under the preview domain without a matching preview: plain 404.
+    NotFound,
+}
+
+/// `host` equals `domain` or is a subdomain of it.
+fn is_under_domain(host: &str, domain: &str) -> bool {
+    host == domain
+        || host
+            .strip_suffix(domain)
+            .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
 fn normalize_host(host_header: Option<&str>) -> String {
@@ -135,8 +158,22 @@ fn normalize_host(host_header: Option<&str>) -> String {
 fn resolve_route(
     host: &str,
     dashboard_domain: Option<&str>,
+    preview_domain: Option<&str>,
     routes: &HashMap<String, String>,
 ) -> RouteTarget {
+    // Checked first: the preview domain never reaches the dashboard/API.
+    // `routes` only holds hosts under the preview domain that are previews
+    // (refresh_routes drops app domains under it).
+    if let Some(pd) = preview_domain
+        && is_under_domain(host, pd)
+    {
+        return routes
+            .get(host)
+            .cloned()
+            .map(RouteTarget::Upstream)
+            .unwrap_or(RouteTarget::NotFound);
+    }
+
     if dashboard_domain == Some(host) {
         return RouteTarget::Dashboard;
     }
@@ -203,42 +240,72 @@ impl TondProxy {
             routes: Arc::new(RwLock::new(HashMap::new())),
             db_path: db_path.to_string(),
             dashboard_domain: Arc::new(RwLock::new(initial_dashboard_domain)),
+            preview_domain: Arc::new(RwLock::new(None)),
             server_addr,
         }
+    }
+
+    async fn resolve(&self, host: &str) -> RouteTarget {
+        let dd = self.dashboard_domain.read().await;
+        let pd = self.preview_domain.read().await;
+        let routes = self.routes.read().await;
+        resolve_route(host, dd.as_deref(), pd.as_deref(), &routes)
     }
 
     /// Refresh routes and settings from SQLite.
     ///
     /// Reads the host_port stored in the DB (written by tond-server on every
-    /// deploy). This avoids a Docker API call per container and makes routing
-    /// deterministic across proxy restarts.
+    /// deploy), which makes routing deterministic across proxy restarts and
+    /// keeps the proxy away from the Docker socket. Rows without a host_port
+    /// (a deploy in progress) are skipped until the next refresh.
     ///
-    /// Also reads `dashboard_domain` from the settings table so that changes
-    /// made via the dashboard UI or `tond settings set` CLI command are
-    /// picked up within 5 s without restarting the proxy.
-    ///
-    /// Falls back to Docker inspect for any app that has a NULL host_port
-    /// (rows created before migration 006 or during an in-progress deploy).
+    /// Also reads `dashboard_domain` and `preview_domain` from the settings
+    /// table so that changes made via the dashboard UI or `tond settings`
+    /// CLI commands are picked up without restarting the proxy.
     async fn refresh_routes(&self) -> Result<()> {
         let pool = SqlitePool::connect(&format!("sqlite:{}?mode=ro", self.db_path)).await?;
 
-        // Read dashboard_domain from settings table and update the shared value.
-        let setting: Option<(String,)> =
-            sqlx::query_as("SELECT value FROM settings WHERE key = 'dashboard_domain'")
-                .fetch_optional(&pool)
-                .await?;
+        let settings: Vec<(String, String)> = sqlx::query_as(
+            "SELECT key, value FROM settings WHERE key IN ('dashboard_domain', 'preview_domain')",
+        )
+        .fetch_all(&pool)
+        .await?;
+        let setting = |key: &str| {
+            settings
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        let new_preview_domain = setting("preview_domain");
         {
-            let new_domain = setting.map(|(v,)| v).filter(|v| !v.is_empty());
+            let new_domain = setting("dashboard_domain");
             let mut dd = self.dashboard_domain.write().await;
             if *dd != new_domain {
                 tracing::info!("Dashboard domain updated: {:?} -> {:?}", *dd, new_domain);
                 *dd = new_domain;
             }
         }
+        {
+            let mut pd = self.preview_domain.write().await;
+            if *pd != new_preview_domain {
+                tracing::info!(
+                    "Preview domain updated: {:?} -> {:?}",
+                    *pd,
+                    new_preview_domain
+                );
+                *pd = new_preview_domain.clone();
+            }
+        }
+        let under_preview_domain = |host: &str| {
+            new_preview_domain
+                .as_deref()
+                .is_some_and(|pd| is_under_domain(host, pd))
+        };
 
-        // Prefer DB-stored host_port; fall back to NULL for legacy rows.
-        let rows: Vec<(String, String, i64, Option<i64>)> = sqlx::query_as(
-            "SELECT name, domain, container_port, host_port FROM apps WHERE status = 'running' AND domain IS NOT NULL",
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT name, domain, host_port FROM apps
+             WHERE status = 'running' AND domain IS NOT NULL AND host_port IS NOT NULL",
         )
         .fetch_all(&pool)
         .await?;
@@ -247,91 +314,16 @@ impl TondProxy {
 
         let mut new_routes = HashMap::new();
 
-        // Only open the Docker socket if at least one row needs a fallback lookup.
-        let needs_docker = rows.iter().any(|(_, _, _, hp)| hp.is_none());
-        let docker_opt = if needs_docker {
-            match bollard::Docker::connect_with_local_defaults() {
-                Ok(d) => Some(d),
-                Err(e) => {
-                    tracing::warn!(
-                        "Could not connect to Docker for fallback port lookup: {}",
-                        e
-                    );
-                    None
-                }
+        for (name, domain, host_port) in &rows {
+            // The preview domain is reserved for previews.
+            if under_preview_domain(domain) {
+                tracing::warn!(
+                    "App {} uses domain {} under the preview domain — not routed",
+                    name,
+                    domain
+                );
+                continue;
             }
-        } else {
-            None
-        };
-
-        for (name, domain, container_port, host_port_db) in &rows {
-            let host_port = if let Some(hp) = host_port_db {
-                // Fast path: use the value stored in the DB.
-                *hp as u16
-            } else {
-                // Legacy / in-progress: fall back to Docker inspect.
-                let Some(ref docker) = docker_opt else {
-                    tracing::warn!(
-                        "App {} has no stored host_port and Docker is unavailable — skipping",
-                        name
-                    );
-                    continue;
-                };
-
-                let container_name = format!("tond-{}", name);
-                match docker.inspect_container(&container_name, None).await {
-                    Ok(info) => {
-                        let raw_ports = info
-                            .network_settings
-                            .as_ref()
-                            .and_then(|ns| ns.ports.as_ref())
-                            .map(|p| format!("{:?}", p))
-                            .unwrap_or_else(|| "<none>".to_string());
-                        tracing::info!(
-                            "Container {} port map (fallback): {}",
-                            container_name,
-                            raw_ports
-                        );
-
-                        let host_port_opt = info.network_settings.and_then(|ns| {
-                            let ports = ns.ports?;
-                            let tcp_key = format!("{}/tcp", container_port);
-                            let udp_key = format!("{}/udp", container_port);
-                            let binding = ports
-                                .get(&tcp_key)
-                                .or_else(|| ports.get(&udp_key))
-                                .and_then(|b| b.as_ref())
-                                .and_then(|b| b.first())
-                                .and_then(|b| b.host_port.clone());
-                            if binding.is_some() {
-                                return binding;
-                            }
-                            ports
-                                .into_values()
-                                .flatten()
-                                .flat_map(|b| b.into_iter())
-                                .find_map(|b| b.host_port)
-                        });
-
-                        match host_port_opt.and_then(|p| p.parse::<u16>().ok()) {
-                            Some(p) => p,
-                            None => {
-                                tracing::warn!(
-                                    "Container {} has no host port binding for port {}",
-                                    container_name,
-                                    container_port
-                                );
-                                continue;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to inspect container {}: {}", container_name, e);
-                        continue;
-                    }
-                }
-            };
-
             let upstream = format!("127.0.0.1:{}", host_port);
             new_routes.insert(domain.clone(), upstream.clone());
             tracing::info!("Route added: {} -> {}", domain, upstream);
@@ -354,6 +346,10 @@ impl TondProxy {
 
         for (subdomain, host_port) in preview_rows {
             if let Some(sub) = subdomain {
+                // Previews are served only under the current preview domain.
+                if !under_preview_domain(&sub) {
+                    continue;
+                }
                 let upstream = format!("127.0.0.1:{}", host_port);
                 new_routes.insert(sub.clone(), upstream.clone());
                 tracing::info!("Preview route added: {} -> {}", sub, upstream);
@@ -390,14 +386,23 @@ impl ProxyHttp for TondProxy {
                 .and_then(|v| v.to_str().ok()),
         );
 
-        let route_target = {
-            let dd = self.dashboard_domain.read().await;
-            let routes = self.routes.read().await;
-            resolve_route(&host, dd.as_deref(), &routes)
-        };
+        let route_target = self.resolve(&host).await;
 
-        if route_target != RouteTarget::Missing {
-            return Ok(false);
+        match route_target {
+            RouteTarget::Dashboard | RouteTarget::Upstream(_) => return Ok(false),
+            RouteTarget::NotFound => {
+                let body = "404 Not Found\n";
+                let mut resp = pingora::http::ResponseHeader::build(404, None)?;
+                resp.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                resp.insert_header("Content-Length", body.len().to_string())?;
+                resp.insert_header("Cache-Control", "no-store")?;
+                session.write_response_header(Box::new(resp), false).await?;
+                session
+                    .write_response_body(Some(bytes::Bytes::from_static(body.as_bytes())), true)
+                    .await?;
+                return Ok(true);
+            }
+            RouteTarget::Missing => {}
         }
 
         // No route found — return a friendly HTML 502 page
@@ -458,11 +463,7 @@ impl ProxyHttp for TondProxy {
                 .and_then(|v| v.to_str().ok()),
         );
 
-        let route_target = {
-            let dd = self.dashboard_domain.read().await;
-            let routes = self.routes.read().await;
-            resolve_route(&host, dd.as_deref(), &routes)
-        };
+        let route_target = self.resolve(&host).await;
 
         tracing::info!(
             "Routing request for host: {:?} (route map has {} entries)",
@@ -481,7 +482,7 @@ impl ProxyHttp for TondProxy {
                     return Ok(Box::new(HttpPeer::new((addr, port), false, String::new())));
                 }
             }
-            RouteTarget::Missing => {}
+            RouteTarget::Missing | RouteTarget::NotFound => {}
         }
 
         // request_filter already handled the no-route case; if we somehow
@@ -595,6 +596,7 @@ fn main() {
 
     let routes = proxy.routes.clone();
     let dashboard_domain_shared = proxy.dashboard_domain.clone();
+    let preview_domain_shared = proxy.preview_domain.clone();
     let db_path_bg = db_path.clone();
     let cert_store_bg = cert_store.clone();
     let challenges_bg = challenges.clone();
@@ -607,6 +609,7 @@ fn main() {
                 routes: routes.clone(),
                 db_path: db_path_bg,
                 dashboard_domain: dashboard_domain_shared.clone(),
+                preview_domain: preview_domain_shared,
                 server_addr: String::new(),
             };
             let db_url = format!("sqlite:{}", proxy_for_refresh.db_path);
@@ -737,7 +740,7 @@ fn main() {
                 }
             });
 
-            // Route refresh loop — also refreshes dashboard_domain from DB
+            // Route refresh loop — also refreshes dashboard_domain and preview_domain from DB
             loop {
                 if let Err(e) = proxy_for_refresh.refresh_routes().await {
                     tracing::warn!("Failed to refresh routes: {}", e);
@@ -900,13 +903,19 @@ mod tests {
             resolve_route(
                 "dashboard.example.com",
                 Some("dashboard.example.com"),
+                None,
                 &routes
             ),
             RouteTarget::Dashboard,
             "resolve_route should prioritize the configured dashboard domain over app routes"
         );
         assert_eq!(
-            resolve_route("app.example.com", Some("dashboard.example.com"), &routes),
+            resolve_route(
+                "app.example.com",
+                Some("dashboard.example.com"),
+                None,
+                &routes
+            ),
             RouteTarget::Upstream("127.0.0.1:4200".to_string()),
             "resolve_route should return the configured upstream for known app hosts"
         );
@@ -914,10 +923,66 @@ mod tests {
             resolve_route(
                 "missing.example.com",
                 Some("dashboard.example.com"),
+                None,
                 &routes
             ),
             RouteTarget::Missing,
             "resolve_route should report missing for unknown hosts"
+        );
+    }
+
+    #[test]
+    fn preview_domain_serves_only_previews_and_never_the_dashboard() {
+        let routes = HashMap::from([
+            (
+                "abc-frontend.previews.test".to_string(),
+                "127.0.0.1:5100".to_string(),
+            ),
+            ("app.example.com".to_string(), "127.0.0.1:4200".to_string()),
+        ]);
+        let resolve = |host: &str| {
+            resolve_route(
+                host,
+                Some("dash.example.com"),
+                Some("previews.test"),
+                &routes,
+            )
+        };
+
+        assert_eq!(
+            resolve("abc-frontend.previews.test"),
+            RouteTarget::Upstream("127.0.0.1:5100".to_string()),
+            "a known preview host is routed to its container"
+        );
+        assert_eq!(
+            resolve("unknown.previews.test"),
+            RouteTarget::NotFound,
+            "unknown hosts under the preview domain get a 404"
+        );
+        assert_eq!(
+            resolve("previews.test"),
+            RouteTarget::NotFound,
+            "the preview domain apex is never the dashboard"
+        );
+        assert_eq!(
+            resolve("dash.example.com"),
+            RouteTarget::Dashboard,
+            "the dashboard domain still reaches the dashboard"
+        );
+        assert_eq!(
+            resolve_route(
+                "dash.previews.test",
+                Some("dash.previews.test"),
+                Some("previews.test"),
+                &routes
+            ),
+            RouteTarget::NotFound,
+            "even a (misconfigured) dashboard domain under the preview domain is not served there"
+        );
+        assert_eq!(
+            resolve("notpreviews.test"),
+            RouteTarget::Missing,
+            "suffix matching respects label boundaries"
         );
     }
 
@@ -1048,12 +1113,12 @@ mod tests {
         let dashboard_target = {
             let dd = proxy.dashboard_domain.read().await;
             let routes = proxy.routes.read().await;
-            resolve_route("dashboard.example.com", dd.as_deref(), &routes)
+            resolve_route("dashboard.example.com", dd.as_deref(), None, &routes)
         };
         let app_target = {
             let dd = proxy.dashboard_domain.read().await;
             let routes = proxy.routes.read().await;
-            resolve_route("app.example.com", dd.as_deref(), &routes)
+            resolve_route("app.example.com", dd.as_deref(), None, &routes)
         };
 
         let dashboard_peer = match dashboard_target {
@@ -1086,14 +1151,19 @@ mod tests {
     }
 
     async fn insert_setting(pool: &SqlitePool, value: &str) {
+        insert_setting_key(pool, "dashboard_domain", value).await;
+    }
+
+    async fn insert_setting_key(pool: &SqlitePool, key: &str, value: &str) {
         sqlx::query(
             "INSERT INTO settings (key, value, updated_at)
-             VALUES ('dashboard_domain', ?, datetime('now'))",
+             VALUES (?, ?, datetime('now'))",
         )
+        .bind(key)
         .bind(value)
         .execute(pool)
         .await
-        .unwrap_or_else(|err| panic!("failed to insert dashboard_domain setting: {err}"));
+        .unwrap_or_else(|err| panic!("failed to insert {key} setting: {err}"));
     }
 
     async fn insert_app(
@@ -1149,6 +1219,7 @@ mod tests {
         let pool = create_test_db(&db_path).await;
 
         insert_setting(&pool, "dashboard.example.com").await;
+        insert_setting_key(&pool, "preview_domain", "previews.test").await;
         insert_app(
             &pool,
             "app-running",
@@ -1183,7 +1254,7 @@ mod tests {
         insert_preview(
             &pool,
             "preview-running",
-            Some("pr-42-frontend.example.com"),
+            Some("pr-42-frontend.previews.test"),
             Some(5100),
             "running",
             "2999-01-01T00:00:00Z",
@@ -1192,7 +1263,7 @@ mod tests {
         insert_preview(
             &pool,
             "preview-expired",
-            Some("expired-frontend.example.com"),
+            Some("expired-frontend.previews.test"),
             Some(5200),
             "running",
             "2000-01-01T00:00:00Z",
@@ -1201,7 +1272,7 @@ mod tests {
         insert_preview(
             &pool,
             "preview-failed",
-            Some("failed-frontend.example.com"),
+            Some("failed-frontend.previews.test"),
             Some(5300),
             "failed",
             "2999-01-01T00:00:00Z",
@@ -1233,7 +1304,7 @@ mod tests {
             "refresh_routes should route running apps with stored host_port values"
         );
         assert_eq!(
-            routes.get("pr-42-frontend.example.com"),
+            routes.get("pr-42-frontend.previews.test"),
             Some(&"127.0.0.1:5100".to_string()),
             "refresh_routes should route active preview deployments with stored host_port values"
         );
@@ -1242,11 +1313,11 @@ mod tests {
             "refresh_routes should ignore apps that are not running"
         );
         assert!(
-            !routes.contains_key("expired-frontend.example.com"),
+            !routes.contains_key("expired-frontend.previews.test"),
             "refresh_routes should ignore expired preview deployments"
         );
         assert!(
-            !routes.contains_key("failed-frontend.example.com"),
+            !routes.contains_key("failed-frontend.previews.test"),
             "refresh_routes should ignore previews that are not running"
         );
 
@@ -1266,6 +1337,7 @@ mod tests {
         let pool = create_test_db(&db_path).await;
 
         insert_setting(&pool, "dashboard.example.com").await;
+        insert_setting_key(&pool, "preview_domain", "previews.test").await;
         insert_app(
             &pool,
             "app-old",
@@ -1310,7 +1382,7 @@ mod tests {
         insert_preview(
             &pool,
             "preview-new",
-            Some("pr-99-api.example.com"),
+            Some("pr-99-api.previews.test"),
             Some(6300),
             "running",
             "2999-01-01T00:00:00Z",
@@ -1340,7 +1412,7 @@ mod tests {
             "refresh_routes should load newly added running app routes"
         );
         assert_eq!(
-            routes.get("pr-99-api.example.com"),
+            routes.get("pr-99-api.previews.test"),
             Some(&"127.0.0.1:6300".to_string()),
             "refresh_routes should retain only active preview routes from the latest refresh"
         );
@@ -1349,6 +1421,82 @@ mod tests {
         assert_eq!(
             dashboard_domain, None,
             "refresh_routes should clear the shared dashboard domain when the setting becomes empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_routes_keeps_previews_and_apps_on_their_own_domains() {
+        let dir = temp_dir();
+        let db_path = temp_db_path(dir.path());
+        let pool = create_test_db(&db_path).await;
+
+        insert_setting(&pool, "dash.example.com").await;
+        insert_setting_key(&pool, "preview_domain", "previews.test").await;
+        insert_app(
+            &pool,
+            "app-squatter",
+            "squatter",
+            Some("squatter.previews.test"),
+            "running",
+            3000,
+            Some(4100),
+        )
+        .await;
+        insert_app(
+            &pool,
+            "app-deploying",
+            "deploying",
+            Some("deploying.example.com"),
+            "running",
+            3000,
+            None,
+        )
+        .await;
+        insert_preview(
+            &pool,
+            "preview-on-dashboard",
+            Some("abc-frontend.dash.example.com"),
+            Some(5100),
+            "running",
+            "2999-01-01T00:00:00Z",
+        )
+        .await;
+        insert_preview(
+            &pool,
+            "preview-ok",
+            Some("def-frontend.previews.test"),
+            Some(5200),
+            "running",
+            "2999-01-01T00:00:00Z",
+        )
+        .await;
+        pool.close().await;
+
+        let proxy = TondProxy::new(
+            &db_path.to_string_lossy(),
+            None,
+            "127.0.0.1:3001".to_string(),
+        );
+        proxy
+            .refresh_routes()
+            .await
+            .unwrap_or_else(|err| panic!("refresh_routes should succeed: {err}"));
+
+        let routes = proxy.routes.read().await.clone();
+        assert_eq!(
+            routes.keys().collect::<Vec<_>>(),
+            vec!["def-frontend.previews.test"],
+            "only the preview under the preview domain is routed: apps under the preview \
+             domain, previews outside it and apps without a host port are dropped"
+        );
+        assert_eq!(
+            proxy.preview_domain.read().await.as_deref(),
+            Some("previews.test"),
+            "refresh_routes should load the preview domain"
+        );
+        assert_eq!(
+            proxy.resolve("squatter.previews.test").await,
+            RouteTarget::NotFound
         );
     }
 }
