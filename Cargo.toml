@@ -37,19 +37,19 @@ tokio = { version = "1.50.0", features = ["full"] }
 
 # Web framework
 axum = { version = "0.8.8", features = ["multipart", "ws"] }
-tower-http = { version = "0.6.8", features = ["cors", "trace", "fs"] }
+tower-http = { version = "0.7.1", features = ["cors", "trace", "fs"] }
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 serde_with = "3.18.0"
-toml = "0.9.7"
+toml = "1.1.6"
 
 # Database
 sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "migrate", "chrono"] }
 
 # Docker
-bollard = "0.20.1"
+bollard = "0.21.1"
 
 # CLI
 clap = { version = "4.6.0", features = ["derive", "env"] }
@@ -91,13 +91,13 @@ rcgen = "0.14.7"
 openssl = "0.10.75"
 
 # WebSocket client
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 
 # System info
-sysinfo = "0.38.4"
+sysinfo = "0.39.6"
 
 # Cron expression parsing + next-run computation
-cron = "0.15.0"
+cron = "0.17.0"
 
 # Timezone-aware cron scheduling
 chrono-tz = "0.10.4"
@@ -125,7 +125,7 @@ walkdir = "2.5.0"
 # Terminal / proxy internals
 portable-pty = "0.9.0"
 bytes = "1.11.1"
-pingora = { version = "0.8.0", features = ["lb", "openssl"] }
+pingora = { version = "0.9.0", features = ["lb", "openssl"] }
 async-trait = "0.1.89"
 
 # Test helpers
