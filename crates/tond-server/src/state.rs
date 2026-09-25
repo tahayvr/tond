@@ -25,7 +25,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tond_common::ServerSettings;
 
-use crate::auth::RateLimiter;
+use crate::{auth::RateLimiter, db};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -45,7 +45,7 @@ impl AppState {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let db = SqlitePool::connect(&format!("sqlite:{}?mode=rwc", db_path)).await?;
+        let db = db::open_pool(&db_path).await?;
 
         let docker = Docker::connect_with_local_defaults()?;
 

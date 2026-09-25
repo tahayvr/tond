@@ -50,6 +50,7 @@ mod docker;
 mod error;
 mod handlers;
 mod health;
+mod janitor;
 mod metrics;
 mod notifications;
 mod secret_key;
@@ -132,6 +133,9 @@ async fn main() -> Result<()> {
 
     // Spawn background cron job scheduler (every 30 s)
     tokio::spawn(cron::run_cron_scheduler(state.clone()));
+
+    // Spawn the janitor (hourly retention for logs, runs, audit, metrics, sessions)
+    tokio::spawn(janitor::run_janitor(state.clone()));
 
     // Spawn backup scheduler (checks cron expression, runs scheduled full snapshots)
     tokio::spawn(backup::backup_scheduler(state.clone()));
