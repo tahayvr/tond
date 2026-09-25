@@ -122,9 +122,16 @@ for svc in tond-server tond-proxy; do
 done
 wait_for 30 "API health" curl -sf http://127.0.0.1:3001/health
 pass "API health check"
-[[ "$(stat -c '%a %U' /opt/tond/data/tond.env)" == "600 root" ]] \
-    && grep -qE '^TOND_SECRET_KEY=[0-9a-f]{64}$' /opt/tond/data/tond.env \
-    || fail "install.sh must generate TOND_SECRET_KEY into /opt/tond/data/tond.env (0600 root)"
+SECRET_ENV=/opt/tond/data/tond.env
+secret_env_state="$(stat -c '%a %U' "$SECRET_ENV" 2>&1 || true)"
+if [[ "$secret_env_state" != "600 root" ]] \
+    || ! grep -qE '^TOND_SECRET_KEY=[0-9a-f]{64}$' "$SECRET_ENV"; then
+    # Describe the file without printing the key.
+    echo "    stat: ${secret_env_state}" >&2
+    awk '{ i = index($0, "="); printf "    line: %s (%d chars after =)\n", substr($0, 1, i), length($0) - i }' \
+        "$SECRET_ENV" >&2 || true
+    fail "install.sh must generate TOND_SECRET_KEY into ${SECRET_ENV} (0600 root)"
+fi
 pass "encryption key generated in tond.env (0600 root)"
 
 step "Authentication boundaries"

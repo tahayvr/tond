@@ -62,6 +62,13 @@ pub struct BackupConfig {
 
 // ── API response shapes ───────────────────────────────────────────────────────
 
+/// Reply to starting a snapshot. The snapshot itself runs in the background.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotStarted {
+    pub id: String,
+    pub message: String,
+}
+
 /// Outbound representation of a snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotResponse {

@@ -28,6 +28,7 @@ use openssl::asn1::Asn1Time;
 use openssl::pkey::{PKey, Private};
 use openssl::x509::X509;
 use std::collections::HashMap;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -36,7 +37,27 @@ use tokio::sync::RwLock;
 #[derive(Clone)]
 pub struct CertPair {
     pub cert: X509,
+    /// Intermediates sent after the leaf. Without them clients that don't
+    /// fetch missing intermediates themselves (curl, most HTTP libraries,
+    /// Android) reject the certificate.
+    pub chain: Vec<X509>,
     pub key: PKey<Private>,
+}
+
+impl CertPair {
+    /// Parse a PEM bundle (leaf first, then intermediates) and its key.
+    fn from_pem(cert_pem: &[u8], key_pem: &[u8]) -> Result<Self> {
+        let mut certs = X509::stack_from_pem(cert_pem)
+            .context("parsing cert PEM")?
+            .into_iter();
+        let cert = certs.next().context("cert PEM contains no certificate")?;
+        let key = PKey::private_key_from_pem(key_pem).context("parsing key PEM")?;
+        Ok(Self {
+            cert,
+            chain: certs.collect(),
+            key,
+        })
+    }
 }
 
 /// Thread-safe certificate store with in-memory cache and disk backing.
@@ -107,8 +128,7 @@ impl CertStore {
     /// Store a cert pair both in memory and on disk.
     pub async fn store(&self, domain: &str, cert_pem: &[u8], key_pem: &[u8]) -> Result<()> {
         // Parse to validate
-        let cert = X509::from_pem(cert_pem).context("parsing cert PEM")?;
-        let key = PKey::private_key_from_pem(key_pem).context("parsing key PEM")?;
+        let pair = CertPair::from_pem(cert_pem, key_pem)?;
 
         // Write to disk
         let domain_dir = self.certs_dir.join(domain);
@@ -118,12 +138,11 @@ impl CertStore {
         let key_path = domain_dir.join("key.pem");
 
         tokio::fs::write(&cert_path, cert_pem).await?;
-        tokio::fs::write(&key_path, key_pem).await?;
+        write_private(&key_path, key_pem).await?;
 
         tracing::info!("Stored certificate for {} on disk", domain);
 
         // Update in-memory cache
-        let pair = CertPair { cert, key };
         let mut cache = self.cache.write().await;
         cache.insert(domain.to_string(), pair);
 
@@ -200,10 +219,24 @@ fn load_cert_from_disk(cert_path: &Path, key_path: &Path) -> Result<CertPair> {
     let key_pem =
         std::fs::read(key_path).with_context(|| format!("reading {}", key_path.display()))?;
 
-    let cert = X509::from_pem(&cert_pem).context("parsing cert PEM")?;
-    let key = PKey::private_key_from_pem(&key_pem).context("parsing key PEM")?;
+    CertPair::from_pem(&cert_pem, &key_pem)
+}
 
-    Ok(CertPair { cert, key })
+/// Write a private key readable by root only.
+async fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .await
+        .with_context(|| format!("writing {}", path.display()))?;
+    file.write_all(contents).await?;
+    // Tighten keys written by older versions too; mode() only applies on create.
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+    Ok(())
 }
 
 /// Generate a self-signed certificate for the given domain using rcgen.
@@ -217,7 +250,11 @@ fn generate_self_signed(domain: &str) -> Result<CertPair> {
     let cert = X509::from_pem(cert_pem.as_bytes()).context("parsing generated cert")?;
     let key = PKey::private_key_from_pem(key_pem.as_bytes()).context("parsing generated key")?;
 
-    Ok(CertPair { cert, key })
+    Ok(CertPair {
+        cert,
+        chain: Vec::new(),
+        key,
+    })
 }
 
 /// Generate a self-signed certificate and save it to disk.
@@ -234,7 +271,15 @@ pub fn generate_self_signed_for_domain(domain: &str) -> Result<(CertPair, Vec<u8
     let cert = X509::from_pem(&cert_pem).context("parsing generated cert")?;
     let key = PKey::private_key_from_pem(&key_pem).context("parsing generated key")?;
 
-    Ok((CertPair { cert, key }, cert_pem, key_pem))
+    Ok((
+        CertPair {
+            cert,
+            chain: Vec::new(),
+            key,
+        },
+        cert_pem,
+        key_pem,
+    ))
 }
 
 #[cfg(test)]
@@ -311,6 +356,52 @@ mod tests {
             key_pem,
             "stored key.pem contents should match the PEM bytes that were provided"
         );
+    }
+
+    #[tokio::test]
+    async fn store_keeps_intermediates_and_writes_key_root_only() {
+        let dir = temp_dir();
+        let store = CertStore::new(&dir.path().join("certs"))
+            .await
+            .unwrap_or_else(|err| panic!("failed to create CertStore: {err}"));
+        // ACME returns the leaf followed by its intermediates in one PEM.
+        let (_, leaf_pem, key_pem) = generate_self_signed_for_domain("demo.example.com")
+            .unwrap_or_else(|err| panic!("failed to generate leaf fixture: {err}"));
+        let (_, intermediate_pem, _) = generate_self_signed_for_domain("Intermediate CA")
+            .unwrap_or_else(|err| panic!("failed to generate intermediate fixture: {err}"));
+        let bundle = [leaf_pem.as_slice(), intermediate_pem.as_slice()].concat();
+
+        store
+            .store("demo.example.com", &bundle, &key_pem)
+            .await
+            .unwrap_or_else(|err| panic!("failed to store certificate: {err}"));
+
+        let pair = store.get("demo.example.com").await;
+        assert_eq!(
+            pair.chain.len(),
+            1,
+            "the intermediate must be served after the leaf"
+        );
+        let expected = X509::from_pem(&intermediate_pem)
+            .unwrap_or_else(|err| panic!("failed to parse intermediate: {err}"));
+        assert!(pair.chain[0].to_der().ok() == expected.to_der().ok());
+
+        let (_, key_path) = store.cert_paths("demo.example.com");
+        let mode = std::fs::metadata(&key_path)
+            .unwrap_or_else(|err| panic!("failed to stat key.pem: {err}"))
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "private keys must be readable by root only"
+        );
+
+        // The chain survives a restart.
+        let reloaded = CertStore::new(&dir.path().join("certs"))
+            .await
+            .unwrap_or_else(|err| panic!("failed to reload CertStore: {err}"));
+        assert_eq!(reloaded.get("demo.example.com").await.chain.len(), 1);
     }
 
     #[tokio::test]

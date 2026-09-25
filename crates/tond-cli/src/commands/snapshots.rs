@@ -92,9 +92,9 @@ pub async fn handle(client: &TondClient, action: SnapshotAction) -> Result<()> {
     match action {
         SnapshotAction::Create { name } => {
             println!("Creating snapshot…");
-            let snap = client.create_snapshot(name.as_deref()).await?;
-            println!("Snapshot created: {} ({})", snap.name, snap.id);
-            println!("Status: {}", snap.status);
+            let started = client.create_snapshot(name.as_deref()).await?;
+            println!("Snapshot started: {}", started.id);
+            println!("Check progress with: tond snapshot list");
         }
 
         SnapshotAction::List { app } => {

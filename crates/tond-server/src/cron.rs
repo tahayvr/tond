@@ -30,7 +30,7 @@ use std::str::FromStr;
 use tond_common::CronJob;
 use uuid::Uuid;
 
-use crate::{alerts, state::AppState};
+use crate::{alerts, docker, state::AppState};
 
 fn should_run_due_job(job: &CronJob) -> bool {
     !(job.status == "running" && job.concurrency_policy == "skip")
@@ -376,6 +376,7 @@ async fn run_cron_container(
         .await;
 
     // Create container
+    docker::ensure_image(docker, &job.image).await?;
     let create_opts = CreateContainerOptionsBuilder::default()
         .name(container_name)
         .build();

@@ -55,7 +55,7 @@ use pingora::listeners::TlsAccept;
 use pingora::listeners::tls::TlsSettings;
 use pingora::prelude::*;
 use pingora::proxy::{ProxyHttp, Session};
-use pingora::tls::ext::{ssl_use_certificate, ssl_use_private_key};
+use pingora::tls::ext::{ssl_add_chain_cert, ssl_use_certificate, ssl_use_private_key};
 use pingora::tls::ssl::NameType;
 use pingora::upstreams::peer::HttpPeer;
 use sqlx::SqlitePool;
@@ -94,6 +94,12 @@ impl TlsAccept for TondTlsAccept {
         if let Err(e) = ssl_use_certificate(ssl, &pair.cert) {
             tracing::error!("Failed to set certificate for {}: {}", sni, e);
             return;
+        }
+        for intermediate in &pair.chain {
+            if let Err(e) = ssl_add_chain_cert(ssl, intermediate) {
+                tracing::error!("Failed to add chain certificate for {}: {}", sni, e);
+                return;
+            }
         }
         if let Err(e) = ssl_use_private_key(ssl, &pair.key) {
             tracing::error!("Failed to set private key for {}: {}", sni, e);

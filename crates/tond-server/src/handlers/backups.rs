@@ -60,9 +60,10 @@ pub async fn create_snapshot(
 
     Ok((
         StatusCode::ACCEPTED,
-        Json(ApiResponse::ok(
-            json!({ "id": id, "message": "Snapshot started" }),
-        )),
+        Json(ApiResponse::ok(SnapshotStarted {
+            id,
+            message: "Snapshot started".to_string(),
+        })),
     ))
 }
 

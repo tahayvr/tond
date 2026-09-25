@@ -35,6 +35,10 @@
 //     host ports. Increments from `start` until finding an unused one.
 //     Used by deploy::deploy() to avoid port collisions between apps.
 //
+//   ensure_image(docker, image)
+//     Pulls `image` unless it is already present locally. Managed databases
+//     and cron jobs start from stock images that a fresh host doesn't have.
+//
 //   ensure_network(docker, network_name)
 //     Creates a Docker bridge network with the given name if it does not
 //     already exist. Idempotent — safe to call on every deploy.
@@ -46,9 +50,9 @@
 use bollard::Docker;
 use bollard::models::*;
 use bollard::query_parameters::{
-    CreateContainerOptionsBuilder, ListContainersOptionsBuilder, ListNetworksOptionsBuilder,
-    LogsOptionsBuilder, RemoveContainerOptionsBuilder, RenameContainerOptionsBuilder,
-    StopContainerOptionsBuilder,
+    CreateContainerOptionsBuilder, CreateImageOptionsBuilder, ListContainersOptionsBuilder,
+    ListNetworksOptionsBuilder, LogsOptionsBuilder, RemoveContainerOptionsBuilder,
+    RenameContainerOptionsBuilder, StopContainerOptionsBuilder,
 };
 use futures::StreamExt;
 use std::collections::HashMap;
@@ -119,6 +123,7 @@ pub async fn run_container(
     binds: Vec<String>,
     network_name: Option<&str>,
 ) -> anyhow::Result<String> {
+    ensure_image(docker, image).await?;
     let env = env_with_port(env_vars, port);
     let port_bindings = make_port_bindings(port, host_port);
 
@@ -290,6 +295,7 @@ pub async fn run_container_named(
     network_name: Option<&str>,
     network_alias: Option<&str>,
 ) -> anyhow::Result<String> {
+    ensure_image(docker, image).await?;
     let env = env_with_port(env_vars, port);
     let port_bindings = make_port_bindings(port, host_port);
 
@@ -458,6 +464,21 @@ pub async fn find_free_port(docker: &Docker, start: u16) -> anyhow::Result<u16> 
 /// Ensure a Docker bridge network with the given name exists.
 /// Creates it if it does not already exist. Idempotent and safe to call on
 /// every deploy — does nothing if the network is already present.
+pub async fn ensure_image(docker: &Docker, image: &str) -> anyhow::Result<()> {
+    if docker.inspect_image(image).await.is_ok() {
+        return Ok(());
+    }
+    tracing::info!("Pulling image {}", image);
+    let options = CreateImageOptionsBuilder::default()
+        .from_image(image)
+        .build();
+    let mut stream = docker.create_image(Some(options), None, None);
+    while let Some(progress) = stream.next().await {
+        progress.map_err(|e| anyhow::anyhow!("Failed to pull image {image}: {e}"))?;
+    }
+    Ok(())
+}
+
 pub async fn ensure_network(docker: &Docker, network_name: &str) -> anyhow::Result<()> {
     let filters: HashMap<String, Vec<String>> = {
         let mut m = HashMap::new();
