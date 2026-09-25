@@ -26,23 +26,11 @@
 
 	let { children } = $props();
 
-	// Start MSW mock service worker in dev when VITE_MOCK_API=true,
-	// then run the auth check. In prod this is a no-op (tree-shaken out).
-	async function boot() {
-		if (import.meta.env.DEV && import.meta.env.VITE_MOCK_API === 'true') {
-			const { worker } = await import('../mocks/browser');
-			await worker.start({
-				serviceWorker: { url: '/mockServiceWorker.js' },
-				onUnhandledRequest: 'bypass'
-			});
-		}
-		await checkAuth();
-	}
-
-	// Check auth on mount (after optional MSW startup)
+	// Check auth on mount. MSW (mock API) is already running by now: it is started
+	// in the `init` hook in hooks.client.ts.
 	$effect(() => {
 		if (typeof window === 'undefined') return;
-		boot();
+		checkAuth();
 	});
 
 	// Redirect based on auth status + current path

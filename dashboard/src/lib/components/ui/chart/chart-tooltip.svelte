@@ -1,9 +1,13 @@
 <script lang="ts">
 	import { cn, type WithElementRef, type WithoutChildren } from '$lib/utils.js';
 	import type { HTMLAttributes } from 'svelte/elements';
-	import { getPayloadConfigFromPayload, useChart, type TooltipPayload } from './chart-utils.js';
-	import { getTooltipContext, Tooltip as TooltipPrimitive } from 'layerchart';
+	import { useChart, type TooltipSeries } from './chart-utils.js';
+	import { getChartContext, Tooltip as TooltipPrimitive } from 'layerchart';
 	import type { Snippet } from 'svelte';
+
+	// Ported from the shadcn-svelte chart tooltip (written for layerchart 2.0.0-next) to the
+	// layerchart 2.x stable API: tooltip state lives on the chart context, and the per-series
+	// `payload` array is now `tooltip.series`.
 
 	function defaultFormatter(value: any) {
 		return `${value}`;
@@ -15,7 +19,6 @@
 		hideLabel = false,
 		indicator = 'dot',
 		hideIndicator = false,
-		labelKey,
 		label,
 		labelFormatter = defaultFormatter,
 		labelClassName,
@@ -25,48 +28,47 @@
 		...restProps
 	}: WithoutChildren<WithElementRef<HTMLAttributes<HTMLDivElement>>> & {
 		hideLabel?: boolean;
+		/** Fixed header label (or a chart config key). Defaults to the hovered x value. */
 		label?: string;
 		indicator?: 'line' | 'dot' | 'dashed';
+		/** Chart config key to look up each item's label/icon, instead of the series key. */
 		nameKey?: string;
-		labelKey?: string;
 		hideIndicator?: boolean;
 		labelClassName?: string;
-		labelFormatter?: ((value: any, payload: TooltipPayload[]) => string | number | Snippet) | null;
+		labelFormatter?: ((value: any, series: TooltipSeries[]) => string | number | Snippet) | null;
 		formatter?: Snippet<
 			[
 				{
 					value: unknown;
 					name: string;
-					item: TooltipPayload;
+					item: TooltipSeries;
 					index: number;
-					payload: TooltipPayload[];
+					series: TooltipSeries[];
 				}
 			]
 		>;
 	} = $props();
 
 	const chart = useChart();
-	const tooltipCtx = getTooltipContext();
+	const chartCtx = getChartContext();
+
+	const items = $derived(chartCtx.tooltip.series.filter((s) => s.visible));
 
 	const formattedLabel = $derived.by(() => {
-		if (hideLabel || !tooltipCtx.payload?.length) return null;
-
-		const [item] = tooltipCtx.payload;
-		const key = labelKey ?? item?.label ?? item?.name ?? 'value';
-
-		const itemConfig = getPayloadConfigFromPayload(chart.config, item, key);
+		const data = chartCtx.tooltip.data;
+		if (hideLabel || data == null) return null;
 
 		const value =
-			!labelKey && typeof label === 'string'
+			typeof label === 'string'
 				? (chart.config[label as keyof typeof chart.config]?.label ?? label)
-				: (itemConfig?.label ?? item.label);
+				: chartCtx.x(data);
 
-		if (value === undefined) return null;
+		if (value == null) return null;
 		if (!labelFormatter) return value;
-		return labelFormatter(value, tooltipCtx.payload);
+		return labelFormatter(value, items);
 	});
 
-	const nestLabel = $derived(tooltipCtx.payload.length === 1 && indicator !== 'dot');
+	const nestLabel = $derived(items.length === 1 && indicator !== 'dot');
 </script>
 
 {#snippet TooltipLabel()}
@@ -83,6 +85,7 @@
 
 <TooltipPrimitive.Root variant="none">
 	<div
+		bind:this={ref}
 		class={cn(
 			'grid min-w-[9rem] items-start gap-1.5 rounded-lg border border-border/50 bg-background px-2.5 py-1.5 text-xs shadow-xl',
 			className
@@ -93,24 +96,18 @@
 			{@render TooltipLabel()}
 		{/if}
 		<div class="grid gap-1.5">
-			{#each tooltipCtx.payload as item, i (item.key + i)}
-				{@const key = `${nameKey || item.key || item.name || 'value'}`}
-				{@const itemConfig = getPayloadConfigFromPayload(chart.config, item, key)}
-				{@const indicatorColor = color || item.payload?.color || item.color}
+			{#each items as item, i (item.key)}
+				{@const itemConfig = chart.config[nameKey ?? item.key]}
+				{@const indicatorColor = color || item.color}
+				{@const name = itemConfig?.label || item.label}
 				<div
 					class={cn(
 						'flex w-full flex-wrap items-stretch gap-2 [&>svg]:size-2.5 [&>svg]:text-muted-foreground',
 						indicator === 'dot' && 'items-center'
 					)}
 				>
-					{#if formatter && item.value !== undefined && item.name}
-						{@render formatter({
-							value: item.value,
-							name: item.name,
-							item,
-							index: i,
-							payload: tooltipCtx.payload
-						})}
+					{#if formatter && item.value !== undefined}
+						{@render formatter({ value: item.value, name, item, index: i, series: items })}
 					{:else}
 						{#if itemConfig?.icon}
 							<itemConfig.icon />
@@ -135,9 +132,7 @@
 								{#if nestLabel}
 									{@render TooltipLabel()}
 								{/if}
-								<span class="text-muted-foreground">
-									{itemConfig?.label || item.name}
-								</span>
+								<span class="text-muted-foreground">{name}</span>
 							</div>
 							{#if item.value !== undefined}
 								<span class="font-mono font-medium text-foreground tabular-nums">

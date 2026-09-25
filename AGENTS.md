@@ -132,7 +132,8 @@ VITE_MOCK_API=true          # start MSW service worker to intercept /api request
 ### Mock API (local dev)
 
 - Handlers live in `src/mocks/handlers.ts`; fixtures in `src/mocks/fixtures.ts`.
-- MSW is started in `+layout.svelte` only when `VITE_MOCK_API=true`.
+- MSW is started in the `init` hook in `src/hooks.client.ts` (awaited before any `load`)
+  only when `VITE_MOCK_API=true`.
 - When adding a new API endpoint, add a corresponding MSW handler so the dashboard
   can be developed without a running backend.
 

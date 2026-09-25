@@ -163,8 +163,7 @@
 						id="em-to"
 						bind:value={toAddrs}
 						class="h-16 border bg-background p-2 font-mono text-xs"
-						placeholder="one@example.com, two@example.com"
-					></textarea>
+						placeholder="one@example.com, two@example.com"></textarea>
 					<p class="text-[10px] text-muted-foreground">
 						Separate multiple addresses with commas or newlines.
 					</p>

@@ -39,6 +39,19 @@
 	}
 </script>
 
+{#snippet gradientAreas(series: { key: string; color?: string }[])}
+	{#each series as s (s.key)}
+		<LinearGradient
+			stops={[s.color ?? '', 'color-mix(in lch, ' + s.color + ' 10%, transparent)']}
+			vertical
+		>
+			{#snippet children({ gradient })}
+				<Area seriesKey={s.key} fill={gradient} fillOpacity={0.4} line={{ class: 'stroke-1' }} />
+			{/snippet}
+		</LinearGradient>
+	{/each}
+{/snippet}
+
 <div class="space-y-6 pt-4">
 	{#if error}
 		<ErrorAlert title="Error" description={error} />
@@ -99,27 +112,14 @@
 							},
 							yAxis: {
 								format: (v: number) => `${v}%`
-							},
-							area: {
-								'fill-opacity': 0.4,
-								line: { class: 'stroke-1' }
 							}
 						}}
 					>
 						{#snippet tooltip()}
 							<Chart.Tooltip labelFormatter={(v) => xAxisFormat(v as Date)} />
 						{/snippet}
-						{#snippet marks({ series, getAreaProps })}
-							{#each series as s, i (s.key)}
-								<LinearGradient
-									stops={[s.color ?? '', 'color-mix(in lch, ' + s.color + ' 10%, transparent)']}
-									vertical
-								>
-									{#snippet children({ gradient })}
-										<Area {...getAreaProps(s, i)} fill={gradient} />
-									{/snippet}
-								</LinearGradient>
-							{/each}
+						{#snippet marks({ context })}
+							{@render gradientAreas(context.series.visibleSeries)}
 						{/snippet}
 					</AreaChart>
 				</Chart.Container>
@@ -153,27 +153,14 @@
 						props={{
 							xAxis: {
 								format: xAxisFormat
-							},
-							area: {
-								'fill-opacity': 0.4,
-								line: { class: 'stroke-1' }
 							}
 						}}
 					>
 						{#snippet tooltip()}
 							<Chart.Tooltip labelFormatter={(v) => xAxisFormat(v as Date)} />
 						{/snippet}
-						{#snippet marks({ series, getAreaProps })}
-							{#each series as s, i (s.key)}
-								<LinearGradient
-									stops={[s.color ?? '', 'color-mix(in lch, ' + s.color + ' 10%, transparent)']}
-									vertical
-								>
-									{#snippet children({ gradient })}
-										<Area {...getAreaProps(s, i)} fill={gradient} />
-									{/snippet}
-								</LinearGradient>
-							{/each}
+						{#snippet marks({ context })}
+							{@render gradientAreas(context.series.visibleSeries)}
 						{/snippet}
 					</AreaChart>
 				</Chart.Container>
