@@ -20,8 +20,8 @@
 //     { "registry_credential_id": null } to detach.
 
 use aes_gcm::{
-    Aes256Gcm, KeyInit, Nonce,
-    aead::{Aead, OsRng, rand_core::RngCore},
+    Aes256Gcm, KeyInit,
+    aead::{Aead, Nonce},
 };
 use axum::{
     Json,
@@ -66,11 +66,11 @@ pub fn encrypt_password(plaintext: &str) -> anyhow::Result<String> {
         .map_err(|e| anyhow::anyhow!("cipher init failed: {}", e))?;
 
     let mut nonce_bytes = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut nonce_bytes);
+    let nonce = Nonce::<Aes256Gcm>::from(nonce_bytes);
 
     let ciphertext = cipher
-        .encrypt(nonce, plaintext.as_bytes())
+        .encrypt(&nonce, plaintext.as_bytes())
         .map_err(|e| anyhow::anyhow!("encryption failed: {}", e))?;
 
     let mut combined = nonce_bytes.to_vec();
@@ -92,10 +92,11 @@ pub fn decrypt_password(encrypted: &str) -> anyhow::Result<String> {
         anyhow::bail!("encrypted payload too short");
     }
     let (nonce_bytes, ciphertext) = combined.split_at(12);
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce = Nonce::<Aes256Gcm>::try_from(nonce_bytes)
+        .map_err(|e| anyhow::anyhow!("invalid nonce: {}", e))?;
 
     let plaintext = cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(&nonce, ciphertext)
         .map_err(|e| anyhow::anyhow!("decryption failed: {}", e))?;
 
     String::from_utf8(plaintext).map_err(|e| anyhow::anyhow!("utf8 decode failed: {}", e))

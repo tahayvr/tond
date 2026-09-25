@@ -43,7 +43,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use tond_common::{ApiResponse, App, GitHubApp, GitLabToken, PreviewDeployment};
 
@@ -1147,7 +1147,7 @@ mod tests {
         http::{HeaderMap, HeaderValue, StatusCode},
     };
     use bollard::{API_DEFAULT_VERSION, Docker};
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     use sqlx::SqlitePool;
     use tokio::sync::RwLock;

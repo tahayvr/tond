@@ -870,7 +870,7 @@ fn archive_snapshot(staging: &Path) -> Result<(PathBuf, String)> {
     let _file = enc.finish()?;
 
     let contents = std::fs::read(&tar_path)?;
-    let checksum = format!("{:x}", Sha256::digest(&contents));
+    let checksum = hex::encode(Sha256::digest(&contents));
 
     Ok((tar_path, checksum))
 }
@@ -1529,7 +1529,7 @@ mod tests {
             .unwrap_or_else(|err| panic!("failed to read created archive: {err}"));
         assert_eq!(
             checksum,
-            format!("{:x}", Sha256::digest(&contents)),
+            hex::encode(Sha256::digest(&contents)),
             "archive_snapshot should return the SHA-256 checksum of the generated tarball"
         );
 

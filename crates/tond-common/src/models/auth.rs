@@ -1,7 +1,7 @@
 // auth.rs — User, Session, API keys, credentials, and all auth/TOTP request types
 
 use chrono::Utc;
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;

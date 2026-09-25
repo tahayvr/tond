@@ -938,25 +938,20 @@ pub async fn totp_setup(
     };
 
     // Generate a random base32 TOTP secret (20 bytes = 160 bits)
-    use rand::RngCore;
-    use totp_rs::{Algorithm, Secret, TOTP};
+    use rand::Rng;
+    use totp_rs::Builder;
     let mut secret_bytes = [0u8; 20];
     rand::rng().fill_bytes(&mut secret_bytes);
     let secret_b32 = base32_encode(&secret_bytes);
 
     // Build a TOTP object via totp-rs so we can use its otpauth URL generator
     // and its built-in QR code renderer (no external HTTP call needed).
-    let totp = match TOTP::new(
-        Algorithm::SHA1,
-        6,
-        1,
-        30,
-        Secret::Encoded(secret_b32.clone())
-            .to_bytes()
-            .unwrap_or_default(),
-        Some("Tond".to_string()),
-        user.email.clone(),
-    ) {
+    let totp = match Builder::new()
+        .with_secret(secret_bytes)
+        .with_issuer(Some("Tond"))
+        .with_account_name(user.email.as_str())
+        .build()
+    {
         Ok(t) => t,
         Err(_) => {
             return (
@@ -967,10 +962,19 @@ pub async fn totp_setup(
         }
     };
 
-    let otpauth_uri = totp.get_url();
+    let otpauth_uri = match totp.to_url() {
+        Ok(url) => url,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<()>::err("Failed to build TOTP URL")),
+            )
+                .into_response();
+        }
+    };
 
     // Generate the QR code as a base64-encoded PNG (server-side, no external request).
-    let qr_code = match totp.get_qr_base64() {
+    let qr_code = match totp.to_qr_base64() {
         Ok(b64) => b64,
         Err(_) => {
             return (
@@ -1107,7 +1111,7 @@ pub async fn totp_confirm(
         .await;
 
     let mut backup_codes: Vec<String> = Vec::with_capacity(10);
-    use rand::RngCore;
+    use rand::Rng;
     for _ in 0..10 {
         let mut raw = [0u8; 8];
         rand::rng().fill_bytes(&mut raw);

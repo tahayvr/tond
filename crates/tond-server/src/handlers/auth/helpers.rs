@@ -6,18 +6,16 @@ use tond_common::generate_raw_key;
 
 /// Hash a password with argon2.
 pub(super) fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
-    use argon2::password_hash::{SaltString, rand_core::OsRng};
     use argon2::{Argon2, PasswordHasher};
 
-    let salt = SaltString::generate(&mut OsRng);
-    let argon2 = Argon2::default();
-    let hash = argon2.hash_password(password.as_bytes(), &salt)?;
+    // A random salt is generated internally from the OS RNG.
+    let hash = Argon2::default().hash_password(password.as_bytes())?;
     Ok(hash.to_string())
 }
 
 /// Verify a password against a stored argon2 hash.
 pub(super) fn verify_password(password: &str, hash: &str) -> bool {
-    use argon2::password_hash::PasswordHash;
+    use argon2::password_hash::phc::PasswordHash;
     use argon2::{Argon2, PasswordVerifier};
 
     let parsed = match PasswordHash::new(hash) {
@@ -91,16 +89,16 @@ pub(super) fn clear_session_cookie() -> String {
 
 /// Encrypt a plaintext string using AES-256-GCM (same helper used for GitLab tokens).
 pub(super) fn encrypt_secret(plaintext: &str, key: &[u8; 32]) -> String {
-    use aes_gcm::aead::generic_array::GenericArray;
-    use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
-    use rand::RngCore;
+    use aes_gcm::aead::{Aead, Nonce};
+    use aes_gcm::{Aes256Gcm, KeyInit};
+    use rand::Rng;
 
-    let cipher = Aes256Gcm::new(GenericArray::from_slice(key));
+    let cipher = Aes256Gcm::new(&(*key).into());
     let mut nonce_bytes = [0u8; 12];
     rand::rng().fill_bytes(&mut nonce_bytes);
-    let nonce = GenericArray::from_slice(&nonce_bytes);
+    let nonce = Nonce::<Aes256Gcm>::from(nonce_bytes);
     let ciphertext = cipher
-        .encrypt(nonce, plaintext.as_bytes())
+        .encrypt(&nonce, plaintext.as_bytes())
         .expect("encryption failure");
     // Encode as nonce_hex:ciphertext_hex
     format!("{}:{}", hex::encode(nonce_bytes), hex::encode(ciphertext))
@@ -108,8 +106,8 @@ pub(super) fn encrypt_secret(plaintext: &str, key: &[u8; 32]) -> String {
 
 /// Decrypt a string encrypted with `encrypt_secret`.
 pub(super) fn decrypt_secret(encoded: &str, key: &[u8; 32]) -> Option<String> {
-    use aes_gcm::aead::generic_array::GenericArray;
-    use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
+    use aes_gcm::aead::{Aead, Nonce};
+    use aes_gcm::{Aes256Gcm, KeyInit};
 
     let parts: Vec<&str> = encoded.splitn(2, ':').collect();
     if parts.len() != 2 {
@@ -117,9 +115,10 @@ pub(super) fn decrypt_secret(encoded: &str, key: &[u8; 32]) -> Option<String> {
     }
     let nonce_bytes = hex::decode(parts[0]).ok()?;
     let ciphertext = hex::decode(parts[1]).ok()?;
-    let cipher = Aes256Gcm::new(GenericArray::from_slice(key));
-    let nonce = GenericArray::from_slice(&nonce_bytes);
-    let plaintext = cipher.decrypt(nonce, ciphertext.as_ref()).ok()?;
+    let cipher = Aes256Gcm::new(&(*key).into());
+    // A malformed nonce is rejected here instead of panicking.
+    let nonce = Nonce::<Aes256Gcm>::try_from(nonce_bytes.as_slice()).ok()?;
+    let plaintext = cipher.decrypt(&nonce, ciphertext.as_ref()).ok()?;
     String::from_utf8(plaintext).ok()
 }
 
@@ -138,22 +137,15 @@ pub(super) fn aes_key() -> [u8; 32] {
 
 /// Verify a 6-digit TOTP code against a base32 secret, allowing ±1 step skew.
 pub(super) fn verify_totp(secret_b32: &str, code: &str) -> bool {
-    use totp_rs::{Algorithm, Secret, TOTP};
-    let totp = match TOTP::new(
-        Algorithm::SHA1,
-        6,
-        1,
-        30,
-        Secret::Encoded(secret_b32.to_string())
-            .to_bytes()
-            .unwrap_or_default(),
-        None,
-        String::new(),
-    ) {
-        Ok(t) => t,
-        Err(_) => return false,
+    use totp_rs::{Builder, Secret};
+    let Ok(secret) = Secret::try_from_base32(secret_b32) else {
+        return false;
     };
-    totp.check_current(code).unwrap_or(false)
+    // Builder defaults: SHA1, 6 digits, ±1 step skew, 30 s steps.
+    let Ok(totp) = Builder::new().with_secret(secret).build() else {
+        return false;
+    };
+    totp.check_current(code).is_some()
 }
 
 /// Simple base32 encoding (RFC 4648, no padding) for TOTP secrets.
@@ -206,7 +198,7 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, header};
     use sha2::Digest;
     use sqlx::SqlitePool;
-    use totp_rs::{Algorithm, Secret, TOTP};
+    use totp_rs::{Builder, Secret};
 
     use super::*;
 
@@ -378,23 +370,45 @@ mod tests {
     }
 
     #[test]
+    fn verify_password_accepts_hash_from_argon2_0_5() {
+        // Generated with argon2 0.5.3, before the 0.6 upgrade: password hashes already
+        // stored in the users table must keep verifying.
+        let hash = "$argon2id$v=19$m=19456,t=2,p=1$086ZikNPOgNLQ7MpJbhgnQ$Br9v0kEEm/Gs0SC69qDZILv4n/fBzd04aU6xnSGnM1g";
+
+        assert!(verify_password("correct horse battery staple", hash));
+        assert!(!verify_password("wrong password", hash));
+    }
+
+    #[test]
+    fn decrypt_secret_reads_ciphertext_from_aes_gcm_0_10() {
+        // Produced by `encrypt_secret` on aes-gcm 0.10.3, before the 0.11 upgrade: encrypted
+        // TOTP secrets already stored in the database must keep decrypting.
+        let key = [b'0'; 32];
+        let encoded = "070707070707070707070707:81a84ff1a54a3069c8dc823c9f198cb131fa4ba901df6c841b79e5e7b45496b4";
+
+        assert_eq!(
+            decrypt_secret(encoded, &key).as_deref(),
+            Some("JBSWY3DPEHPK3PXP")
+        );
+    }
+
+    #[test]
+    fn decrypt_secret_rejects_malformed_nonce_without_panicking() {
+        let key = [b'0'; 32];
+
+        assert_eq!(decrypt_secret("0707:81a84ff1", &key), None);
+    }
+
+    #[test]
     fn verify_totp_accepts_current_code_for_valid_secret() {
         let secret_b32 = base32_encode(b"12345678901234567890");
-        let totp = TOTP::new(
-            Algorithm::SHA1,
-            6,
-            1,
-            30,
-            Secret::Encoded(secret_b32.clone())
-                .to_bytes()
-                .unwrap_or_else(|err| panic!("failed to decode base32 TOTP secret: {err}")),
-            None,
-            String::new(),
-        )
-        .unwrap_or_else(|err| panic!("failed to construct TOTP generator: {err}"));
-        let code = totp
-            .generate_current()
-            .unwrap_or_else(|err| panic!("failed to generate current TOTP code: {err}"));
+        let secret = Secret::try_from_base32(&secret_b32)
+            .unwrap_or_else(|err| panic!("failed to decode base32 TOTP secret: {err}"));
+        let totp = Builder::new()
+            .with_secret(secret)
+            .build()
+            .unwrap_or_else(|err| panic!("failed to construct TOTP generator: {err}"));
+        let code = totp.generate_current().to_string();
 
         assert!(
             verify_totp(&secret_b32, &code),
