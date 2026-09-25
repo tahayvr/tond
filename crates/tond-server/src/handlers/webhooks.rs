@@ -49,6 +49,7 @@ use tond_common::{ApiResponse, App, GitHubApp, GitLabToken, PreviewDeployment};
 
 use crate::{
     alerts, auth, deploy, docker,
+    domains::preview_host,
     error::AppError,
     handlers::{github_apps, gitlab_tokens},
     state::AppState,
@@ -362,13 +363,10 @@ async fn handle_gitlab_merge_request(
         None
     };
 
-    let dashboard_domain: Option<String> = {
+    // Previews are served only under the preview domain (see domains.rs).
+    let preview_domain: Option<String> = {
         let s = state.settings.read().await;
-        if s.dashboard_domain.is_empty() {
-            None
-        } else {
-            Some(s.dashboard_domain.clone())
-        }
+        Some(s.preview_domain.clone()).filter(|d| !d.is_empty())
     };
 
     match action.as_str() {
@@ -388,6 +386,13 @@ async fn handle_gitlab_merge_request(
                 );
                 return Ok((StatusCode::OK, Json(ApiResponse::<()>::ok(()))).into_response());
             }
+            let Some(ref preview_domain) = preview_domain else {
+                tracing::warn!(
+                    "[webhook/gitlab-mr/{}] skipping — no preview domain configured",
+                    app_id
+                );
+                return Ok((StatusCode::OK, Json(ApiResponse::<()>::ok(()))).into_response());
+            };
 
             // Expire any existing previews for this app+MR (best-effort).
             let existing: Vec<PreviewDeployment> = sqlx::query_as(
@@ -421,9 +426,7 @@ async fn handle_gitlab_merge_request(
             let now = chrono::Utc::now();
             let expires_at = (now + chrono::Duration::seconds(ttl_seconds)).to_rfc3339();
             let created_at = now.to_rfc3339();
-            let subdomain = dashboard_domain
-                .as_ref()
-                .map(|d| format!("{}-{}.{}", slug, app.name, d));
+            let subdomain = preview_host(&slug, &app.name, preview_domain);
             let preview_id = uuid::Uuid::new_v4().to_string();
 
             let insert = sqlx::query(
@@ -498,7 +501,7 @@ async fn handle_gitlab_merge_request(
                     id: preview_id.clone(),
                     app_id: app.id.clone(),
                     slug: slug.clone(),
-                    subdomain: subdomain.clone(),
+                    subdomain: Some(subdomain.clone()),
                     container_id: None,
                     host_port: None,
                     image_tag: None,
@@ -890,13 +893,10 @@ async fn handle_github_app_pull_request(
                 Some((owner, repo))
             });
 
-            let dashboard_domain: Option<String> = {
+            // Previews are served only under the preview domain (see domains.rs).
+            let preview_domain: Option<String> = {
                 let s = state.settings.read().await;
-                if s.dashboard_domain.is_empty() {
-                    None
-                } else {
-                    Some(s.dashboard_domain.clone())
-                }
+                Some(s.preview_domain.clone()).filter(|d| !d.is_empty())
             };
 
             let mut deployed = 0usize;
@@ -910,6 +910,13 @@ async fn handle_github_app_pull_request(
                     );
                     continue;
                 }
+                let Some(ref preview_domain) = preview_domain else {
+                    tracing::warn!(
+                        "[github-app-pr] skipping app {} — no preview domain configured",
+                        app.name
+                    );
+                    continue;
+                };
 
                 // Expire any existing previews for this app+PR (best-effort).
                 // Save the most recent comment_id so it can be carried over to the
@@ -950,9 +957,7 @@ async fn handle_github_app_pull_request(
                 let now = chrono::Utc::now();
                 let expires_at = (now + chrono::Duration::seconds(ttl_seconds)).to_rfc3339();
                 let created_at = now.to_rfc3339();
-                let subdomain = dashboard_domain
-                    .as_ref()
-                    .map(|d| format!("{}-{}.{}", slug, app.name, d));
+                let subdomain = preview_host(&slug, &app.name, preview_domain);
                 let preview_id = uuid::Uuid::new_v4().to_string();
 
                 let insert = sqlx::query(
@@ -1017,7 +1022,7 @@ async fn handle_github_app_pull_request(
                             id: preview_id.clone(),
                             app_id: app.id.clone(),
                             slug: slug.clone(),
-                            subdomain: subdomain.clone(),
+                            subdomain: Some(subdomain.clone()),
                             container_id: None,
                             host_port: None,
                             image_tag: None,

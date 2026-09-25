@@ -21,6 +21,17 @@ pub enum SettingsAction {
         /// Domain name (e.g. tond.example.com). Pass an empty string to clear.
         domain: String,
     },
+    /// Set the domain previews are served under (<slug>-<app>.<domain>)
+    ///
+    /// Must be a separate domain you own — not the dashboard domain, a parent
+    /// or subdomain of it, or anything on the same registrable domain — with a
+    /// wildcard DNS record *.<domain> pointing at this server. Previews run
+    /// pull-request code, so they must not share a site with the dashboard.
+    /// Previews cannot be enabled until this is set.
+    SetPreviewDomain {
+        /// Domain name (e.g. example-previews.com). Pass an empty string to clear.
+        domain: String,
+    },
 }
 
 /// Handle `tond settings [subcommand]`.
@@ -41,12 +52,18 @@ pub async fn handle(client: &TondClient, action: Option<SettingsAction>) -> Resu
             } else {
                 println!("dashboard-domain  {}", s.dashboard_domain);
             }
+            if s.preview_domain.is_empty() {
+                println!("preview-domain    (not set — previews disabled)");
+            } else {
+                println!("preview-domain    {}", s.preview_domain);
+            }
         }
         Some(SettingsAction::SetServerName { name }) => {
             let s = client
                 .update_settings(UpdateSettingsRequest {
                     server_name: Some(name.clone()),
                     dashboard_domain: None,
+                    preview_domain: None,
                 })
                 .await?;
             if name.is_empty() {
@@ -60,6 +77,7 @@ pub async fn handle(client: &TondClient, action: Option<SettingsAction>) -> Resu
                 .update_settings(UpdateSettingsRequest {
                     server_name: None,
                     dashboard_domain: Some(domain.clone()),
+                    preview_domain: None,
                 })
                 .await?;
             if domain.is_empty() {
@@ -67,6 +85,24 @@ pub async fn handle(client: &TondClient, action: Option<SettingsAction>) -> Resu
             } else {
                 println!("dashboard-domain set to: {}", s.dashboard_domain);
                 println!("tond-proxy will pick up the change within 5 seconds.");
+            }
+        }
+        Some(SettingsAction::SetPreviewDomain { domain }) => {
+            let s = client
+                .update_settings(UpdateSettingsRequest {
+                    server_name: None,
+                    dashboard_domain: None,
+                    preview_domain: Some(domain.clone()),
+                })
+                .await?;
+            if domain.is_empty() {
+                println!("preview-domain cleared. New previews are refused until one is set.");
+            } else {
+                println!("preview-domain set to: {}", s.preview_domain);
+                println!(
+                    "Point a wildcard DNS record *.{} at this server.",
+                    s.preview_domain
+                );
             }
         }
     }

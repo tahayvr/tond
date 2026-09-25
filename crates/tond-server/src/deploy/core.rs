@@ -972,7 +972,7 @@ pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> R
 ///   4. Insert a `preview_deployments` row and update it once the container is running.
 ///
 /// The caller must provide the `slug` (short random hex) and the `ttl_hours`.
-/// The `subdomain` is set by the caller after reading the dashboard domain from settings.
+/// The `subdomain` (under the preview domain) is set by the caller; see domains::preview_host.
 pub async fn deploy_preview(
     state: &AppState,
     app: &App,
