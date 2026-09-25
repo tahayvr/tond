@@ -10,7 +10,7 @@
 //   Every request flows through the Axum router defined here. Protected
 //   routes require two extractors in the handler signature:
 //     _rate: RateLimit   — per-IP token bucket, 60 req burst / 10 req/s
-//     _auth: RequireAuth — Bearer token OR session cookie
+//     _auth: RequireAuth — local Unix socket, Bearer token OR session cookie
 //
 // Route groups:
 //   /health              — public liveness probe
@@ -26,6 +26,15 @@
 //   TOND_BIND          — bind address (default: 127.0.0.1)
 //   TOND_PORT          — port (default: 3001)
 //   TOND_DASHBOARD_DIR — path to the built SvelteKit SPA (default: ./dashboard)
+//   TOND_SOCKET_PATH   — local Unix socket for the CLI (default: tond.sock next
+//                        to TOND_DB_PATH, i.e. /opt/tond/data/tond.sock)
+//
+// Listeners:
+//   The same router is served on two listeners. TCP (TOND_BIND:TOND_PORT) is
+//   what tond-proxy forwards dashboard traffic to, so it gets no implicit trust.
+//   The Unix socket (mode 0600) is for the `tond` CLI on the host; its router
+//   adds the `LocalSocket` extension, which RequireAuth accepts in place of
+//   credentials.
 
 mod alerts;
 mod audit_log;
@@ -43,9 +52,12 @@ mod notifications;
 mod state;
 mod storage;
 
-use anyhow::Result;
+use std::future::IntoFuture;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
 use axum::{
-    Router,
+    Extension, Router,
     routing::{delete, get, post, put},
 };
 use tower_http::cors::CorsLayer;
@@ -587,16 +599,68 @@ async fn main() -> Result<()> {
     let bind = std::env::var("TOND_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
     let port = std::env::var("TOND_PORT").unwrap_or_else(|_| "3001".to_string());
     let addr = format!("{}:{}", bind, port);
-    tracing::info!("Tond listening on {}", addr);
+    let socket_path = local_socket_path();
+    tracing::info!("Tond listening on {} and {}", addr, socket_path.display());
 
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await?;
+    let tcp_listener = tokio::net::TcpListener::bind(&addr).await?;
+    let unix_listener = bind_local_socket(&socket_path)?;
+
+    let tcp = axum::serve(
+        tcp_listener,
+        app.clone()
+            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    );
+    let local = axum::serve(
+        unix_listener,
+        app.layer(Extension(auth::LocalSocket)).into_make_service(),
+    );
+    tokio::try_join!(tcp.into_future(), local.into_future())?;
 
     Ok(())
+}
+
+/// Path of the CLI's Unix socket: `TOND_SOCKET_PATH`, else `tond.sock` next to the DB.
+fn local_socket_path() -> PathBuf {
+    if let Ok(path) = std::env::var("TOND_SOCKET_PATH") {
+        return PathBuf::from(path);
+    }
+    let db_path =
+        std::env::var("TOND_DB_PATH").unwrap_or_else(|_| "/opt/tond/data/tond.db".to_string());
+    Path::new(&db_path).with_file_name("tond.sock")
+}
+
+/// Bind the CLI's Unix socket and restrict it to the owner (root in production).
+///
+/// Requests on this socket skip authentication, so its permissions are the
+/// credential. The socket is created with the process umask (0755 under the
+/// default 022) before the chmod; connecting needs write permission, so other
+/// users can't connect in that window either.
+fn bind_local_socket(path: &Path) -> Result<tokio::net::UnixListener> {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating socket directory {}", parent.display()))?;
+    }
+
+    // A socket left over from a previous run makes bind fail with EADDRINUSE.
+    // Only remove it if it really is a socket, never some other file.
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(path)
+            .with_context(|| format!("removing stale socket {}", path.display()))?,
+        Ok(_) => anyhow::bail!(
+            "{} exists and is not a socket; refusing to replace it",
+            path.display()
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("inspecting {}", path.display())),
+    }
+
+    let listener = tokio::net::UnixListener::bind(path)
+        .with_context(|| format!("binding Unix socket {}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("restricting permissions on {}", path.display()))?;
+    Ok(listener)
 }
 
 // ── Preview cleanup ──
@@ -642,6 +706,7 @@ async fn run_preview_cleanup(state: &AppState) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
     use std::sync::Arc;
 
     use bollard::{API_DEFAULT_VERSION, Docker};
@@ -651,6 +716,60 @@ mod tests {
 
     use super::*;
     use crate::{auth::RateLimiter, state::AppState};
+
+    #[tokio::test]
+    async fn bind_local_socket_creates_owner_only_socket() {
+        let dir =
+            tempfile::tempdir().unwrap_or_else(|err| panic!("failed to create temp dir: {err}"));
+        let path = dir.path().join("nested").join("tond.sock");
+
+        let _listener = bind_local_socket(&path)
+            .unwrap_or_else(|err| panic!("failed to bind local socket: {err}"));
+
+        let meta = std::fs::metadata(&path)
+            .unwrap_or_else(|err| panic!("socket should exist after bind: {err}"));
+        assert!(meta.file_type().is_socket());
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o600,
+            "the unauthenticated CLI socket must be owner-only"
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_local_socket_replaces_stale_socket() {
+        let dir =
+            tempfile::tempdir().unwrap_or_else(|err| panic!("failed to create temp dir: {err}"));
+        let path = dir.path().join("tond.sock");
+
+        drop(
+            bind_local_socket(&path)
+                .unwrap_or_else(|err| panic!("failed to bind first socket: {err}")),
+        );
+        // The socket file outlives its listener, as after a crash or restart.
+        assert!(path.exists());
+
+        assert!(
+            bind_local_socket(&path).is_ok(),
+            "a stale socket from a previous run should be replaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_local_socket_refuses_to_replace_regular_file() {
+        let dir =
+            tempfile::tempdir().unwrap_or_else(|err| panic!("failed to create temp dir: {err}"));
+        let path = dir.path().join("tond.sock");
+        std::fs::write(&path, "not a socket")
+            .unwrap_or_else(|err| panic!("failed to write file: {err}"));
+
+        assert!(bind_local_socket(&path).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).ok().as_deref(),
+            Some("not a socket"),
+            "a regular file at the socket path must be left untouched"
+        );
+    }
 
     async fn test_state() -> AppState {
         let db = SqlitePool::connect("sqlite::memory:")

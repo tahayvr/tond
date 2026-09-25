@@ -168,7 +168,7 @@ mod tests {
     use std::sync::Arc;
 
     use axum::{
-        extract::{FromRequestParts, connect_info::MockConnectInfo},
+        extract::FromRequestParts,
         http::{HeaderValue, header},
     };
     use bollard::{API_DEFAULT_VERSION, Docker};
@@ -361,11 +361,6 @@ mod tests {
             HeaderValue::from_str(&format!("tond_session={session_token}"))
                 .unwrap_or_else(|err| panic!("failed to build session cookie header: {err}")),
         );
-        parts.extensions.insert(MockConnectInfo(
-            "198.51.100.10:12345"
-                .parse::<std::net::SocketAddr>()
-                .unwrap_or_else(|err| panic!("failed to parse mock client addr: {err}")),
-        ));
 
         RequireAuth::from_request_parts(&mut parts, state)
             .await

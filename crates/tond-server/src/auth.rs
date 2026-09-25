@@ -21,7 +21,7 @@
 pub mod extractor;
 pub mod rate_limit;
 
-pub use extractor::RequireAuth;
+pub use extractor::{LocalPeer, LocalSocket, RequireAuth};
 pub use rate_limit::{RateLimit, RateLimiter};
 
 use anyhow::Result;

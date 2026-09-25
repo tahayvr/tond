@@ -150,5 +150,10 @@ VITE_MOCK_API=true          # start MSW service worker to intercept /api request
   transactions or WAL-mode changes that could block both processes.
 - The dashboard is a **fully static SPA** (`ssr = false`, `prerender = false` in
   `+layout.ts`). There is no SSR — never add server-side load functions.
+- **Never trust a request because it comes from 127.0.0.1.** `tond-proxy` forwards internet
+  traffic to `tond-server` over loopback TCP, so a loopback peer can be anyone. The only
+  credential-free path is the root-only Unix socket (`TOND_SOCKET_PATH`), marked by the
+  `LocalSocket` request extension that only the socket listener adds (see
+  `crates/tond-server/src/auth/extractor.rs`). Never derive trust from a header either.
 - `tond-proxy` opens a fresh DB connection every 5s to poll for cert/route updates;
   do not refactor this without considering the two-process architecture.

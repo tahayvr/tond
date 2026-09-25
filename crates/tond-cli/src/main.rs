@@ -4,12 +4,15 @@
 // communicates with tond-server entirely over HTTP using the typed
 // TondClient in client.rs.
 //
-// Authentication:
-//   No credentials required. The CLI is intended to be run on the same
-//   machine as tond-server (via SSH). The server listens on 127.0.0.1:3001
-//   and trusts all loopback connections unconditionally.
+// Connection and authentication:
+//   By default the CLI talks to tond-server over its local Unix socket
+//   (--socket / TOND_SOCKET_PATH, default /opt/tond/data/tond.sock). The socket
+//   is root-only (0600) and requests on it need no credentials, so run the CLI
+//   on the server as root (e.g. over SSH).
+//   To reach a server over HTTP(S) instead, pass --server / TOND_SERVER and an
+//   API key via --api-key / TOND_API_KEY. Loopback TCP is not trusted.
 //
-// Command summary (all use --server / TOND_SERVER, default localhost:3001):
+// Command summary:
 //   apps <subcommand>              — manage apps (list/create/deploy/push/info/logs/…)
 //   projects <subcommand>          — manage projects (list/create/info/delete/deploy/assign)
 //   db <subcommand>                — manage databases (list/create/info/delete/stop/start)
@@ -21,6 +24,8 @@
 
 mod client;
 mod commands;
+
+use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -34,14 +39,22 @@ use commands::{
 #[derive(Parser)]
 #[command(name = "tond", about = "Tond CLI - Deploy apps with ease", version)]
 struct Cli {
-    /// Server URL to connect to (overrides TOND_SERVER env var)
+    /// Server URL to connect to over HTTP(S) instead of the local socket (requires --api-key)
+    #[arg(long, global = true, env = "TOND_SERVER")]
+    server: Option<String>,
+
+    /// API key for --server connections
+    #[arg(long, global = true, env = "TOND_API_KEY", hide_env_values = true)]
+    api_key: Option<String>,
+
+    /// Path to tond-server's local Unix socket (used when --server is not set)
     #[arg(
         long,
         global = true,
-        env = "TOND_SERVER",
-        default_value = "http://localhost:3001"
+        env = "TOND_SOCKET_PATH",
+        default_value = tond_common::DEFAULT_SOCKET_PATH
     )]
-    server: String,
+    socket: PathBuf,
 
     #[command(subcommand)]
     command: Commands,
@@ -129,15 +142,21 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let client = TondClient::new(&cli.server, None);
+
+    // Connect lazily: `scanner` and `update` don't use the API, so they must work
+    // without a reachable server.
+    let connect = || match cli.server.as_deref() {
+        Some(url) => Ok(TondClient::new(url, cli.api_key.as_deref())),
+        None => TondClient::local(&cli.socket),
+    };
 
     match cli.command {
-        Commands::Apps { action } => commands::apps::handle(&client, action).await?,
-        Commands::Projects { action } => commands::projects::handle(&client, action).await?,
-        Commands::Db { action } => commands::db::handle(&client, action).await?,
-        Commands::Cron { action } => commands::cron::handle(&client, action).await?,
+        Commands::Apps { action } => commands::apps::handle(&connect()?, action).await?,
+        Commands::Projects { action } => commands::projects::handle(&connect()?, action).await?,
+        Commands::Db { action } => commands::db::handle(&connect()?, action).await?,
+        Commands::Cron { action } => commands::cron::handle(&connect()?, action).await?,
         Commands::Integrations { action } => {
-            commands::integrations::handle(&client, action).await?
+            commands::integrations::handle(&connect()?, action).await?
         }
         Commands::Scanner { action } => commands::scanner::handle(action).await?,
 
@@ -148,12 +167,12 @@ async fn main() -> Result<()> {
             force,
         } => commands::update::handle(version, dry_run, skip_backup, force)?,
 
-        Commands::Settings { action } => commands::settings::handle(&client, action).await?,
+        Commands::Settings { action } => commands::settings::handle(&connect()?, action).await?,
         Commands::StorageProvider { action } => {
-            commands::storage_providers::handle(&client, action).await?
+            commands::storage_providers::handle(&connect()?, action).await?
         }
-        Commands::Snapshot { action } => commands::snapshots::handle(&client, action).await?,
-        Commands::Passwd => commands::settings::handle_passwd(&client).await?,
+        Commands::Snapshot { action } => commands::snapshots::handle(&connect()?, action).await?,
+        Commands::Passwd => commands::settings::handle_passwd(&connect()?).await?,
     }
 
     Ok(())
@@ -171,8 +190,13 @@ mod tests {
             .unwrap_or_else(|err| panic!("failed to parse apps list command: {err}"));
 
         assert_eq!(
-            cli.server, "http://localhost:3001",
-            "CLI should default the server URL to the local API endpoint"
+            cli.server, None,
+            "CLI should default to the local Unix socket rather than a server URL"
+        );
+        assert_eq!(
+            cli.socket,
+            PathBuf::from(tond_common::DEFAULT_SOCKET_PATH),
+            "CLI should default to the standard socket path"
         );
         assert!(
             matches!(
@@ -193,7 +217,8 @@ mod tests {
             });
 
         assert_eq!(
-            cli.server, "https://tond.example.com",
+            cli.server.as_deref(),
+            Some("https://tond.example.com"),
             "CLI should honor the explicit --server override"
         );
         assert!(

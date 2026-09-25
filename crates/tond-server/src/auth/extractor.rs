@@ -8,11 +8,14 @@
 //
 // Authentication is accepted via three methods, tried in order:
 //
-//   1. Loopback peer address (CLI on the same machine)
-//      If the TCP connection originates from 127.0.0.1 or ::1, the
-//      request is unconditionally trusted. The server only listens on
-//      127.0.0.1:3001, so this address can never arrive from outside the
-//      machine — SSH access is the implicit credential.
+//   1. Local Unix socket (CLI on the same machine)
+//      Requests accepted on the server's Unix socket (TOND_SOCKET_PATH,
+//      mode 0600, owned by root) carry the `LocalSocket` extension and are
+//      trusted without credentials — root on the host is the credential.
+//      TCP connections are never trusted this way, not even from
+//      127.0.0.1: tond-proxy forwards internet traffic to the server over
+//      loopback TCP, so a loopback peer address says nothing about who the
+//      caller is.
 //
 //   2. Bearer token (API key / programmatic access)
 //      Reads the Authorization header. If it starts with "Bearer ",
@@ -26,11 +29,11 @@
 //
 // If no method succeeds, returns 401.
 
-use std::net::SocketAddr;
+use std::convert::Infallible;
 
 use axum::{
     Json,
-    extract::{ConnectInfo, FromRequestParts},
+    extract::FromRequestParts,
     http::{StatusCode, header, request::Parts},
 };
 use tond_common::ApiResponse;
@@ -38,8 +41,27 @@ use tond_common::ApiResponse;
 use crate::handlers::auth::{extract_session_token, validate_session};
 use crate::state::AppState;
 
+/// Request extension marking a request accepted on the local Unix socket.
+///
+/// Only the Unix-socket listener in `main.rs` inserts it (as a router layer), so
+/// it can't be set by a client — unlike a header, which any TCP caller could forge.
+#[derive(Clone, Copy, Debug)]
+pub struct LocalSocket;
+
+/// Extractor reporting whether the request arrived on the local Unix socket.
+/// Used by WebSocket handlers that authenticate inside the upgraded socket.
+pub struct LocalPeer(pub bool);
+
+impl<S: Send + Sync> FromRequestParts<S> for LocalPeer {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(LocalPeer(parts.extensions.get::<LocalSocket>().is_some()))
+    }
+}
+
 /// Extractor that validates authentication via:
-/// 1. Loopback peer IP (127.0.0.1 / ::1) — CLI on the same machine, no credentials needed
+/// 1. The local Unix socket (`LocalSocket` extension) — CLI on the same machine, no credentials needed
 /// 2. `Authorization: Bearer <api-key>` header
 /// 3. `tond_session` cookie (dashboard browser sessions)
 ///
@@ -88,13 +110,8 @@ impl FromRequestParts<AppState> for RequireAuth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        // Try 1: loopback — trust any connection from 127.0.0.1 or ::1.
-        // The server only binds to 127.0.0.1:3001, so this can never be
-        // spoofed from outside the machine.
-        if let Ok(ConnectInfo(addr)) =
-            ConnectInfo::<SocketAddr>::from_request_parts(parts, state).await
-            && addr.ip().is_loopback()
-        {
+        // Try 1: local Unix socket (see module docs for why loopback TCP isn't trusted).
+        if parts.extensions.get::<LocalSocket>().is_some() {
             return Ok(RequireAuth);
         }
 
@@ -129,7 +146,103 @@ impl FromRequestParts<AppState> for RequireAuth {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use axum::extract::connect_info::MockConnectInfo;
+    use bollard::{API_DEFAULT_VERSION, Docker};
+    use sqlx::SqlitePool;
+    use tokio::sync::RwLock;
+    use tond_common::ServerSettings;
+
     use super::*;
+    use crate::auth::RateLimiter;
+
+    async fn test_state() -> AppState {
+        let db = SqlitePool::connect("sqlite::memory:")
+            .await
+            .unwrap_or_else(|err| panic!("failed to create in-memory SQLite pool: {err}"));
+        crate::db::migrate(&db)
+            .await
+            .unwrap_or_else(|err| panic!("failed to run migrations for extractor tests: {err}"));
+
+        AppState {
+            db,
+            docker: Docker::connect_with_http("http://127.0.0.1:2375", 5, API_DEFAULT_VERSION)
+                .unwrap_or_else(|err| panic!("failed to construct Docker client: {err}")),
+            rate_limiter: RateLimiter::new(60, 10.0),
+            settings: Arc::new(RwLock::new(ServerSettings::default())),
+        }
+    }
+
+    fn request_parts() -> Parts {
+        axum::http::Request::builder()
+            .uri("/api/apps")
+            .body(())
+            .unwrap_or_else(|err| panic!("failed to build test request: {err}"))
+            .into_parts()
+            .0
+    }
+
+    #[tokio::test]
+    async fn loopback_tcp_peer_without_credentials_is_rejected() {
+        // tond-proxy forwards internet traffic to tond-server over loopback TCP, so a
+        // 127.0.0.1 peer must never be trusted on its own.
+        let state = test_state().await;
+        let mut parts = request_parts();
+        parts.extensions.insert(MockConnectInfo(
+            "127.0.0.1:54321"
+                .parse::<std::net::SocketAddr>()
+                .unwrap_or_else(|err| panic!("failed to parse loopback addr: {err}")),
+        ));
+
+        let rejection = RequireAuth::from_request_parts(&mut parts, &state)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("a loopback peer without credentials must be rejected"));
+        assert_eq!(rejection.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn local_socket_requests_are_trusted_without_credentials() {
+        let state = test_state().await;
+        let mut parts = request_parts();
+        parts.extensions.insert(LocalSocket);
+
+        assert!(
+            RequireAuth::from_request_parts(&mut parts, &state)
+                .await
+                .is_ok(),
+            "requests on the local Unix socket should not need credentials"
+        );
+        assert!(
+            LocalPeer::from_request_parts(&mut parts, &state)
+                .await
+                .is_ok_and(|LocalPeer(local)| local),
+            "LocalPeer should report requests carrying the LocalSocket extension"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_socket_header_cannot_be_forged() {
+        // Only the Unix-socket router can set the extension; headers are client-controlled.
+        let state = test_state().await;
+        let mut parts = request_parts();
+        parts.headers.insert(
+            "x-tond-local-socket",
+            axum::http::HeaderValue::from_static("1"),
+        );
+
+        assert!(
+            RequireAuth::from_request_parts(&mut parts, &state)
+                .await
+                .is_err()
+        );
+        assert!(
+            LocalPeer::from_request_parts(&mut parts, &state)
+                .await
+                .is_ok_and(|LocalPeer(local)| !local)
+        );
+    }
 
     #[test]
     fn bearer_result_helper_maps_success_invalid_and_internal_error() {

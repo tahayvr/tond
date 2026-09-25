@@ -480,7 +480,8 @@ print_summary() {
     fi
 
     # Get root API key
-    local root_key=$(journalctl -u tond-server --no-pager | grep -A 1 "ROOT API KEY" | tail -1 | tr -d ' ')
+    # The key line is a tracing log line (timestamp, level, target); keep only the 64-hex key.
+    local root_key=$(journalctl -u tond-server --no-pager | grep -A 1 "ROOT API KEY" | tail -1 | grep -oE '[0-9a-f]{64}')
     if [[ -n "$root_key" ]]; then
         echo -e "${YELLOW}${BOLD}Root API Key (advanced / automation access):${NC}"
         echo "  $root_key"
@@ -511,7 +512,7 @@ print_summary() {
     echo ""
 
     echo -e "${BOLD}CLI Commands:${NC}"
-    echo "  tond --help          Show all commands"
+    echo "  tond --help          Show all commands (run as root: the CLI uses the root-only socket)"
     echo "  tond apps create my-app --source https://github.com/you/your-app"
     echo ""
 

@@ -16,3 +16,8 @@ pub mod models;
 
 pub use errors::*;
 pub use models::*;
+
+/// Default path of tond-server's local Unix socket (the sibling of the default
+/// database path). The `tond` CLI connects here; requests on this socket are
+/// trusted without credentials, so it is created with mode 0600 (root only).
+pub const DEFAULT_SOCKET_PATH: &str = "/opt/tond/data/tond.sock";

@@ -23,8 +23,8 @@
 //     {"type":"deploy","app_id":"...","app_name":"...","level":"...","message":"...","ts":"..."}
 //     {"type":"container","app_id":"...","app_name":"...","line":"..."}
 //
-// Authentication (both endpoints): `?token=<api-key>` query param or
-// `tond_session` cookie. Close code 4001 on failure.
+// Authentication (both endpoints): the local Unix socket (CLI on the host),
+// `?token=<api-key>` query param, or `tond_session` cookie. Close code 4001 on failure.
 
 use axum::{
     extract::{
@@ -41,7 +41,8 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::{
-    auth, docker,
+    auth::{self, LocalPeer},
+    docker,
     handlers::auth::{extract_session_token, validate_session},
     state::AppState,
 };
@@ -83,8 +84,9 @@ pub async fn stream_logs(
     Path(id): Path<String>,
     Query(query): Query<LogStreamQuery>,
     headers: HeaderMap,
+    LocalPeer(local): LocalPeer,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state, id, query, headers))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, id, query, headers, local))
 }
 
 async fn handle_socket(
@@ -93,9 +95,10 @@ async fn handle_socket(
     id: String,
     query: LogStreamQuery,
     headers: HeaderMap,
+    local: bool,
 ) {
     // ── Authenticate ──
-    let authed = authenticate(&state, &query, &headers).await;
+    let authed = authenticate(&state, &query, &headers, local).await;
     if !authed {
         // Close with application error code
         let _ = socket
@@ -311,8 +314,9 @@ pub async fn stream_system_logs(
     State(state): State<AppState>,
     Query(query): Query<LogStreamQuery>,
     headers: HeaderMap,
+    LocalPeer(local): LocalPeer,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_system_socket(socket, state, query, headers))
+    ws.on_upgrade(move |socket| handle_system_socket(socket, state, query, headers, local))
 }
 
 async fn handle_system_socket(
@@ -320,9 +324,10 @@ async fn handle_system_socket(
     state: AppState,
     query: LogStreamQuery,
     headers: HeaderMap,
+    local: bool,
 ) {
     // ── Authenticate ──
-    let authed = authenticate(&state, &query, &headers).await;
+    let authed = authenticate(&state, &query, &headers, local).await;
     if !authed {
         let _ = socket
             .send(Message::Close(Some(axum::extract::ws::CloseFrame {
@@ -550,8 +555,9 @@ pub async fn stream_all_database_logs(
     State(state): State<AppState>,
     Query(query): Query<LogStreamQuery>,
     headers: HeaderMap,
+    LocalPeer(local): LocalPeer,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_all_databases_socket(socket, state, query, headers))
+    ws.on_upgrade(move |socket| handle_all_databases_socket(socket, state, query, headers, local))
 }
 
 async fn handle_all_databases_socket(
@@ -559,9 +565,10 @@ async fn handle_all_databases_socket(
     state: AppState,
     query: LogStreamQuery,
     headers: HeaderMap,
+    local: bool,
 ) {
     // ── Authenticate ──
-    let authed = authenticate(&state, &query, &headers).await;
+    let authed = authenticate(&state, &query, &headers, local).await;
     if !authed {
         let _ = socket
             .send(Message::Close(Some(axum::extract::ws::CloseFrame {
@@ -701,8 +708,9 @@ pub async fn stream_database_logs(
     Path(id): Path<String>,
     Query(query): Query<LogStreamQuery>,
     headers: HeaderMap,
+    LocalPeer(local): LocalPeer,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_database_socket(socket, state, id, query, headers))
+    ws.on_upgrade(move |socket| handle_database_socket(socket, state, id, query, headers, local))
 }
 
 async fn handle_database_socket(
@@ -711,9 +719,10 @@ async fn handle_database_socket(
     id: String,
     query: LogStreamQuery,
     headers: HeaderMap,
+    local: bool,
 ) {
     // ── Authenticate ──
-    let authed = authenticate(&state, &query, &headers).await;
+    let authed = authenticate(&state, &query, &headers, local).await;
     if !authed {
         let _ = socket
             .send(Message::Close(Some(axum::extract::ws::CloseFrame {
@@ -807,8 +816,18 @@ async fn handle_database_socket(
     }
 }
 
-/// Returns true if the request carries valid authentication.
-async fn authenticate(state: &AppState, query: &LogStreamQuery, headers: &HeaderMap) -> bool {
+/// Returns true if the request carries valid authentication. `local` is true for
+/// requests accepted on the trusted local Unix socket (the CLI on the host).
+async fn authenticate(
+    state: &AppState,
+    query: &LogStreamQuery,
+    headers: &HeaderMap,
+    local: bool,
+) -> bool {
+    if local {
+        return true;
+    }
+
     // Try Bearer token from query param (?token=...)
     if let Some(ref raw_key) = query.token {
         return matches!(auth::validate_key(&state.db, raw_key).await, Ok(Some(_)));
@@ -842,8 +861,9 @@ pub async fn stream_cron_runs(
     Path(id): Path<String>,
     Query(query): Query<LogStreamQuery>,
     headers: HeaderMap,
+    LocalPeer(local): LocalPeer,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_cron_socket(socket, state, id, query, headers))
+    ws.on_upgrade(move |socket| handle_cron_socket(socket, state, id, query, headers, local))
 }
 
 async fn handle_cron_socket(
@@ -852,9 +872,10 @@ async fn handle_cron_socket(
     id: String,
     query: LogStreamQuery,
     headers: HeaderMap,
+    local: bool,
 ) {
     // ── Authenticate ──
-    let authed = authenticate(&state, &query, &headers).await;
+    let authed = authenticate(&state, &query, &headers, local).await;
     if !authed {
         let _ = socket
             .send(Message::Close(Some(axum::extract::ws::CloseFrame {

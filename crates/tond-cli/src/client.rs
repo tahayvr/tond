@@ -15,6 +15,11 @@
 //   The server extracts the tarball, builds it, and deploys. The temp tarball
 //   is cleaned up locally after the upload.
 //
+// Transports:
+//   TondClient::local(socket) talks to tond-server over its root-only Unix
+//   socket, where no credentials are needed (the CLI's default).
+//   TondClient::new(url, api_key) talks HTTP(S) and sends the API key.
+//
 // stream_logs():
 //   Opens a WebSocket to GET /api/apps/{id}/logs/stream?token=<key> and
 //   prints each JSON message as a human-readable line until the server
@@ -23,6 +28,8 @@
 // All other methods are straightforward REST wrappers:
 //   list_apps, create_app, get_app, deploy_app, action (stop/start/restart),
 //   delete_app, get_logs, update_env, update_domain.
+
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
@@ -40,15 +47,55 @@ pub struct TondClient {
     base_url: String,
     client: reqwest::Client,
     api_key: Option<String>,
+    /// Set when talking to tond-server over its local Unix socket.
+    socket_path: Option<PathBuf>,
 }
 
+/// Host used in request URLs sent over the Unix socket (the socket, not DNS, picks the peer).
+const LOCAL_BASE_URL: &str = "http://localhost";
+
 impl TondClient {
+    /// Client for a server reached over HTTP(S), authenticated with `api_key`.
     pub fn new(base_url: &str, api_key: Option<&str>) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             client: reqwest::Client::new(),
             api_key: api_key.map(|s| s.to_string()),
+            socket_path: None,
         }
+    }
+
+    /// Client for the tond-server on this machine, via its root-only Unix socket.
+    pub fn local(socket_path: &Path) -> Result<Self> {
+        // Probe the socket first so a missing server or missing root privileges
+        // produce an actionable message instead of a generic request error.
+        if let Err(err) = std::os::unix::net::UnixStream::connect(socket_path) {
+            let hint = "Run the CLI on the Tond server as root, or connect remotely with \
+                        --server <url> --api-key <key>.";
+            return Err(match err.kind() {
+                std::io::ErrorKind::NotFound => anyhow::anyhow!(
+                    "tond-server socket not found at {}. Is tond-server running? {hint}",
+                    socket_path.display()
+                ),
+                std::io::ErrorKind::PermissionDenied => anyhow::anyhow!(
+                    "permission denied on {} (the socket is root-only). {hint}",
+                    socket_path.display()
+                ),
+                _ => anyhow::Error::new(err)
+                    .context(format!("connecting to {}", socket_path.display())),
+            });
+        }
+
+        let client = reqwest::Client::builder()
+            .unix_socket(socket_path)
+            .build()
+            .context("building Unix socket HTTP client")?;
+        Ok(Self {
+            base_url: LOCAL_BASE_URL.to_string(),
+            client,
+            api_key: None,
+            socket_path: Some(socket_path.to_path_buf()),
+        })
     }
 
     /// Add the Authorization header if an API key is configured.
@@ -287,9 +334,23 @@ impl TondClient {
         let token = self.api_key.as_deref().unwrap_or("");
         let url = self.ws_url(&format!("/api/apps/{}/logs/stream?token={}", id, token));
 
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&url)
-            .await
-            .context("Failed to connect to log stream")?;
+        let ws_stream = match &self.socket_path {
+            Some(socket_path) => {
+                let stream = tokio::net::UnixStream::connect(socket_path)
+                    .await
+                    .context("Failed to connect to log stream")?;
+                let (ws, _) = tokio_tungstenite::client_async(url.as_str(), stream)
+                    .await
+                    .context("Failed to connect to log stream")?;
+                futures::future::Either::Left(ws)
+            }
+            None => {
+                let (ws, _) = tokio_tungstenite::connect_async(&url)
+                    .await
+                    .context("Failed to connect to log stream")?;
+                futures::future::Either::Right(ws)
+            }
+        };
 
         let (_, mut read) = ws_stream.split();
 
@@ -1406,6 +1467,65 @@ mod tests {
             request_without_key.headers().get("authorization"),
             None,
             "auth_header should leave requests untouched when no API key is configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_client_talks_to_server_over_unix_socket_without_api_key() {
+        let dir =
+            tempfile::tempdir().unwrap_or_else(|err| panic!("failed to create temp dir: {err}"));
+        let socket_path = dir.path().join("tond.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path)
+            .unwrap_or_else(|err| panic!("failed to bind test Unix socket: {err}"));
+        let state = CaptureState::default();
+        let router = Router::new()
+            .route(
+                "/api/apps",
+                get(
+                    |State(state): State<CaptureState>, headers: HeaderMap| async move {
+                        *state.auth_header.lock().await = headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
+                        axum::Json(json!({ "success": true, "data": [], "error": null }))
+                    },
+                ),
+            )
+            .with_state(state.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .unwrap_or_else(|err| panic!("test server failed: {err}"));
+        });
+
+        let client = TondClient::local(&socket_path)
+            .unwrap_or_else(|err| panic!("expected local client to connect: {err}"));
+        let apps = client
+            .list_apps()
+            .await
+            .unwrap_or_else(|err| panic!("expected list_apps over the socket to succeed: {err}"));
+
+        assert!(apps.is_empty());
+        assert_eq!(
+            *state.auth_header.lock().await,
+            None,
+            "the local socket client should not send credentials"
+        );
+    }
+
+    #[test]
+    fn local_client_reports_missing_socket() {
+        let dir =
+            tempfile::tempdir().unwrap_or_else(|err| panic!("failed to create temp dir: {err}"));
+        let socket_path = dir.path().join("missing.sock");
+
+        let error = TondClient::local(&socket_path)
+            .err()
+            .unwrap_or_else(|| panic!("connecting to a missing socket should fail"));
+
+        assert!(
+            error.to_string().contains("socket not found"),
+            "a missing socket should produce an actionable message, got: {error}"
         );
     }
 
