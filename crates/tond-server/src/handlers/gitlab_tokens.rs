@@ -37,7 +37,7 @@ use tond_common::{
 use uuid::Uuid;
 
 use crate::{
-    auth::{RateLimit, RequireAuth},
+    auth::{RateLimit, RequireAdmin, RequireAuth},
     error::AppError,
     secret_key::{self, Purpose},
     state::AppState,
@@ -62,7 +62,7 @@ pub async fn list_gitlab_tokens(
 /// POST /api/gitlab-tokens
 pub async fn create_gitlab_token(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Json(payload): Json<CreateGitLabTokenRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -152,7 +152,7 @@ pub async fn create_gitlab_token(
 /// DELETE /api/gitlab-tokens/{id}
 pub async fn delete_gitlab_token(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Path(token_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -341,7 +341,7 @@ pub async fn list_gitlab_branches(
 /// Attach or detach a GitLab token from an app.
 pub async fn set_app_gitlab_token(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Path(app_id): Path<String>,
     Json(payload): Json<SetGitLabTokenRequest>,
@@ -684,7 +684,7 @@ mod tests {
 
         let response = set_app_gitlab_token(
             crate::auth::rate_limit::RateLimit,
-            crate::auth::RequireAuth,
+            crate::auth::RequireAdmin,
             State(state.clone()),
             Path("app-1".to_string()),
             Json(SetGitLabTokenRequest {
@@ -705,7 +705,7 @@ mod tests {
 
         let response = set_app_gitlab_token(
             crate::auth::rate_limit::RateLimit,
-            crate::auth::RequireAuth,
+            crate::auth::RequireAdmin,
             State(state.clone()),
             Path("app-1".to_string()),
             Json(SetGitLabTokenRequest {

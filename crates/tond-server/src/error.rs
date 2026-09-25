@@ -11,6 +11,7 @@
 //   AppNotFound      → 404 Not Found
 //   AppAlreadyExists → 409 Conflict
 //   InvalidInput     → 400 Bad Request
+//   Forbidden        → 403 Forbidden
 //   DatabaseError    → 500 Internal Server Error
 //   DockerError      → 500 Internal Server Error
 //   Internal         → 500 Internal Server Error

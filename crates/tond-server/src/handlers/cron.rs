@@ -22,7 +22,7 @@ use tond_common::*;
 
 use crate::{
     audit_log::{AuthActor, write_audit_log},
-    auth::{RateLimit, RequireAuth},
+    auth::{RateLimit, RequireAdmin, RequireAuth},
     cron,
     cron::compute_next_run,
     error::AppError,
@@ -74,7 +74,7 @@ pub async fn get_cron_job(
 
 pub async fn create_cron_job(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     actor: AuthActor,
     State(state): State<AppState>,
     Json(req): Json<CreateCronJobRequest>,
@@ -213,7 +213,7 @@ pub async fn create_cron_job(
 
 pub async fn update_cron_job(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     actor: AuthActor,
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -633,7 +633,7 @@ mod tests {
 
         let error = create_cron_job(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
             AuthActor("admin@example.com".to_string()),
             State(state),
             Json(CreateCronJobRequest {
@@ -670,7 +670,7 @@ mod tests {
 
         let error = create_cron_job(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
             AuthActor("admin@example.com".to_string()),
             State(state),
             Json(CreateCronJobRequest {
@@ -709,7 +709,7 @@ mod tests {
 
         let error = create_cron_job(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
             AuthActor("admin@example.com".to_string()),
             State(state),
             Json(CreateCronJobRequest {
@@ -746,7 +746,7 @@ mod tests {
 
         let error = create_cron_job(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
             AuthActor("admin@example.com".to_string()),
             State(state),
             Json(CreateCronJobRequest {
@@ -786,7 +786,7 @@ mod tests {
 
         let response = create_cron_job(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
             AuthActor("admin@example.com".to_string()),
             State(state.clone()),
             Json(CreateCronJobRequest {
@@ -847,7 +847,7 @@ mod tests {
 
         let bad_name = update_cron_job(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
             AuthActor("admin@example.com".to_string()),
             State(state.clone()),
             Path(job.id.clone()),
@@ -880,7 +880,7 @@ mod tests {
 
         let bad_schedule = update_cron_job(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
             AuthActor("admin@example.com".to_string()),
             State(state.clone()),
             Path(job.id.clone()),
@@ -913,7 +913,7 @@ mod tests {
 
         let bad_policy = update_cron_job(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
             AuthActor("admin@example.com".to_string()),
             State(state),
             Path(job.id),
@@ -955,7 +955,7 @@ mod tests {
 
         let response = update_cron_job(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
             AuthActor("admin@example.com".to_string()),
             State(state.clone()),
             Path(job.id.clone()),
@@ -1066,7 +1066,7 @@ mod tests {
 
         let error = update_cron_job(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
             AuthActor("admin@example.com".to_string()),
             State(state),
             Path(job.id),

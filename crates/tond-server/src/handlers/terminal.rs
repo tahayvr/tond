@@ -23,7 +23,7 @@ use tokio::{
 use tond_common::{ApiResponse, TondError};
 
 use crate::{
-    auth::{self, RateLimit, RequireAuth},
+    auth::{self, AuthRole, RateLimit, Role, extractor::admin_only_message},
     error::AppError,
     handlers::auth::{extract_session_token, validate_session},
     state::AppState,
@@ -89,11 +89,15 @@ struct TerminalSessionRuntime {
 
 pub async fn list_targets(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: AuthRole,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     let shell_user = terminal_shell_user_from_env()?;
-    let targets = collect_terminal_targets(&state.db, &shell_user).await?;
+    let mut targets = collect_terminal_targets(&state.db, &shell_user).await?;
+    // The host shell is admin-only; members only see app and database containers.
+    if auth.0 != Role::Admin {
+        targets.retain(|t| t.kind != TerminalTargetKind::Server);
+    }
     Ok((StatusCode::OK, Json(ApiResponse::ok(targets))))
 }
 
@@ -112,8 +116,18 @@ async fn handle_terminal_socket(
     query: TerminalSessionQuery,
     headers: HeaderMap,
 ) {
-    if !authenticate(&state, &query.token, &headers).await {
+    let Some(role) = authenticate(&state, &query.token, &headers).await else {
         close_socket(&mut socket, 4001, "Authentication required").await;
+        return;
+    };
+
+    if query.target_kind == TerminalTargetKind::Server && role != Role::Admin {
+        let _ = send_terminal_error(
+            &mut socket,
+            &admin_only_message("open a shell on the server"),
+        )
+        .await;
+        close_socket(&mut socket, 4403, "Forbidden").await;
         return;
     }
 
@@ -567,16 +581,25 @@ fn validate_terminal_shell_user(value: &str) -> Result<String, TondError> {
     Ok(trimmed.to_string())
 }
 
-async fn authenticate(state: &AppState, token: &Option<String>, headers: &HeaderMap) -> bool {
+/// Authenticate the WebSocket caller and resolve their role. API keys are
+/// root-equivalent (admin) until scoped tokens land in Phase 1.
+async fn authenticate(
+    state: &AppState,
+    token: &Option<String>,
+    headers: &HeaderMap,
+) -> Option<Role> {
     if let Some(raw_key) = token {
-        return matches!(auth::validate_key(&state.db, raw_key).await, Ok(Some(_)));
+        return matches!(auth::validate_key(&state.db, raw_key).await, Ok(Some(_)))
+            .then_some(Role::Admin);
     }
 
-    if let Some(token) = extract_session_token(headers) {
-        return matches!(validate_session(&state.db, &token).await, Ok(Some(_)));
+    if let Some(token) = extract_session_token(headers)
+        && let Ok(Some(user)) = validate_session(&state.db, &token).await
+    {
+        return Some(Role::from_user_role(&user.role));
     }
 
-    false
+    None
 }
 
 async fn send_terminal_error(socket: &mut WebSocket, message: &str) -> anyhow::Result<()> {
@@ -787,7 +810,7 @@ mod tests {
         seed_database(&state, "db-running", "postgres", "running", Some("cont-db")).await;
         seed_database(&state, "db-pending", "redis", "pending", Some("cont-redis")).await;
 
-        let response = list_targets(RateLimit, RequireAuth, State(state))
+        let response = list_targets(RateLimit, AuthRole(Role::Admin), State(state))
             .await
             .unwrap_or_else(|err| {
                 panic!(
@@ -837,6 +860,29 @@ mod tests {
                 .all(|target| target.id != "app-stopped" && target.id != "db-pending"),
             "stopped or pending workloads should not appear in the selectable terminal target list"
         );
+    }
+
+    #[tokio::test]
+    async fn list_targets_hides_the_server_shell_from_members() {
+        let state = test_state().await;
+        seed_app(&state, "app-running", "api", "running", Some("cont-api")).await;
+
+        let response = list_targets(RateLimit, AuthRole(Role::Member), State(state))
+            .await
+            .unwrap_or_else(|err| panic!("list_targets should succeed for members: {}", err.0))
+            .into_response();
+        let body = response_json(response).await;
+        let targets: Vec<TerminalTargetResponse> =
+            serde_json::from_value(body.get("data").cloned().unwrap_or_default())
+                .unwrap_or_else(|err| panic!("failed to decode terminal targets: {err}"));
+
+        assert!(
+            targets
+                .iter()
+                .all(|target| target.kind != TerminalTargetKind::Server),
+            "members must not be offered a host shell"
+        );
+        assert!(targets.iter().any(|target| target.id == "app-running"));
     }
 
     #[tokio::test]

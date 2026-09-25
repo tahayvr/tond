@@ -1,4 +1,4 @@
-// auth/extractor.rs — RequireAuth Axum extractor
+// auth/extractor.rs — RequireAuth / AuthRole / RequireAdmin Axum extractors
 //
 // RequireAuth is a zero-sized guard struct that implements
 // FromRequestParts<AppState>. Adding `_auth: RequireAuth` to a handler
@@ -28,6 +28,11 @@
 //      and checks expiry.
 //
 // If no method succeeds, returns 401.
+//
+// Roles: the socket and API keys resolve to `Role::Admin` (root-equivalent
+// until scoped tokens land in Phase 1); sessions use the user's `role` column.
+// `RequireAdmin` rejects members with 403; `AuthRole` hands the role to the
+// handler for checks that depend on the request body.
 
 use std::convert::Infallible;
 
@@ -36,8 +41,9 @@ use axum::{
     extract::FromRequestParts,
     http::{StatusCode, header, request::Parts},
 };
-use tond_common::ApiResponse;
+use tond_common::{ApiResponse, TondError};
 
+use crate::error::AppError;
 use crate::handlers::auth::{extract_session_token, validate_session};
 use crate::state::AppState;
 
@@ -71,9 +77,59 @@ impl<S: Send + Sync> FromRequestParts<S> for LocalPeer {
 /// ```
 pub struct RequireAuth;
 
+/// What an authenticated caller may do.
+///
+/// `Admin` can change anything that reaches the host: volumes and bind mounts,
+/// compose files, cron images and commands, credentials, server settings,
+/// snapshot restores and users. `Member` can view everything and deploy,
+/// start, stop and roll back existing apps. Full RBAC arrives in Phase 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Admin,
+    Member,
+}
+
+impl Role {
+    /// Parse the `users.role` column. Anything unrecognised is a member, so a
+    /// bad value in the database can never grant admin rights.
+    pub fn from_user_role(role: &str) -> Self {
+        if role == "admin" {
+            Role::Admin
+        } else {
+            Role::Member
+        }
+    }
+}
+
+/// Extractor that authenticates like [`RequireAuth`] and also reports the
+/// caller's [`Role`], for handlers where only some inputs need an admin
+/// (e.g. creating an app is fine for members unless it sets volumes).
+pub struct AuthRole(pub Role);
+
+impl AuthRole {
+    /// Fail with 403 unless the caller is an admin. `action` completes the
+    /// sentence "Only admins can …".
+    pub fn ensure_admin(&self, action: &str) -> Result<(), AppError> {
+        match self.0 {
+            Role::Admin => Ok(()),
+            Role::Member => Err(AppError(TondError::Forbidden(admin_only_message(action)))),
+        }
+    }
+}
+
+/// Extractor that rejects any caller who is not an admin (401 when not
+/// authenticated at all, 403 when authenticated as a member).
+pub struct RequireAdmin;
+
+pub(crate) fn admin_only_message(action: &str) -> String {
+    format!("Only admins can {action}. Ask an admin of this server to do it.")
+}
+
+type Rejection = (StatusCode, Json<ApiResponse<()>>);
+
 fn unauthorized_message_for_bearer_result(
     result: anyhow::Result<Option<super::ApiKey>>,
-) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<(), Rejection> {
     match result {
         Ok(Some(_)) => Ok(()),
         Ok(None) => Err((
@@ -89,9 +145,9 @@ fn unauthorized_message_for_bearer_result(
 
 fn unauthorized_message_for_session_result(
     result: Result<Option<tond_common::User>, sqlx::Error>,
-) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<Role, Rejection> {
     match result {
-        Ok(Some(_)) => Ok(()),
+        Ok(Some(user)) => Ok(Role::from_user_role(&user.role)),
         Ok(None) => Err((
             StatusCode::UNAUTHORIZED,
             Json(ApiResponse::err("Session expired or invalid")),
@@ -103,44 +159,76 @@ fn unauthorized_message_for_session_result(
     }
 }
 
+/// Authenticate the request and resolve the caller's role.
+async fn authenticate(parts: &Parts, state: &AppState) -> Result<Role, Rejection> {
+    // Try 1: local Unix socket (see module docs for why loopback TCP isn't trusted).
+    if parts.extensions.get::<LocalSocket>().is_some() {
+        return Ok(Role::Admin);
+    }
+
+    // Try 2: Bearer token (API key). Keys are root-equivalent until Phase 1.
+    let auth_header = parts
+        .headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+
+    if let Some(header_val) = auth_header
+        && let Some(raw_key) = header_val.strip_prefix("Bearer ")
+    {
+        unauthorized_message_for_bearer_result(super::validate_key(&state.db, raw_key).await)?;
+        return Ok(Role::Admin);
+    }
+
+    // Try 3: Session cookie (dashboard)
+    if let Some(token) = extract_session_token(&parts.headers) {
+        return unauthorized_message_for_session_result(validate_session(&state.db, &token).await);
+    }
+
+    // No method succeeded
+    Err((
+        StatusCode::UNAUTHORIZED,
+        Json(ApiResponse::err(
+            "Authentication required. Use Authorization: Bearer <api-key> or log in via the dashboard.",
+        )),
+    ))
+}
+
 impl FromRequestParts<AppState> for RequireAuth {
-    type Rejection = (StatusCode, Json<ApiResponse<()>>);
+    type Rejection = Rejection;
 
     async fn from_request_parts(
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        // Try 1: local Unix socket (see module docs for why loopback TCP isn't trusted).
-        if parts.extensions.get::<LocalSocket>().is_some() {
-            return Ok(RequireAuth);
-        }
+        authenticate(parts, state).await.map(|_| RequireAuth)
+    }
+}
 
-        // Try 2: Bearer token (API key)
-        let auth_header = parts
-            .headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok());
+impl FromRequestParts<AppState> for AuthRole {
+    type Rejection = Rejection;
 
-        if let Some(header_val) = auth_header
-            && let Some(raw_key) = header_val.strip_prefix("Bearer ")
-        {
-            unauthorized_message_for_bearer_result(super::validate_key(&state.db, raw_key).await)?;
-            return Ok(RequireAuth);
-        }
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        authenticate(parts, state).await.map(AuthRole)
+    }
+}
 
-        // Try 3: Session cookie (dashboard)
-        if let Some(token) = extract_session_token(&parts.headers) {
-            unauthorized_message_for_session_result(validate_session(&state.db, &token).await)?;
-            return Ok(RequireAuth);
-        }
+impl FromRequestParts<AppState> for RequireAdmin {
+    type Rejection = Rejection;
 
-        // No method succeeded
-        Err((
-            StatusCode::UNAUTHORIZED,
-            Json(ApiResponse::err(
-                "Authentication required. Use Authorization: Bearer <api-key> or log in via the dashboard.",
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        match authenticate(parts, state).await? {
+            Role::Admin => Ok(RequireAdmin),
+            Role::Member => Err((
+                StatusCode::FORBIDDEN,
+                Json(ApiResponse::err(admin_only_message("do this"))),
             )),
-        ))
+        }
     }
 }
 
@@ -222,6 +310,115 @@ mod tests {
         );
     }
 
+    async fn session_parts_for_role(state: &AppState, role: &str) -> Parts {
+        let user_id = format!("user-{role}");
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "INSERT INTO users (id, email, password_hash, role, created_at, updated_at) VALUES (?, ?, 'hash', ?, ?, ?)",
+        )
+        .bind(&user_id)
+        .bind(format!("{role}@example.com"))
+        .bind(role)
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap_or_else(|err| panic!("failed to seed user: {err}"));
+        let token = format!("session-{role}");
+        sqlx::query(
+            "INSERT INTO sessions (id, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(&token)
+        .bind(&user_id)
+        .bind((now + chrono::Duration::hours(1)).to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap_or_else(|err| panic!("failed to seed session: {err}"));
+
+        let mut parts = request_parts();
+        parts.headers.insert(
+            header::COOKIE,
+            axum::http::HeaderValue::from_str(&format!("tond_session={token}"))
+                .unwrap_or_else(|err| panic!("invalid cookie header: {err}")),
+        );
+        parts
+    }
+
+    #[tokio::test]
+    async fn require_admin_rejects_members_with_forbidden() {
+        let state = test_state().await;
+        let mut parts = session_parts_for_role(&state, "member").await;
+
+        let rejection = RequireAdmin::from_request_parts(&mut parts, &state)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("members must not pass RequireAdmin"));
+        assert_eq!(rejection.0, StatusCode::FORBIDDEN);
+
+        // Members are still authenticated for ordinary routes.
+        assert!(
+            RequireAuth::from_request_parts(&mut parts, &state)
+                .await
+                .is_ok()
+        );
+        let role = AuthRole::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap_or_else(|_| panic!("members should authenticate"));
+        assert_eq!(role.0, Role::Member);
+        assert!(role.ensure_admin("add volumes").is_err());
+    }
+
+    #[tokio::test]
+    async fn require_admin_accepts_admin_sessions_and_the_local_socket() {
+        let state = test_state().await;
+        let mut parts = session_parts_for_role(&state, "admin").await;
+        assert!(
+            RequireAdmin::from_request_parts(&mut parts, &state)
+                .await
+                .is_ok()
+        );
+
+        let mut socket_parts = request_parts();
+        socket_parts.extensions.insert(LocalSocket);
+        assert!(
+            RequireAdmin::from_request_parts(&mut socket_parts, &state)
+                .await
+                .is_ok(),
+            "the root-only Unix socket is root on the host and must count as admin"
+        );
+    }
+
+    #[tokio::test]
+    async fn require_admin_without_credentials_is_unauthorized() {
+        let state = test_state().await;
+        let mut parts = request_parts();
+        let rejection = RequireAdmin::from_request_parts(&mut parts, &state)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("anonymous callers must be rejected"));
+        assert_eq!(rejection.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn unknown_user_roles_are_treated_as_members() {
+        assert_eq!(Role::from_user_role("admin"), Role::Admin);
+        assert_eq!(Role::from_user_role("member"), Role::Member);
+        assert_eq!(Role::from_user_role("Admin"), Role::Member);
+        assert_eq!(Role::from_user_role(""), Role::Member);
+    }
+
+    #[test]
+    fn ensure_admin_message_names_the_action() {
+        let err = AuthRole(Role::Member)
+            .ensure_admin("configure volumes")
+            .err()
+            .unwrap_or_else(|| panic!("members must be refused"));
+        assert_eq!(err.0.status_code(), 403);
+        assert!(err.0.to_string().contains("Only admins can configure volumes"));
+        assert!(AuthRole(Role::Admin).ensure_admin("configure volumes").is_ok());
+    }
+
     #[tokio::test]
     async fn local_socket_header_cannot_be_forged() {
         // Only the Unix-socket router can set the extension; headers are client-controlled.
@@ -290,8 +487,8 @@ mod tests {
                 totp_secret_enc: None,
                 totp_enabled: false,
             })))
-            .is_ok(),
-            "valid session authentication results should pass the extractor helper"
+            .is_ok_and(|role| role == Role::Admin),
+            "valid session authentication results should pass the extractor helper with the user's role"
         );
 
         let invalid = unauthorized_message_for_session_result(Ok(None))

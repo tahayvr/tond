@@ -28,7 +28,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tond_common::*;
 
 use crate::{
-    auth::{RateLimit, RequireAuth},
+    auth::{RateLimit, RequireAdmin, RequireAuth},
     backup::{self, SnapshotTrigger},
     error::AppError,
     handlers::storage_providers::decrypt_provider_secret,
@@ -117,7 +117,7 @@ pub async fn list_snapshots(
 
 pub async fn delete_snapshot(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -175,7 +175,7 @@ pub async fn get_backup_config(
 
 pub async fn update_backup_config(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Json(req): Json<UpdateBackupConfigRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -339,7 +339,7 @@ pub async fn stream_snapshot_logs(
 
 pub async fn restore_snapshot(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -360,7 +360,7 @@ pub async fn restore_snapshot(
 
 pub async fn restore_app(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<RestoreAppRequest>,
@@ -384,7 +384,7 @@ pub async fn restore_app(
 
 pub async fn restore_database(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<RestoreDatabaseRequest>,
