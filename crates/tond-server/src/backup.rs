@@ -223,7 +223,8 @@ pub async fn create_snapshot(
         let dest = staging.join("tond.db");
         let db_src = db_path();
         // VACUUM INTO creates a consistent copy without blocking reads/writes
-        sqlx::query(&format!("VACUUM INTO '{}'", dest.to_string_lossy()))
+        sqlx::query("VACUUM INTO ?")
+            .bind(dest.to_string_lossy().into_owned())
             .execute(&state.db)
             .await?;
         let size = tokio::fs::metadata(&dest)

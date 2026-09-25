@@ -2,6 +2,7 @@ use std::{net::IpAddr, time::Duration};
 
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
+use sqlx::AssertSqlSafe;
 
 use crate::{
     AppState,
@@ -67,9 +68,10 @@ pub async fn get_status(
     (StatusCode::OK, Json(tond_common::ApiResponse::ok(status))).into_response()
 }
 
-async fn has_any_rows(db: &sqlx::SqlitePool, table: &str) -> bool {
+async fn has_any_rows(db: &sqlx::SqlitePool, table: &'static str) -> bool {
+    // `table` is always a compile-time literal, so interpolating it is injection-safe.
     let query = format!("SELECT 1 FROM {table} LIMIT 1");
-    sqlx::query(&query)
+    sqlx::query(AssertSqlSafe(query))
         .fetch_optional(db)
         .await
         .ok()

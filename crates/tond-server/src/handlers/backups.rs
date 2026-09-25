@@ -21,6 +21,7 @@ use axum::{
 use futures::stream::{self, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
+use sqlx::AssertSqlSafe;
 use std::convert::Infallible;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -100,7 +101,8 @@ pub async fn list_snapshots(
 
     sql.push_str(" ORDER BY created_at DESC");
 
-    let mut q = sqlx::query_as::<_, Snapshot>(&sql);
+    // `sql` is assembled only from the fixed fragments above; user input is bound via `?`.
+    let mut q = sqlx::query_as::<_, Snapshot>(AssertSqlSafe(sql));
     for b in &binds {
         q = q.bind(b);
     }
