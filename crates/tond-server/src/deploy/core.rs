@@ -18,7 +18,8 @@
 //
 // Helpers private to this module:
 //   update_status()            — update app.status in DB
-//   log_deploy()               — insert timestamped deploy log entry
+//   log_deploy()               — insert timestamped deploy log entry and publish
+//                                it on log_bus for live log streams
 //   wait_for_healthy()         — poll new container health endpoint
 //   fetch_registry_credentials() — look up and decrypt registry credentials
 //   pull_image()               — stream a docker pull with bollard
@@ -31,6 +32,7 @@ use uuid::Uuid;
 use crate::backup::{self, SnapshotTrigger};
 use crate::docker;
 use crate::handlers::{github_apps, gitlab_tokens};
+use crate::log_bus::{self, DeployLogEvent};
 use crate::secret_key::{self, Purpose};
 use crate::state::AppState;
 
@@ -1433,11 +1435,21 @@ pub(super) async fn log_deploy(
     .execute(&state.db)
     .await?;
 
+    // Deploy logs live in the database (and the dashboard); journald only
+    // gets problems. Build output (one call per line) stays at debug.
     match level {
         "error" => tracing::error!("[{}] {}", app_id, message),
         "warn" => tracing::warn!("[{}] {}", app_id, message),
-        _ => tracing::info!("[{}] {}", app_id, message),
+        _ => tracing::debug!("[{}] {}", app_id, message),
     }
+
+    log_bus::publish(DeployLogEvent {
+        id,
+        app_id: app_id.to_string(),
+        level: level.to_string(),
+        message: message.to_string(),
+        created_at: now,
+    });
 
     Ok(())
 }

@@ -51,6 +51,7 @@ mod error;
 mod handlers;
 mod health;
 mod janitor;
+mod log_bus;
 mod metrics;
 mod notifications;
 mod secret_key;
