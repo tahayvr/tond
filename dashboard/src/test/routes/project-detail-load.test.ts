@@ -1,14 +1,18 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { getProject, listDatabases, listApps, listProjectPreviews } = vi.hoisted(() => ({
-	getProject: vi.fn(),
-	listDatabases: vi.fn(),
-	listApps: vi.fn(),
-	listProjectPreviews: vi.fn()
-}));
+const { getProject, getSettings, listDatabases, listApps, listProjectPreviews } = vi.hoisted(
+	() => ({
+		getProject: vi.fn(),
+		getSettings: vi.fn(),
+		listDatabases: vi.fn(),
+		listApps: vi.fn(),
+		listProjectPreviews: vi.fn()
+	})
+);
 
 vi.mock('$lib/api', () => ({
 	getProject,
+	getSettings,
 	listDatabases,
 	listApps,
 	listProjectPreviews
@@ -24,6 +28,11 @@ describe('projects/[id] page load', () => {
 		listDatabases.mockResolvedValue([{ id: 'db_1', name: 'postgres' }]);
 		listApps.mockResolvedValue([{ id: 'app_1', name: 'api-service' }]);
 		listProjectPreviews.mockResolvedValue([]);
+		getSettings.mockResolvedValue({
+			server_name: 'Tond',
+			dashboard_domain: 'dash.example.com',
+			preview_domain: 'example-previews.com'
+		});
 	});
 
 	it('loads project detail route data before render', async () => {
@@ -33,7 +42,8 @@ describe('projects/[id] page load', () => {
 			project: { id: 'proj_1', name: 'Platform', apps: [] },
 			allDatabases: [{ id: 'db_1', name: 'postgres' }],
 			allApps: [{ id: 'app_1', name: 'api-service' }],
-			projectPreviews: []
+			projectPreviews: [],
+			previewDomain: 'example-previews.com'
 		});
 	});
 });

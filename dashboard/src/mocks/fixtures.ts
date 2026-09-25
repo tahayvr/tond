@@ -319,7 +319,8 @@ export const MOCK_APPS: App[] = [
 
 export const MOCK_SETTINGS: ServerSettings = {
 	server_name: 'Tond Server',
-	dashboard_domain: 'dash.example.com'
+	dashboard_domain: 'dash.example.com',
+	preview_domain: 'example-previews.com'
 };
 
 export const MOCK_ONBOARDING_STATUS: OnboardingStatus = {
@@ -462,7 +463,7 @@ export const MOCK_PREVIEWS: Record<string, PreviewDeployment[]> = {
 			app_id: 'app_running',
 			project_preview_id: 'pprev_1',
 			slug: 'feature-auth',
-			subdomain: 'feature-auth-api-service.dash.example.com',
+			subdomain: 'feature-auth-api-service.example-previews.com',
 			container_id: 'c0ffee1234567890',
 			host_port: 32100,
 			image_tag: 'sha-preview1',
@@ -470,7 +471,7 @@ export const MOCK_PREVIEWS: Record<string, PreviewDeployment[]> = {
 			status: 'running',
 			expires_at: new Date(Date.now() + 18 * 3_600_000).toISOString(),
 			created_at: new Date(Date.now() - 6 * 3_600_000).toISOString(),
-			url: 'https://feature-auth-api-service.dash.example.com',
+			url: 'https://feature-auth-api-service.example-previews.com',
 			pr_number: 42,
 			head_sha: 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
 			head_ref: 'feature/auth',
@@ -482,7 +483,7 @@ export const MOCK_PREVIEWS: Record<string, PreviewDeployment[]> = {
 			app_id: 'app_running',
 			project_preview_id: null,
 			slug: 'fix-memory-leak',
-			subdomain: 'fix-memory-leak.preview.example.com',
+			subdomain: 'fix-memory-leak-api-service.example-previews.com',
 			container_id: 'deadbeef12345678',
 			host_port: 32101,
 			image_tag: 'sha-preview2',
@@ -518,7 +519,7 @@ export const MOCK_PROJECT_PREVIEWS: Record<string, ProjectPreview[]> = {
 					app_id: 'app_running',
 					project_preview_id: 'pprev_1',
 					slug: 'feature-auth',
-					subdomain: 'feature-auth-api-service.dash.example.com',
+					subdomain: 'feature-auth-api-service.example-previews.com',
 					container_id: 'c0ffee1234567890',
 					host_port: 32100,
 					image_tag: 'sha-preview1',
@@ -526,7 +527,7 @@ export const MOCK_PROJECT_PREVIEWS: Record<string, ProjectPreview[]> = {
 					status: 'running',
 					expires_at: new Date(Date.now() + 18 * 3_600_000).toISOString(),
 					created_at: new Date(Date.now() - 6 * 3_600_000).toISOString(),
-					url: 'https://feature-auth-api-service.dash.example.com',
+					url: 'https://feature-auth-api-service.example-previews.com',
 					pr_number: 42,
 					head_sha: 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
 					head_ref: 'feature/auth',
@@ -538,7 +539,7 @@ export const MOCK_PROJECT_PREVIEWS: Record<string, ProjectPreview[]> = {
 					app_id: 'app_stopped',
 					project_preview_id: 'pprev_1',
 					slug: 'feature-auth',
-					subdomain: 'feature-auth-web-frontend.dash.example.com',
+					subdomain: 'feature-auth-web-frontend.example-previews.com',
 					container_id: 'abcdef0987654321',
 					host_port: 32102,
 					image_tag: 'sha-preview3',
@@ -546,7 +547,7 @@ export const MOCK_PROJECT_PREVIEWS: Record<string, ProjectPreview[]> = {
 					status: 'running',
 					expires_at: new Date(Date.now() + 18 * 3_600_000).toISOString(),
 					created_at: new Date(Date.now() - 6 * 3_600_000).toISOString(),
-					url: 'https://feature-auth-web-frontend.dash.example.com',
+					url: 'https://feature-auth-web-frontend.example-previews.com',
 					pr_number: 42,
 					head_sha: 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
 					head_ref: 'feature/auth',

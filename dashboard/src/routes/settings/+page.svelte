@@ -11,6 +11,7 @@
 	// Form state — mirrors settings fields, populated once loaded
 	let serverName = $state('');
 	let dashboardDomain = $state('');
+	let previewDomain = $state('');
 
 	// Per-section save state
 	let savingAccess = $state(false);
@@ -24,10 +25,12 @@
 		try {
 			const updated = await updateSettings({
 				server_name: serverName,
-				dashboard_domain: dashboardDomain
+				dashboard_domain: dashboardDomain,
+				preview_domain: previewDomain
 			});
 			serverName = updated.server_name;
 			dashboardDomain = updated.dashboard_domain;
+			previewDomain = updated.preview_domain;
 			accessSaved = true;
 			setTimeout(() => (accessSaved = false), 3000);
 		} catch (e: any) {
@@ -40,6 +43,7 @@
 	$effect(() => {
 		serverName = data.settings.server_name;
 		dashboardDomain = data.settings.dashboard_domain;
+		previewDomain = data.settings.preview_domain ?? '';
 	});
 
 	$effect(() => {
@@ -66,6 +70,7 @@
 	<SettingsForm
 		bind:serverName
 		bind:dashboardDomain
+		bind:previewDomain
 		isSaving={savingAccess}
 		saved={accessSaved}
 		error={accessError}
