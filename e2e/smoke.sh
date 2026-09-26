@@ -1304,6 +1304,94 @@ grep -qi '^content-encoding: br' <<<"$ASSET_HEADERS" || fail "hashed assets shou
 [[ -z "$(find /opt/tond/dashboard -name '*.ttf')" ]] || fail "the dashboard should ship no TTF fonts"
 pass "index.html br + no-cache; hashed assets br + immutable; missing chunks 404; no TTF fonts"
 
+step "Operations: certificates, retention, app events, deploy trend, /metrics token, audit shipping, deploy --follow"
+certs=$(api /api/certs)
+jq -e --arg d "$WHOAMI_DOMAIN" '.data[] | select(.domain == $d)
+    | .serves.kind == "app" and .serves.app_name == "e2e-whoami" and (.issuer_kind | type == "string")' \
+    <<<"$certs" > /dev/null || fail "GET /api/certs must say what each certificate serves: $(jq -c . <<<"$certs")"
+pass "the certificate list names what each domain serves"
+if [[ -n "$CA_FILE" ]]; then
+    jq -e --arg d "$WHOAMI_DOMAIN" '.data[] | select(.domain == $d)
+        | .issuer != null and .last_renewed_at != null and (.expires_at | test("^[0-9]{4}-"))' <<<"$certs" > /dev/null \
+        || fail "an issued certificate must record its issuer, last renewal and an RFC 3339 expiry"
+    pass "issued certificates record issuer and last renewal"
+fi
+
+retention=$(api /api/settings/retention)
+jq -e '([.data.fields[] | select(.key == "retention_audit_log_days")][0].default == 180)
+    and .data.database.file_bytes > 0 and (.data.database.tables | map(.name) | index("audit_log"))' \
+    <<<"$retention" > /dev/null || fail "retention settings must carry defaults and the database size per table"
+read -r code _ < <(api_send PUT /api/settings/retention '{"retention_audit_log_days": 5}')
+[[ "$code" == 400 ]] || fail "retention values outside their bounds must be rejected (got ${code})"
+pass "retention settings: roadmap defaults, bounds enforced, database size per table"
+if [[ -f /etc/systemd/journald.conf.d/tond.conf ]]; then
+    grep -q '^SystemMaxUse=500M' /etc/systemd/journald.conf.d/tond.conf || fail "the journald drop-in must cap the journal at 500M"
+    pass "the journal is capped at 500 MB"
+else
+    grep -rqsE '^[[:space:]]*SystemMaxUse' /etc/systemd/journald.conf /etc/systemd/journald.conf.d/ \
+        || fail "install.sh must cap the journal (or keep an existing SystemMaxUse)"
+    pass "an existing journal cap was kept"
+fi
+
+events=$(api "/api/apps/e2e-whoami/events?limit=200")
+jq -e '[.data.events[].kind] | index("deploy_succeeded") and index("restart")' <<<"$events" > /dev/null \
+    || fail "the app event feed must show deploys and the restart: $(jq -c '[.data.events[].kind]' <<<"$events")"
+pass "app events merge deploys and restarts ($(jq '.data.events | length' <<<"$events") events)"
+stats=$(api /api/apps/e2e-whoami/deployments/stats)
+jq -e '.data.window >= 2 and .data.success_rate != null and .data.median_duration_secs != null' <<<"$stats" > /dev/null \
+    || fail "deploy stats must report a success rate and median duration: $(jq -c .data <<<"$stats")"
+pass "deploy trend: $(jq '.data.success_rate * 100 | floor' <<<"$stats")% of the last $(jq .data.window <<<"$stats") deploys succeeded"
+
+tond token revoke e2e-prometheus > /dev/null 2>&1 || true
+PROM_TOKEN=$(tond token create --name e2e-prometheus --scope metrics:read --expires 1d 2> /dev/null)
+prom=$(curl -sf -H "Authorization: Bearer ${PROM_TOKEN}" http://127.0.0.1:3001/metrics) \
+    || fail "/metrics over TCP must accept a metrics:read token"
+grep -q '^tond_process_resident_memory_bytes' <<<"$prom" || fail "/metrics over TCP must expose Prometheus metrics"
+[[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${RO_TOKEN}" http://127.0.0.1:3001/api/settings/retention)" == 200 ]] \
+    || fail "any signed-in caller may read retention settings"
+pass "Prometheus can scrape /metrics over TCP with a metrics:read token"
+
+if command -v python3 > /dev/null; then
+    SYSLOG_OUT=$(mktemp)
+    python3 -c '
+import socket, sys
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 16514)); s.listen(5)
+out = open(sys.argv[1], "ab")
+while True:
+    c, _ = s.accept()
+    while True:
+        d = c.recv(65536)
+        if not d: break
+        out.write(d); out.flush()
+    c.close()' "$SYSLOG_OUT" &
+    SYSLOG_PID=$!
+    sleep 1
+    read -r code body < <(api_send PUT /api/audit-log/shipping '{"syslog": {"enabled": true, "host": "127.0.0.1", "port": 16514, "tls": false}}')
+    [[ "$code" == 200 ]] || fail "enabling syslog shipping should succeed (got ${code}: ${body})"
+    wait_for 60 "audit entries shipped to the syslog receiver" bash -c "grep -q 'audit_shipping_update' '$SYSLOG_OUT'"
+    wait_for 60 "syslog shipping caught up" \
+        bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/audit-log/shipping | jq -e '.data.syslog.status.pending == 0 and .data.syslog.status.last_error == null'"
+    grep -qE '^[0-9]+ <1(08|09)>1 ' "$SYSLOG_OUT" || fail "shipped entries must be octet-counted RFC 5424 messages"
+    grep -q '"hash":"' "$SYSLOG_OUT" || fail "shipped entries must carry their chain hash"
+    read -r code _ < <(api_send PUT /api/audit-log/shipping '{"syslog": {"enabled": false, "host": "127.0.0.1", "port": 16514, "tls": false}}')
+    kill "$SYSLOG_PID" 2> /dev/null || true
+    rm -f "$SYSLOG_OUT"
+    pass "audit entries (with hashes) are shipped to syslog as RFC 5424 and delivery is tracked"
+else
+    echo "  - python3 not available; skipping the audit shipping check"
+fi
+
+follow_out=$(tond apps deploy e2e-whoami 2>&1) || fail "tond apps deploy must exit 0 for a good deploy: ${follow_out}"
+grep -q "is live" <<<"$follow_out" || fail "tond apps deploy must follow the deploy to the end: ${follow_out}"
+grep -q "✓ " <<<"$follow_out" || fail "tond apps deploy must print phase progress: ${follow_out}"
+queued_out=$(tond apps deploy e2e-whoami --no-follow 2>&1) || fail "tond apps deploy --no-follow failed: ${queued_out}"
+grep -q "queued" <<<"$queued_out" || fail "--no-follow must return once the deploy is queued: ${queued_out}"
+wait_for 300 "the --no-follow deploy to finish" \
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/apps/e2e-whoami/deployments | jq -e '[.data[] | select(.status == \"running\" or .status == \"queued\")] | length == 0'"
+wait_for_app_running e2e-whoami 120
+pass "tond apps deploy follows phases to the end; --no-follow returns at once"
+
 step "Snapshot"
 tond snapshot create --name e2e-smoke > /dev/null
 wait_for 120 "e2e-smoke snapshot completed" \
