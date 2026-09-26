@@ -36,6 +36,10 @@ use crate::{
 
 use super::{check_app_domain, fetch_app};
 
+fn invalid_field(field: &str, msg: impl Into<String>) -> AppError {
+    AppError(TondError::invalid_field(field, msg))
+}
+
 fn invalid(msg: impl Into<String>) -> AppError {
     AppError(TondError::InvalidInput(msg.into()))
 }
@@ -140,15 +144,22 @@ pub async fn update_service(
     let row = service_row(&state.db, &app, &service).await?;
 
     if req.published_port == Some(0) {
-        return Err(invalid("The published port must be between 1 and 65535"));
+        return Err(invalid_field(
+            "published_port",
+            "The published port must be between 1 and 65535",
+        ));
     }
     if req.domains.len() > 20 {
-        return Err(invalid("A service can have at most 20 domains"));
+        return Err(invalid_field(
+            "domains",
+            "A service can have at most 20 domains",
+        ));
     }
     if !req.domains.is_empty() && req.published_port.is_none() {
-        return Err(invalid(format!(
-            "Publish a container port of service '{service}' before routing domains to it"
-        )));
+        return Err(invalid_field(
+            "published_port",
+            format!("Publish a container port of service '{service}' before routing domains to it"),
+        ));
     }
     let mut domains: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
@@ -167,9 +178,10 @@ pub async fn update_service(
             .await?
             .flatten();
             if owner_id != app.id || own_service.is_none() {
-                return Err(invalid(format!(
-                    "{domain} is already used by the app '{owner}'"
-                )));
+                return Err(invalid_field(
+                    "domains",
+                    format!("{domain} is already used by the app '{owner}'"),
+                ));
             }
         }
         warnings.extend(warning);
@@ -325,7 +337,10 @@ pub(crate) async fn control_all(state: &AppState, app: &App, action: &str) -> Re
         .await
         .map_err(|e| AppError(TondError::DockerError(e.to_string())))?;
     if states.is_empty() {
-        return Err(invalid("App has no containers yet — deploy it first"));
+        return Err(AppError(
+            TondError::InvalidInput("App has no containers yet".to_string())
+                .with_hint("Deploy the app first."),
+        ));
     }
     for st in &states {
         let cid = st.container_id.as_str();
@@ -439,7 +454,7 @@ pub async fn update_compose(
     let (content, source_url, branch, compose_path) = match git {
         Some(url) => {
             let path = deploy::compose_path_in_repo(req.compose_path.as_deref())
-                .map_err(|e| invalid(e.to_string()))?;
+                .map_err(|e| invalid_field("compose_path", e.to_string()))?;
             (
                 None,
                 Some(url),
@@ -455,10 +470,11 @@ pub async fn update_compose(
                 .compose_content
                 .clone()
                 .filter(|c| !c.trim().is_empty())
-                .ok_or_else(|| invalid("compose_content is required"))?;
+                .ok_or_else(|| invalid_field("compose_content", "compose_content is required"))?;
             let volume_dir = volumes::app_volume_dir(&volumes::data_dir(), &app.name);
-            compose_policy::validate(&content, &volume_dir)
-                .map_err(|errors| invalid(compose_policy::format_errors(&errors)))?;
+            compose_policy::validate(&content, &volume_dir).map_err(|errors| {
+                invalid_field("compose_content", compose_policy::format_errors(&errors))
+            })?;
             let specs = compose::service_specs(&content).map_err(invalid)?;
             compose::sync_specs(&state.db, &app.id, &specs).await?;
             (Some(content), None, None, None)
