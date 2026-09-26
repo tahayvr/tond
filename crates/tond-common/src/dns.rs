@@ -126,9 +126,120 @@ pub fn server_addresses() -> Vec<IpAddr> {
         .collect()
 }
 
+/// `host` equals `zone` or is a subdomain of it (both normalized).
+fn in_zone(host: &str, zone: &str) -> bool {
+    host == zone
+        || host
+            .strip_suffix(zone)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+/// The longest of `zones` that contains `domain` (a wildcard `*.x` is looked
+/// up as `x`). Zones are plain names like `example.com`.
+pub fn zone_for<'a>(domain: &str, zones: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    let host = domain.strip_prefix("*.").unwrap_or(domain);
+    zones
+        .into_iter()
+        .filter(|z| !z.is_empty() && in_zone(host, z))
+        .max_by_key(|z| z.len())
+}
+
+/// The TXT record name a DNS-01 challenge for `domain` is published under:
+/// `_acme-challenge.<domain>`, where a wildcard `*.x` uses `x`.
+pub fn acme_challenge_name(domain: &str) -> String {
+    format!(
+        "_acme-challenge.{}",
+        domain.strip_prefix("*.").unwrap_or(domain)
+    )
+}
+
+/// The domain a challenge record name belongs to (inverse of
+/// `acme_challenge_name`, minus the wildcard).
+pub fn challenge_domain(record_name: &str) -> Option<&str> {
+    record_name
+        .trim_end_matches('.')
+        .strip_prefix("_acme-challenge.")
+        .filter(|d| !d.is_empty())
+}
+
+/// `pattern` is a wildcard (`*.x`) that covers `host`: exactly one label in
+/// front of `x`, as TLS wildcard matching works (RFC 6125).
+pub fn wildcard_covers(pattern: &str, host: &str) -> bool {
+    let Some(base) = pattern.strip_prefix("*.") else {
+        return false;
+    };
+    host.strip_suffix(base)
+        .and_then(|prefix| prefix.strip_suffix('.'))
+        .is_some_and(|label| !label.is_empty() && !label.contains('.'))
+}
+
+/// The wildcard name that would cover `host` (`a.b.c` -> `*.b.c`), if the
+/// host has a parent with at least two labels.
+pub fn wildcard_for(host: &str) -> Option<String> {
+    let (_, parent) = host.split_once('.')?;
+    parent.contains('.').then(|| format!("*.{parent}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zone_for_picks_the_longest_containing_zone() {
+        let zones = ["example.com", "apps.example.com", "other.org", ""];
+        assert_eq!(zone_for("a.example.com", zones), Some("example.com"));
+        assert_eq!(
+            zone_for("x.apps.example.com", zones),
+            Some("apps.example.com")
+        );
+        assert_eq!(
+            zone_for("*.apps.example.com", zones),
+            Some("apps.example.com")
+        );
+        assert_eq!(zone_for("example.com", zones), Some("example.com"));
+        assert_eq!(
+            zone_for("badexample.com", zones),
+            None,
+            "suffix, not a subdomain"
+        );
+        assert_eq!(zone_for("example.net", zones), None);
+    }
+
+    #[test]
+    fn challenge_names_strip_the_wildcard() {
+        assert_eq!(
+            acme_challenge_name("*.apps.test"),
+            "_acme-challenge.apps.test"
+        );
+        assert_eq!(acme_challenge_name("a.b.test"), "_acme-challenge.a.b.test");
+        assert_eq!(
+            challenge_domain("_acme-challenge.apps.test."),
+            Some("apps.test")
+        );
+        assert_eq!(challenge_domain("_acme-challenge."), None);
+        assert_eq!(challenge_domain("apps.test"), None);
+    }
+
+    #[test]
+    fn wildcards_cover_exactly_one_label() {
+        assert!(wildcard_covers("*.apps.test", "web.apps.test"));
+        assert!(!wildcard_covers("*.apps.test", "apps.test"), "not the base");
+        assert!(
+            !wildcard_covers("*.apps.test", "a.b.apps.test"),
+            "one label only"
+        );
+        assert!(!wildcard_covers("*.apps.test", "webapps.test"));
+        assert!(
+            !wildcard_covers("apps.test", "web.apps.test"),
+            "not a wildcard"
+        );
+        assert_eq!(
+            wildcard_for("web.apps.test").as_deref(),
+            Some("*.apps.test")
+        );
+        assert_eq!(wildcard_for("apps.test"), None, "no wildcard over a TLD");
+        assert_eq!(wildcard_for("localhost"), None);
+    }
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap_or_else(|err| panic!("bad ip {s}: {err}"))
