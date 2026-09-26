@@ -236,60 +236,101 @@ pub struct AlertRuleNotification {
     pub created_at: String,
 }
 
-// ── AuditLog (state-changing operation record) ──
+// ── AuditLog (hash-chained security and change record) ──
 
-/// A single entry in the immutable audit log.
+/// A single entry in the append-only, hash-chained audit log.
+///
+/// The actor is always derived from the request's authentication (a user, an
+/// API token, the root-only local socket) or is `system` for background work;
+/// it is never taken from a client-supplied field.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct AuditLog {
-    pub id: String,
-    /// Which app this action affected (None for server-wide actions)
-    pub app_id: Option<String>,
-    /// Name of the app at the time of the action (denormalised for readability)
-    pub app_name: Option<String>,
-    /// Short verb: "create" | "deploy" | "delete" | "stop" | "start" | "restart"
-    ///   | "env_update" | "domain_update" | "health_update" | "volume_add"
-    ///   | "volume_remove" | "rollback" | "settings_update"
-    pub action: String,
-    /// Who performed the action: "api_key:<name>" | "session:<email>" | "system"
-    pub actor: String,
-    /// Optional extra context (JSON blob, e.g. changed keys)
-    pub detail: Option<String>,
+    /// Position in the chain (1, 2, 3, … with no gaps).
+    pub seq: i64,
     pub created_at: String,
+    /// "user" | "token" | "local_socket" | "system" | "anonymous"
+    pub actor_kind: String,
+    /// User id or token id (None for local_socket/system/anonymous)
+    pub actor_id: Option<String>,
+    /// Human-readable actor: an email, a token name, "local-socket", …
+    pub actor_label: String,
+    /// Short verb, e.g. "deploy", "login", "login_failed", "token_create"
+    pub action: String,
+    /// "app" | "database" | "cron" | "project" | "user" | "token" | "snapshot" | "settings" | …
+    pub resource_type: Option<String>,
+    pub resource_id: Option<String>,
+    /// Name at the time of the action (denormalised for readability)
+    pub resource_name: Option<String>,
+    /// "success" | "failure"
+    pub outcome: String,
+    /// Client address the request came from (None for the socket/system)
+    pub ip: Option<String>,
+    /// Optional extra context
+    pub detail: Option<String>,
+    /// Hash of the previous entry (or the retention checkpoint)
+    pub prev_hash: String,
+    /// sha256(prev_hash || canonical row)
+    pub hash: String,
 }
 
 /// API response for an audit log entry.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AuditLogResponse {
-    pub id: String,
-    pub app_id: Option<String>,
-    pub app_name: Option<String>,
-    pub action: String,
-    pub actor: String,
-    pub detail: Option<String>,
+    pub seq: i64,
     pub created_at: String,
+    pub actor_kind: String,
+    pub actor_id: Option<String>,
+    pub actor_label: String,
+    pub action: String,
+    pub resource_type: Option<String>,
+    pub resource_id: Option<String>,
+    pub resource_name: Option<String>,
+    pub outcome: String,
+    pub ip: Option<String>,
+    pub detail: Option<String>,
 }
 
 impl From<AuditLog> for AuditLogResponse {
     fn from(e: AuditLog) -> Self {
         Self {
-            id: e.id,
-            app_id: e.app_id,
-            app_name: e.app_name,
-            action: e.action,
-            actor: e.actor,
-            detail: e.detail,
+            seq: e.seq,
             created_at: e.created_at,
+            actor_kind: e.actor_kind,
+            actor_id: e.actor_id,
+            actor_label: e.actor_label,
+            action: e.action,
+            resource_type: e.resource_type,
+            resource_id: e.resource_id,
+            resource_name: e.resource_name,
+            outcome: e.outcome,
+            ip: e.ip,
+            detail: e.detail,
         }
     }
 }
 
-/// Query parameters for `GET /api/audit-log`
-#[derive(Debug, Deserialize)]
-pub struct AuditLogQuery {
-    /// Filter by app_id (optional)
-    pub app_id: Option<String>,
-    /// Maximum number of rows to return (default 50, max 200)
-    pub limit: Option<i64>,
+/// One page of GET /api/audit-log.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AuditLogPage {
+    pub entries: Vec<AuditLogResponse>,
+    /// Pass as `before` to get the next (older) page; None on the last page.
+    pub next_before: Option<i64>,
+}
+
+/// Result of verifying the audit log's hash chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditVerifyReport {
+    pub ok: bool,
+    /// Entries checked.
+    pub checked: i64,
+    /// Entries before this sequence number were removed by retention.
+    pub checkpoint_seq: i64,
+    pub first_seq: Option<i64>,
+    pub last_seq: Option<i64>,
+    /// The first entry that failed verification, if any.
+    pub broken_at: Option<i64>,
+    /// Why verification failed.
+    pub problem: Option<String>,
 }
 
 #[cfg(test)]
