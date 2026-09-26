@@ -128,12 +128,13 @@ export const DATABASE_TABS: readonly TabDef<DatabaseTab>[] = [
 	{ id: 'settings', label: 'Settings' }
 ];
 
-export type SystemTab = 'overview' | 'history' | 'disk' | 'uptime';
+export type SystemTab = 'overview' | 'history' | 'disk' | 'uptime' | 'updates';
 export const SYSTEM_TABS: readonly TabDef<SystemTab>[] = [
 	{ id: 'overview', label: 'Overview' },
 	{ id: 'history', label: 'History' },
 	{ id: 'disk', label: 'Disk' },
-	{ id: 'uptime', label: 'Uptime' }
+	{ id: 'uptime', label: 'Uptime' },
+	{ id: 'updates', label: 'Updates' }
 ];
 
 export type CronTab = 'overview' | 'runs' | 'metrics' | 'settings';

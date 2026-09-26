@@ -230,6 +230,7 @@
 		if (snap.trigger === 'pre_deploy') return `Pre-deploy: ${snap.trigger_app ?? snap.scope}`;
 		if (snap.trigger === 'manual') return `Manual · ${what}`;
 		if (snap.trigger === 'pre_restore') return `Pre-restore · ${what}`;
+		if (snap.trigger === 'pre_update') return 'Before a Tond update · Full';
 		return snap.trigger;
 	}
 

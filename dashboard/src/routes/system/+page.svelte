@@ -18,6 +18,7 @@
 	import DiskPanel from '$lib/components/system/DiskPanel.svelte';
 	import UptimeList from '$lib/components/uptime/UptimeList.svelte';
 	import UptimePanel from '$lib/components/uptime/UptimePanel.svelte';
+	import UpdatesPanel from '$lib/components/system/UpdatesPanel.svelte';
 	import PageHeader from '$lib/components/nav/page-header.svelte';
 	import LinkTabs from '$lib/components/nav/link-tabs.svelte';
 	import InlineError from '$lib/components/feedback/inline-error.svelte';
@@ -59,7 +60,7 @@
 	<PageHeader
 		title="System"
 		section={tab === 'overview' ? undefined : SYSTEM_TABS.find((t) => t.id === tab)?.label}
-		description="The server, its history and disk, Tond's services, and uptime."
+		description="The server, its history and disk, Tond's services, uptime and updates."
 	/>
 
 	<LinkTabs
@@ -90,5 +91,7 @@
 			</p>
 			<UptimePanel target={null} canEdit={can('settings:write')} />
 		</section>
+	{:else if tab === 'updates'}
+		<UpdatesPanel canManage={can('settings:write')} />
 	{/if}
 </div>
