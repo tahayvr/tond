@@ -38,7 +38,9 @@ pub async fn ensure_setup_token(pool: &SqlitePool, path: &Path) -> Result<()> {
         .await?;
 
     if users > 0 {
-        sqlx::query("DELETE FROM setup_tokens").execute(pool).await?;
+        sqlx::query("DELETE FROM setup_tokens")
+            .execute(pool)
+            .await?;
         remove_token_file(path);
         return Ok(());
     }
@@ -223,7 +225,10 @@ mod tests {
             .await
             .unwrap_or_else(|err| panic!("{err}"));
 
-        assert!(!path.exists(), "the token file must be removed once setup is done");
+        assert!(
+            !path.exists(),
+            "the token file must be removed once setup is done"
+        );
         assert_eq!(token_rows(&pool).await, 0);
     }
 

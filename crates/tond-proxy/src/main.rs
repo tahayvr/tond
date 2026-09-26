@@ -1002,7 +1002,11 @@ mod tests {
             .unwrap_or_else(|err| panic!("{err}"));
 
         let xff: Vec<_> = req.headers.get_all("x-forwarded-for").iter().collect();
-        assert_eq!(xff, vec!["203.0.113.7"], "spoofed X-Forwarded-For values must be dropped");
+        assert_eq!(
+            xff,
+            vec!["203.0.113.7"],
+            "spoofed X-Forwarded-For values must be dropped"
+        );
         assert!(req.headers.get("x-real-ip").is_none());
         assert_eq!(
             req.headers.get("x-forwarded-proto").map(|v| v.as_bytes()),

@@ -7,6 +7,9 @@
 //                              'unsafe-inline' is needed for scripts. Styles
 //                              allow 'unsafe-inline' (Svelte style attributes,
 //                              xterm.js); images allow data: (2FA QR code).
+//                              Forms may post to github.com (GitHub App
+//                              manifest flow); database logos come from
+//                              cdn.jsdelivr.net (devicon).
 //   Strict-Transport-Security  only when tond-proxy forwarded the request from
 //                              its TLS listener (X-Forwarded-Proto: https on a
 //                              loopback peer). No includeSubDomains: apps on
@@ -89,10 +92,7 @@ fn safe_host(headers: &HeaderMap) -> Option<&str> {
 
 /// Build the Content-Security-Policy for a response to a request with `headers`.
 pub fn content_security_policy(headers: &HeaderMap) -> String {
-    let script_src = SCRIPT_SRC
-        .get()
-        .map(String::as_str)
-        .unwrap_or("'self'");
+    let script_src = SCRIPT_SRC.get().map(String::as_str).unwrap_or("'self'");
     // 'self' covers same-origin ws(s): in current browsers; the explicit host
     // keeps the terminal and log streams working in older ones.
     let connect_src = match safe_host(headers) {
@@ -101,8 +101,8 @@ pub fn content_security_policy(headers: &HeaderMap) -> String {
     };
     format!(
         "default-src 'self'; script-src {script_src}; style-src 'self' 'unsafe-inline'; \
-         img-src 'self' data: blob:; font-src 'self' data:; connect-src {connect_src}; \
-         worker-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; \
+         img-src 'self' data: blob: https://cdn.jsdelivr.net; font-src 'self' data:; connect-src {connect_src}; \
+         worker-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self' https://github.com; \
          frame-ancestors 'none'"
     )
 }
@@ -180,6 +180,10 @@ mod tests {
         let csp = content_security_policy(&headers);
         assert!(csp.contains("frame-ancestors 'none'"));
         assert!(csp.contains("connect-src 'self' wss://dash.example.com"));
+        assert!(
+            csp.contains("form-action 'self' https://github.com;"),
+            "the GitHub App manifest flow posts a form to github.com"
+        );
         assert!(!csp.contains("script-src 'self' 'unsafe-inline'"));
 
         headers.insert(
@@ -187,7 +191,10 @@ mod tests {
             HeaderValue::from_static("evil.test; script-src *"),
         );
         let csp = content_security_policy(&headers);
-        assert!(csp.contains("connect-src 'self';"), "unsafe hosts are not embedded");
+        assert!(
+            csp.contains("connect-src 'self';"),
+            "unsafe hosts are not embedded"
+        );
     }
 
     fn app() -> Router {
@@ -237,7 +244,11 @@ mod tests {
                 .unwrap_or_else(|err| panic!("{err}")),
             "127.0.0.1:5000",
         );
-        assert!(!headers_for(direct).await.contains_key("strict-transport-security"));
+        assert!(
+            !headers_for(direct)
+                .await
+                .contains_key("strict-transport-security")
+        );
 
         // A remote peer can't claim HTTPS by sending the header itself.
         let spoofed = with_peer(
@@ -247,6 +258,10 @@ mod tests {
                 .unwrap_or_else(|err| panic!("{err}")),
             "198.51.100.1:5000",
         );
-        assert!(!headers_for(spoofed).await.contains_key("strict-transport-security"));
+        assert!(
+            !headers_for(spoofed)
+                .await
+                .contains_key("strict-transport-security")
+        );
     }
 }

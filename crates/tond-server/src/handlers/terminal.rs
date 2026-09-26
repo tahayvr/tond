@@ -55,7 +55,7 @@ use crate::{
         csrf::{origin_allowed, request_origin},
     },
     error::AppError,
-    handlers::auth::{extract_session_token, validate_session, verify_step_up},
+    handlers::auth::{Rejection, extract_session_token, validate_session, verify_step_up},
     state::AppState,
 };
 
@@ -194,6 +194,10 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(ApiResponse::<()>::err(message.into()))).into_response()
 }
 
+fn reject(status: StatusCode, message: impl Into<String>) -> Rejection {
+    Box::new(error_response(status, message))
+}
+
 fn host_terminal_disabled_message() -> String {
     format!(
         "The host terminal is turned off. To turn it on, run `{HOST_TERMINAL_ENABLE_COMMAND}` on the server."
@@ -295,7 +299,7 @@ pub async fn create_ticket(
             })),
         )
             .into_response(),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -304,27 +308,27 @@ async fn issue_ticket(
     ip: Option<IpAddr>,
     headers: &HeaderMap,
     req: TerminalTicketRequest,
-) -> Result<String, Response> {
+) -> Result<String, Rejection> {
     if headers.contains_key(header::AUTHORIZATION) {
-        return Err(error_response(
+        return Err(reject(
             StatusCode::FORBIDDEN,
             "Terminal sessions can't be opened with an API key. Sign in to the dashboard.",
         ));
     }
     let token = extract_session_token(headers)
-        .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Not authenticated"))?;
+        .ok_or_else(|| reject(StatusCode::UNAUTHORIZED, "Not authenticated"))?;
     let user = match validate_session(&state.db, &token).await {
         Ok(Some(user)) => user,
         Ok(None) => {
-            return Err(error_response(
+            return Err(reject(
                 StatusCode::UNAUTHORIZED,
                 "Session expired or invalid",
             ));
         }
-        Err(e) => return Err(AppError::from(e).into_response()),
+        Err(e) => return Err(Box::new(AppError::from(e).into_response())),
     };
     if user.role != "admin" {
-        return Err(error_response(
+        return Err(reject(
             StatusCode::FORBIDDEN,
             "Only admins can open terminal sessions",
         ));
@@ -335,31 +339,31 @@ async fn issue_ticket(
         .filter(|origin| origin_allowed(origin, &dashboard_domain))
         .map(str::to_string)
         .ok_or_else(|| {
-            error_response(
+            reject(
                 StatusCode::FORBIDDEN,
                 "Terminal sessions can only be opened from the dashboard",
             )
         })?;
 
-    let shell_user = terminal_shell_user_from_env().map_err(IntoResponse::into_response)?;
+    let shell_user = terminal_shell_user_from_env().map_err(|e| Box::new(e.into_response()))?;
     resolve_terminal_session(&state.db, &req.target_kind, &req.target_id, &shell_user)
         .await
-        .map_err(|e| AppError(e).into_response())?;
+        .map_err(|e| Box::new(AppError(e).into_response()))?;
 
     if req.target_kind == TerminalTargetKind::Server {
         match host_terminal_enabled(&state.db).await {
             Ok(true) => {}
             Ok(false) => {
-                return Err(error_response(
+                return Err(reject(
                     StatusCode::FORBIDDEN,
                     host_terminal_disabled_message(),
                 ));
             }
-            Err(e) => return Err(AppError::from(e).into_response()),
+            Err(e) => return Err(Box::new(AppError::from(e).into_response())),
         }
         let password = req.password.as_deref().unwrap_or("");
         if password.is_empty() {
-            return Err(error_response(
+            return Err(reject(
                 StatusCode::UNAUTHORIZED,
                 "Confirm your password to open the host terminal",
             ));
@@ -388,7 +392,7 @@ async fn issue_ticket(
     .bind(now.to_rfc3339())
     .execute(&state.db)
     .await
-    .map_err(|e| AppError::from(e).into_response())?;
+    .map_err(|e| Box::new(AppError::from(e).into_response()))?;
 
     Ok(ticket)
 }
@@ -398,9 +402,9 @@ async fn redeem_ticket(
     state: &AppState,
     ticket: &str,
     origin: Option<&str>,
-) -> Result<TerminalGrant, Response> {
+) -> Result<TerminalGrant, Rejection> {
     let origin = origin.ok_or_else(|| {
-        error_response(
+        reject(
             StatusCode::FORBIDDEN,
             "Terminal sessions can only be opened from the dashboard",
         )
@@ -414,31 +418,31 @@ async fn redeem_ticket(
     .bind(Utc::now().to_rfc3339())
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| AppError::from(e).into_response())?;
+    .map_err(|e| Box::new(AppError::from(e).into_response()))?;
 
     let (user_id, kind, target_id, ticket_origin) = row.ok_or_else(|| {
-        error_response(
+        reject(
             StatusCode::UNAUTHORIZED,
             "Terminal ticket is invalid, expired or already used",
         )
     })?;
     if !ticket_origin.eq_ignore_ascii_case(origin) {
-        return Err(error_response(
+        return Err(reject(
             StatusCode::FORBIDDEN,
             "Terminal ticket was issued to a different origin",
         ));
     }
     let kind = TerminalTargetKind::parse(&kind)
-        .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "Unknown terminal target"))?;
+        .ok_or_else(|| reject(StatusCode::BAD_REQUEST, "Unknown terminal target"))?;
 
     let user: User = sqlx::query_as("SELECT * FROM users WHERE id = ?")
         .bind(&user_id)
         .fetch_optional(&state.db)
         .await
-        .map_err(|e| AppError::from(e).into_response())?
+        .map_err(|e| Box::new(AppError::from(e).into_response()))?
         .filter(|u: &User| u.role == "admin")
         .ok_or_else(|| {
-            error_response(
+            reject(
                 StatusCode::FORBIDDEN,
                 "Only admins can open terminal sessions",
             )
@@ -449,12 +453,12 @@ async fn redeem_ticket(
         match host_terminal_enabled(&state.db).await {
             Ok(true) => {}
             Ok(false) => {
-                return Err(error_response(
+                return Err(reject(
                     StatusCode::FORBIDDEN,
                     host_terminal_disabled_message(),
                 ));
             }
-            Err(e) => return Err(AppError::from(e).into_response()),
+            Err(e) => return Err(Box::new(AppError::from(e).into_response())),
         }
     }
 
@@ -477,7 +481,7 @@ pub async fn terminal_ws(
         Ok(grant) => ws
             .on_upgrade(move |socket| handle_terminal_socket(socket, state, grant))
             .into_response(),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -494,7 +498,11 @@ async fn target_label(db: &sqlx::SqlitePool, kind: &TerminalTargetKind, id: &str
         .await
         .ok()
         .flatten();
-    format!("{} {}", kind.as_str(), name.unwrap_or_else(|| id.to_string()))
+    format!(
+        "{} {}",
+        kind.as_str(),
+        name.unwrap_or_else(|| id.to_string())
+    )
 }
 
 async fn handle_terminal_socket(mut socket: WebSocket, state: AppState, grant: TerminalGrant) {
@@ -507,16 +515,16 @@ async fn handle_terminal_socket(mut socket: WebSocket, state: AppState, grant: T
         }
     };
 
-    let spec =
-        match resolve_terminal_session(&state.db, &grant.kind, &grant.target_id, &shell_user).await
-        {
-            Ok(spec) => spec,
-            Err(err) => {
-                let _ = send_terminal_error(&mut socket, &err.to_string()).await;
-                close_socket(&mut socket, 4404, "Terminal target not found").await;
-                return;
-            }
-        };
+    let spec = match resolve_terminal_session(&state.db, &grant.kind, &grant.target_id, &shell_user)
+        .await
+    {
+        Ok(spec) => spec,
+        Err(err) => {
+            let _ = send_terminal_error(&mut socket, &err.to_string()).await;
+            close_socket(&mut socket, 4404, "Terminal target not found").await;
+            return;
+        }
+    };
 
     let runtime = match spawn_terminal_process(&spec) {
         Ok(runtime) => runtime,
@@ -1352,7 +1360,11 @@ mod tests {
         headers
     }
 
-    fn ticket_request(kind: TerminalTargetKind, id: &str, password: Option<&str>) -> Json<TerminalTicketRequest> {
+    fn ticket_request(
+        kind: TerminalTargetKind,
+        id: &str,
+        password: Option<&str>,
+    ) -> Json<TerminalTicketRequest> {
         Json(TerminalTicketRequest {
             target_kind: kind,
             target_id: id.to_string(),
@@ -1366,7 +1378,14 @@ mod tests {
         headers: HeaderMap,
         req: Json<TerminalTicketRequest>,
     ) -> (StatusCode, serde_json::Value) {
-        let response = create_ticket(RateLimit, ClientIp(None), State(state.clone()), headers, req).await;
+        let response = create_ticket(
+            RateLimit,
+            ClientIp(None),
+            State(state.clone()),
+            headers,
+            req,
+        )
+        .await;
         let status = response.status();
         (status, response_json(response).await)
     }
@@ -1501,7 +1520,11 @@ mod tests {
                 ticket_request(TerminalTargetKind::App, "app-1", None),
             )
             .await;
-            assert_eq!(status, StatusCode::FORBIDDEN, "origin {origin:?} must be refused");
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "origin {origin:?} must be refused"
+            );
         }
 
         // Container exec needs no step-up.
@@ -1528,14 +1551,21 @@ mod tests {
             )
             .await;
             assert_eq!(status, StatusCode::CREATED);
-            body["data"]["ticket"].as_str().unwrap_or_default().to_string()
+            body["data"]["ticket"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
         };
 
         let ticket = issue().await;
         let wrong_origin = redeem_ticket(&state, &ticket, Some("http://localhost:5173")).await;
         assert!(matches!(wrong_origin, Err(ref r) if r.status() == StatusCode::FORBIDDEN));
         // A failed redemption still burns the ticket.
-        assert!(redeem_ticket(&state, &ticket, Some(DASH_ORIGIN)).await.is_err());
+        assert!(
+            redeem_ticket(&state, &ticket, Some(DASH_ORIGIN))
+                .await
+                .is_err()
+        );
 
         let ticket = issue().await;
         let grant = redeem_ticket(&state, &ticket, Some(DASH_ORIGIN))
@@ -1552,14 +1582,17 @@ mod tests {
             .await
             .unwrap_or_else(|err| panic!("{err}"));
         assert!(
-            redeem_ticket(&state, &ticket, Some(DASH_ORIGIN)).await.is_err(),
+            redeem_ticket(&state, &ticket, Some(DASH_ORIGIN))
+                .await
+                .is_err(),
             "expired tickets must be refused"
         );
-        let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM terminal_tickets WHERE ticket_hash = ?")
-            .bind(&ticket)
-            .fetch_one(&state.db)
-            .await
-            .unwrap_or_else(|err| panic!("{err}"));
+        let stored: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM terminal_tickets WHERE ticket_hash = ?")
+                .bind(&ticket)
+                .fetch_one(&state.db)
+                .await
+                .unwrap_or_else(|err| panic!("{err}"));
         assert_eq!(stored, 0, "tickets are stored hashed");
     }
 
@@ -1574,7 +1607,10 @@ mod tests {
             ticket_request(TerminalTargetKind::Server, "server", Some("ValidPass123!")),
         )
         .await;
-        let ticket = body["data"]["ticket"].as_str().unwrap_or_default().to_string();
+        let ticket = body["data"]["ticket"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
 
         let off = set_host_terminal(
             LocalPeer(true),

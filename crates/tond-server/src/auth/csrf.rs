@@ -257,7 +257,11 @@ mod tests {
 
     #[test]
     fn same_site_fetch_metadata_is_rejected_for_cookie_mutations() {
-        let h = headers(&[COOKIE, ("x-tond-csrf", "1"), ("sec-fetch-site", "same-site")]);
+        let h = headers(&[
+            COOKIE,
+            ("x-tond-csrf", "1"),
+            ("sec-fetch-site", "same-site"),
+        ]);
         assert_eq!(
             check_request(&Method::POST, &h, DASH),
             Some("Cross-site request blocked")
@@ -356,7 +360,10 @@ mod tests {
             .header("cookie", "__Host-tond_session=abc")
             .body(Body::empty())
             .unwrap_or_else(|err| panic!("{err}"));
-        assert_eq!(call(app(state.clone()), csrf).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(
+            call(app(state.clone()), csrf).await.0,
+            StatusCode::FORBIDDEN
+        );
 
         let ws = HttpRequest::get("/echo")
             .header("cookie", "__Host-tond_session=abc")

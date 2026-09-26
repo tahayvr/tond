@@ -92,7 +92,10 @@ mod tests {
     #[test]
     fn extract_session_token_rejects_missing_or_empty_cookie() {
         let mut headers = HeaderMap::new();
-        headers.insert(header::COOKIE, HeaderValue::from_static("__Host-tond_session="));
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("__Host-tond_session="),
+        );
         assert_eq!(
             extract_session_token(&headers),
             None,
@@ -240,10 +243,16 @@ mod tests {
         let by_hash = validate_session(&pool, &stored)
             .await
             .unwrap_or_else(|err| panic!("validate_session failed: {err}"));
-        assert!(by_hash.is_none(), "the stored hash must not be usable as a session token");
+        assert!(
+            by_hash.is_none(),
+            "the stored hash must not be usable as a session token"
+        );
         let by_token = validate_session(&pool, "real-token")
             .await
             .unwrap_or_else(|err| panic!("validate_session failed: {err}"));
-        assert!(by_token.is_some(), "the raw token should validate against its stored hash");
+        assert!(
+            by_token.is_some(),
+            "the raw token should validate against its stored hash"
+        );
     }
 }

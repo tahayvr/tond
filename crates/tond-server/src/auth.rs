@@ -116,9 +116,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
         let key_file = dir.path().join(secret_file::ROOT_API_KEY_FILE);
 
-        ensure_root_key(&pool, &key_file).await.unwrap_or_else(|err| {
-            panic!("ensure_root_key should succeed on an empty table: {err}")
-        });
+        ensure_root_key(&pool, &key_file)
+            .await
+            .unwrap_or_else(|err| {
+                panic!("ensure_root_key should succeed on an empty table: {err}")
+            });
 
         use std::os::unix::fs::PermissionsExt;
         let raw_key = secret_file::read_secret_file(&key_file)
@@ -171,10 +173,15 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
         let key_file = dir.path().join(secret_file::ROOT_API_KEY_FILE);
-        ensure_root_key(&pool, &key_file).await.unwrap_or_else(|err| {
-            panic!("ensure_root_key should succeed when keys already exist: {err}")
-        });
-        assert!(!key_file.exists(), "no key file is written when a key already exists");
+        ensure_root_key(&pool, &key_file)
+            .await
+            .unwrap_or_else(|err| {
+                panic!("ensure_root_key should succeed when keys already exist: {err}")
+            });
+        assert!(
+            !key_file.exists(),
+            "no key file is written when a key already exists"
+        );
 
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM api_keys")
             .fetch_one(&pool)

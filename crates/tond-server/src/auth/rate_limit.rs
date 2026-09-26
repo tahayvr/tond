@@ -436,7 +436,10 @@ mod tests {
         }
         assert_eq!(map.len(), 3, "the map must stay at its configured cap");
         assert!(map.get("k99").is_some(), "the newest key must be kept");
-        assert!(map.get("k0").is_none(), "the least recently seen key is evicted");
+        assert!(
+            map.get("k0").is_none(),
+            "the least recently seen key is evicted"
+        );
     }
 
     #[test]
@@ -494,7 +497,9 @@ mod tests {
         let b: IpAddr = "2001:db8:1:2:ffff::9"
             .parse()
             .unwrap_or_else(|err| panic!("{err}"));
-        let c: IpAddr = "2001:db8:1:3::1".parse().unwrap_or_else(|err| panic!("{err}"));
+        let c: IpAddr = "2001:db8:1:3::1"
+            .parse()
+            .unwrap_or_else(|err| panic!("{err}"));
         assert_eq!(client_key(a), client_key(b));
         assert_ne!(client_key(a), client_key(c));
         let mapped: IpAddr = "::ffff:203.0.113.4"

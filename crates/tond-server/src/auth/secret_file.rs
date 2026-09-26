@@ -62,8 +62,7 @@ pub fn write_secret_file(path: &Path, contents: &str) -> Result<()> {
 
     // create_new + mode is subject to the umask; make sure it's exactly 0600.
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("moving {} into place", path.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("moving {} into place", path.display()))?;
     Ok(())
 }
 

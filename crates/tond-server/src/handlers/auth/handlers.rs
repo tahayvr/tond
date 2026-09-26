@@ -29,11 +29,10 @@ use crate::{
 };
 
 use super::helpers::{
-    MFA_MAX_ATTEMPTS, MFA_PENDING_TTL_SECS, PasswordError, base32_encode,
-    clear_mfa_pending_cookie, clear_session_cookie, create_session, decrypt_secret,
-    encrypt_secret, extract_user_agent, hash_password_throttled, ip_label, mfa_pending_cookie,
-    normalize_email, revoke_other_sessions, session_cookie, use_backup_code,
-    verify_password_throttled, verify_totp_once,
+    MFA_MAX_ATTEMPTS, MFA_PENDING_TTL_SECS, PasswordError, base32_encode, clear_mfa_pending_cookie,
+    clear_session_cookie, create_session, decrypt_secret, encrypt_secret, extract_user_agent,
+    hash_password_throttled, ip_label, mfa_pending_cookie, normalize_email, revoke_other_sessions,
+    session_cookie, use_backup_code, verify_password_throttled, verify_totp_once,
 };
 use super::session::{MFA_PENDING_COOKIE, extract_cookie, extract_session_token, validate_session};
 
@@ -67,17 +66,24 @@ fn with_cookies(mut response: Response, cookies: &[String]) -> Response {
     response
 }
 
+/// An early-return response from an auth helper (boxed: `Response` is large).
+pub type Rejection = Box<Response>;
+
+fn reject(status: StatusCode, message: impl Into<String>) -> Rejection {
+    Box::new(error_response(status, message))
+}
+
 /// Resolve the session user, or the 401/500 response to return.
-async fn session_user(state: &AppState, headers: &HeaderMap) -> Result<(String, User), Response> {
+async fn session_user(state: &AppState, headers: &HeaderMap) -> Result<(String, User), Rejection> {
     let token = extract_session_token(headers)
-        .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Not authenticated"))?;
+        .ok_or_else(|| reject(StatusCode::UNAUTHORIZED, "Not authenticated"))?;
     match validate_session(&state.db, &token).await {
         Ok(Some(user)) => Ok((token, user)),
-        Ok(None) => Err(error_response(
+        Ok(None) => Err(reject(
             StatusCode::UNAUTHORIZED,
             "Session expired or invalid",
         )),
-        Err(e) => Err(internal_error(e)),
+        Err(e) => Err(Box::new(internal_error(e))),
     }
 }
 
@@ -86,12 +92,9 @@ async fn check_lockout(
     state: &AppState,
     ip: Option<IpAddr>,
     account: Option<&str>,
-) -> Result<(), Response> {
+) -> Result<(), Rejection> {
     match state.rate_limiter.login_retry_after(ip, account).await {
-        Some(wait) => Err(error_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            lockout_message(wait),
-        )),
+        Some(wait) => Err(reject(StatusCode::TOO_MANY_REQUESTS, lockout_message(wait))),
         None => Ok(()),
     }
 }
@@ -104,7 +107,7 @@ async fn reauthenticate_password(
     user: &User,
     password: &str,
     wrong_message: &str,
-) -> Result<(), Response> {
+) -> Result<(), Rejection> {
     check_lockout(state, ip, Some(&user.id)).await?;
     match verify_password_throttled(password, Some(&user.password_hash)).await {
         Ok(true) => Ok(()),
@@ -113,9 +116,9 @@ async fn reauthenticate_password(
                 .rate_limiter
                 .record_login_failure(ip, Some(&user.id))
                 .await;
-            Err(error_response(StatusCode::UNAUTHORIZED, wrong_message))
+            Err(reject(StatusCode::UNAUTHORIZED, wrong_message))
         }
-        Err(e) => Err(password_error_response(e)),
+        Err(e) => Err(Box::new(password_error_response(e))),
     }
 }
 
@@ -125,7 +128,7 @@ async fn verify_second_factor(
     ip: Option<IpAddr>,
     user: &User,
     code: &str,
-) -> Result<(), Response> {
+) -> Result<(), Rejection> {
     let secret_b32 = user
         .totp_secret_enc
         .as_deref()
@@ -135,7 +138,7 @@ async fn verify_second_factor(
     let valid = match verify_totp_once(&state.db, &user.id, &secret_b32, code).await {
         Ok(true) => true,
         Ok(false) => use_backup_code(&state.db, &user.id, code).await,
-        Err(e) => return Err(internal_error(e)),
+        Err(e) => return Err(Box::new(internal_error(e))),
     };
     if valid {
         Ok(())
@@ -144,7 +147,7 @@ async fn verify_second_factor(
             .rate_limiter
             .record_login_failure(ip, Some(&user.id))
             .await;
-        Err(error_response(
+        Err(reject(
             StatusCode::UNAUTHORIZED,
             "Invalid authentication code",
         ))
@@ -159,15 +162,18 @@ pub async fn verify_step_up(
     user: &User,
     password: &str,
     code: Option<&str>,
-) -> Result<(), Response> {
+) -> Result<(), Rejection> {
     reauthenticate_password(state, ip, user, password, "Password is incorrect").await?;
     if user.totp_enabled {
-        let code = code.map(str::trim).filter(|c| !c.is_empty()).ok_or_else(|| {
-            error_response(
-                StatusCode::UNAUTHORIZED,
-                "Enter the code from your authenticator app",
-            )
-        })?;
+        let code = code
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .ok_or_else(|| {
+                reject(
+                    StatusCode::UNAUTHORIZED,
+                    "Enter the code from your authenticator app",
+                )
+            })?;
         verify_second_factor(state, ip, user, code).await?;
     }
     Ok(())
@@ -227,7 +233,11 @@ pub async fn setup_check(
     Json(req): Json<SetupCheckRequest>,
 ) -> Response {
     match setup_token::is_valid(&state.db, &req.token).await {
-        Ok(true) => (StatusCode::OK, Json(ApiResponse::ok(json!({ "valid": true })))).into_response(),
+        Ok(true) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(json!({ "valid": true }))),
+        )
+            .into_response(),
         Ok(false) => error_response(StatusCode::FORBIDDEN, INVALID_SETUP_TOKEN),
         Err(e) => internal_error(e),
     }
@@ -366,7 +376,7 @@ pub async fn login(
     let account = user.as_ref().map(|u| u.id.as_str());
 
     if let Err(response) = check_lockout(&state, ip, account).await {
-        return response;
+        return *response;
     }
 
     let verified = match verify_password_throttled(
@@ -466,7 +476,7 @@ pub async fn me(_rate: RateLimit, State(state): State<AppState>, headers: Header
             Json(ApiResponse::ok(UserResponse::from(user))),
         )
             .into_response(),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -481,7 +491,7 @@ pub async fn create_user(
 ) -> Response {
     let caller = match session_user(&state, &headers).await {
         Ok((_, user)) => user,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     if caller.role != "admin" {
         return error_response(StatusCode::FORBIDDEN, "Only admins can create users");
@@ -548,7 +558,7 @@ pub async fn list_users(
 ) -> Response {
     let caller = match session_user(&state, &headers).await {
         Ok((_, user)) => user,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     if caller.role != "admin" {
         return error_response(StatusCode::FORBIDDEN, "Only admins can list users");
@@ -583,7 +593,7 @@ pub async fn change_password(
 ) -> Response {
     let (token, user) = match session_user(&state, &headers).await {
         Ok(v) => v,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     if let Err(response) = reauthenticate_password(
@@ -595,7 +605,7 @@ pub async fn change_password(
     )
     .await
     {
-        return response;
+        return *response;
     }
 
     if req.new_password.chars().count() < 8 {
@@ -644,7 +654,7 @@ pub async fn list_sessions(
 ) -> Response {
     let (token, user) = match session_user(&state, &headers).await {
         Ok(v) => v,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let current = hash_key(&token);
     let now = Utc::now().to_rfc3339();
@@ -689,7 +699,7 @@ pub async fn revoke_session(
 ) -> Response {
     let (_, user) = match session_user(&state, &headers).await {
         Ok(v) => v,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     match sqlx::query("DELETE FROM sessions WHERE id = ? AND user_id = ?")
@@ -720,7 +730,7 @@ pub async fn revoke_all_sessions(
 ) -> Response {
     let (token, user) = match session_user(&state, &headers).await {
         Ok(v) => v,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     match revoke_other_sessions(&state.db, &user.id, Some(&token)).await {
@@ -754,7 +764,7 @@ pub async fn totp_setup(
 ) -> Response {
     let (_, user) = match session_user(&state, &headers).await {
         Ok(v) => v,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     if user.totp_enabled {
@@ -767,7 +777,7 @@ pub async fn totp_setup(
     if let Err(response) =
         reauthenticate_password(&state, ip, &user, &req.password, "Password is incorrect").await
     {
-        return response;
+        return *response;
     }
 
     use rand::Rng;
@@ -838,7 +848,7 @@ pub async fn totp_confirm(
 ) -> Response {
     let (token, user) = match session_user(&state, &headers).await {
         Ok(v) => v,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     if user.totp_enabled {
@@ -856,7 +866,7 @@ pub async fn totp_confirm(
     };
 
     if let Err(response) = check_lockout(&state, ip, Some(&user.id)).await {
-        return response;
+        return *response;
     }
     match verify_totp_once(&state.db, &user.id, &secret_b32, req.code.trim()).await {
         Ok(true) => {}
@@ -933,7 +943,7 @@ pub async fn totp_disable(
 ) -> Response {
     let (token, user) = match session_user(&state, &headers).await {
         Ok(v) => v,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     if let Err(response) = reauthenticate_password(
@@ -945,7 +955,7 @@ pub async fn totp_disable(
     )
     .await
     {
-        return response;
+        return *response;
     }
 
     if !user.totp_enabled {
@@ -953,7 +963,7 @@ pub async fn totp_disable(
     }
 
     if let Err(response) = verify_second_factor(&state, ip, &user, &req.code).await {
-        return response;
+        return *response;
     }
 
     let now = Utc::now().to_rfc3339();
@@ -1037,7 +1047,7 @@ pub async fn totp_verify(
     };
 
     if let Err(response) = check_lockout(&state, ip, Some(&user_id)).await {
-        return response;
+        return *response;
     }
 
     let user = match sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
@@ -1051,6 +1061,7 @@ pub async fn totp_verify(
     };
 
     if let Err(response) = verify_second_factor(&state, ip, &user, &req.code).await {
+        let response = *response;
         if attempts >= MFA_MAX_ATTEMPTS {
             let _ = sqlx::query("DELETE FROM mfa_pending WHERE id = ?")
                 .bind(&pending_hash)
@@ -1133,7 +1144,9 @@ mod tests {
     const IP: ClientIp = ClientIp(None);
 
     fn client(ip: &str) -> ClientIp {
-        ClientIp(Some(ip.parse().unwrap_or_else(|err| panic!("bad ip: {err}"))))
+        ClientIp(Some(
+            ip.parse().unwrap_or_else(|err| panic!("bad ip: {err}")),
+        ))
     }
 
     async fn response_json(response: Response) -> serde_json::Value {
@@ -1303,7 +1316,11 @@ mod tests {
             .await;
             assert_eq!(response.status(), StatusCode::FORBIDDEN);
         }
-        assert_eq!(user_count(&state).await, 0, "no user may be created without the token");
+        assert_eq!(
+            user_count(&state).await,
+            0,
+            "no user may be created without the token"
+        );
     }
 
     #[tokio::test]
@@ -1453,8 +1470,16 @@ mod tests {
     #[tokio::test]
     async fn login_rejects_invalid_password() {
         let state = test_state().await;
-        seed_user(&state, "user-1", "admin@example.com", "ValidPass123!", "admin", false, None)
-            .await;
+        seed_user(
+            &state,
+            "user-1",
+            "admin@example.com",
+            "ValidPass123!",
+            "admin",
+            false,
+            None,
+        )
+        .await;
 
         let response = login(
             RateLimit,
@@ -1474,8 +1499,16 @@ mod tests {
     #[tokio::test]
     async fn login_sets_hashed_session_when_2fa_is_disabled() {
         let state = test_state().await;
-        seed_user(&state, "user-1", "admin@example.com", "ValidPass123!", "admin", false, None)
-            .await;
+        seed_user(
+            &state,
+            "user-1",
+            "admin@example.com",
+            "ValidPass123!",
+            "admin",
+            false,
+            None,
+        )
+        .await;
 
         let response = login(
             RateLimit,
@@ -1496,7 +1529,11 @@ mod tests {
             .fetch_one(&state.db)
             .await
             .unwrap_or_else(|err| panic!("{err}"));
-        assert_eq!(stored, hash_key(&token), "only the token hash may be stored");
+        assert_eq!(
+            stored,
+            hash_key(&token),
+            "only the token hash may be stored"
+        );
     }
 
     #[tokio::test]
@@ -1504,8 +1541,16 @@ mod tests {
         // Rotating X-Forwarded-For used to give unlimited guesses; now the
         // account itself backs off whatever address the guesses come from.
         let state = test_state().await;
-        seed_user(&state, "user-1", "admin@example.com", "ValidPass123!", "admin", false, None)
-            .await;
+        seed_user(
+            &state,
+            "user-1",
+            "admin@example.com",
+            "ValidPass123!",
+            "admin",
+            false,
+            None,
+        )
+        .await;
 
         let mut last = StatusCode::OK;
         for i in 0..12 {
@@ -1705,22 +1750,41 @@ mod tests {
     #[tokio::test]
     async fn me_returns_current_user_for_valid_session() {
         let state = test_state().await;
-        seed_user(&state, "user-1", "admin@example.com", "ValidPass123!", "admin", false, None)
-            .await;
+        seed_user(
+            &state,
+            "user-1",
+            "admin@example.com",
+            "ValidPass123!",
+            "admin",
+            false,
+            None,
+        )
+        .await;
         let token = seed_session(&state, "user-1", "current").await;
 
         let response = me(RateLimit, State(state), session_headers(&token)).await;
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
-        assert_eq!(body["data"]["email"], serde_json::json!("admin@example.com"));
+        assert_eq!(
+            body["data"]["email"],
+            serde_json::json!("admin@example.com")
+        );
     }
 
     #[tokio::test]
     async fn legacy_cookie_name_is_not_accepted() {
         let state = test_state().await;
-        seed_user(&state, "user-1", "admin@example.com", "ValidPass123!", "admin", false, None)
-            .await;
+        seed_user(
+            &state,
+            "user-1",
+            "admin@example.com",
+            "ValidPass123!",
+            "admin",
+            false,
+            None,
+        )
+        .await;
         let token = seed_session(&state, "user-1", "current").await;
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1735,8 +1799,16 @@ mod tests {
     #[tokio::test]
     async fn list_sessions_marks_current_and_hides_tokens() {
         let state = test_state().await;
-        seed_user(&state, "user-1", "admin@example.com", "ValidPass123!", "admin", false, None)
-            .await;
+        seed_user(
+            &state,
+            "user-1",
+            "admin@example.com",
+            "ValidPass123!",
+            "admin",
+            false,
+            None,
+        )
+        .await;
         let token = seed_session(&state, "user-1", "current").await;
         let _other = seed_session(&state, "user-1", "other").await;
 
@@ -1759,8 +1831,16 @@ mod tests {
     #[tokio::test]
     async fn create_user_requires_admin_role() {
         let state = test_state().await;
-        seed_user(&state, "member-1", "member@example.com", "ValidPass123!", "member", false, None)
-            .await;
+        seed_user(
+            &state,
+            "member-1",
+            "member@example.com",
+            "ValidPass123!",
+            "member",
+            false,
+            None,
+        )
+        .await;
         let token = seed_session(&state, "member-1", "member-session").await;
 
         let response = create_user(
@@ -1781,8 +1861,16 @@ mod tests {
     #[tokio::test]
     async fn change_password_updates_hash_and_revokes_other_sessions() {
         let state = test_state().await;
-        seed_user(&state, "user-1", "admin@example.com", "ValidPass123!", "admin", false, None)
-            .await;
+        seed_user(
+            &state,
+            "user-1",
+            "admin@example.com",
+            "ValidPass123!",
+            "admin",
+            false,
+            None,
+        )
+        .await;
         let current_token = seed_session(&state, "user-1", "current").await;
         let _other_token = seed_session(&state, "user-1", "other").await;
 
@@ -1824,8 +1912,16 @@ mod tests {
     #[tokio::test]
     async fn totp_setup_requires_the_password() {
         let state = test_state().await;
-        seed_user(&state, "user-1", "admin@example.com", "ValidPass123!", "admin", false, None)
-            .await;
+        seed_user(
+            &state,
+            "user-1",
+            "admin@example.com",
+            "ValidPass123!",
+            "admin",
+            false,
+            None,
+        )
+        .await;
         let token = seed_session(&state, "user-1", "current").await;
 
         let wrong = totp_setup(
@@ -1844,7 +1940,10 @@ mod tests {
                 .fetch_one(&state.db)
                 .await
                 .unwrap_or_else(|err| panic!("{err}"));
-        assert!(secret.is_none(), "no secret may be stored without the password");
+        assert!(
+            secret.is_none(),
+            "no secret may be stored without the password"
+        );
 
         let ok = totp_setup(
             RateLimit,
@@ -1891,14 +1990,26 @@ mod tests {
                 .fetch_one(&state.db)
                 .await
                 .unwrap_or_else(|err| panic!("{err}"));
-        assert_eq!(stored, Some(encrypted), "the active secret must not be replaced");
+        assert_eq!(
+            stored,
+            Some(encrypted),
+            "the active secret must not be replaced"
+        );
     }
 
     #[tokio::test]
     async fn enabling_and_disabling_2fa_revoke_other_sessions() {
         let state = test_state().await;
-        seed_user(&state, "user-1", "admin@example.com", "ValidPass123!", "admin", false, None)
-            .await;
+        seed_user(
+            &state,
+            "user-1",
+            "admin@example.com",
+            "ValidPass123!",
+            "admin",
+            false,
+            None,
+        )
+        .await;
         let token = seed_session(&state, "user-1", "current").await;
         let _other = seed_session(&state, "user-1", "other").await;
 
