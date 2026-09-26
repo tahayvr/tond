@@ -316,6 +316,13 @@ async fn run_with_source(
     let specs =
         compose::service_specs_env(&source.content, &app_env).map_err(anyhow::Error::msg)?;
     compose::sync_specs(&state.db, &app_id, &specs).await?;
+    // Services in a profile (or scaled to zero) are not started: nothing to
+    // build, pull or wait for.
+    let inactive = compose::inactive_services(&source.content);
+    let specs: Vec<ComposeServiceSpec> = specs
+        .into_iter()
+        .filter(|s| !inactive.contains(&s.name))
+        .collect();
     ensure_web_service(state, app, &specs).await?;
 
     let builds = compose::build_specs(&hardened.yaml, &source.base_dir, &app_env);
@@ -441,7 +448,7 @@ async fn run_with_source(
     progress::start(state, &app_id, DeployPhase::Start).await;
     let project = compose_project_name(&app_name);
     let port_guard = queue::port_allocation().await;
-    let publish = allocate_host_ports(state, &app_id, &project).await?;
+    let publish = allocate_host_ports(state, &app_id).await?;
     let pins: Vec<Pin> = specs
         .iter()
         .map(|s| Pin {
@@ -719,7 +726,6 @@ async fn assign_service_domain(state: &AppState, app: &App, trigger: &str) -> Re
 async fn allocate_host_ports(
     state: &AppState,
     app_id: &str,
-    project: &str,
 ) -> Result<HashMap<String, (u16, u16)>> {
     let rows: Vec<(String, i64, Option<i64>)> = sqlx::query_as(
         "SELECT name, published_port, host_port FROM compose_services
@@ -731,7 +737,10 @@ async fn allocate_host_ports(
     if rows.is_empty() {
         return Ok(HashMap::new());
     }
-    let mut used = docker::used_host_ports(&state.docker, Some(project)).await?;
+    // Ports live containers publish (this app's own included: a port the
+    // file maps itself must not be handed out again) and ports stored for
+    // other apps whose containers may be down right now.
+    let mut used = docker::used_host_ports(&state.docker, None).await?;
     let reserved: Vec<i64> = sqlx::query_scalar(
         "SELECT host_port FROM compose_services WHERE app_id != ? AND host_port IS NOT NULL
          UNION SELECT host_port FROM apps WHERE host_port IS NOT NULL AND id != ?",
@@ -741,21 +750,45 @@ async fn allocate_host_ports(
     .fetch_all(&state.db)
     .await?;
     used.extend(reserved.into_iter().filter_map(|p| u16::try_from(p).ok()));
+    let plan = plan_host_ports(&rows, used)?;
+    for (name, (host, _)) in &plan {
+        sqlx::query("UPDATE compose_services SET host_port = ? WHERE app_id = ? AND name = ?")
+            .bind(*host as i64)
+            .bind(app_id)
+            .bind(name)
+            .execute(&state.db)
+            .await?;
+    }
+    Ok(plan)
+}
+
+/// Host ports for `(service, published port, stored host port)` rows: a
+/// service keeps its stored port (its own container holds it, so it is
+/// taken out of `used` first) unless something else uses it; new ones get
+/// the first free port from COMPOSE_PORT_BASE.
+pub fn plan_host_ports(
+    rows: &[(String, i64, Option<i64>)],
+    mut used: Vec<u16>,
+) -> Result<HashMap<String, (u16, u16)>> {
+    let own: Vec<u16> = rows
+        .iter()
+        .filter_map(|(_, _, h)| h.and_then(|h| u16::try_from(h).ok()))
+        .collect();
+    // Each own port once: a second occurrence belongs to something else.
+    for port in &own {
+        if let Some(i) = used.iter().position(|p| p == port) {
+            used.remove(i);
+        }
+    }
     let mut out = HashMap::new();
     for (name, container, host) in rows {
-        let container = u16::try_from(container).context("published port out of range")?;
+        let container = u16::try_from(*container).context("published port out of range")?;
         let host = match host.and_then(|h| u16::try_from(h).ok()) {
             Some(h) if !used.contains(&h) => h,
             _ => docker::first_free_port(COMPOSE_PORT_BASE, &used)?,
         };
         used.push(host);
-        sqlx::query("UPDATE compose_services SET host_port = ? WHERE app_id = ? AND name = ?")
-            .bind(host as i64)
-            .bind(app_id)
-            .bind(&name)
-            .execute(&state.db)
-            .await?;
-        out.insert(name, (host, container));
+        out.insert(name.clone(), (host, container));
     }
     Ok(out)
 }
@@ -1027,6 +1060,25 @@ mod tests {
             judge_service(&checked, Some(&st("running", Some("unhealthy"), None))),
             ServiceReadiness::Failed(m) if m.contains("unhealthy")
         ));
+    }
+
+    #[test]
+    fn host_ports_are_stable_unless_taken() {
+        let rows = vec![
+            ("web".to_string(), 80, Some(8300)),
+            ("admin".to_string(), 8080, Some(8301)),
+            ("api".to_string(), 3000, None),
+        ];
+        // 8300 is web's own container; 8301 is also held by something else.
+        let plan =
+            plan_host_ports(&rows, vec![8300, 8301, 8301, 8302]).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(plan["web"], (8300, 80), "a service keeps its port");
+        assert_eq!(
+            plan["admin"],
+            (8303, 8080),
+            "a port taken by someone else moves"
+        );
+        assert_eq!(plan["api"], (8304, 3000));
     }
 
     #[test]

@@ -88,6 +88,13 @@ fn specs_list_services_in_file_order_with_ports_and_healthchecks() {
 }
 
 #[test]
+fn profiled_and_zero_replica_services_are_inactive() {
+    let content = "services:\n  web:\n    image: a\n  debug:\n    image: b\n    profiles: [debug]\n  off:\n    image: c\n    deploy:\n      replicas: 0\n  on:\n    image: d\n    profiles: []\n";
+    assert_eq!(inactive_services(content), vec!["debug", "off"]);
+    assert!(inactive_services("not: [valid").is_empty());
+}
+
+#[test]
 fn container_ports_parse_every_short_syntax() {
     let p = |s: &str| container_port(&Value::String(s.into()));
     assert_eq!(p("80"), Some(80));

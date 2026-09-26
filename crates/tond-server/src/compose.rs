@@ -261,6 +261,38 @@ pub fn service_specs_env(
     Ok(specs)
 }
 
+/// Services `docker compose up` leaves alone: those in a profile (Tond
+/// never passes `--profile`) and those scaled to zero replicas.
+pub fn inactive_services(content: &str) -> Vec<String> {
+    let Ok(doc) = load(content) else {
+        return Vec::new();
+    };
+    let Some(Value::Mapping(services)) = untag(&doc).get("services").map(untag) else {
+        return Vec::new();
+    };
+    services
+        .iter()
+        .filter(|(_, svc)| {
+            let svc = untag(svc);
+            let profiled = matches!(
+                svc.get("profiles").map(untag),
+                Some(Value::Sequence(p)) if !p.is_empty()
+            );
+            let scaled_to_zero = svc
+                .get("deploy")
+                .and_then(|d| untag(d).get("replicas"))
+                .and_then(scalar)
+                .is_some_and(|r| r.trim() == "0")
+                || svc
+                    .get("scale")
+                    .and_then(scalar)
+                    .is_some_and(|r| r.trim() == "0");
+            profiled || scaled_to_zero
+        })
+        .filter_map(|(name, _)| scalar(name))
+        .collect()
+}
+
 /// Volumes a compose file uses: named volumes (top-level `volumes:` keys and
 /// named sources in services) and whether any service bind-mounts a path.
 #[derive(Debug, Default, PartialEq, Eq)]

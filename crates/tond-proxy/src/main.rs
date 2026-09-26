@@ -664,6 +664,8 @@ impl TondProxy {
 
         // Compose services: domain -> (app, service) -> the loopback host port
         // tond-server allocated for the service's published container port.
+        // The port is stable across deploys and compose only recreates
+        // changed services, so routes stay up while the app is building.
         // Requests are counted per app (all its services share one bucket).
         #[allow(clippy::type_complexity)]
         let service_rows: Vec<(String, String, String, String, i64, bool, bool)> =
@@ -672,7 +674,7 @@ impl TondProxy {
                  FROM app_domains d
                  JOIN apps a ON a.id = d.app_id
                  JOIN compose_services s ON s.app_id = d.app_id AND s.name = d.service
-                 WHERE d.service IS NOT NULL AND a.status = 'running' AND s.host_port IS NOT NULL",
+                 WHERE d.service IS NOT NULL AND a.status IN ('running', 'building', 'unhealthy') AND s.host_port IS NOT NULL",
             )
             .fetch_all(&mut *tx)
             .await?;
@@ -1948,10 +1950,11 @@ mod tests {
         insert_setting_key(&pool, "preview_domain", "previews.test").await;
         insert_app(&pool, "shop", "shop", None, "running", 80, None).await;
         insert_app(&pool, "down", "down", None, "stopped", 80, None).await;
+        insert_app(&pool, "blog", "blog", None, "building", 80, None).await;
         for stmt in [
             "INSERT INTO compose_services (app_id, name, host_port) VALUES
                ('shop', 'web', 8300), ('shop', 'admin', 8301), ('shop', 'cache', NULL),
-               ('down', 'web', 8302)",
+               ('down', 'web', 8302), ('blog', 'web', 8303)",
             "INSERT INTO app_domains (domain, app_id, service, port) VALUES
                ('shop.example.com', 'shop', 'web', 80),
                ('www.shop.example.com', 'shop', 'web', 80),
@@ -1959,6 +1962,7 @@ mod tests {
                ('cache.shop.example.com', 'shop', 'cache', 6379),
                ('x.previews.test', 'shop', 'web', 80),
                ('down.example.com', 'down', 'web', 80),
+               ('blog.example.com', 'blog', 'web', 80),
                ('single.example.com', 'shop', NULL, NULL)",
         ] {
             sqlx::query(stmt)
@@ -1976,6 +1980,8 @@ mod tests {
             ("shop.example.com", "127.0.0.1:8300"),
             ("www.shop.example.com", "127.0.0.1:8300"),
             ("admin.shop.example.com", "127.0.0.1:8301"),
+            // A redeploy keeps serving: unchanged services keep their port.
+            ("blog.example.com", "127.0.0.1:8303"),
         ]
         .into_iter()
         .map(|(d, u)| (d.to_string(), u.to_string()))
