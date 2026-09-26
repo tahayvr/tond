@@ -10,6 +10,7 @@ import type {
 	BackupConfig,
 	Certificate,
 	RetentionSettings,
+	AuditShipping,
 	CronJob,
 	CronJobRun,
 	Deployment,
@@ -673,6 +674,43 @@ export const MOCK_RETENTION: RetentionSettings = {
 		],
 		measured_at: new Date().toISOString()
 	}
+};
+
+// ── Audit log shipping ─────────────────────────────────────────────────────
+
+export const MOCK_AUDIT_SHIPPING: AuditShipping = {
+	syslog: {
+		enabled: true,
+		host: 'logs.example.net',
+		port: 6514,
+		tls: true,
+		status: {
+			shipped_seq: 1284,
+			pending: 0,
+			failures: 0,
+			last_attempt_at: new Date(Date.now() - 4 * 60_000).toISOString(),
+			last_success_at: new Date(Date.now() - 4 * 60_000).toISOString(),
+			last_error: null,
+			next_attempt_at: null,
+			dropped: 0
+		}
+	},
+	webhook: {
+		enabled: false,
+		url: '',
+		has_secret: false,
+		status: {
+			shipped_seq: 0,
+			pending: 1284,
+			failures: 0,
+			last_attempt_at: null,
+			last_success_at: null,
+			last_error: null,
+			next_attempt_at: null,
+			dropped: 0
+		}
+	},
+	latest_seq: 1284
 };
 
 // ── Certificates ───────────────────────────────────────────────────────────

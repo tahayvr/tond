@@ -25,6 +25,7 @@ import {
 	MOCK_TEMPLATES,
 	MOCK_SETTINGS,
 	MOCK_RETENTION,
+	MOCK_AUDIT_SHIPPING,
 	MOCK_ONBOARDING_STATUS,
 	MOCK_DEPLOYMENTS,
 	MOCK_DEPLOYMENT_LOGS,
@@ -57,6 +58,7 @@ import {
 	MOCK_DATABASE_SECRETS
 } from './fixtures';
 import type {
+	UpdateAuditShipping,
 	AlertRule,
 	AlertIntegrationLink,
 	App,
@@ -2569,6 +2571,61 @@ export const handlers = [
 			? 'pending'
 			: null;
 		return ok(MOCK_ONBOARDING_STATUS);
+	}),
+
+	http.get('/api/audit-log/shipping', async () => {
+		await delay(LATENCY);
+		return ok(MOCK_AUDIT_SHIPPING);
+	}),
+
+	http.put('/api/audit-log/shipping', async ({ request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as UpdateAuditShipping;
+		if (body.syslog) {
+			if (body.syslog.enabled && !body.syslog.host.trim()) {
+				return err("Enter the syslog server's host name or IP address.", 400);
+			}
+			const repointed =
+				body.syslog.host !== MOCK_AUDIT_SHIPPING.syslog.host ||
+				body.syslog.port !== MOCK_AUDIT_SHIPPING.syslog.port;
+			Object.assign(MOCK_AUDIT_SHIPPING.syslog, body.syslog);
+			if (repointed) {
+				MOCK_AUDIT_SHIPPING.syslog.status.shipped_seq = 0;
+				MOCK_AUDIT_SHIPPING.syslog.status.pending = MOCK_AUDIT_SHIPPING.latest_seq;
+			}
+		}
+		if (body.webhook) {
+			const url = body.webhook.url.trim();
+			if (url && !url.startsWith('https://')) return err('The webhook must use https://.', 400);
+			const secret = body.webhook.secret?.trim();
+			if (secret && secret.length < 16) {
+				return err('The signing secret must be at least 16 characters.', 400);
+			}
+			if (body.webhook.enabled && !secret && !MOCK_AUDIT_SHIPPING.webhook.has_secret) {
+				return err(
+					'Set a signing secret so the receiver can check each delivery came from this server.',
+					400
+				);
+			}
+			MOCK_AUDIT_SHIPPING.webhook.enabled = body.webhook.enabled;
+			MOCK_AUDIT_SHIPPING.webhook.url = url;
+			if (secret) MOCK_AUDIT_SHIPPING.webhook.has_secret = true;
+		}
+		return ok(MOCK_AUDIT_SHIPPING);
+	}),
+
+	http.post('/api/audit-log/shipping/test', async ({ request }) => {
+		await delay(LATENCY * 2);
+		const { destination } = (await request.json()) as { destination: string };
+		if (destination === 'syslog') {
+			return ok({
+				ok: true,
+				message: 'Test entry sent. Look for action audit_shipping_test on the syslog server.'
+			});
+		}
+		if (!MOCK_AUDIT_SHIPPING.webhook.url)
+			return ok({ ok: false, message: 'Save a webhook URL first.' });
+		return ok({ ok: false, message: 'the webhook answered HTTP 401' });
 	}),
 
 	http.get('/api/settings/retention', async () => {

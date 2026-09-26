@@ -1042,6 +1042,57 @@ export async function updateRetention(changes: Record<string, number>): Promise<
 	});
 }
 
+// ── Audit log shipping ──
+
+/** Delivery progress of one audit shipping destination. */
+export interface DeliveryStatus {
+	/** Last audit entry the destination accepted */
+	shipped_seq: number;
+	/** Entries waiting to be delivered */
+	pending: number;
+	failures: number;
+	last_attempt_at: string | null;
+	last_success_at: string | null;
+	last_error: string | null;
+	next_attempt_at: string | null;
+	/** Entries removed by retention before they could be delivered */
+	dropped: number;
+}
+
+export interface AuditShipping {
+	syslog: { enabled: boolean; host: string; port: number; tls: boolean; status: DeliveryStatus };
+	webhook: { enabled: boolean; url: string; has_secret: boolean; status: DeliveryStatus };
+	latest_seq: number;
+}
+
+export interface UpdateAuditShipping {
+	syslog?: { enabled: boolean; host: string; port: number; tls: boolean };
+	/** `secret` omitted or null keeps the stored one */
+	webhook?: { enabled: boolean; url: string; secret?: string | null };
+}
+
+export type ShippingDestination = 'syslog' | 'webhook';
+
+export async function getAuditShipping(): Promise<AuditShipping> {
+	return request<AuditShipping>('/audit-log/shipping');
+}
+
+export async function updateAuditShipping(body: UpdateAuditShipping): Promise<AuditShipping> {
+	return request<AuditShipping>('/audit-log/shipping', {
+		method: 'PUT',
+		body: JSON.stringify(body)
+	});
+}
+
+export async function testAuditShipping(
+	destination: ShippingDestination
+): Promise<{ ok: boolean; message: string }> {
+	return request<{ ok: boolean; message: string }>('/audit-log/shipping/test', {
+		method: 'POST',
+		body: JSON.stringify({ destination })
+	});
+}
+
 // ── Deployments ──
 
 /** Steps of a deployment, in order ("release" = switch traffic, stop the old container). */
