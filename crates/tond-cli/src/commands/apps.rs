@@ -6,6 +6,7 @@ use serde_json::Value;
 use tond_common::{DatabaseCredentialsResponse, TemplateManifest, load_template_manifests};
 
 use crate::client::TondClient;
+use crate::deploy_follow;
 
 #[derive(Args)]
 pub struct CreateAppOptions {
@@ -84,10 +85,13 @@ pub enum AppsAction {
     /// Create a new app
     Create(Box<CreateAppOptions>),
 
-    /// Deploy an app (build & start from stored source)
+    /// Deploy an app (build & start from stored source) and follow its progress
     Deploy {
         /// App name or ID
         app: String,
+        /// Return as soon as the deploy is queued instead of following it
+        #[arg(long)]
+        no_follow: bool,
     },
 
     /// Deploy current directory to an app (tar + upload)
@@ -426,13 +430,19 @@ pub async fn handle(client: &TondClient, action: AppsAction) -> Result<()> {
             }
         }
 
-        AppsAction::Deploy { app } => {
+        AppsAction::Deploy { app, no_follow } => {
             println!("Deploying {}...", app);
-            client.deploy_app(&app).await?;
-            println!(
-                "Deployment started! Check status with: tond apps info {}",
-                app
-            );
+            let deployment_id = client.deploy_app(&app).await?;
+            match deployment_id {
+                Some(id) if !no_follow => {
+                    let outcome = deploy_follow::follow(client, &app, &id).await?;
+                    deploy_follow::finish(&app, outcome)?;
+                }
+                _ => println!(
+                    "Deployment queued. Follow it with: tond apps deployments {}",
+                    app
+                ),
+            }
         }
 
         AppsAction::Push { app } => {

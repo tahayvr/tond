@@ -44,7 +44,7 @@ export function tabHref(
 
 // ── App page ────────────────────────────────────────────────────────────────
 
-export type AppTab = 'overview' | 'deployments' | 'logs' | 'metrics' | 'settings';
+export type AppTab = 'overview' | 'deployments' | 'logs' | 'metrics' | 'events' | 'settings';
 export type AppSettingsSection =
 	| 'environment'
 	| 'domain'
@@ -62,6 +62,7 @@ export const APP_TABS: readonly TabDef<AppTab>[] = [
 	{ id: 'deployments', label: 'Deployments' },
 	{ id: 'logs', label: 'Logs', scope: 'logs:read' },
 	{ id: 'metrics', label: 'Metrics', scope: 'metrics:read' },
+	{ id: 'events', label: 'Events' },
 	{ id: 'settings', label: 'Settings' }
 ];
 

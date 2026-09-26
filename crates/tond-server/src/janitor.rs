@@ -15,13 +15,14 @@
 //   cron_job_runs  — per job, keep the last N runs and drop runs older than M
 //                    days (the latest run is always kept; running rows never
 //                    deleted).
-//   audit_log      — drop rows older than N days (security data: default 90)
+//   audit_log      — drop rows older than N days (security data: default 180)
 //                    through audit_log::prune_before, which removes a prefix
 //                    of the hash chain and records a checkpoint so the rest
 //                    still verifies.
 //   metrics        — tiered retention (raw 25 h, 5-minute rollups 8 days,
-//                    hourly rollups and events 90 days) plus targets whose
-//                    owner is gone; see metrics::store::prune.
+//                    hourly rollups 90 days; restart/crash/OOM events for
+//                    `retention_app_events_days`) plus targets whose owner
+//                    is gone; see metrics::store::prune.
 //   alert_history  — drop episodes resolved more than N days ago (default 90;
 //                    their deliveries go with them) and close episodes whose
 //                    rule disappeared with its app.
@@ -65,7 +66,8 @@ const INTERVAL: Duration = Duration::from_secs(3600);
 /// such images plus the running one, so this never trims a live target.
 const KEEP_ROLLBACK_IMAGES: i64 = 5;
 
-/// Retention settings. Each field maps to a key in the `settings` table.
+/// Retention settings. Each field maps to a key in the `settings` table;
+/// defaults and bounds are `tond_common::RETENTION_RULES`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetentionPolicy {
     /// `retention_deploy_logs_deployments` — deployments per app whose logs are kept.
@@ -80,20 +82,27 @@ pub struct RetentionPolicy {
     pub cron_run_days: i64,
     /// `retention_audit_log_days` — max age of audit log rows.
     pub audit_log_days: i64,
+    /// `retention_app_events_days` — max age of restart / crash / OOM events.
+    pub app_events_days: i64,
     /// `retention_alert_history_days` — how long resolved alerts are kept.
     pub alert_history_days: i64,
+}
+
+fn rule_default(key: &str) -> i64 {
+    tond_common::retention_rule(key).map_or(0, |r| r.default)
 }
 
 impl Default for RetentionPolicy {
     fn default() -> Self {
         Self {
-            deploy_log_deployments: 20,
-            deploy_log_days: 30,
-            deployments_per_app: 50,
-            cron_runs_per_job: 100,
-            cron_run_days: 30,
-            audit_log_days: 90,
-            alert_history_days: 90,
+            deploy_log_deployments: rule_default("retention_deploy_logs_deployments"),
+            deploy_log_days: rule_default("retention_deploy_logs_days"),
+            deployments_per_app: rule_default("retention_deployments_per_app"),
+            cron_runs_per_job: rule_default("retention_cron_runs_per_job"),
+            cron_run_days: rule_default("retention_cron_runs_days"),
+            audit_log_days: rule_default("retention_audit_log_days"),
+            app_events_days: rule_default("retention_app_events_days"),
+            alert_history_days: rule_default("retention_alert_history_days"),
         }
     }
 }
@@ -110,25 +119,37 @@ impl RetentionPolicy {
         Self::from_pairs(rows.iter().map(|(k, v)| (k.as_str(), v.as_str())))
     }
 
-    fn from_pairs<'a>(pairs: impl Iterator<Item = (&'a str, &'a str)>) -> Self {
+    pub(crate) fn from_pairs<'a>(pairs: impl Iterator<Item = (&'a str, &'a str)>) -> Self {
         let mut policy = Self::default();
         for (key, value) in pairs {
             let Ok(n) = value.trim().parse::<i64>() else {
                 continue;
             };
-            let field = match key {
-                "retention_deploy_logs_deployments" => &mut policy.deploy_log_deployments,
-                "retention_deploy_logs_days" => &mut policy.deploy_log_days,
-                "retention_deployments_per_app" => &mut policy.deployments_per_app,
-                "retention_cron_runs_per_job" => &mut policy.cron_runs_per_job,
-                "retention_cron_runs_days" => &mut policy.cron_run_days,
-                "retention_audit_log_days" => &mut policy.audit_log_days,
-                "retention_alert_history_days" => &mut policy.alert_history_days,
-                _ => continue,
-            };
-            *field = n;
+            if let Some(field) = policy.field_mut(key) {
+                *field = n;
+            }
         }
         policy
+    }
+
+    fn field_mut(&mut self, key: &str) -> Option<&mut i64> {
+        Some(match key {
+            "retention_deploy_logs_deployments" => &mut self.deploy_log_deployments,
+            "retention_deploy_logs_days" => &mut self.deploy_log_days,
+            "retention_deployments_per_app" => &mut self.deployments_per_app,
+            "retention_cron_runs_per_job" => &mut self.cron_runs_per_job,
+            "retention_cron_runs_days" => &mut self.cron_run_days,
+            "retention_audit_log_days" => &mut self.audit_log_days,
+            "retention_app_events_days" => &mut self.app_events_days,
+            "retention_alert_history_days" => &mut self.alert_history_days,
+            _ => return None,
+        })
+    }
+
+    /// The value for a settings key (None for an unknown key).
+    pub fn get(&self, key: &str) -> Option<i64> {
+        let mut copy = self.clone();
+        copy.field_mut(key).map(|v| *v)
     }
 }
 
@@ -329,7 +350,12 @@ pub async fn run_once(db: &SqlitePool, policy: &RetentionPolicy) -> Result<Janit
     }
 
     // ── metrics (fixed tiers, see metrics/store.rs) ──
-    report.metrics += metrics::store::prune(db, now.timestamp()).await?;
+    let event_keep_secs = if policy.app_events_days > 0 {
+        policy.app_events_days.saturating_mul(86_400)
+    } else {
+        i64::MAX / 2
+    };
+    report.metrics += metrics::store::prune(db, now.timestamp(), event_keep_secs).await?;
 
     // ── alert history (unix seconds; deliveries cascade) ──
     let _ = alerts::evaluate::close_orphans(db, now.timestamp()).await;
@@ -626,11 +652,14 @@ mod tests {
         );
         assert_eq!(policy.audit_log_days, 365);
         assert_eq!(
-            policy.deploy_log_days, 30,
+            policy.deploy_log_days, 90,
             "garbage falls back to the default"
         );
         assert_eq!(policy.cron_runs_per_job, 0, "0 disables the rule");
-        assert_eq!(policy.deploy_log_deployments, 20);
+        assert_eq!(policy.deploy_log_deployments, 30);
+        assert_eq!(policy.app_events_days, 90);
+        assert_eq!(policy.get("retention_audit_log_days"), Some(365));
+        assert_eq!(policy.get("retention_nope"), None);
     }
 
     #[tokio::test]
@@ -778,7 +807,7 @@ mod tests {
         }
 
         let actor = crate::audit_log::AuditActor::system("test");
-        for (action, days) in [("au-old", 100), ("au-new", 1)] {
+        for (action, days) in [("au-old", 200), ("au-new", 1)] {
             crate::audit_log::record_at(
                 &db,
                 &actor,

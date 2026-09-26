@@ -262,11 +262,55 @@ async fn provision_cert_inner(
     Ok(())
 }
 
-pub(crate) fn certificate_timestamps(cert_pem: &[u8]) -> Result<(String, String)> {
+/// What tond-server stores about an issued certificate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CertDetails {
+    /// RFC 3339 `notBefore`.
+    pub issued_at: String,
+    /// RFC 3339 `notAfter`.
+    pub expires_at: String,
+    /// The issuing CA as written in the certificate ("Let's Encrypt R11",
+    /// "(STAGING) Let's Encrypt …"), if it has an O or CN.
+    pub issuer: Option<String>,
+}
+
+/// Validity window and issuer of a PEM certificate (the leaf, i.e. the first
+/// certificate in the chain).
+pub(crate) fn certificate_details(cert_pem: &[u8]) -> Result<CertDetails> {
     let cert = openssl::x509::X509::from_pem(cert_pem).context("parsing issued certificate PEM")?;
-    let issued_at = cert.not_before().to_string();
-    let expires_at = cert.not_after().to_string();
-    Ok((issued_at, expires_at))
+    Ok(CertDetails {
+        issued_at: asn1_to_rfc3339(cert.not_before())?,
+        expires_at: asn1_to_rfc3339(cert.not_after())?,
+        issuer: issuer_name(cert.issuer_name()),
+    })
+}
+
+/// ASN.1 time as RFC 3339 (UTC), via its distance from the Unix epoch.
+fn asn1_to_rfc3339(t: &openssl::asn1::Asn1TimeRef) -> Result<String> {
+    let epoch = openssl::asn1::Asn1Time::from_unix(0).context("building the epoch")?;
+    let diff = epoch.diff(t).context("reading certificate time")?;
+    let secs = i64::from(diff.days) * 86_400 + i64::from(diff.secs);
+    let at = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
+        .context("certificate time out of range")?;
+    Ok(at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
+
+/// "O CN" of the issuer, without repeating the organisation when the CN
+/// already starts with it.
+fn issuer_name(name: &openssl::x509::X509NameRef) -> Option<String> {
+    let field = |nid| {
+        name.entries_by_nid(nid)
+            .next()
+            .and_then(|e| e.data().to_string().ok())
+            .filter(|s| !s.trim().is_empty())
+    };
+    let org = field(openssl::nid::Nid::ORGANIZATIONNAME);
+    let cn = field(openssl::nid::Nid::COMMONNAME);
+    match (org, cn) {
+        (Some(o), Some(c)) if c.starts_with(&o) => Some(c),
+        (Some(o), Some(c)) => Some(format!("{o} {c}")),
+        (o, c) => o.or(c),
+    }
 }
 
 #[cfg(test)]
@@ -343,24 +387,18 @@ mod tests {
     }
 
     #[test]
-    fn certificate_timestamps_extract_not_before_and_not_after() {
+    fn certificate_details_are_rfc3339_with_the_issuer() {
         let (_pair, cert_pem, _key_pem) =
             crate::certs::generate_self_signed_for_domain("dash.example.com")
                 .unwrap_or_else(|err| panic!("failed to generate self-signed cert fixture: {err}"));
 
-        let (issued_at, expires_at) = certificate_timestamps(&cert_pem)
-            .unwrap_or_else(|err| panic!("failed to extract certificate timestamps: {err}"));
+        let details = certificate_details(&cert_pem)
+            .unwrap_or_else(|err| panic!("failed to extract certificate details: {err}"));
 
-        let cert = openssl::x509::X509::from_pem(&cert_pem)
-            .unwrap_or_else(|err| panic!("failed to parse generated certificate PEM: {err}"));
-
-        assert!(
-            cert.not_before().to_string() == issued_at,
-            "issued_at should match the parsed certificate's not_before value"
-        );
-        assert!(
-            cert.not_after().to_string() == expires_at,
-            "expires_at should match the parsed certificate's not_after value"
-        );
+        // rcgen's defaults: valid from 1975-01-01 to 4096-01-01.
+        assert_eq!(details.issued_at, "1975-01-01T00:00:00Z");
+        assert_eq!(details.expires_at, "4096-01-01T00:00:00Z");
+        // rcgen's self-signed certificates are issued by "rcgen self signed cert".
+        assert_eq!(details.issuer.as_deref(), Some("rcgen self signed cert"));
     }
 }

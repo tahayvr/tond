@@ -24,6 +24,9 @@ import {
 	MOCK_PROJECTS,
 	MOCK_TEMPLATES,
 	MOCK_SETTINGS,
+	MOCK_RETENTION,
+	MOCK_AUDIT_SHIPPING,
+	makeMockAppEvents,
 	MOCK_ONBOARDING_STATUS,
 	MOCK_DEPLOYMENTS,
 	MOCK_DEPLOYMENT_LOGS,
@@ -56,6 +59,7 @@ import {
 	MOCK_DATABASE_SECRETS
 } from './fixtures';
 import type {
+	UpdateAuditShipping,
 	ActiveAlert,
 	AlertEpisode,
 	AlertRule,
@@ -341,7 +345,11 @@ function queueMockCertificate(domain: string) {
 		last_error: null,
 		last_attempt_at: null,
 		next_retry_at: null,
-		failure_count: 0
+		failure_count: 0,
+		issuer: null,
+		issuer_kind: 'unknown',
+		last_renewed_at: null,
+		serves: { kind: 'unused' }
 	});
 }
 
@@ -2034,6 +2042,7 @@ export const handlers = [
 		const cert = certificates.find((c) => c.domain === params.domain);
 		if (!cert) return err(`No certificate for ${params.domain}`, 404);
 		cert.next_retry_at = null;
+		cert.last_attempt_at = new Date().toISOString();
 		return ok({ message: 'Certificate retry queued', domain: cert.domain });
 	}),
 
@@ -2113,6 +2122,37 @@ export const handlers = [
 	}),
 
 	// ── Deployments ───────────────────────────────────────────────────────────
+
+	http.get('/api/apps/:id/deployments/stats', async ({ params }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
+		if (!app) return err('App not found', 404);
+		const outcomes = Array.from({ length: 30 }, (_, i) => {
+			const status =
+				i === 7 || i === 19 || i === 20 ? 'failed' : i === 12 ? 'superseded' : 'succeeded';
+			return {
+				id: `dep_trend_${i}`,
+				status,
+				started_at: new Date(Date.now() - (30 - i) * 86_400_000).toISOString(),
+				duration_secs: 60 + ((i * 17) % 50),
+				commit_sha: (0xabc1234 + i).toString(16)
+			};
+		});
+		const succeeded = outcomes.filter((o) => o.status === 'succeeded').length;
+		const failed = outcomes.filter((o) => o.status === 'failed').length;
+		const durations = outcomes
+			.filter((o) => o.status === 'succeeded')
+			.map((o) => o.duration_secs)
+			.sort((a, b) => a - b);
+		return ok({
+			window: outcomes.length,
+			succeeded,
+			failed,
+			success_rate: succeeded / (succeeded + failed),
+			median_duration_secs: durations[Math.floor(durations.length / 2)],
+			outcomes
+		});
+	}),
 
 	http.get('/api/apps/:id/deployments', async ({ params }) => {
 		await delay(LATENCY);
@@ -2565,6 +2605,95 @@ export const handlers = [
 			? 'pending'
 			: null;
 		return ok(MOCK_ONBOARDING_STATUS);
+	}),
+
+	http.get('/api/apps/:id/events', async ({ params, request }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
+		if (!app) return err('App not found', 404);
+		const url = new URL(request.url);
+		const limit = Number(url.searchParams.get('limit') ?? 50);
+		const before = url.searchParams.get('before');
+		const all = makeMockAppEvents(app.id).filter((e) => !before || e.at < before);
+		const page = all.slice(0, limit);
+		return ok({
+			events: page,
+			next_before: all.length > limit ? page[page.length - 1].at : null
+		});
+	}),
+
+	http.get('/api/audit-log/shipping', async () => {
+		await delay(LATENCY);
+		return ok(MOCK_AUDIT_SHIPPING);
+	}),
+
+	http.put('/api/audit-log/shipping', async ({ request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as UpdateAuditShipping;
+		if (body.syslog) {
+			if (body.syslog.enabled && !body.syslog.host.trim()) {
+				return err("Enter the syslog server's host name or IP address.", 400);
+			}
+			const repointed =
+				body.syslog.host !== MOCK_AUDIT_SHIPPING.syslog.host ||
+				body.syslog.port !== MOCK_AUDIT_SHIPPING.syslog.port;
+			Object.assign(MOCK_AUDIT_SHIPPING.syslog, body.syslog);
+			if (repointed) {
+				MOCK_AUDIT_SHIPPING.syslog.status.shipped_seq = 0;
+				MOCK_AUDIT_SHIPPING.syslog.status.pending = MOCK_AUDIT_SHIPPING.latest_seq;
+			}
+		}
+		if (body.webhook) {
+			const url = body.webhook.url.trim();
+			if (url && !url.startsWith('https://')) return err('The webhook must use https://.', 400);
+			const secret = body.webhook.secret?.trim();
+			if (secret && secret.length < 16) {
+				return err('The signing secret must be at least 16 characters.', 400);
+			}
+			if (body.webhook.enabled && !secret && !MOCK_AUDIT_SHIPPING.webhook.has_secret) {
+				return err(
+					'Set a signing secret so the receiver can check each delivery came from this server.',
+					400
+				);
+			}
+			MOCK_AUDIT_SHIPPING.webhook.enabled = body.webhook.enabled;
+			MOCK_AUDIT_SHIPPING.webhook.url = url;
+			if (secret) MOCK_AUDIT_SHIPPING.webhook.has_secret = true;
+		}
+		return ok(MOCK_AUDIT_SHIPPING);
+	}),
+
+	http.post('/api/audit-log/shipping/test', async ({ request }) => {
+		await delay(LATENCY * 2);
+		const { destination } = (await request.json()) as { destination: string };
+		if (destination === 'syslog') {
+			return ok({
+				ok: true,
+				message: 'Test entry sent. Look for action audit_shipping_test on the syslog server.'
+			});
+		}
+		if (!MOCK_AUDIT_SHIPPING.webhook.url)
+			return ok({ ok: false, message: 'Save a webhook URL first.' });
+		return ok({ ok: false, message: 'the webhook answered HTTP 401' });
+	}),
+
+	http.get('/api/settings/retention', async () => {
+		await delay(LATENCY);
+		return ok(MOCK_RETENTION);
+	}),
+
+	http.put('/api/settings/retention', async ({ request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as Record<string, number>;
+		for (const [key, value] of Object.entries(body)) {
+			const field = MOCK_RETENTION.fields.find((f) => f.key === key);
+			if (!field) return err(`Unknown setting '${key}'`, 400);
+			if (!Number.isInteger(value) || value < field.min || value > field.max) {
+				return err(`${key} must be between ${field.min} and ${field.max} ${field.unit}`, 400);
+			}
+			field.value = value;
+		}
+		return ok(MOCK_RETENTION);
 	}),
 
 	http.put('/api/settings', async ({ request }) => {

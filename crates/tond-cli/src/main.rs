@@ -30,6 +30,7 @@
 
 mod client;
 mod commands;
+mod deploy_follow;
 mod signature;
 
 use std::path::PathBuf;

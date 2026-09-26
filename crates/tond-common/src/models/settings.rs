@@ -106,3 +106,149 @@ pub struct UpdateSettingsRequest {
     #[serde(default)]
     pub session_max_age_days: Option<i64>,
 }
+
+// ── Retention ──
+//
+// Each retention rule is one row in the `settings` table. The janitor
+// (tond-server janitor.rs) reads them every pass; the dashboard edits them
+// through GET/PUT /api/settings/retention within these bounds.
+
+/// One retention setting: its settings key, default and accepted range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RetentionRule {
+    pub key: &'static str,
+    pub default: i64,
+    pub min: i64,
+    pub max: i64,
+    /// What the number counts: "deploys", "days" or "runs".
+    pub unit: &'static str,
+}
+
+/// Every retention setting, in display order. Defaults follow the roadmap:
+/// deploy logs of the last 30 deploys per app (max 90 days), cron runs last
+/// 100 per job (max 30 days), audit log 180 days, app events 90 days.
+pub const RETENTION_RULES: &[RetentionRule] = &[
+    RetentionRule {
+        key: "retention_deploy_logs_deployments",
+        default: 30,
+        min: 1,
+        max: 500,
+        unit: "deploys",
+    },
+    RetentionRule {
+        key: "retention_deploy_logs_days",
+        default: 90,
+        min: 1,
+        max: 365,
+        unit: "days",
+    },
+    RetentionRule {
+        key: "retention_deployments_per_app",
+        default: 50,
+        min: 30,
+        max: 1000,
+        unit: "deploys",
+    },
+    RetentionRule {
+        key: "retention_cron_runs_per_job",
+        default: 100,
+        min: 10,
+        max: 1000,
+        unit: "runs",
+    },
+    RetentionRule {
+        key: "retention_cron_runs_days",
+        default: 30,
+        min: 1,
+        max: 365,
+        unit: "days",
+    },
+    RetentionRule {
+        key: "retention_audit_log_days",
+        default: 180,
+        min: 30,
+        max: 3650,
+        unit: "days",
+    },
+    RetentionRule {
+        key: "retention_app_events_days",
+        default: 90,
+        min: 7,
+        max: 365,
+        unit: "days",
+    },
+    RetentionRule {
+        key: "retention_alert_history_days",
+        default: 90,
+        min: 7,
+        max: 365,
+        unit: "days",
+    },
+];
+
+/// The rule for a settings key.
+pub fn retention_rule(key: &str) -> Option<&'static RetentionRule> {
+    RETENTION_RULES.iter().find(|r| r.key == key)
+}
+
+/// A retention setting with its current value (GET /api/settings/retention).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetentionField {
+    pub key: String,
+    pub value: i64,
+    pub default: i64,
+    pub min: i64,
+    pub max: i64,
+    pub unit: String,
+}
+
+/// Size of one table (its indexes included).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableSize {
+    pub name: String,
+    pub bytes: u64,
+}
+
+/// How big the database is and where the space goes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseSize {
+    /// tond.db on disk.
+    pub file_bytes: u64,
+    /// The write-ahead log next to it.
+    pub wal_bytes: u64,
+    /// Pages inside the file that are free for reuse.
+    pub free_bytes: u64,
+    /// Largest first. Empty when SQLite's dbstat table is unavailable.
+    pub tables: Vec<TableSize>,
+    /// RFC 3339 time of the measurement (it is cached for a few minutes).
+    pub measured_at: String,
+}
+
+/// GET /api/settings/retention.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetentionResponse {
+    pub fields: Vec<RetentionField>,
+    pub database: Option<DatabaseSize>,
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_inside_their_bounds_and_keys_are_unique() {
+        let mut keys = std::collections::HashSet::new();
+        for rule in RETENTION_RULES {
+            assert!(
+                rule.min <= rule.default && rule.default <= rule.max,
+                "{rule:?}"
+            );
+            assert!(rule.key.starts_with("retention_"));
+            assert!(keys.insert(rule.key), "duplicate {}", rule.key);
+        }
+        assert_eq!(
+            retention_rule("retention_audit_log_days").map(|r| r.default),
+            Some(180)
+        );
+    }
+}
