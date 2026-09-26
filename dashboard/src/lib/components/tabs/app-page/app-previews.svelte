@@ -2,7 +2,7 @@
 	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { safeUrl } from '$lib/utils';
 	import { Button } from '$lib/components/ui/button/index.js';
-	import { Badge } from '$lib/components/ui/badge/index.js';
+	import StatusBadge from '$lib/components/feedback/status-badge.svelte';
 	import type { PreviewDeployment } from '$lib/api';
 	import Github from '~icons/ri/github-fill';
 	import GitBranch from '~icons/ri/git-branch-line';
@@ -51,13 +51,7 @@
 					{#each previews as p (p.id)}
 						<tr class="border-b last:border-0">
 							<td class="px-4 py-2">
-								<Badge
-									variant={p.status === 'running'
-										? 'default'
-										: p.status === 'failed'
-											? 'destructive'
-											: 'secondary'}>{p.status}</Badge
-								>
+								<StatusBadge status={p.status} kind="preview" size="sm" />
 							</td>
 
 							<!-- PR column -->

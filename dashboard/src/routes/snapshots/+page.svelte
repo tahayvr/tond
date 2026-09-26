@@ -67,7 +67,10 @@
 
 	const create = useAction(() => createSnapshot(), {
 		invalidate: true,
-		success: (snap) => `Snapshot created: ${snap.name}`
+		success: (snap) => `Snapshot created: ${snap.name}`,
+		onSuccess: (snap) => {
+			if (!snapshots.some((s) => s.id === snap.id)) snapshots = [snap, ...snapshots];
+		}
 	});
 
 	// ── Delete ────────────────────────────────────────────────────────────────
@@ -81,6 +84,7 @@
 			pendingLabel: 'Deleting…',
 			onconfirm: async () => {
 				await deleteSnapshot(snap.id);
+				snapshots = snapshots.filter((s) => s.id !== snap.id);
 				await invalidateAll();
 			}
 		});
@@ -243,7 +247,12 @@
 				<Settings2 class="h-3.5 w-3.5" />
 				Backup settings
 			</Button>
-			<Button size="sm" disabled={create.pending} aria-busy={create.pending} onclick={() => create.run()}>
+			<Button
+				size="sm"
+				disabled={create.pending}
+				aria-busy={create.pending}
+				onclick={() => create.run()}
+			>
 				<Plus class="h-3.5 w-3.5" />
 				{create.pending ? 'Creating…' : 'Create snapshot'}
 			</Button>

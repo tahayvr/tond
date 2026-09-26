@@ -46,7 +46,9 @@
 		>
 			<SearchIcon class="size-4" />
 			<span class="hidden sm:inline">Search…</span>
-			<kbd class="ml-auto hidden rounded-sm border bg-muted px-1 font-mono text-[11px] sm:inline">⌘K</kbd>
+			<kbd class="ml-auto hidden rounded-sm border bg-muted px-1 font-mono text-[11px] sm:inline"
+				>⌘K</kbd
+			>
 		</Button>
 		<Button
 			href="/profile"

@@ -19,7 +19,12 @@ export function tabFromUrl<T extends string>(
 }
 
 /** Same path, with `?tab=` set (the default tab drops the parameter). Other params are dropped. */
-export function tabHref(pathname: string, tab: string, fallback: string, extra: Record<string, string> = {}): string {
+export function tabHref(
+	pathname: string,
+	tab: string,
+	fallback: string,
+	extra: Record<string, string> = {}
+): string {
 	const params = new URLSearchParams();
 	if (tab !== fallback) params.set('tab', tab);
 	for (const [key, value] of Object.entries(extra)) params.set(key, value);

@@ -19,7 +19,15 @@ const MONTHS = [
 	'November',
 	'December'
 ];
-const DAY_NAMES: Record<string, number> = { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 };
+const DAY_NAMES: Record<string, number> = {
+	sun: 0,
+	mon: 1,
+	tue: 2,
+	wed: 3,
+	thu: 4,
+	fri: 5,
+	sat: 6
+};
 const MONTH_NAMES: Record<string, number> = {
 	jan: 1,
 	feb: 2,
@@ -103,7 +111,10 @@ export function describeCron(expression: string): CronDescription {
 	const expanded = MACROS[trimmed.toLowerCase()] ?? trimmed;
 	const fields = expanded.split(' ');
 	if (fields.length !== 5) {
-		return { ok: false, text: 'A schedule needs 5 fields: minute hour day-of-month month day-of-week' };
+		return {
+			ok: false,
+			text: 'A schedule needs 5 fields: minute hour day-of-month month day-of-week'
+		};
 	}
 	const [minute, hour, dom, monthRaw, dowRaw] = fields;
 	const month = normalize(monthRaw, MONTH_NAMES);
@@ -154,11 +165,12 @@ export function describeCron(expression: string): CronDescription {
 
 /** All IANA time zones the browser knows, with UTC first. */
 export function timeZones(): string[] {
-	let zones: string[] = [];
+	let zones: string[];
 	try {
-		zones = (Intl as unknown as { supportedValuesOf?: (k: string) => string[] }).supportedValuesOf?.(
-			'timeZone'
-		) ?? [];
+		zones =
+			(Intl as unknown as { supportedValuesOf?: (k: string) => string[] }).supportedValuesOf?.(
+				'timeZone'
+			) ?? [];
 	} catch {
 		zones = [];
 	}

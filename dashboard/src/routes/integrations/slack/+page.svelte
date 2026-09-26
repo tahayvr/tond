@@ -34,7 +34,7 @@
 	});
 </script>
 
-<PageTitle title={'Slack · Integrations'} />
+<PageTitle title="Slack · Integrations" />
 
 <div class="space-y-8">
 	<div class="flex h-14 items-center gap-4">

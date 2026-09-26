@@ -34,7 +34,10 @@
 						{item.label}
 					</span>
 				{:else}
-					<a href={item.href} class="truncate transition-colors hover:text-foreground hover:underline">
+					<a
+						href={item.href}
+						class="truncate transition-colors hover:text-foreground hover:underline"
+					>
 						{item.label}
 					</a>
 				{/if}

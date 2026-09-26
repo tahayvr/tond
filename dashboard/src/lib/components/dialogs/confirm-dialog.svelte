@@ -105,7 +105,9 @@
 			<AlertDialog.Header>
 				<AlertDialog.Title>{title}</AlertDialog.Title>
 				{#if description}
-					<AlertDialog.Description class="whitespace-pre-line">{description}</AlertDialog.Description>
+					<AlertDialog.Description class="whitespace-pre-line"
+						>{description}</AlertDialog.Description
+					>
 				{/if}
 			</AlertDialog.Header>
 
@@ -116,8 +118,7 @@
 			{#if typedConfirmation}
 				<div class="grid gap-2">
 					<label for={inputId} class="text-sm text-muted-foreground">
-						Type <span class="font-semibold break-all text-foreground">{typedConfirmation}</span> to
-						confirm
+						Type <span class="font-semibold break-all text-foreground">{typedConfirmation}</span> to confirm
 					</label>
 					<Input
 						id={inputId}

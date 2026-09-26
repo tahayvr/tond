@@ -90,7 +90,7 @@
 	}
 </script>
 
-<PageTitle title={'Set up'} />
+<PageTitle title="Set up" />
 
 <div class="flex min-h-[80vh] flex-col items-center justify-center px-4">
 	<div class="w-full max-w-lg space-y-8 font-mono">
@@ -189,11 +189,7 @@
 					{#if password.length > 0}
 						<ul class="mt-2 space-y-0.5">
 							{#each requirements as req (req.label)}
-								<li
-									class="text-xs {req.met
-										? 'text-success'
-										: 'text-muted-foreground'}"
-								>
+								<li class="text-xs {req.met ? 'text-success' : 'text-muted-foreground'}">
 									{req.met ? '✓' : '○'}
 									{req.label}
 								</li>

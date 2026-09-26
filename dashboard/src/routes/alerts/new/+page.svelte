@@ -107,7 +107,8 @@
 			return;
 		}
 		if (!hasRecipient) {
-			error = 'Choose at least one notification channel or add a webhook URL, so this rule notifies someone.';
+			error =
+				'Choose at least one notification channel or add a webhook URL, so this rule notifies someone.';
 			return;
 		}
 		error = '';
@@ -131,7 +132,7 @@
 	}
 </script>
 
-<PageTitle title={'New alert rule'} />
+<PageTitle title="New alert rule" />
 
 <div class="space-y-6 pb-12">
 	<Breadcrumb items={[{ label: 'Alerts', href: '/alerts' }, { label: 'New alert rule' }]} />
@@ -293,7 +294,9 @@
 				<div class="rounded-sm border border-dashed p-3 text-sm">
 					<p>No notification channels yet.</p>
 					<p class="mt-1 text-xs text-muted-foreground">
-						<a href="/integrations" class="underline underline-offset-2">Add Slack, Discord, Telegram or email</a>
+						<a href="/integrations" class="underline underline-offset-2"
+							>Add Slack, Discord, Telegram or email</a
+						>
 						, or use a webhook below.
 					</p>
 				</div>
@@ -310,7 +313,10 @@
 									else selectedChannels.delete(channel.id);
 								}}
 							/>
-							<label for={`channel-${channel.id}`} class="flex flex-1 items-center justify-between gap-2 text-sm">
+							<label
+								for={`channel-${channel.id}`}
+								class="flex flex-1 items-center justify-between gap-2 text-sm"
+							>
 								<span>{channel.name}</span>
 								<span class="text-xs text-muted-foreground">
 									{channel.enabled ? channel.kind : `${channel.kind} (switched off)`}
@@ -348,7 +354,9 @@
 			{/if}
 		</Button>
 		{#if !hasRecipient}
-			<p class="mt-2 text-xs text-muted-foreground">Choose a channel or add a webhook to continue.</p>
+			<p class="mt-2 text-xs text-muted-foreground">
+				Choose a channel or add a webhook to continue.
+			</p>
 		{/if}
 	</div>
 </div>

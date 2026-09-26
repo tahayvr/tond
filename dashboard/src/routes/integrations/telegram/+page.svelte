@@ -46,7 +46,7 @@
 	});
 </script>
 
-<PageTitle title={'Telegram · Integrations'} />
+<PageTitle title="Telegram · Integrations" />
 
 <div class="space-y-8">
 	<div class="flex h-14 items-center gap-4">

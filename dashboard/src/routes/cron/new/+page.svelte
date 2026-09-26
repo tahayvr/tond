@@ -212,7 +212,7 @@
 	}
 </script>
 
-<PageTitle title={'New cron job'} />
+<PageTitle title="New cron job" />
 
 <div class="space-y-6 pb-12">
 	<Breadcrumb items={[{ label: 'Cron jobs', href: '/cron' }, { label: 'New cron job' }]} />

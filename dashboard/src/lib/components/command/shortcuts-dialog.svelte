@@ -10,7 +10,9 @@
 	<Dialog.Content class="sm:max-w-md">
 		<Dialog.Header>
 			<Dialog.Title>Keyboard shortcuts</Dialog.Title>
-			<Dialog.Description>Shortcuts work anywhere except while typing in a field.</Dialog.Description>
+			<Dialog.Description
+				>Shortcuts work anywhere except while typing in a field.</Dialog.Description
+			>
 		</Dialog.Header>
 		<dl class="grid max-h-[60vh] gap-2 overflow-y-auto text-sm">
 			{#each SHORTCUTS as shortcut (shortcut.description)}
@@ -18,7 +20,8 @@
 					<dt class="text-muted-foreground">{shortcut.description}</dt>
 					<dd class="flex shrink-0 gap-1">
 						{#each shortcut.keys as key, i (i)}
-							<kbd class="rounded-sm border bg-muted px-1.5 py-0.5 font-mono text-xs text-foreground"
+							<kbd
+								class="rounded-sm border bg-muted px-1.5 py-0.5 font-mono text-xs text-foreground"
 								>{key}</kbd
 							>
 						{/each}

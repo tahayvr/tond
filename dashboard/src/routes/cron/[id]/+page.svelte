@@ -461,7 +461,11 @@
 						Last run <StatusBadge status={current.last_run_status} kind="run" size="sm" />
 					</span>
 				{/if}
-				<span>{describeCron(current.schedule).text}{current.timezone ? ` (${current.timezone})` : ' (UTC)'}</span>
+				<span
+					>{describeCron(current.schedule).text}{current.timezone
+						? ` (${current.timezone})`
+						: ' (UTC)'}</span
+				>
 			{/snippet}
 			{#snippet actions()}
 				<Button
@@ -485,7 +489,11 @@
 		</PageHeader>
 
 		<InlineError message={error} ondismiss={() => (error = '')} />
-		<InlineError title="Couldn't start the run" message={triggerError} ondismiss={() => (triggerError = '')} />
+		<InlineError
+			title="Couldn't start the run"
+			message={triggerError}
+			ondismiss={() => (triggerError = '')}
+		/>
 		<InlineError message={toggleEnabled.error} ondismiss={toggleEnabled.clear} />
 		<SuccessAlert message={triggerNotice} ondismiss={() => (triggerNotice = '')} />
 

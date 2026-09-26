@@ -1,6 +1,7 @@
 import { render, screen } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { confirmDialog, renderConfirmHost } from '../../../test/confirm';
 import type { EmailConfig } from '$lib/api';
 import NotificationChannelList from './notification-channel-list.svelte';
 
@@ -173,7 +174,9 @@ describe('NotificationChannelList', () => {
 			}
 		});
 
+		renderConfirmHost();
 		await user.click(screen.getByRole('button', { name: /delete ops email/i }));
+		await confirmDialog(user);
 
 		expect(api.deleteIntegration).toHaveBeenCalledWith('int_1');
 		expect(screen.queryByText(/ops email/i)).not.toBeInTheDocument();

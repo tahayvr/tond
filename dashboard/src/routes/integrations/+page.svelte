@@ -69,7 +69,7 @@
 	}
 </script>
 
-<PageTitle title={'Integrations'} />
+<PageTitle title="Integrations" />
 
 <div class="space-y-10">
 	<div class="flex h-14 items-center justify-between">

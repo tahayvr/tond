@@ -92,9 +92,7 @@
 	{#if loading}
 		<p class="font-mono text-xs text-muted-foreground">Loading integrations...</p>
 	{:else if integrations.length === 0}
-		<div
-			class="flex items-start gap-2 rounded border border-dashed p-3"
-		>
+		<div class="flex items-start gap-2 rounded border border-dashed p-3">
 			<Plug class="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
 			<div>
 				<p class="text-xs font-medium">No notification channels configured</p>

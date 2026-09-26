@@ -62,6 +62,7 @@ const WARNING = new Set([
 	'timed_out',
 	'rolled_back',
 	'partial',
+	'partially_failed',
 	'firing',
 	'not_installed'
 ]);

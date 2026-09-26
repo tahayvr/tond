@@ -120,7 +120,9 @@
 	</div>
 	<p
 		id={`${idPrefix}-desc`}
-		class={description.ok || !schedule.trim() ? 'text-sm text-foreground' : 'text-sm text-destructive'}
+		class={description.ok || !schedule.trim()
+			? 'text-sm text-foreground'
+			: 'text-sm text-destructive'}
 		aria-live="polite"
 	>
 		{schedule.trim() ? description.text : 'minute hour day-of-month month day-of-week'}

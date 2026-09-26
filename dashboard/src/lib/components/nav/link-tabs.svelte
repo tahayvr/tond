@@ -45,7 +45,7 @@
 	<ul
 		bind:this={list}
 		class={cn(
-			'flex overflow-x-auto [scrollbar-width:none]',
+			'flex [scrollbar-width:none] overflow-x-auto',
 			variant === 'underline' && 'gap-1 border-b',
 			variant === 'pills' && 'gap-1 md:flex-col md:overflow-visible'
 		)}
@@ -63,7 +63,8 @@
 							'-mb-px border-b-2 px-2.5 py-2 text-muted-foreground hover:text-foreground sm:px-3',
 						variant === 'underline' && current && 'border-foreground font-medium text-foreground',
 						variant === 'underline' && !current && 'border-transparent',
-						variant === 'pills' && 'px-3 py-1.5 text-muted-foreground hover:bg-muted hover:text-foreground',
+						variant === 'pills' &&
+							'px-3 py-1.5 text-muted-foreground hover:bg-muted hover:text-foreground',
 						variant === 'pills' && current && 'bg-muted font-medium text-foreground'
 					)}>{tab.label}</a
 				>

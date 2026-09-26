@@ -53,7 +53,7 @@
 	}
 </script>
 
-<PageTitle title={'New database'} />
+<PageTitle title="New database" />
 
 <div class="space-y-6 pb-12">
 	<Breadcrumb items={[{ label: 'Databases', href: '/databases' }, { label: 'New Database' }]} />

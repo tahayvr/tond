@@ -277,8 +277,8 @@ function mockNextRuns(schedule: string, count: number): string[] | null {
 			const [range, stepStr] = part.split('/');
 			const step = stepStr ? Number(stepStr) : 1;
 			if (!Number.isInteger(step) || step < 1) return null;
-			let [a, b] = range === '*' ? [min, max] : range.split('-').map(Number);
-			if (b === undefined) b = stepStr ? max : a;
+			const [a, rawB] = range === '*' ? [min, max] : range.split('-').map(Number);
+			const b = rawB === undefined ? (stepStr ? max : a) : rawB;
 			if (!Number.isInteger(a) || !Number.isInteger(b) || a < min || b > max || a > b) return null;
 			for (let v = a; v <= b; v += step) set.add(i === 4 ? v % 7 : v);
 		}

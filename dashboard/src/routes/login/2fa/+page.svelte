@@ -34,7 +34,7 @@
 	}
 </script>
 
-<PageTitle title={'Two-factor sign in'} />
+<PageTitle title="Two-factor sign in" />
 
 <div class="flex min-h-[80vh] flex-col items-center justify-center">
 	<div class="w-full max-w-lg space-y-8 font-mono">

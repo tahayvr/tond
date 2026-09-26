@@ -6,7 +6,11 @@ import { appTabHref } from './tabs';
 
 export type PaletteGroup = 'Pages' | 'Apps' | 'Databases' | 'Cron jobs' | 'Projects' | 'Actions';
 
-export type PaletteAction = { kind: 'deploy'; appId: string; appName: string } | { kind: 'theme' } | { kind: 'terminal' } | { kind: 'shortcuts' };
+export type PaletteAction =
+	| { kind: 'deploy'; appId: string; appName: string }
+	| { kind: 'theme' }
+	| { kind: 'terminal' }
+	| { kind: 'shortcuts' };
 
 export interface PaletteEntry {
 	id: string;
@@ -40,17 +44,65 @@ export function buildPaletteEntries(
 			keywords: [item.href.slice(1)],
 			href: item.href
 		})),
-		{ id: 'page:/profile', group: 'Pages', label: 'Profile', keywords: ['2fa', 'password', 'account'], href: '/profile' }
+		{
+			id: 'page:/profile',
+			group: 'Pages',
+			label: 'Profile',
+			keywords: ['2fa', 'password', 'account'],
+			href: '/profile'
+		}
 	];
 
 	entries.push(
-		{ id: 'new:app', group: 'Actions', label: 'New app', keywords: ['create', 'deploy'], href: '/apps/new' },
-		{ id: 'new:db', group: 'Actions', label: 'New database', keywords: ['create', 'postgres', 'mysql', 'redis'], href: '/databases/new' },
-		{ id: 'new:cron', group: 'Actions', label: 'New cron job', keywords: ['create', 'schedule'], href: '/cron/new' },
-		{ id: 'new:alert', group: 'Actions', label: 'New alert rule', keywords: ['create', 'notify'], href: '/alerts/new' },
-		{ id: 'act:theme', group: 'Actions', label: 'Toggle light/dark theme', keywords: ['dark', 'light', 'mode'], action: { kind: 'theme' } },
-		{ id: 'act:terminal', group: 'Actions', label: 'Toggle terminal', keywords: ['shell', 'console'], action: { kind: 'terminal' } },
-		{ id: 'act:shortcuts', group: 'Actions', label: 'Keyboard shortcuts', keywords: ['help', 'keys', 'hotkeys'], action: { kind: 'shortcuts' } }
+		{
+			id: 'new:app',
+			group: 'Actions',
+			label: 'New app',
+			keywords: ['create', 'deploy'],
+			href: '/apps/new'
+		},
+		{
+			id: 'new:db',
+			group: 'Actions',
+			label: 'New database',
+			keywords: ['create', 'postgres', 'mysql', 'redis'],
+			href: '/databases/new'
+		},
+		{
+			id: 'new:cron',
+			group: 'Actions',
+			label: 'New cron job',
+			keywords: ['create', 'schedule'],
+			href: '/cron/new'
+		},
+		{
+			id: 'new:alert',
+			group: 'Actions',
+			label: 'New alert rule',
+			keywords: ['create', 'notify'],
+			href: '/alerts/new'
+		},
+		{
+			id: 'act:theme',
+			group: 'Actions',
+			label: 'Toggle light/dark theme',
+			keywords: ['dark', 'light', 'mode'],
+			action: { kind: 'theme' }
+		},
+		{
+			id: 'act:terminal',
+			group: 'Actions',
+			label: 'Toggle terminal',
+			keywords: ['shell', 'console'],
+			action: { kind: 'terminal' }
+		},
+		{
+			id: 'act:shortcuts',
+			group: 'Actions',
+			label: 'Keyboard shortcuts',
+			keywords: ['help', 'keys', 'hotkeys'],
+			action: { kind: 'shortcuts' }
+		}
 	);
 
 	for (const app of data.apps) {
@@ -111,4 +163,11 @@ export function buildPaletteEntries(
 	return entries;
 }
 
-export const GROUP_ORDER: PaletteGroup[] = ['Actions', 'Apps', 'Databases', 'Cron jobs', 'Projects', 'Pages'];
+export const GROUP_ORDER: PaletteGroup[] = [
+	'Actions',
+	'Apps',
+	'Databases',
+	'Cron jobs',
+	'Projects',
+	'Pages'
+];

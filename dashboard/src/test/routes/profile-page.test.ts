@@ -28,6 +28,10 @@ vi.mock('$lib/api', () => ({
 	...api
 }));
 
+vi.mock('$app/state', async () => ({
+	page: (await import('../mocks/page-state.svelte')).page
+}));
+
 vi.mock('$lib/components/tabs/profile-page/profile-two-factor.svelte', async () => ({
 	default: (await import('../mocks/ProfileTwoFactorHarness.svelte')).default
 }));
@@ -40,6 +44,9 @@ vi.mock('$lib/auth.svelte', () => ({
 }));
 
 import ProfilePage from '../../routes/profile/+page.svelte';
+import { setPageUrl } from '../mocks/page-state.svelte';
+import { acknowledgeBackupCodes, getPendingBackupCodes } from '$lib/backup-codes.svelte';
+import { confirmDialog, renderConfirmHost } from '../confirm';
 
 const sessions = [
 	{
@@ -70,7 +77,9 @@ const me = {
 	created_at: '2026-01-01T00:00:00.000Z'
 };
 
-function renderPage(routeSessions = sessions, totpEnabled = false) {
+function renderPage(routeSessions = sessions, totpEnabled = false, tab = '') {
+	setPageUrl(`http://localhost/profile${tab ? `?tab=${tab}` : ''}`);
+	renderConfirmHost();
 	render(ProfilePage, {
 		props: {
 			params: {},
@@ -84,6 +93,7 @@ function renderPage(routeSessions = sessions, totpEnabled = false) {
 
 describe('profile page', () => {
 	beforeEach(() => {
+		acknowledgeBackupCodes();
 		setUiContext.mockReset();
 		clearUiContext.mockReset();
 		projectsContext.mockClear();
@@ -133,9 +143,8 @@ describe('profile page', () => {
 
 	it('enables 2fa and confirms setup with backup codes', async () => {
 		const user = userEvent.setup();
-		renderPage();
+		renderPage(sessions, false, '2fa');
 
-		await user.click(screen.getByRole('tab', { name: /two-factor auth/i }));
 		await user.click(screen.getByRole('button', { name: /enable two-factor auth/i }));
 
 		// The current password is required before a new authenticator is enrolled.
@@ -153,14 +162,15 @@ describe('profile page', () => {
 		expect(api.confirm2FA).toHaveBeenCalledWith('123456');
 		expect(await screen.findByText(/save these backup codes/i)).toBeInTheDocument();
 		expect(screen.getByText(/code-1/i)).toBeInTheDocument();
+		// The codes are kept (in memory) until acknowledged, so a tab switch doesn't lose them.
+		expect(getPendingBackupCodes()).toEqual(['code-1', 'code-2', 'code-3']);
 	});
 
 	it('offers to disable 2fa for an enrolled user and disables it', async () => {
 		api.disable2FA.mockResolvedValue(undefined);
 		const user = userEvent.setup();
-		renderPage(sessions, true);
+		renderPage(sessions, true, '2fa');
 
-		await user.click(screen.getByRole('tab', { name: /two-factor auth/i }));
 		expect(
 			screen.queryByRole('button', { name: /enable two-factor auth/i })
 		).not.toBeInTheDocument();
@@ -182,14 +192,14 @@ describe('profile page', () => {
 
 	it('loads sessions when the sessions tab is opened and revokes other sessions', async () => {
 		const user = userEvent.setup();
-		renderPage();
-
-		await user.click(screen.getByRole('tab', { name: /sessions/i }));
+		renderPage(sessions, false, 'sessions');
 
 		expect(api.listSessions).toHaveBeenCalledOnce();
 		expect(await screen.findByText(/sign out everywhere/i)).toBeInTheDocument();
 
 		await user.click(screen.getByRole('button', { name: /^revoke$/i }));
+		expect(api.revokeSession).not.toHaveBeenCalled();
+		await confirmDialog(user);
 
 		expect(api.revokeSession).toHaveBeenCalledWith('sess_2');
 		expect(screen.queryByText(/10\.0\.0\.2/i)).not.toBeInTheDocument();
@@ -197,11 +207,11 @@ describe('profile page', () => {
 
 	it('revokes all non-current sessions', async () => {
 		const user = userEvent.setup();
-		renderPage();
+		renderPage(sessions, false, 'sessions');
 
-		await user.click(screen.getByRole('tab', { name: /sessions/i }));
 		await screen.findByText(/sign out everywhere/i);
 		await user.click(screen.getByRole('button', { name: /sign out everywhere/i }));
+		await confirmDialog(user);
 
 		expect(api.revokeAllSessions).toHaveBeenCalledOnce();
 		expect(screen.queryByText(/10\.0\.0\.2/i)).not.toBeInTheDocument();

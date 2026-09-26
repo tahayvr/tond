@@ -7,6 +7,10 @@
 	import * as InputOTP from '$lib/components/ui/input-otp/index.js';
 	import { REGEXP_ONLY_DIGITS } from 'bits-ui';
 	import ShieldCheck from '~icons/ri/shield-check-line';
+	import CopyIcon from '~icons/ri/file-copy-line';
+	import DownloadIcon from '~icons/ri/download-line';
+	import SuccessAlert from '$lib/components/feedback/success-alert.svelte';
+	import { backupCodesFile } from '$lib/backup-code-file';
 
 	interface Props {
 		phase: 'idle' | 'password' | 'setup' | 'done' | 'disable';
@@ -26,6 +30,10 @@
 		onDisable: () => void;
 		onCancelDisable: () => void;
 		onShowDisable: () => void;
+		/** User confirmed they saved the backup codes. */
+		onAcknowledge?: () => void;
+		/** Shown in the downloaded backup-code file. */
+		account?: string;
 	}
 
 	let {
@@ -45,8 +53,32 @@
 		onCancelSetup,
 		onDisable,
 		onCancelDisable,
-		onShowDisable
+		onShowDisable,
+		onAcknowledge,
+		account
 	}: Props = $props();
+
+	let copyNotice = $state('');
+
+	async function handleCopy() {
+		try {
+			await navigator.clipboard.writeText(backupCodes.join('\n'));
+			copyNotice = 'Backup codes copied to the clipboard.';
+		} catch {
+			copyNotice = '';
+		}
+	}
+
+	function handleDownload() {
+		const blob = new Blob([backupCodesFile(backupCodes, account)], { type: 'text/plain' });
+		const url = URL.createObjectURL(blob);
+		const a = document.createElement('a');
+		a.href = url;
+		a.download = 'tond-backup-codes.txt';
+		a.click();
+		URL.revokeObjectURL(url);
+		copyNotice = 'Backup codes downloaded.';
+	}
 </script>
 
 <div class="rounded-lg border border-border bg-card p-4">
@@ -112,9 +144,7 @@
 				height="180"
 			/>
 			<div>
-				<p class="mb-1 font-mono text-[10px] text-muted-foreground uppercase">
-					Manual entry key
-				</p>
+				<p class="mb-1 font-mono text-[10px] text-muted-foreground uppercase">Manual entry key</p>
 				<code class="rounded bg-muted px-2 py-1 font-mono text-xs tracking-widest select-all">
 					{setup.secret}
 				</code>
@@ -157,12 +187,11 @@
 		</div>
 	{:else if phase === 'done'}
 		<!-- Just activated — show backup codes -->
-		<div
-			class="mb-6 rounded-md border border-warn/30 bg-warn/10 p-4 text-sm text-warn"
-		>
+		<div class="mb-6 rounded-md border border-warn/30 bg-warn/10 p-4 text-sm text-warn">
 			<p class="mb-1 font-semibold">Save these backup codes</p>
 			<p class="text-xs">
-				Each code can only be used once. Store them somewhere safe — you won't see them again.
+				Each code works once, if you lose your authenticator. You won't see them again after you
+				confirm below.
 			</p>
 		</div>
 		<p class="mb-4 text-xs text-muted-foreground">
@@ -179,18 +208,31 @@
 			{/each}
 		</div>
 
-		<div class="flex items-center gap-3">
-			<ShieldCheck class="h-4 w-4 text-success" />
-			<span class="font-mono text-xs text-success">2FA ENABLED</span>
-			<Button variant="outline" size="sm" class="ml-auto" onclick={onShowDisable}>
-				Disable 2FA
+		<div class="mb-4 flex flex-wrap gap-2">
+			<Button variant="outline" size="sm" onclick={handleCopy}>
+				<CopyIcon class="size-4" /> Copy codes
 			</Button>
+			<Button variant="outline" size="sm" onclick={handleDownload}>
+				<DownloadIcon class="size-4" /> Download .txt
+			</Button>
+		</div>
+		<SuccessAlert
+			message={copyNotice}
+			class="mb-4"
+			ondismiss={() => (copyNotice = '')}
+			timeout={4000}
+		/>
+
+		<div class="flex flex-wrap items-center gap-3">
+			<ShieldCheck class="h-4 w-4 text-success" />
+			<span class="text-sm text-success">Two-factor authentication is on</span>
+			<Button size="sm" class="ml-auto" onclick={onAcknowledge}>I've saved my codes</Button>
 		</div>
 	{:else if enabled && phase !== 'disable'}
 		<!-- Enabled, steady state -->
 		<div class="mb-4 flex items-center gap-3">
 			<ShieldCheck class="h-4 w-4 text-success" />
-			<span class="font-mono text-xs text-success">2FA ENABLED</span>
+			<span class="text-sm text-success">Two-factor authentication is on</span>
 		</div>
 		<p class="mb-4 text-sm text-muted-foreground">
 			Your account is protected with a time-based one-time password.

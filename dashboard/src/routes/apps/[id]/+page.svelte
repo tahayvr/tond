@@ -987,7 +987,11 @@
 					disabled={deploy.pending || current.status === 'building'}
 					aria-busy={deploy.pending}
 				>
-					{deploy.pending ? 'Starting deploy…' : current.status === 'building' ? 'Deploying…' : 'Deploy'}
+					{deploy.pending
+						? 'Starting deploy…'
+						: current.status === 'building'
+							? 'Deploying…'
+							: 'Deploy'}
 				</Button>
 			{/snippet}
 		</PageHeader>
@@ -1012,815 +1016,828 @@
 				/>
 			{/if}
 			<div class="min-w-0">
-			<!-- Overview tab -->
-			{#if activeTab === 'overview'}
-				<AppOverview {app} />
-			{/if}
+				<!-- Overview tab -->
+				{#if activeTab === 'overview'}
+					<AppOverview {app} />
+				{/if}
 
-			<!-- Logs tab -->
-			{#if activeTab === 'logs'}
-				<AppLogs
-					{logLines}
-					streaming={logStreaming}
-					onConnect={startLogStream}
-					onStop={stopLogStream}
-					onClear={() => logBuffer.clear()}
-				/>
-			{/if}
+				<!-- Logs tab -->
+				{#if activeTab === 'logs'}
+					<AppLogs
+						{logLines}
+						streaming={logStreaming}
+						onConnect={startLogStream}
+						onStop={stopLogStream}
+						onClear={() => logBuffer.clear()}
+					/>
+				{/if}
 
-			<!-- Deployments tab -->
-			{#if activeTab === 'deployments'}
-				<AppDeployments
-					{deployments}
-					loading={deploymentsLoading}
-					error={rollbackError}
-					onRollback={handleRollback}
-					onViewGeneratedDockerfile={handleViewGeneratedDockerfile}
-				/>
-			{/if}
+				<!-- Deployments tab -->
+				{#if activeTab === 'deployments'}
+					<AppDeployments
+						{deployments}
+						loading={deploymentsLoading}
+						error={rollbackError}
+						onRollback={handleRollback}
+						onViewGeneratedDockerfile={handleViewGeneratedDockerfile}
+					/>
+				{/if}
 
-			<!-- Environment tab -->
-			{#if activeTab === 'environment'}
-				<AppEnvironment
-					appId={app.id}
-					sourceType={app.source_type}
-					{registryCredentials}
-					registryCredentialId={app.registry_credential_id}
-					onRegistryCredentialChange={handleEnvRegistryCredential}
-					previewEnabled={app.preview_enabled}
-					onRedeploy={handleEnvRedeploy}
-				/>
-			{/if}
+				<!-- Environment tab -->
+				{#if activeTab === 'environment'}
+					<AppEnvironment
+						appId={app.id}
+						sourceType={app.source_type}
+						{registryCredentials}
+						registryCredentialId={app.registry_credential_id}
+						onRegistryCredentialChange={handleEnvRegistryCredential}
+						previewEnabled={app.preview_enabled}
+						onRedeploy={handleEnvRedeploy}
+					/>
+				{/if}
 
-			<!-- Domain tab -->
-			{#if activeTab === 'domain'}
-				<AppDomain
-					bind:domainInput
-					savedDomain={app?.domain ?? null}
-					{certRefreshKey}
-					onUpdate={handleUpdateDomain}
-				/>
-			{/if}
+				<!-- Domain tab -->
+				{#if activeTab === 'domain'}
+					<AppDomain
+						bind:domainInput
+						savedDomain={app?.domain ?? null}
+						{certRefreshKey}
+						onUpdate={handleUpdateDomain}
+					/>
+				{/if}
 
-			<!-- Health tab -->
-			{#if activeTab === 'health'}
-				<AppHealth
-					{app}
-					bind:healthPath
-					bind:healthInterval
-					bind:healthThreshold
-					bind:drainTimeout
-					onUpdateHealth={handleUpdateHealth}
-					onDisableHealth={handleDisableHealth}
-					onUpdateDrainTimeout={handleUpdateDrainTimeout}
-				/>
-			{/if}
+				<!-- Health tab -->
+				{#if activeTab === 'health'}
+					<AppHealth
+						{app}
+						bind:healthPath
+						bind:healthInterval
+						bind:healthThreshold
+						bind:drainTimeout
+						onUpdateHealth={handleUpdateHealth}
+						onDisableHealth={handleDisableHealth}
+						onUpdateDrainTimeout={handleUpdateDrainTimeout}
+					/>
+				{/if}
 
-			<!-- Volumes tab -->
-			{#if activeTab === 'volumes'}
-				<AppVolumes
-					{app}
-					bind:volumeContainerPath
-					bind:volumeName
-					canEdit={isAdmin()}
-					{volumeError}
-					onAdd={handleAddVolume}
-					onRemove={handleRemoveVolume}
-				/>
-			{/if}
-			<!-- Resources tab -->
-			{#if activeTab === 'resources'}
-				<div class="max-w-sm space-y-6">
-					<div class="space-y-2">
-						<Label for="resource-memory">Memory limit</Label>
-						<div class="flex gap-2">
-							<Input
-								id="resource-memory"
-								type="number"
-								bind:value={resourceMemoryDraft}
-								placeholder="Unlimited"
-								min={1}
-								disabled={savingResources}
-							/>
-							<Select.Root type="single" bind:value={resourceMemoryUnit}>
-								<Select.Trigger class="w-24" disabled={savingResources} aria-label="Memory unit">
-									{resourceMemoryUnit.toUpperCase()}
-								</Select.Trigger>
-								<Select.Content>
-									<Select.Item value="mb">MB</Select.Item>
-									<Select.Item value="gb">GB</Select.Item>
-								</Select.Content>
-							</Select.Root>
-						</div>
-						<p class="text-xs text-muted-foreground">
-							Leave empty for unlimited memory. Default: 256 MB.
-						</p>
-					</div>
-
-					<div class="space-y-2">
-						<Label for="resource-cpu">CPU limit (cores)</Label>
-						<Input
-							id="resource-cpu"
-							type="number"
-							bind:value={resourceCpuDraft}
-							placeholder="Unlimited"
-							min={0.1}
-							step={0.1}
-							disabled={savingResources}
-						/>
-						<p class="text-xs text-muted-foreground">
-							Fractional cores allowed (e.g. 0.5, 1, 2). Leave empty for unlimited. Default: 0.5.
-						</p>
-					</div>
-
-					<InlineError message={resourcesError} title="Limits weren't saved" />
-
-					<div class="flex items-center gap-3">
-						<Button onclick={handleSaveResources} disabled={savingResources}>
-							{savingResources ? 'Saving...' : 'Save'}
-						</Button>
-						<SuccessAlert
-							message={resourcesSaved}
-							ondismiss={() => (resourcesSaved = '')}
-							timeout={5000}
-						/>
-					</div>
-				</div>
-			{/if}
-			<!-- Git tab -->
-			{#if activeTab === 'git'}
-				<div class="space-y-6 pt-4">
-					<InlineError message={gitError} ondismiss={() => (gitError = '')} />
-					<SuccessAlert message={gitSuccess} ondismiss={() => (gitSuccess = '')} />
-
-					<!-- Source type & URL -->
-					<div class="grid gap-3">
-						<h3 class="text-sm font-medium">Source</h3>
-						<p class="text-sm text-muted-foreground">
-							How this app's deployable artifact is provided.
-						</p>
-						<div class="flex gap-3">
-							<div class="grid gap-2">
-								<Label for="source-type">Type</Label>
-								<Select.Root
-									type="single"
-									value={sourceTypeInput}
-									onValueChange={(v) => {
-										if (v === 'git' || v === 'image' || v === 'tarball') sourceTypeInput = v;
-									}}
-								>
-									<Select.Trigger id="source-type" class="w-32">
-										{sourceTypeInput}
+				<!-- Volumes tab -->
+				{#if activeTab === 'volumes'}
+					<AppVolumes
+						{app}
+						bind:volumeContainerPath
+						bind:volumeName
+						canEdit={isAdmin()}
+						{volumeError}
+						onAdd={handleAddVolume}
+						onRemove={handleRemoveVolume}
+					/>
+				{/if}
+				<!-- Resources tab -->
+				{#if activeTab === 'resources'}
+					<div class="max-w-sm space-y-6">
+						<div class="space-y-2">
+							<Label for="resource-memory">Memory limit</Label>
+							<div class="flex gap-2">
+								<Input
+									id="resource-memory"
+									type="number"
+									bind:value={resourceMemoryDraft}
+									placeholder="Unlimited"
+									min={1}
+									disabled={savingResources}
+								/>
+								<Select.Root type="single" bind:value={resourceMemoryUnit}>
+									<Select.Trigger class="w-24" disabled={savingResources} aria-label="Memory unit">
+										{resourceMemoryUnit.toUpperCase()}
 									</Select.Trigger>
 									<Select.Content>
-										<Select.Item value="git">git</Select.Item>
-										<Select.Item value="image">image</Select.Item>
-										<Select.Item value="tarball">tarball</Select.Item>
+										<Select.Item value="mb">MB</Select.Item>
+										<Select.Item value="gb">GB</Select.Item>
 									</Select.Content>
 								</Select.Root>
 							</div>
-							{#if sourceTypeInput !== 'tarball'}
-								<div class="grid flex-1 gap-2">
-									<Label for="source-url"
-										>{sourceTypeInput === 'image' ? 'Docker Image' : 'Git URL'}</Label
+							<p class="text-xs text-muted-foreground">
+								Leave empty for unlimited memory. Default: 256 MB.
+							</p>
+						</div>
+
+						<div class="space-y-2">
+							<Label for="resource-cpu">CPU limit (cores)</Label>
+							<Input
+								id="resource-cpu"
+								type="number"
+								bind:value={resourceCpuDraft}
+								placeholder="Unlimited"
+								min={0.1}
+								step={0.1}
+								disabled={savingResources}
+							/>
+							<p class="text-xs text-muted-foreground">
+								Fractional cores allowed (e.g. 0.5, 1, 2). Leave empty for unlimited. Default: 0.5.
+							</p>
+						</div>
+
+						<InlineError message={resourcesError} title="Limits weren't saved" />
+
+						<div class="flex items-center gap-3">
+							<Button onclick={handleSaveResources} disabled={savingResources}>
+								{savingResources ? 'Saving...' : 'Save'}
+							</Button>
+							<SuccessAlert
+								message={resourcesSaved}
+								ondismiss={() => (resourcesSaved = '')}
+								timeout={5000}
+							/>
+						</div>
+					</div>
+				{/if}
+				<!-- Git tab -->
+				{#if activeTab === 'git'}
+					<div class="space-y-6 pt-4">
+						<InlineError message={gitError} ondismiss={() => (gitError = '')} />
+						<SuccessAlert message={gitSuccess} ondismiss={() => (gitSuccess = '')} />
+
+						<!-- Source type & URL -->
+						<div class="grid gap-3">
+							<h3 class="text-sm font-medium">Source</h3>
+							<p class="text-sm text-muted-foreground">
+								How this app's deployable artifact is provided.
+							</p>
+							<div class="flex gap-3">
+								<div class="grid gap-2">
+									<Label for="source-type">Type</Label>
+									<Select.Root
+										type="single"
+										value={sourceTypeInput}
+										onValueChange={(v) => {
+											if (v === 'git' || v === 'image' || v === 'tarball') sourceTypeInput = v;
+										}}
 									>
+										<Select.Trigger id="source-type" class="w-32">
+											{sourceTypeInput}
+										</Select.Trigger>
+										<Select.Content>
+											<Select.Item value="git">git</Select.Item>
+											<Select.Item value="image">image</Select.Item>
+											<Select.Item value="tarball">tarball</Select.Item>
+										</Select.Content>
+									</Select.Root>
+								</div>
+								{#if sourceTypeInput !== 'tarball'}
+									<div class="grid flex-1 gap-2">
+										<Label for="source-url"
+											>{sourceTypeInput === 'image' ? 'Docker Image' : 'Git URL'}</Label
+										>
+										<Input
+											id="source-url"
+											type="text"
+											bind:value={sourceUrlInput}
+											placeholder={sourceTypeInput === 'image'
+												? 'registry.example.com/org/image:tag'
+												: 'https://github.com/org/repo.git'}
+											class="font-mono"
+										/>
+									</div>
+								{/if}
+								<Button onclick={handleUpdateSource} class="self-end">Save</Button>
+							</div>
+
+							<!-- ── GitHub App source picker ────────────────────────────────── -->
+							{#if sourceTypeInput === 'git'}
+								{@const installedApps = githubApps.filter((a) => a.installed)}
+								{#if app?.github_app_id}
+									<!-- Currently linked -->
+									{@const linkedApp = githubApps.find((a) => a.id === app?.github_app_id)}
+									<div class="flex items-center gap-3 rounded-md border bg-muted/20 px-4 py-3">
+										<Github class="h-4 w-4 shrink-0 text-muted-foreground" />
+										<div class="min-w-0 flex-1">
+											<p class="text-xs font-medium">
+												GitHub App: <span class="font-mono"
+													>{linkedApp?.name ?? app.github_app_id}</span
+												>
+											</p>
+											<p class="truncate font-mono text-[10px] text-muted-foreground">
+												{app.source_url}
+											</p>
+										</div>
+										<Button
+											variant="outline"
+											size="sm"
+											class="h-7 shrink-0 text-xs text-destructive uppercase hover:text-destructive"
+											disabled={githubLinkSaving}
+											onclick={handleGithubUnlink}
+										>
+											<Unlink2 class="h-3 w-3" />
+											Unlink
+										</Button>
+									</div>
+									<InlineError message={githubLinkError} />
+								{:else if installedApps.length > 0}
+									<!-- Picker: choose app → repo → branch -->
+									<div class="space-y-3 rounded-md border bg-muted/10 px-4 py-3">
+										<p class="text-xs font-medium text-muted-foreground uppercase">
+											Link a GitHub App (optional)
+										</p>
+										<p class="text-xs text-muted-foreground">
+											Select a connected GitHub App and repository to enable private repo access and
+											auto-fill the Git URL. The app will use the GitHub App's access token to clone
+											the repo.
+										</p>
+
+										<InlineError message={githubLinkError} />
+
+										<div class="flex flex-wrap gap-3">
+											<!-- App selector -->
+											<div class="grid gap-1.5">
+												<Label class="text-xs" for="gh-app-select">GitHub App</Label>
+												<Select.Root
+													type="single"
+													value={selectedGithubAppId ?? ''}
+													onValueChange={(v) => handleGithubAppChange(v || null)}
+												>
+													<Select.Trigger id="gh-app-select" class="h-8 w-44 text-xs">
+														{selectedGithubAppId
+															? (installedApps.find((a) => a.id === selectedGithubAppId)?.name ??
+																selectedGithubAppId)
+															: 'Select app…'}
+													</Select.Trigger>
+													<Select.Content>
+														{#each installedApps as ghApp (ghApp.id)}
+															<Select.Item value={ghApp.id} class="text-xs"
+																>{ghApp.name}</Select.Item
+															>
+														{/each}
+													</Select.Content>
+												</Select.Root>
+											</div>
+
+											<!-- Repo selector -->
+											{#if selectedGithubAppId}
+												<div class="grid gap-1.5">
+													<Label class="text-xs" for="gh-repo-select">Repository</Label>
+													{#if githubPickerReposLoading}
+														<p class="text-xs text-muted-foreground">Loading…</p>
+													{:else}
+														<Select.Root
+															type="single"
+															value={selectedGithubRepo?.full_name ?? ''}
+															onValueChange={(v) => {
+																const repo =
+																	githubPickerRepos[selectedGithubAppId ?? '']?.find(
+																		(r) => r.full_name === v
+																	) ?? null;
+																handleGithubRepoChange(repo);
+															}}
+														>
+															<Select.Trigger
+																id="gh-repo-select"
+																class="h-8 w-52 font-mono text-xs"
+															>
+																{selectedGithubRepo?.full_name ?? 'Select repo…'}
+															</Select.Trigger>
+															<Select.Content>
+																{#each githubPickerRepos[selectedGithubAppId] ?? [] as repo (repo.id)}
+																	<Select.Item value={repo.full_name} class="font-mono text-xs">
+																		{#if repo.private}
+																			<Lock class="mr-1 inline h-3 w-3 text-muted-foreground" />
+																		{/if}
+																		{repo.full_name}
+																	</Select.Item>
+																{/each}
+															</Select.Content>
+														</Select.Root>
+													{/if}
+												</div>
+											{/if}
+
+											<!-- Branch selector -->
+											{#if selectedGithubRepo}
+												{@const branchKey = `${selectedGithubAppId}/${selectedGithubRepo.full_name}`}
+												<div class="grid gap-1.5">
+													<Label class="text-xs" for="gh-branch-select">Branch</Label>
+													{#if githubPickerBranchesLoading}
+														<p class="text-xs text-muted-foreground">Loading…</p>
+													{:else}
+														<Select.Root
+															type="single"
+															value={selectedGithubBranch ?? ''}
+															onValueChange={(v) => {
+																selectedGithubBranch = v || null;
+															}}
+														>
+															<Select.Trigger
+																id="gh-branch-select"
+																class="h-8 w-36 font-mono text-xs"
+															>
+																{#if selectedGithubBranch}
+																	<GitBranch class="mr-1 inline h-3 w-3" />
+																	{selectedGithubBranch}
+																{:else}
+																	Select branch…
+																{/if}
+															</Select.Trigger>
+															<Select.Content>
+																{#each githubPickerBranches[branchKey] ?? [] as branch (branch.name)}
+																	<Select.Item value={branch.name} class="font-mono text-xs">
+																		{branch.name}
+																		{#if branch.name === selectedGithubRepo.default_branch}
+																			<span class="ml-1 text-muted-foreground">(default)</span>
+																		{/if}
+																	</Select.Item>
+																{/each}
+															</Select.Content>
+														</Select.Root>
+													{/if}
+												</div>
+											{/if}
+
+											<!-- Link button -->
+											{#if selectedGithubRepo}
+												<div class="grid gap-1.5">
+													<Button
+														size="sm"
+														class="h-8 text-xs uppercase"
+														disabled={githubLinkSaving}
+														onclick={handleGithubLink}
+													>
+														<Github class="h-3 w-3" />
+														{githubLinkSaving ? 'Linking…' : 'Link Repo'}
+													</Button>
+												</div>
+											{/if}
+										</div>
+									</div>
+								{/if}
+							{/if}
+						</div>
+
+						{#if sourceTypeInput === 'image'}
+							<Separator />
+
+							<!-- Registry Credentials -->
+							<div class="grid gap-3">
+								<h3 class="text-sm font-medium">Registry Credential</h3>
+								<p class="text-sm text-muted-foreground">
+									Attach a stored credential to authenticate pulls from a private registry.
+								</p>
+
+								<InlineError message={credError} ondismiss={() => (credError = '')} />
+
+								<!-- Attach credential dropdown -->
+								<div class="flex gap-3">
+									<div class="grid flex-1 gap-2">
+										<Label for="reg-cred-select">Credential</Label>
+										<Select.Root
+											type="single"
+											value={selectedCredentialId ?? '__none__'}
+											onValueChange={(v) => {
+												selectedCredentialId = v === '__none__' ? null : v;
+											}}
+										>
+											<Select.Trigger id="reg-cred-select" class="w-full">
+												{#if selectedCredentialId}
+													{registryCredentials.find((c) => c.id === selectedCredentialId)?.name ??
+														selectedCredentialId}
+												{:else}
+													None (public image)
+												{/if}
+											</Select.Trigger>
+											<Select.Content>
+												<Select.Item value="__none__">None (public image)</Select.Item>
+												{#each registryCredentials as cred (cred.id)}
+													<Select.Item value={cred.id}>{cred.name}</Select.Item>
+												{/each}
+											</Select.Content>
+										</Select.Root>
+									</div>
+									<Button
+										onclick={() => handleSetRegistryCredential(selectedCredentialId)}
+										class="self-end"
+									>
+										Attach
+									</Button>
+								</div>
+
+								<!-- Stored credentials list -->
+								{#if registryCredentialsLoading}
+									<div class="py-2 text-center text-sm text-muted-foreground">Loading...</div>
+								{:else if registryCredentials.length > 0}
+									<div class="divide-y rounded-md border">
+										{#each registryCredentials as cred (cred.id)}
+											<div class="flex items-center gap-3 px-4 py-2">
+												<div class="min-w-0 flex-1">
+													<span class="text-sm font-medium">{cred.name}</span>
+													<span class="ml-2 font-mono text-xs text-muted-foreground"
+														>{cred.server}</span
+													>
+													<span class="ml-2 text-xs text-muted-foreground">({cred.username})</span>
+												</div>
+												{#if app.registry_credential_id === cred.id}
+													<span class="text-xs text-muted-foreground">attached</span>
+												{/if}
+												<Button
+													variant="ghost"
+													size="sm"
+													class="h-7 px-2 text-xs text-destructive hover:bg-destructive/10 hover:text-destructive"
+													onclick={() => handleDeleteCredential(cred.id)}
+												>
+													Remove
+												</Button>
+											</div>
+										{/each}
+									</div>
+								{/if}
+
+								<!-- Add credential form -->
+								{#if addCredOpen}
+									<div class="grid gap-3 rounded-md border p-4">
+										<h4 class="text-sm font-medium">Add credential</h4>
+										<InlineError message={addCredError} ondismiss={() => (addCredError = '')} />
+										<div class="grid gap-2">
+											<Label for="cred-name">Name</Label>
+											<Input
+												id="cred-name"
+												type="text"
+												bind:value={newCredName}
+												placeholder="Docker Hub"
+											/>
+										</div>
+										<div class="grid gap-2">
+											<Label for="cred-server">Registry Server</Label>
+											<Input
+												id="cred-server"
+												type="text"
+												bind:value={newCredServer}
+												placeholder="registry-1.docker.io"
+												class="font-mono"
+											/>
+										</div>
+										<div class="grid gap-2">
+											<Label for="cred-username">Username</Label>
+											<Input
+												id="cred-username"
+												type="text"
+												bind:value={newCredUsername}
+												placeholder="myuser"
+											/>
+										</div>
+										<div class="grid gap-2">
+											<Label for="cred-password">Password / Token</Label>
+											<Input
+												id="cred-password"
+												type="password"
+												bind:value={newCredPassword}
+												placeholder="••••••••"
+											/>
+										</div>
+										<div class="flex gap-2">
+											<Button onclick={handleAddCredential}>Save Credential</Button>
+											<Button
+												variant="outline"
+												onclick={() => {
+													addCredOpen = false;
+													addCredError = '';
+												}}
+											>
+												Cancel
+											</Button>
+										</div>
+									</div>
+								{:else}
+									<Button
+										variant="outline"
+										size="sm"
+										class="self-start"
+										onclick={() => (addCredOpen = true)}
+									>
+										Add new credential
+									</Button>
+								{/if}
+							</div>
+						{/if}
+
+						<Separator />
+
+						<AppWebhooks appId={app.id} />
+
+						<Separator />
+
+						<!-- Auto-deploy toggle -->
+						<div class="grid gap-3">
+							<div class="flex items-center justify-between">
+								<div>
+									<h3 class="text-sm font-medium">Auto-deploy</h3>
+									<p class="mt-1 text-sm text-muted-foreground">
+										Automatically deploy when a webhook push event is received.
+									</p>
+								</div>
+								<StatusBadge status={app.auto_deploy ? 'enabled' : 'disabled'} />
+							</div>
+							<div class="flex gap-2">
+								{#if !app.auto_deploy}
+									<Button size="sm" onclick={() => handleSetAutoDeploy(true)}
+										>Enable Auto-deploy</Button
+									>
+								{:else}
+									<Button variant="outline" size="sm" onclick={() => handleSetAutoDeploy(false)}
+										>Disable Auto-deploy</Button
+									>
+								{/if}
+							</div>
+						</div>
+
+						<!-- Watch branch -->
+						<div class="grid gap-3">
+							<h3 class="text-sm font-medium">Watch Branch</h3>
+							<p class="text-sm text-muted-foreground">
+								Only trigger deploys for pushes to this branch. Leave empty to deploy on any branch
+								push.
+							</p>
+							<div class="flex gap-3">
+								<div class="grid flex-1 gap-2">
+									<Label for="watch-branch">Branch</Label>
 									<Input
-										id="source-url"
+										id="watch-branch"
 										type="text"
-										bind:value={sourceUrlInput}
-										placeholder={sourceTypeInput === 'image'
-											? 'registry.example.com/org/image:tag'
-											: 'https://github.com/org/repo.git'}
+										bind:value={watchBranchInput}
+										placeholder="main"
 										class="font-mono"
 									/>
 								</div>
+								<Button onclick={handleSaveWatchBranch} class="self-end">Save</Button>
+							</div>
+							{#if app.watch_branch}
+								<p class="text-xs text-muted-foreground">
+									Currently watching: <span class="font-mono">{app.watch_branch}</span>
+								</p>
+							{:else}
+								<p class="text-xs text-muted-foreground">Watching all branches.</p>
 							{/if}
-							<Button onclick={handleUpdateSource} class="self-end">Save</Button>
 						</div>
 
-						<!-- ── GitHub App source picker ────────────────────────────────── -->
-						{#if sourceTypeInput === 'git'}
-							{@const installedApps = githubApps.filter((a) => a.installed)}
-							{#if app?.github_app_id}
-								<!-- Currently linked -->
-								{@const linkedApp = githubApps.find((a) => a.id === app?.github_app_id)}
-								<div class="flex items-center gap-3 rounded-md border bg-muted/20 px-4 py-3">
-									<Github class="h-4 w-4 shrink-0 text-muted-foreground" />
-									<div class="min-w-0 flex-1">
-										<p class="text-xs font-medium">
-											GitHub App: <span class="font-mono"
-												>{linkedApp?.name ?? app.github_app_id}</span
-											>
-										</p>
-										<p class="truncate font-mono text-[10px] text-muted-foreground">
-											{app.source_url}
+						<Separator />
+
+						<!-- Deploy key -->
+						<div class="grid gap-3">
+							<div class="flex items-center justify-between">
+								<div>
+									<h3 class="text-sm font-medium">SSH Deploy Key</h3>
+									<p class="mt-1 text-sm text-muted-foreground">
+										Add this Ed25519 public key to your repository's deploy keys (read-only access).
+									</p>
+								</div>
+								<Button
+									variant="outline"
+									size="sm"
+									onclick={handleGenerateDeployKey}
+									disabled={deployKeyLoading}
+								>
+									{deployKey ? 'Regenerate' : 'Generate Key'}
+								</Button>
+							</div>
+
+							<InlineError message={deployKeyError} ondismiss={() => (deployKeyError = '')} />
+
+							{#if deployKeyLoading}
+								<div class="py-4 text-center text-sm text-muted-foreground">Loading...</div>
+							{:else if deployKey}
+								<SecretInput value={deployKey.public_key} readonly />
+								<p class="text-xs text-muted-foreground">
+									Copy this key and add it to your repository under Settings &rarr; Deploy Keys.
+								</p>
+							{:else}
+								<div class="rounded-md border py-6 text-center text-sm text-muted-foreground">
+									No deploy key generated yet. Click "Generate Key" to create one.
+								</div>
+							{/if}
+						</div>
+					</div>
+				{/if}
+
+				<!-- Previews tab -->
+				{#if activeTab === 'previews'}
+					<div class="space-y-6 pt-4">
+						<!-- PR Preview config -->
+						<div class="grid gap-3">
+							<div class="flex items-center justify-between">
+								<div>
+									<h3 class="text-sm font-medium">PR Preview Deployments</h3>
+									<p class="mt-1 text-sm text-muted-foreground">
+										Automatically deploy a preview environment for every pull request opened on the
+										linked GitHub repository.
+									</p>
+								</div>
+								<StatusBadge status={app.preview_enabled ? 'enabled' : 'disabled'} />
+							</div>
+
+							{#if previewsBlocked}
+								<PreviewDomainRequiredAlert />
+							{/if}
+
+							<InlineError
+								message={previewConfigError}
+								ondismiss={() => (previewConfigError = '')}
+							/>
+
+							<div class="flex gap-2">
+								{#if !app.preview_enabled}
+									<Button
+										size="sm"
+										disabled={previewConfigSaving || previewsBlocked}
+										onclick={() => handleTogglePreviewEnabled(true)}
+									>
+										{previewConfigSaving ? 'Saving…' : 'Enable PR Previews'}
+									</Button>
+								{:else}
+									<Button
+										variant="outline"
+										size="sm"
+										disabled={previewConfigSaving}
+										onclick={() => handleTogglePreviewEnabled(false)}
+									>
+										{previewConfigSaving ? 'Saving…' : 'Disable PR Previews'}
+									</Button>
+								{/if}
+							</div>
+
+							{#if !app.github_app_id}
+								<p class="text-xs text-muted-foreground">
+									A GitHub App must be linked (Git tab) before PR previews can be triggered
+									automatically.
+								</p>
+							{/if}
+
+							{#if previewDomain}
+								<div
+									class="rounded-md border border-dashed px-4 py-3 text-sm text-muted-foreground"
+								>
+									Previews are served at
+									<code class="font-mono text-xs">&lt;id&gt;-{app.name}.{previewDomain}</code>.
+									<strong class="text-foreground">Wildcard DNS required</strong> — add a
+									<code class="font-mono text-xs">*.{previewDomain} → &lt;server IP&gt;</code> A record
+									so preview hostnames resolve automatically.
+								</div>
+							{/if}
+						</div>
+
+						<Separator />
+
+						<AppPreviews
+							{previews}
+							loading={previewsLoading}
+							error={previewsError}
+							onDelete={handleDeletePreview}
+						/>
+
+						<!-- Load open PRs section (only when preview enabled and GitHub App linked) -->
+						{#if app.preview_enabled && app.github_app_id}
+							<div class="grid gap-3">
+								<div class="flex items-center justify-between">
+									<div>
+										<h3 class="text-sm font-medium">Open Pull Requests</h3>
+										<p class="text-sm text-muted-foreground">
+											Load open PRs from the linked repository and deploy previews for them.
 										</p>
 									</div>
 									<Button
 										variant="outline"
 										size="sm"
-										class="h-7 shrink-0 text-xs text-destructive uppercase hover:text-destructive"
-										disabled={githubLinkSaving}
-										onclick={handleGithubUnlink}
+										disabled={openPRsLoading}
+										onclick={handleLoadOpenPRs}
 									>
-										<Unlink2 class="h-3 w-3" />
-										Unlink
+										{openPRsLoading ? 'Loading…' : 'Load open PRs'}
 									</Button>
 								</div>
-								<InlineError message={githubLinkError} />
-							{:else if installedApps.length > 0}
-								<!-- Picker: choose app → repo → branch -->
-								<div class="space-y-3 rounded-md border bg-muted/10 px-4 py-3">
-									<p class="text-xs font-medium text-muted-foreground uppercase">
-										Link a GitHub App (optional)
-									</p>
-									<p class="text-xs text-muted-foreground">
-										Select a connected GitHub App and repository to enable private repo access and
-										auto-fill the Git URL. The app will use the GitHub App's access token to clone
-										the repo.
-									</p>
 
-									<InlineError message={githubLinkError} />
+								<InlineError message={openPRsError} />
 
-									<div class="flex flex-wrap gap-3">
-										<!-- App selector -->
-										<div class="grid gap-1.5">
-											<Label class="text-xs" for="gh-app-select">GitHub App</Label>
-											<Select.Root
-												type="single"
-												value={selectedGithubAppId ?? ''}
-												onValueChange={(v) => handleGithubAppChange(v || null)}
-											>
-												<Select.Trigger id="gh-app-select" class="h-8 w-44 text-xs">
-													{selectedGithubAppId
-														? (installedApps.find((a) => a.id === selectedGithubAppId)?.name ??
-															selectedGithubAppId)
-														: 'Select app…'}
-												</Select.Trigger>
-												<Select.Content>
-													{#each installedApps as ghApp (ghApp.id)}
-														<Select.Item value={ghApp.id} class="text-xs">{ghApp.name}</Select.Item>
-													{/each}
-												</Select.Content>
-											</Select.Root>
-										</div>
-
-										<!-- Repo selector -->
-										{#if selectedGithubAppId}
-											<div class="grid gap-1.5">
-												<Label class="text-xs" for="gh-repo-select">Repository</Label>
-												{#if githubPickerReposLoading}
-													<p class="text-xs text-muted-foreground">Loading…</p>
-												{:else}
-													<Select.Root
-														type="single"
-														value={selectedGithubRepo?.full_name ?? ''}
-														onValueChange={(v) => {
-															const repo =
-																githubPickerRepos[selectedGithubAppId ?? '']?.find(
-																	(r) => r.full_name === v
-																) ?? null;
-															handleGithubRepoChange(repo);
-														}}
+								{#if openPRs.length > 0}
+									<div class="overflow-hidden rounded border border-border">
+										<table class="w-full text-sm">
+											<thead>
+												<tr class="border-b border-border bg-muted/50">
+													<th
+														class="px-3 py-2 text-left font-mono text-xs font-medium text-muted-foreground uppercase"
+														>#</th
 													>
-														<Select.Trigger id="gh-repo-select" class="h-8 w-52 font-mono text-xs">
-															{selectedGithubRepo?.full_name ?? 'Select repo…'}
-														</Select.Trigger>
-														<Select.Content>
-															{#each githubPickerRepos[selectedGithubAppId] ?? [] as repo (repo.id)}
-																<Select.Item value={repo.full_name} class="font-mono text-xs">
-																	{#if repo.private}
-																		<Lock class="mr-1 inline h-3 w-3 text-muted-foreground" />
-																	{/if}
-																	{repo.full_name}
-																</Select.Item>
-															{/each}
-														</Select.Content>
-													</Select.Root>
-												{/if}
-											</div>
-										{/if}
-
-										<!-- Branch selector -->
-										{#if selectedGithubRepo}
-											{@const branchKey = `${selectedGithubAppId}/${selectedGithubRepo.full_name}`}
-											<div class="grid gap-1.5">
-												<Label class="text-xs" for="gh-branch-select">Branch</Label>
-												{#if githubPickerBranchesLoading}
-													<p class="text-xs text-muted-foreground">Loading…</p>
-												{:else}
-													<Select.Root
-														type="single"
-														value={selectedGithubBranch ?? ''}
-														onValueChange={(v) => {
-															selectedGithubBranch = v || null;
-														}}
+													<th
+														class="px-3 py-2 text-left font-mono text-xs font-medium text-muted-foreground uppercase"
+														>Title</th
 													>
-														<Select.Trigger id="gh-branch-select" class="h-8 w-36 font-mono text-xs">
-															{#if selectedGithubBranch}
-																<GitBranch class="mr-1 inline h-3 w-3" />
-																{selectedGithubBranch}
-															{:else}
-																Select branch…
-															{/if}
-														</Select.Trigger>
-														<Select.Content>
-															{#each githubPickerBranches[branchKey] ?? [] as branch (branch.name)}
-																<Select.Item value={branch.name} class="font-mono text-xs">
-																	{branch.name}
-																	{#if branch.name === selectedGithubRepo.default_branch}
-																		<span class="ml-1 text-muted-foreground">(default)</span>
-																	{/if}
-																</Select.Item>
-															{/each}
-														</Select.Content>
-													</Select.Root>
-												{/if}
-											</div>
-										{/if}
-
-										<!-- Link button -->
-										{#if selectedGithubRepo}
-											<div class="grid gap-1.5">
-												<Button
-													size="sm"
-													class="h-8 text-xs uppercase"
-													disabled={githubLinkSaving}
-													onclick={handleGithubLink}
-												>
-													<Github class="h-3 w-3" />
-													{githubLinkSaving ? 'Linking…' : 'Link Repo'}
-												</Button>
-											</div>
-										{/if}
-									</div>
-								</div>
-							{/if}
-						{/if}
-					</div>
-
-					{#if sourceTypeInput === 'image'}
-						<Separator />
-
-						<!-- Registry Credentials -->
-						<div class="grid gap-3">
-							<h3 class="text-sm font-medium">Registry Credential</h3>
-							<p class="text-sm text-muted-foreground">
-								Attach a stored credential to authenticate pulls from a private registry.
-							</p>
-
-							<InlineError message={credError} ondismiss={() => (credError = '')} />
-
-							<!-- Attach credential dropdown -->
-							<div class="flex gap-3">
-								<div class="grid flex-1 gap-2">
-									<Label for="reg-cred-select">Credential</Label>
-									<Select.Root
-										type="single"
-										value={selectedCredentialId ?? '__none__'}
-										onValueChange={(v) => {
-											selectedCredentialId = v === '__none__' ? null : v;
-										}}
-									>
-										<Select.Trigger id="reg-cred-select" class="w-full">
-											{#if selectedCredentialId}
-												{registryCredentials.find((c) => c.id === selectedCredentialId)?.name ??
-													selectedCredentialId}
-											{:else}
-												None (public image)
-											{/if}
-										</Select.Trigger>
-										<Select.Content>
-											<Select.Item value="__none__">None (public image)</Select.Item>
-											{#each registryCredentials as cred (cred.id)}
-												<Select.Item value={cred.id}>{cred.name}</Select.Item>
-											{/each}
-										</Select.Content>
-									</Select.Root>
-								</div>
-								<Button
-									onclick={() => handleSetRegistryCredential(selectedCredentialId)}
-									class="self-end"
-								>
-									Attach
-								</Button>
-							</div>
-
-							<!-- Stored credentials list -->
-							{#if registryCredentialsLoading}
-								<div class="py-2 text-center text-sm text-muted-foreground">Loading...</div>
-							{:else if registryCredentials.length > 0}
-								<div class="divide-y rounded-md border">
-									{#each registryCredentials as cred (cred.id)}
-										<div class="flex items-center gap-3 px-4 py-2">
-											<div class="min-w-0 flex-1">
-												<span class="text-sm font-medium">{cred.name}</span>
-												<span class="ml-2 font-mono text-xs text-muted-foreground"
-													>{cred.server}</span
-												>
-												<span class="ml-2 text-xs text-muted-foreground">({cred.username})</span>
-											</div>
-											{#if app.registry_credential_id === cred.id}
-												<span class="text-xs text-muted-foreground">attached</span>
-											{/if}
-											<Button
-												variant="ghost"
-												size="sm"
-												class="h-7 px-2 text-xs text-destructive hover:bg-destructive/10 hover:text-destructive"
-												onclick={() => handleDeleteCredential(cred.id)}
-											>
-												Remove
-											</Button>
-										</div>
-									{/each}
-								</div>
-							{/if}
-
-							<!-- Add credential form -->
-							{#if addCredOpen}
-								<div class="grid gap-3 rounded-md border p-4">
-									<h4 class="text-sm font-medium">Add credential</h4>
-									<InlineError message={addCredError} ondismiss={() => (addCredError = '')} />
-									<div class="grid gap-2">
-										<Label for="cred-name">Name</Label>
-										<Input
-											id="cred-name"
-											type="text"
-											bind:value={newCredName}
-											placeholder="Docker Hub"
-										/>
-									</div>
-									<div class="grid gap-2">
-										<Label for="cred-server">Registry Server</Label>
-										<Input
-											id="cred-server"
-											type="text"
-											bind:value={newCredServer}
-											placeholder="registry-1.docker.io"
-											class="font-mono"
-										/>
-									</div>
-									<div class="grid gap-2">
-										<Label for="cred-username">Username</Label>
-										<Input
-											id="cred-username"
-											type="text"
-											bind:value={newCredUsername}
-											placeholder="myuser"
-										/>
-									</div>
-									<div class="grid gap-2">
-										<Label for="cred-password">Password / Token</Label>
-										<Input
-											id="cred-password"
-											type="password"
-											bind:value={newCredPassword}
-											placeholder="••••••••"
-										/>
-									</div>
-									<div class="flex gap-2">
-										<Button onclick={handleAddCredential}>Save Credential</Button>
-										<Button
-											variant="outline"
-											onclick={() => {
-												addCredOpen = false;
-												addCredError = '';
-											}}
-										>
-											Cancel
-										</Button>
-									</div>
-								</div>
-							{:else}
-								<Button
-									variant="outline"
-									size="sm"
-									class="self-start"
-									onclick={() => (addCredOpen = true)}
-								>
-									Add new credential
-								</Button>
-							{/if}
-						</div>
-					{/if}
-
-					<Separator />
-
-					<AppWebhooks appId={app.id} />
-
-					<Separator />
-
-					<!-- Auto-deploy toggle -->
-					<div class="grid gap-3">
-						<div class="flex items-center justify-between">
-							<div>
-								<h3 class="text-sm font-medium">Auto-deploy</h3>
-								<p class="mt-1 text-sm text-muted-foreground">
-									Automatically deploy when a webhook push event is received.
-								</p>
-							</div>
-							<StatusBadge status={app.auto_deploy ? 'enabled' : 'disabled'} />
-						</div>
-						<div class="flex gap-2">
-							{#if !app.auto_deploy}
-								<Button size="sm" onclick={() => handleSetAutoDeploy(true)}
-									>Enable Auto-deploy</Button
-								>
-							{:else}
-								<Button variant="outline" size="sm" onclick={() => handleSetAutoDeploy(false)}
-									>Disable Auto-deploy</Button
-								>
-							{/if}
-						</div>
-					</div>
-
-					<!-- Watch branch -->
-					<div class="grid gap-3">
-						<h3 class="text-sm font-medium">Watch Branch</h3>
-						<p class="text-sm text-muted-foreground">
-							Only trigger deploys for pushes to this branch. Leave empty to deploy on any branch
-							push.
-						</p>
-						<div class="flex gap-3">
-							<div class="grid flex-1 gap-2">
-								<Label for="watch-branch">Branch</Label>
-								<Input
-									id="watch-branch"
-									type="text"
-									bind:value={watchBranchInput}
-									placeholder="main"
-									class="font-mono"
-								/>
-							</div>
-							<Button onclick={handleSaveWatchBranch} class="self-end">Save</Button>
-						</div>
-						{#if app.watch_branch}
-							<p class="text-xs text-muted-foreground">
-								Currently watching: <span class="font-mono">{app.watch_branch}</span>
-							</p>
-						{:else}
-							<p class="text-xs text-muted-foreground">Watching all branches.</p>
-						{/if}
-					</div>
-
-					<Separator />
-
-					<!-- Deploy key -->
-					<div class="grid gap-3">
-						<div class="flex items-center justify-between">
-							<div>
-								<h3 class="text-sm font-medium">SSH Deploy Key</h3>
-								<p class="mt-1 text-sm text-muted-foreground">
-									Add this Ed25519 public key to your repository's deploy keys (read-only access).
-								</p>
-							</div>
-							<Button
-								variant="outline"
-								size="sm"
-								onclick={handleGenerateDeployKey}
-								disabled={deployKeyLoading}
-							>
-								{deployKey ? 'Regenerate' : 'Generate Key'}
-							</Button>
-						</div>
-
-						<InlineError message={deployKeyError} ondismiss={() => (deployKeyError = '')} />
-
-						{#if deployKeyLoading}
-							<div class="py-4 text-center text-sm text-muted-foreground">Loading...</div>
-						{:else if deployKey}
-							<SecretInput value={deployKey.public_key} readonly />
-							<p class="text-xs text-muted-foreground">
-								Copy this key and add it to your repository under Settings &rarr; Deploy Keys.
-							</p>
-						{:else}
-							<div class="rounded-md border py-6 text-center text-sm text-muted-foreground">
-								No deploy key generated yet. Click "Generate Key" to create one.
-							</div>
-						{/if}
-					</div>
-				</div>
-			{/if}
-
-			<!-- Previews tab -->
-			{#if activeTab === 'previews'}
-				<div class="space-y-6 pt-4">
-					<!-- PR Preview config -->
-					<div class="grid gap-3">
-						<div class="flex items-center justify-between">
-							<div>
-								<h3 class="text-sm font-medium">PR Preview Deployments</h3>
-								<p class="mt-1 text-sm text-muted-foreground">
-									Automatically deploy a preview environment for every pull request opened on the
-									linked GitHub repository.
-								</p>
-							</div>
-							<StatusBadge status={app.preview_enabled ? 'enabled' : 'disabled'} />
-						</div>
-
-						{#if previewsBlocked}
-							<PreviewDomainRequiredAlert />
-						{/if}
-
-						<InlineError message={previewConfigError} ondismiss={() => (previewConfigError = '')} />
-
-						<div class="flex gap-2">
-							{#if !app.preview_enabled}
-								<Button
-									size="sm"
-									disabled={previewConfigSaving || previewsBlocked}
-									onclick={() => handleTogglePreviewEnabled(true)}
-								>
-									{previewConfigSaving ? 'Saving…' : 'Enable PR Previews'}
-								</Button>
-							{:else}
-								<Button
-									variant="outline"
-									size="sm"
-									disabled={previewConfigSaving}
-									onclick={() => handleTogglePreviewEnabled(false)}
-								>
-									{previewConfigSaving ? 'Saving…' : 'Disable PR Previews'}
-								</Button>
-							{/if}
-						</div>
-
-						{#if !app.github_app_id}
-							<p class="text-xs text-muted-foreground">
-								A GitHub App must be linked (Git tab) before PR previews can be triggered
-								automatically.
-							</p>
-						{/if}
-
-						{#if previewDomain}
-							<div class="rounded-md border border-dashed px-4 py-3 text-sm text-muted-foreground">
-								Previews are served at
-								<code class="font-mono text-xs">&lt;id&gt;-{app.name}.{previewDomain}</code>.
-								<strong class="text-foreground">Wildcard DNS required</strong> — add a
-								<code class="font-mono text-xs">*.{previewDomain} → &lt;server IP&gt;</code> A record
-								so preview hostnames resolve automatically.
-							</div>
-						{/if}
-					</div>
-
-					<Separator />
-
-					<AppPreviews
-						{previews}
-						loading={previewsLoading}
-						error={previewsError}
-						onDelete={handleDeletePreview}
-					/>
-
-					<!-- Load open PRs section (only when preview enabled and GitHub App linked) -->
-					{#if app.preview_enabled && app.github_app_id}
-						<div class="grid gap-3">
-							<div class="flex items-center justify-between">
-								<div>
-									<h3 class="text-sm font-medium">Open Pull Requests</h3>
-									<p class="text-sm text-muted-foreground">
-										Load open PRs from the linked repository and deploy previews for them.
-									</p>
-								</div>
-								<Button
-									variant="outline"
-									size="sm"
-									disabled={openPRsLoading}
-									onclick={handleLoadOpenPRs}
-								>
-									{openPRsLoading ? 'Loading…' : 'Load open PRs'}
-								</Button>
-							</div>
-
-							<InlineError message={openPRsError} />
-
-							{#if openPRs.length > 0}
-								<div class="overflow-hidden rounded border border-border">
-									<table class="w-full text-sm">
-										<thead>
-											<tr class="border-b border-border bg-muted/50">
-												<th
-													class="px-3 py-2 text-left font-mono text-xs font-medium text-muted-foreground uppercase"
-													>#</th
-												>
-												<th
-													class="px-3 py-2 text-left font-mono text-xs font-medium text-muted-foreground uppercase"
-													>Title</th
-												>
-												<th
-													class="px-3 py-2 text-left font-mono text-xs font-medium text-muted-foreground uppercase"
-													>Branch</th
-												>
-												<th class="w-36 px-3 py-2"></th>
-											</tr>
-										</thead>
-										<tbody>
-											{#each openPRs as pr, i (pr.number)}
-												{@const alreadyDeployed = previews.some((p) => p.pr_number === pr.number)}
-												<tr class={i < openPRs.length - 1 ? 'border-b border-border' : ''}>
-													<td class="px-3 py-2 font-mono text-xs text-muted-foreground"
-														>#{pr.number}</td
+													<th
+														class="px-3 py-2 text-left font-mono text-xs font-medium text-muted-foreground uppercase"
+														>Branch</th
 													>
-													<td class="px-3 py-2 text-xs">
-														<a
-															href={safeUrl(pr.pr_url)}
-															target="_blank"
-															rel="noopener noreferrer"
-															class="hover:underline">{pr.title}</a
-														>
-													</td>
-													<td class="px-3 py-2 font-mono text-xs text-muted-foreground"
-														>{pr.head_ref}</td
-													>
-													<td class="px-3 py-2">
-														<div class="flex items-center justify-end gap-2">
-															{#if alreadyDeployed}
-																<Badge variant="secondary" class="text-xs">Deployed</Badge>
-															{/if}
-															<Button
-																size="sm"
-																variant="outline"
-																disabled={deployingPR === pr.number}
-																onclick={() => handleDeployPR(pr)}
-															>
-																{deployingPR === pr.number ? 'Deploying…' : 'Deploy Preview'}
-															</Button>
-														</div>
-													</td>
+													<th class="w-36 px-3 py-2"></th>
 												</tr>
-											{/each}
-										</tbody>
-									</table>
-								</div>
-							{/if}
-						</div>
-					{/if}
-
-					<!-- Create preview form -->
-					<div class="grid gap-3">
-						<h3 class="text-sm font-medium">New Preview Deployment</h3>
-						<p class="text-sm text-muted-foreground">
-							Creates a temporary deployment from the current image with a unique subdomain. Useful
-							for PR review workflows.
-						</p>
-						<div class="flex items-end gap-3">
-							<div class="grid gap-2">
-								<Label for="preview-ttl">TTL (hours)</Label>
-								<Input
-									id="preview-ttl"
-									type="number"
-									bind:value={previewTtl}
-									min={1}
-									max={168}
-									class="w-28"
-								/>
+											</thead>
+											<tbody>
+												{#each openPRs as pr, i (pr.number)}
+													{@const alreadyDeployed = previews.some((p) => p.pr_number === pr.number)}
+													<tr class={i < openPRs.length - 1 ? 'border-b border-border' : ''}>
+														<td class="px-3 py-2 font-mono text-xs text-muted-foreground"
+															>#{pr.number}</td
+														>
+														<td class="px-3 py-2 text-xs">
+															<a
+																href={safeUrl(pr.pr_url)}
+																target="_blank"
+																rel="noopener noreferrer"
+																class="hover:underline">{pr.title}</a
+															>
+														</td>
+														<td class="px-3 py-2 font-mono text-xs text-muted-foreground"
+															>{pr.head_ref}</td
+														>
+														<td class="px-3 py-2">
+															<div class="flex items-center justify-end gap-2">
+																{#if alreadyDeployed}
+																	<Badge variant="secondary" class="text-xs">Deployed</Badge>
+																{/if}
+																<Button
+																	size="sm"
+																	variant="outline"
+																	disabled={deployingPR === pr.number}
+																	onclick={() => handleDeployPR(pr)}
+																>
+																	{deployingPR === pr.number ? 'Deploying…' : 'Deploy Preview'}
+																</Button>
+															</div>
+														</td>
+													</tr>
+												{/each}
+											</tbody>
+										</table>
+									</div>
+								{/if}
 							</div>
-							<Button onclick={() => handleCreatePreview()} disabled={previewsBlocked}>
-								Create Preview
-							</Button>
+						{/if}
+
+						<!-- Create preview form -->
+						<div class="grid gap-3">
+							<h3 class="text-sm font-medium">New Preview Deployment</h3>
+							<p class="text-sm text-muted-foreground">
+								Creates a temporary deployment from the current image with a unique subdomain.
+								Useful for PR review workflows.
+							</p>
+							<div class="flex items-end gap-3">
+								<div class="grid gap-2">
+									<Label for="preview-ttl">TTL (hours)</Label>
+									<Input
+										id="preview-ttl"
+										type="number"
+										bind:value={previewTtl}
+										min={1}
+										max={168}
+										class="w-28"
+									/>
+								</div>
+								<Button onclick={() => handleCreatePreview()} disabled={previewsBlocked}>
+									Create Preview
+								</Button>
+							</div>
+							<p class="text-xs text-muted-foreground">
+								The preview will be automatically removed after the TTL expires.
+							</p>
 						</div>
-						<p class="text-xs text-muted-foreground">
-							The preview will be automatically removed after the TTL expires.
-						</p>
 					</div>
-				</div>
-			{/if}
+				{/if}
 
-			<!-- Metrics tab -->
-			{#if activeTab === 'metrics'}
-				<AppMetrics
-					{metrics}
-					loading={metricsLoading}
-					error={metricsError}
-					period={metricsPeriod}
-					onPeriodChange={(p) => (metricsPeriod = p)}
-				/>
-			{/if}
+				<!-- Metrics tab -->
+				{#if activeTab === 'metrics'}
+					<AppMetrics
+						{metrics}
+						loading={metricsLoading}
+						error={metricsError}
+						period={metricsPeriod}
+						onPeriodChange={(p) => (metricsPeriod = p)}
+					/>
+				{/if}
 
-			<!-- History tab -->
-			{#if activeTab === 'history'}
-				<AppHistory appName={app.name} />
-			{/if}
+				<!-- History tab -->
+				{#if activeTab === 'history'}
+					<AppHistory appName={app.name} />
+				{/if}
 
-			{#if activeTab === 'danger'}
-				<section
-					aria-labelledby="danger-zone-heading"
-					class="space-y-4 rounded-sm border border-destructive/40 p-4"
-				>
-					<div>
-						<h2 id="danger-zone-heading" class="text-sm font-semibold text-destructive">
-							Delete this app
-						</h2>
-						<p class="mt-1 text-sm text-muted-foreground">
-							Removes the container, deployment history, environment variables, previews and alert
-							rules scoped to this app. Volume data stays on the server's disk.
-						</p>
-					</div>
-					<Button variant="destructive" size="sm" onclick={() => (showDeleteDialog = true)}>
-						Delete app…
-					</Button>
-				</section>
-			{/if}
+				{#if activeTab === 'danger'}
+					<section
+						aria-labelledby="danger-zone-heading"
+						class="space-y-4 rounded-sm border border-destructive/40 p-4"
+					>
+						<div>
+							<h2 id="danger-zone-heading" class="text-sm font-semibold text-destructive">
+								Delete this app
+							</h2>
+							<p class="mt-1 text-sm text-muted-foreground">
+								Removes the container, deployment history, environment variables, previews and alert
+								rules scoped to this app. Volume data stays on the server's disk.
+							</p>
+						</div>
+						<Button variant="destructive" size="sm" onclick={() => (showDeleteDialog = true)}>
+							Delete app…
+						</Button>
+					</section>
+				{/if}
 			</div>
 		</div>
 	</div>

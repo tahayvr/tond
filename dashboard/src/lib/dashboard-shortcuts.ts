@@ -70,7 +70,11 @@ export function registerDashboardShortcuts(
 				actions.setTerminalOpen(!terminalOpen);
 				return;
 			}
-			if (event.key.toLowerCase() === 'k' && actions.openPalette && !isTerminalTarget(event.target)) {
+			if (
+				event.key.toLowerCase() === 'k' &&
+				actions.openPalette &&
+				!isTerminalTarget(event.target)
+			) {
 				event.preventDefault();
 				actions.openPalette();
 			}
@@ -84,7 +88,13 @@ export function registerDashboardShortcuts(
 		}
 
 		// Single-key shortcuts never fire while typing or inside the terminal.
-		if (typing || isTerminalTarget(event.target) || event.altKey || event.ctrlKey || event.metaKey) {
+		if (
+			typing ||
+			isTerminalTarget(event.target) ||
+			event.altKey ||
+			event.ctrlKey ||
+			event.metaKey
+		) {
 			return;
 		}
 

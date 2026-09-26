@@ -36,7 +36,7 @@
 	});
 </script>
 
-<PageTitle title={'Connecting GitHub'} />
+<PageTitle title="Connecting GitHub" />
 
 <div class="flex min-h-[60vh] flex-col items-center justify-center gap-4 text-center">
 	<Github class="size-10 animate-pulse text-muted-foreground" />

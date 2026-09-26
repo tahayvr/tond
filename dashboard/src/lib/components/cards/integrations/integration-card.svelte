@@ -1,6 +1,6 @@
 <script lang="ts">
 	import type { Component, Snippet } from 'svelte';
-	import Badge from '$lib/components/ui/badge/badge.svelte';
+	import StatusBadge from '$lib/components/feedback/status-badge.svelte';
 	import * as Card from '$lib/components/ui/card/index.js';
 	import Button from '$lib/components/ui/button/button.svelte';
 	import Unlink from '~icons/ri/link-unlink';
@@ -43,11 +43,11 @@
 				<Icon class="h-8 w-8" />
 			</div>
 			{#if status === 'connected'}
-				<Badge variant="outline" class="border-success text-success">Connected</Badge>
+				<StatusBadge status="connected" size="sm" />
 			{:else if status === 'loading'}
-				<Badge variant="outline" class="border-warn text-warn">Connecting…</Badge>
+				<StatusBadge status="pending" label="Connecting…" size="sm" />
 			{:else}
-				<Badge variant="outline" class="text-muted-foreground">Not Connected</Badge>
+				<StatusBadge status="not_connected" label="Not connected" size="sm" />
 			{/if}
 		</div>
 		<Card.Title class="text-lg font-bold uppercase">{name}</Card.Title>

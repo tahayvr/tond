@@ -1605,9 +1605,13 @@ export function watchCronRunCompletion(id: string, onDone: () => void): () => vo
 		onDone();
 		close();
 	};
-	const close = openRawStream(`/api/cron/${id}/runs/stream`, (frame) => {
-		if (frame?.type === 'run') finish();
-	}, finish);
+	const close = openRawStream(
+		`/api/cron/${id}/runs/stream`,
+		(frame) => {
+			if (frame?.type === 'run') finish();
+		},
+		finish
+	);
 	return () => {
 		settled = true;
 		close();

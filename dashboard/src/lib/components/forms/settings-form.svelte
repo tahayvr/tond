@@ -76,9 +76,7 @@
 		</div>
 
 		<div class="grid gap-2">
-			<Label for="server-name" class="text-xs text-muted-foreground">
-				Server Name
-			</Label>
+			<Label for="server-name" class="text-xs text-muted-foreground">Server Name</Label>
 			<Input
 				id="server-name"
 				type="text"
@@ -102,9 +100,7 @@
 		</div>
 
 		<div class="grid gap-2">
-			<Label for="dashboard-domain" class="text-xs text-muted-foreground">
-				Dashboard Domain
-			</Label>
+			<Label for="dashboard-domain" class="text-xs text-muted-foreground">Dashboard Domain</Label>
 			<Input
 				id="dashboard-domain"
 				type="text"
@@ -131,9 +127,7 @@
 		</div>
 
 		<div class="grid gap-2">
-			<Label for="preview-domain" class="text-xs text-muted-foreground">
-				Preview Domain
-			</Label>
+			<Label for="preview-domain" class="text-xs text-muted-foreground">Preview Domain</Label>
 			<Input
 				id="preview-domain"
 				type="text"

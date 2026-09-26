@@ -40,7 +40,7 @@
 			{status ? `Error ${status}` : 'Connection error'}
 		</p>
 		<h1 class="text-2xl font-extrabold">{title}</h1>
-		<PageTitle title={title} />
+		<PageTitle {title} />
 		<p class="text-sm text-muted-foreground">
 			{#if unavailable}
 				Tond didn't respond. It may be restarting or updating — nothing was lost. Try again in a few

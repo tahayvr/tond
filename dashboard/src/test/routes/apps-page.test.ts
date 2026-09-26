@@ -80,6 +80,6 @@ describe('apps page', () => {
 		});
 
 		expect(screen.queryByText(/loading_units/i)).not.toBeInTheDocument();
-		expect(screen.getByText(/1\/1 units operational/i)).toBeInTheDocument();
+		expect(screen.getByText(/1 of 1 running/i)).toBeInTheDocument();
 	});
 });

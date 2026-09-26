@@ -1,4 +1,5 @@
 <script lang="ts">
+	import StatusBadge from '$lib/components/feedback/status-badge.svelte';
 	import SuccessAlert from '$lib/components/feedback/success-alert.svelte';
 	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { confirmAction } from '$lib/confirm.svelte';
@@ -19,7 +20,6 @@
 	import Plus from '~icons/ri/add-line';
 	import Pencil from '~icons/ri/pencil-line';
 	import FlaskConical from '~icons/ri/flask-line';
-	import Badge from '$lib/components/ui/badge/badge.svelte';
 
 	interface Props {
 		kind: IntegrationKind;
@@ -312,16 +312,9 @@
 							<div class="flex items-center gap-2">
 								<span class="font-medium">{integration.name}</span>
 								{#if integration.enabled}
-									<Badge
-										variant="outline"
-										class="h-4 border-success px-1 text-[10px] text-success"
-									>
-										Enabled
-									</Badge>
+									<StatusBadge status="enabled" size="sm" />
 								{:else}
-									<Badge variant="outline" class="h-4 px-1 text-[10px] text-muted-foreground">
-										Disabled
-									</Badge>
+									<StatusBadge status="disabled" size="sm" />
 								{/if}
 							</div>
 							<span class="text-muted-foreground">Added {formatDate(integration.created_at)}</span>

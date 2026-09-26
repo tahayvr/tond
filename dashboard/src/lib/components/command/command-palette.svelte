@@ -118,7 +118,9 @@
 					>
 						<span class="truncate">{entry.label}</span>
 						{#if entry.hint}
-							<span class="ml-auto truncate font-mono text-xs text-muted-foreground">{entry.hint}</span>
+							<span class="ml-auto truncate font-mono text-xs text-muted-foreground"
+								>{entry.hint}</span
+							>
 						{/if}
 					</Command.Item>
 				{/each}

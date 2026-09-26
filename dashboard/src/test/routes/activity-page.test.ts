@@ -81,6 +81,6 @@ describe('activity page', () => {
 		});
 
 		expect(screen.queryByText(/loading_events/i)).not.toBeInTheDocument();
-		expect(screen.getByText(/1 events_logged/i)).toBeInTheDocument();
+		expect(screen.getByText(/^1 events$/i)).toBeInTheDocument();
 	});
 });

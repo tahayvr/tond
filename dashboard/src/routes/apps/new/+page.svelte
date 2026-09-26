@@ -454,7 +454,7 @@
 	}
 </script>
 
-<PageTitle title={'New app'} />
+<PageTitle title="New app" />
 
 <div class="min-h-screen space-y-6 pb-12">
 	<!-- Header -->

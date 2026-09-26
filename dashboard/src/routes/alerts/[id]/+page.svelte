@@ -26,7 +26,6 @@
 	import { Checkbox } from '$lib/components/ui/checkbox/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
-	import { Separator } from '$lib/components/ui/separator/index.js';
 	import * as Select from '$lib/components/ui/select/index.js';
 	import Breadcrumb from '$lib/components/nav/breadcrumb.svelte';
 	import IntegrationSelector from '$lib/components/integrations/integration-selector.svelte';
@@ -247,12 +246,16 @@
 		<InlineError title="Test not sent" message={sendTest.error} ondismiss={sendTest.clear} />
 		<SuccessAlert message={testSummary} ondismiss={() => (testResults = [])} />
 		{#if testResults.some((r) => !r.ok)}
-			<div role="alert" class="space-y-1 rounded-sm border border-warn/40 bg-warn/10 px-3 py-2.5 text-sm text-warn">
+			<div
+				role="alert"
+				class="space-y-1 rounded-sm border border-warn/40 bg-warn/10 px-3 py-2.5 text-sm text-warn"
+			>
 				<p class="font-semibold">Some channels didn't receive the test</p>
 				<ul class="space-y-0.5">
 					{#each testResults as result (result.kind + result.name)}
 						<li>
-							{result.ok ? '✓' : '✕'} {result.name} ({result.kind}){result.error ? `: ${result.error}` : ''}
+							{result.ok ? '✓' : '✕'}
+							{result.name} ({result.kind}){result.error ? `: ${result.error}` : ''}
 						</li>
 					{/each}
 				</ul>

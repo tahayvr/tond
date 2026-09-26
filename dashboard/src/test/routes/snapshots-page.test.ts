@@ -29,7 +29,10 @@ vi.mock('$lib/api', () => ({
 	...api
 }));
 
+vi.mock('$app/navigation', () => ({ goto: vi.fn(), invalidateAll: vi.fn() }));
+
 import SnapshotsPage from '../../routes/snapshots/+page.svelte';
+import { confirmDialog, renderConfirmHost } from '../confirm';
 
 const fullSnapshot: Snapshot = {
 	id: 'snap_1',
@@ -74,6 +77,7 @@ const preDeploySnapshot: Snapshot = {
 };
 
 function renderPage(snapshots = [fullSnapshot]) {
+	renderConfirmHost();
 	render(SnapshotsPage, {
 		props: {
 			params: {},
@@ -132,6 +136,8 @@ describe('snapshots page', () => {
 		renderPage([fullSnapshot, preDeploySnapshot]);
 
 		await user.click(screen.getByRole('button', { name: /delete snapshot before-deploy/i }));
+		expect(api.deleteSnapshot).not.toHaveBeenCalled();
+		await confirmDialog(user);
 
 		expect(api.deleteSnapshot).toHaveBeenCalledWith('snap_1');
 		expect(screen.queryByText(/manual · full/i)).not.toBeInTheDocument();
@@ -142,7 +148,11 @@ describe('snapshots page', () => {
 		renderPage();
 
 		await user.click(screen.getByRole('button', { name: /restore/i }));
-		await user.click(screen.getByRole('button', { name: /yes, restore/i }));
+		// Spells out what gets overwritten and needs the word typed.
+		const dialog = await screen.findByRole('alertdialog');
+		expect(dialog).toHaveTextContent(/app volumes and database data are overwritten/i);
+		expect(dialog).toHaveTextContent(/pre-restore snapshot/i);
+		await confirmDialog(user, { typed: 'restore' });
 
 		expect(api.restoreSnapshot).toHaveBeenCalledWith('snap_1');
 		expect(await screen.findByText(/restore queued/i)).toBeInTheDocument();
@@ -152,10 +162,8 @@ describe('snapshots page', () => {
 		const user = userEvent.setup();
 		renderPage([preDeploySnapshot]);
 
-		await user.click(screen.getByRole('button', { name: /rollback/i }));
-		await user.clear(screen.getByPlaceholderText('web'));
-		await user.type(screen.getByPlaceholderText('web'), 'web');
-		await user.click(screen.getByRole('button', { name: /confirm/i }));
+		await user.click(screen.getByRole('button', { name: /roll back data/i }));
+		await confirmDialog(user, { typed: 'web' });
 
 		expect(api.rollbackAppToSnapshot).toHaveBeenCalledWith('snap_2', 'web');
 		expect(await screen.findByText(/rollback started/i)).toBeInTheDocument();
@@ -165,7 +173,7 @@ describe('snapshots page', () => {
 		const user = userEvent.setup();
 		renderPage();
 
-		await user.click(screen.getByRole('button', { name: /config/i }));
+		await user.click(screen.getByRole('button', { name: /backup settings/i }));
 
 		expect(api.getBackupConfig).toHaveBeenCalledOnce();
 		expect(api.listStorageProviders).toHaveBeenCalledOnce();
@@ -173,7 +181,7 @@ describe('snapshots page', () => {
 
 		await user.clear(screen.getByLabelText(/schedule \(cron\)/i));
 		await user.type(screen.getByLabelText(/schedule \(cron\)/i), '0 4 * * *');
-		await user.click(screen.getByRole('button', { name: /save config/i }));
+		await user.click(screen.getByRole('button', { name: /save settings/i }));
 
 		expect(api.updateBackupConfig).toHaveBeenCalledWith({
 			enabled: true,
