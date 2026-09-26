@@ -1488,17 +1488,19 @@ wait_for 60 "route for www.${STACK_DOMAIN}" bash -c "curl -sk --resolve 'www.${S
 pass "a second domain on the same service is routed at once"
 docker volume inspect e2e-stack_cache-data > /dev/null || fail "the named volume should exist"
 
-# Edit the file (web gets an env var), redeploy, then roll back to the first
-# deployment: its compose file and pinned images come back.
+# Edit the file (web reads WHOAMI_NAME from the app's environment), redeploy,
+# then roll back to the first deployment: its compose file and images come back.
 STACK_FIRST=$(api /api/v1/apps/e2e-stack/deployments | jq -r '[.data[] | select(.status == "succeeded")][0].id')
-STACK_FILE_V2=$'services:\n  web:\n    image: traefik/whoami:v1.10\n    expose: ["80"]\n    environment: ["WHOAMI_NAME=v2"]\n  cache:\n    image: redis:7-alpine\n    volumes: ["cache-data:/data"]\n    healthcheck:\n      test: ["CMD", "redis-cli", "ping"]\n      interval: 2s\n      timeout: 2s\n      retries: 15\nvolumes:\n  cache-data: {}\n'
+STACK_FILE_V2=$'services:\n  web:\n    image: traefik/whoami:v1.10\n    expose: ["80"]\n    environment: ["WHOAMI_NAME=${STACK_NAME}"]\n  cache:\n    image: redis:7-alpine\n    volumes: ["cache-data:/data"]\n    healthcheck:\n      test: ["CMD", "redis-cli", "ping"]\n      interval: 2s\n      timeout: 2s\n      retries: 15\nvolumes:\n  cache-data: {}\n'
 code=$(api_req PUT /api/v1/apps/e2e-stack/compose "$(jq -n --arg f "$STACK_FILE_V2" '{compose_content: $f}')")
 [[ "$code" == 200 ]] || fail "saving the compose file should work, got ${code}: $(cat "$API_BODY")"
+code=$(api_req PATCH /api/v1/apps/e2e-stack/env '{"set":{"STACK_NAME":"v2"},"unset":[]}')
+[[ "$code" == 200 ]] || fail "setting an app variable should work, got ${code}: $(cat "$API_BODY")"
 tond apps deploy e2e-stack > /dev/null
 wait_for 300 "a second compose deployment" \
     bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/apps/e2e-stack/deployments | jq -e '[.data[] | select(.status == \"succeeded\")] | length >= 2'"
 wait_for 60 "the edited web service" bash -c "curl -sk --resolve '${STACK_DOMAIN}:443:${IP}' 'https://${STACK_DOMAIN}/' | grep -q 'Name: v2'"
-pass "an edited compose file redeploys (web now says Name: v2)"
+pass "an edited compose file redeploys; ${STACK_NAME} came from the app's environment (Name: v2)"
 api "/api/v1/apps/e2e-stack/deployments/${STACK_FIRST}" | jq -e '.data.services | length == 2 and all(.image | test("^tond-e2e-stack/"))' > /dev/null \
     || fail "a compose deployment should list its pinned service images"
 code=$(api_req POST /api/v1/apps/e2e-stack/rollback "{\"deployment_id\":\"${STACK_FIRST}\"}")

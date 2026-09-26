@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 const TWO_SERVICES: &str = r#"
@@ -39,6 +40,36 @@ fn interpolation_uses_an_empty_environment() {
     assert_eq!(interpolate("cost: $$5"), "cost: $5");
     assert_eq!(interpolate("${A:-${B:-deep}}"), "deep");
     assert_eq!(interpolate("héllo"), "héllo");
+}
+
+#[test]
+fn interpolation_reads_the_apps_environment() {
+    let env = BTreeMap::from([
+        ("TAG".to_string(), "2.0".to_string()),
+        ("EMPTY".to_string(), String::new()),
+    ]);
+    assert_eq!(interpolate_env("nginx:${TAG:-1}", &env), "nginx:2.0");
+    assert_eq!(interpolate_env("nginx:$TAG", &env), "nginx:2.0");
+    assert_eq!(
+        interpolate_env("${EMPTY:-d}", &env),
+        "d",
+        ":- also replaces empty"
+    );
+    assert_eq!(
+        interpolate_env("${EMPTY-d}", &env),
+        "",
+        "- only replaces unset"
+    );
+    assert_eq!(interpolate_env("${MISSING?need it}", &env), "");
+    let specs = service_specs_env("services:\n  a:\n    image: app:${TAG}\n", &env)
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(specs[0].image.as_deref(), Some("app:2.0"));
+    let builds = build_specs(
+        "services:\n  a:\n    build:\n      context: .\n      args: [\"V=${TAG}\"]\n",
+        Path::new("/c"),
+        &env,
+    );
+    assert_eq!(builds["a"].args, vec![("V".to_string(), "2.0".to_string())]);
 }
 
 #[test]
@@ -112,7 +143,7 @@ fn web_service_is_the_preferred_one_or_the_one_with_the_port() {
 
 #[test]
 fn build_specs_resolve_contexts_inside_the_compose_directory() {
-    let specs = build_specs(TWO_SERVICES, Path::new("/srv/repo"));
+    let specs = build_specs(TWO_SERVICES, Path::new("/srv/repo"), &BTreeMap::new());
     let api = specs
         .get("api")
         .unwrap_or_else(|| panic!("api builds: {specs:?}"));
@@ -125,6 +156,7 @@ fn build_specs_resolve_contexts_inside_the_compose_directory() {
     let short = build_specs(
         "services:\n  a:\n    build: https://github.com/x/y.git\n  b:\n    build: .\n    image: b\n",
         Path::new("/c"),
+        &BTreeMap::new(),
     );
     assert_eq!(short["a"].context, "https://github.com/x/y.git");
     assert_eq!(short["b"].context, "/c/.");

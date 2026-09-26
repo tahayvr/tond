@@ -310,11 +310,15 @@ async fn run_with_source(
     for rel in &hardened.bind_sources {
         volumes::prepare_host_dir(&data_dir, &volume_dir, rel, true)?;
     }
-    let specs = compose::service_specs(&source.content).map_err(anyhow::Error::msg)?;
+    // The app's environment variables are what `${VAR}` in the file resolves
+    // against (Tond's own environment never reaches compose).
+    let app_env = super::build::compose_app_env(&crate::secrets::app_env(app)?);
+    let specs =
+        compose::service_specs_env(&source.content, &app_env).map_err(anyhow::Error::msg)?;
     compose::sync_specs(&state.db, &app_id, &specs).await?;
     ensure_web_service(state, app, &specs).await?;
 
-    let builds = compose::build_specs(&hardened.yaml, &source.base_dir);
+    let builds = compose::build_specs(&hardened.yaml, &source.base_dir, &app_env);
     let credentials = match &app.registry_credential_id {
         Some(id) => fetch_registry_credentials(state, id).await?,
         None => None,
@@ -470,7 +474,7 @@ async fn run_with_source(
         "Starting services with docker compose up...",
     )
     .await?;
-    let up = compose_up(state, &app_id, &app_name, &compose_path, trigger).await;
+    let up = compose_up(state, &app_id, &app_name, &compose_path, &app_env, trigger).await;
     drop(port_guard);
     if let Err(e) = up {
         set_services_status(state, &app_id, deployment_id, &names, "failed").await;

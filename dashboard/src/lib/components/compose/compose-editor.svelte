@@ -100,7 +100,9 @@
 		<code class="rounded bg-muted px-1 font-mono">docker compose up</code>. Privileged mode, host
 		namespaces, extra capabilities, devices and bind mounts outside the app's folder are refused —
 		use relative binds like <code class="font-mono">./data:/data</code> or named volumes (both are included
-		in snapshots). Ports are bound to 127.0.0.1; give a service a domain to reach it.
+		in snapshots). Ports are bound to 127.0.0.1; give a service a domain to reach it. Write
+		<code class="font-mono">${"{"}NAME}</code> to use one of the app's environment variables (secrets stay out
+		of the file).
 	</p>
 
 	{#if errors.length > 0}

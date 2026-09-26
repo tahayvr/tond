@@ -85,6 +85,14 @@ fn load(content: &str) -> Result<Value, String> {
 /// `${VAR:-default}` / `${VAR-default}` → default, `${VAR}` / `$VAR` → "",
 /// `$$` → `$`.
 pub fn interpolate(s: &str) -> String {
+    interpolate_env(s, &BTreeMap::new())
+}
+
+/// Compose variable substitution against `env` (the app's environment, the
+/// only variables `docker compose` sees): `${VAR}` / `$VAR` → the value or
+/// "", `${VAR:-d}` → d when unset or empty, `${VAR-d}` → d when unset,
+/// `$$` → `$`.
+pub fn interpolate_env(s: &str, env: &BTreeMap<String, String>) -> String {
     let b = s.as_bytes();
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
@@ -103,9 +111,24 @@ pub fn interpolate(s: &str) -> String {
             Some(b'{') => match closing_brace(&s[i + 2..]) {
                 Some(end) => {
                     let inner = &s[i + 2..i + 2 + end];
-                    if let Some(pos) = inner.find(":-").or_else(|| inner.find('-')) {
-                        let skip = if inner[pos..].starts_with(":-") { 2 } else { 1 };
-                        out.push_str(&interpolate(&inner[pos + skip..]));
+                    let name_len = inner
+                        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .unwrap_or(inner.len());
+                    let (name, rest) = inner.split_at(name_len);
+                    let value = env.get(name);
+                    if let Some(default) = rest.strip_prefix(":-") {
+                        match value.filter(|v| !v.is_empty()) {
+                            Some(v) => out.push_str(v),
+                            None => out.push_str(&interpolate_env(default, env)),
+                        }
+                    } else if let Some(default) = rest.strip_prefix('-') {
+                        match value {
+                            Some(v) => out.push_str(v),
+                            None => out.push_str(&interpolate_env(default, env)),
+                        }
+                    } else if let Some(v) = value {
+                        // `${VAR}`, and `${VAR:?err}` / `${VAR?err}` when set.
+                        out.push_str(v);
                     }
                     i += 3 + end;
                 }
@@ -115,9 +138,13 @@ pub fn interpolate(s: &str) -> String {
                 }
             },
             Some(c) if c.is_ascii_alphabetic() || *c == b'_' => {
+                let start = i + 1;
                 i += 1;
                 while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
                     i += 1;
+                }
+                if let Some(v) = env.get(&s[start..i]) {
+                    out.push_str(v);
                 }
             }
             _ => {
@@ -195,8 +222,17 @@ fn has_healthcheck(svc: &Mapping) -> bool {
     }
 }
 
-/// The services a compose file declares, in file order.
+/// The services a compose file declares, in file order (variables resolved
+/// against an empty environment).
 pub fn service_specs(content: &str) -> Result<Vec<ComposeServiceSpec>, String> {
+    service_specs_env(content, &BTreeMap::new())
+}
+
+/// [`service_specs`] with variables resolved against the app's environment.
+pub fn service_specs_env(
+    content: &str,
+    env: &BTreeMap<String, String>,
+) -> Result<Vec<ComposeServiceSpec>, String> {
     let doc = load(content)?;
     let services = match untag(&doc).get("services").map(untag) {
         Some(Value::Mapping(s)) => s,
@@ -214,7 +250,7 @@ pub fn service_specs(content: &str) -> Result<Vec<ComposeServiceSpec>, String> {
             image: svc
                 .get("image")
                 .and_then(scalar)
-                .map(|i| interpolate(&i))
+                .map(|i| interpolate_env(&i, env))
                 .filter(|i| !i.trim().is_empty()),
             builds: svc.contains_key("build"),
             ports: declared_ports(svc),
@@ -340,7 +376,11 @@ fn is_remote_context(ctx: &str) -> bool {
 
 /// Build specs of every service with a `build:` section. Paths were checked
 /// by compose_policy (inside the compose directory, no `..`).
-pub fn build_specs(content: &str, base_dir: &std::path::Path) -> BTreeMap<String, BuildSpec> {
+pub fn build_specs(
+    content: &str,
+    base_dir: &std::path::Path,
+    env: &BTreeMap<String, String>,
+) -> BTreeMap<String, BuildSpec> {
     let mut out = BTreeMap::new();
     let Ok(doc) = load(content) else {
         return out;
@@ -359,14 +399,17 @@ pub fn build_specs(content: &str, base_dir: &std::path::Path) -> BTreeMap<String
                     Some(Value::Mapping(m)) => m
                         .iter()
                         .filter_map(|(k, v)| {
-                            Some((scalar(k)?, interpolate(&scalar(v).unwrap_or_default())))
+                            Some((
+                                scalar(k)?,
+                                interpolate_env(&scalar(v).unwrap_or_default(), env),
+                            ))
                         })
                         .collect(),
                     Some(Value::Sequence(items)) => items
                         .iter()
                         .filter_map(scalar)
                         .map(|kv| match kv.split_once('=') {
-                            Some((k, v)) => (k.to_string(), interpolate(v)),
+                            Some((k, v)) => (k.to_string(), interpolate_env(v, env)),
                             None => (kv, String::new()),
                         })
                         .collect(),
@@ -379,7 +422,9 @@ pub fn build_specs(content: &str, base_dir: &std::path::Path) -> BTreeMap<String
                     b.get("dockerfile").and_then(scalar),
                     b.get("dockerfile_inline").and_then(scalar),
                     args,
-                    b.get("target").and_then(scalar).map(|t| interpolate(&t)),
+                    b.get("target")
+                        .and_then(scalar)
+                        .map(|t| interpolate_env(&t, env)),
                 )
             }
             other => (
