@@ -254,6 +254,24 @@ fn preview_env_vars(
     env_vars
 }
 
+/// Whether a deploy of `app` starts with a pre-deploy snapshot: only when
+/// they are enabled (`backup_config.pre_deploy_enabled`) and the app has
+/// data to protect. Compose apps keep data in bind mounts and named volumes;
+/// a git-sourced compose file is only known after the clone, so it counts.
+fn wants_pre_deploy_snapshot(app: &App, enabled: bool) -> bool {
+    if !enabled {
+        return false;
+    }
+    let volumes: Vec<Volume> = serde_json::from_str(app.volumes.as_str()).unwrap_or_default();
+    let compose_data = app.source_type == "compose"
+        && (app.source_url.is_some()
+            || app.compose_content.as_deref().is_some_and(|c| {
+                let usage = crate::compose::volume_usage(c);
+                usage.binds || !usage.named.is_empty()
+            }));
+    !volumes.is_empty() || compose_data
+}
+
 /// What a deployment does.
 #[derive(Debug, Clone)]
 pub enum DeployKind {
@@ -529,19 +547,15 @@ async fn pipeline(
 
     // ── Pre-deploy snapshot (fire-and-forget) ────────────────────────────────
     // If the app has a volume, snapshot it now so the user can roll back in ~5s
-    // if the new deploy breaks something. A snapshot failure must never block a
+    // if the new deploy breaks something (unless pre-deploy snapshots are off
+    // in the backup settings). A snapshot failure must never block a
     // deployment — hence the fire-and-forget spawn with `let _ =`.
     {
-        let volumes: Vec<Volume> = serde_json::from_str(app.volumes.as_str()).unwrap_or_default();
-        // Compose apps keep data in bind mounts and named volumes; a
-        // git-sourced file is only known after the clone, so snapshot it.
-        let compose_data = app.source_type == "compose"
-            && (app.source_url.is_some()
-                || app.compose_content.as_deref().is_some_and(|c| {
-                    let usage = crate::compose::volume_usage(c);
-                    usage.binds || !usage.named.is_empty()
-                }));
-        if !volumes.is_empty() || compose_data {
+        // An unreadable config keeps the default (on).
+        let enabled = backup::get_backup_config(state)
+            .await
+            .map_or(true, |cfg| cfg.pre_deploy_enabled != 0);
+        if wants_pre_deploy_snapshot(app, enabled) {
             let snap_state = state.clone();
             let snap_app_name = app_name.clone();
             let snap_deploy_id = deployment_id.to_string();
@@ -1920,6 +1934,28 @@ mod tests {
             env,
             HashMap::from([("SENTRY_DSN".to_string(), "project".to_string())])
         );
+    }
+
+    #[test]
+    fn pre_deploy_snapshots_follow_the_setting_and_need_data() {
+        let mut app = App::new("web".into(), "image".into(), None, None, 3000);
+        app.volumes = r#"[{"name":"data","host_path":"/x","container_path":"/data"}]"#.into();
+        assert!(wants_pre_deploy_snapshot(&app, true));
+        assert!(
+            !wants_pre_deploy_snapshot(&app, false),
+            "pre_deploy_enabled = 0 turns them off"
+        );
+
+        app.volumes = "[]".into();
+        assert!(
+            !wants_pre_deploy_snapshot(&app, true),
+            "no volumes, nothing to snapshot"
+        );
+
+        app.source_type = "compose".into();
+        app.compose_content = Some("services:\n  db:\n    image: postgres\n    volumes: [pg:/var/lib/postgresql/data]\nvolumes:\n  pg: {}\n".into());
+        assert!(wants_pre_deploy_snapshot(&app, true));
+        assert!(!wants_pre_deploy_snapshot(&app, false));
     }
 
     #[tokio::test]
