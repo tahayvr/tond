@@ -103,9 +103,9 @@ describe('labels', () => {
 	});
 
 	it('points failures at the tab that fixes them', () => {
-		expect(failureFix({ code: 'port_not_listening' })?.tab).toBe('health');
-		expect(failureFix({ code: 'app_oom' })?.tab).toBe('resources');
-		expect(failureFix({ code: 'image_pull_denied' })?.tab).toBe('env');
+		expect(failureFix({ code: 'port_not_listening' })?.section).toBe('health');
+		expect(failureFix({ code: 'app_oom' })?.section).toBe('resources');
+		expect(failureFix({ code: 'image_pull_denied' })?.section).toBe('environment');
 		expect(failureFix({ code: 'build_failed' })).toBeNull();
 		expect(failureFix(null)).toBeNull();
 	});

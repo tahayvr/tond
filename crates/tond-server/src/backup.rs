@@ -970,7 +970,6 @@ pub async fn restore_database(
 // ── Backup scheduler ──────────────────────────────────────────────────────────
 
 pub async fn backup_scheduler(state: AppState) {
-
     loop {
         let cfg = match get_backup_config(&state).await {
             Ok(c) => c,

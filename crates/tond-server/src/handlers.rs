@@ -383,10 +383,16 @@ pub async fn create_app(
         app.base_dir = (!dir.is_empty()).then_some(dir);
     }
     app.static_build = if req.static_build { 1 } else { 0 };
+    apply_readiness(
+        &mut app,
+        req.readiness.as_deref(),
+        req.ready_after_secs,
+        ReadinessChange::Create,
+    )?;
 
     sqlx::query(
-		"INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, status, env_vars, memory_limit, cpu_limit, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, project_id, github_app_id, registry_credential_id, dockerfile_content, compose_content, base_dir, static_build, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		"INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, status, env_vars, memory_limit, cpu_limit, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, project_id, github_app_id, registry_credential_id, dockerfile_content, compose_content, base_dir, static_build, readiness, ready_after_secs, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 	)
 	.bind(&app.id)
 	.bind(&app.name)
@@ -417,6 +423,8 @@ pub async fn create_app(
 	.bind(&app.compose_content)
 	.bind(&app.base_dir)
 	.bind(app.static_build)
+	.bind(&app.readiness)
+	.bind(app.ready_after_secs)
 	.bind(&app.created_at)
 	.bind(&app.updated_at)
 	.execute(&state.db)
@@ -1076,6 +1084,115 @@ pub async fn update_drain_timeout(
     ))
 }
 
+// ── Readiness (web app / TCP service / background worker) ──
+
+/// Whether a readiness change comes from creating the app or editing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadinessChange {
+    Create,
+    Update,
+}
+
+/// Validate and apply a readiness mode to `app`. Background workers have no
+/// domain and no health check path: on create a domain is refused (it would
+/// never be routed); on update switching to a worker clears them.
+pub(crate) fn apply_readiness(
+    app: &mut App,
+    readiness: Option<&str>,
+    ready_after_secs: Option<i64>,
+    change: ReadinessChange,
+) -> Result<(), AppError> {
+    let invalid = |msg: &str| AppError(TondError::InvalidInput(msg.to_string()));
+    if let Some(value) = readiness {
+        let mode = Readiness::from_input(value)
+            .ok_or_else(|| invalid("readiness must be one of: http, tcp, none"))?;
+        app.readiness = mode.as_str().to_string();
+    }
+    if let Some(secs) = ready_after_secs {
+        if !READY_AFTER_SECS_RANGE.contains(&secs) {
+            return Err(invalid("ready_after_secs must be between 1 and 600"));
+        }
+        app.ready_after_secs = secs;
+    }
+    if app.readiness() == Readiness::None {
+        if app.source_type == "compose" {
+            return Err(invalid(
+                "Compose apps can't be background workers; publish a web service port instead",
+            ));
+        }
+        if change == ReadinessChange::Create && app.domain.is_some() {
+            return Err(invalid(
+                "Background workers have no domain: they serve no traffic. Leave the domain empty.",
+            ));
+        }
+        app.domain = None;
+        app.health_check_path = None;
+    }
+    Ok(())
+}
+
+/// PUT /api/apps/{id}/readiness body.
+#[derive(Debug, Deserialize)]
+pub struct UpdateReadinessRequest {
+    /// "http" | "tcp" | "none"
+    pub readiness: String,
+    /// For "none": seconds the container must stay up (default: unchanged)
+    pub ready_after_secs: Option<i64>,
+}
+
+// PUT /api/apps/{id}/readiness
+// How deploys decide the new container is ready. Switching to a background
+// worker ("none") removes the app's domain and health check path: a worker
+// serves no traffic and is never routed. Takes effect on the next deploy.
+pub async fn update_readiness(
+    _rate: RateLimit,
+    auth: Authz<scope::AppsWrite>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateReadinessRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let mut app = fetch_app(&state.db, &id).await?;
+    let had_domain = app.domain.clone();
+    apply_readiness(
+        &mut app,
+        Some(&req.readiness),
+        req.ready_after_secs,
+        ReadinessChange::Update,
+    )?;
+    sqlx::query(
+        "UPDATE apps SET readiness = ?, ready_after_secs = ?, domain = ?, health_check_path = ?,
+                updated_at = datetime('now') WHERE id = ?",
+    )
+    .bind(&app.readiness)
+    .bind(app.ready_after_secs)
+    .bind(&app.domain)
+    .bind(&app.health_check_path)
+    .bind(&app.id)
+    .execute(&state.db)
+    .await?;
+    let removed = match (&had_domain, &app.domain) {
+        (Some(d), None) => format!(" domain_removed={d}"),
+        _ => String::new(),
+    };
+    write_audit_log(
+        &state.db,
+        Some(&app.id),
+        Some(&app.name),
+        "readiness_update",
+        &auth.audit_actor(),
+        Some(&format!(
+            "readiness={} ready_after_secs={}{removed}",
+            app.readiness, app.ready_after_secs
+        )),
+    )
+    .await;
+    let updated = fetch_app(&state.db, &app.id).await?;
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(AppResponse::from(updated))),
+    ))
+}
+
 // ── Update Container Port ──
 //
 // PUT /api/apps/{id}/port  { "container_port": 80 }
@@ -1417,6 +1534,8 @@ mod tests {
                 compose_content: None,
                 base_dir: None,
                 static_build: false,
+                readiness: None,
+                ready_after_secs: None,
             }),
         )
         .await
@@ -1463,6 +1582,8 @@ mod tests {
                 compose_content: None,
                 base_dir: None,
                 static_build: false,
+                readiness: None,
+                ready_after_secs: None,
             }),
         )
         .await
@@ -1509,6 +1630,8 @@ mod tests {
                 compose_content: None,
                 base_dir: None,
                 static_build: false,
+                readiness: None,
+                ready_after_secs: None,
             }),
         )
         .await
@@ -1555,6 +1678,8 @@ mod tests {
                 compose_content: None,
                 base_dir: None,
                 static_build: false,
+                readiness: None,
+                ready_after_secs: None,
             }),
         )
         .await
@@ -1601,6 +1726,8 @@ mod tests {
                 compose_content: None,
                 base_dir: None,
                 static_build: false,
+                readiness: None,
+                ready_after_secs: None,
             }),
         )
         .await
@@ -1647,6 +1774,8 @@ mod tests {
                 compose_content: None,
                 base_dir: None,
                 static_build: false,
+                readiness: None,
+                ready_after_secs: None,
             }),
         )
         .await
@@ -1693,6 +1822,8 @@ mod tests {
                 compose_content: None,
                 base_dir: None,
                 static_build: false,
+                readiness: None,
+                ready_after_secs: None,
             }),
         )
         .await
@@ -1739,6 +1870,8 @@ mod tests {
                 compose_content: None,
                 base_dir: None,
                 static_build: false,
+                readiness: None,
+                ready_after_secs: None,
             }),
         )
         .await
@@ -1784,6 +1917,8 @@ mod tests {
                 compose_content: None,
                 base_dir: None,
                 static_build: false,
+                readiness: None,
+                ready_after_secs: None,
             }),
         )
         .await
@@ -1832,6 +1967,8 @@ mod tests {
                 compose_content: None,
                 base_dir: None,
                 static_build: false,
+                readiness: None,
+                ready_after_secs: None,
             }),
         )
         .await
@@ -1883,6 +2020,8 @@ mod tests {
                 compose_content: None,
                 base_dir: Some("services/api".to_string()),
                 static_build: true,
+                readiness: None,
+                ready_after_secs: None,
             }),
         )
         .await
@@ -1980,6 +2119,68 @@ mod tests {
             .await
             .unwrap_or_else(|err| panic!("read port: {err}"));
         assert_eq!(port, 80);
+    }
+
+    #[test]
+    fn readiness_rules_for_workers() {
+        let mut app = App::new("w".into(), "image".into(), None, None, 3000);
+        app.domain = Some("w.example.com".into());
+        app.health_check_path = Some("/health".into());
+        assert!(
+            apply_readiness(
+                &mut app.clone(),
+                Some("none"),
+                None,
+                ReadinessChange::Create
+            )
+            .is_err(),
+            "a worker can't be created with a domain"
+        );
+        apply_readiness(&mut app, Some("none"), Some(20), ReadinessChange::Update)
+            .unwrap_or_else(|e| panic!("update to worker: {}", e.0));
+        assert_eq!(app.readiness(), Readiness::None);
+        assert_eq!(app.ready_after_secs, 20);
+        assert!(app.domain.is_none() && app.health_check_path.is_none());
+        assert!(apply_readiness(&mut app, Some("udp"), None, ReadinessChange::Update).is_err());
+        assert!(apply_readiness(&mut app, None, Some(0), ReadinessChange::Update).is_err());
+        let mut compose = App::new("c".into(), "compose".into(), None, None, 80);
+        assert!(
+            apply_readiness(&mut compose, Some("none"), None, ReadinessChange::Create).is_err()
+        );
+        let mut tcp = App::new("t".into(), "image".into(), None, None, 6379);
+        apply_readiness(&mut tcp, Some("tcp"), None, ReadinessChange::Create)
+            .unwrap_or_else(|e| panic!("tcp: {}", e.0));
+        assert_eq!(tcp.readiness(), Readiness::Tcp);
+    }
+
+    #[tokio::test]
+    async fn update_readiness_switches_to_a_worker_and_drops_the_domain() {
+        let state = test_state().await;
+        let app = seed_app(&state, "jobs").await;
+        sqlx::query("UPDATE apps SET domain = 'jobs.example.com' WHERE id = ?")
+            .bind(&app.id)
+            .execute(&state.db)
+            .await
+            .unwrap_or_else(|err| panic!("seed domain: {err}"));
+        update_readiness(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            State(state.clone()),
+            Path(app.id.clone()),
+            Json(UpdateReadinessRequest {
+                readiness: "none".into(),
+                ready_after_secs: Some(15),
+            }),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("update_readiness should succeed: {}", err.0));
+        let (readiness, secs, domain): (String, i64, Option<String>) =
+            sqlx::query_as("SELECT readiness, ready_after_secs, domain FROM apps WHERE id = ?")
+                .bind(&app.id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap_or_else(|err| panic!("read: {err}"));
+        assert_eq!((readiness.as_str(), secs, domain), ("none", 15, None));
     }
 
     #[test]
@@ -2286,6 +2487,8 @@ mod tests {
             compose_content: None,
             base_dir: None,
             static_build: false,
+            readiness: None,
+            ready_after_secs: None,
         };
 
         let error = create_app(
@@ -2335,6 +2538,8 @@ mod tests {
             compose_content: None,
             base_dir: None,
             static_build: false,
+            readiness: None,
+            ready_after_secs: None,
         };
         let error = create_app(
             RateLimit,
@@ -2374,6 +2579,8 @@ mod tests {
             compose_content: Some(content.to_string()),
             base_dir: None,
             static_build: false,
+            readiness: None,
+            ready_after_secs: None,
         }
     }
 

@@ -40,7 +40,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashMap};
-use tond_common::{App, DeployFailure, DeployPhase, PreviewDeployment, Volume};
+use tond_common::{App, DeployFailure, DeployPhase, PreviewDeployment, Readiness, Volume};
 use uuid::Uuid;
 
 use crate::alerts;
@@ -237,7 +237,7 @@ pub async fn create(state: &AppState, app: &App, req: &DeployRequest) -> Result<
         DeployKind::Upload { .. } => "tarball",
         DeployKind::Source => app.source_type.as_str(),
     };
-    let phases = progress::plan_for(plan_source, app.health_check_path.as_deref());
+    let phases = progress::plan_for_app(plan_source, app);
     let phases_json = serde_json::to_string(&phases).unwrap_or_else(|_| "[]".to_string());
     sqlx::query(
         "INSERT INTO deployments (id, app_id, image_tag, status, trigger_source, trigger_detail, rollback_of, phases, started_at, created_at)
@@ -284,7 +284,7 @@ pub async fn run(
         DeployKind::Upload { .. } => "tarball",
         DeployKind::Source => app.source_type.as_str(),
     };
-    let phases = progress::plan_for(plan_source, app.health_check_path.as_deref());
+    let phases = progress::plan_for_app(plan_source, app);
     progress::begin(state, &app_id, deployment_id, phases).await;
 
     let previous_status = app.status.clone();
@@ -325,6 +325,7 @@ pub async fn run(
                 container_logs: &facts.container_logs,
                 memory_limit: app.memory_limit,
                 has_registry_credential: app.registry_credential_id.is_some(),
+                readiness: app.readiness(),
             });
             // The excerpt may quote the app's own output: keep its secrets out.
             for line in failure.excerpt.iter_mut() {
@@ -655,46 +656,88 @@ async fn pipeline(
     //
     // Poll the new container directly on its host port (bypassing the proxy)
     // so that the old container keeps serving traffic until we are confident
-    // the new one is ready. With a health check path the app must answer it
-    // with a 2xx; without one, any HTTP answer on the app's port will do (so
-    // a wrong port is caught here instead of as 502s after the cutover).
+    // the new one is ready. How depends on the app's readiness mode:
+    //   http  a health check path must answer 2xx; without one, any HTTP
+    //         answer on the app's port will do (so a wrong port is caught
+    //         here instead of as 502s after the cutover)
+    //   tcp   the container port accepts connections (probed on the
+    //         container's own address: docker-proxy accepts any connection)
+    //   none  background worker: the container stays up ready_after_secs
     progress::start(state, &app_id, DeployPhase::Health).await;
-    let (path, require_2xx, timeout_secs) = match app.health_check_path.clone() {
-        Some(path) => (path, true, app.drain_timeout.max(1) as u64),
-        None => (
-            "/".to_string(),
-            false,
-            (app.drain_timeout.max(1) as u64).max(PORT_PROBE_MIN_SECS),
-        ),
+    let readiness = app.readiness();
+    let port_timeout = (app.drain_timeout.max(1) as u64).max(PORT_PROBE_MIN_SECS);
+    let (probe, timeout_secs) = match readiness {
+        Readiness::Http => {
+            let (path, require_2xx, timeout_secs) = match app.health_check_path.clone() {
+                Some(path) => (path, true, app.drain_timeout.max(1) as u64),
+                None => ("/".to_string(), false, port_timeout),
+            };
+            let url = format!("http://127.0.0.1:{}{}", new_host_port, path);
+            log_deploy(
+                state,
+                &app_id,
+                "info",
+                trigger_source,
+                &if require_2xx {
+                    format!(
+                        "Waiting up to {}s for the health check on port {}{} to pass",
+                        timeout_secs, container_port, path
+                    )
+                } else {
+                    format!(
+                        "Waiting up to {}s for the app to answer on port {}",
+                        timeout_secs, container_port
+                    )
+                },
+            )
+            .await?;
+            let probe = probe_until_ready(
+                &state.docker,
+                &new_container_id,
+                &url,
+                require_2xx,
+                timeout_secs,
+            )
+            .await?;
+            (probe, timeout_secs)
+        }
+        Readiness::Tcp => {
+            log_deploy(
+                state,
+                &app_id,
+                "info",
+                trigger_source,
+                &format!(
+                    "Waiting up to {}s for port {} to accept connections",
+                    port_timeout, container_port
+                ),
+            )
+            .await?;
+            let probe = probe_tcp_until_ready(
+                &state.docker,
+                &new_container_id,
+                container_port,
+                port_timeout,
+            )
+            .await;
+            (probe, port_timeout)
+        }
+        Readiness::None => {
+            let secs = app.ready_after_secs.max(1) as u64;
+            log_deploy(
+                state,
+                &app_id,
+                "info",
+                trigger_source,
+                &format!("Background worker: waiting {secs}s to make sure it stays up"),
+            )
+            .await?;
+            (
+                wait_stays_up(&state.docker, &new_container_id, secs).await,
+                secs,
+            )
+        }
     };
-    let url = format!("http://127.0.0.1:{}{}", new_host_port, path);
-    log_deploy(
-        state,
-        &app_id,
-        "info",
-        trigger_source,
-        &if require_2xx {
-            format!(
-                "Waiting up to {}s for the health check on port {}{} to pass",
-                timeout_secs, container_port, path
-            )
-        } else {
-            format!(
-                "Waiting up to {}s for the app to answer on port {}",
-                timeout_secs, container_port
-            )
-        },
-    )
-    .await?;
-
-    let probe = probe_until_ready(
-        &state.docker,
-        &new_container_id,
-        &url,
-        require_2xx,
-        timeout_secs,
-    )
-    .await?;
     if probe.result != ProbeResult::Healthy {
         facts.timeout_secs = timeout_secs;
         facts.probe = Some(probe.result);
@@ -707,7 +750,7 @@ async fn pipeline(
             .collect();
         let _ = docker::remove_container(&state.docker, &new_container_id).await;
         anyhow::bail!(
-            "the new container did not become ready within {}s; the previous version keeps serving",
+            "the new container did not become ready within {}s; the previous version keeps running",
             timeout_secs
         );
     }
@@ -716,7 +759,11 @@ async fn pipeline(
         &app_id,
         "info",
         trigger_source,
-        "New container is ready — cutting over traffic",
+        if readiness.serves_traffic() {
+            "New container is ready — cutting over traffic"
+        } else {
+            "The worker stayed up — replacing the old container"
+        },
     )
     .await?;
 
@@ -750,18 +797,21 @@ async fn pipeline(
     if let Some(ref old_id) = old_container_id
         && old_id != &new_container_id
     {
-        log_deploy(
-            state,
-            &app_id,
-            "info",
-            trigger_source,
-            &format!(
-                "Waiting {}s for proxy to pick up new port before stopping old container",
-                PROXY_POLL_SECS
-            ),
-        )
-        .await?;
-        tokio::time::sleep(std::time::Duration::from_secs(PROXY_POLL_SECS)).await;
+        // Workers are never routed: nothing for the proxy to pick up.
+        if readiness.serves_traffic() {
+            log_deploy(
+                state,
+                &app_id,
+                "info",
+                trigger_source,
+                &format!(
+                    "Waiting {}s for proxy to pick up new port before stopping old container",
+                    PROXY_POLL_SECS
+                ),
+            )
+            .await?;
+            tokio::time::sleep(std::time::Duration::from_secs(PROXY_POLL_SECS)).await;
+        }
 
         log_deploy(
             state,
@@ -968,7 +1018,8 @@ async fn source_image(
 /// Auto-assign `<app>.<dashboard domain>` when the app has no domain.
 /// Falls back to `<app>.localhost` if no dashboard domain is configured.
 async fn assign_auto_domain(state: &AppState, app: &mut App) -> Result<()> {
-    if app.domain.is_some() {
+    // Background workers serve no traffic: no address.
+    if app.domain.is_some() || !app.readiness().serves_traffic() {
         return Ok(());
     }
     let base = {
@@ -1306,6 +1357,94 @@ struct Probe {
     result: ProbeResult,
     /// Set when the container stopped (crash, OOM) before becoming ready.
     container: Option<ContainerExit>,
+}
+
+/// The container's address on its first Docker network.
+async fn container_ip(docker: &bollard::Docker, container_id: &str) -> Option<std::net::IpAddr> {
+    let info = docker.inspect_container(container_id, None).await.ok()?;
+    let networks = info.network_settings?.networks?;
+    networks
+        .values()
+        .filter_map(|n| n.ip_address.as_deref())
+        .find_map(|ip| ip.parse().ok())
+}
+
+/// Poll until the container accepts TCP connections on `port`. Connects to
+/// the container's own address: the loopback-published port is held by
+/// docker-proxy, which accepts connections even when nothing listens.
+async fn probe_tcp_until_ready(
+    docker: &bollard::Docker,
+    container_id: &str,
+    port: u16,
+    timeout_secs: u64,
+) -> Probe {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let mut last = ProbeResult::NotListening;
+    loop {
+        if let Some(ip) = container_ip(docker, container_id).await {
+            let addr = std::net::SocketAddr::new(ip, port);
+            last = match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                tokio::net::TcpStream::connect(addr),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    return Probe {
+                        result: ProbeResult::Healthy,
+                        container: None,
+                    };
+                }
+                Ok(Err(_)) => ProbeResult::NotListening,
+                Err(_) => ProbeResult::Timeout,
+            };
+        }
+        let exit = container_exit(docker, container_id).await;
+        if let Some(exit) = exit.filter(|e| !e.running) {
+            return Probe {
+                result: last,
+                container: Some(exit),
+            };
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Probe {
+                result: last,
+                container: container_exit(docker, container_id).await,
+            };
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+/// Background workers: ready once the container has stayed up `secs`
+/// without exiting or being restarted.
+async fn wait_stays_up(docker: &bollard::Docker, container_id: &str, secs: u64) -> Probe {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        let exit = container_exit(docker, container_id).await;
+        match exit {
+            Some(exit) if !exit.running => {
+                return Probe {
+                    result: ProbeResult::NotListening,
+                    container: Some(exit),
+                };
+            }
+            None => {
+                return Probe {
+                    result: ProbeResult::NotListening,
+                    container: Some(ContainerExit::default()),
+                };
+            }
+            Some(_) => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Probe {
+                result: ProbeResult::Healthy,
+                container: None,
+            };
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
 }
 
 /// Whether one HTTP answer means "ready".

@@ -128,7 +128,7 @@ wait_for_app_running() {
 }
 
 delete_e2e_resources() {
-    for app in e2e-whoami e2e-static e2e-rooted e2e-compose e2e-badport; do
+    for app in e2e-whoami e2e-static e2e-rooted e2e-compose e2e-badport e2e-worker e2e-worker-domain; do
         tond apps delete "$app" -y > /dev/null 2>&1 || true
     done
     tond db delete e2e-redis -y > /dev/null 2>&1 || true
@@ -1016,6 +1016,27 @@ DNS_STATUS=$(jq -r '.data.dns.status' "$API_BODY")
 code=$(api_req GET "/api/domains/check?domain=not_a_domain" '')
 [[ "$code" == 400 ]] || fail "an invalid domain must be rejected with 400, got ${code}"
 pass "domain check reports DNS '${DNS_STATUS}' for ${WHOAMI_DOMAIN}; invalid domains → 400"
+
+step "Background worker (readiness: none — no port, no domain, never routed)"
+# A worker that serves nothing must deploy (the HTTP release check would fail it).
+code=$(api_req POST /api/apps '{"name":"e2e-worker","source_type":"dockerfile","dockerfile_content":"FROM alpine:3\nCMD [\"sh\", \"-c\", \"while true; do echo tick; sleep 5; done\"]","readiness":"none","ready_after_secs":5}')
+[[ "$code" == 201 ]] || fail "creating a background worker should succeed, got ${code}: $(cat "$API_BODY")"
+code=$(api_req POST /api/apps '{"name":"e2e-worker-domain","source_type":"image","source_url":"alpine:3","readiness":"none","domain":"worker.example.test"}')
+[[ "$code" == 400 ]] || fail "a background worker with a domain must be rejected, got ${code}"
+code=$(api_req POST /api/apps/e2e-worker/deploy '{}')
+[[ "$code" == 202 ]] || fail "worker deploy should be accepted, got ${code}: $(cat "$API_BODY")"
+WORKER_DEP=$(jq -r '.data.deployment_id' "$API_BODY")
+wait_for_app_running e2e-worker 300
+WORKER=$(api "/api/apps/e2e-worker/deployments/${WORKER_DEP}")
+jq -e '.data.status == "succeeded"' <<< "$WORKER" > /dev/null \
+    || fail "the worker deployment must succeed: $(jq -c '.data | {status, failure}' <<< "$WORKER")"
+jq -e '.data.phases[] | select(.phase == "health") | .label == "Stay up for 5s" and .status == "succeeded"' <<< "$WORKER" > /dev/null \
+    || fail "the worker's readiness step must be 'Stay up for 5s': $(jq -c '.data.phases' <<< "$WORKER")"
+[[ "$(app_field e2e-worker domain)" == null ]] || fail "a worker must not get an automatic domain"
+[[ "$(app_field e2e-worker readiness)" == none ]] || fail "the app must report readiness none"
+docker logs tond-e2e-worker 2>&1 | grep -q tick || fail "the worker container should be running its loop"
+pass "a background worker deploys to running with no domain (readiness step: stay up 5s)"
+
 
 step "Resource metrics (cgroup sampling, restarts, cached host stats)"
 # The collector samples every 30 s; the first reading only primes the rates.

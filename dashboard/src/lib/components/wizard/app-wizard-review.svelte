@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { Project, RegistryCredential } from '$lib/api';
+	import type { Project, Readiness, RegistryCredential } from '$lib/api';
 	import type { SourceSubType } from '$lib/components/wizard/app-wizard-source.svelte';
 
 	interface Volume {
@@ -17,6 +17,8 @@
 		composeContent: string;
 		buildMethod: 'dockerfile' | 'tbuild';
 		containerPort: number;
+		readiness?: Readiness;
+		readyAfterSecs?: number;
 		autoDeploy: boolean;
 		branch: string;
 		baseDir: string;
@@ -46,6 +48,8 @@
 		composeContent,
 		buildMethod,
 		containerPort,
+		readiness = 'http',
+		readyAfterSecs = 10,
 		autoDeploy,
 		branch,
 		baseDir,
@@ -163,7 +167,18 @@
 				{:else if sourceSubType === 'image'}
 					<div><span class="text-muted-foreground">Method:</span> Pre-built image</div>
 				{/if}
-				<div><span class="text-muted-foreground">Container Port:</span> {containerPort}</div>
+				{#if readiness === 'none'}
+					<div>
+						<span class="text-muted-foreground">Kind:</span> Background worker (ready after {readyAfterSecs}s,
+						no port or domain)
+					</div>
+				{:else}
+					<div>
+						<span class="text-muted-foreground">Kind:</span>
+						{readiness === 'tcp' ? 'TCP service' : 'Web app'}
+					</div>
+					<div><span class="text-muted-foreground">Container Port:</span> {containerPort}</div>
+				{/if}
 				{#if baseDir}
 					<div>
 						<span class="text-muted-foreground">Base Directory:</span>
@@ -195,7 +210,7 @@
 			<div class="space-y-1 text-sm">
 				<div>
 					<span class="text-muted-foreground">Domain:</span>
-					{domain || 'Auto-generated'}
+					{readiness === 'none' ? 'None (not routed)' : domain || 'Auto-generated'}
 				</div>
 				<div>
 					<span class="text-muted-foreground">Health Path:</span>

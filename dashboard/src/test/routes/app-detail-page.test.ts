@@ -92,6 +92,10 @@ vi.mock('$lib/components/tabs/app-page/app-domain.svelte', async () => ({
 	default: (await import('../mocks/EmptyComponent.svelte')).default
 }));
 
+vi.mock('$lib/components/tabs/app-page/app-readiness.svelte', async () => ({
+	default: (await import('../mocks/EmptyComponent.svelte')).default
+}));
+
 vi.mock('$lib/components/tabs/app-page/app-port.svelte', async () => ({
 	default: (await import('../mocks/EmptyComponent.svelte')).default
 }));
@@ -124,7 +128,8 @@ vi.mock('$lib/ui-context.svelte', () => ({
 }));
 
 vi.mock('$lib/api', () => ({
-	...api
+	...api,
+	appReadiness: (a: { readiness?: string }) => a.readiness ?? 'http'
 }));
 
 import AppDetailPage from '../../routes/apps/[id]/+page.svelte';

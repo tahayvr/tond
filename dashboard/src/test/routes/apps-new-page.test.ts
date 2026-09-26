@@ -321,6 +321,62 @@ describe('new app page', () => {
 		).toBeInTheDocument();
 	});
 
+	it('creates a background worker without a port or domain', async () => {
+		const user = userEvent.setup();
+		render(NewAppPage, { props: { data, params: {} } });
+
+		await user.type(screen.getByLabelText(/application name/i), 'jobs');
+		await user.click(screen.getByRole('button', { name: /docker/i }));
+		await user.click(screen.getByRole('button', { name: /docker image/i }));
+		await user.type(screen.getByLabelText(/^docker image/i), 'acme/worker:1');
+		await user.click(screen.getByRole('button', { name: /^next$/i }));
+
+		await user.click(await screen.findByRole('button', { name: /background worker/i }));
+		expect(screen.queryByLabelText(/container port/i)).not.toBeInTheDocument();
+		expect(screen.queryByLabelText(/custom domain/i)).not.toBeInTheDocument();
+		const secs = screen.getByLabelText(/stays up for/i);
+		await user.clear(secs);
+		await user.type(secs, '15');
+
+		for (let i = 0; i < 3; i++) {
+			await user.click(screen.getByRole('button', { name: /^next$/i }));
+		}
+		expect(await screen.findByText(/background worker \(ready after 15s/i)).toBeInTheDocument();
+		await user.click(screen.getByRole('button', { name: /deploy application/i }));
+		await waitFor(() =>
+			expect(createApp).toHaveBeenCalledWith(
+				expect.objectContaining({ readiness: 'none', ready_after_secs: 15 })
+			)
+		);
+		const body = createApp.mock.calls[0][0];
+		expect(body.domain).toBeUndefined();
+		expect(body.health_check_path).toBeUndefined();
+	});
+
+	it('explains a private image it cannot read yet instead of failing', async () => {
+		inspectImage.mockResolvedValue({
+			image: 'ghcr.io/acme/private:1',
+			exposed_ports: [],
+			env_port: null,
+			suggested_port: null,
+			pulled: false,
+			unavailable:
+				"Tond couldn't read ghcr.io/acme/private:1. If it's private, choose registry credentials on the Environment step and Tond reads its port then.",
+			needs_credentials: true
+		});
+		const user = userEvent.setup();
+		render(NewAppPage, { props: { data, params: {} } });
+		await user.type(screen.getByLabelText(/application name/i), 'web');
+		await user.click(screen.getByRole('button', { name: /docker/i }));
+		await user.click(screen.getByRole('button', { name: /docker image/i }));
+		await user.type(screen.getByLabelText(/^docker image/i), 'ghcr.io/acme/private:1');
+		await user.click(screen.getByRole('button', { name: /^next$/i }));
+		expect(
+			await screen.findByText(/choose registry credentials on the environment step/i)
+		).toBeInTheDocument();
+		expect(screen.queryByText(/configuration error/i)).not.toBeInTheDocument();
+	});
+
 	it('asks for the port of an image app and detects it from the image', async () => {
 		const user = userEvent.setup();
 		render(NewAppPage, { props: { data, params: {} } });
