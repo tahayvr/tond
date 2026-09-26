@@ -2,10 +2,10 @@
 //
 // Per-app endpoints, addressed by app UUID only (never by name):
 //
-//   POST /api/webhooks/github/{app_id}   X-Hub-Signature-256: sha256=HMAC-SHA256(secret, body)
-//   POST /api/webhooks/gitlab/{app_id}   X-Gitlab-Token: <secret>   (constant-time compare)
-//   POST /api/webhooks/gitea/{app_id}    X-Gitea-Signature / X-Forgejo-Signature: hex HMAC
-//   POST /api/webhooks/generic/{app_id}  X-Tond-Signature-256: sha256=<hex HMAC>
+//   POST /api/v1/webhooks/github/{app_id}   X-Hub-Signature-256: sha256=HMAC-SHA256(secret, body)
+//   POST /api/v1/webhooks/gitlab/{app_id}   X-Gitlab-Token: <secret>   (constant-time compare)
+//   POST /api/v1/webhooks/gitea/{app_id}    X-Gitea-Signature / X-Forgejo-Signature: hex HMAC
+//   POST /api/v1/webhooks/generic/{app_id}  X-Tond-Signature-256: sha256=<hex HMAC>
 //                                        or Authorization: Bearer <secret>
 //
 // GitHub App endpoint (all repos the App is installed on):
@@ -83,7 +83,7 @@ fn info_response(message: &str) -> Response {
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response {
-    (status, Json(ApiResponse::<()>::err(message))).into_response()
+    crate::error::status_error(status, message)
 }
 
 // ── Verification ───────────────────────────────────────────────────────────
@@ -456,7 +456,7 @@ fn extract_push_branch(body: &[u8]) -> Option<String> {
 
 // ── GitHub ─────────────────────────────────────────────────────────────────
 
-/// POST /api/webhooks/github/{app_id}
+/// POST /api/v1/webhooks/github/{app_id}
 ///
 /// Requires a valid X-Hub-Signature-256; only "push" events trigger a deploy.
 pub async fn github_webhook(
@@ -482,7 +482,7 @@ pub async fn github_webhook(
 
 // ── GitLab ─────────────────────────────────────────────────────────────────
 
-/// POST /api/webhooks/gitlab/{app_id}
+/// POST /api/v1/webhooks/gitlab/{app_id}
 ///
 /// Requires X-Gitlab-Token to equal the app's secret. "Push Hook" triggers a
 /// deploy; "Merge Request Hook" drives preview deployments.
@@ -511,7 +511,7 @@ pub async fn gitlab_webhook(
 
 // ── Gitea / Forgejo ────────────────────────────────────────────────────────
 
-/// POST /api/webhooks/gitea/{app_id}
+/// POST /api/v1/webhooks/gitea/{app_id}
 ///
 /// Requires a valid X-Gitea-Signature (or X-Forgejo-Signature); "push" events
 /// trigger a deploy.
@@ -537,7 +537,7 @@ pub async fn gitea_webhook(
 
 // ── Generic ────────────────────────────────────────────────────────────────
 
-/// POST /api/webhooks/generic/{app_id}
+/// POST /api/v1/webhooks/generic/{app_id}
 ///
 /// For CI pipelines and scripts. Authenticate with
 /// `X-Tond-Signature-256: sha256=<HMAC-SHA256(secret, body)>` or
@@ -581,7 +581,10 @@ async fn handle_gitlab_merge_request(
     let Ok(payload) = serde_json::from_slice::<serde_json::Value>(body) else {
         return Ok((
             StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<()>::err("invalid JSON")),
+            Json(ApiResponse::<()>::err(
+                tond_common::code::INVALID_JSON,
+                "invalid JSON",
+            )),
         )
             .into_response());
     };
@@ -1089,7 +1092,10 @@ async fn handle_github_app_pull_request(
     let Ok(payload) = serde_json::from_slice::<serde_json::Value>(body) else {
         return (
             StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<()>::err("invalid JSON")),
+            Json(ApiResponse::<()>::err(
+                tond_common::code::INVALID_JSON,
+                "invalid JSON",
+            )),
         )
             .into_response();
     };
@@ -1806,7 +1812,10 @@ mod tests {
         .await;
         assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
         let body = response_json(bad).await;
-        assert_eq!(body["error"], "invalid or missing webhook signature");
+        assert_eq!(
+            body["error"]["message"],
+            "invalid or missing webhook signature"
+        );
 
         // Even a ping must be signed.
         let ping = call_github(
@@ -1838,7 +1847,7 @@ mod tests {
         .await;
         assert_eq!(first.status(), StatusCode::OK);
         assert_eq!(
-            response_json(first).await["error"],
+            response_json(first).await["message"],
             "auto_deploy not enabled"
         );
 
@@ -1901,7 +1910,10 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response_json(response).await["error"], "branch not watched");
+        assert_eq!(
+            response_json(response).await["message"],
+            "branch not watched"
+        );
     }
 
     #[tokio::test]
@@ -1958,7 +1970,7 @@ mod tests {
         .unwrap_or_else(|err| panic!("gitlab_webhook should return a response: {}", err.0));
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            response_json(response).await["error"],
+            response_json(response).await["message"],
             "auto_deploy not enabled"
         );
     }
@@ -1994,7 +2006,7 @@ mod tests {
         .unwrap_or_else(|err| panic!("gitea_webhook should return a response: {}", err.0));
         assert_eq!(signed.status(), StatusCode::OK);
         assert_eq!(
-            response_json(signed).await["error"],
+            response_json(signed).await["message"],
             "auto_deploy not enabled"
         );
     }
@@ -2029,7 +2041,7 @@ mod tests {
             .unwrap_or_else(|err| panic!("generic_webhook should return a response: {}", err.0));
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(
-                response_json(response).await["error"],
+                response_json(response).await["message"],
                 "auto_deploy not enabled"
             );
         }

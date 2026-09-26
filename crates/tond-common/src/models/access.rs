@@ -6,7 +6,7 @@
 // creator's role at every request. Keeping the role → scope mapping here makes
 // it easy to gate roles later (roles beyond admin are planned as a paid option).
 //
-// The dashboard renders the scope picker from GET /api/tokens/catalog, which
+// The dashboard renders the scope picker from GET /api/v1/tokens/catalog, which
 // serialises `scope_groups()` and `presets()` below, so descriptions live here
 // too.
 
@@ -104,8 +104,25 @@ impl<'de> Deserialize<'de> for Scope {
     }
 }
 
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for Scope {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Scope".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let names: Vec<&str> = Scope::ALL.iter().map(|s| s.as_str()).collect();
+        schemars::json_schema!({
+            "type": "string",
+            "enum": names,
+            "description": "A permission scope, e.g. `apps:deploy` (GET /api/v1/tokens/catalog describes each)."
+        })
+    }
+}
+
 /// How scopes are grouped in the token form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ScopeGroup {
     Apps,
@@ -229,6 +246,7 @@ impl<'de> Deserialize<'de> for ScopeSet {
 
 /// A user's role. The first (setup) user is an admin, who is the owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
     /// Everything, including users, tokens and server settings.
@@ -334,6 +352,7 @@ const READ_ONLY: &[Scope] = &[
 /// What a token is for. Agent tokens (AI agents, bots) must expire and can
 /// never hold admin scopes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum TokenKind {
     Personal,
@@ -396,6 +415,7 @@ impl fmt::Display for TokenKind {
 
 /// A named starting point for a token's scopes.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TokenPreset {
     pub id: &'static str,
     pub label: &'static str,
@@ -446,8 +466,9 @@ pub fn preset_scopes(id: &str) -> Option<ScopeSet> {
         .map(|p| p.scopes.into_iter().collect())
 }
 
-/// Scope catalog served to the dashboard (GET /api/tokens/catalog).
+/// Scope catalog served to the dashboard (GET /api/v1/tokens/catalog).
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ScopeCatalog {
     pub groups: Vec<ScopeGroupInfo>,
     pub presets: Vec<TokenPreset>,
@@ -457,6 +478,7 @@ pub struct ScopeCatalog {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ScopeGroupInfo {
     pub id: ScopeGroup,
     pub label: &'static str,
@@ -464,12 +486,14 @@ pub struct ScopeGroupInfo {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ScopeInfo {
     pub id: Scope,
     pub description: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RoleInfo {
     pub id: Role,
     pub description: &'static str,
@@ -512,8 +536,9 @@ impl ScopeCatalog {
 
 // ── API token DTOs ──
 
-/// Body of POST /api/tokens.
+/// Body of POST /api/v1/tokens.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreateTokenRequest {
     pub name: String,
     pub kind: Option<TokenKind>,
@@ -539,6 +564,7 @@ pub struct CreateTokenRequest {
 
 /// An API token as listed (never includes the secret).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TokenResponse {
     pub id: String,
     pub name: String,
@@ -559,8 +585,9 @@ pub struct TokenResponse {
     pub created_at: String,
 }
 
-/// Response of POST /api/tokens: the token plus its secret, shown once.
+/// Response of POST /api/v1/tokens: the token plus its secret, shown once.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreatedTokenResponse {
     pub token: TokenResponse,
     pub secret: String,

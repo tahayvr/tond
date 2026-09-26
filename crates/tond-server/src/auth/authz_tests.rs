@@ -64,11 +64,20 @@ async fn test_state() -> AppState {
 
 fn router(state: AppState, peer: &str) -> Router {
     Router::new()
-        .route("/api/apps", get(handlers::list_apps))
-        .route("/api/apps/{id}", get(handlers::get_app))
-        .route("/api/projects/{id}", get(handlers::projects::get_project))
-        .route("/api/databases", get(handlers::databases::list_databases))
-        .route("/api/audit-log", get(handlers::audit_log::list_audit_log))
+        .route("/api/v1/apps", get(handlers::list_apps))
+        .route("/api/v1/apps/{id}", get(handlers::get_app))
+        .route(
+            "/api/v1/projects/{id}",
+            get(handlers::projects::get_project),
+        )
+        .route(
+            "/api/v1/databases",
+            get(handlers::databases::list_databases),
+        )
+        .route(
+            "/api/v1/audit-log",
+            get(handlers::audit_log::list_audit_log),
+        )
         .route("/metrics", get(handlers::system_self::metrics))
         .with_state(state)
         .layer(Extension(ConnectInfo(
@@ -121,13 +130,13 @@ async fn missing_scopes_get_403_scope_denied() {
     let app = router(state.clone(), "127.0.0.1:1234");
     let (secret, _) = token(&state, req("reader", &["apps:read"])).await;
 
-    let (status, _) = call(&app, "/api/apps", &secret).await;
+    let (status, _) = call(&app, "/api/v1/apps", &secret).await;
     assert_eq!(status, StatusCode::OK);
-    let (status, body) = call(&app, "/api/databases", &secret).await;
+    let (status, body) = call(&app, "/api/v1/databases", &secret).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(body["code"], "SCOPE_DENIED");
+    assert_eq!(body["error"]["code"], "SCOPE_DENIED");
     assert!(
-        body["error"]
+        body["error"]["message"]
             .as_str()
             .unwrap_or_default()
             .contains("db:read")
@@ -147,7 +156,7 @@ async fn resource_filters_limit_tokens_to_their_apps() {
     )
     .await;
 
-    let (status, body) = call(&app, "/api/apps", &secret).await;
+    let (status, body) = call(&app, "/api/v1/apps", &secret).await;
     assert_eq!(status, StatusCode::OK);
     let names: Vec<&str> = body["data"]
         .as_array()
@@ -155,26 +164,26 @@ async fn resource_filters_limit_tokens_to_their_apps() {
         .unwrap_or_default();
     assert_eq!(names, vec!["web"], "the list only shows allowed apps");
 
-    let (status, _) = call(&app, "/api/apps/web", &secret).await;
+    let (status, _) = call(&app, "/api/v1/apps/web", &secret).await;
     assert_eq!(status, StatusCode::OK, "by name");
-    let (status, _) = call(&app, "/api/apps/app-1", &secret).await;
+    let (status, _) = call(&app, "/api/v1/apps/app-1", &secret).await;
     assert_eq!(status, StatusCode::OK, "by id");
-    let (status, body) = call(&app, "/api/apps/api", &secret).await;
+    let (status, body) = call(&app, "/api/v1/apps/api", &secret).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(body["code"], "RESOURCE_DENIED");
-    let (status, body) = call(&app, "/api/apps/does-not-exist", &secret).await;
+    assert_eq!(body["error"]["code"], "RESOURCE_DENIED");
+    let (status, body) = call(&app, "/api/v1/apps/does-not-exist", &secret).await;
     assert_eq!(
-        (status, body["code"].as_str()),
+        (status, body["error"]["code"].as_str()),
         (StatusCode::FORBIDDEN, Some("RESOURCE_DENIED")),
         "unknown apps look the same as foreign ones"
     );
-    let (status, body) = call(&app, "/api/databases", &secret).await;
+    let (status, body) = call(&app, "/api/v1/databases", &secret).await;
     assert_eq!(
-        (status, body["code"].as_str()),
+        (status, body["error"]["code"].as_str()),
         (StatusCode::FORBIDDEN, Some("RESOURCE_DENIED")),
         "routes outside the filter are refused even with the scope"
     );
-    let (status, _) = call(&app, "/api/audit-log", &secret).await;
+    let (status, _) = call(&app, "/api/v1/audit-log", &secret).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
@@ -190,13 +199,16 @@ async fn project_filters_cover_the_projects_apps() {
         },
     )
     .await;
-    assert_eq!(call(&app, "/api/apps/api", &secret).await.0, StatusCode::OK);
     assert_eq!(
-        call(&app, "/api/projects/shop", &secret).await.0,
+        call(&app, "/api/v1/apps/api", &secret).await.0,
         StatusCode::OK
     );
     assert_eq!(
-        call(&app, "/api/apps/web", &secret).await.0,
+        call(&app, "/api/v1/projects/shop", &secret).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&app, "/api/v1/apps/web", &secret).await.0,
         StatusCode::FORBIDDEN
     );
 }
@@ -209,9 +221,9 @@ async fn revoked_and_expired_tokens_get_401() {
     tokens::revoke_token(&state.db, &id)
         .await
         .unwrap_or_else(|err| panic!("revoke: {err}"));
-    let (status, body) = call(&app, "/api/apps", &secret).await;
+    let (status, body) = call(&app, "/api/v1/apps", &secret).await;
     assert_eq!(
-        (status, body["code"].as_str()),
+        (status, body["error"]["code"].as_str()),
         (StatusCode::UNAUTHORIZED, Some("TOKEN_REVOKED"))
     );
 
@@ -221,9 +233,9 @@ async fn revoked_and_expired_tokens_get_401() {
         .execute(&state.db)
         .await
         .unwrap_or_else(|err| panic!("expire: {err}"));
-    let (status, body) = call(&app, "/api/apps", &secret).await;
+    let (status, body) = call(&app, "/api/v1/apps", &secret).await;
     assert_eq!(
-        (status, body["code"].as_str()),
+        (status, body["error"]["code"].as_str()),
         (StatusCode::UNAUTHORIZED, Some("TOKEN_EXPIRED"))
     );
 }
@@ -240,11 +252,14 @@ async fn allowed_ips_are_checked_against_the_client_address() {
     )
     .await;
     let inside = router(state.clone(), "203.0.113.50:4000");
-    assert_eq!(call(&inside, "/api/apps", &secret).await.0, StatusCode::OK);
-    let outside = router(state.clone(), "198.51.100.7:4000");
-    let (status, body) = call(&outside, "/api/apps", &secret).await;
     assert_eq!(
-        (status, body["code"].as_str()),
+        call(&inside, "/api/v1/apps", &secret).await.0,
+        StatusCode::OK
+    );
+    let outside = router(state.clone(), "198.51.100.7:4000");
+    let (status, body) = call(&outside, "/api/v1/apps", &secret).await;
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
         (StatusCode::FORBIDDEN, Some("IP_NOT_ALLOWED"))
     );
 
@@ -287,7 +302,7 @@ async fn prometheus_scrapes_metrics_over_tcp_with_a_metrics_read_token() {
 
     let (status, body) = call(&app, "/metrics", &other).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(body["code"], "SCOPE_DENIED");
+    assert_eq!(body["error"]["code"], "SCOPE_DENIED");
 
     let anonymous = app
         .clone()

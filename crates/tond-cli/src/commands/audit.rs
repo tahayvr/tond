@@ -7,6 +7,7 @@ use anyhow::{Result, bail};
 use clap::Subcommand;
 
 use crate::client::TondClient;
+use crate::output::{Output, outln};
 
 #[derive(Subcommand)]
 pub enum AuditAction {
@@ -29,18 +30,20 @@ pub enum AuditAction {
     },
 }
 
-pub async fn handle(client: &TondClient, action: AuditAction) -> Result<()> {
+pub async fn handle(client: &TondClient, out: &Output, action: AuditAction) -> Result<()> {
     match action {
         AuditAction::Verify => {
             let report = client.verify_audit_log().await?;
+            out.json(&report)?;
             if report.ok {
                 let range = match (report.first_seq, report.last_seq) {
                     (Some(a), Some(b)) => format!("entries #{a}–#{b}"),
                     _ => "no entries".to_string(),
                 };
-                println!("Audit log OK: {} checked ({range}).", report.checked);
+                outln!(out, "Audit log OK: {} checked ({range}).", report.checked);
                 if report.checkpoint_seq > 0 {
-                    println!(
+                    outln!(
+                        out,
                         "Entries up to #{} were removed by retention; the chain continues from that checkpoint.",
                         report.checkpoint_seq
                     );
@@ -69,13 +72,15 @@ pub async fn handle(client: &TondClient, action: AuditAction) -> Result<()> {
                 query.push(("action", a));
             }
             let page = client.list_audit_log(&query).await?;
+            out.json(&page)?;
             for e in page.entries {
                 let resource = match (&e.resource_type, &e.resource_name) {
                     (Some(t), Some(n)) => format!(" {t}:{n}"),
                     (Some(t), None) => format!(" {t}"),
                     _ => String::new(),
                 };
-                println!(
+                outln!(
+                    out,
                     "#{:<6} {}  {:<24} {}{}{}{}",
                     e.seq,
                     e.created_at,

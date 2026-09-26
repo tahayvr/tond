@@ -20,6 +20,7 @@ fn default_upload_max_bytes() -> u64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ServerSettings {
     /// A human-readable name for this Tond server instance (e.g. "My VPS").
     #[serde(default = "default_server_name")]
@@ -90,9 +91,10 @@ pub struct SettingRow {
     pub value: String,
 }
 
-/// PUT /api/settings request body — all fields are optional so the caller
+/// PUT /api/v1/settings request body — all fields are optional so the caller
 /// can update only the keys they care about.
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateSettingsRequest {
     pub server_name: Option<String>,
     pub dashboard_domain: Option<String>,
@@ -111,10 +113,11 @@ pub struct UpdateSettingsRequest {
 //
 // Each retention rule is one row in the `settings` table. The janitor
 // (tond-server janitor.rs) reads them every pass; the dashboard edits them
-// through GET/PUT /api/settings/retention within these bounds.
+// through GET/PUT /api/v1/settings/retention within these bounds.
 
 /// One retention setting: its settings key, default and accepted range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RetentionRule {
     pub key: &'static str,
     pub default: i64,
@@ -215,8 +218,9 @@ pub fn retention_rule(key: &str) -> Option<&'static RetentionRule> {
     RETENTION_RULES.iter().find(|r| r.key == key)
 }
 
-/// A retention setting with its current value (GET /api/settings/retention).
+/// A retention setting with its current value (GET /api/v1/settings/retention).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RetentionField {
     pub key: String,
     pub value: i64,
@@ -228,6 +232,7 @@ pub struct RetentionField {
 
 /// Size of one table (its indexes included).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TableSize {
     pub name: String,
     pub bytes: u64,
@@ -235,6 +240,7 @@ pub struct TableSize {
 
 /// How big the database is and where the space goes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DatabaseSize {
     /// tond.db on disk.
     pub file_bytes: u64,
@@ -248,8 +254,9 @@ pub struct DatabaseSize {
     pub measured_at: String,
 }
 
-/// GET /api/settings/retention.
+/// GET /api/v1/settings/retention.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RetentionResponse {
     pub fields: Vec<RetentionField>,
     pub database: Option<DatabaseSize>,

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 /// DB row for the `gitlab_tokens` table.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct GitLabToken {
     pub id: String,
     pub name: String,
@@ -21,6 +22,7 @@ pub struct GitLabToken {
 
 /// API response for a stored GitLab token (PAT value never returned).
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct GitLabTokenResponse {
     pub id: String,
     pub name: String,
@@ -41,8 +43,9 @@ impl From<GitLabToken> for GitLabTokenResponse {
     }
 }
 
-/// POST /api/gitlab-tokens — store a new PAT
+/// POST /api/v1/gitlab-tokens — store a new PAT
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreateGitLabTokenRequest {
     pub name: String,
     pub token: String,
@@ -54,15 +57,17 @@ fn default_gitlab_url() -> String {
     "https://gitlab.com".to_string()
 }
 
-/// PUT /api/apps/{id}/gitlab-token — link or unlink a GitLab token from an app
+/// PUT /api/v1/apps/{id}/gitlab-token — link or unlink a GitLab token from an app
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SetGitLabTokenRequest {
     /// GitLab token ID to link. `null` = detach.
     pub gitlab_token_id: Option<String>,
 }
 
-/// Response for `GET /api/gitlab-tokens/{id}/repos` — a single GitLab project entry.
+/// Response for `GET /api/v1/gitlab-tokens/{id}/repos` — a single GitLab project entry.
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct GitLabRepoResponse {
     pub id: i64,
     pub path_with_namespace: String,
@@ -73,8 +78,9 @@ pub struct GitLabRepoResponse {
     pub default_branch: Option<String>,
 }
 
-/// Response for `GET /api/gitlab-tokens/{id}/repos/{project_id}/branches` — one branch.
+/// Response for `GET /api/v1/gitlab-tokens/{id}/repos/{project_id}/branches` — one branch.
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct GitLabBranchResponse {
     pub name: String,
 }

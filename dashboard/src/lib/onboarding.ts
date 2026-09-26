@@ -1,4 +1,4 @@
-// First-run checklist built from /api/onboarding/status and the signed-in user.
+// First-run checklist built from /api/v1/onboarding/status and the signed-in user.
 
 import type { OnboardingStatus } from './api';
 

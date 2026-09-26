@@ -2,7 +2,7 @@
 //
 // Every line written with `deploy::log_deploy` passes through `scrub_for_app`
 // before it is stored, and so does every container log line the API returns
-// or streams (handlers/logs.rs, GET /api/apps/{id}/logs); database container
+// or streams (handlers/logs.rs, GET /api/v1/apps/{id}/logs); database container
 // logs get the same treatment without app secrets (`scrub(line, &[])`):
 //
 //   1. credentials in URLs (`https://user:token@host` → `https://***@host`);

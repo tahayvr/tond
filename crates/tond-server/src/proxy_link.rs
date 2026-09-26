@@ -13,7 +13,7 @@
 //     confirms it routes the new port. This replaced a fixed 3 s sleep;
 //   - receives certificate results (cert events) and stores them — the proxy
 //     opens tond.db read-only — then acks them;
-//   - asks for the proxy's own stats for GET /api/system/self;
+//   - asks for the proxy's own stats for GET /api/v1/system/self;
 //   - reads its per-route request counters on the metrics tick (`traffic`).
 //
 // When the proxy is not running there is nothing to wait for: it loads the

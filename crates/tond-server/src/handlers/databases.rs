@@ -6,16 +6,16 @@
 // communication.
 //
 // Routes (all require RateLimit + an Authz scope, see each handler):
-//   GET    /api/databases                         — list all managed databases
-//   POST   /api/databases                         — create and start a new database container
-//   GET    /api/databases/{id}                    — get database details + connection strings
-//   PATCH  /api/databases/{id}                    — update custom URL / image overrides
-//   DELETE /api/databases/{id}                    — stop+remove container, delete row
-//   POST   /api/databases/{id}/stop               — stop container
-//   POST   /api/databases/{id}/start              — start container (existing container)
-//   POST   /api/databases/{id}/redeploy           — recreate container (picks up custom_image)
-//   PATCH  /api/databases/{id}/credentials        — change passwords inside the running database
-//   GET    /api/databases/{id}/credentials        — reveal passwords + connection strings (admin, audited)
+//   GET    /api/v1/databases                         — list all managed databases
+//   POST   /api/v1/databases                         — create and start a new database container
+//   GET    /api/v1/databases/{id}                    — get database details + connection strings
+//   PATCH  /api/v1/databases/{id}                    — update custom URL / image overrides
+//   DELETE /api/v1/databases/{id}                    — stop+remove container, delete row
+//   POST   /api/v1/databases/{id}/stop               — stop container
+//   POST   /api/v1/databases/{id}/start              — start container (existing container)
+//   POST   /api/v1/databases/{id}/redeploy           — recreate container (picks up custom_image)
+//   PATCH  /api/v1/databases/{id}/credentials        — change passwords inside the running database
+//   GET    /api/v1/databases/{id}/credentials        — reveal passwords + connection strings (admin, audited)
 //
 // Secrets at rest: passwords and connection-string overrides are stored
 // encrypted (`secrets::seal_database`); `fetch_db` returns them decrypted for
@@ -95,7 +95,7 @@ pub async fn get_database(
 // write-only (`build_detail` masks connection strings) and readable only
 // through the audited `reveal_database_credentials` (db:credentials).
 
-/// GET /api/databases/{id}/credentials — the plaintext passwords and
+/// GET /api/v1/databases/{id}/credentials — the plaintext passwords and
 /// connection strings, for copying into an app or a client. Needs
 /// db:credentials; every reveal is audit-logged.
 pub async fn reveal_database_credentials(

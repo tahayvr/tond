@@ -704,7 +704,7 @@
 			{#if tab === 'logs'}
 				<div class="mt-4">
 					<StreamLogViewer
-						wsUrl="/api/databases/{db.id}/logs/stream"
+						wsUrl="/api/v1/databases/{db.id}/logs/stream"
 						downloadName="{db.name}-logs"
 						label="{db.name} logs"
 						showPrefix={false}

@@ -33,6 +33,7 @@ pub struct StorageProvider {
 /// `endpoint` is None for real AWS (uses the standard regional endpoint).
 /// `secret_access_key_enc` is AES-GCM encrypted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct S3Config {
     /// Custom endpoint URL, e.g. "https://<account>.r2.cloudflarestorage.com".
     /// Leave None for real AWS S3.
@@ -49,6 +50,7 @@ pub struct S3Config {
 
 /// Strongly-typed config parsed from the `config` JSON column.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StorageProviderConfig {
     S3(S3Config),
@@ -70,6 +72,7 @@ impl StorageProviderConfig {
 /// `secret_access_key_enc` is intentionally omitted — the client must send a
 /// new value to update the secret.
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct StorageProviderResponse {
     pub id: String,
     pub name: String,
@@ -82,8 +85,9 @@ pub struct StorageProviderResponse {
 
 // ── Request bodies ───────────────────────────────────────────────────────────
 
-/// POST /api/storage-providers
+/// POST /api/v1/storage-providers
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreateStorageProviderRequest {
     pub name: String,
     /// "s3" (only supported kind for now)
@@ -93,8 +97,9 @@ pub struct CreateStorageProviderRequest {
     pub config: serde_json::Value,
 }
 
-/// PATCH /api/storage-providers/:id — all fields optional
+/// PATCH /api/v1/storage-providers/:id — all fields optional
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateStorageProviderRequest {
     pub name: Option<String>,
     /// Partial config update. Include `secret_access_key` only if rotating.

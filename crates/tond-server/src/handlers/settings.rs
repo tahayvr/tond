@@ -1,11 +1,11 @@
-// handlers/settings.rs — GET and PUT /api/settings
+// handlers/settings.rs — GET and PUT /api/v1/settings
 //
 // Settings are held in memory in AppState.settings (Arc<RwLock<ServerSettings>>)
 // and persisted to the `settings` table so that tond-proxy (a separate process)
 // can read them from the DB on restart.
 //
-//   get_settings()    GET  /api/settings — return a snapshot of the in-memory settings
-//   update_settings() PUT  /api/settings — patch one or more keys; write-through to DB
+//   get_settings()    GET  /api/v1/settings — return a snapshot of the in-memory settings
+//   update_settings() PUT  /api/v1/settings — patch one or more keys; write-through to DB
 //
 // upload_max_bytes caps uploaded source archives (see upload.rs); it must be
 // between 1 MiB and 64 GiB.
@@ -58,7 +58,7 @@ async fn queue_dashboard_certificate(
 }
 
 fn invalid(msg: String) -> axum::response::Response {
-    (StatusCode::BAD_REQUEST, Json(ApiResponse::<()>::err(msg))).into_response()
+    crate::error::AppError(tond_common::TondError::InvalidInput(msg)).into_response()
 }
 
 // ── Get Settings ──
@@ -175,11 +175,7 @@ pub async fn update_settings(
         .await;
 
         if let Err(e) = result {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::<()>::err(e.to_string())),
-            )
-                .into_response();
+            return crate::error::AppError(e.into()).into_response();
         }
     }
 
