@@ -143,7 +143,7 @@ choose_apps_domain() {
     fi
 }
 
-mark_pass() { printf"%b✓%b %s\n" "$GREEN" "$NC" "$1"; }
+mark_pass() { printf "%b✓%b %s\n" "$GREEN" "$NC" "$1"; }
 mark_warn() { printf "%b!%b %s\n" "$YELLOW" "$NC" "$1"; }
 mark_fail() { printf "%b✗%b %s\n" "$RED" "$NC" "$1"; }
 

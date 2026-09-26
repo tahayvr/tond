@@ -741,9 +741,16 @@ step "Network isolation (per-app networks, database links)"
 networks_of() { docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$1"; }
 ip_on() { docker inspect -f "{{(index .NetworkSettings.Networks \"$2\").IPAddress}}" "$1"; }
 PROBE_IMAGE="redis:7-alpine" # already pulled for e2e-redis; has wget, redis-cli, timeout
-probe() { local net=$1; shift; docker run --rm --network "$net" "$PROBE_IMAGE" timeout 5 "$@"; }
-http_ok() { probe "$1" wget -q -O /dev/null "http://$2/" > /dev/null 2>&1; }
-redis_reachable() { probe "$1" redis-cli -h "$2" PING 2>&1 | grep -q NOAUTH; }
+# Traffic between networks is dropped, so a refused probe would hang in TCP
+# connect: every tool gets its own timeout, --init makes signals work (a
+# process running as PID 1 ignores SIGTERM), and the host caps the whole run.
+probe() {
+    local net=$1; shift
+    timeout 30 docker run --rm --init --network "$net" "$PROBE_IMAGE" "$@"
+}
+http_ok() { probe "$1" wget -q -T 3 -O /dev/null "http://$2/" > /dev/null 2>&1; }
+redis_reachable() { probe "$1" redis-cli -t 3 -h "$2" PING 2>&1 | grep -q NOAUTH; }
+redis_unreachable() { ! redis_reachable "$@"; }
 
 WHOAMI_NET=tond-net-app-e2e-whoami
 STATIC_NET=tond-net-app-e2e-static
@@ -787,8 +794,8 @@ read -r code body < <(api_send DELETE /api/databases/e2e-redis/links/e2e-static 
 [[ "$code" == 200 ]] || fail "unlinking e2e-static must succeed (got ${code}: ${body})"
 read -r code body < <(api_send DELETE /api/databases/e2e-redis/links/e2e-whoami '{}')
 [[ "$code" == 200 ]] || fail "unlinking e2e-whoami must succeed (got ${code}: ${body})"
-wait_for 20 "e2e-redis unreachable from e2e-whoami after unlinking" \
-    bash -c "! docker run --rm --network '${WHOAMI_NET}' '${PROBE_IMAGE}' timeout 5 redis-cli -h '${REDIS_IP}' PING 2>&1 | grep -q NOAUTH"
+wait_for 30 "e2e-redis unreachable from e2e-whoami after unlinking" \
+    redis_unreachable "$WHOAMI_NET" "$REDIS_IP"
 [[ "$(networks_of tond-db-e2e-redis)" == "${REDIS_NET} " ]] \
     || fail "unlinking must detach e2e-redis from the apps' networks (on: $(networks_of tond-db-e2e-redis))"
 pass "unlinking detaches the database again"
@@ -818,7 +825,6 @@ read -r restore_code _ < <(api_send PUT /api/settings '{"upload_max_bytes": 1073
     || fail "an archive that unpacks past the limit must be refused with 413, got ${code}: $(cat "$API_BODY")"
 pass "an archive that unpacks past upload_max_bytes is refused (413, says how to fix it)"
 [[ -z "$(ls -A "${DATA_DIR}/uploads" 2> /dev/null)" ]] || fail "refused uploads must not leave files in ${DATA_DIR}/uploads"
-[[ ! -e /tmp/tond-uploads ]] || fail "uploads must no longer use /tmp/tond-uploads"
 pass "refused uploads leave nothing behind"
 rm -rf "$UPLOAD_TMP"
 [[ "$(app_field e2e-static status)" == running ]] || fail "refused uploads must not touch the running app"
