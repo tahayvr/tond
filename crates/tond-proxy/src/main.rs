@@ -424,8 +424,11 @@ impl TondProxy {
         };
 
         let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            // Background workers (readiness 'none') serve nothing: never routed,
+            // even if a domain lingers on the row.
             "SELECT name, domain, host_port FROM apps
-             WHERE status = 'running' AND domain IS NOT NULL AND host_port IS NOT NULL",
+             WHERE status = 'running' AND domain IS NOT NULL AND host_port IS NOT NULL
+               AND readiness != 'none'",
         )
         .fetch_all(&pool)
         .await?;
@@ -937,7 +940,8 @@ mod tests {
                 domain TEXT,
                 container_port INTEGER NOT NULL DEFAULT 3000,
                 status TEXT NOT NULL DEFAULT 'pending',
-                host_port INTEGER
+                host_port INTEGER,
+                readiness TEXT NOT NULL DEFAULT 'http'
             )",
         )
         .execute(&pool)
@@ -1523,6 +1527,21 @@ mod tests {
         )
         .await;
 
+        insert_app(
+            &pool,
+            "app-worker",
+            "queue-worker",
+            Some("queue-worker.example.com"),
+            "running",
+            3003,
+            Some(4400),
+        )
+        .await;
+        sqlx::query("UPDATE apps SET readiness = 'none' WHERE id = 'app-worker'")
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|err| panic!("failed to mark worker: {err}"));
+
         insert_preview(
             &pool,
             "preview-running",
@@ -1583,6 +1602,10 @@ mod tests {
         assert!(
             !routes.contains_key("worker.example.com"),
             "refresh_routes should ignore apps that are not running"
+        );
+        assert!(
+            !routes.contains_key("queue-worker.example.com"),
+            "background workers are never routed"
         );
         assert!(
             !routes.contains_key("expired-frontend.previews.test"),

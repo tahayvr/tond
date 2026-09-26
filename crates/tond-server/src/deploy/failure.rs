@@ -6,7 +6,7 @@
 // do, and the few log lines that show the problem. It is a pure function so
 // every rule is unit-tested; the deploy pipeline gathers the facts.
 
-use tond_common::{DeployFailure, DeployPhase};
+use tond_common::{DeployFailure, DeployPhase, Readiness};
 
 /// Lines quoted in a failure excerpt.
 const EXCERPT_LINES: usize = 12;
@@ -48,6 +48,8 @@ pub struct FailureContext<'a> {
     pub container_logs: &'a [String],
     pub memory_limit: Option<i64>,
     pub has_registry_credential: bool,
+    /// How the deploy decided readiness.
+    pub readiness: Readiness,
 }
 
 fn failure(
@@ -421,6 +423,30 @@ fn classify_inner(ctx: &FailureContext<'_>) -> DeployFailure {
             return f;
         }
         let timeout = ctx.health_timeout_secs;
+        if ctx.readiness == Readiness::None {
+            // A worker that is still running passed; getting here means the
+            // container vanished (removed outside Tond).
+            return failure(
+                Some(Health),
+                "worker_gone",
+                "The worker's container disappeared while Tond was waiting",
+                "Something removed the container during the deploy. Deploy again.",
+            );
+        }
+        if ctx.readiness == Readiness::Tcp
+            && matches!(probe, ProbeResult::NotListening | ProbeResult::Healthy)
+        {
+            let mut f = failure(
+                Some(Health),
+                "port_not_listening",
+                format!("Nothing accepted connections on port {port} within {timeout}s"),
+                format!(
+                    "Tond expected the service to listen on TCP port {port} inside the container, on 0.0.0.0. Change the app's port if it uses another one. If it doesn't listen at all (a queue consumer, a scheduler), make it a background worker in the Health tab."
+                ),
+            );
+            f.excerpt = tail(ctx.container_logs);
+            return f;
+        }
         return match probe {
             ProbeResult::NotListening | ProbeResult::Healthy => {
                 let mut f = failure(
@@ -428,7 +454,7 @@ fn classify_inner(ctx: &FailureContext<'_>) -> DeployFailure {
                     "port_not_listening",
                     format!("Nothing answered on port {port} within {timeout}s"),
                     format!(
-                        "Tond expected the app to listen on port {port} inside the container. If it uses another port (nginx listens on 80, many Node apps on 3000), change the app's port; make sure the app binds to 0.0.0.0, not localhost."
+                        "Tond expected the app to listen on port {port} inside the container. If it uses another port (nginx listens on 80, many Node apps on 3000), change the app's port; make sure the app binds to 0.0.0.0, not localhost. If it serves no traffic at all (a queue worker), make it a background worker in the Health tab."
                     ),
                 );
                 f.excerpt = tail(ctx.container_logs);
@@ -625,6 +651,35 @@ mod tests {
 
         c.probe = Some(ProbeResult::Timeout);
         assert_eq!(classify(&c).code, "health_check_timeout");
+    }
+
+    #[test]
+    fn tcp_and_worker_failures_speak_their_mode() {
+        let mut c = ctx("not ready", &[]);
+        c.probe = Some(ProbeResult::NotListening);
+        c.readiness = Readiness::Tcp;
+        c.container = Some(ContainerExit {
+            running: true,
+            ..Default::default()
+        });
+        let f = classify(&c);
+        assert_eq!(f.code, "port_not_listening");
+        assert!(f.title.contains("accepted connections"));
+        assert!(f.hint.contains("background worker"));
+
+        // A worker that exits is a crash, like any app.
+        c.readiness = Readiness::None;
+        c.container = Some(ContainerExit {
+            running: false,
+            exit_code: Some(2),
+            oom_killed: false,
+        });
+        assert_eq!(classify(&c).code, "app_crashed");
+        c.container = Some(ContainerExit {
+            running: true,
+            ..Default::default()
+        });
+        assert_eq!(classify(&c).code, "worker_gone");
     }
 
     #[test]

@@ -6,6 +6,10 @@
 //   anyway, so the pull is not wasted) and reports the ports its config
 //   exposes (EXPOSE) plus a PORT environment default, so the wizard can
 //   suggest the right container port instead of a blind 8080.
+//
+//   A failed pull is a soft failure (200 with `unavailable` set): a private
+//   image can't be read before registry credentials are chosen, and the
+//   wizard then asks for the port by hand or reads it again with them.
 
 use std::time::Duration;
 
@@ -40,6 +44,52 @@ pub struct InspectImageResponse {
     pub suggested_port: Option<u16>,
     /// The image had to be pulled for this
     pub pulled: bool,
+    /// Set when the image couldn't be read (a soft failure: the port is then
+    /// entered by hand). Says why and what to do.
+    pub unavailable: Option<String>,
+    /// The registry refused access (or claims no such image): the image may be
+    /// private and need registry credentials.
+    pub needs_credentials: bool,
+}
+
+/// A soft failure's hint: whether credentials may help, and what to say.
+pub fn pull_failure_hint(image: &str, error: &str, had_credentials: bool) -> (bool, String) {
+    let lower = error.to_ascii_lowercase();
+    let denied = [
+        "unauthorized",
+        "denied",
+        "authentication required",
+        "401",
+        "403",
+        "not found",
+        "manifest unknown",
+        "404",
+        "does not exist",
+    ]
+    .iter()
+    .any(|m| lower.contains(m));
+    if denied && !had_credentials {
+        (
+            true,
+            format!(
+                "Tond couldn't read {image}. If it's private, choose registry credentials on the Environment step and Tond reads its port then; otherwise check the name and tag."
+            ),
+        )
+    } else if denied {
+        (
+            true,
+            format!(
+                "The registry refused {image} with the chosen credentials, or it doesn't exist. Check the image name, tag and credentials."
+            ),
+        )
+    } else {
+        (
+            false,
+            format!(
+                "Tond couldn't pull {image} to read its port ({error}). Enter the port by hand."
+            ),
+        )
+    }
 }
 
 /// TCP ports from Docker's `ExposedPorts` keys ("80/tcp", "53/udp", "8080").
@@ -105,21 +155,34 @@ pub async fn inspect_image(
                 .map_err(|e| AppError(TondError::Internal(e.to_string())))?,
             None => None,
         };
-        tokio::time::timeout(
+        let had_credentials = credentials.is_some();
+        let outcome = tokio::time::timeout(
             PULL_TIMEOUT,
             deploy::pull_image(&state.docker, &image, credentials),
         )
-        .await
-        .map_err(|_| {
-            AppError(TondError::InvalidInput(
-                "Pulling the image took too long; set the port by hand".to_string(),
-            ))
-        })?
-        .map_err(|e| {
-            AppError(TondError::InvalidInput(format!(
-                "Couldn't pull {image}: {e}. Check the name and tag; private images need registry credentials."
-            )))
-        })?;
+        .await;
+        let error = match outcome {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(_) => Some("the pull took too long".to_string()),
+        };
+        // Fail softly: the wizard shows the hint and the port is typed by hand
+        // (or read again once credentials are chosen).
+        if let Some(error) = error {
+            let (needs_credentials, hint) = pull_failure_hint(&image, &error, had_credentials);
+            return Ok((
+                StatusCode::OK,
+                Json(ApiResponse::ok(InspectImageResponse {
+                    image,
+                    exposed_ports: Vec::new(),
+                    env_port: None,
+                    suggested_port: None,
+                    pulled: false,
+                    unavailable: Some(hint),
+                    needs_credentials,
+                })),
+            ));
+        }
         pulled = true;
     }
 
@@ -141,6 +204,8 @@ pub async fn inspect_image(
             env_port,
             suggested_port,
             pulled,
+            unavailable: None,
+            needs_credentials: false,
         })),
     ))
 }
@@ -161,6 +226,20 @@ mod tests {
         );
         assert_eq!(env_port(&s(&["PATH=/bin", "PORT=3000"])), Some(3000));
         assert_eq!(env_port(&s(&["PORT=abc"])), None);
+    }
+
+    #[test]
+    fn pull_failures_hint_at_credentials() {
+        let (creds, hint) = pull_failure_hint(
+            "ghcr.io/acme/app:1",
+            "Docker responded with status code 401: unauthorized",
+            false,
+        );
+        assert!(creds && hint.contains("registry credentials on the Environment step"));
+        let (creds, hint) = pull_failure_hint("x", "manifest unknown", true);
+        assert!(creds && hint.contains("chosen credentials"));
+        let (creds, hint) = pull_failure_hint("x", "the pull took too long", false);
+        assert!(!creds && hint.contains("by hand"));
     }
 
     #[test]
