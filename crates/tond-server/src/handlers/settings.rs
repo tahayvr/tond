@@ -6,6 +6,11 @@
 //
 //   get_settings()    GET  /api/settings — return a snapshot of the in-memory settings
 //   update_settings() PUT  /api/settings — patch one or more keys; write-through to DB
+//
+// dashboard_domain and preview_domain are normalized (trimmed, lowercased) and
+// validated together: the preview domain must be a different registrable
+// domain from the dashboard domain (see domains.rs), whichever of the two
+// changes.
 
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use chrono::{Duration, Utc};
@@ -14,6 +19,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::{RateLimit, RequireAuth},
+    domains::{is_valid_hostname, normalize_domain, validate_preview_domain},
     state::AppState,
 };
 
@@ -46,6 +52,10 @@ async fn queue_dashboard_certificate(
     .await;
 }
 
+fn invalid(msg: String) -> axum::response::Response {
+    (StatusCode::BAD_REQUEST, Json(ApiResponse::<()>::err(msg))).into_response()
+}
+
 // ── Get Settings ──
 
 pub async fn get_settings(
@@ -72,8 +82,37 @@ pub async fn update_settings(
         pairs.push(("server_name", v));
     }
 
-    if let Some(v) = req.dashboard_domain {
+    let current = state.settings.read().await.clone();
+    let dashboard_domain = req.dashboard_domain.as_deref().map(normalize_domain);
+    let preview_domain = req.preview_domain.as_deref().map(normalize_domain);
+
+    if let Some(d) = dashboard_domain.as_deref()
+        && !d.is_empty()
+        && !is_valid_hostname(d)
+    {
+        return invalid(format!("'{d}' is not a valid domain name"));
+    }
+
+    // Validate the pair as it will be after this update.
+    let effective_dashboard = dashboard_domain
+        .clone()
+        .unwrap_or_else(|| current.dashboard_domain.clone());
+    let effective_preview = preview_domain
+        .clone()
+        .unwrap_or_else(|| current.preview_domain.clone());
+    if !effective_preview.is_empty()
+        && (dashboard_domain.is_some() || preview_domain.is_some())
+        && let Err(msg) = validate_preview_domain(&effective_preview, &effective_dashboard)
+    {
+        return invalid(msg);
+    }
+
+    if let Some(v) = dashboard_domain {
         pairs.push(("dashboard_domain", v));
+    }
+
+    if let Some(v) = preview_domain {
+        pairs.push(("preview_domain", v));
     }
 
     // Write-through: persist each changed key to the DB first so that
@@ -114,6 +153,7 @@ pub async fn update_settings(
             match key {
                 "server_name" => s.server_name = value,
                 "dashboard_domain" => s.dashboard_domain = value,
+                "preview_domain" => s.preview_domain = value,
                 _ => {}
             }
         }
@@ -170,6 +210,7 @@ mod tests {
             Json(UpdateSettingsRequest {
                 server_name: None,
                 dashboard_domain: Some("dash.example.com".to_string()),
+                preview_domain: None,
             }),
         )
         .await
@@ -202,6 +243,119 @@ mod tests {
             row.2.ends_with("/certs/dash.example.com/key.pem"),
             "queued dashboard certificate should use the standard key path"
         );
+    }
+
+    async fn put(
+        state: &AppState,
+        dashboard_domain: Option<&str>,
+        preview_domain: Option<&str>,
+    ) -> axum::response::Response {
+        update_settings(
+            RateLimit,
+            RequireAuth,
+            State(state.clone()),
+            Json(UpdateSettingsRequest {
+                server_name: None,
+                dashboard_domain: dashboard_domain.map(str::to_string),
+                preview_domain: preview_domain.map(str::to_string),
+            }),
+        )
+        .await
+        .into_response()
+    }
+
+    async fn stored(state: &AppState, key: &str) -> Option<String> {
+        sqlx::query_as::<_, (String,)>("SELECT value FROM settings WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&state.db)
+            .await
+            .unwrap_or_else(|err| panic!("failed to read setting {key}: {err}"))
+            .map(|(v,)| v)
+    }
+
+    #[tokio::test]
+    async fn preview_domain_is_normalized_and_stored_when_cross_site() {
+        let (state, _data_dir) = test_state().await;
+
+        let response = put(
+            &state,
+            Some("dash.example.com"),
+            Some(" Example-Previews.COM. "),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            stored(&state, "preview_domain").await.as_deref(),
+            Some("example-previews.com"),
+            "the preview domain should be persisted normalized for tond-proxy"
+        );
+        assert_eq!(
+            state.settings.read().await.preview_domain,
+            "example-previews.com",
+            "the in-memory settings cache should hold the preview domain"
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_domain_on_the_dashboard_site_is_rejected() {
+        let (state, _data_dir) = test_state().await;
+        assert_eq!(
+            put(&state, Some("dash.example.com"), None).await.status(),
+            StatusCode::OK
+        );
+
+        for preview in [
+            "dash.example.com",
+            "pr.dash.example.com",
+            "previews.example.com",
+            "example.com",
+            "co.uk",
+        ] {
+            assert_eq!(
+                put(&state, None, Some(preview)).await.status(),
+                StatusCode::BAD_REQUEST,
+                "preview domain {preview} must be rejected next to dash.example.com"
+            );
+        }
+        assert_eq!(
+            stored(&state, "preview_domain").await,
+            None,
+            "rejected preview domains must not be persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_domain_change_is_checked_against_the_preview_domain() {
+        let (state, _data_dir) = test_state().await;
+        assert_eq!(
+            put(
+                &state,
+                Some("dash.example.com"),
+                Some("example-previews.com")
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+
+        assert_eq!(
+            put(&state, Some("dash.example-previews.com"), None)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST,
+            "moving the dashboard onto the preview domain's site must be rejected"
+        );
+        assert_eq!(
+            stored(&state, "dashboard_domain").await.as_deref(),
+            Some("dash.example.com")
+        );
+
+        assert_eq!(
+            put(&state, None, Some("")).await.status(),
+            StatusCode::OK,
+            "clearing the preview domain is always allowed"
+        );
+        assert_eq!(state.settings.read().await.preview_domain, "");
     }
 
     #[tokio::test]

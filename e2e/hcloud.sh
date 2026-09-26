@@ -3,12 +3,14 @@ set -euo pipefail
 
 # Run the end-to-end smoke test on a throwaway Hetzner Cloud server.
 #
-# Creates a fresh Ubuntu 24.04 x86 server, copies the bundle + e2e scripts,
+# Creates a fresh Ubuntu 24.04 server (x86 cx23, or ARM cax11 with --arch
+# aarch64), copies the bundle + e2e scripts,
 # runs e2e/run.sh on it, and deletes the server (and its one-off SSH key)
 # afterwards — even when the test fails or the script is interrupted.
 #
 # With the default --acme letsencrypt-staging, apps get real certificates from
-# Let's Encrypt staging for <name>.<ip>.sslip.io — exercising public DNS, the
+# Let's Encrypt staging for <name>.<ip>.sslip.io (previews on <ip>.nip.io, a
+# different site) — exercising public DNS, the
 # cloud network, and HTTP-01 validation from the internet, which the local
 # Pebble runs can't.
 #
@@ -16,8 +18,9 @@ set -euo pipefail
 # from release/package.sh.
 #
 # Usage:
-#   e2e/hcloud.sh [--bundle <dir>] [--acme letsencrypt-staging|pebble|none]
-#                 [--type cx23] [--location nbg1] [--keep]
+#   e2e/hcloud.sh [--arch x86_64|aarch64] [--bundle <dir>]
+#                 [--acme letsencrypt-staging|pebble|none]
+#                 [--type cx23|cax11] [--location nbg1] [--keep]
 #   e2e/hcloud.sh --gc [--max-age-hours 3]
 #
 #   --keep   leave the server running for debugging (prints how to SSH in and
@@ -26,9 +29,10 @@ set -euo pipefail
 #            (a safety net for runs that were killed before cleaning up)
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BUNDLE="${ROOT}/dist/tond-linux-x86_64"
+ARCH="x86_64"
+BUNDLE=""
 ACME="letsencrypt-staging"
-SERVER_TYPE="${HCLOUD_SERVER_TYPE:-cx23}"
+SERVER_TYPE="${HCLOUD_SERVER_TYPE:-}"
 LOCATION="${HCLOUD_LOCATION:-nbg1}"
 KEEP=false
 GC=false
@@ -37,6 +41,7 @@ LABEL="tond-e2e=true"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --arch) ARCH="$2"; shift 2 ;;
         --bundle) BUNDLE="$2"; shift 2 ;;
         --acme) ACME="$2"; shift 2 ;;
         --type) SERVER_TYPE="$2"; shift 2 ;;
@@ -44,10 +49,17 @@ while [[ $# -gt 0 ]]; do
         --keep) KEEP=true; shift ;;
         --gc) GC=true; shift ;;
         --max-age-hours) MAX_AGE_HOURS="$2"; shift 2 ;;
-        -h|--help) sed -n '4,27p' "$0"; exit 0 ;;
+        -h|--help) sed -n '4,29p' "$0"; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
+
+case "$ARCH" in
+    x86_64|amd64) ARCH="x86_64"; SERVER_TYPE="${SERVER_TYPE:-cx23}" ;;
+    aarch64|arm64) ARCH="aarch64"; SERVER_TYPE="${SERVER_TYPE:-cax11}" ;;
+    *) echo "Unsupported --arch: $ARCH" >&2; exit 1 ;;
+esac
+BUNDLE="${BUNDLE:-${ROOT}/dist/tond-linux-${ARCH}}"
 
 command -v hcloud > /dev/null || { echo "hcloud CLI is required" >&2; exit 1; }
 
@@ -125,11 +137,13 @@ COPYFILE_DISABLE=1 tar "${TAR_FLAGS[@]}" -czf "${WORK}/payload.tar.gz" -C "${WOR
 scp "${SSH_OPTS[@]}" "${WORK}/payload.tar.gz" "root@${IP}:/root/payload.tar.gz"
 ssh "${SSH_OPTS[@]}" "root@${IP}" "mkdir -p /root/tond-e2e && tar -xzf /root/payload.tar.gz -C /root/tond-e2e"
 
+# The preview domain must be a different site from the dashboard's.
 case "$ACME" in
-    letsencrypt-staging) BASE_DOMAIN="${IP//./-}.sslip.io"; TARGET_IP="$IP" ;;
-    *) BASE_DOMAIN="tond.test"; TARGET_IP="127.0.0.1" ;;
+    letsencrypt-staging)
+        BASE_DOMAIN="${IP//./-}.sslip.io"; PREVIEW_DOMAIN="${IP//./-}.nip.io"; TARGET_IP="$IP" ;;
+    *) BASE_DOMAIN="tond.test"; PREVIEW_DOMAIN="preview.test"; TARGET_IP="127.0.0.1" ;;
 esac
 
-echo "Running e2e (acme=${ACME}, domains=*.${BASE_DOMAIN})..."
+echo "Running e2e (acme=${ACME}, domains=*.${BASE_DOMAIN}, previews=*.${PREVIEW_DOMAIN})..."
 ssh "${SSH_OPTS[@]}" "root@${IP}" \
-    "/root/tond-e2e/e2e/run.sh --bundle /root/tond-e2e/bundle --acme ${ACME} --base-domain ${BASE_DOMAIN} --ip ${TARGET_IP}"
+    "/root/tond-e2e/e2e/run.sh --bundle /root/tond-e2e/bundle --acme ${ACME} --base-domain ${BASE_DOMAIN} --preview-domain ${PREVIEW_DOMAIN} --ip ${TARGET_IP}"

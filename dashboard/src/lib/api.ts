@@ -456,6 +456,11 @@ export async function verify2FA(code: string): Promise<{ user: User }> {
 export interface ServerSettings {
 	server_name: string;
 	dashboard_domain: string;
+	/**
+	 * Domain previews are served under (`<slug>-<app>.<preview_domain>`). Must be a
+	 * different registrable domain from `dashboard_domain`; empty = previews disabled.
+	 */
+	preview_domain: string;
 }
 
 export interface OnboardingStatus {

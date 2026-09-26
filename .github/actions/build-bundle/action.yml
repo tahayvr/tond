@@ -1,25 +1,45 @@
 name: Build install bundle
-description: Build the Linux binaries and dashboard, then assemble dist/tond-linux-x86_64 with release/package.sh
+description: Build the Linux binaries and dashboard natively for one architecture, then assemble dist/tond-linux-<arch> (+ .tar.gz and .sha256) with release/package.sh
+
+# Actions are pinned by commit SHA (supply-chain hardening); the comment names
+# the tag or branch the SHA was taken from.
 
 inputs:
+  arch:
+    description: Bundle architecture, x86_64 or aarch64. Must match the runner (use ubuntu-24.04-arm for aarch64).
+    default: x86_64
   profile:
     description: Cargo profile for the binaries
     default: fast-release
+  version:
+    description: Written to the bundle's VERSION file (default ci-<short sha>)
+    default: ""
 
 runs:
   using: composite
   steps:
-    - uses: dtolnay/rust-toolchain@stable
+    - name: Check runner architecture
+      shell: bash
+      run: |
+        if [[ "$(uname -m)" != "${{ inputs.arch }}" ]]; then
+          echo "::error::runner is $(uname -m) but arch=${{ inputs.arch }}; use a matching runner (ubuntu-24.04-arm for aarch64)"
+          exit 1
+        fi
 
-    - uses: Swatinem/rust-cache@v2
+    - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       with:
-        key: bundle-${{ inputs.profile }}
+        toolchain: stable
+        targets: ${{ inputs.arch }}-unknown-linux-gnu
 
-    - uses: pnpm/action-setup@v4
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      with:
+        key: bundle-${{ inputs.arch }}-${{ inputs.profile }}
+
+    - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
       with:
         package_json_file: dashboard/package.json
 
-    - uses: actions/setup-node@v6
+    - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
       with:
         node-version: "24"
         cache: pnpm
@@ -27,7 +47,9 @@ runs:
 
     - name: Build binaries
       shell: bash
-      run: cargo build -p tond-server -p tond-proxy -p tond-cli --profile ${{ inputs.profile }} --locked
+      run: |
+        cargo build -p tond-server -p tond-proxy -p tond-cli --locked \
+          --target ${{ inputs.arch }}-unknown-linux-gnu --profile ${{ inputs.profile }}
 
     - name: Build dashboard
       shell: bash
@@ -38,4 +60,9 @@ runs:
 
     - name: Package bundle
       shell: bash
-      run: release/package.sh --bin-dir target/${{ inputs.profile }} --version "ci-${GITHUB_SHA::12}"
+      env:
+        BUNDLE_VERSION: ${{ inputs.version }}
+      run: |
+        release/package.sh --arch ${{ inputs.arch }} \
+          --bin-dir target/${{ inputs.arch }}-unknown-linux-gnu/${{ inputs.profile }} \
+          --version "$(v="${BUNDLE_VERSION:-ci-${GITHUB_SHA::12}}"; echo "${v#v}")"

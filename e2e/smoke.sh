@@ -12,6 +12,9 @@ set -euo pipefail
 #   E2E_BASE_DOMAIN       (required) apps are served at <name>.<base>, e.g. tond.test
 #                         or 203-0-113-7.sslip.io
 #   E2E_DASHBOARD_DOMAIN  dashboard domain passed to install.sh (default: dash.<base>)
+#   E2E_PREVIEW_DOMAIN    preview domain passed to install.sh (e.g. preview.test, a
+#                         different site than the base domain). When unset the
+#                         preview checks are skipped.
 #   E2E_TARGET_IP         IP that the domains resolve to (default: 127.0.0.1)
 #   E2E_CA_FILE           root CA of the ACME server (Pebble / LE staging). When set,
 #                         the test waits for a real certificate and verifies it
@@ -24,6 +27,7 @@ set -euo pipefail
 
 BASE="${E2E_BASE_DOMAIN:?E2E_BASE_DOMAIN is required}"
 DASH="${E2E_DASHBOARD_DOMAIN:-dash.${BASE}}"
+PREVIEW="${E2E_PREVIEW_DOMAIN:-}"
 IP="${E2E_TARGET_IP:-127.0.0.1}"
 CA_FILE="${E2E_CA_FILE:-}"
 FIXTURE_DIR="${E2E_FIXTURE_DIR:-$(cd "$(dirname "$0")" && pwd)/fixtures/static-site}"
@@ -67,6 +71,15 @@ trap diagnostics EXIT
 
 # GET an API path over the CLI's Unix socket (trusted, no credentials).
 api() { curl -sf --unix-socket "$SOCK" "http://localhost$1"; }
+
+# api_send <method> <path> <json>: prints "<status> <body>" (does not fail on 4xx).
+api_send() {
+    curl -s --unix-socket "$SOCK" -X "$1" -H 'Content-Type: application/json' -d "$3" \
+        -w ' %{http_code}' "http://localhost$2" | awk '{ code = $NF; $NF = ""; print code " " $0 }'
+}
+
+# "<mode> <owner> <group>" of a path.
+perms() { stat -c '%a %U %G' "$1"; }
 
 # HTTP status code of an HTTPS request to <domain><path> through tond-proxy.
 # -k: before ACME finishes, the proxy serves a self-signed fallback cert.
@@ -138,6 +151,72 @@ if [[ "$secret_env_state" != "600 root" ]] \
     fail "install.sh must generate TOND_SECRET_KEY into ${SECRET_ENV} (0600 root)"
 fi
 pass "encryption key generated in tond.env (0600 root)"
+
+step "Data directory permissions (tond.db, keys and certs are not world-readable)"
+[[ "$(perms "$DATA_DIR")" == "3770 root tond-proxy" ]] \
+    || fail "${DATA_DIR} must be 3770 root:tond-proxy, got: $(perms "$DATA_DIR")"
+pass "${DATA_DIR} is 3770 root:tond-proxy (setgid + sticky, no access for others)"
+for f in tond.db tond.db-wal tond.db-shm; do
+    [[ -e "${DATA_DIR}/${f}" ]] || continue
+    [[ "$(perms "${DATA_DIR}/${f}")" == "660 root tond-proxy" ]] \
+        || fail "${f} must be 660 root:tond-proxy, got: $(perms "${DATA_DIR}/${f}")"
+done
+pass "tond.db (+ -wal/-shm) is 660 root:tond-proxy"
+world=$(find "$DATA_DIR" -maxdepth 1 -mindepth 1 -perm /o+rwx)
+[[ -z "$world" ]] || fail "top-level entries accessible to others: ${world}"
+for d in keys backups volumes databases builds compose docker-config; do
+    [[ ! -e "${DATA_DIR}/${d}" || "$(perms "${DATA_DIR}/${d}")" == "700 root root" ]] \
+        || fail "${DATA_DIR}/${d} must be 700 root:root, got: $(perms "${DATA_DIR}/${d}")"
+done
+pass "no top-level entry is accessible to others; private subdirectories are 0700 root"
+if runuser -u nobody -- cat "${DATA_DIR}/tond.db" > /dev/null 2>&1; then
+    fail "an unrelated user must not be able to read tond.db"
+fi
+pass "an unrelated user cannot read tond.db"
+
+step "Service sandboxing (tond-proxy unprivileged, both units hardened)"
+PROXY_PID=$(systemctl show -p MainPID --value tond-proxy)
+[[ "$(ps -o user= -p "$PROXY_PID" | tr -d ' ')" == tond-proxy ]] \
+    || fail "tond-proxy must run as the tond-proxy user, got: $(ps -o user= -p "$PROXY_PID")"
+pass "tond-proxy runs as tond-proxy (pid ${PROXY_PID})"
+# CAP_NET_BIND_SERVICE is capability 10 → 0x400; nothing else may be effective.
+cap_eff=$(awk '/^CapEff:/ { print $2 }' "/proc/${PROXY_PID}/status")
+[[ "$cap_eff" == 0000000000000400 ]] || fail "tond-proxy must only hold CAP_NET_BIND_SERVICE, CapEff=${cap_eff}"
+pass "tond-proxy holds only CAP_NET_BIND_SERVICE"
+# Root-only secrets in the shared data dir: the encryption key, the root API
+# key and (until setup completes) the setup token.
+for f in "$SECRET_ENV" "${DATA_DIR}/root-api-key" "${DATA_DIR}/setup-token"; do
+    [[ -e "$f" ]] || continue
+    [[ "$(perms "$f")" == "600 root "* ]] || fail "${f} must be 0600 root, got: $(perms "$f")"
+    if runuser -u tond-proxy -- cat "$f" > /dev/null 2>&1; then
+        fail "tond-proxy must not be able to read ${f}"
+    fi
+done
+if runuser -u tond-proxy -- test -w /var/run/docker.sock; then
+    fail "tond-proxy must not have access to the Docker socket"
+fi
+if runuser -u tond-proxy -- rm -f "$SECRET_ENV" 2> /dev/null || [[ ! -f "$SECRET_ENV" ]]; then
+    fail "tond-proxy must not be able to remove root's files from the data directory"
+fi
+pass "tond-proxy cannot read tond.env, root-api-key or setup-token, remove root's files, or reach Docker"
+# Container runtimes (OrbStack/LXC machines) may ship a drop-in that resets
+# sandboxing directives; there, check the unit's configuration instead of the
+# effective value. Real VMs (CI runners, Hetzner) check the effective value.
+for svc in tond-server tond-proxy; do
+    for prop in NoNewPrivileges=yes PrivateTmp=yes ProtectSystem=strict ProtectHome=yes \
+        RestrictSUIDSGID=yes ProtectKernelModules=yes LockPersonality=yes; do
+        key="${prop%%=*}" want="${prop#*=}"
+        [[ "$(systemctl show -p "$key" --value "$svc")" == "$want" ]] && continue
+        if systemd-detect-virt --container -q \
+            && grep -qE "^${key}=(${want}|true)$" "/etc/systemd/system/${svc}.service"; then
+            echo "  - ${svc}: ${key} is configured but overridden by the container runtime"
+            continue
+        fi
+        fail "${svc}: expected ${prop}, got $(systemctl show -p "$key" "$svc")"
+    done
+done
+[[ "$(systemctl show -p UMask --value tond-proxy)" == 0077 ]] || fail "tond-proxy must run with UMask=0077"
+pass "both units: NoNewPrivileges, PrivateTmp, ProtectSystem=strict, ProtectHome, RestrictSUIDSGID, ...; proxy UMask=0077"
 
 step "Authentication boundaries"
 [[ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3001/api/apps)" == 401 ]] \
@@ -488,6 +567,71 @@ if [[ -n "$CA_FILE" ]]; then
     pass "certificate state (status, retry, last error) recorded for the dashboard"
 else
     echo "  - E2E_CA_FILE not set; skipping certificate verification"
+fi
+# Issued (or self-signed fallback) certificates and the ACME account belong to
+# tond-proxy and are owner-only.
+bad=$(find "${DATA_DIR}/certs" \( -type f ! -perm 600 \) -o \( -type d ! -perm 700 \) -o ! -user tond-proxy)
+[[ -z "$bad" ]] || fail "certs must be tond-proxy-owned 0600 files / 0700 dirs: ${bad}"
+if [[ -e "${DATA_DIR}/acme_account.json" ]]; then
+    [[ "$(stat -c '%a %U' "${DATA_DIR}/acme_account.json")" == "600 tond-proxy" ]] \
+        || fail "acme_account.json must be 600 tond-proxy, got: $(perms "${DATA_DIR}/acme_account.json")"
+fi
+pass "TLS keys and the ACME account key are 0600, owned by tond-proxy"
+
+step "Preview domain isolation"
+if [[ -n "$PREVIEW" ]]; then
+    # Capture first: with pipefail, `tond settings | grep -q` can fail on SIGPIPE.
+    settings_out="$(tond settings)"
+    grep -qE "^preview-domain +${PREVIEW}$" <<< "$settings_out" \
+        || fail "install.sh must set the preview domain to ${PREVIEW}"
+    pass "preview domain ${PREVIEW} configured by install.sh"
+
+    read -r code body < <(api_send PUT /api/settings "{\"preview_domain\": \"previews.${BASE}\"}")
+    [[ "$code" == 400 ]] || fail "a preview domain on the dashboard's site must be rejected (got ${code}: ${body})"
+    pass "a preview domain on the dashboard's site (previews.${BASE}) is rejected"
+
+    read -r code body < <(api_send POST /api/apps/e2e-whoami/preview '{"ttl_hours": 1}')
+    [[ "$code" == 202 ]] || fail "creating a preview must succeed (got ${code}: ${body})"
+    PREVIEW_ID=$(jq -r .data.id <<< "$body")
+    PREVIEW_HOST=$(jq -r .data.subdomain <<< "$body")
+    [[ "$PREVIEW_HOST" == *"-e2e-whoami.${PREVIEW}" ]] || fail "preview host must be under ${PREVIEW}, got: ${PREVIEW_HOST}"
+    wait_for 180 "preview ${PREVIEW_HOST} running" \
+        bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/apps/e2e-whoami/previews | jq -e '.data[] | select(.id == \"${PREVIEW_ID}\" and .status == \"running\")'"
+    wait_for 60 "route for ${PREVIEW_HOST}" \
+        bash -c "curl -sk --resolve '${PREVIEW_HOST}:443:${IP}' 'https://${PREVIEW_HOST}/' | grep -q Hostname:"
+    pass "preview served at https://${PREVIEW_HOST}"
+
+    for host in "$PREVIEW" "dash.${PREVIEW}" "unknown.${PREVIEW}"; do
+        status=$(proxied_status "$host" /api/apps)
+        [[ "$status" == 404 ]] || fail "https://${host}/api/apps must be 404 (dashboard/API never on the preview domain), got ${status}"
+    done
+    pass "the dashboard/API is never served on the preview domain (404)"
+    PREVIEW_ON_DASH="${PREVIEW_HOST%%."${PREVIEW}"}.${DASH}"
+    if curl -sk --resolve "${PREVIEW_ON_DASH}:443:${IP}" "https://${PREVIEW_ON_DASH}/" | grep -q Hostname:; then
+        fail "a preview must not be served under the dashboard domain (${PREVIEW_ON_DASH})"
+    fi
+    pass "the preview is not served under the dashboard domain"
+
+    if [[ -n "$CA_FILE" ]]; then
+        wait_for 240 "a certificate for ${PREVIEW_HOST} signed by ${CA_FILE}" \
+            curl -sf --cacert "$CA_FILE" --resolve "${PREVIEW_HOST}:443:${IP}" "https://${PREVIEW_HOST}/"
+        pass "${PREVIEW_HOST} serves a certificate that verifies against the ACME CA"
+    fi
+
+    read -r code body < <(api_send PUT /api/settings '{"preview_domain": ""}')
+    [[ "$code" == 200 ]] || fail "clearing the preview domain must succeed (got ${code}: ${body})"
+    read -r code body < <(api_send POST /api/apps/e2e-whoami/preview '{}')
+    [[ "$code" == 400 && "$body" == *"preview domain"* ]] \
+        || fail "previews must be refused without a preview domain (got ${code}: ${body})"
+    read -r code body < <(api_send PUT /api/settings "{\"preview_domain\": \"${PREVIEW}\"}")
+    [[ "$code" == 200 ]] || fail "restoring the preview domain must succeed (got ${code}: ${body})"
+    pass "previews are refused with an explanation when no preview domain is set"
+
+    curl -sf --unix-socket "$SOCK" -X DELETE "http://localhost/api/apps/e2e-whoami/previews/${PREVIEW_ID}" > /dev/null \
+        || fail "deleting the preview must succeed"
+    pass "preview deleted"
+else
+    echo "  - E2E_PREVIEW_DOMAIN not set; skipping preview checks"
 fi
 
 step "Managed database"
