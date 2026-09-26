@@ -107,7 +107,7 @@ mod tests {
             .unwrap_or_else(|e| match e {})
     }
 
-    fn header_of<'a>(res: &'a Response, name: header::HeaderName) -> Option<&'a str> {
+    fn header_of(res: &Response, name: header::HeaderName) -> Option<&str> {
         res.headers().get(name).and_then(|v| v.to_str().ok())
     }
 
