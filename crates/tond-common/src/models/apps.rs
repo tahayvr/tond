@@ -40,9 +40,9 @@ pub struct App {
     pub container_id: Option<String>,
     /// Host port that the container is bound to (set after deploy)
     pub host_port: Option<i64>,
-    /// Memory limit in bytes (None = no limit; default 256 MiB)
+    /// Memory limit in bytes (None = the host default cap, 75% of RAM)
     pub memory_limit: Option<i64>,
-    /// CPU limit as nano_cpus (None = no limit; default 0.5 CPU = 500_000_000)
+    /// CPU limit as nano_cpus (None = no limit; 1 CPU = 1_000_000_000)
     pub cpu_limit: Option<i64>,
     /// "building" | "running" | "stopped" | "failed" | "unhealthy"
     pub status: String,
@@ -136,8 +136,10 @@ impl App {
             container_port,
             container_id: None,
             host_port: None,
-            memory_limit: Some(268_435_456), // 256 MiB
-            cpu_limit: Some(500_000_000),    // 0.5 CPU
+            // No explicit caps: containers get the host default (75% of RAM,
+            // docker::default_memory_limit) and may use every CPU.
+            memory_limit: None,
+            cpu_limit: None,
             status: "pending".to_string(),
             env_vars: Some("{}".to_string()),
             health_check_path: None,
@@ -183,9 +185,9 @@ pub struct CreateAppRequest {
     pub domain: Option<String>,
     /// Project to associate this app with
     pub project_id: Option<String>,
-    /// Memory limit in bytes (None = use server default 256 MiB)
+    /// Memory limit in bytes (None = the host default cap, 75% of RAM)
     pub memory_limit: Option<i64>,
-    /// CPU limit as nano_cpus (None = use server default 0.5 CPU)
+    /// CPU limit as nano_cpus (None = no limit)
     pub cpu_limit: Option<i64>,
     /// HTTP path to poll for health checks (e.g. "/health"); None = disabled
     pub health_check_path: Option<String>,
@@ -594,15 +596,10 @@ mod tests {
             "new apps should start in pending status before first deploy"
         );
         assert_eq!(
-            app.memory_limit,
-            Some(268_435_456),
-            "new apps should default to a 256 MiB memory limit"
+            app.memory_limit, None,
+            "new apps have no explicit memory cap (the host default applies)"
         );
-        assert_eq!(
-            app.cpu_limit,
-            Some(500_000_000),
-            "new apps should default to 0.5 CPU"
-        );
+        assert_eq!(app.cpu_limit, None, "new apps may use every CPU");
         assert_eq!(
             app.env_vars.as_deref(),
             Some("{}"),

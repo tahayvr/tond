@@ -1,21 +1,29 @@
 // deploy/mod.rs — deployment orchestration module
 //
-// Splits the original deploy.rs into focused sub-modules:
-//   core.rs  — deploy(), deploy_image(), deploy_preview() and internal helpers
-//   build.rs — all image build helpers (git clone, tbuild, dockerfile, compose)
-//   git.rs   — clone hardening: credentials via env, log redaction, known_hosts
+//   core.rs     — start()/create()/run() (the deployment pipeline),
+//                 deploy_preview() and internal helpers
+//   build.rs    — image build helpers (git clone, tbuild, dockerfile, compose)
+//   git.rs      — clone hardening: credentials via env, log redaction,
+//                 known_hosts; commit and branch listing helpers
+//   progress.rs — phase tracking and log attribution for the active deployment
+//   failure.rs  — classify a failed deployment into a likely cause + fix hint
+//   images.rs   — per-deployment image tags and pruning
 //
-// Public surface (unchanged from the original deploy.rs):
-//   deploy::deploy(state, app, trigger_source)
-//   deploy::deploy_image(state, app, image_tag)
+// Public surface:
+//   deploy::start(state, app, DeployRequest) -> deployment id (runs in background)
+//   deploy::create(..) + deploy::run(..)   — the same, run in the caller's task
 //   deploy::deploy_preview(state, app, preview)
-//   deploy::build_from_dir(state, app, dir)
 
 mod build;
 mod core;
-mod git;
+pub mod failure;
+pub mod git;
 pub mod images;
+pub mod progress;
 
-pub use build::{build_from_dir, compose_project_name, validate_base_dir};
-pub use core::{deploy, deploy_image, deploy_preview};
+pub use build::{compose_project_name, validate_base_dir};
+pub use core::{
+    DeployKind, DeployRequest, create, deploy_preview, fetch_registry_credentials, pull_image, run,
+    start,
+};
 pub use git::{GitHttpAuth, redact_url_credentials};

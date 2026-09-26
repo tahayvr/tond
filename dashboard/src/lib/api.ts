@@ -1,4 +1,4 @@
-import { connectWithRetry, wsUrl } from './reconnecting-socket';
+import { connectWithRetry, wsUrl, type ReconnectingSocket } from './reconnecting-socket';
 
 export interface DeployLog {
 	level: string;
@@ -367,8 +367,9 @@ export async function deleteApp(id: string): Promise<void> {
 	await request(`/apps/${id}`, { method: 'DELETE' });
 }
 
-export async function deployApp(id: string): Promise<void> {
-	await request(`/apps/${id}/deploy`, { method: 'POST' });
+/** Start a deployment; the result carries its id for the live deploy view. */
+export async function deployApp(id: string): Promise<DeployStarted> {
+	return request<DeployStarted>(`/apps/${id}/deploy`, { method: 'POST' });
 }
 
 export async function stopApp(id: string): Promise<void> {
@@ -495,6 +496,14 @@ export async function updateHealth(
 	await request(`/apps/${id}/health`, {
 		method: 'PUT',
 		body: JSON.stringify({ health_check_path, health_check_interval, health_failure_threshold })
+	});
+}
+
+/** Set the port the app listens on inside its container (applies on the next deploy). */
+export async function updateContainerPort(id: string, container_port: number): Promise<App> {
+	return request<App>(`/apps/${id}/port`, {
+		method: 'PUT',
+		body: JSON.stringify({ container_port })
 	});
 }
 
@@ -850,6 +859,11 @@ export interface ServerSettings {
 	 * different registrable domain from `dashboard_domain`; empty = previews disabled.
 	 */
 	preview_domain: string;
+	/**
+	 * Domain apps get an automatic address under (`<app>.<apps_domain>`), when
+	 * the server has the setting; the dashboard domain is used otherwise.
+	 */
+	apps_domain?: string;
 	/** Sessions end after this many hours without a request (1–720, default 12) */
 	session_idle_timeout_hours?: number;
 	/** Sessions end this many days after sign-in (1–365, default 30) */
@@ -890,16 +904,58 @@ export async function updateSettings(data: Partial<ServerSettings>): Promise<Ser
 
 // ── Deployments ──
 
+/** Steps of a deployment, in order ("release" = switch traffic, stop the old container). */
+export type DeployPhase = 'clone' | 'build' | 'start' | 'health' | 'release';
+export type PhaseStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'skipped';
+
+export interface PhaseRecord {
+	phase: DeployPhase;
+	status: PhaseStatus;
+	/** This deployment's flavour of the step, e.g. "Pull image" */
+	label?: string;
+	started_at?: string;
+	finished_at?: string;
+}
+
+/** The likely cause of a failed deployment, with what to do about it. */
+export interface DeployFailure {
+	phase?: DeployPhase;
+	/** e.g. "build_failed", "port_not_listening", "image_pull_denied" */
+	code: string;
+	title: string;
+	hint: string;
+	detail?: string;
+	/** Log lines that show the problem */
+	excerpt?: string[];
+}
+
 export interface Deployment {
 	id: string;
 	app_id: string;
 	image_tag: string | null;
+	/**
+	 * "running" | "succeeded" | "failed"; a build queue may add others (e.g.
+	 * "queued", "superseded") — treat unknown values generically.
+	 */
 	status: string;
+	/** "manual" | "webhook" | "upload" | "rollback" | "cli" | "api" | … */
 	trigger_source: string;
+	/** Who or what triggered it: a user's email, "GitHub push to main", … */
+	trigger_detail?: string | null;
 	has_generated_dockerfile: boolean;
 	started_at: string;
 	finished_at: string | null;
 	created_at: string;
+	duration_secs?: number | null;
+	commit_sha?: string | null;
+	commit_message?: string | null;
+	commit_author?: string | null;
+	/** For rollbacks: the deployment whose image was restored */
+	rollback_of?: string | null;
+	phases?: PhaseRecord[];
+	failure?: DeployFailure | null;
+	/** Position in the build queue while status is "queued" (if the server reports it) */
+	queue_position?: number | null;
 	/** The image was removed from the server to save disk space */
 	image_pruned: boolean;
 	/** This deployment's image is what the app runs now */
@@ -910,8 +966,100 @@ export interface Deployment {
 	rollback_unavailable_reason: string | null;
 }
 
+export interface DeploymentLogLine {
+	level: string;
+	message: string;
+	ts: string;
+}
+
+/** A deployment with its log, as returned by GET …/deployments/{id} and the stream snapshot. */
+export interface DeploymentDetail extends Deployment {
+	logs: DeploymentLogLine[];
+	logs_truncated: boolean;
+	/** Port Tond expects the app to listen on */
+	container_port: number;
+	health_check_path: string | null;
+	source_type: string;
+}
+
+/** 202 body of deploy, rollback and upload requests. */
+export interface DeployStarted {
+	message: string;
+	app_id: string;
+	deployment_id: string;
+	status?: string;
+	queue_position?: number | null;
+}
+
 export async function listDeployments(id: string): Promise<Deployment[]> {
 	return request<Deployment[]>(`/apps/${id}/deployments`);
+}
+
+export async function getDeployment(id: string, deploymentId: string): Promise<DeploymentDetail> {
+	return request<DeploymentDetail>(`/apps/${id}/deployments/${deploymentId}`);
+}
+
+export interface DeploymentStreamCallbacks {
+	/** Full state on connect (and on every reconnect). */
+	onSnapshot: (detail: DeploymentDetail) => void;
+	onLog: (line: DeploymentLogLine) => void;
+	/** The deployment row changed (phase, commit, result). */
+	onDeployment: (deployment: Deployment) => void;
+	/** Connected (again); a snapshot follows. */
+	onOpen?: (reconnected: boolean) => void;
+	/** The connection dropped; it reconnects by itself in `retryInMs`. */
+	onDisconnect?: (retryInMs: number) => void;
+}
+
+/** Statuses after which a deployment no longer changes. */
+const FINISHED_DEPLOYMENT = ['succeeded', 'failed', 'superseded', 'cancelled', 'canceled'];
+
+/**
+ * Live deploy view stream. Reconnects after a drop (each connection starts
+ * with a full snapshot, so nothing is missed) and closes for good once the
+ * deployment has finished. Returns a `close()` function for $effect cleanup.
+ * See handlers/deployments.rs `stream_deployment` for the frames.
+ */
+export function openDeploymentStream(
+	id: string,
+	deploymentId: string,
+	callbacks: DeploymentStreamCallbacks
+): () => void {
+	const socket: ReconnectingSocket = connectWithRetry(
+		() => wsUrl(`${BASE}/apps/${id}/deployments/${deploymentId}/stream`),
+		{
+			onOpen: (reconnected) => callbacks.onOpen?.(reconnected),
+			onDisconnect: (retryInMs) => callbacks.onDisconnect?.(retryInMs),
+			onMessage: (ev) => {
+				let frame: any;
+				try {
+					frame = JSON.parse(ev.data as string);
+				} catch {
+					return;
+				}
+				let status: string | undefined;
+				if (frame.type === 'snapshot') {
+					status = frame.deployment?.status;
+					callbacks.onSnapshot({
+						...frame.deployment,
+						logs: frame.logs ?? [],
+						logs_truncated: !!frame.logs_truncated,
+						container_port: frame.container_port,
+						health_check_path: frame.health_check_path ?? null,
+						source_type: frame.source_type ?? ''
+					});
+				} else if (frame.type === 'log') {
+					callbacks.onLog({ level: frame.level, message: frame.message, ts: frame.ts });
+				} else if (frame.type === 'deployment') {
+					status = frame.deployment?.status;
+					callbacks.onDeployment(frame.deployment);
+				}
+				// Finished: the server closes the socket; don't reconnect.
+				if (status && FINISHED_DEPLOYMENT.includes(status)) socket.close();
+			}
+		}
+	);
+	return () => socket.close();
 }
 
 export async function getDeploymentGeneratedDockerfile(
@@ -928,11 +1076,99 @@ export async function getDeploymentGeneratedDockerfile(
  * Redeploy the exact image of an earlier deployment. Without `deploymentId`
  * the server restores the previous distinct image.
  */
-export async function rollbackApp(id: string, deploymentId?: string): Promise<void> {
-	await request(`/apps/${id}/rollback`, {
+export async function rollbackApp(id: string, deploymentId?: string): Promise<DeployStarted> {
+	return request<DeployStarted>(`/apps/${id}/rollback`, {
 		method: 'POST',
 		...(deploymentId ? { body: JSON.stringify({ deployment_id: deploymentId }) } : {})
 	});
+}
+
+// ── Source inspection (new-app wizard) ──
+
+export interface RemoteBranches {
+	default_branch: string | null;
+	/** Default branch first */
+	branches: string[];
+	truncated: boolean;
+}
+
+/** Branches of a Git repository (http/https URLs only). */
+export async function listRemoteBranches(
+	url: string,
+	opts: { github_app_id?: string; gitlab_token_id?: string } = {}
+): Promise<RemoteBranches> {
+	return request<RemoteBranches>('/git/branches', {
+		method: 'POST',
+		body: JSON.stringify({ url, ...opts })
+	});
+}
+
+export interface ImageInspection {
+	image: string;
+	exposed_ports: number[];
+	env_port: number | null;
+	suggested_port: number | null;
+	pulled: boolean;
+}
+
+/** Ports an image exposes (pulls it first if it isn't on the server yet). */
+export async function inspectImage(
+	image: string,
+	registryCredentialId?: string
+): Promise<ImageInspection> {
+	return request<ImageInspection>('/images/inspect', {
+		method: 'POST',
+		body: JSON.stringify({
+			image,
+			...(registryCredentialId ? { registry_credential_id: registryCredentialId } : {})
+		})
+	});
+}
+
+// ── Domain checks ──
+
+export interface DnsRecord {
+	type: 'A' | 'AAAA';
+	/** Name relative to the zone: "app", "@", "*.apps" */
+	name: string;
+	host: string;
+	value: string;
+}
+
+export type DnsCheckStatus = 'ok' | 'mismatch' | 'missing' | 'inconclusive';
+
+export interface DomainCertificate {
+	status: string;
+	issued_at: string;
+	expires_at: string;
+	last_error: string | null;
+	last_attempt_at: string | null;
+	next_retry_at: string | null;
+	failure_count: number;
+}
+
+export interface DomainCheck {
+	domain: string;
+	zone: string | null;
+	apps_domain: string | null;
+	under_apps_domain: boolean;
+	records: DnsRecord[];
+	wildcard_records: DnsRecord[];
+	server_ips: string[];
+	dns: {
+		status: DnsCheckStatus;
+		resolved: string[];
+		expected: string[];
+		stray: string[];
+		message: string;
+	};
+	certificate: DomainCertificate | null;
+	checked_at: string;
+}
+
+/** Live DNS check: the records to create, what the domain resolves to, and its certificate. */
+export async function checkDomain(domain: string): Promise<DomainCheck> {
+	return request<DomainCheck>(`/domains/check?domain=${encodeURIComponent(domain)}`);
 }
 
 // ── Git Integration ──
