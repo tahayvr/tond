@@ -234,8 +234,14 @@ fn samples_compute_rates_and_sum_compose_services() {
     assert_eq!(second.sample.cpu, 1_500, "hundredths of a percent");
     // ...and each service on its own.
     let per = c.service_samples();
-    assert_eq!(per.get(&("app-2".to_string(), "web".to_string())), Some(&(500, 10_000)));
-    assert_eq!(per.get(&("app-2".to_string(), "db".to_string())), Some(&(1_000, 20_000)));
+    assert_eq!(
+        per.get(&("app-2".to_string(), "web".to_string())),
+        Some(&(500, 10_000))
+    );
+    assert_eq!(
+        per.get(&("app-2".to_string(), "db".to_string())),
+        Some(&(1_000, 20_000))
+    );
     // Both containers read the same (shared) fake netns: 1000 B/s each.
     assert_eq!(second.sample.rx, 2_000);
     assert_eq!(second.sample.tx, 200);

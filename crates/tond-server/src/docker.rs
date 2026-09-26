@@ -594,7 +594,10 @@ pub async fn compose_volumes(
 
 /// Remove the named volumes of a compose project (app deletion).
 pub async fn remove_compose_volumes(docker: &Docker, project_name: &str) {
-    for (name, _) in compose_volumes(docker, project_name).await.unwrap_or_default() {
+    for (name, _) in compose_volumes(docker, project_name)
+        .await
+        .unwrap_or_default()
+    {
         let _ = docker
             .remove_volume(
                 &name,

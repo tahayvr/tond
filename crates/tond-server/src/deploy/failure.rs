@@ -68,6 +68,12 @@ fn failure(
     }
 }
 
+/// The compose service an error names: `service "web" …`.
+fn compose_service_in(err: &str) -> Option<&str> {
+    let rest = err.split_once("service \"")?.1;
+    Some(rest.split_once('"')?.0).filter(|s| !s.is_empty())
+}
+
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     let lower = haystack.to_ascii_lowercase();
     needles.iter().any(|n| lower.contains(n))
@@ -212,6 +218,66 @@ fn classify_inner(ctx: &FailureContext<'_>) -> DeployFailure {
     let recent = ctx.recent_lines;
     let joined_recent = recent.join("\n");
     let port = ctx.container_port;
+
+    // ── Compose apps ──
+    if contains_any(err, &["compose file rejected"]) {
+        return failure(
+            Some(Build),
+            "compose_rejected",
+            "The compose file was rejected",
+            "It uses options that would give containers access to the host. Fix the problems listed below in the compose file, then deploy again.",
+        );
+    }
+    if contains_any(err, &["has no compose file at"]) {
+        return failure(
+            Some(Clone),
+            "compose_file_missing",
+            "The repository has no compose file at that path",
+            "Check the compose file path in the app's settings (for example docker-compose.yml or deploy/compose.yaml) and the branch, then deploy again.",
+        );
+    }
+    if let Some(service) = compose_service_in(err)
+        && contains_any(
+            err,
+            &[
+                "exited",
+                "is unhealthy",
+                "did not answer",
+                "did not become ready",
+            ],
+        )
+    {
+        let (title, hint) = if contains_any(err, &["is unhealthy"]) {
+            (
+                format!("Service {service} failed its healthcheck"),
+                format!(
+                    "Open the logs of {service} to see why its healthcheck fails, or adjust the healthcheck in the compose file."
+                ),
+            )
+        } else if contains_any(err, &["exited"]) {
+            (
+                format!("Service {service} stopped during the deploy"),
+                format!(
+                    "Its container exited. The logs of {service} usually say why (a missing variable, a crash on start)."
+                ),
+            )
+        } else if contains_any(err, &["did not answer"]) {
+            (
+                format!("Service {service} didn't answer on its published port"),
+                format!(
+                    "Make sure {service} listens on the published container port (on 0.0.0.0, not 127.0.0.1), or publish the port it really uses."
+                ),
+            )
+        } else {
+            (
+                format!("Service {service} wasn't ready in time"),
+                "A service kept starting or restarting. Check its logs, or raise the drain timeout if it is just slow to start.".to_string(),
+            )
+        };
+        let mut f = failure(Some(Health), "compose_service_failed", title, hint);
+        f.excerpt = tail(ctx.container_logs);
+        return f;
+    }
 
     // ── Source problems ──
     if contains_any(err, &["no dockerfile was found", "dockerfile not found"]) {
@@ -515,6 +581,49 @@ mod tests {
             health_timeout_secs: 30,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn compose_failures_name_the_service() {
+        let f = classify(&ctx(
+            "Compose file rejected: service \"a\": 'privileged' is not allowed",
+            &[],
+        ));
+        assert_eq!(f.code, "compose_rejected");
+        let logs = lines(&["boot", "Error: DATABASE_URL is not set"]);
+        let f = classify(&FailureContext {
+            container_logs: &logs,
+            ..ctx(
+                "service \"api\" exited with code 1; the compose app did not become ready",
+                &[],
+            )
+        });
+        assert_eq!(f.code, "compose_service_failed");
+        assert_eq!(f.title, "Service api stopped during the deploy");
+        assert!(f.excerpt.iter().any(|l| l.contains("DATABASE_URL")));
+        let f = classify(&ctx(
+            "service \"db\" is unhealthy; the compose app did not become ready",
+            &[],
+        ));
+        assert_eq!(f.title, "Service db failed its healthcheck");
+        let f = classify(&ctx(
+            "service \"web\" did not answer on port 80 within 60s",
+            &[],
+        ));
+        assert!(f.hint.contains("0.0.0.0"), "{}", f.hint);
+        let f = classify(&ctx(
+            "service \"cache\": could not pull redis:9: Failed to pull image: manifest unknown",
+            &[],
+        ));
+        assert!(
+            f.code.starts_with("image_pull"),
+            "pull errors keep their own advice"
+        );
+        let f = classify(&ctx(
+            "the repository has no compose file at deploy/compose.yml: No such file",
+            &[],
+        ));
+        assert_eq!(f.code, "compose_file_missing");
     }
 
     #[test]

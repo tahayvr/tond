@@ -266,7 +266,12 @@ async fn compose_service_tags(state: &AppState, app_name: &str) -> Option<Vec<St
 }
 
 /// Remove the service images of one release. True when none is left.
-async fn remove_compose_release(state: &AppState, tags: &[String], app_name: &str, release: &str) -> bool {
+async fn remove_compose_release(
+    state: &AppState,
+    tags: &[String],
+    app_name: &str,
+    release: &str,
+) -> bool {
     let mut all_gone = true;
     for tag in tags
         .iter()
@@ -274,7 +279,11 @@ async fn remove_compose_release(state: &AppState, tags: &[String], app_name: &st
     {
         match state
             .docker
-            .remove_image(tag, Some(RemoveImageOptionsBuilder::default().build()), None)
+            .remove_image(
+                tag,
+                Some(RemoveImageOptionsBuilder::default().build()),
+                None,
+            )
             .await
         {
             Ok(_)
@@ -313,14 +322,13 @@ async fn prune_compose_images(state: &AppState, app_id: &str, app_name: &str) {
     .fetch_all(&state.db)
     .await
     .unwrap_or_default();
-    let running: Option<String> =
-        sqlx::query_scalar("SELECT container_id FROM apps WHERE id = ?")
-            .bind(app_id)
-            .fetch_optional(&state.db)
-            .await
-            .ok()
-            .flatten()
-            .flatten();
+    let running: Option<String> = sqlx::query_scalar("SELECT container_id FROM apps WHERE id = ?")
+        .bind(app_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .flatten();
     let referenced: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT image_tag FROM deployments WHERE app_id = ? AND image_tag IS NOT NULL",
     )
@@ -360,10 +368,17 @@ async fn prune_compose_images(state: &AppState, app_id: &str, app_name: &str) {
 
 /// Remove every service image of a compose app (app deletion).
 pub async fn remove_compose_images(state: &AppState, app_name: &str) {
-    for tag in compose_service_tags(state, app_name).await.unwrap_or_default() {
+    for tag in compose_service_tags(state, app_name)
+        .await
+        .unwrap_or_default()
+    {
         let _ = state
             .docker
-            .remove_image(&tag, Some(RemoveImageOptionsBuilder::default().force(true).build()), None)
+            .remove_image(
+                &tag,
+                Some(RemoveImageOptionsBuilder::default().force(true).build()),
+                None,
+            )
             .await;
     }
 }

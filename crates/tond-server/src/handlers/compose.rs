@@ -98,7 +98,10 @@ pub(crate) async fn services_response(
                 status: r.status.clone(),
                 health: r.health.clone(),
                 exit_code: r.exit_code,
-                container_id: r.container_id.as_ref().map(|c| c.chars().take(12).collect()),
+                container_id: r
+                    .container_id
+                    .as_ref()
+                    .map(|c| c.chars().take(12).collect()),
                 running_image: r.running_image.clone(),
                 image_digest: r.image_digest.clone(),
                 cpu: usage.map(|u| u.0),
@@ -164,7 +167,9 @@ pub async fn update_service(
             .await?
             .flatten();
             if owner_id != app.id || own_service.is_none() {
-                return Err(invalid(format!("{domain} is already used by the app '{owner}'")));
+                return Err(invalid(format!(
+                    "{domain} is already used by the app '{owner}'"
+                )));
             }
         }
         warnings.extend(warning);
@@ -404,7 +409,9 @@ pub async fn service_logs(
     let lines = log_scrub::scrub_lines_for_app(&state.db, &app.id, lines).await;
     Ok((
         StatusCode::OK,
-        Json(ApiResponse::ok(json!({ "service": service, "lines": lines }))),
+        Json(ApiResponse::ok(
+            json!({ "service": service, "lines": lines }),
+        )),
     ))
 }
 

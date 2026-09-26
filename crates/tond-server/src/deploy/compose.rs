@@ -41,9 +41,9 @@ use super::build::{
     compose_work_dir,
 };
 use super::core::{
-    DeployKind, DeployRequest, HealthFacts, auto_domain, container_exit, fetch_registry_credentials,
-    log_deploy, probe_tcp_until_ready, probe_until_ready, pull_image, resolve_git_source,
-    strip_docker_ts, wait_for_proxy_cutover,
+    DeployKind, DeployRequest, HealthFacts, auto_domain, container_exit,
+    fetch_registry_credentials, log_deploy, probe_tcp_until_ready, probe_until_ready, pull_image,
+    resolve_git_source, strip_docker_ts, wait_for_proxy_cutover,
 };
 use super::failure::ProbeResult;
 use super::queue::{self, DeployCtx};
@@ -93,21 +93,26 @@ async fn fetch_source(
     let work_dir = PathBuf::from(compose_work_dir(&data_dir.to_string_lossy(), &app.name));
     match &req.kind {
         DeployKind::Upload { .. } => {
-            anyhow::bail!("Compose apps can't be deployed from an upload; edit the compose file instead")
+            anyhow::bail!(
+                "Compose apps can't be deployed from an upload; edit the compose file instead"
+            )
         }
         DeployKind::Rollback {
             target_deployment_id,
             ..
         } => {
-            let content: Option<String> =
-                sqlx::query_scalar("SELECT compose_source FROM deployments WHERE id = ? AND app_id = ?")
-                    .bind(target_deployment_id)
-                    .bind(&app.id)
-                    .fetch_optional(&state.db)
-                    .await?
-                    .flatten();
+            let content: Option<String> = sqlx::query_scalar(
+                "SELECT compose_source FROM deployments WHERE id = ? AND app_id = ?",
+            )
+            .bind(target_deployment_id)
+            .bind(&app.id)
+            .fetch_optional(&state.db)
+            .await?
+            .flatten();
             let content = content.ok_or_else(|| {
-                anyhow::anyhow!("This deployment has no recorded compose file, so it can't be restored")
+                anyhow::anyhow!(
+                    "This deployment has no recorded compose file, so it can't be restored"
+                )
             })?;
             let services = deployment_services(&state.db, target_deployment_id).await?;
             for svc in &services {
@@ -137,7 +142,12 @@ async fn fetch_source(
                 content,
                 base_dir: work_dir,
                 checkout: None,
-                reuse: Some(services.into_iter().map(|s| (s.service.clone(), s)).collect()),
+                reuse: Some(
+                    services
+                        .into_iter()
+                        .map(|s| (s.service.clone(), s))
+                        .collect(),
+                ),
             })
         }
         DeployKind::Source => match app.source_url.as_deref().filter(|u| !u.trim().is_empty()) {
@@ -388,9 +398,11 @@ async fn run_with_source(
                 .await
                 .with_context(|| format!("service \"{name}\": could not pull {image}"));
             let pulled = match pulled {
-                Ok(()) => images::tag_image(&state.docker, &super::core::with_default_tag(image), &tag)
-                    .await
-                    .with_context(|| format!("service \"{name}\": could not pin {image}")),
+                Ok(()) => {
+                    images::tag_image(&state.docker, &super::core::with_default_tag(image), &tag)
+                        .await
+                        .with_context(|| format!("service \"{name}\": could not pin {image}"))
+                }
                 Err(e) => Err(e),
             };
             if let Err(e) = pulled {
@@ -469,9 +481,18 @@ async fn run_with_source(
     progress::start(state, &app_id, DeployPhase::Health).await;
     let timeout = (app.drain_timeout.max(1) as u64).max(READY_MIN_SECS);
     facts.timeout_secs = timeout;
-    if let Err(e) =
-        wait_until_ready(state, app, deployment_id, &project, &specs, &publish, timeout, facts, trigger)
-            .await
+    if let Err(e) = wait_until_ready(
+        state,
+        app,
+        deployment_id,
+        &project,
+        &specs,
+        &publish,
+        timeout,
+        facts,
+        trigger,
+    )
+    .await
     {
         let _ = compose::refresh(state, &app_id, &app_name).await;
         return Err(e);
@@ -822,12 +843,26 @@ async fn wait_until_ready(
                 ServiceReadiness::Ready => {
                     if !ready.contains(&spec.name) {
                         ready.push(spec.name.clone());
-                        set_services_status(state, app_id, deployment_id, &[spec.name.as_str()], "healthy").await;
+                        set_services_status(
+                            state,
+                            app_id,
+                            deployment_id,
+                            &[spec.name.as_str()],
+                            "healthy",
+                        )
+                        .await;
                     }
                 }
                 ServiceReadiness::Waiting(why) => waiting.push(why),
                 ServiceReadiness::Failed(why) => {
-                    set_services_status(state, app_id, deployment_id, &[spec.name.as_str()], "failed").await;
+                    set_services_status(
+                        state,
+                        app_id,
+                        deployment_id,
+                        &[spec.name.as_str()],
+                        "failed",
+                    )
+                    .await;
                     if let Some(st) = st {
                         facts.container = container_exit(&state.docker, &st.container_id).await;
                         facts.container_logs = service_logs(state, &st.container_id).await;
@@ -900,7 +935,14 @@ async fn wait_until_ready(
                 "service \"{service}\" did not answer on port {container} within {timeout}s"
             );
         }
-        log_deploy(state, app_id, "info", trigger, &format!("[{service}] Ready")).await?;
+        log_deploy(
+            state,
+            app_id,
+            "info",
+            trigger,
+            &format!("[{service}] Ready"),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -961,7 +1003,10 @@ mod tests {
             judge_service(&plain, Some(&st("restarting", None, None))),
             ServiceReadiness::Waiting(_)
         ));
-        assert!(matches!(judge_service(&plain, None), ServiceReadiness::Waiting(_)));
+        assert!(matches!(
+            judge_service(&plain, None),
+            ServiceReadiness::Waiting(_)
+        ));
         assert!(matches!(
             judge_service(&checked, Some(&st("running", Some("starting"), None))),
             ServiceReadiness::Waiting(_)

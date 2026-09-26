@@ -337,7 +337,10 @@ async fn run() -> Result<()> {
             "/api/apps/{id}/services/{service}/{action}",
             post(handlers::compose::service_action),
         )
-        .route("/api/apps/{id}/compose", put(handlers::compose::update_compose))
+        .route(
+            "/api/apps/{id}/compose",
+            put(handlers::compose::update_compose),
+        )
         .route("/api/apps/{id}/logs", get(handlers::app_logs))
         .route(
             "/api/apps/{id}/logs/stream",

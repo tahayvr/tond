@@ -1446,7 +1446,10 @@ fn probe_outcome(status: Option<u16>, timed_out: bool, require_2xx: bool) -> Pro
 
 /// How the container is doing; `running` is false while Docker restarts a
 /// crashed container.
-pub(super) async fn container_exit(docker: &bollard::Docker, container_id: &str) -> Option<ContainerExit> {
+pub(super) async fn container_exit(
+    docker: &bollard::Docker,
+    container_id: &str,
+) -> Option<ContainerExit> {
     let info = docker.inspect_container(container_id, None).await.ok()?;
     let crashed_before = info.restart_count.unwrap_or(0) > 0;
     let st = info.state?;

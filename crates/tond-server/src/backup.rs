@@ -385,9 +385,7 @@ async fn build_snapshot(
             total_bytes += t;
             compose_volumes_included.push(volume);
         }
-        if !apps_included.contains(app_name)
-            && compose_volume_root(&staging, app_name).exists()
-        {
+        if !apps_included.contains(app_name) && compose_volume_root(&staging, app_name).exists() {
             apps_included.push(app_name.clone());
         }
     }

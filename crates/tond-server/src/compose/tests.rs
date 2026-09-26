@@ -92,7 +92,10 @@ fn web_service_is_the_preferred_one_or_the_one_with_the_port() {
         pick_web_service(&specs, None, 3000),
         Some(("api".into(), 3000))
     );
-    assert_eq!(pick_web_service(&specs, None, 1234), Some(("web".into(), 80)));
+    assert_eq!(
+        pick_web_service(&specs, None, 1234),
+        Some(("web".into(), 80))
+    );
     assert_eq!(
         pick_web_service(&specs, Some("cache"), 80),
         Some(("cache".into(), 6379)),
@@ -173,7 +176,10 @@ fn pin_file_swaps_builds_for_pinned_images_and_publishes_routed_ports() {
         .filter_map(|p| p.as_str().map(str::to_string))
         .collect();
     assert!(ports.contains(&"127.0.0.1:8101:3000".to_string()));
-    assert_eq!(doc["services"]["cache"]["image"].as_str(), Some("tond-shop/cache:abc"));
+    assert_eq!(
+        doc["services"]["cache"]["image"].as_str(),
+        Some("tond-shop/cache:abc")
+    );
     assert!(doc["services"]["cache"]["ports"].is_null());
     assert_eq!(
         doc["services"]["web"]["image"].as_str(),
@@ -259,7 +265,10 @@ async fn syncing_keeps_user_choices_and_drops_services_that_left_the_file() {
         .await
         .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(domains.get("web").map(Vec::len), Some(1));
-    assert!(!domains.contains_key("cache"), "domains of a removed service go too");
+    assert!(
+        !domains.contains_key("cache"),
+        "domains of a removed service go too"
+    );
 
     // Docker reports web running and api missing.
     store_states(

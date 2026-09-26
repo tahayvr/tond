@@ -744,7 +744,10 @@ pub async fn refresh(state: &crate::state::AppState, app_id: &str, app_name: &st
 }
 
 /// Name of the app that uses `domain` (its own domain or a service domain).
-pub async fn domain_owner(db: &sqlx::SqlitePool, domain: &str) -> sqlx::Result<Option<(String, String)>> {
+pub async fn domain_owner(
+    db: &sqlx::SqlitePool,
+    domain: &str,
+) -> sqlx::Result<Option<(String, String)>> {
     sqlx::query_as(
         "SELECT id, name FROM apps WHERE domain = ?
          UNION ALL

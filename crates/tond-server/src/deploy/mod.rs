@@ -25,9 +25,7 @@ pub mod images;
 pub mod progress;
 pub mod queue;
 
-pub use build::{
-    compose_project_name, compose_work_dir_for, validate_base_dir,
-};
+pub use build::{compose_project_name, compose_work_dir_for, validate_base_dir};
 pub use compose::{compose_path_in_repo, deployment_services};
 pub use core::{
     DeployKind, DeployRequest, deploy_preview, fetch_registry_credentials, pull_image, run, start,

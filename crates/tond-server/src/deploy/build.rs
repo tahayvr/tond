@@ -17,7 +17,6 @@ use tond_common::DeployPhase;
 
 use crate::state::AppState;
 
-
 use super::progress;
 
 use super::core::log_deploy;
@@ -65,7 +64,11 @@ pub fn compose_work_dir_for(app_name: &str) -> String {
 /// `docker compose -p <app> -f <file> <args…>` with a cleared environment:
 /// compose interpolates `${VAR}` from its own environment, and tond-server's
 /// holds TOND_SECRET_KEY. Only what docker needs is passed on.
-pub fn compose_command(compose_path: &str, app_name: &str, args: &[&str]) -> tokio::process::Command {
+pub fn compose_command(
+    compose_path: &str,
+    app_name: &str,
+    args: &[&str],
+) -> tokio::process::Command {
     let mut cmd = crate::process::command("docker");
     cmd.env_clear();
     for key in [

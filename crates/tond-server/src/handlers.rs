@@ -372,7 +372,8 @@ pub async fn create_app(
             let specs = crate::compose::service_specs(content)
                 .map_err(|e| AppError(TondError::InvalidInput(e)))?;
             let port = u16::try_from(app.container_port).unwrap_or(80);
-            let web = crate::compose::pick_web_service(&specs, req.compose_service.as_deref(), port);
+            let web =
+                crate::compose::pick_web_service(&specs, req.compose_service.as_deref(), port);
             if web.is_none()
                 && let Some(name) = req.compose_service.as_deref().filter(|n| !n.is_empty())
             {
@@ -768,7 +769,11 @@ async fn compose_control(
     action: &str,
 ) -> Result<(StatusCode, Json<ApiResponse<serde_json::Value>>), AppError> {
     compose::control_all(state, app, action).await?;
-    let status = if action == "stop" { "stopped" } else { "running" };
+    let status = if action == "stop" {
+        "stopped"
+    } else {
+        "running"
+    };
     sqlx::query("UPDATE apps SET status = ?, updated_at = datetime('now') WHERE id = ?")
         .bind(status)
         .bind(&app.id)

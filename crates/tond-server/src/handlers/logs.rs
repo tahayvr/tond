@@ -1143,14 +1143,26 @@ mod tests {
         app.sort_by(|a, b| a.key.cmp(&b.key));
         let keys: Vec<(&str, &str, Option<&str>)> = app
             .iter()
-            .map(|t| (t.key.as_str(), t.container_id.as_str(), t.service.as_deref()))
+            .map(|t| {
+                (
+                    t.key.as_str(),
+                    t.container_id.as_str(),
+                    t.service.as_deref(),
+                )
+            })
             .collect();
         assert_eq!(
             keys,
-            [("a1/cache", "c2", Some("cache")), ("a1/web", "c1", Some("web"))],
+            [
+                ("a1/cache", "c2", Some("cache")),
+                ("a1/web", "c1", Some("web"))
+            ],
             "the release tag in apps.container_id is not a container"
         );
-        assert!(app.iter().all(|t| t.owner == "a1"), "scrubbed with the app's secrets");
+        assert!(
+            app.iter().all(|t| t.owner == "a1"),
+            "scrubbed with the app's secrets"
+        );
 
         let one = ContainerScope::Service("a1".into(), "web".into())
             .targets(&db)

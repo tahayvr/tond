@@ -142,7 +142,7 @@ async fn reconcile_apps(state: &AppState) -> Result<u64> {
     )
     .fetch_all(&state.db)
     .await?;
-    let mut corrected = 0;
+    let mut corrected = reconcile_compose_apps(state).await?;
     for app in apps {
         let container = match app.container_id.as_deref() {
             Some(id) => match state
@@ -180,6 +180,38 @@ async fn reconcile_apps(state: &AppState) -> Result<u64> {
             sqlx::query("UPDATE apps SET status = ?, updated_at = datetime('now') WHERE id = ?")
                 .bind(status)
                 .bind(&app.id)
+                .execute(&state.db)
+                .await?;
+            corrected += 1;
+        }
+    }
+    Ok(corrected)
+}
+
+/// Compose apps: refresh each service's state and correct the app status
+/// from them (running when any service runs, stopped when containers exist
+/// but none runs, missing when there are none).
+async fn reconcile_compose_apps(state: &AppState) -> Result<u64> {
+    let apps: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id, name, status FROM apps WHERE source_type = 'compose'
+           AND id NOT IN (SELECT app_id FROM deployments WHERE status = 'queued')",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    let mut corrected = 0;
+    for (id, name, status) in apps {
+        let project = crate::deploy::compose_project_name(&name);
+        // Docker unreachable: leave the app alone.
+        let Ok(states) = crate::compose::discover(&state.docker, &project).await else {
+            continue;
+        };
+        crate::compose::store_states(&state.db, &id, &states).await?;
+        let container = (!states.is_empty()).then(|| states.iter().any(|s| s.state == "running"));
+        if let Some(new) = corrected_status(&status, container) {
+            tracing::info!("App {name}: status {status} -> {new} (compose services)");
+            sqlx::query("UPDATE apps SET status = ?, updated_at = datetime('now') WHERE id = ?")
+                .bind(new)
+                .bind(&id)
                 .execute(&state.db)
                 .await?;
             corrected += 1;

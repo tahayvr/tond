@@ -682,7 +682,6 @@ mod tests {
             "{}",
             err.0
         );
-
     }
 
     #[test]
@@ -711,7 +710,11 @@ mod tests {
         )
         .err()
         .unwrap_or_else(|| panic!("legacy sentinels are not releases"));
-        assert!(err.0.to_string().contains("No previous deployment"), "{}", err.0);
+        assert!(
+            err.0.to_string().contains("No previous deployment"),
+            "{}",
+            err.0
+        );
     }
 
     #[test]
