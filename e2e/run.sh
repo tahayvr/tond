@@ -100,6 +100,11 @@ mkdir -p /etc/systemd/system/tond-server.service.d
 {
     printf '[Service]\nEnvironment=TOND_UPTIME_RESOLVE=%s\n' "$IP"
     if [[ -n "$CA_FILE" ]]; then printf 'Environment=TOND_UPTIME_CA_FILE=%s\n' "$CA_FILE"; fi
+    # Pebble's challtestsrv doubles as a fake DNS provider for the DNS-01
+    # wildcard check (test-only provider kind; the installer never sets this).
+    if [[ "$ACME" == pebble ]]; then
+        printf 'Environment=TOND_DNS_TEST_PROVIDER=1\nEnvironment=TOND_DNS_PROPAGATION_SECS=0\n'
+    fi
 } > /etc/systemd/system/tond-server.service.d/e2e-uptime.conf
 systemctl daemon-reload
 

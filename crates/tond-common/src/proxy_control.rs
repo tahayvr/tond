@@ -16,13 +16,27 @@
 //     traffic { id }             report cumulative per-route request counters
 //                                (tond_common::traffic)
 //     ack   { seq }              a cert event was stored; the proxy drops it
+//     install_cert { id, domain, cert_pem, key_pem }
+//                                validate an uploaded certificate and serve it
+//                                (replies cert_installed or error)
+//     remove_cert { id, domain } stop serving a certificate and delete its files
+//     dns_result { id, error? }  answer to a dns_txt message
 //
 //   proxy -> server   ProxyMessage
 //     hello      { pid, route_version }         first line on every connection
 //     reply      { id, body }                   answer to a request with that id
 //     cert_event { seq, report }                result of an issuance attempt; resent
 //                                               on every new connection until acked
+//     dns_txt    { id, action, name, value }    publish (set) or remove (clear) an ACME
+//                                               DNS-01 TXT record; tond-server answers
+//                                               with dns_result
 //
+// DNS-01: tond-proxy runs every ACME order, but it never sees a DNS provider
+// token. When an order needs a DNS-01 challenge it asks tond-server (root,
+// holds the encrypted tokens) to publish the TXT record, waits for the
+// answer, and asks it to clear the record afterwards. tond-server only
+// publishes `_acme-challenge.<d>` records for domains Tond serves.
+
 // tond-proxy opens tond.db read-only: everything it used to write (the
 // certificate retry state) travels as cert events, and tond-server writes it.
 
@@ -50,20 +64,71 @@ pub const FALLBACK_POLL_SECS: u64 = 60;
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ProxyRequest {
-    Sync { id: u64, min_version: i64 },
-    Certs { id: u64, domain: Option<String> },
-    Stats { id: u64 },
-    Traffic { id: u64 },
-    Ack { seq: u64 },
+    Sync {
+        id: u64,
+        min_version: i64,
+    },
+    Certs {
+        id: u64,
+        domain: Option<String>,
+    },
+    Stats {
+        id: u64,
+    },
+    Traffic {
+        id: u64,
+    },
+    Ack {
+        seq: u64,
+    },
+    InstallCert {
+        id: u64,
+        domain: String,
+        cert_pem: String,
+        key_pem: String,
+    },
+    RemoveCert {
+        id: u64,
+        domain: String,
+    },
+    DnsResult {
+        id: u64,
+        error: Option<String>,
+    },
+}
+
+/// What a dns_txt message asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum DnsTxtAction {
+    Set,
+    Clear,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProxyMessage {
-    Hello { pid: u32, route_version: i64 },
-    Reply { id: u64, body: ReplyBody },
-    CertEvent { seq: u64, report: CertReport },
+    Hello {
+        pid: u32,
+        route_version: i64,
+    },
+    Reply {
+        id: u64,
+        body: ReplyBody,
+    },
+    CertEvent {
+        seq: u64,
+        report: CertReport,
+    },
+    DnsTxt {
+        id: u64,
+        action: DnsTxtAction,
+        /// `_acme-challenge.<domain>`, without a trailing dot.
+        name: String,
+        value: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -73,8 +138,24 @@ pub enum ReplyBody {
     Synced { route_version: i64, routes: u64 },
     Stats { stats: ProxyStats },
     Traffic { traffic: TrafficSnapshot },
+    CertInstalled { cert: InstalledCert },
     Ok,
     Error { message: String },
+}
+
+/// An uploaded certificate the proxy validated and now serves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct InstalledCert {
+    pub domain: String,
+    pub cert_path: String,
+    pub key_path: String,
+    /// RFC 3339 `notBefore` / `notAfter` of the leaf.
+    pub issued_at: String,
+    pub expires_at: String,
+    pub issuer: Option<String>,
+    /// DNS names in the leaf's subjectAltName.
+    pub names: Vec<String>,
 }
 
 /// Outcome of one certificate issuance attempt, as tond-server stores it in
@@ -87,6 +168,9 @@ pub struct CertReport {
     pub key_path: String,
     /// RFC 3339 time of the attempt.
     pub attempted_at: String,
+    /// "http-01" | "dns-01" — how the CA validated the domain.
+    #[serde(default)]
+    pub challenge: Option<String>,
     pub outcome: CertOutcome,
 }
 
@@ -111,6 +195,9 @@ pub enum CertOutcome {
         failure_count: u32,
         next_retry_at: String,
     },
+    /// The domain's own certificate is no longer used: a wildcard (`by`)
+    /// serves it now. tond-server drops the row (no expiry alerts for it).
+    Superseded { by: String },
 }
 
 /// Serialize one message as a line (with the trailing newline).
@@ -141,6 +228,34 @@ mod tests {
     }
 
     #[test]
+    fn certificate_and_dns_requests_round_trip() {
+        for req in [
+            ProxyRequest::InstallCert {
+                id: 1,
+                domain: "*.example.com".into(),
+                cert_pem: "-----BEGIN CERTIFICATE-----".into(),
+                key_pem: "-----BEGIN PRIVATE KEY-----".into(),
+            },
+            ProxyRequest::RemoveCert {
+                id: 2,
+                domain: "a.example.com".into(),
+            },
+            ProxyRequest::DnsResult {
+                id: 3,
+                error: Some("zone not found".into()),
+            },
+        ] {
+            let line = encode_line(&req).unwrap_or_default();
+            let back: Result<ProxyRequest, _> = serde_json::from_slice(&line);
+            assert_eq!(back.ok(), Some(req));
+        }
+        // Reports from older proxies (no `challenge`) still parse.
+        let old = r#"{"domain":"a","cert_path":"c","key_path":"k","attempted_at":"t","outcome":{"result":"issued","issued_at":"i","expires_at":"e"}}"#;
+        let report: Result<CertReport, _> = serde_json::from_str(old);
+        assert_eq!(report.ok().and_then(|r| r.challenge), None);
+    }
+
+    #[test]
     fn messages_round_trip() {
         let msgs = vec![
             ProxyMessage::Hello {
@@ -167,6 +282,7 @@ mod tests {
                     cert_path: "/c".into(),
                     key_path: "/k".into(),
                     attempted_at: "2026-01-01T00:00:00Z".into(),
+                    challenge: Some("dns-01".into()),
                     outcome: CertOutcome::Failed {
                         status: "failed".into(),
                         error: "boom".into(),
@@ -174,6 +290,12 @@ mod tests {
                         next_retry_at: "2026-01-01T00:02:00Z".into(),
                     },
                 },
+            },
+            ProxyMessage::DnsTxt {
+                id: 4,
+                action: DnsTxtAction::Set,
+                name: "_acme-challenge.apps.test".into(),
+                value: "abc".into(),
             },
         ];
         for msg in msgs {

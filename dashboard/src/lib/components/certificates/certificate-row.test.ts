@@ -22,6 +22,7 @@ function cert(overrides: Partial<Certificate>): Certificate {
 		issuer: "Let's Encrypt R11",
 		issuer_kind: 'letsencrypt',
 		last_renewed_at: inDays(-10),
+		challenge: 'http-01',
 		serves: { kind: 'app', app_id: 'a1', app_name: 'shop' },
 		...overrides
 	};

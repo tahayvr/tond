@@ -676,10 +676,88 @@ export async function updateDomain(id: string, domain: string): Promise<UpdateDo
 	});
 }
 
+// ── App domains (several per app) ──
+
+/** primary: the app's main address · alias: also served · redirect: answered with a 301/308 */
+export type DomainKind = 'primary' | 'alias' | 'redirect';
+
+export interface AppDomain {
+	domain: string;
+	kind: DomainKind;
+	/** For redirects: the domain visitors are sent to (a serving domain of the same app) */
+	redirect_to: string | null;
+	/** 301 or 308 */
+	redirect_code: number;
+	/** Compose apps: the service this domain routes to (null: the main container) */
+	service: string | null;
+	port: number | null;
+	created_at: string;
+	/** Under the apps domain (the automatic address) */
+	automatic: boolean;
+	/** Set when the domain is on the same site as the dashboard */
+	warning: string | null;
+}
+
+export interface AddAppDomainRequest {
+	domain: string;
+	/** Default: primary when the app has none, else alias */
+	kind?: DomainKind;
+	redirect_to?: string;
+	redirect_code?: 301 | 308;
+}
+
+export interface UpdateAppDomainRequest {
+	kind?: DomainKind;
+	redirect_to?: string;
+	redirect_code?: 301 | 308;
+}
+
+export async function listAppDomains(id: string): Promise<AppDomain[]> {
+	return request<AppDomain[]>(`/apps/${id}/domains`);
+}
+
+/** Every call returns the app's full, updated domain list. */
+export async function addAppDomain(id: string, req: AddAppDomainRequest): Promise<AppDomain[]> {
+	return request<AppDomain[]>(`/apps/${id}/domains`, {
+		method: 'POST',
+		body: JSON.stringify(req)
+	});
+}
+
+/** Add example.com and www.example.com: `canonical` serves, the other redirects to it. */
+export async function addWwwPair(
+	id: string,
+	domain: string,
+	canonical: 'apex' | 'www',
+	primary = true
+): Promise<AppDomain[]> {
+	return request<AppDomain[]>(`/apps/${id}/domains/www-pair`, {
+		method: 'POST',
+		body: JSON.stringify({ domain, canonical, primary })
+	});
+}
+
+export async function updateAppDomain(
+	id: string,
+	domain: string,
+	req: UpdateAppDomainRequest
+): Promise<AppDomain[]> {
+	return request<AppDomain[]>(`/apps/${id}/domains/${encodeURIComponent(domain)}`, {
+		method: 'PATCH',
+		body: JSON.stringify(req)
+	});
+}
+
+export async function removeAppDomain(id: string, domain: string): Promise<AppDomain[]> {
+	return request<AppDomain[]>(`/apps/${id}/domains/${encodeURIComponent(domain)}`, {
+		method: 'DELETE'
+	});
+}
+
 // ── Certificates ──
 
 /** Which CA issued a certificate. */
-export type IssuerKind = 'letsencrypt' | 'letsencrypt_staging' | 'custom' | 'unknown';
+export type IssuerKind = 'letsencrypt' | 'letsencrypt_staging' | 'custom' | 'uploaded' | 'unknown';
 
 /** What a certificate's domain is used for right now. */
 export type CertificateTarget =
@@ -692,6 +770,8 @@ export type CertificateTarget =
 			preview_id: string;
 			pr_number: number | null;
 	  }
+	/** purpose: apps (the apps domain) | previews (the preview domain) | custom */
+	| { kind: 'wildcard'; purpose: 'apps' | 'previews' | 'custom'; hosts: number }
 	| { kind: 'unused' };
 
 export interface Certificate {
@@ -714,6 +794,8 @@ export interface Certificate {
 	issuer_kind: IssuerKind;
 	/** Last successful issuance or renewal */
 	last_renewed_at: string | null;
+	/** How the CA validated the domain (ACME certificates) */
+	challenge: 'http-01' | 'dns-01' | null;
 	serves: CertificateTarget;
 }
 
@@ -723,6 +805,104 @@ export async function listCertificates(): Promise<Certificate[]> {
 
 export async function retryCertificate(domain: string): Promise<void> {
 	await request(`/certs/${encodeURIComponent(domain)}/retry`, { method: 'POST' });
+}
+
+export interface UploadCertificateRequest {
+	/** app.example.com or *.example.com */
+	domain: string;
+	/** PEM: the leaf first, then the intermediates */
+	cert_pem: string;
+	/** PEM private key (unencrypted) */
+	key_pem: string;
+}
+
+/** tond-proxy validates the upload (key, chain order, validity, names) before serving it. */
+export async function uploadCertificate(
+	req: UploadCertificateRequest
+): Promise<Certificate | null> {
+	return request<Certificate | null>('/certs/custom', {
+		method: 'POST',
+		body: JSON.stringify(req)
+	});
+}
+
+/** Stop serving an uploaded certificate; Tond requests one from Let's Encrypt again. */
+export async function deleteUploadedCertificate(domain: string): Promise<void> {
+	await request(`/certs/custom/${encodeURIComponent(domain)}`, { method: 'DELETE' });
+}
+
+// ── DNS providers (ACME DNS-01: wildcard certificates) ──
+
+export type DnsProviderKind =
+	'cloudflare' | 'hetzner' | 'digitalocean' | 'route53' | 'challtestsrv';
+
+export interface DnsProviderConfig {
+	/** Route 53: the access key id (the secret access key is the token) */
+	access_key_id?: string;
+	/** challtestsrv (tests only): management API URL */
+	url?: string;
+}
+
+export interface DnsProvider {
+	id: string;
+	name: string;
+	kind: DnsProviderKind;
+	/** Zones the provider may write challenge records in, e.g. ["example.com"] */
+	zones: string[];
+	config: DnsProviderConfig;
+	/** The token is write-only: never returned */
+	token_set: boolean;
+	created_at: string;
+	updated_at: string;
+	last_used_at: string | null;
+	last_error: string | null;
+}
+
+export interface CreateDnsProviderRequest {
+	name: string;
+	kind: DnsProviderKind;
+	zones: string[];
+	token: string;
+	config?: DnsProviderConfig;
+}
+
+export interface UpdateDnsProviderRequest {
+	name?: string;
+	zones?: string[];
+	/** Replaced only when sent */
+	token?: string;
+	config?: DnsProviderConfig;
+}
+
+export interface DnsProviderTestResult {
+	ok: boolean;
+	zones: { zone: string; ok: boolean; message: string }[];
+}
+
+export async function listDnsProviders(): Promise<DnsProvider[]> {
+	return request<DnsProvider[]>('/dns-providers');
+}
+
+export async function createDnsProvider(req: CreateDnsProviderRequest): Promise<DnsProvider> {
+	return request<DnsProvider>('/dns-providers', { method: 'POST', body: JSON.stringify(req) });
+}
+
+export async function updateDnsProvider(
+	id: string,
+	req: UpdateDnsProviderRequest
+): Promise<DnsProvider> {
+	return request<DnsProvider>(`/dns-providers/${id}`, {
+		method: 'PATCH',
+		body: JSON.stringify(req)
+	});
+}
+
+export async function deleteDnsProvider(id: string): Promise<void> {
+	await request(`/dns-providers/${id}`, { method: 'DELETE' });
+}
+
+export async function testDnsProvider(id: string): Promise<DnsProviderTestResult> {
+	return request<DnsProviderTestResult>(`/dns-providers/${id}/test`, { method: 'POST' });
 }
 
 export async function updateHealth(
@@ -1598,6 +1778,12 @@ export interface DnsRecord {
 export type DnsCheckStatus = 'ok' | 'mismatch' | 'missing' | 'inconclusive';
 
 export interface DomainCertificate {
+	/** The certificate's own name (`*.apps.example.com` for a wildcard) */
+	domain: string;
+	/** "acme" | "custom" (uploaded) */
+	cert_type: string;
+	challenge: 'http-01' | 'dns-01' | null;
+	issuer: string | null;
 	status: string;
 	issued_at: string;
 	expires_at: string;
@@ -1623,6 +1809,10 @@ export interface DomainCheck {
 		message: string;
 	};
 	certificate: DomainCertificate | null;
+	/** Set when a wildcard certificate serves the domain */
+	covered_by: string | null;
+	/** DNS provider that validates the domain with DNS-01, if any */
+	dns_provider: string | null;
 	checked_at: string;
 	/** Set when the domain is on the same site as the dashboard (allowed, shown as a warning) */
 	warning?: string | null;

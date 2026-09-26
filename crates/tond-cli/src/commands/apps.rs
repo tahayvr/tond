@@ -11,7 +11,10 @@ use clap::{Args, Subcommand};
 use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::Message;
-use tond_common::{TemplateDeployRequest, TemplateResponse};
+use tond_common::{
+    AddAppDomainRequest, AppDomainResponse, CanonicalHost, DomainKind, TemplateDeployRequest,
+    TemplateResponse, UpdateAppDomainRequest, WwwPairRequest,
+};
 
 use crate::client::TondClient;
 use crate::deploy_follow;
@@ -195,13 +198,19 @@ pub enum AppsAction {
         vars: Vec<String>,
     },
 
-    /// Set custom domain for an app
+    /// Make a domain the app's primary domain (adding it if needed)
     Domain {
         /// App name or ID
         app: String,
 
         /// Domain name
         domain: String,
+    },
+
+    /// List, add and remove an app's domains (aliases, redirects, www pairs)
+    Domains {
+        #[command(subcommand)]
+        action: DomainsAction,
     },
 
     /// Configure health checks for an app
@@ -752,8 +761,10 @@ pub async fn handle(client: &TondClient, out: &Output, action: AppsAction) -> Re
         AppsAction::Domain { app, domain } => {
             let data = client.update_domain(&app, &domain).await?;
             out.done("set_domain", "app", &app, data)?;
-            outln!(out, "Domain set to {} for app {}", domain, app);
+            outln!(out, "{domain} is now the primary domain of {app}");
         }
+
+        AppsAction::Domains { action } => domains(client, out, action).await?,
 
         AppsAction::Health {
             app,
@@ -1186,6 +1197,182 @@ fn parse_env_pair(pair: &str) -> Result<(String, String)> {
     }
 
     Ok((key.trim().to_string(), value.to_string()))
+}
+
+#[derive(Subcommand)]
+pub enum DomainsAction {
+    /// List an app's domains
+    List {
+        /// App name or ID
+        app: String,
+    },
+    /// Add a domain (the first one becomes primary, later ones aliases)
+    Add {
+        /// App name or ID
+        app: String,
+        /// Domain name, e.g. shop.example.com
+        domain: String,
+        /// Make it the primary domain
+        #[arg(long, conflicts_with = "redirect_to")]
+        primary: bool,
+        /// Answer with a redirect to this domain of the app instead of serving
+        #[arg(long)]
+        redirect_to: Option<String>,
+        /// Redirect status: 301 or 308 (default 308)
+        #[arg(long, requires = "redirect_to")]
+        code: Option<u16>,
+        /// Also add www.<domain> / <apex>, redirecting to this name
+        #[arg(long, conflicts_with_all = ["redirect_to", "primary"])]
+        www: bool,
+    },
+    /// Make a domain the app's primary domain
+    SetPrimary {
+        /// App name or ID
+        app: String,
+        domain: String,
+    },
+    /// Turn a domain into a redirect to another domain of the app
+    Redirect {
+        /// App name or ID
+        app: String,
+        domain: String,
+        /// Target domain (must be a serving domain of the same app)
+        #[arg(long)]
+        to: String,
+        /// 301 or 308 (default 308)
+        #[arg(long)]
+        code: Option<u16>,
+    },
+    /// Remove a domain (asks first; --yes to skip)
+    Remove {
+        /// App name or ID
+        app: String,
+        domain: String,
+        /// Don't ask for confirmation (required when stdin is not a terminal)
+        #[arg(short, long)]
+        yes: bool,
+    },
+}
+
+fn print_domains(out: &Output, list: &[AppDomainResponse]) {
+    if list.is_empty() {
+        outln!(
+            out,
+            "No domains. Add one with: tond apps domains add <app> <domain>"
+        );
+        return;
+    }
+    outln!(out, "{:<40} {:<9} TARGET", "DOMAIN", "KIND");
+    for d in list {
+        let target = match (&d.redirect_to, d.kind) {
+            (Some(to), DomainKind::Redirect) => format!("{} -> https://{to}", d.redirect_code),
+            _ if d.automatic => "automatic address".to_string(),
+            _ => d
+                .service
+                .as_deref()
+                .map(|s| format!("service {s}"))
+                .unwrap_or_default(),
+        };
+        outln!(out, "{:<40} {:<9} {target}", d.domain, d.kind.as_str());
+    }
+    for d in list.iter().filter(|d| d.warning.is_some()) {
+        outln!(out, "\nNote: {}", d.warning.as_deref().unwrap_or_default());
+    }
+}
+
+async fn domains(client: &TondClient, out: &Output, action: DomainsAction) -> Result<()> {
+    let list = match action {
+        DomainsAction::List { app } => client.list_domains(&app).await?,
+        DomainsAction::Add {
+            app,
+            domain,
+            primary,
+            redirect_to,
+            code,
+            www,
+        } => {
+            if www {
+                let canonical = if domain.starts_with("www.") {
+                    CanonicalHost::Www
+                } else {
+                    CanonicalHost::Apex
+                };
+                client
+                    .add_www_pair(
+                        &app,
+                        &WwwPairRequest {
+                            domain,
+                            canonical,
+                            primary: None,
+                        },
+                    )
+                    .await?
+            } else {
+                let kind = if redirect_to.is_some() {
+                    Some(DomainKind::Redirect)
+                } else if primary {
+                    Some(DomainKind::Primary)
+                } else {
+                    None
+                };
+                client
+                    .add_domain(
+                        &app,
+                        &AddAppDomainRequest {
+                            domain,
+                            kind,
+                            redirect_to,
+                            redirect_code: code,
+                            service: None,
+                            port: None,
+                        },
+                    )
+                    .await?
+            }
+        }
+        DomainsAction::SetPrimary { app, domain } => {
+            client
+                .update_app_domain(
+                    &app,
+                    &domain,
+                    &UpdateAppDomainRequest {
+                        kind: Some(DomainKind::Primary),
+                        ..Default::default()
+                    },
+                )
+                .await?
+        }
+        DomainsAction::Redirect {
+            app,
+            domain,
+            to,
+            code,
+        } => {
+            client
+                .update_app_domain(
+                    &app,
+                    &domain,
+                    &UpdateAppDomainRequest {
+                        kind: Some(DomainKind::Redirect),
+                        redirect_to: Some(to),
+                        redirect_code: code,
+                    },
+                )
+                .await?
+        }
+        DomainsAction::Remove { app, domain, yes } => {
+            out.confirm(
+                yes,
+                &format!("Remove {domain} from {app}? Visitors to it get a \"no route\" page."),
+                &format!("remove domain {domain}"),
+            )?;
+            client.remove_domain(&app, &domain).await?
+        }
+    };
+    // --json: the app's full domain list after the change.
+    out.json(&list)?;
+    print_domains(out, &list);
+    Ok(())
 }
 
 #[cfg(test)]
