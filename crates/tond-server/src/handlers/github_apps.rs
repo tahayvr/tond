@@ -61,6 +61,7 @@ use crate::{
     auth::{Authz, RateLimit, scope},
     error::AppError,
     handlers::auth::{extract_session_token, validate_session},
+    secrets,
     state::AppState,
 };
 
@@ -98,7 +99,8 @@ pub async fn generate_installation_token(app: &GitHubApp) -> anyhow::Result<Stri
         "iss": app.app_id,
     });
 
-    let encoding_key = EncodingKey::from_rsa_pem(app.private_key.as_bytes())
+    let private_key = secrets::github_private_key(app)?;
+    let encoding_key = EncodingKey::from_rsa_pem(private_key.as_bytes())
         .map_err(|e| anyhow::anyhow!("Failed to parse GitHub App private key: {}", e))?;
 
     let jwt = encode(&Header::new(Algorithm::RS256), &claims, &encoding_key)
@@ -685,6 +687,8 @@ async fn exchange_manifest_code(state: &AppState, code: &str) -> anyhow::Result<
     let name = json["name"].as_str().unwrap_or(&slug).to_string();
     let now = chrono::Utc::now().to_rfc3339();
     let id = uuid::Uuid::new_v4().to_string();
+    let (client_secret, webhook_secret, pem) =
+        secrets::seal_github_credentials(&client_secret, &webhook_secret, &pem)?;
 
     sqlx::query(
         "INSERT INTO github_apps

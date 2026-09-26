@@ -28,11 +28,17 @@ use crate::{
     alerts::{channel_count, send_test_notifications},
     auth::{Authz, RateLimit, scope},
     error::AppError,
+    secrets,
     state::AppState,
 };
 
 const NO_CHANNEL: &str =
     "Choose at least one notification channel or add a webhook URL, so this rule notifies someone.";
+
+fn rule_response(rule: AlertRule) -> Result<AlertRuleResponse, AppError> {
+    let url = secrets::alert_webhook_url(&rule.webhook_url)?;
+    Ok(AlertRuleResponse::new(rule, &url))
+}
 
 // ── List ──
 
@@ -46,7 +52,10 @@ pub async fn list_alerts(
             .fetch_all(&state.db)
             .await?;
 
-    let resp: Vec<AlertRuleResponse> = rules.into_iter().map(AlertRuleResponse::from).collect();
+    let mut resp: Vec<AlertRuleResponse> = Vec::with_capacity(rules.len());
+    for rule in rules {
+        resp.push(rule_response(rule)?);
+    }
     Ok((StatusCode::OK, Json(ApiResponse::ok(resp))))
 }
 
@@ -64,10 +73,7 @@ pub async fn get_alert(
         .await?
         .ok_or_else(|| AppError(TondError::NotFound(format!("Alert rule {id} not found"))))?;
 
-    Ok((
-        StatusCode::OK,
-        Json(ApiResponse::ok(AlertRuleResponse::from(rule))),
-    ))
+    Ok((StatusCode::OK, Json(ApiResponse::ok(rule_response(rule)?))))
 }
 
 // ── Helpers ──
@@ -159,7 +165,7 @@ pub async fn create_alert(
     .bind(&req.name)
     .bind(&req.metric)
     .bind(threshold)
-    .bind(&webhook_url)
+    .bind(secrets::seal_alert_webhook_url(&webhook_url)?)
     .bind(&events_json)
     .execute(&mut *tx)
     .await?;
@@ -188,7 +194,7 @@ pub async fn create_alert(
     .await;
     Ok((
         StatusCode::CREATED,
-        Json(ApiResponse::ok(AlertRuleResponse::from(rule))),
+        Json(ApiResponse::ok(rule_response(rule)?)),
     ))
 }
 
@@ -217,10 +223,12 @@ pub async fn update_alert(
         None => rule.metric,
     };
     let threshold = req.threshold.unwrap_or(rule.threshold);
-    let webhook_url = req
-        .webhook_url
-        .map(|url| url.trim().to_string())
-        .unwrap_or(rule.webhook_url);
+    // Write-only: absent keeps the saved URL, "" clears it.
+    let webhook_url = match req.webhook_url {
+        Some(url) => secrets::seal_alert_webhook_url(url.trim())?,
+        None => rule.webhook_url,
+    };
+    // Sealed URLs are empty exactly when no webhook is set.
     if channel_count(&state.db, &id, &webhook_url).await == 0 {
         return Err(AppError(TondError::InvalidInput(NO_CHANNEL.to_string())));
     }
@@ -265,7 +273,7 @@ pub async fn update_alert(
     .await;
     Ok((
         StatusCode::OK,
-        Json(ApiResponse::ok(AlertRuleResponse::from(updated))),
+        Json(ApiResponse::ok(rule_response(updated)?)),
     ))
 }
 

@@ -28,7 +28,6 @@ describe('NotificationChannelList', () => {
 		smtp_host: 'smtp.example.com',
 		smtp_port: 587,
 		smtp_user: 'alerts@example.com',
-		smtp_password: 'secret',
 		smtp_encryption: 'starttls',
 		to_addrs: ['ops@example.com']
 	};
@@ -42,6 +41,7 @@ describe('NotificationChannelList', () => {
 			name,
 			kind,
 			config,
+			saved_secrets: ['smtp_password'],
 			enabled: true,
 			created_at: '2026-01-02T00:00:00.000Z',
 			updated_at: '2026-01-02T00:00:00.000Z'
@@ -51,6 +51,7 @@ describe('NotificationChannelList', () => {
 			name: payload.name ?? 'Ops Email',
 			kind: 'email',
 			config: payload.config ?? emailConfig,
+			saved_secrets: ['smtp_password'],
 			enabled: payload.enabled ?? true,
 			created_at: '2026-01-01T00:00:00.000Z',
 			updated_at: '2026-01-03T00:00:00.000Z'
@@ -76,10 +77,10 @@ describe('NotificationChannelList', () => {
 							smtp_host: 'smtp.example.com',
 							smtp_port: 587,
 							smtp_user: 'alerts@example.com',
-							smtp_password: 'secret',
 							smtp_encryption: 'starttls',
 							to_addrs: ['ops@example.com']
 						},
+						saved_secrets: ['smtp_password'],
 						created_at: '2026-01-01T00:00:00.000Z',
 						updated_at: '2026-01-01T00:00:00.000Z'
 					}
@@ -133,6 +134,7 @@ describe('NotificationChannelList', () => {
 						name: 'Ops Email',
 						enabled: true,
 						config: emailConfig,
+						saved_secrets: ['smtp_password'],
 						created_at: '2026-01-01T00:00:00.000Z',
 						updated_at: '2026-01-01T00:00:00.000Z'
 					}
@@ -164,6 +166,7 @@ describe('NotificationChannelList', () => {
 						name: 'Ops Email',
 						enabled: true,
 						config: emailConfig,
+						saved_secrets: ['smtp_password'],
 						created_at: '2026-01-01T00:00:00.000Z',
 						updated_at: '2026-01-01T00:00:00.000Z'
 					}

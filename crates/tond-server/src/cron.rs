@@ -40,17 +40,19 @@ use std::str::FromStr;
 use tond_common::{CronJob, CronVolume};
 use uuid::Uuid;
 
-use crate::{alerts, docker, metrics, state::AppState, volumes};
+use crate::{alerts, docker, metrics, secrets, state::AppState, volumes};
 
 fn should_run_due_job(job: &CronJob) -> bool {
     !(job.status == "running" && job.concurrency_policy == "skip")
 }
 
-fn cron_env_vec(env_json: Option<&str>) -> Vec<String> {
-    env_json
-        .and_then(|s| serde_json::from_str::<std::collections::HashMap<String, String>>(s).ok())
-        .map(|m| m.into_iter().map(|(k, v)| format!("{}={}", k, v)).collect())
-        .unwrap_or_default()
+/// Decrypt the stored env into `KEY=value` strings. An env that cannot be
+/// decrypted fails the run instead of silently running without it.
+fn cron_env_vec(stored: Option<&str>) -> Result<Vec<String>> {
+    Ok(secrets::cron_env(stored)?
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect())
 }
 
 /// Parse the stored volumes JSON and turn it into confined Docker bind strings.
@@ -609,8 +611,8 @@ async fn run_cron_container(
 
     let docker: &Docker = &state.docker;
 
-    // Build env vec from the stored JSON object string, e.g. {"KEY":"val"} → ["KEY=val"]
-    let env_vec = cron_env_vec(job.env.as_deref());
+    // Decrypt the stored env, e.g. {"KEY":"val"} → ["KEY=val"]
+    let env_vec = cron_env_vec(job.env.as_deref())?;
 
     let cmd_vec: Option<Vec<&str>> = cmd.map(|c| c.iter().map(|s| s.as_str()).collect());
 
@@ -763,7 +765,11 @@ mod tests {
             Some(r#"["echo","hello"]"#.to_string()),
             None,
             Some(60),
-            Some(r#"{"RUST_LOG":"info","MODE":"prod"}"#.to_string()),
+            secrets::seal_cron_env(&std::collections::BTreeMap::from([
+                ("RUST_LOG".to_string(), "info".to_string()),
+                ("MODE".to_string(), "prod".to_string()),
+            ]))
+            .unwrap_or_else(|err| panic!("seal: {err}")),
             "skip".to_string(),
             Some(256),
             Some(512),
@@ -1058,17 +1064,17 @@ mod tests {
     fn cron_env_and_bind_helpers_parse_json_and_tolerate_invalid_input() {
         let job = sample_job();
 
-        let env = cron_env_vec(job.env.as_deref());
+        let env = cron_env_vec(job.env.as_deref()).unwrap_or_default();
         assert!(
             env.contains(&"RUST_LOG=info".to_string()) && env.contains(&"MODE=prod".to_string()),
             "cron_env_vec should convert the stored JSON object into KEY=value strings"
         );
 
-        assert_eq!(
-            cron_env_vec(Some("not-json")),
-            Vec::<String>::new(),
-            "cron_env_vec should fall back to an empty environment on invalid JSON"
+        assert!(
+            cron_env_vec(Some("not-json")).is_err(),
+            "cron_env_vec should fail loudly on a value that does not decrypt"
         );
+        assert_eq!(cron_env_vec(None).ok(), Some(Vec::new()));
 
         let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
         let binds = cron_binds(tmp.path(), &job.id, job.volumes.as_deref())

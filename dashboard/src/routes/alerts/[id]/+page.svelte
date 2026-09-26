@@ -30,6 +30,9 @@
 	import * as Select from '$lib/components/ui/select/index.js';
 	import Breadcrumb from '$lib/components/nav/breadcrumb.svelte';
 	import IntegrationSelector from '$lib/components/integrations/integration-selector.svelte';
+	import SavedSecretField, {
+		secretFieldUpdate
+	} from '$lib/components/secrets/saved-secret-field.svelte';
 	import Bell from '~icons/ri/notification-3-line';
 	import Plug from '~icons/ri/plug-line';
 	import type { PageProps } from './$types';
@@ -61,7 +64,10 @@
 	let settingsMetric = $state<AlertMetric | ''>('');
 	let settingsThreshold = $state(80);
 	let settingsEvents = new SvelteSet<AlertEvent>();
+	// The webhook URL is write-only: a saved one shows as "Saved" + host.
 	let settingsWebhookUrl = $state('');
+	let settingsWebhookReplacing = $state(false);
+	let settingsWebhookRemoved = $state(false);
 	let settingsSaving = $state(false);
 	let settingsError = $state('');
 	let settingsSuccess = $state('');
@@ -165,7 +171,12 @@
 				name: settingsName.trim(),
 				metric: settingsHasMetrics && settingsMetric ? (settingsMetric as AlertMetric) : null,
 				threshold: settingsThreshold,
-				webhook_url: settingsWebhookUrl.trim(),
+				webhook_url: secretFieldUpdate({
+					saved: rule?.has_webhook_url ?? false,
+					replacing: settingsWebhookReplacing,
+					removed: settingsWebhookRemoved,
+					value: settingsWebhookUrl
+				}),
 				events: [...settingsEvents]
 			});
 			settingsSuccess = 'Settings saved.';
@@ -187,7 +198,9 @@
 			settingsGroupId = inferGroupId(rule);
 			settingsMetric = rule.metric ?? '';
 			settingsThreshold = rule.threshold;
-			settingsWebhookUrl = rule.webhook_url;
+			settingsWebhookUrl = '';
+			settingsWebhookReplacing = false;
+			settingsWebhookRemoved = false;
 			settingsEvents.clear();
 			for (const ev of rule.events) settingsEvents.add(ev);
 		}
@@ -364,13 +377,13 @@
 								Notifications
 							</h2>
 							<div class="space-y-3 text-sm">
-								{#if rule.webhook_url}
+								{#if rule.has_webhook_url}
 									<div class="flex items-start gap-2">
 										<Bell class="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
 										<div class="min-w-0">
 											<p class="font-mono text-xs font-medium uppercase">Webhook</p>
 											<p class="truncate font-mono text-xs text-muted-foreground">
-												{rule.webhook_url}
+												{rule.webhook_host ?? 'Saved'}
 											</p>
 										</div>
 									</div>
@@ -499,13 +512,21 @@
 								Webhook URL
 								<span class="text-muted-foreground">(optional)</span>
 							</Label>
-							<Input
+							<SavedSecretField
 								id="s-webhook"
-								type="url"
+								kind="url"
+								saved={rule.has_webhook_url}
+								savedHint={rule.webhook_host}
+								allowRemove
 								bind:value={settingsWebhookUrl}
+								bind:replacing={settingsWebhookReplacing}
+								bind:removed={settingsWebhookRemoved}
 								placeholder="https://hooks.example.com/alert"
-								class="font-mono text-sm"
 							/>
+							<p class="text-xs text-muted-foreground">
+								Webhook URLs often carry a token, so they are stored encrypted and never shown
+								again.
+							</p>
 						</div>
 
 						<!-- Notification channels -->

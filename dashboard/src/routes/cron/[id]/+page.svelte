@@ -2,6 +2,7 @@
 	import SuccessAlert from '$lib/components/feedback/success-alert.svelte';
 	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { page } from '$app/state';
+	import { untrack } from 'svelte';
 	import {
 		getCronJob,
 		updateCronJob,
@@ -22,6 +23,14 @@
 	} from '$lib/components/forms/cron-volume-fields.svelte';
 	import type { CronVolumeInput } from '$lib/api';
 	import { intOr, optionalInt } from '$lib/form-numbers';
+	import {
+		draftPatch,
+		draftRemove,
+		draftRows,
+		draftSet,
+		envDraftFrom,
+		type EnvDraft
+	} from '$lib/env-draft';
 	import { goto } from '$app/navigation';
 	import {
 		setUiContext,
@@ -51,7 +60,7 @@
 	import ChevronRight from '~icons/ri/arrow-right-s-line';
 	import Plus from '~icons/ri/add-line';
 	import Trash2 from '~icons/ri/delete-bin-line';
-	import { untrack } from 'svelte';
+	import Pencil from '~icons/ri/pencil-line';
 	import type { PageProps } from './$types';
 
 	let { data, params }: PageProps = $props();
@@ -87,7 +96,8 @@
 	let settingsCommand = $state('');
 	// Number inputs bind as number | null (null when empty).
 	let settingsTimeout = $state<number | null>(null);
-	let settingsEnvVars = $state<Record<string, string>>({});
+	// Env values are write-only: the form edits a draft of changes (see env-draft.ts).
+	let settingsEnv = $state<EnvDraft>(envDraftFrom([]));
 	let settingsConcurrencyPolicy = $state('skip');
 	let settingsMemoryMb = $state<number | null>(null);
 	let settingsCpuShares = $state<number | null>(null);
@@ -119,7 +129,7 @@
 	let volContainerPath = $state('');
 	let volDialogError = $state('');
 
-	let envEntries = $derived(Object.entries(settingsEnvVars));
+	let envRows = $derived(draftRows(settingsEnv));
 
 	let jobId = $derived(page.params.id || params.id);
 
@@ -133,7 +143,7 @@
 			settingsImage = job.image;
 			settingsCommand = parseCommand(job.command);
 			settingsTimeout = job.timeout_seconds ?? null;
-			settingsEnvVars = job.env ? { ...job.env } : {};
+			settingsEnv = envDraftFrom(job.env ?? []);
 			settingsConcurrencyPolicy = job.concurrency_policy ?? 'skip';
 			settingsMemoryMb = job.memory_mb ?? null;
 			settingsCpuShares = job.cpu_shares ?? null;
@@ -264,7 +274,7 @@
 				// Send [] explicitly to clear command, or the parsed array
 				command: commandArr.length > 0 ? commandArr : [],
 				timeout_seconds: timeoutNum,
-				env: settingsEnvVars,
+				...draftPatch(settingsEnv),
 				concurrency_policy: settingsConcurrencyPolicy,
 				memory_mb: memoryMb,
 				cpu_shares: cpuShares,
@@ -318,10 +328,10 @@
 		envDialogOpen = true;
 	}
 
-	function openEnvEdit(key: string, value: string) {
+	function openEnvEdit(key: string) {
 		envEditingKey = key;
 		envNewKey = key;
-		envNewValue = value;
+		envNewValue = settingsEnv.set[key] ?? '';
 		envDialogError = '';
 		envDialogOpen = true;
 	}
@@ -337,20 +347,12 @@
 				'Key must start with a letter or underscore and contain only letters, numbers, and underscores';
 			return;
 		}
-		if (envEditingKey !== null && envEditingKey !== key) {
-			const next = { ...settingsEnvVars };
-			delete next[envEditingKey];
-			settingsEnvVars = { ...next, [key]: envNewValue };
-		} else {
-			settingsEnvVars = { ...settingsEnvVars, [key]: envNewValue };
-		}
+		settingsEnv = draftSet(settingsEnv, key, envNewValue, envEditingKey);
 		envDialogOpen = false;
 	}
 
 	function handleEnvRemove(key: string) {
-		const next = { ...settingsEnvVars };
-		delete next[key];
-		settingsEnvVars = next;
+		settingsEnv = draftRemove(settingsEnv, key);
 	}
 
 	function handleEnvKeydown(e: KeyboardEvent) {
@@ -403,30 +405,28 @@
 	// reading `job` after assigning it would re-run this effect forever.
 	$effect(() => {
 		const routeData = data as CronJobDetailData;
-		untrack(() => seedFromRoute(routeData));
+		untrack(() => {
+			job = routeData.job;
+			projects = routeData.projects;
+			if (job) {
+				settingsName = job.name;
+				settingsSchedule = job.schedule;
+				settingsImage = job.image;
+				settingsCommand = parseCommand(job.command);
+				settingsTimeout = job.timeout_seconds ?? null;
+				settingsEnv = envDraftFrom(job.env ?? []);
+				settingsConcurrencyPolicy = job.concurrency_policy ?? 'skip';
+				settingsMemoryMb = job.memory_mb ?? null;
+				settingsCpuShares = job.cpu_shares ?? null;
+				settingsTimezone = job.timezone ?? '';
+				settingsMaxRetries = job.max_retries ?? 0;
+				settingsRetryDelay = job.retry_delay_seconds ?? 60;
+				settingsVolumes = job.volumes ? [...job.volumes] : [];
+				settingsProjectId = job.project_id;
+				setUiContext(cronJobContext(job));
+			}
+		});
 	});
-
-	function seedFromRoute(routeData: CronJobDetailData) {
-		job = routeData.job;
-		projects = routeData.projects;
-		if (job) {
-			settingsName = job.name;
-			settingsSchedule = job.schedule;
-			settingsImage = job.image;
-			settingsCommand = parseCommand(job.command);
-			settingsTimeout = job.timeout_seconds ?? null;
-			settingsEnvVars = job.env ? { ...job.env } : {};
-			settingsConcurrencyPolicy = job.concurrency_policy ?? 'skip';
-			settingsMemoryMb = job.memory_mb ?? null;
-			settingsCpuShares = job.cpu_shares ?? null;
-			settingsTimezone = job.timezone ?? '';
-			settingsMaxRetries = job.max_retries ?? 0;
-			settingsRetryDelay = job.retry_delay_seconds ?? 60;
-			settingsVolumes = job.volumes ? [...job.volumes] : [];
-			settingsProjectId = job.project_id;
-			setUiContext(cronJobContext(job));
-		}
-	}
 
 	// Load the run history whenever the Runs tab is opened.
 	$effect(() => {
@@ -641,8 +641,8 @@
 								</div>
 								<div>
 									<span class="text-muted-foreground">Env vars:</span>
-									{#if job.env && Object.keys(job.env).length > 0}
-										<span class="font-mono text-xs">{Object.keys(job.env).length} defined</span>
+									{#if job.env.length > 0}
+										<span class="font-mono text-xs">{job.env.length} defined</span>
 									{:else}
 										<span class="text-muted-foreground">None</span>
 									{/if}
@@ -986,7 +986,7 @@
 											</Dialog.Title>
 											<Dialog.Description>
 												{envEditingKey !== null
-													? 'Update the key or value for this environment variable.'
+													? 'Values are stored encrypted and never shown. Enter a new value to replace the saved one.'
 													: 'Enter a key and value for the new environment variable.'}
 											</Dialog.Description>
 										</Dialog.Header>
@@ -1007,7 +1007,9 @@
 												<Input
 													id="env-value"
 													bind:value={envNewValue}
-													placeholder="postgres://user:pass@host/db"
+													placeholder={envEditingKey !== null
+														? 'New value'
+														: 'postgres://user:pass@host/db'}
 													class="font-mono"
 													onkeydown={handleEnvKeydown}
 												/>
@@ -1026,7 +1028,7 @@
 								</Dialog.Root>
 							</div>
 
-							{#if envEntries.length === 0}
+							{#if envRows.length === 0}
 								<div class="rounded border border-dashed border-border py-6 text-center">
 									<p class="text-xs text-muted-foreground">No environment variables defined.</p>
 								</div>
@@ -1047,13 +1049,22 @@
 											</tr>
 										</thead>
 										<tbody>
-											{#each envEntries as [key, value], i (key)}
-												<tr class={i < envEntries.length - 1 ? 'border-b border-border' : ''}>
-													<td class="px-3 py-2 font-mono text-xs font-medium">{key}</td>
+											{#each envRows as row, i (row.key)}
+												{@const key = row.key}
+												<tr class={i < envRows.length - 1 ? 'border-b border-border' : ''}>
+													<td class="px-3 py-2 font-mono text-xs font-medium">
+														{key}
+														{#if row.change}
+															<span
+																class="ml-1 font-sans text-[10px] font-normal text-muted-foreground uppercase"
+																>{row.change === 'new' ? 'new' : 'changed'}</span
+															>
+														{/if}
+													</td>
 													<td
 														class="max-w-0 truncate px-3 py-2 font-mono text-xs text-muted-foreground"
 													>
-														{#if !value}
+														{#if row.empty}
 															<span class="italic">empty</span>
 														{:else}
 															<span class="tracking-widest">••••••••</span>
@@ -1066,9 +1077,9 @@
 																size="icon"
 																class="h-7 w-7 text-muted-foreground hover:text-foreground"
 																aria-label="Edit variable"
-																onclick={() => openEnvEdit(key, value)}
+																onclick={() => openEnvEdit(key)}
 															>
-																<Plus class="h-3.5 w-3.5 rotate-45" />
+																<Pencil class="h-3.5 w-3.5" />
 															</Button>
 															<Button
 																variant="ghost"
@@ -1088,7 +1099,8 @@
 								</div>
 							{/if}
 							<p class="text-xs text-muted-foreground">
-								Values are write-only. Saving replaces all variables.
+								Values are stored encrypted and write-only. Saving changes only the variables you
+								edited.
 							</p>
 						</div>
 

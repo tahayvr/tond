@@ -1,4 +1,5 @@
 <script lang="ts">
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { updateSettings, type ServerSettings } from '$lib/api';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
@@ -86,11 +87,7 @@
 			/>
 		</div>
 	</div>
-	{#if error}
-		<p class="mt-3 rounded-md bg-destructive/10 p-3 text-sm text-destructive" role="alert">
-			{error}
-		</p>
-	{/if}
+	<InlineError message={error} />
 	<div class="mt-4 flex items-center gap-3">
 		{#if canEdit}
 			<Button type="submit" size="sm" disabled={saving}>{saving ? 'Saving…' : 'Save'}</Button>

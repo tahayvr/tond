@@ -981,10 +981,22 @@ export interface WebhookConfig {
 	paths: WebhookUrls;
 	/** Absolute URLs when the dashboard domain is configured, else null */
 	urls: WebhookUrls | null;
-	/** Shared secret: HMAC key for GitHub/Gitea/generic, token for GitLab */
-	secret: string;
+	/**
+	 * Whether a shared secret (HMAC key for GitHub/Gitea/generic, token for
+	 * GitLab) is set. The secret is write-only: see `revealWebhookSecret`.
+	 */
+	has_secret: boolean;
 	auto_deploy: boolean;
 	watch_branch: string | null;
+}
+
+export interface WebhookSecret {
+	secret: string;
+}
+
+/** Reveal the webhook secret (admin only; every reveal is audit-logged). */
+export async function revealWebhookSecret(id: string): Promise<WebhookSecret> {
+	return request<WebhookSecret>(`/apps/${id}/webhook-secret`);
 }
 
 export async function getWebhookConfig(id: string): Promise<WebhookConfig> {
@@ -999,9 +1011,12 @@ export async function setWebhookSecret(id: string, secret: string): Promise<Webh
 	});
 }
 
-/** Generate a new webhook secret; the old one stops working immediately. */
-export async function rotateWebhookSecret(id: string): Promise<WebhookConfig> {
-	return request<WebhookConfig>(`/apps/${id}/webhook-secret/rotate`, { method: 'POST' });
+/**
+ * Generate a new webhook secret; the old one stops working immediately. The
+ * new secret is returned once, in this response.
+ */
+export async function rotateWebhookSecret(id: string): Promise<WebhookSecret> {
+	return request<WebhookSecret>(`/apps/${id}/webhook-secret/rotate`, { method: 'POST' });
 }
 
 export async function setAutoDeploy(
@@ -1401,7 +1416,10 @@ export interface AlertRule {
 	/** Threshold-based metric, null for pure event-based rules */
 	metric: AlertMetric | null;
 	threshold: number;
-	webhook_url: string;
+	/** Whether a webhook URL is set (the URL itself is write-only) */
+	has_webhook_url: boolean;
+	/** Host of the saved webhook URL, e.g. "hooks.slack.com" */
+	webhook_host: string | null;
 	enabled: boolean;
 	/** Event slugs this rule subscribes to */
 	events: AlertEvent[];
@@ -1441,6 +1459,7 @@ export async function updateAlertRule(
 		name: string;
 		metric: AlertMetric | null;
 		threshold: number;
+		/** Omit to keep the saved URL, "" to remove it */
 		webhook_url: string;
 		enabled: boolean;
 		events: AlertEvent[];
@@ -1542,7 +1561,8 @@ export interface Project {
 	id: string;
 	name: string;
 	description: string | null;
-	env_vars: Record<string, string>;
+	/** Shared env var keys; values are masked (write-only) */
+	env: EnvVarEntry[];
 	created_at: string;
 	updated_at: string;
 	/** Number of active (non-expired) project previews. Returned by GET /projects. */
@@ -1647,11 +1667,14 @@ export interface ManagedDatabase {
 	status: string;
 	db_name: string | null;
 	db_user: string | null;
-	db_password: string | null;
-	/** Separate root/admin password for MySQL and MariaDB. Null for other engines. */
-	root_password: string | null;
+	/** Whether the database has an application password (never returned) */
+	has_password: boolean;
+	/** Whether there is a separate root/admin password (MySQL and MariaDB) */
+	has_root_password: boolean;
 	memory_limit: number | null;
+	/** Connection-string override, password masked */
 	custom_external_url: string | null;
+	/** Connection-string override, password masked */
 	custom_internal_url: string | null;
 	/** Docker image actually used when the container was last created/redeployed */
 	image_used: string | null;
@@ -1663,11 +1686,42 @@ export interface ManagedDatabase {
 	public_access: boolean;
 }
 
+/** Connection strings in a detail response have the password masked. */
 export interface ManagedDatabaseDetail extends ManagedDatabase {
 	connection_string: string | null;
 	/** Connection string via the server's public address; only when public_access is on */
 	public_connection_string: string | null;
 	internal_connection_string: string | null;
+}
+
+/** Plaintext credentials: GET /databases/{id}/credentials (admin, audit-logged). */
+export interface DatabaseCredentials {
+	db_user: string | null;
+	db_password: string | null;
+	root_password: string | null;
+	connection_string: string | null;
+	public_connection_string: string | null;
+	internal_connection_string: string | null;
+}
+
+/** POST /databases: the detail plus the generated credentials, shown once. */
+export interface CreatedDatabase extends ManagedDatabaseDetail {
+	credentials: DatabaseCredentials;
+}
+
+/** Reveal a database's passwords and connection strings (admin only; audit-logged). */
+export async function revealDatabaseCredentials(id: string): Promise<DatabaseCredentials> {
+	return request<DatabaseCredentials>(`/databases/${id}/credentials`);
+}
+
+/** A database's own backups plus the full snapshots (which hold every database). */
+export async function listDatabaseBackups(id: string): Promise<Snapshot[]> {
+	return request<Snapshot[]>(`/databases/${id}/backups`);
+}
+
+/** Back up one database now. Resolves when the local copy is complete. */
+export async function createDatabaseBackup(id: string): Promise<Snapshot> {
+	return request<Snapshot>(`/databases/${id}/backups`, { method: 'POST' });
 }
 
 export async function listDatabases(): Promise<ManagedDatabase[]> {
@@ -1683,8 +1737,8 @@ export async function createDatabase(data: {
 	db_type: string;
 	project_id?: string;
 	memory_limit?: number;
-}): Promise<ManagedDatabaseDetail> {
-	return request<ManagedDatabaseDetail>('/databases', {
+}): Promise<CreatedDatabase> {
+	return request<CreatedDatabase>('/databases', {
 		method: 'POST',
 		body: JSON.stringify(data)
 	});
@@ -1764,8 +1818,8 @@ export interface CronJob {
 	updated_at: string;
 	/** Maximum wall-clock seconds the container may run. null = no timeout. */
 	timeout_seconds: number | null;
-	/** Environment variables. null = none defined. */
-	env: Record<string, string> | null;
+	/** Environment variable keys; values are masked (write-only). */
+	env: EnvVarEntry[];
 	/** Denormalised last-run outcome: "success" | "failed" | null (never run). */
 	last_run_status: string | null;
 	/** Concurrency policy: "skip" (default) or "allow". */
@@ -1847,7 +1901,12 @@ export async function updateCronJob(
 		enabled: boolean;
 		/** Pass null to clear, a number to set, omit to leave unchanged */
 		timeout_seconds: number | null;
+		/** Replace all environment variables */
 		env: Record<string, string>;
+		/** Add or overwrite these variables (keeps the others) */
+		env_set: Record<string, string>;
+		/** Remove these variables */
+		env_unset: string[];
 		/** "skip" or "allow" */
 		concurrency_policy: string;
 		/** Memory limit in MiB. null = no limit. */
@@ -2194,18 +2253,22 @@ export function openTerminalSession(
 
 export type IntegrationKind = 'telegram' | 'discord' | 'slack' | 'email';
 
+// Secret fields (bot_token, webhook_url, smtp_password) are write-only: the
+// server never returns them (see `Integration.saved_secrets`), and an update
+// that omits one, or sends "", keeps the saved value.
+
 export interface TelegramConfig {
-	bot_token: string;
+	bot_token?: string;
 	chat_id: string;
 	thread_id?: string;
 }
 
 export interface DiscordConfig {
-	webhook_url: string;
+	webhook_url?: string;
 }
 
 export interface SlackConfig {
-	webhook_url: string;
+	webhook_url?: string;
 }
 
 export interface EmailConfig {
@@ -2214,7 +2277,7 @@ export interface EmailConfig {
 	smtp_host: string;
 	smtp_port: number;
 	smtp_user: string;
-	smtp_password: string;
+	smtp_password?: string;
 	/** "tls" | "starttls" | "none" */
 	smtp_encryption: string;
 	to_addrs: string[];
@@ -2226,7 +2289,10 @@ export interface Integration {
 	id: string;
 	name: string;
 	kind: IntegrationKind;
+	/** Config without its secret fields */
 	config: IntegrationConfig;
+	/** Secret fields that have a saved value, e.g. ["bot_token"] */
+	saved_secrets: string[];
 	enabled: boolean;
 	created_at: string;
 	updated_at: string;
@@ -2373,9 +2439,16 @@ export interface Snapshot {
 	local_path: string | null;
 	remote_key: string | null;
 	storage_provider_id: string | null;
+	/** SHA-256 of the encrypted archive in remote storage */
 	checksum_sha256: string | null;
 	error_message: string | null;
 	notes: string | null;
+	/** null (local only) | "uploading" | "uploaded" | "failed" */
+	remote_status: 'uploading' | 'uploaded' | 'failed' | null;
+	/** Why the last remote upload failed */
+	remote_error: string | null;
+	/** Size of the encrypted archive in remote storage */
+	archive_bytes: number | null;
 }
 
 export interface BackupConfig {
@@ -2430,11 +2503,21 @@ export async function rollbackAppToSnapshot(
 	});
 }
 
+export interface RestoreDatabaseResult {
+	message: string;
+	/** Backup of the data as it was just before the restore */
+	pre_restore_snapshot_id: string;
+}
+
+/**
+ * Restore one database from a snapshot that holds it. The server backs up the
+ * current data first and returns that backup's id.
+ */
 export async function restoreDatabase(
 	snapshotId: string,
 	dbName: string
-): Promise<{ message: string }> {
-	return request<{ message: string }>(`/snapshots/${snapshotId}/restore-database`, {
+): Promise<RestoreDatabaseResult> {
+	return request<RestoreDatabaseResult>(`/snapshots/${snapshotId}/restore-database`, {
 		method: 'POST',
 		body: JSON.stringify({ db_name: dbName })
 	});

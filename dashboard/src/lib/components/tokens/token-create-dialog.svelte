@@ -1,4 +1,5 @@
 <script lang="ts">
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import {
 		createToken,
 		getTokenCatalog,
@@ -394,11 +395,7 @@
 						</div>
 					</div>
 
-					{#if error}
-						<div class="rounded-md bg-destructive/10 p-3 text-sm text-destructive" role="alert">
-							{error}
-						</div>
-					{/if}
+					<InlineError message={error} />
 
 					<Dialog.Footer>
 						<Button type="button" variant="outline" onclick={() => (open = false)}>Cancel</Button>

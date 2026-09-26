@@ -1,4 +1,5 @@
 <script lang="ts">
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import {
 		createPasswordLink,
 		deleteUser,
@@ -213,11 +214,7 @@
 		{/if}
 	</div>
 
-	{#if error}
-		<div class="rounded-md bg-destructive/10 p-3 text-sm text-destructive" role="alert">
-			{error}
-		</div>
-	{/if}
+	<InlineError message={error} />
 
 	{#if users.length === 0}
 		<div class="rounded-lg border border-dashed border-border py-16 text-center">
@@ -316,11 +313,7 @@
 			<AlertDialog.Title>{pending?.title}</AlertDialog.Title>
 			<AlertDialog.Description>{pending?.description}</AlertDialog.Description>
 		</AlertDialog.Header>
-		{#if pendingError}
-			<div class="rounded-md bg-destructive/10 p-3 text-sm text-destructive" role="alert">
-				{pendingError}
-			</div>
-		{/if}
+		<InlineError message={pendingError} />
 		<AlertDialog.Footer>
 			<AlertDialog.Cancel disabled={pendingBusy}>Cancel</AlertDialog.Cancel>
 			<Button
@@ -388,11 +381,7 @@
 			<Dialog.Title>Sessions of {sessionsUser?.email}</Dialog.Title>
 			<Dialog.Description>Browsers signed in to this account right now.</Dialog.Description>
 		</Dialog.Header>
-		{#if sessionsError}
-			<div class="rounded-md bg-destructive/10 p-3 text-sm text-destructive" role="alert">
-				{sessionsError}
-			</div>
-		{/if}
+		<InlineError message={sessionsError} />
 		{#if sessionsLoading}
 			<p class="py-6 text-center text-sm text-muted-foreground">Loading…</p>
 		{:else if sessions.length === 0}

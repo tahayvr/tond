@@ -28,6 +28,7 @@ const integrations: Integration[] = [
 		kind: 'slack' as const,
 		enabled: true,
 		config: {} as Integration['config'],
+		saved_secrets: [],
 		created_at: '',
 		updated_at: ''
 	},
@@ -37,6 +38,7 @@ const integrations: Integration[] = [
 		kind: 'email' as const,
 		enabled: false,
 		config: {} as Integration['config'],
+		saved_secrets: [],
 		created_at: '',
 		updated_at: ''
 	}

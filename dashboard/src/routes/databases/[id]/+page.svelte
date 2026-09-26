@@ -1,6 +1,7 @@
 <script lang="ts">
 	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import ConnectionString from '$lib/components/databases/connection-string.svelte';
+	import DatabaseBackups from '$lib/components/databases/database-backups.svelte';
 	import { page } from '$app/state';
 	import {
 		getDatabase,
@@ -10,7 +11,9 @@
 		updateDatabase,
 		updateDatabaseCredentials,
 		redeployDatabase,
+		revealDatabaseCredentials,
 		listProjects,
+		type DatabaseCredentials,
 		type ManagedDatabaseDetail,
 		type Project
 	} from '$lib/api';
@@ -45,7 +48,7 @@
 	import GlobeIcon from '~icons/ri/global-line';
 	import LockIcon from '~icons/ri/lock-line';
 	import AlertIcon from '~icons/ri/alert-line';
-	import { isAdmin, can } from '$lib/auth.svelte';
+	import { can, isAdmin } from '$lib/auth.svelte';
 	import type { PageProps } from './$types';
 
 	let { data, params }: PageProps = $props();
@@ -55,15 +58,15 @@
 	};
 
 	let db = $state<ManagedDatabaseDetail | null>(null);
-	let error = $state('');
-	let projects = $state<Project[]>([]);
-	let showDeleteDialog = $state(false);
 	/** Active tab from `?tab=` (old `?tab=limits` links open Settings). */
 	let tab = $derived<DatabaseTab>(
 		page.url.searchParams.get('tab') === 'limits'
 			? 'settings'
 			: tabFromUrl(page.url, DATABASE_TABS, 'overview')
 	);
+	let error = $state('');
+	let projects = $state<Project[]>([]);
+	let showDeleteDialog = $state(false);
 	let acting = $state(false);
 	let redeploying = $state(false);
 
@@ -109,6 +112,26 @@
 		return field === 'root_password' ? 'Root password' : 'Password';
 	}
 
+	// Passwords are write-only in the API: the plaintext is fetched once, on an
+	// explicit (audited) reveal, and kept only in this page.
+	let creds = $state<DatabaseCredentials | null>(null);
+	let revealingCreds = $state(false);
+	let credsError = $state('');
+
+	async function revealCreds(): Promise<void> {
+		if (creds) return;
+		revealingCreds = true;
+		credsError = '';
+		try {
+			creds = await revealDatabaseCredentials(dbId);
+		} catch (e: any) {
+			credsError = e.message ?? 'Could not reveal the credentials';
+			throw e;
+		} finally {
+			revealingCreds = false;
+		}
+	}
+
 	// Per-row reveal/copy state
 	let revealedKeys = new SvelteSet<string>();
 	let copiedEnvVar = $state<string | null>(null);
@@ -119,8 +142,7 @@
 	let memoryUnitDraft = $state<'mb' | 'gb'>('mb');
 	let savingLimits = $state(false);
 	let limitsError = $state('');
-	let limitsSaved = $state(false);
-	let limitsSavedTimeout: ReturnType<typeof setTimeout> | null = null;
+	let limitsSaved = $state('');
 
 	let dbId = $derived(page.params.id || params.id);
 
@@ -216,8 +238,10 @@
 
 	// ── URL editing ──
 
+	// Drafts start from the plaintext string when it has been revealed; the
+	// masked one would save the mask as the password.
 	function startEditExternal() {
-		externalDraft = db?.custom_external_url ?? db?.connection_string ?? '';
+		externalDraft = creds?.connection_string ?? '';
 		editingExternal = true;
 		urlError = '';
 	}
@@ -232,6 +256,7 @@
 		urlError = '';
 		try {
 			db = await updateDatabase(dbId, { custom_external_url: externalDraft || null });
+			creds = null;
 			editingExternal = false;
 		} catch (e: any) {
 			urlError = e.message ?? 'Failed to save external URL';
@@ -245,6 +270,7 @@
 		urlError = '';
 		try {
 			db = await updateDatabase(dbId, { custom_external_url: '' });
+			creds = null;
 			editingExternal = false;
 		} catch (e: any) {
 			urlError = e.message ?? 'Failed to clear external URL override';
@@ -254,7 +280,7 @@
 	}
 
 	function startEditInternal() {
-		internalDraft = db?.custom_internal_url ?? db?.internal_connection_string ?? '';
+		internalDraft = creds?.internal_connection_string ?? '';
 		editingInternal = true;
 		urlError = '';
 	}
@@ -269,6 +295,7 @@
 		urlError = '';
 		try {
 			db = await updateDatabase(dbId, { custom_internal_url: internalDraft || null });
+			creds = null;
 			editingInternal = false;
 		} catch (e: any) {
 			urlError = e.message ?? 'Failed to save internal URL';
@@ -282,6 +309,7 @@
 		urlError = '';
 		try {
 			db = await updateDatabase(dbId, { custom_internal_url: '' });
+			creds = null;
 			editingInternal = false;
 		} catch (e: any) {
 			urlError = e.message ?? 'Failed to clear internal URL override';
@@ -366,6 +394,8 @@
 			const field = editingCredField;
 			const res = await updateDatabaseCredentials(dbId, { [field]: credDraft });
 			db = res.database;
+			creds = null;
+			revealedKeys.clear();
 			if (db) setUiContext(databaseContext(db));
 			credSuccess = `${credLabel(field)} changed inside the database and saved. Update any app that still connects with the old password, then redeploy it.`;
 			credDialogOpen = false;
@@ -378,15 +408,31 @@
 		}
 	}
 
-	function toggleReveal(envKey: string) {
+	async function toggleReveal(envKey: string, secret: boolean) {
 		if (revealedKeys.has(envKey)) {
 			revealedKeys.delete(envKey);
-		} else {
-			revealedKeys.add(envKey);
+			return;
 		}
+		if (secret) {
+			try {
+				await revealCreds();
+			} catch {
+				return;
+			}
+		}
+		revealedKeys.add(envKey);
 	}
 
-	async function copyEnvVar(text: string, key: string) {
+	/** Copy a value; secrets are revealed (audited) first. */
+	async function copyEnvVar(value: () => string, key: string, secret: boolean) {
+		if (secret) {
+			try {
+				await revealCreds();
+			} catch {
+				return;
+			}
+		}
+		const text = value();
 		await navigator.clipboard.writeText(text);
 		copiedEnvVar = key;
 		if (copyTimeout) clearTimeout(copyTimeout);
@@ -425,9 +471,7 @@
 			}
 			db = await updateDatabase(dbId, { memory_limit: memoryLimitBytes });
 			if (db) setUiContext(databaseContext(db));
-			limitsSaved = true;
-			if (limitsSavedTimeout) clearTimeout(limitsSavedTimeout);
-			limitsSavedTimeout = setTimeout(() => (limitsSaved = false), 2000);
+			limitsSaved = 'Memory limit saved.';
 		} catch (e: any) {
 			limitsError = e.message ?? 'Failed to save limits';
 		} finally {
@@ -439,12 +483,17 @@
 	let envVars = $derived.by(() => {
 		if (!db) return [];
 		const type = db.db_type;
+		// Password values come from `creds` once revealed; until then they are
+		// `null` with `secret: true` (shown masked when the database has one).
 		const vars: {
 			envKey: string;
 			credField: CredField;
 			label: string;
 			value: string | null;
+			secret?: boolean;
 		}[] = [];
+		const password = { value: creds?.db_password ?? null, secret: true };
+		const rootPassword = { value: creds?.root_password ?? null, secret: true };
 
 		if (type === 'postgres') {
 			if (db.db_name !== null)
@@ -461,12 +510,12 @@
 					label: 'Username',
 					value: db.db_user
 				});
-			if (db.db_password !== null)
+			if (db.has_password)
 				vars.push({
 					envKey: 'POSTGRES_PASSWORD',
 					credField: 'db_password',
 					label: 'Password',
-					value: db.db_password
+					...password
 				});
 		} else if (type === 'mysql' || type === 'mariadb') {
 			const prefix = type === 'mariadb' ? 'MARIADB' : 'MYSQL';
@@ -484,19 +533,19 @@
 					label: 'Username',
 					value: db.db_user
 				});
-			if (db.db_password !== null)
+			if (db.has_password)
 				vars.push({
 					envKey: `${prefix}_PASSWORD`,
 					credField: 'db_password',
 					label: 'Password',
-					value: db.db_password
+					...password
 				});
-			if (db.root_password !== null)
+			if (db.has_root_password)
 				vars.push({
 					envKey: `${prefix}_ROOT_PASSWORD`,
 					credField: 'root_password',
 					label: 'Root password',
-					value: db.root_password
+					...rootPassword
 				});
 		} else if (type === 'mongodb') {
 			if (db.db_name !== null)
@@ -513,12 +562,12 @@
 					label: 'Username',
 					value: db.db_user
 				});
-			if (db.db_password !== null)
+			if (db.has_password)
 				vars.push({
 					envKey: 'MONGO_INITDB_ROOT_PASSWORD',
 					credField: 'db_password',
 					label: 'Password',
-					value: db.db_password
+					...password
 				});
 		} else if (type === 'redis' || type === 'keydb') {
 			if (db.db_user !== null)
@@ -528,12 +577,12 @@
 					label: 'Username',
 					value: db.db_user
 				});
-			if (db.db_password !== null)
+			if (db.has_password)
 				vars.push({
 					envKey: 'REDIS_PASSWORD',
 					credField: 'db_password',
 					label: 'Password',
-					value: db.db_password
+					...password
 				});
 		}
 
@@ -640,7 +689,7 @@
 			{#if tab === 'overview'}
 				<div class="mt-4 space-y-4">
 					<!-- Info grid -->
-					<div class="grid grid-cols-1 gap-4 sm:grid-cols-2 [&>*]:min-w-0">
+					<div class="grid gap-4 sm:grid-cols-2">
 						<!-- Connection strings -->
 						<div class="space-y-4 rounded-lg border p-4">
 							<h2 class="text-sm font-semibold tracking-wide text-muted-foreground uppercase">
@@ -648,6 +697,7 @@
 							</h2>
 
 							<InlineError message={urlError} />
+							<InlineError message={credsError} />
 
 							<!-- External URL -->
 							<div class="space-y-2">
@@ -675,6 +725,9 @@
 											bind:value={externalDraft}
 											disabled={savingExternal}
 										/>
+										<p class="text-xs text-muted-foreground">
+											Enter the full string, including the password. It is stored encrypted.
+										</p>
 										<div class="flex gap-2">
 											<Button size="sm" disabled={savingExternal} onclick={saveExternal}>
 												{savingExternal ? 'Saving...' : 'Save'}
@@ -702,7 +755,12 @@
 									</div>
 								{:else if db.connection_string}
 									<div>
-										<ConnectionString value={db.connection_string} />
+										<ConnectionString
+											value={db.connection_string}
+											plain={creds?.connection_string}
+											reveal={revealCreds}
+											canReveal={can('db:credentials')}
+										/>
 										{#if db.custom_external_url}
 											<span class="mt-1 block text-xs text-muted-foreground">custom override</span>
 										{/if}
@@ -738,6 +796,9 @@
 											bind:value={internalDraft}
 											disabled={savingInternal}
 										/>
+										<p class="text-xs text-muted-foreground">
+											Enter the full string, including the password. It is stored encrypted.
+										</p>
 										<div class="flex gap-2">
 											<Button size="sm" disabled={savingInternal} onclick={saveInternal}>
 												{savingInternal ? 'Saving...' : 'Save'}
@@ -765,7 +826,12 @@
 									</div>
 								{:else if db.internal_connection_string}
 									<div>
-										<ConnectionString value={db.internal_connection_string} />
+										<ConnectionString
+											value={db.internal_connection_string}
+											plain={creds?.internal_connection_string}
+											reveal={revealCreds}
+											canReveal={can('db:credentials')}
+										/>
 										{#if db.custom_internal_url}
 											<span class="mt-1 block text-xs text-muted-foreground">custom override</span>
 										{/if}
@@ -898,7 +964,12 @@
 							{#if db.public_connection_string}
 								<div class="space-y-1">
 									<p class="text-xs font-medium text-muted-foreground">Public connection string</p>
-									<ConnectionString value={db.public_connection_string} />
+									<ConnectionString
+										value={db.public_connection_string}
+										plain={creds?.public_connection_string}
+										reveal={revealCreds}
+										canReveal={can('db:credentials')}
+									/>
 									{#if db.public_connection_string.includes('<server-ip>')}
 										<p class="text-xs text-muted-foreground">
 											Replace <span class="font-mono">&lt;server-ip&gt;</span> with this server's public
@@ -1016,6 +1087,14 @@
 						<div
 							class="rounded-lg border border-border bg-muted/30 px-4 py-3 text-xs text-muted-foreground"
 						>
+							<p class="mb-1">
+								Passwords are stored encrypted and stay hidden.
+								{#if can('db:credentials')}
+									Revealing or copying one is recorded in Activity.
+								{:else}
+									Your role can't reveal them.
+								{/if}
+							</p>
 							{#if isRedisLike}
 								Redis and KeyDB passwords can't be changed in place yet.
 							{:else}
@@ -1046,7 +1125,7 @@
 											class="px-3 py-2 text-left font-mono text-xs font-medium text-muted-foreground uppercase"
 											>Value</th
 										>
-										<th class="w-24 px-3 py-2"><span class="sr-only">Actions</span></th>
+										<th class="w-28 px-3 py-2"><span class="sr-only">Actions</span></th>
 									</tr>
 								</thead>
 								<tbody>
@@ -1057,9 +1136,9 @@
 											<td
 												class="max-w-0 truncate px-3 py-2 font-mono text-xs text-muted-foreground"
 											>
-												{#if !v.value}
+												{#if !v.secret && !v.value}
 													<span class="italic">empty</span>
-												{:else if revealed}
+												{:else if revealed && v.value !== null}
 													{v.value}
 												{:else}
 													<span class="tracking-widest">••••••••</span>
@@ -1067,13 +1146,14 @@
 											</td>
 											<td class="px-3 py-2">
 												<div class="flex items-center justify-end gap-1">
-													{#if v.value}
+													{#if v.value || (v.secret && can('db:credentials'))}
 														<Button
 															variant="ghost"
 															size="icon"
 															class="h-7 w-7 text-muted-foreground hover:text-foreground"
-															aria-label={revealed ? 'Hide value' : 'Reveal value'}
-															onclick={() => toggleReveal(v.envKey)}
+															aria-label={`${revealed ? 'Hide' : 'Reveal'} ${v.envKey}`}
+															disabled={revealingCreds}
+															onclick={() => toggleReveal(v.envKey, !!v.secret)}
 														>
 															{#if revealed}
 																<EyeOff class="h-3.5 w-3.5" />
@@ -1086,10 +1166,16 @@
 															size="icon"
 															class="h-7 w-7 text-muted-foreground hover:text-foreground"
 															aria-label="Copy value"
-															onclick={() => copyEnvVar(v.value ?? '', v.envKey)}
+															disabled={revealingCreds}
+															onclick={() =>
+																copyEnvVar(
+																	() => envVars.find((e) => e.envKey === v.envKey)?.value ?? '',
+																	v.envKey,
+																	!!v.secret
+																)}
 														>
 															{#if copiedEnvVar === v.envKey}
-																<Check class="h-3.5 w-3.5 text-success" />
+																<Check class="h-3.5 w-3.5 text-green-500" />
 															{:else}
 																<Copy class="h-3.5 w-3.5" />
 															{/if}
@@ -1129,10 +1215,13 @@
 									variant="ghost"
 									size="sm"
 									class="h-6 px-2 text-xs"
+									disabled={revealingCreds ||
+										(!can('db:credentials') && envVars.some((v) => v.secret))}
 									onclick={() =>
 										copyEnvVar(
-											envVars.map((v) => `${v.envKey}=${v.value ?? ''}`).join('\n'),
-											'__all__'
+											() => envVars.map((v) => `${v.envKey}=${v.value ?? ''}`).join('\n'),
+											'__all__',
+											envVars.some((v) => v.secret)
 										)}
 								>
 									{copiedEnvVar === '__all__' ? 'Copied!' : 'Copy'}
@@ -1144,11 +1233,23 @@
 								class="overflow-x-auto rounded bg-muted px-3 py-2 font-mono text-xs leading-relaxed">{envVars
 									.map(
 										(v) =>
-											`${v.envKey}=${revealedKeys.has(v.envKey) ? (v.value ?? '') : '••••••••'}`
+											`${v.envKey}=${revealedKeys.has(v.envKey) || !v.secret ? (v.value ?? '') : '••••••••'}`
 									)
 									.join('\n')}</pre>
 						</div>
 					{/if}
+				</div>
+			{/if}
+
+			<!-- ── Backups tab ── -->
+			{#if tab === 'backups'}
+				<div class="mt-4">
+					<DatabaseBackups
+						dbId={db.id}
+						dbName={db.name}
+						canRestore={can('snapshots:restore')}
+						canBackup={can('snapshots:create')}
+					/>
 				</div>
 			{/if}
 
@@ -1157,9 +1258,10 @@
 				<div class="mt-4 space-y-8 pt-2">
 					<div class="max-w-sm space-y-6">
 						<div class="space-y-2">
-							<Label>Memory Limit</Label>
+							<Label for="db-memory-limit">Memory limit</Label>
 							<div class="flex gap-2">
 								<Input
+									id="db-memory-limit"
 									type="number"
 									bind:value={memoryLimitDraft}
 									placeholder="Unlimited"
@@ -1167,7 +1269,7 @@
 									disabled={savingLimits}
 								/>
 								<Select.Root type="single" bind:value={memoryUnitDraft}>
-									<Select.Trigger class="w-24" disabled={savingLimits}>
+									<Select.Trigger class="w-24" disabled={savingLimits} aria-label="Memory unit">
 										{memoryUnitDraft.toUpperCase()}
 									</Select.Trigger>
 									<Select.Content>
@@ -1188,7 +1290,11 @@
 							<Button onclick={saveLimits} disabled={savingLimits}>
 								{savingLimits ? 'Saving...' : 'Save'}
 							</Button>
-							<SuccessAlert message={limitsSaved ? 'Memory limit saved.' : ''} class="py-1.5" />
+							<SuccessAlert
+								message={limitsSaved}
+								ondismiss={() => (limitsSaved = '')}
+								timeout={5000}
+							/>
 						</div>
 					</div>
 					{#if can('db:delete')}

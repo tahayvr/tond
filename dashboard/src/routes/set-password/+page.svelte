@@ -1,4 +1,5 @@
 <script lang="ts">
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { checkPasswordLink, completePasswordLink, type PasswordLinkInfo } from '$lib/api';
@@ -132,11 +133,7 @@
 						autocomplete="new-password"
 					/>
 				</div>
-				{#if error}
-					<p class="rounded-md bg-destructive/10 p-3 text-sm text-destructive" role="alert">
-						{error}
-					</p>
-				{/if}
+				<InlineError message={error} />
 				<Button type="submit" class="w-full" disabled={saving}>
 					{saving ? 'Saving…' : info?.purpose === 'reset' ? 'Set new password' : 'Create account'}
 				</Button>

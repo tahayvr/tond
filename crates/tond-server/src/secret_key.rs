@@ -1,8 +1,10 @@
 // secret_key.rs — at-rest encryption for stored secrets
 //
-// Every secret tond-server stores encrypted (registry credential passwords,
-// GitLab PATs, storage provider secret access keys, users' TOTP secrets) uses
-// one format:
+// Every secret tond-server stores is encrypted with one format: app env vars
+// and preview overrides, project and cron env, app webhook secrets, managed
+// database passwords and connection-string overrides, GitHub App credentials,
+// GitLab PATs, notification integration secrets, alert webhook URLs, registry
+// passwords, storage provider secret keys and users' TOTP secrets:
 //
 //   "v1." base64(nonce || AES-256-GCM ciphertext)
 //
@@ -23,6 +25,8 @@ use aes_gcm::{
     Aes256Gcm, KeyInit,
     aead::{Aead, Nonce, Payload},
 };
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use hmac::{Hmac, Mac};
@@ -47,6 +51,29 @@ pub enum Purpose {
     GitlabToken,
     StorageSecretKey,
     TotpSecret,
+    /// apps.env_vars (the whole JSON object, see `seal_map`)
+    AppEnv,
+    /// apps.preview_env_vars (the whole JSON object)
+    AppPreviewEnv,
+    AppWebhookSecret,
+    /// projects.env_vars (the whole JSON object)
+    ProjectEnv,
+    /// cron_jobs.env (the whole JSON object)
+    CronEnv,
+    DatabasePassword,
+    DatabaseRootPassword,
+    /// databases.custom_external_url (may embed a password)
+    DatabaseExternalUrl,
+    /// databases.custom_internal_url (may embed a password)
+    DatabaseInternalUrl,
+    GithubClientSecret,
+    GithubWebhookSecret,
+    GithubPrivateKey,
+    /// Secret fields inside integrations.config (bot tokens, webhook URLs,
+    /// SMTP passwords)
+    IntegrationSecret,
+    /// alert_rules.webhook_url (Slack/Discord-style URLs are bearer secrets)
+    AlertWebhookUrl,
 }
 
 impl Purpose {
@@ -56,8 +83,46 @@ impl Purpose {
             Purpose::GitlabToken => b"tond:gitlab_tokens.token_enc",
             Purpose::StorageSecretKey => b"tond:storage_providers.secret_access_key_enc",
             Purpose::TotpSecret => b"tond:users.totp_secret_enc",
+            Purpose::AppEnv => b"tond:apps.env_vars",
+            Purpose::AppPreviewEnv => b"tond:apps.preview_env_vars",
+            Purpose::AppWebhookSecret => b"tond:apps.webhook_secret",
+            Purpose::ProjectEnv => b"tond:projects.env_vars",
+            Purpose::CronEnv => b"tond:cron_jobs.env",
+            Purpose::DatabasePassword => b"tond:databases.db_password",
+            Purpose::DatabaseRootPassword => b"tond:databases.root_password",
+            Purpose::DatabaseExternalUrl => b"tond:databases.custom_external_url",
+            Purpose::DatabaseInternalUrl => b"tond:databases.custom_internal_url",
+            Purpose::GithubClientSecret => b"tond:github_apps.client_secret",
+            Purpose::GithubWebhookSecret => b"tond:github_apps.webhook_secret",
+            Purpose::GithubPrivateKey => b"tond:github_apps.private_key",
+            Purpose::IntegrationSecret => b"tond:integrations.config",
+            Purpose::AlertWebhookUrl => b"tond:alert_rules.webhook_url",
         }
     }
+}
+
+/// HKDF-SHA256 (RFC 5869) of `secret` with `salt` and `info`; one 32-byte block.
+pub fn hkdf_sha256(secret: &[u8], salt: &[u8], info: &[u8]) -> [u8; 32] {
+    let mut extract =
+        <Hmac<Sha256> as KeyInit>::new_from_slice(salt).expect("HMAC accepts any key length");
+    extract.update(secret);
+    let prk = extract.finalize().into_bytes();
+
+    let mut expand =
+        <Hmac<Sha256> as KeyInit>::new_from_slice(&prk).expect("HMAC accepts any key length");
+    expand.update(info);
+    expand.update(&[1]);
+    expand.finalize().into_bytes().into()
+}
+
+/// TOND_SECRET_KEY (the public dev secret when unset in debug builds).
+pub fn current_secret() -> String {
+    env_secret(SECRET_KEY_ENV).unwrap_or_else(|| DEV_SECRET.to_string())
+}
+
+/// TOND_PREVIOUS_SECRET_KEY, when a key rotation is in progress.
+pub fn previous_secret() -> Option<String> {
+    env_secret(PREVIOUS_SECRET_KEY_ENV)
 }
 
 /// A 256-bit AES key derived from a secret.
@@ -67,25 +132,20 @@ pub struct Key([u8; 32]);
 impl Key {
     /// HKDF-SHA256 (RFC 5869) with a fixed salt and info; one 32-byte block.
     pub fn derive(secret: &str) -> Self {
-        let mut extract = <Hmac<Sha256> as KeyInit>::new_from_slice(b"tond-secret-key-salt-v1")
-            .expect("HMAC accepts any key length");
-        extract.update(secret.as_bytes());
-        let prk = extract.finalize().into_bytes();
-
-        let mut expand =
-            <Hmac<Sha256> as KeyInit>::new_from_slice(&prk).expect("HMAC accepts any key length");
-        expand.update(b"tond stored secrets v1");
-        expand.update(&[1]);
-        Self(expand.finalize().into_bytes().into())
+        Self(hkdf_sha256(
+            secret.as_bytes(),
+            b"tond-secret-key-salt-v1",
+            b"tond stored secrets v1",
+        ))
     }
 
     /// The key from TOND_SECRET_KEY (the dev secret when unset).
     pub fn current() -> Self {
-        Self::derive(env_secret(SECRET_KEY_ENV).as_deref().unwrap_or(DEV_SECRET))
+        Self::derive(&current_secret())
     }
 
     fn previous() -> Option<Self> {
-        env_secret(PREVIOUS_SECRET_KEY_ENV).map(|s| Self::derive(&s))
+        previous_secret().map(|s| Self::derive(&s))
     }
 
     fn cipher(&self) -> Aes256Gcm {
@@ -123,6 +183,93 @@ pub fn encrypt(purpose: Purpose, plaintext: &str) -> Result<String> {
 /// Decrypt a value produced by `encrypt` for the same `purpose`.
 pub fn decrypt(purpose: Purpose, encoded: &str) -> Result<String> {
     decrypt_with(&Key::current(), purpose, encoded)
+}
+
+/// Encrypt an optional value; `None` stays `None`.
+pub fn encrypt_opt(purpose: Purpose, plaintext: Option<&str>) -> Result<Option<String>> {
+    plaintext.map(|p| encrypt(purpose, p)).transpose()
+}
+
+/// Decrypt an optional value; `None` stays `None`.
+pub fn decrypt_opt(purpose: Purpose, encoded: Option<&str>) -> Result<Option<String>> {
+    encoded.map(|e| decrypt(purpose, e)).transpose()
+}
+
+/// Stored form of an empty key/value map. It holds nothing secret, so it is
+/// kept readable (column defaults use it too).
+pub const EMPTY_MAP: &str = "{}";
+
+/// Encrypt a key/value map (env vars) as one value: the JSON object is the
+/// plaintext. An empty map is stored as `EMPTY_MAP`.
+pub fn seal_map(purpose: Purpose, map: &BTreeMap<String, String>) -> Result<String> {
+    if map.is_empty() {
+        return Ok(EMPTY_MAP.to_string());
+    }
+    let json = serde_json::to_string(map).context("failed to serialise map")?;
+    encrypt(purpose, &json)
+}
+
+/// Decrypt a map stored by `seal_map`. NULL, blank and `EMPTY_MAP` read as an
+/// empty map; anything else must decrypt, so a corrupt value is an error and
+/// is never silently replaced.
+pub fn open_map(purpose: Purpose, stored: Option<&str>) -> Result<BTreeMap<String, String>> {
+    let stored = stored.map(str::trim).unwrap_or_default();
+    if stored.is_empty() || stored == EMPTY_MAP {
+        return Ok(BTreeMap::new());
+    }
+    let json = decrypt(purpose, stored)?;
+    let value: serde_json::Value =
+        serde_json::from_str(&json).context("decrypted map is not valid JSON")?;
+    let object = value
+        .as_object()
+        .context("decrypted map is not a JSON object")?;
+    Ok(object
+        .iter()
+        .map(|(k, v)| {
+            let value = match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Null => String::new(),
+                other => other.to_string(),
+            };
+            (k.clone(), value)
+        })
+        .collect())
+}
+
+/// Encrypt the listed string fields of a JSON object in place (fields that
+/// are missing, not strings or empty are left alone).
+pub fn seal_json_fields(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    fields: &[&str],
+    purpose: Purpose,
+) -> Result<()> {
+    for field in fields {
+        if let Some(serde_json::Value::String(value)) = object.get(*field)
+            && !value.is_empty()
+        {
+            let sealed = encrypt(purpose, value)?;
+            object.insert((*field).to_string(), serde_json::Value::String(sealed));
+        }
+    }
+    Ok(())
+}
+
+/// Reverse of `seal_json_fields`.
+pub fn open_json_fields(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    fields: &[&str],
+    purpose: Purpose,
+) -> Result<()> {
+    for field in fields {
+        if let Some(serde_json::Value::String(value)) = object.get(*field)
+            && !value.is_empty()
+        {
+            let opened = decrypt(purpose, value)
+                .with_context(|| format!("stored secret '{field}' cannot be decrypted"))?;
+            object.insert((*field).to_string(), serde_json::Value::String(opened));
+        }
+    }
+    Ok(())
 }
 
 pub fn encrypt_with(key: &Key, purpose: Purpose, plaintext: &str) -> Result<String> {
@@ -233,25 +380,19 @@ pub async fn reencrypt_stored_secrets(
     }
     let mut tx = pool.begin().await?;
 
-    for (table, column, purpose) in [
-        (
-            "registry_credentials",
-            "password_enc",
-            Purpose::RegistryPassword,
-        ),
-        ("gitlab_tokens", "token_enc", Purpose::GitlabToken),
-        ("users", "totp_secret_enc", Purpose::TotpSecret),
-    ] {
-        // `table` and `column` come from the literal list above: injection-safe.
+    for (table, column, purpose) in SCALAR_SECRET_COLUMNS {
+        // `table` and `column` come from the literal list: injection-safe.
+        // Empty maps are stored as readable `{}` and hold nothing to rotate.
         let rows: Vec<(String, String)> = sqlx::query_as(AssertSqlSafe(format!(
-            "SELECT id, {column} FROM {table} WHERE {column} IS NOT NULL AND {column} != ''"
+            "SELECT id, {column} FROM {table}
+             WHERE {column} IS NOT NULL AND {column} != '' AND {column} != '{EMPTY_MAP}'"
         )))
         .fetch_all(&mut *tx)
         .await?;
         for (id, value) in rows {
             let what = format!("{table}.{column} for id {id}");
             if let Some(new_value) =
-                rotate_value(&value, purpose, current, previous, &mut report, &what)?
+                rotate_value(&value, *purpose, current, previous, &mut report, &what)?
             {
                 sqlx::query(AssertSqlSafe(format!(
                     "UPDATE {table} SET {column} = ? WHERE id = ?"
@@ -264,45 +405,103 @@ pub async fn reencrypt_stored_secrets(
         }
     }
 
-    // storage_providers.config JSON → secret_access_key_enc.
-    let rows: Vec<(String, String)> = sqlx::query_as("SELECT id, config FROM storage_providers")
-        .fetch_all(&mut *tx)
-        .await?;
-    for (id, config) in rows {
-        let Ok(mut cfg) =
-            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&config)
-        else {
-            continue;
-        };
-        let Some(value) = cfg.get("secret_access_key_enc").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let what = format!("storage_providers secret for id {id}");
-        if let Some(new_value) = rotate_value(
-            value,
-            Purpose::StorageSecretKey,
-            current,
-            previous,
-            &mut report,
-            &what,
-        )? {
-            cfg.insert(
-                "secret_access_key_enc".to_string(),
-                serde_json::Value::String(new_value),
-            );
-            let new_config = serde_json::to_string(&cfg)
-                .context("failed to serialise storage provider config")?;
-            sqlx::query("UPDATE storage_providers SET config = ? WHERE id = ?")
+    // Secrets stored as fields inside a JSON config column.
+    for (table, fields, purpose) in JSON_SECRET_FIELDS {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as(AssertSqlSafe(format!("SELECT id, config FROM {table}")))
+                .fetch_all(&mut *tx)
+                .await?;
+        for (id, config) in rows {
+            let Ok(mut cfg) =
+                serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&config)
+            else {
+                continue;
+            };
+            let mut changed = false;
+            for field in *fields {
+                let Some(value) = cfg.get(*field).and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if value.is_empty() {
+                    continue;
+                }
+                let what = format!("{table}.config.{field} for id {id}");
+                if let Some(new_value) =
+                    rotate_value(value, *purpose, current, previous, &mut report, &what)?
+                {
+                    cfg.insert((*field).to_string(), serde_json::Value::String(new_value));
+                    changed = true;
+                }
+            }
+            if changed {
+                let new_config =
+                    serde_json::to_string(&cfg).context("failed to serialise config")?;
+                sqlx::query(AssertSqlSafe(format!(
+                    "UPDATE {table} SET config = ? WHERE id = ?"
+                )))
                 .bind(&new_config)
                 .bind(&id)
                 .execute(&mut *tx)
                 .await?;
+            }
         }
     }
 
     tx.commit().await?;
     Ok(report)
 }
+
+/// Every column that holds one encrypted value (a map sealed with `seal_map`
+/// counts as one value). Key rotation walks this list: a new secret column
+/// must be added here.
+pub const SCALAR_SECRET_COLUMNS: &[(&str, &str, Purpose)] = &[
+    (
+        "registry_credentials",
+        "password_enc",
+        Purpose::RegistryPassword,
+    ),
+    ("gitlab_tokens", "token_enc", Purpose::GitlabToken),
+    ("users", "totp_secret_enc", Purpose::TotpSecret),
+    ("apps", "env_vars", Purpose::AppEnv),
+    ("apps", "preview_env_vars", Purpose::AppPreviewEnv),
+    ("apps", "webhook_secret", Purpose::AppWebhookSecret),
+    ("projects", "env_vars", Purpose::ProjectEnv),
+    ("cron_jobs", "env", Purpose::CronEnv),
+    ("databases", "db_password", Purpose::DatabasePassword),
+    ("databases", "root_password", Purpose::DatabaseRootPassword),
+    (
+        "databases",
+        "custom_external_url",
+        Purpose::DatabaseExternalUrl,
+    ),
+    (
+        "databases",
+        "custom_internal_url",
+        Purpose::DatabaseInternalUrl,
+    ),
+    ("github_apps", "client_secret", Purpose::GithubClientSecret),
+    (
+        "github_apps",
+        "webhook_secret",
+        Purpose::GithubWebhookSecret,
+    ),
+    ("github_apps", "private_key", Purpose::GithubPrivateKey),
+    ("alert_rules", "webhook_url", Purpose::AlertWebhookUrl),
+];
+
+/// Secrets stored as string fields inside a `config` JSON column.
+pub const JSON_SECRET_FIELDS: &[(&str, &[&str], Purpose)] = &[
+    (
+        "storage_providers",
+        &["secret_access_key_enc"],
+        Purpose::StorageSecretKey,
+    ),
+    (
+        "integrations",
+        tond_common::INTEGRATION_SECRET_FIELDS,
+        Purpose::IntegrationSecret,
+    ),
+];
 
 #[cfg(test)]
 mod tests {
@@ -491,6 +690,120 @@ mod tests {
                 undecryptable: 1
             },
             "second run is a no-op apart from the undecryptable row"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_covers_every_new_secret_column() {
+        let pool = test_pool().await;
+        let old = Key::derive("old-production-secret");
+        let new = Key::derive("new-production-secret");
+        let enc = |purpose: Purpose, value: &str| {
+            encrypt_with(&old, purpose, value).unwrap_or_else(|err| panic!("encrypt: {err}"))
+        };
+
+        sqlx::query(
+            "INSERT INTO apps (id, name, created_at, updated_at, env_vars, preview_env_vars, webhook_secret)
+             VALUES ('a1', 'web', 'now', 'now', ?, '{}', ?)",
+        )
+        .bind(enc(Purpose::AppEnv, r#"{"K":"v"}"#))
+        .bind(enc(Purpose::AppWebhookSecret, "hook"))
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|err| panic!("insert app: {err}"));
+        sqlx::query(
+            "INSERT INTO databases (id, name, db_type, db_password, custom_external_url)
+             VALUES ('d1', 'pg', 'postgres', ?, ?)",
+        )
+        .bind(enc(Purpose::DatabasePassword, "pw"))
+        .bind(enc(Purpose::DatabaseExternalUrl, "postgres://u:pw@h/db"))
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|err| panic!("insert database: {err}"));
+        sqlx::query(
+            "INSERT INTO github_apps (id, name, app_id, client_id, client_secret, webhook_secret, private_key, slug)
+             VALUES ('g1', 'gh', 1, 'cid', ?, ?, ?, 'slug')",
+        )
+        .bind(enc(Purpose::GithubClientSecret, "cs"))
+        .bind(enc(Purpose::GithubWebhookSecret, "ws"))
+        .bind(enc(Purpose::GithubPrivateKey, "pem"))
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|err| panic!("insert github app: {err}"));
+        let config = serde_json::json!({
+            "chat_id": "42",
+            "bot_token": enc(Purpose::IntegrationSecret, "123:tok"),
+        });
+        sqlx::query(
+            "INSERT INTO integrations (id, name, kind, config) VALUES ('i1', 'tg', 'telegram', ?)",
+        )
+        .bind(config.to_string())
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|err| panic!("insert integration: {err}"));
+        sqlx::query("INSERT INTO alert_rules (id, name, metric, threshold, webhook_url) VALUES ('r1', 'cpu', 'cpu', 80, ?)")
+            .bind(enc(Purpose::AlertWebhookUrl, "https://hooks.example.com/x"))
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|err| panic!("insert alert rule: {err}"));
+
+        let report = reencrypt_stored_secrets(&pool, &new, &old)
+            .await
+            .unwrap_or_else(|err| panic!("rotation: {err}"));
+        assert_eq!(
+            report,
+            RotationReport {
+                reencrypted: 9,
+                undecryptable: 0
+            },
+            "every encrypted column must be rotated; the empty preview map is skipped"
+        );
+
+        let (env, hook): (String, String) =
+            sqlx::query_as("SELECT env_vars, webhook_secret FROM apps WHERE id = 'a1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|err| panic!("read app: {err}"));
+        assert!(decrypt_with(&new, Purpose::AppEnv, &env).is_ok());
+        assert_eq!(
+            decrypt_with(&new, Purpose::AppWebhookSecret, &hook)
+                .ok()
+                .as_deref(),
+            Some("hook")
+        );
+        let (config,): (String,) =
+            sqlx::query_as("SELECT config FROM integrations WHERE id = 'i1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|err| panic!("read integration: {err}"));
+        let config: serde_json::Value =
+            serde_json::from_str(&config).unwrap_or_else(|err| panic!("config json: {err}"));
+        assert_eq!(
+            decrypt_with(
+                &new,
+                Purpose::IntegrationSecret,
+                config["bot_token"].as_str().unwrap_or_default()
+            )
+            .ok()
+            .as_deref(),
+            Some("123:tok")
+        );
+        assert_eq!(config["chat_id"], "42");
+    }
+
+    #[test]
+    fn maps_round_trip_and_empty_maps_stay_readable() {
+        let map = BTreeMap::from([("A".to_string(), "1".to_string())]);
+        let sealed = seal_map(Purpose::AppEnv, &map).unwrap_or_default();
+        assert!(sealed.starts_with("v1."));
+        assert_eq!(open_map(Purpose::AppEnv, Some(&sealed)).ok(), Some(map));
+        assert!(
+            open_map(Purpose::ProjectEnv, Some(&sealed)).is_err(),
+            "a map sealed for one column must not open for another"
+        );
+        assert_eq!(
+            seal_map(Purpose::AppEnv, &BTreeMap::new()).ok().as_deref(),
+            Some(EMPTY_MAP)
         );
     }
 }

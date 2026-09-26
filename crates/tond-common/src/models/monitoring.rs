@@ -153,7 +153,9 @@ pub struct AlertRule {
     ///
     /// Ignored when metric is NULL.
     pub threshold: f64,
-    /// Webhook URL to POST to when the condition fires
+    /// Webhook URL to POST to when the condition fires. Stored encrypted by
+    /// the server (such URLs are bearer secrets); `""` = none.
+    #[serde(skip_serializing)]
     pub webhook_url: String,
     /// Whether this rule is active (1 = active, 0 = paused)
     pub enabled: i64,
@@ -176,7 +178,8 @@ impl AlertRule {
     }
 }
 
-/// API response for an alert rule (same shape, with `enabled` as bool)
+/// API response for an alert rule. The webhook URL is write-only: the
+/// response says whether one is set and shows its host.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AlertRuleResponse {
     pub id: String,
@@ -184,7 +187,12 @@ pub struct AlertRuleResponse {
     pub name: String,
     pub metric: Option<String>,
     pub threshold: f64,
-    pub webhook_url: String,
+    /// Whether a webhook URL is set
+    #[serde(default)]
+    pub has_webhook_url: bool,
+    /// Host of the webhook URL (e.g. `hooks.slack.com`), for recognition
+    #[serde(default)]
+    pub webhook_host: Option<String>,
     pub enabled: bool,
     /// Parsed event slugs (never null in the response — empty array if none).
     pub events: Vec<String>,
@@ -193,8 +201,17 @@ pub struct AlertRuleResponse {
     pub updated_at: String,
 }
 
-impl From<AlertRule> for AlertRuleResponse {
-    fn from(r: AlertRule) -> Self {
+/// Host part of a URL (`https://hooks.slack.com/x` → `hooks.slack.com`).
+pub fn url_host(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map(|(_, r)| r)?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+impl AlertRuleResponse {
+    /// Build a response from a rule and its decrypted webhook URL.
+    pub fn new(r: AlertRule, webhook_url: &str) -> Self {
         let events = r.parse_events();
         Self {
             id: r.id,
@@ -202,7 +219,8 @@ impl From<AlertRule> for AlertRuleResponse {
             name: r.name,
             metric: r.metric,
             threshold: r.threshold,
-            webhook_url: r.webhook_url,
+            has_webhook_url: !webhook_url.is_empty(),
+            webhook_host: url_host(webhook_url),
             enabled: r.enabled != 0,
             events,
             last_fired_at: r.last_fired_at,
@@ -237,6 +255,7 @@ pub struct UpdateAlertRuleRequest {
     pub name: Option<String>,
     pub metric: Option<String>,
     pub threshold: Option<f64>,
+    /// New webhook URL: omit (or null) to keep the saved one, `""` to clear.
     pub webhook_url: Option<String>,
     pub enabled: Option<bool>,
     /// Replace the full events list (None = leave unchanged)
@@ -423,7 +442,15 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         };
 
-        let response = AlertRuleResponse::from(rule);
+        let response =
+            AlertRuleResponse::new(rule, "https://hooks.example.com/services/T0/B0/secret");
+        let json = serde_json::to_string(&response).unwrap_or_default();
+        assert!(
+            !json.contains("secret"),
+            "webhook URL must not be returned: {json}"
+        );
+        assert!(response.has_webhook_url);
+        assert_eq!(response.webhook_host.as_deref(), Some("hooks.example.com"));
 
         assert!(
             response.enabled,

@@ -2,30 +2,47 @@
 	import PageTitle from '$lib/components/nav/page-title.svelte';
 	import ChevronLeft from '~icons/ri/arrow-left-s-line';
 	import Webhook from '~icons/ri/webhook-line';
-	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
+	import SavedSecretField, {
+		secretFieldUpdate
+	} from '$lib/components/secrets/saved-secret-field.svelte';
 	import NotificationChannelList from '$lib/components/integrations/notification-channel-list.svelte';
 	import { setUiContext, clearUiContext, integrationsContext } from '$lib/ui-context.svelte';
-	import type { Integration, IntegrationConfig, DiscordConfig } from '$lib/api';
+	import type { Integration, IntegrationConfig } from '$lib/api';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();
 	let integrations = $derived((data as { integrations: Integration[] }).integrations);
 
 	// ── Form fields ───────────────────────────────────────────────────────────
+	// The webhook URL is write-only: a saved one is never shown or prefilled.
 	let webhookUrl = $state('');
+	let webhookSaved = $state(false);
+	let webhookReplacing = $state(false);
 
 	function buildConfig(): IntegrationConfig {
-		if (!webhookUrl.trim()) throw new Error('Webhook URL is required');
-		return { webhook_url: webhookUrl.trim() };
+		const url = secretFieldUpdate({
+			saved: webhookSaved,
+			replacing: webhookReplacing,
+			removed: false,
+			value: webhookUrl
+		});
+		if (url === undefined && (!webhookSaved || webhookReplacing)) {
+			throw new Error('Webhook URL is required');
+		}
+		return url === undefined ? {} : { webhook_url: url };
 	}
 
 	function resetConfig() {
 		webhookUrl = '';
+		webhookSaved = false;
+		webhookReplacing = false;
 	}
 
-	function loadConfig(config: IntegrationConfig) {
-		webhookUrl = (config as DiscordConfig).webhook_url;
+	function loadConfig(_config: IntegrationConfig, savedSecrets: string[]) {
+		webhookUrl = '';
+		webhookReplacing = false;
+		webhookSaved = savedSecrets.includes('webhook_url');
 	}
 
 	$effect(() => {
@@ -62,12 +79,17 @@
 		{#snippet configFields()}
 			<div class="grid gap-1.5">
 				<Label class="text-xs" for="dc-url">Discord Webhook URL</Label>
-				<Input
+				<SavedSecretField
 					id="dc-url"
-					class="h-8 text-xs"
+					kind="url"
+					saved={webhookSaved}
 					bind:value={webhookUrl}
+					bind:replacing={webhookReplacing}
 					placeholder="https://discord.com/api/webhooks/..."
 				/>
+				<p class="text-[10px] text-muted-foreground">
+					The URL contains a token, so it is stored encrypted and never shown again.
+				</p>
 			</div>
 		{/snippet}
 	</NotificationChannelList>

@@ -32,8 +32,12 @@
 		buildConfig: () => IntegrationConfig;
 		/** Reset channel-specific form fields to empty */
 		resetConfig: () => void;
-		/** Populate channel-specific form fields from an existing config (for editing) */
-		loadConfig: (config: IntegrationConfig) => void;
+		/**
+		 * Populate channel-specific form fields from an existing config (for
+		 * editing). Secret fields are never returned; `savedSecrets` names the
+		 * ones that have a saved value, so the form can show them as saved.
+		 */
+		loadConfig: (config: IntegrationConfig, savedSecrets: string[]) => void;
 	}
 
 	let {
@@ -125,7 +129,7 @@
 		editingId = integration.id;
 		editName = integration.name;
 		editError = '';
-		loadConfig(integration.config);
+		loadConfig(integration.config, integration.saved_secrets ?? []);
 	}
 
 	async function handleSave() {

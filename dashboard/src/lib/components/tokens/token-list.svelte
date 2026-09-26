@@ -1,4 +1,5 @@
 <script lang="ts">
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { listTokens, revokeToken, type ApiToken } from '$lib/api';
 	import { relativeTime, tokenState, type TokenState } from '$lib/access';
 	import { can } from '$lib/auth.svelte';
@@ -117,11 +118,7 @@
 		</label>
 	</div>
 
-	{#if error}
-		<div class="rounded-md bg-destructive/10 p-3 text-sm text-destructive" role="alert">
-			{error}
-		</div>
-	{/if}
+	<InlineError message={error} />
 
 	{#if loading}
 		<p class="py-6 text-center text-sm text-muted-foreground">Loading…</p>
@@ -207,11 +204,7 @@
 				new token later.
 			</AlertDialog.Description>
 		</AlertDialog.Header>
-		{#if revokeError}
-			<div class="rounded-md bg-destructive/10 p-3 text-sm text-destructive" role="alert">
-				{revokeError}
-			</div>
-		{/if}
+		<InlineError message={revokeError} />
 		<AlertDialog.Footer>
 			<AlertDialog.Cancel disabled={revoking}>Keep it</AlertDialog.Cancel>
 			<Button variant="destructive" onclick={handleRevoke} disabled={revoking}>
