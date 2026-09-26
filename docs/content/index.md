@@ -36,9 +36,9 @@ The [Quickstart](/quickstart) takes you from a fresh server to a deployed app wi
 <desc id="flow-desc">Browsers and clients on the internet connect to tond-proxy on ports 80 and 443. The proxy terminates TLS and routes by host name: app domains go to the app containers on local ports, the dashboard domain goes to tond-server on 127.0.0.1:3001. tond-server drives Docker, keeps its state in SQLite, and tells the proxy about route changes over a control socket. The tond CLI on the server talks to tond-server over a root-only Unix socket.</desc>
 <defs><marker id="flow-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted-foreground)"/></marker></defs>
 <g font-size="13" fill="var(--foreground)">
-<rect x="10" y="130" width="120" height="64" rx="6" fill="var(--card)" stroke="var(--input)"/>
-<text x="70" y="158" text-anchor="middle" font-weight="600">Internet</text>
-<text x="70" y="178" text-anchor="middle" fill="var(--muted-foreground)" font-size="11">browsers, CI, API</text>
+<rect x="4" y="130" width="140" height="64" rx="6" fill="var(--card)" stroke="var(--input)"/>
+<text x="74" y="158" text-anchor="middle" font-weight="600">Internet</text>
+<text x="74" y="178" text-anchor="middle" fill="var(--muted-foreground)" font-size="11">browsers, CI, API</text>
 <rect x="190" y="110" width="160" height="104" rx="6" fill="var(--card)" stroke="var(--foreground)" stroke-width="1.5"/>
 <text x="270" y="140" text-anchor="middle" font-weight="600">tond-proxy</text>
 <text x="270" y="162" text-anchor="middle" fill="var(--muted-foreground)" font-size="11">:80 and :443</text>
@@ -58,7 +58,7 @@ The [Quickstart](/quickstart) takes you from a fresh server to a deployed app wi
 <text x="505" y="280" text-anchor="middle" font-weight="600">tond CLI</text>
 <text x="505" y="299" text-anchor="middle" fill="var(--muted-foreground)" font-size="11">root, on the server</text>
 <g stroke="var(--muted-foreground)" stroke-width="1.4" fill="none" marker-end="url(#flow-arrow)">
-<path d="M130 162 H186"/>
+<path d="M144 162 H186"/>
 <path d="M350 135 C390 135 390 48 426 48"/>
 <path d="M350 162 H426"/>
 <path d="M580 150 C610 150 610 122 636 122"/>
@@ -67,7 +67,7 @@ The [Quickstart](/quickstart) takes you from a fresh server to a deployed app wi
 <path d="M430 186 C400 200 380 205 354 200" stroke-dasharray="4 3"/>
 </g>
 <g font-size="11" fill="var(--muted-foreground)">
-<text x="395" y="84" text-anchor="middle">app domains</text>
+<text x="345" y="66" text-anchor="middle">app domains</text>
 <text x="390" y="154" text-anchor="middle">dashboard</text>
 <text x="392" y="226" text-anchor="middle">route changes</text>
 <text x="555" y="236" text-anchor="middle">Unix socket</text>

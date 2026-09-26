@@ -42,39 +42,39 @@ If Tond is stopped or restarted, deploys that were waiting stay queued and resum
 A deployment moves through up to five phases. The dashboard shows them live on the app's **Deployments** tab.
 
 <figure class="diagram">
-<svg viewBox="0 0 760 250" role="img" aria-labelledby="deploy-title deploy-desc" xmlns="http://www.w3.org/2000/svg">
+<svg viewBox="0 0 900 250" role="img" aria-labelledby="deploy-title deploy-desc" xmlns="http://www.w3.org/2000/svg">
 <title id="deploy-title">How a deploy runs</title>
 <desc id="deploy-desc">A deploy starts from a push, the dashboard, the CLI or the API and waits in the build queue (one per app, a global number of build slots). It is built into its own image, started next to the running version on a new local port, and health-checked directly. When it is healthy, tond-proxy switches traffic and acknowledges, then the old container drains and stops. If the build or the health check fails, the new container is removed and the old version keeps serving.</desc>
 <defs><marker id="deploy-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted-foreground)"/></marker></defs>
 <g font-size="12" fill="var(--foreground)">
-<rect x="10" y="40" width="110" height="70" rx="6" fill="var(--card)" stroke="var(--input)"/>
-<text x="65" y="66" text-anchor="middle" font-weight="600">Trigger</text>
-<text x="65" y="84" text-anchor="middle" fill="var(--muted-foreground)" font-size="11">push, CLI,</text>
-<text x="65" y="98" text-anchor="middle" fill="var(--muted-foreground)" font-size="11">dashboard, API</text>
-<rect x="150" y="40" width="110" height="70" rx="6" fill="var(--card)" stroke="var(--input)"/>
-<text x="205" y="66" text-anchor="middle" font-weight="600">Queue</text>
-<text x="205" y="84" text-anchor="middle" fill="var(--muted-foreground)" font-size="11">one per app,</text>
-<text x="205" y="98" text-anchor="middle" fill="var(--muted-foreground)" font-size="11">build slots</text>
-<rect x="290" y="40" width="110" height="70" rx="6" fill="var(--card)" stroke="var(--input)"/>
-<text x="345" y="66" text-anchor="middle" font-weight="600">Build</text>
-<text x="345" y="84" text-anchor="middle" fill="var(--muted-foreground)" font-size="11">its own image</text>
-<text x="345" y="98" text-anchor="middle" fill="var(--muted-foreground)" font-size="11">tondbuild.slice</text>
-<rect x="430" y="40" width="110" height="70" rx="6" fill="var(--card)" stroke="var(--input)"/>
-<text x="485" y="66" text-anchor="middle" font-weight="600">Start + check</text>
-<text x="485" y="84" text-anchor="middle" fill="var(--muted-foreground)" font-size="11">next to the old one,</text>
-<text x="485" y="98" text-anchor="middle" fill="var(--muted-foreground)" font-size="11">health gate</text>
-<rect x="570" y="40" width="180" height="70" rx="6" fill="var(--card)" stroke="var(--foreground)" stroke-width="1.5"/>
-<text x="660" y="66" text-anchor="middle" font-weight="600">Switch</text>
-<text x="660" y="84" text-anchor="middle" fill="var(--muted-foreground)" font-size="11">proxy routes to the new one,</text>
-<text x="660" y="98" text-anchor="middle" fill="var(--muted-foreground)" font-size="11">old one drains and stops</text>
+<rect x="10" y="30" width="140" height="74" rx="6" fill="var(--card)" stroke="var(--input)"/>
+<text x="80" y="56" text-anchor="middle" font-weight="600">Trigger</text>
+<text x="80" y="75" text-anchor="middle" fill="var(--muted-foreground)" font-size="11">push, CLI,</text>
+<text x="80" y="90" text-anchor="middle" fill="var(--muted-foreground)" font-size="11">dashboard, API</text>
+<rect x="175" y="30" width="140" height="74" rx="6" fill="var(--card)" stroke="var(--input)"/>
+<text x="245" y="56" text-anchor="middle" font-weight="600">Queue</text>
+<text x="245" y="75" text-anchor="middle" fill="var(--muted-foreground)" font-size="11">one per app,</text>
+<text x="245" y="90" text-anchor="middle" fill="var(--muted-foreground)" font-size="11">build slots</text>
+<rect x="340" y="30" width="150" height="74" rx="6" fill="var(--card)" stroke="var(--input)"/>
+<text x="415" y="56" text-anchor="middle" font-weight="600">Build</text>
+<text x="415" y="75" text-anchor="middle" fill="var(--muted-foreground)" font-size="11">its own image,</text>
+<text x="415" y="90" text-anchor="middle" fill="var(--muted-foreground)" font-size="11">tondbuild.slice</text>
+<rect x="515" y="30" width="160" height="74" rx="6" fill="var(--card)" stroke="var(--input)"/>
+<text x="595" y="56" text-anchor="middle" font-weight="600">Start and check</text>
+<text x="595" y="75" text-anchor="middle" fill="var(--muted-foreground)" font-size="11">next to the old one,</text>
+<text x="595" y="90" text-anchor="middle" fill="var(--muted-foreground)" font-size="11">health gate</text>
+<rect x="700" y="30" width="190" height="74" rx="6" fill="var(--card)" stroke="var(--foreground)" stroke-width="1.5"/>
+<text x="795" y="56" text-anchor="middle" font-weight="600">Switch</text>
+<text x="795" y="75" text-anchor="middle" fill="var(--muted-foreground)" font-size="11">proxy moves traffic,</text>
+<text x="795" y="90" text-anchor="middle" fill="var(--muted-foreground)" font-size="11">old one drains, stops</text>
 <g stroke="var(--muted-foreground)" stroke-width="1.4" fill="none" marker-end="url(#deploy-arrow)">
-<path d="M120 75 H146"/><path d="M260 75 H286"/><path d="M400 75 H426"/><path d="M540 75 H566"/>
-<path d="M345 110 V160 H400"/><path d="M485 110 V160 H454"/>
+<path d="M150 67 H171"/><path d="M315 67 H336"/><path d="M490 67 H511"/><path d="M675 67 H696"/>
+<path d="M415 104 V156"/><path d="M595 104 V156"/>
 </g>
-<rect x="300" y="150" width="250" height="60" rx="6" fill="var(--card)" stroke="var(--destructive)"/>
-<text x="425" y="175" text-anchor="middle" font-weight="600" fill="var(--destructive)">Failed</text>
-<text x="425" y="194" text-anchor="middle" fill="var(--muted-foreground)" font-size="11">new container removed, old version keeps serving</text>
-<text x="660" y="140" text-anchor="middle" fill="var(--success)" font-size="11">succeeded</text>
+<rect x="330" y="160" width="360" height="60" rx="6" fill="var(--card)" stroke="var(--destructive)"/>
+<text x="510" y="185" text-anchor="middle" font-weight="600" fill="var(--destructive)">Failed</text>
+<text x="510" y="204" text-anchor="middle" fill="var(--muted-foreground)" font-size="11">new container removed, old version keeps serving</text>
+<text x="795" y="128" text-anchor="middle" fill="var(--success)" font-size="11">succeeded</text>
 </g>
 </svg>
 <figcaption>Traffic moves only after the new version is healthy and the proxy has confirmed the switch.</figcaption>
