@@ -175,6 +175,9 @@ pass "https://${WHOAMI_DOMAIN} is routed to the container"
 [[ "$(curl -s -o /dev/null -w '%{http_code}' --resolve "${WHOAMI_DOMAIN}:80:${IP}" "http://${WHOAMI_DOMAIN}/")" == 301 ]] \
     || fail "plain HTTP should redirect to HTTPS"
 pass "HTTP redirects to HTTPS"
+[[ "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: not-served.example.net' "http://${IP}/")" == 404 ]] \
+    || fail "plain HTTP for a host Tond does not serve must be 404, not an open redirect"
+pass "HTTP for an unknown host → 404 (no open redirect)"
 
 step "Built app (tond apps push → TBuild → docker build)"
 tond apps create e2e-static --source-type tarball --port 8080 --domain "$STATIC_DOMAIN" > /dev/null
@@ -188,6 +191,9 @@ if [[ -n "$CA_FILE" ]]; then
     wait_for 240 "a certificate for ${WHOAMI_DOMAIN} signed by ${CA_FILE}" \
         curl -sf --cacert "$CA_FILE" --resolve "${WHOAMI_DOMAIN}:443:${IP}" "https://${WHOAMI_DOMAIN}/"
     pass "${WHOAMI_DOMAIN} serves a certificate that verifies against the ACME CA"
+    wait_for 30 "certificate state for ${WHOAMI_DOMAIN} recorded as active" \
+        bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/certs | jq -e '.data[] | select(.domain == \"${WHOAMI_DOMAIN}\" and .status == \"active\" and .failure_count == 0 and .next_retry_at == null and .last_error == null)'"
+    pass "certificate state (status, retry, last error) recorded for the dashboard"
 else
     echo "  - E2E_CA_FILE not set; skipping certificate verification"
 fi
@@ -218,6 +224,29 @@ wait_for 30 "API health after restart" curl -sf http://127.0.0.1:3001/health
 [[ "$(app_field e2e-whoami status)" == running ]] || fail "e2e-whoami should still be running after a restart"
 wait_for 60 "route after restart" bash -c "curl -sk --resolve '${WHOAMI_DOMAIN}:443:${IP}' 'https://${WHOAMI_DOMAIN}/' | grep -q Hostname:"
 pass "apps keep running and routing after restarting tond-server and tond-proxy"
+
+step "Stability"
+running_runs=$(api "/api/cron/${CRON_ID}/runs" | jq '[.data[] | select(.status == "running")] | length')
+[[ "$running_runs" == 0 ]] || fail "no cron run may stay 'running' after a restart (found ${running_runs})"
+pass "no cron run left 'running' after the restart"
+[[ "$(api "/api/cron/${CRON_ID}" | jq -r '.data.status')" != running ]] \
+    || fail "the cron job must not stay 'running' after its run finished"
+pass "cron job status settled after its run"
+
+# The proxy must not log per request or per unchanged route refresh: 200
+# requests (half to an unknown host) and a few 2 s refreshes add ~nothing.
+since=$(date '+%Y-%m-%d %H:%M:%S')
+for _ in $(seq 1 100); do
+    curl -sk -o /dev/null --resolve "${WHOAMI_DOMAIN}:443:${IP}" "https://${WHOAMI_DOMAIN}/" || true
+    curl -sk -o /dev/null --resolve "unknown.${BASE}:443:${IP}" "https://unknown.${BASE}/" || true
+done
+sleep 6
+proxy_lines=$(journalctl -u tond-proxy --since "$since" --no-pager -o cat | wc -l)
+if (( proxy_lines > 20 )); then
+    journalctl -u tond-proxy --since "$since" --no-pager -o cat | sort | uniq -c | sort -rn | head -10 >&2
+    fail "tond-proxy wrote ${proxy_lines} journal lines for 200 requests (expected ≤ 20)"
+fi
+pass "tond-proxy journal stays quiet under traffic (${proxy_lines} lines for 200 requests)"
 
 if [[ "$CLEANUP" == 1 ]]; then
     step "Cleanup"
