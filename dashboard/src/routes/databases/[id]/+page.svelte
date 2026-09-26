@@ -32,6 +32,7 @@
 	import Breadcrumb from '$lib/components/nav/breadcrumb.svelte';
 	import ConfirmDeleteDialog from '$lib/components/dialogs/confirm-delete-dialog.svelte';
 	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
+	import MetricsPanel from '$lib/components/metrics/metrics-panel.svelte';
 	import { SvelteSet } from 'svelte/reactivity';
 	import { untrack } from 'svelte';
 	import Eye from '~icons/ri/eye-line';
@@ -52,6 +53,7 @@
 	};
 
 	let db = $state<ManagedDatabaseDetail | null>(null);
+	let activeTab = $state('overview');
 	let error = $state('');
 	let projects = $state<Project[]>([]);
 	let showDeleteDialog = $state(false);
@@ -626,11 +628,12 @@
 		<Separator />
 
 		<!-- Tabs -->
-		<Tabs.Root value="overview">
-			<Tabs.List>
+		<Tabs.Root bind:value={activeTab}>
+			<Tabs.List class="max-w-full justify-start overflow-x-auto">
 				<Tabs.Trigger value="overview">Overview</Tabs.Trigger>
 				<Tabs.Trigger value="environment">Environment</Tabs.Trigger>
 				<Tabs.Trigger value="limits">Limits</Tabs.Trigger>
+				<Tabs.Trigger value="metrics">Metrics</Tabs.Trigger>
 			</Tabs.List>
 
 			<!-- ── Overview tab ── -->
@@ -1196,6 +1199,15 @@
 						{/if}
 					</div>
 				</div>
+			</Tabs.Content>
+
+			<!-- ── Metrics tab (mounted only while open, so it polls only then) ── -->
+			<Tabs.Content value="metrics">
+				{#if activeTab === 'metrics'}
+					{#key db.id}
+						<MetricsPanel owner="databases" id={db.id} noun="database" />
+					{/key}
+				{/if}
 			</Tabs.Content>
 		</Tabs.Root>
 	</div>

@@ -16,8 +16,9 @@
 //                    days (the latest run is always kept; running rows never
 //                    deleted).
 //   audit_log      — drop rows older than N days (security data: default 90).
-//   metrics        — drop samples older than N days (was a full-table scan
-//                    every 30 s in metrics.rs; now indexed and hourly).
+//   metrics        — tiered retention (raw 25 h, 5-minute rollups 8 days,
+//                    hourly rollups and events 90 days) plus targets whose
+//                    owner is gone; see metrics::store::prune.
 //   sessions / mfa_pending — drop expired rows.
 //   terminal_tickets / github_app_flows — drop expired rows.
 //   webhook_deliveries — drop replay IDs older than the 72 h replay window.
@@ -41,7 +42,7 @@ use anyhow::Result;
 use chrono::Utc;
 use sqlx::SqlitePool;
 
-use crate::{docker, state::AppState};
+use crate::{docker, metrics, state::AppState};
 
 /// Rows deleted per statement.
 const BATCH_SIZE: i64 = 2_000;
@@ -71,8 +72,6 @@ pub struct RetentionPolicy {
     pub cron_run_days: i64,
     /// `retention_audit_log_days` — max age of audit log rows.
     pub audit_log_days: i64,
-    /// `retention_metrics_days` — max age of metric samples.
-    pub metrics_days: i64,
 }
 
 impl Default for RetentionPolicy {
@@ -84,7 +83,6 @@ impl Default for RetentionPolicy {
             cron_runs_per_job: 100,
             cron_run_days: 30,
             audit_log_days: 90,
-            metrics_days: 7,
         }
     }
 }
@@ -114,7 +112,6 @@ impl RetentionPolicy {
                 "retention_cron_runs_per_job" => &mut policy.cron_runs_per_job,
                 "retention_cron_runs_days" => &mut policy.cron_run_days,
                 "retention_audit_log_days" => &mut policy.audit_log_days,
-                "retention_metrics_days" => &mut policy.metrics_days,
                 _ => continue,
             };
             *field = n;
@@ -310,20 +307,8 @@ pub async fn run_once(db: &SqlitePool, policy: &RetentionPolicy) -> Result<Janit
         .await?;
     }
 
-    // ── metrics (collected_at uses datetime('now') format) ──
-    if policy.metrics_days > 0 {
-        let modifier = format!("-{} days", policy.metrics_days);
-        report.metrics += delete_in_batches(|| {
-            sqlx::query(
-                "DELETE FROM metrics WHERE rowid IN (
-                    SELECT rowid FROM metrics WHERE collected_at < datetime('now', ?) LIMIT ?)",
-            )
-            .bind(&modifier)
-            .bind(BATCH_SIZE)
-            .execute(db)
-        })
-        .await?;
-    }
+    // ── metrics (fixed tiers, see metrics/store.rs) ──
+    report.metrics += metrics::store::prune(db, now.timestamp()).await?;
 
     // ── expired sessions and MFA challenges (RFC 3339 timestamps) ──
     let now_str = now.to_rfc3339();
@@ -547,14 +532,17 @@ mod tests {
         let policy = RetentionPolicy::from_pairs(
             [
                 ("retention_audit_log_days", "365"),
-                ("retention_metrics_days", "not-a-number"),
+                ("retention_deploy_logs_days", "not-a-number"),
                 ("retention_unknown", "5"),
                 ("retention_cron_runs_per_job", " 0 "),
             ]
             .into_iter(),
         );
         assert_eq!(policy.audit_log_days, 365);
-        assert_eq!(policy.metrics_days, 7, "garbage falls back to the default");
+        assert_eq!(
+            policy.deploy_log_days, 30,
+            "garbage falls back to the default"
+        );
         assert_eq!(policy.cron_runs_per_job, 0, "0 disables the rule");
         assert_eq!(policy.deploy_log_deployments, 20);
     }
@@ -648,7 +636,15 @@ mod tests {
             .execute(&db)
             .await
             .unwrap_or_else(|err| panic!("seed audit: {err}"));
-        sqlx::query("INSERT INTO metrics (id, app_id, collected_at) VALUES ('m-old', 'a', datetime('now', '-8 days')), ('m-new', 'a', datetime('now', '-1 days'))")
+        // Metric samples of cron job j1: one past the 25 h raw retention, one fresh.
+        sqlx::query("INSERT INTO metric_targets (id, kind, owner_id) VALUES (1, 'cron', 'j1')")
+            .execute(&db)
+            .await
+            .unwrap_or_else(|err| panic!("seed target: {err}"));
+        let now = Utc::now().timestamp();
+        sqlx::query("INSERT INTO metrics_raw (target, ts, cpu, mem, rx, tx, pids) VALUES (1, ?, 0, 0, 0, 0, 0), (1, ?, 0, 0, 0, 0, 0)")
+            .bind(now - 26 * 3600)
+            .bind(now - 60)
             .execute(&db)
             .await
             .unwrap_or_else(|err| panic!("seed metrics: {err}"));
@@ -680,7 +676,12 @@ mod tests {
             "keeps the last 2 runs and never deletes a running row"
         );
         assert_eq!(ids(&db, "SELECT id FROM audit_log").await, vec!["au-new"]);
-        assert_eq!(ids(&db, "SELECT id FROM metrics").await, vec!["m-new"]);
+        let raw: Vec<i64> = sqlx::query_scalar("SELECT ts FROM metrics_raw")
+            .fetch_all(&db)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(raw, vec![now - 60]);
+        assert_eq!(report.metrics, 1);
         assert_eq!(ids(&db, "SELECT id FROM sessions").await, vec!["s-live"]);
         assert_eq!(report.cron_job_runs, 2);
         assert_eq!(report.sessions, 1);

@@ -45,7 +45,7 @@ import {
 	MOCK_CERTIFICATES,
 	MOCK_DATABASE_LINKS,
 	makeMockSystemMetrics,
-	makeMockAppMetrics
+	makeMockMetrics
 } from './fixtures';
 import type {
 	AlertRule,
@@ -1534,11 +1534,23 @@ export const handlers = [
 
 	// ── Metrics ───────────────────────────────────────────────────────────────
 
-	http.get('/api/apps/:id/metrics', async ({ request }) => {
+	// Stopped / never-deployed apps have no samples (shows the empty state).
+	http.get('/api/apps/:id/metrics', async ({ request, params }) => {
 		await delay(LATENCY);
-		const url = new URL(request.url);
-		const period = url.searchParams.get('period') ?? '1h';
-		return ok(makeMockAppMetrics(period));
+		const range = new URL(request.url).searchParams.get('range') ?? '1h';
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
+		const measured = app?.status === 'running' || app?.status === 'unhealthy';
+		return ok(makeMockMetrics(range, !measured));
+	}),
+
+	http.get('/api/databases/:id/metrics', async ({ request }) => {
+		await delay(LATENCY);
+		return ok(makeMockMetrics(new URL(request.url).searchParams.get('range') ?? '1h'));
+	}),
+
+	http.get('/api/cron/:id/metrics', async ({ request }) => {
+		await delay(LATENCY);
+		return ok(makeMockMetrics(new URL(request.url).searchParams.get('range') ?? '1h', true));
 	}),
 
 	http.get('/api/system/metrics', async () => {

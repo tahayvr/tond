@@ -27,7 +27,7 @@
 	let lines = $state.raw<LogLine[]>([]);
 	const buffer = createLogBuffer<LogLine>((next) => (lines = next), { limit: MAX_LINES });
 	let connected = $state(false);
-	let error = $state('');
+	let reconnecting = $state(false);
 	let autoScroll = $state(true);
 	let scrollEl = $state<HTMLElement | null>(null);
 
@@ -69,22 +69,24 @@
 		const url = wsUrl;
 
 		buffer.clear();
-		error = '';
+		reconnecting = false;
 		connected = false;
 
 		if (!url) return;
 
 		const close = openLogStream(url, {
-			onLine(line) {
+			onOpen(reconnected) {
 				connected = true;
+				reconnecting = false;
+				// The server re-sends its snapshot on every connection.
+				if (reconnected) buffer.clear();
+			},
+			onLine(line) {
 				buffer.push(line);
 			},
-			onError() {
-				error = 'Stream error';
+			onDisconnect() {
 				connected = false;
-			},
-			onClose() {
-				connected = false;
+				reconnecting = true;
 			}
 		});
 
@@ -102,9 +104,9 @@
 			{#if connected}
 				<span class="size-1.5 rounded-full bg-green-500"></span>
 				<span>connected</span>
-			{:else if error}
-				<span class="size-1.5 rounded-full bg-destructive"></span>
-				<span class="text-destructive">{error}</span>
+			{:else if reconnecting}
+				<span class="size-1.5 animate-pulse rounded-full bg-destructive"></span>
+				<span>connection lost, reconnecting…</span>
 			{:else}
 				<span class="size-1.5 animate-pulse rounded-full bg-warn"></span>
 				<span>connecting…</span>
