@@ -211,7 +211,8 @@ One system for all of these — never hand-roll a pill, banner or `confirm()`:
   the WAL persistent (`SQLITE_FCNTL_PERSIST_WAL`) because a read-only reader cannot
   create `-wal`/`-shm`. Anything else under `/opt/tond/data` must stay root-only; never
   make the proxy depend on Docker or on files outside `tond.db*`, `certs/`,
-  `acme_account.json` and `proxy.sock` (see `secure_data_dir` in `release/install.sh`).
+  `acme_account.json`, `proxy.sock` and `access/` (opt-in access logs, which tond-server reads as
+  root refusing symlinks and hard links) (see `secure_data_dir` in `release/install.sh`).
 - Previews run pull-request code and are served only as `<id>-<app>.<preview_domain>`, a
   separate registrable domain from the dashboard (`preview_domain` setting, validated with
   the Public Suffix List in `crates/tond-server/src/domains.rs`). tond-proxy never serves

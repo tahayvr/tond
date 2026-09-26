@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { checkAuth, getStatus } from '$lib/auth.svelte';
+	import { can, checkAuth, getStatus } from '$lib/auth.svelte';
 	import { authRedirect, isAuthRoute as isAuthRoutePath, showsAppShell } from '$lib/auth-routes';
 	import {
 		getFeedOpen,
@@ -21,9 +21,9 @@
 	import * as Tooltip from '$lib/components/ui/tooltip/index.js';
 	import FeedPanel from '$lib/components/feed-panel/feed-panel.svelte';
 	import { Toaster } from '$lib/components/ui/sonner';
-	import { listAlertRules } from '$lib/api';
+	import { listActiveAlerts } from '$lib/api';
 	import { toast } from 'svelte-sonner';
-	import { SvelteMap } from 'svelte/reactivity';
+	import { SvelteSet } from 'svelte/reactivity';
 	import { registerDashboardShortcuts } from '$lib/dashboard-shortcuts';
 	import { pollWhileVisible } from '$lib/polling';
 	import { untrack } from 'svelte';
@@ -79,42 +79,34 @@
 	});
 
 	// ── Alert firing notifications (60 s polling) ────────────────────────────
-	// Keeps a snapshot of last_fired_at per rule. When a value changes we show
-	// a toast so the user is notified even if they are not on the alerts page.
+	// Remembers which alerts were firing. A newly firing one shows a toast so
+	// the user hears about it even when they are not on the Alerts page.
 	// Only runs while authenticated.
 
 	const ALERT_POLL_MS = 60_000;
-	const alertSnapshot = new SvelteMap<string, string | null>();
-
-	function metricLabel(metric: string | null): string {
-		if (metric === 'cpu') return 'CPU usage threshold exceeded';
-		if (metric === 'memory') return 'Memory usage threshold exceeded';
-		if (metric === 'app_down') return 'App is down';
-		if (metric === 'disk_usage') return 'Disk usage threshold exceeded';
-		return 'Alert condition triggered';
-	}
+	const firingSeen = new SvelteSet<string>();
+	let alertsSeeded = false;
 
 	$effect(() => {
-		if (getStatus() !== 'authenticated') return;
+		if (getStatus() !== 'authenticated' || !can('metrics:read')) return;
 
 		async function poll() {
 			try {
-				const rules = await listAlertRules();
-
-				for (const rule of rules) {
-					const prev = alertSnapshot.get(rule.id);
-					// prev === undefined means it's the first poll — just seed the snapshot.
-					// prev !== undefined and different means it fired since last check.
-					if (prev !== undefined && rule.last_fired_at !== prev && rule.last_fired_at !== null) {
-						toast.warning(`Alert fired: ${rule.name}`, {
-							description: metricLabel(rule.metric)
+				const firing = (await listActiveAlerts()).filter(
+					(a) => a.state === 'firing' && a.episode_id
+				);
+				for (const a of firing) {
+					const id = a.episode_id ?? '';
+					if (alertsSeeded && !firingSeen.has(id)) {
+						toast.warning(`Alert firing: ${a.rule_name}`, {
+							description: a.target_label,
+							action: { label: 'View', onClick: () => goto(`/alerts?alert=${id}`) }
 						});
 					}
 				}
-
-				// Rebuild snapshot from current rules
-				alertSnapshot.clear();
-				for (const rule of rules) alertSnapshot.set(rule.id, rule.last_fired_at);
+				firingSeen.clear();
+				for (const a of firing) firingSeen.add(a.episode_id ?? '');
+				alertsSeeded = true;
 			} catch {
 				// Polling failures are silent — don't interrupt the user
 			}

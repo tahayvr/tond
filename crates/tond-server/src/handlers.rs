@@ -27,7 +27,7 @@
 //   (env vars live in handlers/env.rs: masked GET, PATCH, per-key reveal)
 //   update_domain()     PUT  /api/apps/{id}/domain — set domain, upsert 'pending' cert record
 //   update_port()       PUT  /api/apps/{id}/port   — container port (next deploy)
-//   list_certs()        GET  /api/certs            — all certificate rows
+//   (certificates live in handlers/certificates.rs)
 //   upload_deploy()     POST /api/apps/{id}/upload — accept .tar.gz, extract, build,
 //                                                    then deploy — all in background, returns 202
 //
@@ -35,19 +35,25 @@
 //   handler spawns tokio::spawn -> deploy::deploy() -> docker::run_container()
 //   The handler returns 202 immediately; the caller polls app status.
 
+pub mod access_log;
 pub mod alerts;
+pub mod app_events;
 pub mod audit_log;
+pub mod audit_shipping;
 pub mod auth;
 pub mod backups;
+pub mod certificates;
 pub mod cron;
 pub mod database_links;
 pub mod databases;
+pub mod deploy_stats;
 pub mod deployments;
 pub mod domains;
 pub mod env;
 pub mod git;
 pub mod github_apps;
 pub mod gitlab_tokens;
+pub mod host;
 pub mod images;
 pub mod integrations;
 pub mod logs;
@@ -57,12 +63,15 @@ pub mod previews;
 pub mod project_previews;
 pub mod projects;
 pub mod registry_credentials;
+pub mod requests;
+pub mod retention;
 pub mod settings;
 pub mod storage_providers;
 pub mod system_self;
 pub mod templates;
 pub mod terminal;
 pub mod tokens;
+pub mod uptime;
 pub mod users;
 pub mod webhooks;
 
@@ -82,7 +91,7 @@ use crate::{
     auth::{Authz, Principal, RateLimit, principal::Actor, scope},
     compose_policy, deploy, docker, domains as domain_rules,
     error::AppError,
-    networks, proxy_link, secrets,
+    log_scrub, networks, secrets,
     state::AppState,
     upload, volumes,
 };
@@ -773,7 +782,7 @@ pub async fn app_logs(
     .await
     .unwrap_or_default();
 
-    // Get container logs if running
+    // Get container logs if running, without the app's secrets
     let container_logs = if let Some(container_id) = &app.container_id {
         docker::get_logs(&state.docker, container_id, 100)
             .await
@@ -781,6 +790,7 @@ pub async fn app_logs(
     } else {
         vec![]
     };
+    let container_logs = log_scrub::scrub_lines_for_app(&state.db, &app.id, container_logs).await;
 
     Ok((
         StatusCode::OK,
@@ -875,64 +885,6 @@ pub async fn update_domain(
             "domain": req.domain,
             "warning": warning,
         }))),
-    ))
-}
-
-// ── List Certificates ──
-
-pub async fn list_certs(
-    _rate: RateLimit,
-    _auth: Authz<scope::AppsRead>,
-    State(state): State<AppState>,
-) -> Result<impl IntoResponse, AppError> {
-    let certs =
-        sqlx::query_as::<_, Certificate>("SELECT * FROM certificates ORDER BY created_at DESC")
-            .fetch_all(&state.db)
-            .await?;
-
-    let responses: Vec<CertificateResponse> =
-        certs.into_iter().map(CertificateResponse::from).collect();
-    Ok((StatusCode::OK, Json(ApiResponse::ok(responses))))
-}
-
-// ── Retry a pending certificate now ──
-
-/// POST /api/certs/{domain}/retry — ask tond-proxy to attempt issuance on its
-/// next pass (within ~30 s) instead of waiting for the backoff. The failure
-/// count is kept, so repeated retries of a broken domain still back off.
-pub async fn retry_cert(
-    _rate: RateLimit,
-    auth: Authz<scope::AppsWrite>,
-    State(state): State<AppState>,
-    Path(domain): Path<String>,
-) -> Result<impl IntoResponse, AppError> {
-    let updated = sqlx::query(
-        "UPDATE certificates SET next_retry_at = NULL, updated_at = ? WHERE domain = ?",
-    )
-    .bind(chrono::Utc::now().to_rfc3339())
-    .bind(&domain)
-    .execute(&state.db)
-    .await?
-    .rows_affected();
-
-    if updated == 0 {
-        return Err(TondError::NotFound(format!("No certificate for {domain}")).into());
-    }
-
-    // Ask tond-proxy to try right away instead of at its next scheduled pass.
-    tokio::spawn(proxy_link::request_certs(Some(domain.clone())));
-
-    record(
-        &state.db,
-        &auth.audit_actor(),
-        AuditEntry::new("cert_retry").resource("certificate", &domain, &domain),
-    )
-    .await;
-    Ok((
-        StatusCode::OK,
-        Json(ApiResponse::ok(
-            json!({ "message": "Certificate retry queued", "domain": domain }),
-        )),
     ))
 }
 
@@ -2905,47 +2857,6 @@ mod tests {
             Some("project-1"),
             "assign_project should persist the selected project ID on the app"
         );
-    }
-
-    #[tokio::test]
-    async fn retry_cert_clears_next_retry_but_keeps_the_failure_count() {
-        let state = test_state().await;
-        sqlx::query(
-            "INSERT INTO certificates (id, domain, cert_path, key_path, issued_at, expires_at, status, next_retry_at, failure_count, last_error)
-             VALUES ('c1', 'x.example.com', 'c', 'k', 'now', 'later', 'failed', '2999-01-01T00:00:00Z', 3, 'boom')",
-        )
-        .execute(&state.db)
-        .await
-        .unwrap_or_else(|err| panic!("seed cert: {err}"));
-
-        let response = retry_cert(
-            RateLimit,
-            Authz::unchecked(Principal::test_user(Role::Admin)),
-            State(state.clone()),
-            Path("x.example.com".to_string()),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("retry_cert should succeed"))
-        .into_response();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let (next, count): (Option<String>, i64) = sqlx::query_as(
-            "SELECT next_retry_at, failure_count FROM certificates WHERE domain = 'x.example.com'",
-        )
-        .fetch_one(&state.db)
-        .await
-        .unwrap_or_else(|err| panic!("read cert: {err}"));
-        assert_eq!(next, None, "the proxy retries on its next pass");
-        assert_eq!(count, 3, "backoff history is kept");
-
-        let missing = retry_cert(
-            RateLimit,
-            Authz::unchecked(Principal::test_user(Role::Admin)),
-            State(state),
-            Path("nope.example.com".to_string()),
-        )
-        .await;
-        assert!(missing.is_err(), "unknown domains are a 404");
     }
 
     /// Run `receive_upload` behind a real axum router so the Multipart

@@ -44,7 +44,8 @@ export function tabHref(
 
 // ── App page ────────────────────────────────────────────────────────────────
 
-export type AppTab = 'overview' | 'deployments' | 'logs' | 'metrics' | 'settings';
+export type AppTab =
+	'overview' | 'deployments' | 'logs' | 'metrics' | 'uptime' | 'events' | 'settings';
 export type AppSettingsSection =
 	| 'environment'
 	| 'domain'
@@ -62,6 +63,8 @@ export const APP_TABS: readonly TabDef<AppTab>[] = [
 	{ id: 'deployments', label: 'Deployments' },
 	{ id: 'logs', label: 'Logs', scope: 'logs:read' },
 	{ id: 'metrics', label: 'Metrics', scope: 'metrics:read' },
+	{ id: 'uptime', label: 'Uptime', scope: 'metrics:read' },
+	{ id: 'events', label: 'Events' },
 	{ id: 'settings', label: 'Settings' }
 ];
 
@@ -98,6 +101,21 @@ export function appTabHref(appId: string, tab: AppTab, section?: AppSettingsSect
 	return tabHref(`/apps/${appId}`, tab, 'overview', extra);
 }
 
+/** The app's Logs tab shows container output or the access log (`?log=access`). */
+export type AppLogView = 'output' | 'access';
+export const APP_LOG_VIEWS: readonly TabDef<AppLogView>[] = [
+	{ id: 'output', label: 'App output' },
+	{ id: 'access', label: 'Access log' }
+];
+
+export function appLogViewFromUrl(url: URL): AppLogView {
+	return tabFromUrl(url, APP_LOG_VIEWS, 'output', 'log');
+}
+
+export function appLogViewHref(appId: string, view: AppLogView): string {
+	return tabHref(`/apps/${appId}`, 'logs', 'overview', view === 'access' ? { log: 'access' } : {});
+}
+
 // ── Database and cron pages ─────────────────────────────────────────────────
 
 export type DatabaseTab = 'overview' | 'logs' | 'environment' | 'backups' | 'metrics' | 'settings';
@@ -110,11 +128,27 @@ export const DATABASE_TABS: readonly TabDef<DatabaseTab>[] = [
 	{ id: 'settings', label: 'Settings' }
 ];
 
-export type CronTab = 'overview' | 'runs' | 'settings';
+export type SystemTab = 'overview' | 'history' | 'disk' | 'uptime';
+export const SYSTEM_TABS: readonly TabDef<SystemTab>[] = [
+	{ id: 'overview', label: 'Overview' },
+	{ id: 'history', label: 'History' },
+	{ id: 'disk', label: 'Disk' },
+	{ id: 'uptime', label: 'Uptime' }
+];
+
+export type CronTab = 'overview' | 'runs' | 'metrics' | 'settings';
 export const CRON_TABS: readonly TabDef<CronTab>[] = [
 	{ id: 'overview', label: 'Overview' },
 	{ id: 'runs', label: 'Runs' },
+	{ id: 'metrics', label: 'Metrics', scope: 'metrics:read' },
 	{ id: 'settings', label: 'Settings' }
+];
+
+export type AlertsPageTab = 'alerts' | 'rules' | 'settings';
+export const ALERTS_PAGE_TABS: readonly TabDef<AlertsPageTab>[] = [
+	{ id: 'alerts', label: 'Alerts' },
+	{ id: 'rules', label: 'Rules' },
+	{ id: 'settings', label: 'Quiet hours' }
 ];
 
 export type AlertTab = 'overview' | 'settings';

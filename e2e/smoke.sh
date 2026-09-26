@@ -294,9 +294,9 @@ for m in tond_process_resident_memory_bytes tond_loop_wakeups_total tond_db_quer
     grep -q "^${m}" <<<"$metrics" || fail "/metrics must expose ${m}"
 done
 pass "/metrics on the root-only socket exposes Prometheus metrics"
-[[ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3001/metrics)" == 404 ]] \
-    || fail "/metrics must not be served over TCP"
-pass "/metrics over TCP → 404"
+[[ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3001/metrics)" == 401 ]] \
+    || fail "/metrics over TCP must require a metrics:read token"
+pass "/metrics over TCP without a token → 401"
 
 id -u tond > /dev/null 2>&1 || fail "install.sh must create the host terminal user 'tond'"
 for group in docker sudo; do
@@ -575,6 +575,59 @@ pass "HTTP redirects to HTTPS"
 [[ "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: not-served.example.net' "http://${IP}/")" == 404 ]] \
     || fail "plain HTTP for a host Tond does not serve must be 404, not an open redirect"
 pass "HTTP for an unknown host → 404 (no open redirect)"
+
+step "Request metrics and access logs (tond-proxy counters, opt-in access log)"
+# The proxy counts every request per route; tond-server scrapes the counters
+# on its 30 s metrics tick (the not-yet-written minute is included).
+REQ_N=20
+for _ in $(seq 1 "$REQ_N"); do
+    curl -sk -o /dev/null --resolve "${WHOAMI_DOMAIN}:443:${IP}" "https://${WHOAMI_DOMAIN}/"
+done
+# whoami's /health answers with the status last POSTed to it: make it a 404.
+curl -sk -o /dev/null -X POST -d 404 --resolve "${WHOAMI_DOMAIN}:443:${IP}" "https://${WHOAMI_DOMAIN}/health"
+code=$(proxied_status "$WHOAMI_DOMAIN" /health)
+curl -sk -o /dev/null -X POST -d 200 --resolve "${WHOAMI_DOMAIN}:443:${IP}" "https://${WHOAMI_DOMAIN}/health"
+[[ "$code" == 404 ]] || fail "whoami's /health should answer 404 after POSTing 404, got ${code}"
+[[ "$(proxied_status "nothing-here.${BASE}" /)" == 502 ]] || fail "an unknown host must get the 502 page"
+wait_for 90 "request metrics for e2e-whoami" bash -c "curl -sf --unix-socket '$SOCK' \
+    'http://localhost/api/apps/e2e-whoami/requests?range=1h' \
+    | jq -e '.data.summary.requests >= ${REQ_N} and .data.summary.s2xx >= ${REQ_N} and .data.summary.s4xx >= 1'"
+pass "after ${REQ_N} requests the API reports ≥ ${REQ_N} requests, their 2xx and the 4xx"
+REQ=$(api "/api/apps/e2e-whoami/requests?range=1h")
+jq -e '.data.series.t | length > 0 and length <= 481' <<< "$REQ" > /dev/null \
+    || fail "the request series must be server-sized, got: $(jq -c '.data.series.t | length' <<< "$REQ")"
+jq -e '.data.summary.p95 != null and .data.proxy_connected == true' <<< "$REQ" > /dev/null \
+    || fail "latency percentiles and the proxy link must be reported, got: $(jq -c '.data.summary' <<< "$REQ")"
+pass "series ≤ 481 buckets, p95 latency reported, proxy connected"
+wait_for 60 "server-wide traffic" bash -c "curl -sf --unix-socket '$SOCK' \
+    'http://localhost/api/system/requests?range=24h' \
+    | jq -e '(.data.busiest | map(.name) | index(\"e2e-whoami\")) != null and .data.unknown_requests >= 1'"
+pass "the traffic overview lists e2e-whoami and counts unknown hosts"
+
+[[ "$(api_req PUT /api/apps/e2e-whoami/access-log '{"enabled":true}')" == 200 ]] \
+    || fail "enabling the access log failed: $(cat "$API_BODY")"
+# The route_state trigger makes the proxy reload; then it writes the lines.
+wait_for 30 "an access log line" bash -c "curl -sk -o /dev/null --resolve '${WHOAMI_DOMAIN}:443:${IP}' \
+    'https://${WHOAMI_DOMAIN}/e2e-access?token=secret' && curl -sf --unix-socket '$SOCK' \
+    'http://localhost/api/apps/e2e-whoami/access-log?q=e2e-access' | jq -e '.data.lines | length >= 1'"
+LINE=$(api "/api/apps/e2e-whoami/access-log?q=e2e-access" | jq -r '.data.lines[-1]')
+[[ "$LINE" == *" GET /e2e-access 200 "* && "$LINE" != *secret* ]] \
+    || fail "access lines must hold method, path and status without the query string, got: ${LINE}"
+pass "access log line recorded without the query string: ${LINE}"
+[[ "$(perms "${DATA_DIR}/access")" == "700 tond-proxy tond-proxy" ]] \
+    || fail "access/ must be 700 tond-proxy, got: $(perms "${DATA_DIR}/access")"
+WHOAMI_APP_ID=$(app_field e2e-whoami id)
+[[ "$(stat -c '%a %U' "${DATA_DIR}/access/${WHOAMI_APP_ID}.log")" == "600 tond-proxy" ]] \
+    || fail "the access log file must be 600 tond-proxy"
+pass "access logs live in a proxy-owned 0700 directory, files 0600"
+curl -sf --unix-socket "$SOCK" "http://localhost/api/apps/e2e-whoami/access-log/download" | grep -q "/e2e-access" \
+    || fail "the access log download must contain the recorded line"
+pass "the full access log downloads"
+[[ "$(api_req PUT /api/apps/e2e-whoami/access-log '{"enabled":false}')" == 200 ]] \
+    || fail "disabling the access log failed"
+[[ "$(api_req DELETE /api/apps/e2e-whoami/access-log '')" == 200 ]] || fail "deleting the access log failed"
+[[ ! -e "${DATA_DIR}/access/${WHOAMI_APP_ID}.log" ]] || fail "the access log file must be gone after delete"
+pass "access log turned off and deleted"
 
 step "Webhook and integration hardening"
 API_TCP="http://127.0.0.1:3001"
@@ -937,22 +990,87 @@ TZ_CODE=$(api_req POST /api/cron '{"name":"e2e-bad-tz","schedule":"0 3 * * *","i
 [[ "$TZ_CODE" == 400 ]] || fail "creating a cron job with an unknown time zone should be 400, got $TZ_CODE"
 pass "schedule preview uses Mon-Fri for 1-5 in the job's time zone; unknown zones are rejected"
 
-NO_CHANNEL=$(api_req POST /api/alerts '{"name":"e2e-nobody","events":["deployment_failure"]}')
+NO_CHANNEL=$(api_req POST /api/alerts '{"name":"e2e-nobody","kind":"deploy_failed"}')
 [[ "$NO_CHANNEL" == 400 ]] || fail "an alert rule that notifies nobody should be 400, got $NO_CHANNEL"
-RULE_CODE=$(api_req POST /api/alerts '{"name":"e2e-events","events":["deployment_failure"],"webhook_url":"http://127.0.0.1:9/unreachable"}')
-[[ "$RULE_CODE" == 201 ]] || fail "an event-only rule with a webhook should be created, got $RULE_CODE: $(cat "$API_BODY")"
+CH_CODE=$(api_req POST /api/integrations '{"name":"e2e-unreachable","kind":"webhook","config":{"webhook_url":"http://127.0.0.1:9/unreachable"}}')
+[[ "$CH_CODE" == 201 ]] || fail "a webhook channel should be created, got $CH_CODE: $(cat "$API_BODY")"
+UNREACHABLE_ID=$(jq -r '.data.id' "$API_BODY")
+RULE_CODE=$(api_req POST /api/alerts "{\"name\":\"e2e-deploys\",\"kind\":\"deploy_failed\",\"integration_ids\":[\"${UNREACHABLE_ID}\"]}")
+[[ "$RULE_CODE" == 201 ]] || fail "a deploy-failed rule with a channel should be created, got $RULE_CODE: $(cat "$API_BODY")"
 RULE_ID=$(jq -r '.data.id' "$API_BODY")
 TEST_CODE=$(api_req POST "/api/alerts/${RULE_ID}/test" '')
 [[ "$TEST_CODE" == 200 ]] || fail "send-test should answer 200, got $TEST_CODE"
 jq -e '.data | length == 1 and .[0].kind == "webhook" and .[0].ok == false and (.[0].error | length > 0)' "$API_BODY" > /dev/null \
     || fail "send-test should report the unreachable webhook: $(cat "$API_BODY")"
+api /api/integrations | jq -e --arg id "$UNREACHABLE_ID" '.data[] | select(.id == $id and (.last_error | length > 0))' > /dev/null \
+    || fail "a failed send must be visible on the channel"
 api_req DELETE "/api/alerts/${RULE_ID}" '' > /dev/null
-pass "alert rules need a channel; event-only rules work; send-test reports each channel"
+api_req DELETE "/api/integrations/${UNREACHABLE_ID}" '' > /dev/null
+pass "alert rules need a channel; send-test reports each channel; failures show on the channel"
 
 ONBOARDING=$(api /api/onboarding/status)
 jq -e '.data.has_successful_deploy == true and .data.last_deployment.app_name != null and (.data | has("has_source_integration") and has("has_notification_channel"))' \
     <<<"$ONBOARDING" > /dev/null || fail "onboarding status should report the checklist and last deploy: $ONBOARDING"
 pass "onboarding status reports the first-run checklist and the latest deployment"
+
+step "Alert engine: an alert fires, notifies a signed webhook and resolves"
+# A tiny local receiver stores every POST body (and its signature header);
+# a memory rule on e2e-whoami at a near-zero threshold fires on the next
+# metrics tick, then raising the threshold resolves it.
+if command -v python3 > /dev/null; then
+    HOOK_DIR=$(mktemp -d)
+    python3 -c '
+import http.server, os, sys
+d = sys.argv[1]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        n = len([f for f in os.listdir(d) if f.endswith(".json")])
+        open(os.path.join(d, "%03d.sig" % n), "w").write(self.headers.get("X-Tond-Signature-256", ""))
+        open(os.path.join(d, "%03d.json" % n), "wb").write(body)
+        self.send_response(200)
+        self.end_headers()
+    def log_message(self, *args):
+        pass
+http.server.HTTPServer(("127.0.0.1", 18099), H).serve_forever()
+' "$HOOK_DIR" &
+    HOOK_PID=$!
+    wait_for 10 "the local webhook receiver" bash -c "curl -s -o /dev/null -X POST -d '{}' http://127.0.0.1:18099/probe"
+    rm -f "$HOOK_DIR"/*
+    [[ "$(api_req POST /api/integrations '{"name":"e2e-signed-hook","kind":"webhook","config":{"webhook_url":"http://127.0.0.1:18099/hook","signing_secret":"e2e-signing-secret"}}')" == 201 ]] \
+        || fail "the signed webhook channel should be created: $(cat "$API_BODY")"
+    HOOK_ID=$(jq -r '.data.id' "$API_BODY")
+    jq -e '.data.saved_secrets | index("signing_secret") and index("webhook_url")' "$API_BODY" > /dev/null \
+        || fail "the channel's secrets must be write-only: $(cat "$API_BODY")"
+    [[ "$(api_req POST /api/alerts "{\"name\":\"e2e-memory\",\"kind\":\"memory\",\"app_id\":\"${WHOAMI_ID}\",\"threshold\":0.001,\"for_secs\":0,\"severity\":\"critical\",\"integration_ids\":[\"${HOOK_ID}\"]}")" == 201 ]] \
+        || fail "the memory rule should be created: $(cat "$API_BODY")"
+    MEM_RULE=$(jq -r '.data.id' "$API_BODY")
+    wait_for 120 "the firing notification" bash -c "grep -l '\"event\":\"firing\"' '$HOOK_DIR'/*.json"
+    FIRED=$(grep -l '"event":"firing"' "$HOOK_DIR"/*.json | head -1)
+    jq -e --arg rule "$MEM_RULE" '.version == 1 and .alert.rule_id == $rule and .alert.target_label == "e2e-whoami" and .alert.severity == "critical" and .alert.value > 0' "$FIRED" > /dev/null \
+        || fail "the firing payload must describe the alert: $(cat "$FIRED")"
+    if command -v openssl > /dev/null; then
+        EXPECTED="sha256=$(openssl dgst -sha256 -hmac e2e-signing-secret -hex < "$FIRED" | awk '{print $NF}')"
+        [[ "$(cat "${FIRED%.json}.sig")" == "$EXPECTED" ]] || fail "the webhook signature must be HMAC-SHA256 of the body"
+    fi
+    api /api/alerts/active | jq -e --arg rule "$MEM_RULE" '.data[] | select(.rule_id == $rule and .state == "firing" and .target == "app:'"${WHOAMI_ID}"'")' > /dev/null \
+        || fail "the alert must be listed as firing"
+    pass "memory alert fired and a signed notification arrived"
+
+    [[ "$(api_req PATCH "/api/alerts/${MEM_RULE}" '{"threshold":100}')" == 200 ]] || fail "raising the threshold should work: $(cat "$API_BODY")"
+    wait_for 120 "the resolved notification" bash -c "grep -l '\"event\":\"resolved\"' '$HOOK_DIR'/*.json"
+    api "/api/alerts/history?rule_id=${MEM_RULE}" | jq -e '.data.total == 1 and .data.episodes[0].state == "resolved" and .data.episodes[0].notifications_sent >= 2' > /dev/null \
+        || fail "history must show the resolved episode with its notifications: $(api "/api/alerts/history?rule_id=${MEM_RULE}")"
+    [[ "$(api /api/alerts/active | jq --arg rule "$MEM_RULE" '[.data[] | select(.rule_id == $rule)] | length')" == 0 ]] \
+        || fail "a resolved alert must leave the active list"
+    api_req DELETE "/api/alerts/${MEM_RULE}" '' > /dev/null
+    api_req DELETE "/api/integrations/${HOOK_ID}" '' > /dev/null
+    kill "$HOOK_PID" 2> /dev/null || true
+    rm -rf "$HOOK_DIR"
+    pass "the alert resolved, sent a resolve notification and is in the history"
+else
+    echo "  - python3 not available; skipping the alert fire/resolve check"
+fi
 
 step "Container confinement"
 # Every container Tond starts: ports on 127.0.0.1 only (Docker's iptables rules
@@ -1232,8 +1350,9 @@ api /api/apps/e2e-whoami/deployments | jq -e --arg id "$D2" --arg by "$D3" \
     || fail "the waiting deploy must be marked superseded by the newest one"
 pass "3 deploys → first ran, second superseded by the third, third succeeded"
 wait_for_app_running e2e-whoami 120
-tond apps logs e2e-whoami 2>/dev/null | grep -q "Proxy confirmed the new route in" \
-    || { tond apps logs e2e-whoami | tail -20 >&2; fail "the cutover must wait for tond-proxy's acknowledgement"; }
+whoami_logs=$(tond apps logs e2e-whoami 2>/dev/null || true)
+grep -q "Proxy confirmed the new route in" <<< "$whoami_logs" \
+    || { tail -20 <<< "$whoami_logs" >&2; fail "the cutover must wait for tond-proxy's acknowledgement"; }
 pass "cutover waited for the proxy's acknowledgement ($(tond apps logs e2e-whoami | grep -o 'confirmed the new route in [0-9]* ms' | tail -1))"
 wait_for 30 "route after queued deploys" bash -c "curl -sk --resolve '${WHOAMI_DOMAIN}:443:${IP}' 'https://${WHOAMI_DOMAIN}/' | grep -q Hostname:"
 
@@ -1290,6 +1409,119 @@ jq -e '.data.disk_total > 0 and (.data.disk_mount | length) > 0 and .data.contai
     <<<"$(api /api/system/metrics)" > /dev/null || fail "system metrics should report the data directory's filesystem and Tond's containers"
 pass "system metrics answer from the cache in ${SYS_TIME}s with the data directory's disk"
 
+step "Uptime checks, heartbeat and host history"
+# Probes take the public path (DNS → tond-proxy on 443 → TLS → app). The test
+# domains have no public DNS and the ACME CA isn't publicly trusted, so run.sh
+# gives tond-server TOND_UPTIME_RESOLVE / TOND_UPTIME_CA_FILE (tests only).
+if systemctl show tond-server -p Environment | grep -q TOND_UPTIME_RESOLVE; then
+    api /api/system/self | jq -e '.data.loops | any(.name == "uptime")' > /dev/null \
+        || fail "the uptime loop should be registered in /api/system/self"
+    api "/api/apps/e2e-whoami/uptime" | jq -e '.data.check.interval_secs == 60 and .data.url == "https://'"${WHOAMI_DOMAIN}"'/"' > /dev/null \
+        || fail "e2e-whoami should get an uptime check automatically: $(api /api/apps/e2e-whoami/uptime)"
+    UPTIME_CODE=$(api_req POST /api/apps/e2e-whoami/uptime/check '{}')
+    [[ "$UPTIME_CODE" == 200 ]] || fail "check now answered ${UPTIME_CODE}: $(cat "$API_BODY")"
+    if [[ -n "$CA_FILE" ]]; then
+        jq -e '.data.status == "up" and .data.last.status == 200 and .data.last.cert_days_left > 0 and .data.last.dns == "overridden"' "$API_BODY" > /dev/null \
+            || fail "e2e-whoami should be up with a valid certificate (via the ACME CA): $(jq -c '.data | {status, last}' "$API_BODY")"
+        pass "e2e-whoami is up through DNS/TLS/proxy (HTTP 200, certificate valid for $(jq -r .data.last.cert_days_left "$API_BODY") more days)"
+    else
+        jq -e '.data.last != null' "$API_BODY" > /dev/null || fail "check now should record a probe"
+        pass "check now probed e2e-whoami (no ACME CA: TLS isn't verified here)"
+    fi
+    # Stop the container behind Tond's back: the proxy answers 502 → down (http_5xx).
+    docker stop tond-e2e-whoami > /dev/null
+    [[ "$(api_req POST /api/apps/e2e-whoami/uptime/check '{}')" == 200 ]] || fail "check now failed: $(cat "$API_BODY")"
+    jq -e '.data.status == "down" and .data.incidents[0].cause == "http_5xx" and .data.incidents[0].ended_at == null' "$API_BODY" > /dev/null \
+        || fail "a stopped container should open an http_5xx incident: $(jq -c '.data | {status, last, incidents}' "$API_BODY")"
+    pass "a dead app is reported down with the cause (HTTP 502 from the proxy) and an open incident"
+    docker start tond-e2e-whoami > /dev/null
+    wait_for 60 "e2e-whoami back behind the proxy" bash -c "curl -sk --resolve '${WHOAMI_DOMAIN}:443:${IP}' 'https://${WHOAMI_DOMAIN}/' | grep -q Hostname:"
+    if [[ -n "$CA_FILE" ]]; then
+        [[ "$(api_req POST /api/apps/e2e-whoami/uptime/check '{}')" == 200 ]] || fail "check now failed: $(cat "$API_BODY")"
+        jq -e '.data.status == "up" and .data.incidents[0].ended_at != null' "$API_BODY" > /dev/null \
+            || fail "recovery should close the incident: $(jq -c '.data | {status, incidents}' "$API_BODY")"
+        pass "recovery closes the incident"
+    fi
+    UPTIME_RUNS=$(api /api/system/self | jq '.data.loops[] | select(.name == "uptime") | .runs')
+    wait_for 150 "a scheduled uptime round" \
+        bash -c "(( \$(curl -sf --unix-socket '$SOCK' http://localhost/api/system/self | jq '.data.loops[] | select(.name == \"uptime\") | .runs') > ${UPTIME_RUNS} ))"
+    api /api/uptime | jq -e '.data[] | select(.name == "e2e-whoami") | .uptime.day_probes >= 2 and .uptime.day != null' > /dev/null \
+        || fail "GET /api/uptime should report e2e-whoami's probes: $(api /api/uptime)"
+    pass "the uptime loop probes on its own on the minute grid (GET /api/uptime)"
+    api /api/system/uptime | jq -e '.data.check.path == "/health"' > /dev/null || fail "the dashboard should have its own check"
+    pass "the dashboard has its own uptime check (/health)"
+    [[ "$(api_req PUT /api/apps/e2e-whoami/uptime '{"enabled":true,"path":"nope","interval_secs":60,"expected_status":null,"timeout_secs":10}')" == 400 ]] \
+        || fail "an invalid check path must be rejected"
+    pass "check settings are validated"
+else
+    echo "  - TOND_UPTIME_RESOLVE not set for tond-server (not run via e2e/run.sh); skipping probe checks"
+fi
+
+# Heartbeat: a local listener stands in for healthchecks.io.
+HB_PORT=18477
+HB_LOG=$(mktemp)
+python3 - "$HB_PORT" "$HB_LOG" <<'PY' &
+import http.server, sys
+port, log = int(sys.argv[1]), sys.argv[2]
+class Hit(http.server.BaseHTTPRequestHandler):
+    def hit(self):
+        with open(log, "a") as f:
+            f.write(f"{self.command} {self.path}\n")
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+    do_GET = hit
+    do_POST = hit
+    def log_message(self, *args):
+        pass
+http.server.HTTPServer(("127.0.0.1", port), Hit).serve_forever()
+PY
+HB_PID=$!
+wait_for 10 "the heartbeat listener" bash -c "curl -sf http://127.0.0.1:${HB_PORT}/ready"
+[[ "$(api_req PUT /api/system/heartbeat '{"url":"http://127.0.0.1:'"${HB_PORT}"'/ping/e2e-hb-secret","method":"POST","interval_secs":60,"enabled":true}')" == 200 ]] \
+    || fail "saving the heartbeat failed: $(cat "$API_BODY")"
+jq -e '.data.configured and .data.url_host == "127.0.0.1"' "$API_BODY" > /dev/null || fail "heartbeat settings not saved: $(cat "$API_BODY")"
+if grep -q e2e-hb-secret "$API_BODY" || api /api/system/heartbeat | grep -q e2e-hb-secret; then
+    fail "the heartbeat URL must be write-only"
+fi
+[[ "$(api_req POST /api/system/heartbeat/test '{}')" == 200 ]] || fail "test ping failed: $(cat "$API_BODY")"
+jq -e '.data.outcome == "sent"' "$API_BODY" > /dev/null || fail "the test ping should be sent: $(cat "$API_BODY")"
+grep -q "POST /ping/e2e-hb-secret" "$HB_LOG" || fail "the listener didn't receive the test ping"
+pass "heartbeat URL is write-only; a test ping reaches the monitor"
+wait_for 150 "a scheduled heartbeat" bash -c "[[ \$(grep -c 'POST /ping/e2e-hb-secret' '$HB_LOG') -ge 2 ]]"
+api /api/system/heartbeat | jq -e '.data.last_ok_at != null and .data.healthy' > /dev/null \
+    || fail "the heartbeat should be healthy with a recent success: $(api /api/system/heartbeat)"
+pass "the scheduled heartbeat is sent while Tond is healthy (Docker, proxy, loops)"
+[[ "$(api_req PUT /api/system/heartbeat '{"url":""}')" == 200 ]] || fail "removing the heartbeat URL failed"
+kill "$HB_PID" 2> /dev/null || true
+grep -q "e2e-hb-secret" /opt/tond/data/tond.db && fail "the heartbeat URL must be encrypted at rest"
+pass "the heartbeat URL is encrypted at rest and can be removed"
+
+# Host history: one row a minute from the metrics tick.
+wait_for 150 "host history samples" \
+    bash -c "curl -sf --unix-socket '$SOCK' 'http://localhost/api/system/host/history?range=1h' | jq -e '(.data.series.t | length) >= 1'"
+jq -e '.data.step == 60 and .data.series.disk_total[-1] > 0 and .data.series.inodes_total[-1] >= .data.series.inodes_used[-1] and .data.series.mem_total[-1] > 0 and (.data.series.load1 | length) == (.data.series.t | length)' \
+    <<<"$(api '/api/system/host/history?range=1h')" > /dev/null || fail "host history should carry disk, inodes, memory and load: $(api '/api/system/host/history?range=1h' | head -c 600)"
+# (btrfs reports no inode counts: inodes_total is 0 there.)
+pass "host history is recorded every minute (CPU, load, memory, swap, disk, inodes)"
+api /api/system/host/forecast | jq -e '.data.day.status | IN("filling", "stable", "insufficient_data")' > /dev/null \
+    || fail "the disk forecast should answer: $(api /api/system/host/forecast)"
+HOST=$(api /api/system/host)
+jq -e '.data.docker.reachable and (.data.docker.version | length) > 0 and (.data.docker.storage_driver | length) > 0 and .data.current.data_fs.total > 0' \
+    <<<"$HOST" > /dev/null || fail "host overview should report Docker's health and the filesystems: ${HOST}"
+pass "disk forecast answers; Docker is reachable ($(jq -r '.data.docker.version + ", " + .data.docker.storage_driver' <<<"$HOST"))"
+DISK=$(curl -sf --unix-socket "$SOCK" -X POST http://localhost/api/system/disk/refresh)
+jq -e '.data.error == null and .data.images.count >= 1 and .data.images.bytes > 0 and .data.tond_data > 0' <<<"$DISK" > /dev/null \
+    || fail "the disk breakdown should list Docker images and the data directory: ${DISK}"
+PREVIEW_CLEANUP=$(api /api/system/disk/cleanup)
+jq -e '(.data.total_bytes | type) == "number" and (.data.dangling_images | type) == "array"' <<<"$PREVIEW_CLEANUP" > /dev/null \
+    || fail "the cleanup preview should list what would be removed: ${PREVIEW_CLEANUP}"
+[[ "$(api_req POST /api/system/disk/cleanup '{}')" == 200 ]] || fail "free up space failed: $(cat "$API_BODY")"
+api "/api/audit-log?action=disk_cleanup&limit=1" | jq -e '.data.entries | length > 0' > /dev/null \
+    || fail "free up space must be audited"
+proxied_body "$WHOAMI_DOMAIN" / | grep -q Hostname: || fail "free up space must not touch running apps"
+pass "disk breakdown (images, build cache, data dir); free up space removes only build cache and dangling images, audited"
+
 step "Dashboard delivery (precompressed, cached)"
 INDEX_HEADERS=$(curl -sk -D - -o /dev/null -H 'Accept-Encoding: br, gzip' --resolve "${DASH}:443:${IP}" "https://${DASH}/")
 grep -qi '^content-encoding: br' <<<"$INDEX_HEADERS" || fail "index.html should be served brotli-compressed: ${INDEX_HEADERS}"
@@ -1303,6 +1535,94 @@ grep -qi '^content-encoding: br' <<<"$ASSET_HEADERS" || fail "hashed assets shou
     || fail "a missing build file must be 404, not the SPA shell"
 [[ -z "$(find /opt/tond/dashboard -name '*.ttf')" ]] || fail "the dashboard should ship no TTF fonts"
 pass "index.html br + no-cache; hashed assets br + immutable; missing chunks 404; no TTF fonts"
+
+step "Operations: certificates, retention, app events, deploy trend, /metrics token, audit shipping, deploy --follow"
+certs=$(api /api/certs)
+jq -e --arg d "$WHOAMI_DOMAIN" '.data[] | select(.domain == $d)
+    | .serves.kind == "app" and .serves.app_name == "e2e-whoami" and (.issuer_kind | type == "string")' \
+    <<<"$certs" > /dev/null || fail "GET /api/certs must say what each certificate serves: $(jq -c . <<<"$certs")"
+pass "the certificate list names what each domain serves"
+if [[ -n "$CA_FILE" ]]; then
+    jq -e --arg d "$WHOAMI_DOMAIN" '.data[] | select(.domain == $d)
+        | .issuer != null and .last_renewed_at != null and (.expires_at | test("^[0-9]{4}-"))' <<<"$certs" > /dev/null \
+        || fail "an issued certificate must record its issuer, last renewal and an RFC 3339 expiry"
+    pass "issued certificates record issuer and last renewal"
+fi
+
+retention=$(api /api/settings/retention)
+jq -e '([.data.fields[] | select(.key == "retention_audit_log_days")][0].default == 180)
+    and .data.database.file_bytes > 0 and (.data.database.tables | map(.name) | index("audit_log"))' \
+    <<<"$retention" > /dev/null || fail "retention settings must carry defaults and the database size per table"
+read -r code _ < <(api_send PUT /api/settings/retention '{"retention_audit_log_days": 5}')
+[[ "$code" == 400 ]] || fail "retention values outside their bounds must be rejected (got ${code})"
+pass "retention settings: roadmap defaults, bounds enforced, database size per table"
+if [[ -f /etc/systemd/journald.conf.d/tond.conf ]]; then
+    grep -q '^SystemMaxUse=500M' /etc/systemd/journald.conf.d/tond.conf || fail "the journald drop-in must cap the journal at 500M"
+    pass "the journal is capped at 500 MB"
+else
+    grep -rqsE '^[[:space:]]*SystemMaxUse' /etc/systemd/journald.conf /etc/systemd/journald.conf.d/ \
+        || fail "install.sh must cap the journal (or keep an existing SystemMaxUse)"
+    pass "an existing journal cap was kept"
+fi
+
+events=$(api "/api/apps/e2e-whoami/events?limit=200")
+jq -e '[.data.events[].kind] | index("deploy_succeeded") and index("restart")' <<<"$events" > /dev/null \
+    || fail "the app event feed must show deploys and the restart: $(jq -c '[.data.events[].kind]' <<<"$events")"
+pass "app events merge deploys and restarts ($(jq '.data.events | length' <<<"$events") events)"
+stats=$(api /api/apps/e2e-whoami/deployments/stats)
+jq -e '.data.window >= 2 and .data.success_rate != null and .data.median_duration_secs != null' <<<"$stats" > /dev/null \
+    || fail "deploy stats must report a success rate and median duration: $(jq -c .data <<<"$stats")"
+pass "deploy trend: $(jq '.data.success_rate * 100 | floor' <<<"$stats")% of the last $(jq .data.window <<<"$stats") deploys succeeded"
+
+tond token revoke e2e-prometheus > /dev/null 2>&1 || true
+PROM_TOKEN=$(tond token create --name e2e-prometheus --scope metrics:read --expires 1d 2> /dev/null)
+prom=$(curl -sf -H "Authorization: Bearer ${PROM_TOKEN}" http://127.0.0.1:3001/metrics) \
+    || fail "/metrics over TCP must accept a metrics:read token"
+grep -q '^tond_process_resident_memory_bytes' <<<"$prom" || fail "/metrics over TCP must expose Prometheus metrics"
+[[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${RO_TOKEN}" http://127.0.0.1:3001/api/settings/retention)" == 200 ]] \
+    || fail "any signed-in caller may read retention settings"
+pass "Prometheus can scrape /metrics over TCP with a metrics:read token"
+
+if command -v python3 > /dev/null; then
+    SYSLOG_OUT=$(mktemp)
+    python3 -c '
+import socket, sys
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 16514)); s.listen(5)
+out = open(sys.argv[1], "ab")
+while True:
+    c, _ = s.accept()
+    while True:
+        d = c.recv(65536)
+        if not d: break
+        out.write(d); out.flush()
+    c.close()' "$SYSLOG_OUT" &
+    SYSLOG_PID=$!
+    sleep 1
+    read -r code body < <(api_send PUT /api/audit-log/shipping '{"syslog": {"enabled": true, "host": "127.0.0.1", "port": 16514, "tls": false}}')
+    [[ "$code" == 200 ]] || fail "enabling syslog shipping should succeed (got ${code}: ${body})"
+    wait_for 60 "audit entries shipped to the syslog receiver" bash -c "grep -q 'audit_shipping_update' '$SYSLOG_OUT'"
+    wait_for 60 "syslog shipping caught up" \
+        bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/audit-log/shipping | jq -e '.data.syslog.status.pending == 0 and .data.syslog.status.last_error == null'"
+    grep -qE '^[0-9]+ <1(08|09)>1 ' "$SYSLOG_OUT" || fail "shipped entries must be octet-counted RFC 5424 messages"
+    grep -q '"hash":"' "$SYSLOG_OUT" || fail "shipped entries must carry their chain hash"
+    read -r code _ < <(api_send PUT /api/audit-log/shipping '{"syslog": {"enabled": false, "host": "127.0.0.1", "port": 16514, "tls": false}}')
+    kill "$SYSLOG_PID" 2> /dev/null || true
+    rm -f "$SYSLOG_OUT"
+    pass "audit entries (with hashes) are shipped to syslog as RFC 5424 and delivery is tracked"
+else
+    echo "  - python3 not available; skipping the audit shipping check"
+fi
+
+follow_out=$(tond apps deploy e2e-whoami 2>&1) || fail "tond apps deploy must exit 0 for a good deploy: ${follow_out}"
+grep -q "is live" <<<"$follow_out" || fail "tond apps deploy must follow the deploy to the end: ${follow_out}"
+grep -q "✓ " <<<"$follow_out" || fail "tond apps deploy must print phase progress: ${follow_out}"
+queued_out=$(tond apps deploy e2e-whoami --no-follow 2>&1) || fail "tond apps deploy --no-follow failed: ${queued_out}"
+grep -q "queued" <<<"$queued_out" || fail "--no-follow must return once the deploy is queued: ${queued_out}"
+wait_for 300 "the --no-follow deploy to finish" \
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/apps/e2e-whoami/deployments | jq -e '[.data[] | select(.status == \"running\" or .status == \"queued\")] | length == 0'"
+wait_for_app_running e2e-whoami 120
+pass "tond apps deploy follows phases to the end; --no-follow returns at once"
 
 step "Snapshot"
 tond snapshot create --name e2e-smoke > /dev/null

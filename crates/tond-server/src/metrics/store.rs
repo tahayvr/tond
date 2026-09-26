@@ -5,7 +5,8 @@
 //   metrics_raw     30 s samples                 kept RAW_KEEP_SECS  (25 h)
 //   metrics_5m      5-minute rollups             kept M5_KEEP_SECS   (8 days)
 //   metrics_1h      1-hour rollups               kept H1_KEEP_SECS   (90 days)
-//   metric_events   restarts / crashes / OOMs    kept EVENT_KEEP_SECS (90 days)
+//   metric_events   restarts / crashes / OOMs    kept retention_app_events_days (90)
+//   requests_1m/1h  request metrics (requests.rs; pruned there, orphans here)
 //
 // Each tick writes all samples in one transaction. Rollups are computed when a
 // bucket closes (every 5 minutes / every hour) with INSERT OR REPLACE, so a
@@ -29,7 +30,6 @@ pub const MAX_POINTS: i64 = 480;
 pub const RAW_KEEP_SECS: i64 = 25 * 3600;
 pub const M5_KEEP_SECS: i64 = 8 * 86_400;
 pub const H1_KEEP_SECS: i64 = 90 * 86_400;
-pub const EVENT_KEEP_SECS: i64 = 90 * 86_400;
 const BATCH: i64 = 2_000;
 const BATCH_PAUSE: Duration = Duration::from_millis(25);
 
@@ -250,12 +250,14 @@ impl RollupTable {
 
 /// Drop samples, rollups and events past their retention, plus targets whose
 /// owner no longer exists. Returns the number of rows deleted.
-pub async fn prune(db: &SqlitePool, now: i64) -> anyhow::Result<u64> {
+/// Delete expired rows. `event_keep_secs` is how long restart / crash / OOM
+/// events are kept (`retention_app_events_days`, default 90 days).
+pub async fn prune(db: &SqlitePool, now: i64, event_keep_secs: i64) -> anyhow::Result<u64> {
     let mut deleted = 0;
 
     // Targets whose app / database / cron job / preview is gone, with all rows.
     let orphans: Vec<i64> = sqlx::query_scalar(
-        "SELECT id FROM metric_targets t WHERE NOT EXISTS (
+        "SELECT id FROM metric_targets t WHERE t.kind NOT IN ('dashboard', 'unknown') AND NOT EXISTS (
             SELECT 1 FROM apps WHERE t.kind = 'app' AND apps.id = t.owner_id
             UNION ALL SELECT 1 FROM databases WHERE t.kind = 'database' AND databases.id = t.owner_id
             UNION ALL SELECT 1 FROM cron_jobs WHERE t.kind = 'cron' AND cron_jobs.id = t.owner_id
@@ -264,7 +266,14 @@ pub async fn prune(db: &SqlitePool, now: i64) -> anyhow::Result<u64> {
     .fetch_all(db)
     .await?;
     for id in orphans {
-        for table in ["metrics_raw", "metrics_5m", "metrics_1h", "metric_events"] {
+        for table in [
+            "metrics_raw",
+            "metrics_5m",
+            "metrics_1h",
+            "metric_events",
+            "requests_1m",
+            "requests_1h",
+        ] {
             let sql = format!("DELETE FROM {table} WHERE target = ?");
             deleted += sqlx::query(AssertSqlSafe(sql.as_str()))
                 .bind(id)
@@ -283,7 +292,7 @@ pub async fn prune(db: &SqlitePool, now: i64) -> anyhow::Result<u64> {
         ("metrics_raw", RAW_KEEP_SECS, "target, ts"),
         ("metrics_5m", M5_KEEP_SECS, "target, ts"),
         ("metrics_1h", H1_KEEP_SECS, "target, ts"),
-        ("metric_events", EVENT_KEEP_SECS, "target, ts, kind"),
+        ("metric_events", event_keep_secs, "target, ts, kind"),
     ] {
         let sql = format!(
             "DELETE FROM {table} WHERE ({key}) IN (
@@ -456,19 +465,6 @@ pub async fn latest_sample(
     }))
 }
 
-/// Highest latest-sample CPU (percent of one core) across all app targets
-/// sampled since `since`.
-pub async fn max_app_cpu_since(db: &SqlitePool, since: i64) -> sqlx::Result<Option<f64>> {
-    let v: Option<i64> = sqlx::query_scalar(
-        "SELECT MAX(cpu) FROM metrics_raw
-         WHERE target IN (SELECT id FROM metric_targets WHERE kind = 'app') AND ts >= ?",
-    )
-    .bind(since)
-    .fetch_one(db)
-    .await?;
-    Ok(v.map(|c| c as f64 / 100.0))
-}
-
 /// Hundredths of a percent → percent with one decimal.
 pub fn centi_to_percent(v: f64) -> f64 {
     (v / 10.0).round() / 10.0
@@ -614,10 +610,6 @@ mod tests {
             latest.map(|(ts, s)| (ts, s.cpu)),
             Some((base + 39 * 30, 3000))
         );
-        assert_eq!(
-            max_app_cpu_since(&db, base).await.ok().flatten(),
-            Some(30.0)
-        );
     }
 
     #[tokio::test]
@@ -691,7 +683,7 @@ mod tests {
             .await
             .unwrap_or_else(|e| panic!("{e}"));
 
-        let deleted = prune(&db, now)
+        let deleted = prune(&db, now, 90 * 86_400)
             .await
             .unwrap_or_else(|e| panic!("prune: {e}"));
         assert_eq!(deleted, 5, "old raw + old hourly + orphan raw/event/target");

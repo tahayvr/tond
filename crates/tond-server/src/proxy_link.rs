@@ -13,7 +13,8 @@
 //     confirms it routes the new port. This replaced a fixed 3 s sleep;
 //   - receives certificate results (cert events) and stores them — the proxy
 //     opens tond.db read-only — then acks them;
-//   - asks for the proxy's own stats for GET /api/system/self.
+//   - asks for the proxy's own stats for GET /api/system/self;
+//   - reads its per-route request counters on the metrics tick (`traffic`).
 //
 // When the proxy is not running there is nothing to wait for: it loads the
 // current routes from the database when it starts. When it runs but does not
@@ -37,6 +38,7 @@ use tond_common::proxy_control::{
     CertOutcome, CertReport, FALLBACK_POLL_SECS, MAX_LINE_BYTES, PROXY_SOCKET_NAME, ProxyMessage,
     ProxyRequest, ReplyBody, encode_line,
 };
+use tond_common::traffic::TrafficSnapshot;
 
 use crate::runtime::changes::{Table, Watch};
 use crate::runtime::{loops, shutdown};
@@ -261,18 +263,39 @@ pub async fn proxy_stats() -> Option<ProxyStats> {
     }
 }
 
+/// The proxy's cumulative per-route request counters (metrics collector
+/// tick). None when the proxy is not connected or does not answer quickly.
+pub async fn traffic() -> Option<TrafficSnapshot> {
+    if !is_connected() {
+        return None;
+    }
+    match request(|id| ProxyRequest::Traffic { id }, Duration::from_secs(2)).await {
+        Ok(ReplyBody::Traffic { traffic }) => Some(traffic),
+        Ok(other) => {
+            tracing::debug!("unexpected answer to traffic: {other:?}");
+            None
+        }
+        Err(e) => {
+            tracing::debug!("proxy traffic request failed: {e}");
+            None
+        }
+    }
+}
+
 /// Store a certificate result reported by the proxy.
 pub async fn apply_cert_report(db: &sqlx::SqlitePool, report: &CertReport) -> Result<()> {
     match &report.outcome {
         CertOutcome::Issued {
             issued_at,
             expires_at,
+            issuer,
         } => {
             sqlx::query(
                 "INSERT INTO certificates (id, domain, cert_type, cert_path, key_path, issued_at, expires_at,
                                            status, created_at, updated_at,
-                                           last_error, last_attempt_at, next_retry_at, failure_count)
-                 VALUES (?1, ?2, 'acme', ?3, ?4, ?5, ?6, 'active', ?7, ?7, NULL, ?7, NULL, 0)
+                                           last_error, last_attempt_at, next_retry_at, failure_count,
+                                           issuer, last_renewed_at)
+                 VALUES (?1, ?2, 'acme', ?3, ?4, ?5, ?6, 'active', ?7, ?7, NULL, ?7, NULL, 0, ?8, ?7)
                  ON CONFLICT(domain) DO UPDATE SET
                     cert_path = excluded.cert_path,
                     key_path = excluded.key_path,
@@ -283,7 +306,9 @@ pub async fn apply_cert_report(db: &sqlx::SqlitePool, report: &CertReport) -> Re
                     last_error = NULL,
                     last_attempt_at = excluded.last_attempt_at,
                     next_retry_at = NULL,
-                    failure_count = 0",
+                    failure_count = 0,
+                    issuer = excluded.issuer,
+                    last_renewed_at = excluded.last_renewed_at",
             )
             .bind(uuid::Uuid::new_v4().to_string())
             .bind(&report.domain)
@@ -292,6 +317,7 @@ pub async fn apply_cert_report(db: &sqlx::SqlitePool, report: &CertReport) -> Re
             .bind(issued_at)
             .bind(expires_at)
             .bind(&report.attempted_at)
+            .bind(issuer)
             .execute(db)
             .await
             .context("storing issued certificate")?;
@@ -519,8 +545,9 @@ mod tests {
         apply_cert_report(
             &db,
             &report(CertOutcome::Issued {
-                issued_at: "May  1 10:00:00 2026 GMT".into(),
-                expires_at: "Jul 30 10:00:00 2026 GMT".into(),
+                issued_at: "2026-05-01T10:00:00Z".into(),
+                expires_at: "2026-07-30T10:00:00Z".into(),
+                issuer: Some("Let's Encrypt R11".into()),
             }),
         )
         .await
@@ -538,9 +565,37 @@ mod tests {
                 None,
                 None,
                 0,
-                "Jul 30 10:00:00 2026 GMT".into()
+                "2026-07-30T10:00:00Z".into()
             )
         );
+        let (issuer, renewed): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT issuer, last_renewed_at FROM certificates WHERE domain = 'app.example.com'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap_or_else(|e| panic!("row: {e}"));
+        assert_eq!(issuer.as_deref(), Some("Let's Encrypt R11"));
+        assert_eq!(renewed.as_deref(), Some("2026-05-01T10:00:00+00:00"));
+
+        // A later failed renewal keeps the issuer and the last renewal time.
+        apply_cert_report(
+            &db,
+            &report(CertOutcome::Failed {
+                status: "active".into(),
+                error: "timeout".into(),
+                failure_count: 1,
+                next_retry_at: "2026-06-01T10:01:00+00:00".into(),
+            }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("apply failure: {e}"));
+        let (issuer, renewed): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT issuer, last_renewed_at FROM certificates WHERE domain = 'app.example.com'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap_or_else(|e| panic!("row: {e}"));
+        assert!(issuer.is_some() && renewed.is_some());
     }
 
     #[test]

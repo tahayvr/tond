@@ -17,6 +17,8 @@ Type=simple
 #   proxy.sock                      tond-proxy 0600: control socket; only root
 #                                   (tond-server) and tond-proxy may connect
 #   certs/, acme_account.json       tond-proxy only (0700 / 0600)
+#   access/                         tond-proxy only (0700; files 0600): opt-in
+#                                   per-app access logs, 60 MB per app at most
 #   tond.env, setup-token, tond.sock, keys/, backups/, ...  root only
 User=tond-proxy
 Group=tond-proxy
@@ -60,6 +62,11 @@ Environment=TOND_SERVER_ADDR=127.0.0.1:3001
 
 # Logging level: trace, debug, info, warn, error
 Environment=RUST_LOG=info
+
+# Log format: text (default, readable in journalctl) or json (one JSON object
+# per line with level, target, message and span fields, for log shippers).
+# Set it with: systemctl edit tond-proxy
+# Environment=TOND_LOG_FORMAT=json
 
 # ── Privileges ──
 AmbientCapabilities=CAP_NET_BIND_SERVICE

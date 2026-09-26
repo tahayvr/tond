@@ -2,6 +2,8 @@
 	import {
 		getOnboardingStatus,
 		getSystemMetrics,
+		listActiveAlerts,
+		type ActiveAlert,
 		type Project,
 		type App,
 		type ManagedDatabase,
@@ -17,8 +19,10 @@
 	import PageHeader from '$lib/components/nav/page-header.svelte';
 	import StatusBadge from '$lib/components/feedback/status-badge.svelte';
 	import InlineError from '$lib/components/feedback/inline-error.svelte';
+	import TrafficOverview from '$lib/components/metrics/traffic-overview.svelte';
 	import { errorMessage } from '$lib/action.svelte';
 	import { buildChecklist } from '$lib/onboarding';
+	import FiringBanner from '$lib/components/alerts/FiringBanner.svelte';
 	import { appTabHref } from '$lib/tabs';
 	import { formatRelativePast } from '$lib/time';
 	import Plus from '~icons/ri/add-line';
@@ -51,6 +55,7 @@
 	let onboarding = $state<OnboardingStatus | null>(null);
 	let onboardingError = $state('');
 	let metrics = $state<SystemMetrics | null>(null);
+	let firing = $state<ActiveAlert[]>([]);
 
 	$effect(() => {
 		let cancelled = false;
@@ -60,6 +65,11 @@
 		getSystemMetrics()
 			.then((m) => !cancelled && (metrics = m))
 			.catch(() => {});
+		if (can('metrics:read')) {
+			listActiveAlerts()
+				.then((a) => !cancelled && (firing = a.filter((x) => x.state === 'firing')))
+				.catch(() => {});
+		}
 		return () => {
 			cancelled = true;
 		};
@@ -101,6 +111,8 @@
 			{/if}
 		{/snippet}
 	</PageHeader>
+
+	<FiringBanner alerts={firing} />
 
 	<!-- First-run checklist -->
 	{#if onboardingError}
@@ -252,6 +264,10 @@
 			{/if}
 		</a>
 	</section>
+
+	{#if can('metrics:read')}
+		<TrafficOverview />
+	{/if}
 
 	<div class="grid gap-4 lg:grid-cols-3">
 		<!-- Apps that need attention, then everything by project -->

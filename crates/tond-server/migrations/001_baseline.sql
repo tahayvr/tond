@@ -1,11 +1,10 @@
 -- Tond baseline schema.
 --
 -- Squashed before the first release (no installs existed): the original
--- migrations 001-049, then Phase 0 (lock down) and Phase 1 (solid core):
--- authorization and API tokens, hash-chained audit log, encrypted snapshots,
--- build queue and route_state triggers, compact metrics, deploy phases and
--- readiness, event-only alert rules, database links and preview sharing.
--- Add new migrations as 002_..., 003_... from here on.
+-- migrations 001-049, then Phase 0 (lock down), Phase 1 (solid core) and
+-- Phase 2 (observable): request metrics and access logs, the alert engine,
+-- host history, uptime checks and heartbeat, certificate issuer, audit
+-- shipping. Add new migrations as 002_..., 003_... from here on.
 
 CREATE TABLE apps(
   id TEXT PRIMARY KEY NOT NULL,
@@ -46,7 +45,9 @@ CREATE TABLE apps(
   preview_shared_keys TEXT NOT NULL DEFAULT '[]',
   preview_env_vars TEXT NOT NULL DEFAULT '{}',
   readiness TEXT NOT NULL DEFAULT 'http',
-  ready_after_secs INTEGER NOT NULL DEFAULT 10
+  ready_after_secs INTEGER NOT NULL DEFAULT 10,
+  access_log INTEGER NOT NULL DEFAULT 0,
+  access_log_query INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE deploy_logs(
@@ -106,7 +107,9 @@ CREATE TABLE certificates(
   last_error TEXT,
   last_attempt_at TEXT,
   next_retry_at TEXT,
-  failure_count INTEGER NOT NULL DEFAULT 0
+  failure_count INTEGER NOT NULL DEFAULT 0,
+  issuer TEXT,
+  last_renewed_at TEXT
 );
 
 CREATE TABLE settings(
@@ -302,13 +305,6 @@ CREATE TABLE mfa_pending(
   attempts INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE TABLE alert_rule_notifications(
-  id TEXT NOT NULL PRIMARY KEY,
-  rule_id TEXT NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
-  integration_id TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT(datetime('now'))
-);
-
 CREATE TABLE integrations(
   id TEXT NOT NULL PRIMARY KEY,
   name TEXT NOT NULL,
@@ -318,7 +314,11 @@ CREATE TABLE integrations(
   config TEXT NOT NULL DEFAULT '{}',
   enabled INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL DEFAULT(datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT(datetime('now'))
+  updated_at TEXT NOT NULL DEFAULT(datetime('now')),
+  quiet_hours TEXT,
+  last_sent_at INTEGER,
+  last_error TEXT,
+  last_error_at INTEGER
 );
 
 CREATE TABLE storage_providers(
@@ -633,29 +633,6 @@ CREATE INDEX idx_deploy_logs_deployment ON deploy_logs(
   created_at
 );
 
-CREATE TABLE "alert_rules"(
-  id TEXT NOT NULL PRIMARY KEY,
-  -- Optional: scope to a specific app; NULL = all apps
-  app_id TEXT REFERENCES apps(id) ON DELETE CASCADE,
-  -- Human-readable name
-  name TEXT NOT NULL,
-  -- Metric to watch: "cpu" | "memory" | "app_down" | "disk_usage"; NULL for event-only rules
-  metric TEXT,
-  -- Threshold:
-  -- cpu / memory / disk_usage → percentage(0–100)
-  -- app_down → minutes the app must be non-running before alerting
-  threshold REAL NOT NULL,
-  -- Optional webhook URL to POST to when the rule fires('' = none)
-  webhook_url TEXT NOT NULL DEFAULT '',
-  -- 1 = active, 0 = paused
-  enabled INTEGER NOT NULL DEFAULT 1,
-  -- ISO-8601 timestamp of last fire(NULL = never fired)
-  last_fired_at TEXT,
-  created_at TEXT NOT NULL DEFAULT(datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT(datetime('now')),
-  events TEXT
-);
-
 CREATE TABLE database_links(
   database_id TEXT NOT NULL REFERENCES databases(id) ON DELETE CASCADE,
   app_id TEXT NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
@@ -663,6 +640,288 @@ CREATE TABLE database_links(
   PRIMARY KEY(database_id, app_id)
 );
 CREATE INDEX idx_database_links_app ON database_links(app_id);
+
+CREATE TABLE requests_1m(
+  target INTEGER NOT NULL,
+  -- Minute start, unix seconds.
+  ts INTEGER NOT NULL,
+  requests INTEGER NOT NULL,
+  s1xx INTEGER NOT NULL,
+  s2xx INTEGER NOT NULL,
+  s3xx INTEGER NOT NULL,
+  s4xx INTEGER NOT NULL,
+  s5xx INTEGER NOT NULL,
+  s502 INTEGER NOT NULL,
+  s504 INTEGER NOT NULL,
+  bytes_in INTEGER NOT NULL,
+  bytes_out INTEGER NOT NULL,
+  -- Latency histograms(tond_common::traffic::encode_histogram): total time
+  -- and time to the upstream's response head.
+  latency BLOB NOT NULL,
+  upstream BLOB NOT NULL,
+  PRIMARY KEY(target, ts)
+) WITHOUT ROWID;
+
+CREATE TABLE requests_1h(
+  target INTEGER NOT NULL,
+  ts INTEGER NOT NULL,
+  requests INTEGER NOT NULL,
+  s1xx INTEGER NOT NULL,
+  s2xx INTEGER NOT NULL,
+  s3xx INTEGER NOT NULL,
+  s4xx INTEGER NOT NULL,
+  s5xx INTEGER NOT NULL,
+  s502 INTEGER NOT NULL,
+  s504 INTEGER NOT NULL,
+  bytes_in INTEGER NOT NULL,
+  bytes_out INTEGER NOT NULL,
+  latency BLOB NOT NULL,
+  upstream BLOB NOT NULL,
+  PRIMARY KEY(target, ts)
+) WITHOUT ROWID;
+CREATE TRIGGER route_apps_access_log AFTER UPDATE OF access_log, access_log_query ON apps
+WHEN OLD.access_log IS NOT NEW.access_log
+  OR OLD.access_log_query IS NOT NEW.access_log_query
+BEGIN
+  UPDATE route_state SET version = version + 1 WHERE id = 1;
+END;
+
+CREATE TABLE alert_rules(
+  id TEXT NOT NULL PRIMARY KEY,
+  name TEXT NOT NULL,
+  -- tond_common::ALERT_KINDS: cpu | memory | app_down | disk_usage |
+  -- disk_forecast | http_5xx_rate | http_p95_latency | cert_expiry | oom |
+  -- crash_loop | backup_failed | deploy_failed | cron_failed
+  kind TEXT NOT NULL,
+  -- App-scoped kinds: one app, or NULL for every app. Ignored otherwise.
+  app_id TEXT REFERENCES apps(id) ON DELETE CASCADE,
+  -- Unit depends on the kind(percent, ms, days, hours, restarts)
+  threshold REAL NOT NULL DEFAULT 0,
+  -- Look-back window(5xx rate, p95 latency, OOM, crash loop), seconds
+  window_secs INTEGER NOT NULL DEFAULT 0,
+  -- How long the condition must hold before the alert fires, seconds
+  for_secs INTEGER NOT NULL DEFAULT 0,
+  -- info | warning | critical
+  severity TEXT NOT NULL DEFAULT 'warning',
+  -- Re-notify while firing and unacknowledged; 0 = never
+  repeat_secs INTEGER NOT NULL DEFAULT 14400,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  -- The whole rule is muted until this unix time(NULL = not muted)
+  snoozed_until INTEGER,
+  created_at TEXT NOT NULL DEFAULT(datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT(datetime('now'))
+);
+
+CREATE TABLE alert_rule_notifications(
+  rule_id TEXT NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
+  integration_id TEXT NOT NULL REFERENCES integrations(id) ON DELETE CASCADE,
+  PRIMARY KEY(rule_id, integration_id)
+) WITHOUT ROWID;
+
+CREATE TABLE alert_history(
+  id TEXT NOT NULL PRIMARY KEY,
+  rule_id TEXT REFERENCES alert_rules(id) ON DELETE SET NULL,
+  rule_name TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  severity TEXT NOT NULL,
+  -- "app:<id>" | "host" | "cert:<domain>" | "backup" | "cron:<id>"
+  target TEXT NOT NULL,
+  target_label TEXT NOT NULL,
+  app_id TEXT,
+  threshold REAL NOT NULL,
+  -- Value when it fired, and the latest value seen while firing
+  value REAL,
+  last_value REAL,
+  -- Unix seconds: condition first true, fired, resolved
+  pending_since INTEGER NOT NULL,
+  fired_at INTEGER NOT NULL,
+  resolved_at INTEGER,
+  acknowledged_at INTEGER,
+  acknowledged_by TEXT,
+  last_notified_at INTEGER
+);
+CREATE INDEX alert_history_fired ON alert_history(fired_at DESC);
+CREATE INDEX alert_history_rule ON alert_history(rule_id, fired_at DESC);
+CREATE INDEX alert_history_app ON alert_history(app_id, fired_at DESC);
+CREATE INDEX alert_history_resolved ON alert_history(resolved_at);
+
+CREATE TABLE alert_states(
+  rule_id TEXT NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
+  target TEXT NOT NULL,
+  target_label TEXT NOT NULL,
+  -- pending | firing | inactive
+  state TEXT NOT NULL,
+  -- Unix seconds the condition became true
+  since INTEGER NOT NULL,
+  value REAL,
+  episode_id TEXT REFERENCES alert_history(id) ON DELETE SET NULL,
+  -- Timed snooze of this target(unix seconds)
+  snoozed_until INTEGER,
+  PRIMARY KEY(rule_id, target)
+) WITHOUT ROWID;
+
+CREATE TABLE alert_deliveries(
+  id TEXT NOT NULL PRIMARY KEY,
+  episode_id TEXT NOT NULL REFERENCES alert_history(id) ON DELETE CASCADE,
+  integration_id TEXT NOT NULL REFERENCES integrations(id) ON DELETE CASCADE,
+  -- firing | repeat | resolved
+  event TEXT NOT NULL,
+  -- pending | sent | failed | skipped
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at INTEGER NOT NULL,
+  -- 1 when held back by quiet hours
+  deferred INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  sent_at INTEGER,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX alert_deliveries_due ON alert_deliveries(status, next_attempt_at);
+CREATE INDEX alert_deliveries_episode ON alert_deliveries(episode_id);
+
+CREATE TABLE host_1m(
+  ts INTEGER PRIMARY KEY NOT NULL,
+  cpu INTEGER NOT NULL,
+  cpu_max INTEGER NOT NULL,
+  load1 INTEGER NOT NULL,
+  load5 INTEGER NOT NULL,
+  load15 INTEGER NOT NULL,
+  mem_used INTEGER NOT NULL,
+  mem_total INTEGER NOT NULL,
+  swap_used INTEGER NOT NULL,
+  swap_total INTEGER NOT NULL,
+  disk_used INTEGER NOT NULL,
+  disk_total INTEGER NOT NULL,
+  inodes_used INTEGER NOT NULL,
+  inodes_total INTEGER NOT NULL,
+  root_used INTEGER NOT NULL,
+  root_total INTEGER NOT NULL,
+  root_inodes_used INTEGER NOT NULL,
+  root_inodes_total INTEGER NOT NULL
+) WITHOUT ROWID;
+
+CREATE TABLE host_1h(
+  ts INTEGER PRIMARY KEY NOT NULL,
+  cpu INTEGER NOT NULL,
+  cpu_max INTEGER NOT NULL,
+  load1 INTEGER NOT NULL,
+  load5 INTEGER NOT NULL,
+  load15 INTEGER NOT NULL,
+  mem_used INTEGER NOT NULL,
+  mem_total INTEGER NOT NULL,
+  swap_used INTEGER NOT NULL,
+  swap_total INTEGER NOT NULL,
+  disk_used INTEGER NOT NULL,
+  disk_total INTEGER NOT NULL,
+  inodes_used INTEGER NOT NULL,
+  inodes_total INTEGER NOT NULL,
+  root_used INTEGER NOT NULL,
+  root_total INTEGER NOT NULL,
+  root_inodes_used INTEGER NOT NULL,
+  root_inodes_total INTEGER NOT NULL
+) WITHOUT ROWID;
+
+CREATE TABLE uptime_checks(
+  id INTEGER PRIMARY KEY,
+  -- "app" | "dashboard"
+  kind TEXT NOT NULL,
+  -- apps.id for "app"; '' for the dashboard
+  owner_id TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  path TEXT NOT NULL DEFAULT '/',
+  -- seconds between probes: a multiple of 60, 60 – 3600
+  interval_secs INTEGER NOT NULL DEFAULT 60,
+  -- expected HTTP status; NULL = any 2xx or 3xx
+  expected_status INTEGER,
+  timeout_secs INTEGER NOT NULL DEFAULT 10,
+  created_at TEXT NOT NULL DEFAULT(datetime('now')),
+  UNIQUE(kind, owner_id)
+);
+
+CREATE TABLE uptime_1m(
+  check_id INTEGER NOT NULL,
+  ts INTEGER NOT NULL,
+  result INTEGER NOT NULL,
+  status INTEGER,
+  latency_ms INTEGER,
+  PRIMARY KEY(check_id, ts)
+) WITHOUT ROWID;
+
+CREATE TABLE uptime_1h(
+  check_id INTEGER NOT NULL,
+  ts INTEGER NOT NULL,
+  probes INTEGER NOT NULL,
+  up INTEGER NOT NULL,
+  latency_ms INTEGER,
+  PRIMARY KEY(check_id, ts)
+) WITHOUT ROWID;
+
+CREATE TABLE uptime_incidents(
+  id INTEGER PRIMARY KEY,
+  check_id INTEGER NOT NULL,
+  started_at INTEGER NOT NULL,
+  ended_at INTEGER,
+  cause TEXT NOT NULL,
+  detail TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX idx_uptime_incidents_check ON uptime_incidents(
+  check_id,
+  started_at
+);
+CREATE INDEX idx_uptime_incidents_started ON uptime_incidents(started_at);
+CREATE TRIGGER uptime_checks_app_delete AFTER DELETE ON apps
+BEGIN
+  DELETE FROM uptime_checks WHERE kind = 'app' AND owner_id = OLD.id;
+END;
+CREATE TRIGGER uptime_checks_delete AFTER DELETE ON uptime_checks
+BEGIN
+  DELETE FROM uptime_1m WHERE check_id = OLD.id;
+  DELETE FROM uptime_1h WHERE check_id = OLD.id;
+  DELETE FROM uptime_incidents WHERE check_id = OLD.id;
+END;
+
+CREATE TABLE heartbeat_config(
+  id TEXT PRIMARY KEY NOT NULL CHECK(id = 'heartbeat'),
+  url_enc TEXT NOT NULL DEFAULT '',
+  -- "GET" | "POST"
+  method TEXT NOT NULL DEFAULT 'GET',
+  interval_secs INTEGER NOT NULL DEFAULT 300,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  last_ok_at INTEGER,
+  last_failure_at INTEGER,
+  last_error TEXT,
+  -- why the last ping was not sent(Tond itself unhealthy), when it was not
+  last_skipped_at INTEGER,
+  last_skip_reason TEXT
+);
+
+CREATE TABLE audit_shipping(
+  id TEXT PRIMARY KEY NOT NULL CHECK(id = 'default'),
+  syslog_enabled INTEGER NOT NULL DEFAULT 0,
+  syslog_host TEXT NOT NULL DEFAULT '',
+  syslog_port INTEGER NOT NULL DEFAULT 6514,
+  -- 1 = RFC 5425(syslog over TLS), 0 = plain TCP(RFC 6587 framing)
+  syslog_tls INTEGER NOT NULL DEFAULT 1,
+  webhook_enabled INTEGER NOT NULL DEFAULT 0,
+  webhook_url TEXT NOT NULL DEFAULT '',
+  -- HMAC-SHA256 key for X-Tond-Signature, encrypted(secret_key.rs)
+  webhook_secret TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT(datetime('now'))
+);
+
+CREATE TABLE audit_ship_state(
+  -- "syslog" | "webhook"
+  destination TEXT PRIMARY KEY NOT NULL,
+  shipped_seq INTEGER NOT NULL DEFAULT 0,
+  -- consecutive failed attempts(drives the backoff)
+  failures INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT,
+  last_attempt_at TEXT,
+  last_success_at TEXT,
+  last_error TEXT,
+  -- entries removed by retention before they could be delivered
+  dropped INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
 
 
 -- Seed rows
@@ -672,3 +931,6 @@ INSERT OR IGNORE INTO backup_config (id) VALUES (1);
 INSERT INTO audit_state (id, checkpoint_seq, checkpoint_hash)
 VALUES (1, 0, '0000000000000000000000000000000000000000000000000000000000000000');
 INSERT INTO route_state (id, version) VALUES (1, 0);
+INSERT INTO uptime_checks (kind, owner_id, path) VALUES ('dashboard', '', '/health');
+INSERT INTO heartbeat_config (id) VALUES ('heartbeat');
+INSERT INTO audit_shipping (id) VALUES ('default');

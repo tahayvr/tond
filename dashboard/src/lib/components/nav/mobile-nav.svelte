@@ -7,6 +7,10 @@
 	import { isActive, visibleNavItems } from './nav-items.svelte.ts';
 
 	const items = $derived(visibleNavItems());
+	const groups = $derived([
+		{ label: null, items: items.filter((item) => item.primary) },
+		{ label: 'More', items: items.filter((item) => !item.primary) }
+	]);
 
 	let { email, onLogout }: { email?: string; onLogout: () => void } = $props();
 
@@ -35,22 +39,27 @@
 			{/if}
 		</Sheet.Header>
 		<nav class="flex-1 overflow-y-auto p-2" aria-label="Main">
-			<ul class="flex flex-col gap-1">
-				{#each items as item (item.href)}
-					{@const active = isActive(item.href, page.url.pathname)}
-					<li>
-						<a
-							href={item.href}
-							data-sveltekit-preload-data="tap"
-							aria-current={active ? 'page' : undefined}
-							class={cn(
-								'block rounded px-3 py-2.5 text-sm text-muted-foreground hover:bg-muted hover:text-foreground',
-								active && 'bg-muted text-foreground'
-							)}>{item.label}</a
-						>
-					</li>
-				{/each}
-			</ul>
+			{#each groups as group (group.label)}
+				{#if group.label && group.items.length > 0}
+					<p class="mt-3 px-3 pb-1 text-xs text-muted-foreground">{group.label}</p>
+				{/if}
+				<ul class="flex flex-col gap-1">
+					{#each group.items as item (item.href)}
+						{@const active = isActive(item.href, page.url.pathname)}
+						<li>
+							<a
+								href={item.href}
+								data-sveltekit-preload-data="tap"
+								aria-current={active ? 'page' : undefined}
+								class={cn(
+									'block rounded px-3 py-2.5 text-sm text-muted-foreground hover:bg-muted hover:text-foreground',
+									active && 'bg-muted text-foreground'
+								)}>{item.label}</a
+							>
+						</li>
+					{/each}
+				</ul>
+			{/each}
 		</nav>
 		<div class="flex flex-col gap-1 border-t p-2">
 			<a

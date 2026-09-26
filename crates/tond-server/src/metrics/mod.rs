@@ -15,19 +15,28 @@
 //              no dockerd load — computes CPU and network *rates* against the
 //              previous reading, and writes one small row per target in a
 //              single transaction (store.rs). The host gauges are sampled in
-//              the same tick and cached for /api/system/metrics (host.rs).
+//              the same tick and cached for /api/system/metrics (host.rs);
+//              they also become one host_1m row a minute (host_history.rs),
+//              and every 30 minutes the tick starts a `docker system df`
+//              refresh in the background (docker_host.rs).
+//   Requests   The same tick reads tond-proxy's per-route request counters
+//              over the control socket (requests.rs): deltas, in-memory
+//              rings, and one requests_1m write a minute.
 //   Rollups    When a 5-minute / 1-hour bucket closes, it is rolled up.
 //              Retention is the janitor's job (store::prune).
 //   Events     Restarts (a container that exited on its own and was started
 //              again), crashes (exited on its own and stayed down) and OOM
-//              kills are recorded in metric_events and fire the
-//              container_restart / container_oom alert events. Exits that
+//              kills are recorded in metric_events and wake the alert
+//              engine (OOM and crash-loop rules read them). Exits that
 //              follow a `kill`/`stop` request (deploys, stop, restart buttons)
 //              are not crashes. Counter resets and memory.events oom_kill
 //              deltas catch what the event stream missed.
 
 pub mod cgroup;
+pub mod docker_host;
 pub mod host;
+pub mod host_history;
+pub mod requests;
 pub mod store;
 
 use std::collections::HashMap;
@@ -50,12 +59,12 @@ pub use store::{EventKind, Owner, Sample, TargetKind};
 pub const TICK: Duration = Duration::from_secs(30);
 /// Delay before the first tick, so host CPU has a baseline to diff against.
 const FIRST_TICK: Duration = Duration::from_secs(5);
+/// The first `docker system df` waits until startup work is done.
+const FIRST_DF_AFTER: Duration = Duration::from_secs(120);
 /// A die this soon after a kill/stop request was requested, not a crash.
 const REQUESTED_WINDOW_SECS: i64 = 60;
 /// An unrequested exit not followed by a start within this long is a crash.
 const CRASH_AFTER_SECS: i64 = 60;
-/// Minimum gap between two alerts of the same kind for one target.
-const ALERT_COOLDOWN_SECS: i64 = 600;
 const EVENT_RETRY_MIN: Duration = Duration::from_secs(5);
 const EVENT_RETRY_MAX: Duration = Duration::from_secs(300);
 /// Label Tond puts on cron containers (value: the cron job id).
@@ -273,10 +282,14 @@ pub struct Collector {
     mem_limits: HashMap<i64, i64>,
     next_5m: Option<i64>,
     next_1h: Option<i64>,
-    last_alert: HashMap<(Owner, &'static str), i64>,
     /// Changes to the owner tables (runtime::changes): the resolver is
     /// reloaded only when one moved, not on every tick.
     owner_changes: Vec<tokio::sync::watch::Receiver<u64>>,
+    /// Request metrics from tond-proxy (requests.rs), scraped on the same tick.
+    requests: requests::Tracker,
+    host_history: host_history::HostHistory,
+    /// When the next background `docker system df` is due.
+    next_df: Instant,
 }
 
 /// Reload the owner tables at least this often even without a change
@@ -294,7 +307,6 @@ impl Collector {
             mem_limits: HashMap::new(),
             next_5m: None,
             next_1h: None,
-            last_alert: HashMap::new(),
             owner_changes: [
                 changes::Table::Apps,
                 changes::Table::Databases,
@@ -304,6 +316,9 @@ impl Collector {
             .into_iter()
             .map(changes::subscribe)
             .collect(),
+            requests: requests::Tracker::default(),
+            host_history: host_history::HostHistory::default(),
+            next_df: Instant::now() + FIRST_DF_AFTER,
         }
     }
 
@@ -594,7 +609,7 @@ impl Collector {
         Ok(id)
     }
 
-    /// Persist a happening and fire its alert (rate-limited per target).
+    /// Persist a happening and let the alert engine look at it.
     async fn record(&mut self, state: &AppState, h: Happening) {
         let target = match self.target_id(&state.db, &h.owner).await {
             Ok(t) => t,
@@ -608,35 +623,26 @@ impl Collector {
         {
             tracing::warn!("metrics: cannot record {:?}: {}", h.kind, e);
         }
-        let slug = match h.kind {
-            EventKind::Oom => "container_oom",
-            EventKind::Restart | EventKind::Crash => "container_restart",
-        };
-        let key = (h.owner.clone(), slug);
-        if self
-            .last_alert
-            .get(&key)
-            .is_some_and(|t| h.ts - t < ALERT_COOLDOWN_SECS)
-        {
-            return;
-        }
-        self.last_alert.insert(key, h.ts);
         let name = self.resolver.name(&h.owner);
-        let detail = describe(&h);
-        tracing::info!("{} {} {}", h.owner.kind.as_str(), name, detail);
-        let state = state.clone();
-        let owner_id = h.owner.id.clone();
-        tokio::spawn(async move {
-            alerts::fire_event_alerts(&state, slug, Some(&owner_id), Some(&name), Some(&detail))
-                .await;
-        });
+        tracing::info!("{} {} {}", h.owner.kind.as_str(), name, describe(&h));
+        alerts::kick();
     }
 
     /// One sampling pass: host gauges, container samples, rollups.
     pub async fn tick(&mut self, state: &AppState, host: &mut host::HostSampler) {
         let now = now_unix();
         let at = Instant::now();
-        host.sample(now);
+        let snapshot = host.sample(now);
+        if let Err(e) = self.host_history.record(&state.db, &snapshot).await {
+            tracing::warn!("metrics: cannot store host history: {}", e);
+        }
+        if at >= self.next_df {
+            self.next_df = at + docker_host::DF_EVERY;
+            let docker = state.docker.clone();
+            tokio::spawn(async move {
+                docker_host::refresh_disk(&docker, &secret_file::data_dir()).await;
+            });
+        }
 
         // Idle servers tick with nothing new: skip re-reading four tables.
         if self.owners_stale() {
@@ -721,6 +727,13 @@ impl Collector {
         if let Err(e) = self.roll_up(&state.db, now).await {
             tracing::warn!("metrics: rollup failed: {}", e);
         }
+
+        // Request counters from tond-proxy: one control-socket round trip;
+        // rows are written once a minute.
+        self.requests.tick(&state.db, now).await;
+
+        // Alert rules are evaluated on this tick (no loop of their own).
+        alerts::on_metrics_tick(state, now).await;
     }
 
     async fn roll_up(&mut self, db: &SqlitePool, now: i64) -> sqlx::Result<()> {

@@ -499,7 +499,24 @@ export async function updateDomain(id: string, domain: string): Promise<UpdateDo
 
 // ── Certificates ──
 
+/** Which CA issued a certificate. */
+export type IssuerKind = 'letsencrypt' | 'letsencrypt_staging' | 'custom' | 'unknown';
+
+/** What a certificate's domain is used for right now. */
+export type CertificateTarget =
+	| { kind: 'dashboard' }
+	| { kind: 'app'; app_id: string; app_name: string }
+	| {
+			kind: 'preview';
+			app_id: string;
+			app_name: string;
+			preview_id: string;
+			pr_number: number | null;
+	  }
+	| { kind: 'unused' };
+
 export interface Certificate {
+	/** Empty for a served domain tond-proxy has not reported on yet */
 	id: string;
 	domain: string;
 	cert_type: string;
@@ -513,6 +530,12 @@ export interface Certificate {
 	/** No new attempt before this time (exponential backoff) */
 	next_retry_at: string | null;
 	failure_count: number;
+	/** Issuing CA as named in the certificate, e.g. "Let's Encrypt R11" */
+	issuer: string | null;
+	issuer_kind: IssuerKind;
+	/** Last successful issuance or renewal */
+	last_renewed_at: string | null;
+	serves: CertificateTarget;
 }
 
 export async function listCertificates(): Promise<Certificate[]> {
@@ -972,6 +995,178 @@ export async function updateSettings(data: Partial<ServerSettings>): Promise<Ser
 		method: 'PUT',
 		body: JSON.stringify(data)
 	});
+}
+
+// ── Retention ──
+
+/** One retention rule with its current value and accepted range. */
+export interface RetentionField {
+	/** settings key, e.g. "retention_audit_log_days" */
+	key: string;
+	value: number;
+	default: number;
+	min: number;
+	max: number;
+	/** "deploys" | "days" | "runs" */
+	unit: string;
+}
+
+export interface TableSize {
+	name: string;
+	bytes: number;
+}
+
+export interface DatabaseSize {
+	file_bytes: number;
+	wal_bytes: number;
+	free_bytes: number;
+	/** Largest first; empty when the breakdown is unavailable */
+	tables: TableSize[];
+	measured_at: string;
+}
+
+export interface RetentionSettings {
+	fields: RetentionField[];
+	database: DatabaseSize | null;
+}
+
+export async function getRetention(): Promise<RetentionSettings> {
+	return request<RetentionSettings>('/settings/retention');
+}
+
+/** Change some retention rules: `{ retention_audit_log_days: 365 }`. */
+export async function updateRetention(changes: Record<string, number>): Promise<RetentionSettings> {
+	return request<RetentionSettings>('/settings/retention', {
+		method: 'PUT',
+		body: JSON.stringify(changes)
+	});
+}
+
+// ── Audit log shipping ──
+
+/** Delivery progress of one audit shipping destination. */
+export interface DeliveryStatus {
+	/** Last audit entry the destination accepted */
+	shipped_seq: number;
+	/** Entries waiting to be delivered */
+	pending: number;
+	failures: number;
+	last_attempt_at: string | null;
+	last_success_at: string | null;
+	last_error: string | null;
+	next_attempt_at: string | null;
+	/** Entries removed by retention before they could be delivered */
+	dropped: number;
+}
+
+export interface AuditShipping {
+	syslog: { enabled: boolean; host: string; port: number; tls: boolean; status: DeliveryStatus };
+	webhook: { enabled: boolean; url: string; has_secret: boolean; status: DeliveryStatus };
+	latest_seq: number;
+}
+
+export interface UpdateAuditShipping {
+	syslog?: { enabled: boolean; host: string; port: number; tls: boolean };
+	/** `secret` omitted or null keeps the stored one */
+	webhook?: { enabled: boolean; url: string; secret?: string | null };
+}
+
+export type ShippingDestination = 'syslog' | 'webhook';
+
+export async function getAuditShipping(): Promise<AuditShipping> {
+	return request<AuditShipping>('/audit-log/shipping');
+}
+
+export async function updateAuditShipping(body: UpdateAuditShipping): Promise<AuditShipping> {
+	return request<AuditShipping>('/audit-log/shipping', {
+		method: 'PUT',
+		body: JSON.stringify(body)
+	});
+}
+
+export async function testAuditShipping(
+	destination: ShippingDestination
+): Promise<{ ok: boolean; message: string }> {
+	return request<{ ok: boolean; message: string }>('/audit-log/shipping/test', {
+		method: 'POST',
+		body: JSON.stringify({ destination })
+	});
+}
+
+// ── App events ──
+
+export type AppEventKind =
+	| 'deploy_started'
+	| 'deploy_succeeded'
+	| 'deploy_failed'
+	| 'deploy_cancelled'
+	| 'restart'
+	| 'crash'
+	| 'oom'
+	| 'cert_issued'
+	| 'cert_failed'
+	| 'domain_changed'
+	| 'resources_changed'
+	| 'config_changed'
+	| 'control'
+	| 'alert_fired'
+	| 'alert_resolved'
+	| 'uptime_down'
+	| 'uptime_up';
+
+export interface AppEvent {
+	at: string;
+	kind: AppEventKind;
+	severity: 'info' | 'success' | 'warning' | 'danger';
+	title: string;
+	detail: string | null;
+	actor: string | null;
+	deployment_id: string | null;
+}
+
+export interface AppEventsPage {
+	/** Newest first */
+	events: AppEvent[];
+	/** Pass as `before` for older events; null when there are none */
+	next_before: string | null;
+}
+
+export async function getAppEvents(
+	id: string,
+	opts: { limit?: number; before?: string | null } = {}
+): Promise<AppEventsPage> {
+	const params = new URLSearchParams();
+	if (opts.limit) params.set('limit', String(opts.limit));
+	if (opts.before) params.set('before', opts.before);
+	const query = params.toString();
+	return request<AppEventsPage>(`/apps/${id}/events${query ? `?${query}` : ''}`);
+}
+
+// ── Deploy trend ──
+
+export interface DeployOutcome {
+	id: string;
+	/** "succeeded" | "failed" | "superseded" | "cancelled" */
+	status: string;
+	started_at: string;
+	duration_secs: number | null;
+	commit_sha: string | null;
+}
+
+export interface DeployStats {
+	/** Finished deployments covered (at most 30) */
+	window: number;
+	succeeded: number;
+	failed: number;
+	/** 0–1; null before the first result */
+	success_rate: number | null;
+	median_duration_secs: number | null;
+	/** Oldest first */
+	outcomes: DeployOutcome[];
+}
+
+export async function getDeployStats(id: string): Promise<DeployStats> {
+	return request<DeployStats>(`/apps/${id}/deployments/stats`);
 }
 
 // ── Deployments ──
@@ -1627,9 +1822,9 @@ export interface SystemMetrics {
 	collected_at: string;
 }
 
-export type MetricsOwner = 'apps' | 'databases' | 'cron';
+export type MetricsOwner = 'apps' | 'databases' | 'cron' | 'previews';
 
-/** Resource metrics of an app, database or cron job. */
+/** Resource metrics of an app, database, cron job or preview. */
 export async function getMetrics(
 	owner: MetricsOwner,
 	id: string,
@@ -1642,6 +1837,180 @@ export async function getMetrics(
 
 export async function getSystemMetrics(): Promise<SystemMetrics> {
 	return request<SystemMetrics>('/system/metrics');
+}
+
+// ── Request metrics (tond-proxy traffic) ──
+
+export type RequestRange = '1h' | '6h' | '24h' | '7d' | '30d' | '90d';
+
+/** Request series as parallel arrays. Rates are per second; latency in ms,
+ *  null for buckets without requests. */
+export interface RequestSeries {
+	t: number[];
+	rps: number[];
+	rps_1xx: number[];
+	rps_2xx: number[];
+	rps_3xx: number[];
+	rps_4xx: number[];
+	rps_5xx: number[];
+	/** 5xx share of responses, percent. */
+	err_pct: (number | null)[];
+	p50: (number | null)[];
+	p95: (number | null)[];
+	p99: (number | null)[];
+	/** Body bytes per second. */
+	bytes_in: number[];
+	bytes_out: number[];
+}
+
+export interface RequestSummary {
+	requests: number;
+	rps: number;
+	s1xx: number;
+	s2xx: number;
+	s3xx: number;
+	s4xx: number;
+	s5xx: number;
+	s502: number;
+	s504: number;
+	err_pct: number | null;
+	p50: number | null;
+	p95: number | null;
+	p99: number | null;
+	upstream_p50: number | null;
+	upstream_p95: number | null;
+	upstream_p99: number | null;
+	bytes_in: number;
+	bytes_out: number;
+}
+
+/** The last minute, from tond-server's memory. */
+export interface RequestCurrent {
+	t: number;
+	secs: number;
+	rps: number;
+	err_pct: number | null;
+	p95: number | null;
+}
+
+export type RequestMarkerKind = 'deploy' | 'rollback' | MetricEventKind;
+
+/** A deploy, rollback, restart, crash or OOM kill drawn on request charts. */
+export interface RequestMarker {
+	t: number;
+	kind: RequestMarkerKind;
+	/** Deployment status for deploys, the event detail otherwise. */
+	detail: string | null;
+	deployment_id: string | null;
+}
+
+export interface RequestMetricsResponse {
+	range: RequestRange;
+	step: number;
+	from: number;
+	to: number;
+	series: RequestSeries;
+	summary: RequestSummary;
+	current: RequestCurrent | null;
+	markers: RequestMarker[];
+	/** False when tond-proxy did not answer the last scrape. */
+	proxy_connected: boolean;
+}
+
+export type RequestOwner = 'apps' | 'previews';
+
+/** Request metrics of an app or a preview. */
+export async function getRequestMetrics(
+	owner: RequestOwner,
+	id: string,
+	range: RequestRange = '24h'
+): Promise<RequestMetricsResponse> {
+	return request<RequestMetricsResponse>(
+		`/${owner}/${encodeURIComponent(id)}/requests?range=${encodeURIComponent(range)}`
+	);
+}
+
+export interface AppTraffic {
+	id: string;
+	name: string;
+	requests: number;
+	rps: number;
+	s4xx: number;
+	s5xx: number;
+	err_pct: number | null;
+	p95: number | null;
+	bytes_out: number;
+}
+
+export interface TrafficOverview {
+	range: RequestRange;
+	from: number;
+	to: number;
+	/** Every route together (apps, previews, dashboard, unknown hosts). */
+	total: RequestSummary;
+	/** Requests for hosts nothing is routed for. */
+	unknown_requests: number;
+	/** Busiest apps first (at most 10). */
+	busiest: AppTraffic[];
+	/** Apps with 5xx responses, most first (at most 5). */
+	errors: AppTraffic[];
+	proxy_connected: boolean;
+}
+
+/** Server-wide traffic: totals, busiest apps and apps with errors. */
+export async function getTrafficOverview(range: RequestRange = '24h'): Promise<TrafficOverview> {
+	return request<TrafficOverview>(`/system/requests?range=${encodeURIComponent(range)}`);
+}
+
+// ── Access logs (opt-in per app) ──
+
+export interface AccessLogSettings {
+	enabled: boolean;
+	/** Also log query strings (they often carry tokens). */
+	include_query: boolean;
+}
+
+export interface AccessLog extends AccessLogSettings {
+	/** Bytes on disk (current + rotated file). */
+	size_bytes: number;
+	/** Most bytes the log may use (60 MB). */
+	max_bytes: number;
+	/** Matching lines, oldest first. */
+	lines: string[];
+	/** More lines matched than were returned. */
+	truncated: boolean;
+}
+
+export async function getAccessLog(
+	appId: string,
+	opts: { lines?: number; q?: string } = {}
+): Promise<AccessLog> {
+	const params = new URLSearchParams();
+	if (opts.lines) params.set('lines', String(opts.lines));
+	if (opts.q) params.set('q', opts.q);
+	const query = params.toString();
+	return request<AccessLog>(
+		`/apps/${encodeURIComponent(appId)}/access-log${query ? `?${query}` : ''}`
+	);
+}
+
+export async function updateAccessLog(
+	appId: string,
+	settings: AccessLogSettings
+): Promise<AccessLogSettings> {
+	return request<AccessLogSettings>(`/apps/${encodeURIComponent(appId)}/access-log`, {
+		method: 'PUT',
+		body: JSON.stringify(settings)
+	});
+}
+
+export async function deleteAccessLog(appId: string): Promise<void> {
+	await request(`/apps/${encodeURIComponent(appId)}/access-log`, { method: 'DELETE' });
+}
+
+/** URL of the full access log download (a plain link; the session cookie authenticates it). */
+export function accessLogDownloadUrl(appId: string): string {
+	return `${BASE}/apps/${encodeURIComponent(appId)}/access-log/download`;
 }
 
 // ── Tond measuring itself (GET /api/system/self) ──
@@ -1685,6 +2054,8 @@ export interface ProxyStats extends ProcessSample {
 	route_version: number;
 	routes: number;
 	reloads: number;
+	/** Access log lines dropped because the writer fell behind. */
+	access_log_dropped?: number;
 	loops: LoopStats[];
 }
 
@@ -1720,94 +2091,546 @@ export async function getSystemSelf(): Promise<SystemSelf> {
 	return request<SystemSelf>('/system/self');
 }
 
-// ── Alert Rules ──
+// ── Host history, disk, Docker (GET /api/system/host…) ──
 
-/** Valid metric identifiers for threshold-based alert rules. */
-export type AlertMetric = 'cpu' | 'memory' | 'app_down' | 'disk_usage';
-
-/** Valid event slugs for event-based alert subscriptions. */
-export type AlertEvent =
-	| 'deployment_success'
-	| 'deployment_failure'
-	| 'cron_success'
-	| 'cron_failure'
-	| 'container_restart'
-	| 'container_oom';
-
-/** Groups of alert events/metrics shown in the UI. */
-export interface AlertGroup {
-	/** Internal key used as the Select value */
-	id: string;
-	label: string;
-	/** Threshold-based metrics in this group */
-	metrics: { value: AlertMetric; label: string; unit: string; placeholder: number }[];
-	/** Event-based subscriptions in this group */
-	events: { value: AlertEvent; label: string }[];
+export interface Filesystem {
+	mount: string;
+	used: number;
+	total: number;
+	inodes_used: number;
+	inodes_total: number;
 }
 
-export const ALERT_GROUPS: AlertGroup[] = [
-	{
-		id: 'resources',
-		label: 'Resources',
-		metrics: [
-			{ value: 'cpu', label: 'CPU Usage', unit: '%', placeholder: 80 },
-			{ value: 'memory', label: 'Memory Usage', unit: '%', placeholder: 85 },
-			{ value: 'app_down', label: 'App Down', unit: 'minutes', placeholder: 5 }
-		],
-		events: []
-	},
-	{
-		id: 'server',
-		label: 'Server',
-		metrics: [{ value: 'disk_usage', label: 'Disk Usage', unit: '%', placeholder: 85 }],
-		events: []
-	},
-	{
-		id: 'deployments',
-		label: 'Deployments',
-		metrics: [],
-		events: [
-			{ value: 'deployment_success', label: 'Deployment Success' },
-			{ value: 'deployment_failure', label: 'Deployment Failure' }
-		]
-	},
-	{
-		id: 'containers',
-		label: 'Crashes',
-		metrics: [],
-		events: [
-			{ value: 'container_restart', label: 'Crashed or restarted unexpectedly' },
-			{ value: 'container_oom', label: 'Process killed for running out of memory' }
-		]
-	},
-	{
-		id: 'scheduled_tasks',
-		label: 'Scheduled Tasks',
-		metrics: [],
-		events: [
-			{ value: 'cron_success', label: 'Scheduled Task Success' },
-			{ value: 'cron_failure', label: 'Scheduled Task Failure' }
-		]
-	}
-];
+export interface HostCurrent {
+	cpu_percent: number;
+	load1: number;
+	load5: number;
+	load15: number;
+	cpus: number;
+	mem_used: number;
+	mem_total: number;
+	swap_used: number;
+	swap_total: number;
+	/** Filesystem holding Tond's data directory. */
+	data_fs: Filesystem;
+	/** `/`, when it is a different filesystem. */
+	root_fs: Filesystem | null;
+	collected_at: number;
+}
+
+export type DiskTrend = 'filling' | 'stable' | 'insufficient_data';
+
+export interface DiskForecast {
+	window: '24h' | '7d';
+	status: DiskTrend;
+	/** Bytes per day (negative when shrinking). */
+	growth_per_day: number;
+	eta_secs: number | null;
+	samples: number;
+}
+
+export interface DiskEta {
+	used: number;
+	total: number;
+	day: DiskForecast;
+	week: DiskForecast;
+	/** The sooner of the two ETAs; null when not filling. */
+	eta_secs: number | null;
+}
+
+export interface UsageItem {
+	bytes: number;
+	count: number;
+	reclaimable: number;
+}
+
+export interface DiskUsage {
+	images: UsageItem;
+	containers: UsageItem;
+	volumes: UsageItem;
+	build_cache: UsageItem;
+	/** Bytes under the data directory (null when it couldn't be measured). */
+	tond_data: number | null;
+	data_dir: string;
+	docker_root: string | null;
+	/** Docker's data is on the data directory's filesystem. */
+	docker_on_data_fs: boolean;
+	error: string | null;
+	collected_at: number;
+	took_ms: number;
+}
+
+export interface DockerHealth {
+	reachable: boolean;
+	version: string | null;
+	api_version: string | null;
+	storage_driver: string | null;
+	root_dir: string | null;
+	cgroup_version: string | null;
+	warnings: string[];
+	containers: number | null;
+	containers_running: number | null;
+	images: number | null;
+	rss_bytes: number | null;
+	uptime_secs: number | null;
+	error: string | null;
+	checked_at: number;
+}
+
+export interface HostOverview {
+	current: HostCurrent | null;
+	forecast: DiskEta;
+	disk: DiskUsage | null;
+	docker: DockerHealth;
+}
+
+export interface HostSeries {
+	t: number[];
+	cpu: number[];
+	cpu_max: number[];
+	load1: number[];
+	load5: number[];
+	load15: number[];
+	mem_used: number[];
+	mem_total: number[];
+	swap_used: number[];
+	swap_total: number[];
+	disk_used: number[];
+	disk_total: number[];
+	inodes_used: number[];
+	inodes_total: number[];
+	root_used: number[];
+	root_total: number[];
+	root_inodes_used: number[];
+	root_inodes_total: number[];
+}
+
+export interface HostHistory {
+	range: MetricsRange;
+	step: number;
+	from: number;
+	to: number;
+	separate_root: boolean;
+	data_mount: string;
+	series: HostSeries;
+}
+
+export interface CleanupPreview {
+	build_cache_bytes: number;
+	build_cache_entries: number;
+	dangling_images: { id: string; bytes: number; created: number }[];
+	dangling_bytes: number;
+	total_bytes: number;
+}
+
+export interface CleanupResult {
+	build_cache_bytes: number;
+	build_cache_entries: number;
+	images_deleted: number;
+	image_bytes: number;
+	total_bytes: number;
+}
+
+export async function getHostOverview(): Promise<HostOverview> {
+	return request<HostOverview>('/system/host');
+}
+
+export async function getHostHistory(range: MetricsRange): Promise<HostHistory> {
+	return request<HostHistory>(`/system/host/history?range=${encodeURIComponent(range)}`);
+}
+
+export async function refreshDiskUsage(): Promise<DiskUsage> {
+	return request<DiskUsage>('/system/disk/refresh', { method: 'POST' });
+}
+
+export async function getCleanupPreview(): Promise<CleanupPreview> {
+	return request<CleanupPreview>('/system/disk/cleanup');
+}
+
+export async function freeUpSpace(): Promise<CleanupResult> {
+	return request<CleanupResult>('/system/disk/cleanup', { method: 'POST' });
+}
+
+// ── Outbound heartbeat ──
+
+export interface HeartbeatStatus {
+	configured: boolean;
+	/** Host of the heartbeat URL; the URL itself is write-only. */
+	url_host: string | null;
+	method: 'GET' | 'POST';
+	interval_secs: number;
+	enabled: boolean;
+	last_ok_at: number | null;
+	last_failure_at: number | null;
+	last_error: string | null;
+	last_skipped_at: number | null;
+	last_skip_reason: string | null;
+	next_at: number | null;
+	/** Whether a ping would be sent right now. */
+	healthy: boolean;
+	unhealthy_reason: string | null;
+}
+
+export interface HeartbeatUpdate {
+	/** Omit to keep the stored URL; '' removes it. */
+	url?: string;
+	method?: 'GET' | 'POST';
+	interval_secs?: number;
+	enabled?: boolean;
+}
+
+export type HeartbeatOutcome =
+	| { outcome: 'sent'; status: number }
+	| { outcome: 'failed'; error: string }
+	| { outcome: 'skipped'; reason: string };
+
+export async function getHeartbeat(): Promise<HeartbeatStatus> {
+	return request<HeartbeatStatus>('/system/heartbeat');
+}
+
+export async function updateHeartbeat(update: HeartbeatUpdate): Promise<HeartbeatStatus> {
+	return request<HeartbeatStatus>('/system/heartbeat', {
+		method: 'PUT',
+		body: JSON.stringify(update)
+	});
+}
+
+export async function testHeartbeat(): Promise<HeartbeatOutcome & { heartbeat: HeartbeatStatus }> {
+	return request<HeartbeatOutcome & { heartbeat: HeartbeatStatus }>('/system/heartbeat/test', {
+		method: 'POST'
+	});
+}
+
+// ── Uptime checks ──
+
+export type UptimeStatus = 'up' | 'down' | 'paused' | 'pending';
+export type UptimeCause =
+	'dns' | 'refused' | 'connect' | 'timeout' | 'tls' | 'http_5xx' | 'http_status';
+export type UptimeDnsState = 'matches' | 'elsewhere' | 'unknown' | 'failed' | 'overridden';
+
+export interface UptimeCheckSettings {
+	id: number;
+	enabled: boolean;
+	path: string;
+	interval_secs: number;
+	/** null = any 2xx or 3xx */
+	expected_status: number | null;
+	timeout_secs: number;
+}
+
+export interface UptimeProbe {
+	/** Unix seconds. */
+	at: number;
+	ok: boolean;
+	cause: UptimeCause | null;
+	detail: string;
+	status: number | null;
+	latency_ms: number;
+	ip: string | null;
+	dns: UptimeDnsState;
+	cert_expires_at: number | null;
+	cert_days_left: number | null;
+	dns_label: string;
+}
+
+export interface UptimeBar {
+	/** Bucket start, unix seconds. */
+	t: number;
+	probes: number;
+	up: number;
+}
+
+export interface UptimePercent {
+	day: number | null;
+	week: number | null;
+	month: number | null;
+	day_probes: number;
+}
+
+export interface UptimeIncident {
+	id: number;
+	check_id: number;
+	started_at: number;
+	ended_at: number | null;
+	cause: UptimeCause;
+	detail: string;
+	duration_secs: number;
+}
+
+export interface UptimeCheck {
+	check: UptimeCheckSettings | null;
+	host: string | null;
+	url: string | null;
+	status: UptimeStatus;
+	paused_reason: string | null;
+	last: UptimeProbe | null;
+	down_since: number | null;
+	next_at: number | null;
+	uptime: UptimePercent;
+	/** Last 24 h, 30-minute bars. */
+	recent: UptimeBar[];
+	/** Last 90 days, daily bars. */
+	daily: UptimeBar[];
+	latency: { t: number[]; ms: number[] };
+	incidents: UptimeIncident[];
+}
+
+export interface UptimeSummary {
+	check_id: number;
+	kind: 'app' | 'dashboard';
+	app_id: string | null;
+	name: string;
+	host: string;
+	status: UptimeStatus;
+	uptime: UptimePercent;
+	last_at: number | null;
+	latency_ms: number | null;
+	down_since: number | null;
+}
+
+export interface UptimeCheckUpdate {
+	enabled: boolean;
+	path: string;
+	interval_secs: number;
+	expected_status: number | null;
+	timeout_secs: number;
+}
+
+/** `app` is an app id or name; null means the dashboard's own check. */
+function uptimePath(app: string | null): string {
+	return app === null ? '/system/uptime' : `/apps/${encodeURIComponent(app)}/uptime`;
+}
+
+export async function listUptime(): Promise<UptimeSummary[]> {
+	return request<UptimeSummary[]>('/uptime');
+}
+
+export async function getUptime(app: string | null): Promise<UptimeCheck> {
+	return request<UptimeCheck>(uptimePath(app));
+}
+
+export async function updateUptime(
+	app: string | null,
+	update: UptimeCheckUpdate
+): Promise<UptimeCheck> {
+	return request<UptimeCheck>(uptimePath(app), {
+		method: 'PUT',
+		body: JSON.stringify(update)
+	});
+}
+
+export async function checkUptimeNow(app: string | null): Promise<UptimeCheck> {
+	return request<UptimeCheck>(`${uptimePath(app)}/check`, { method: 'POST' });
+}
+
+// ── Alert Rules ──
+
+// ── Alerts ──
+
+/** Rule kinds (one condition per rule). */
+export type AlertKind =
+	| 'app_down'
+	| 'crash_loop'
+	| 'oom'
+	| 'cpu'
+	| 'memory'
+	| 'http_5xx_rate'
+	| 'http_p95_latency'
+	| 'deploy_failed'
+	| 'disk_usage'
+	| 'disk_forecast'
+	| 'cert_expiry'
+	| 'backup_failed'
+	| 'cron_failed';
+
+export type AlertSeverity = 'info' | 'warning' | 'critical';
+/** What a rule's targets are. */
+export type AlertScope = 'app' | 'host' | 'certificate' | 'backup' | 'cron';
+/** How the value is compared with the threshold ("none": a yes/no condition). */
+export type AlertComparison = 'above' | 'at_least' | 'below' | 'none';
+
+/** One rule kind as described by the server (GET /api/alerts/kinds). */
+export interface AlertKindInfo {
+	kind: AlertKind;
+	label: string;
+	description: string;
+	scope: AlertScope;
+	/** Unit of the threshold and value: "%", "ms", "days", "hours", "restarts" or "" */
+	unit: string;
+	comparison: AlertComparison;
+	default_threshold: number | null;
+	default_window_secs: number | null;
+	default_for_secs: number;
+	default_severity: AlertSeverity;
+	/** False while this server can't provide the data (e.g. request metrics) */
+	available: boolean;
+	unavailable_reason: string | null;
+}
 
 export interface AlertRule {
 	id: string;
-	app_id: string | null;
 	name: string;
-	/** Threshold-based metric, null for pure event-based rules */
-	metric: AlertMetric | null;
+	kind: AlertKind;
+	/** App-scoped kinds: one app, or null for every app */
+	app_id: string | null;
+	app_name: string | null;
 	threshold: number;
-	/** Whether a webhook URL is set (the URL itself is write-only) */
-	has_webhook_url: boolean;
-	/** Host of the saved webhook URL, e.g. "hooks.slack.com" */
-	webhook_host: string | null;
+	/** Look-back window in seconds (5xx rate, p95, OOM, crash loop) */
+	window_secs: number;
+	/** How long the condition must hold before the alert fires */
+	for_secs: number;
+	severity: AlertSeverity;
+	/** Re-notify while firing and unacknowledged; 0 = never */
+	repeat_secs: number;
 	enabled: boolean;
-	/** Event slugs this rule subscribes to */
-	events: AlertEvent[];
+	/** The whole rule is muted until then */
+	snoozed_until: string | null;
+	/** Linked notification channels (at least one) */
+	integration_ids: string[];
+	/** Targets firing / pending right now */
+	firing: number;
+	pending: number;
 	last_fired_at: string | null;
 	created_at: string;
 	updated_at: string;
+}
+
+export interface AlertRuleInput {
+	name: string;
+	kind: AlertKind;
+	app_id?: string | null;
+	threshold?: number;
+	window_secs?: number;
+	for_secs?: number;
+	severity?: AlertSeverity;
+	repeat_secs?: number;
+	integration_ids: string[];
+}
+
+export interface AlertRuleUpdate {
+	name?: string;
+	threshold?: number;
+	window_secs?: number;
+	for_secs?: number;
+	severity?: AlertSeverity;
+	repeat_secs?: number;
+	enabled?: boolean;
+	integration_ids?: string[];
+	/** RFC 3339 to mute the whole rule, "" to unmute */
+	snoozed_until?: string;
+}
+
+/** A pending or firing alert. */
+export interface ActiveAlert {
+	rule_id: string;
+	rule_name: string;
+	kind: AlertKind;
+	severity: AlertSeverity;
+	/** "app:<id>" | "host" | "cert:<domain>" | "backup" | "cron:<id>" */
+	target: string;
+	target_label: string;
+	app_id: string | null;
+	state: 'pending' | 'firing';
+	/** When the condition became true */
+	since: string;
+	fired_at: string | null;
+	value: number | null;
+	threshold: number;
+	unit: string;
+	comparison: AlertComparison;
+	/** History row of the firing episode */
+	episode_id: string | null;
+	acknowledged_at: string | null;
+	acknowledged_by: string | null;
+	snoozed_until: string | null;
+	snoozed_until_resolved: boolean;
+	/** Notifications of this alert that failed for good */
+	failed_deliveries: number;
+}
+
+/** One firing episode in the history. */
+export interface AlertEpisode {
+	id: string;
+	rule_id: string | null;
+	rule_name: string;
+	kind: AlertKind;
+	severity: AlertSeverity;
+	target: string;
+	target_label: string;
+	app_id: string | null;
+	threshold: number;
+	unit: string;
+	comparison: AlertComparison;
+	/** Value when it fired, and the latest one seen */
+	value: number | null;
+	last_value: number | null;
+	state: 'firing' | 'resolved';
+	pending_since: string;
+	fired_at: string;
+	resolved_at: string | null;
+	acknowledged_at: string | null;
+	acknowledged_by: string | null;
+	notifications_sent: number;
+	failed_deliveries: number;
+}
+
+export interface AlertHistoryPage {
+	episodes: AlertEpisode[];
+	total: number;
+}
+
+export interface AlertHistoryFilter {
+	rule_id?: string;
+	app_id?: string;
+	state?: 'firing' | 'resolved';
+	page?: number;
+	per_page?: number;
+}
+
+/** One notification to one channel. */
+export interface AlertDelivery {
+	id: string;
+	episode_id: string;
+	integration_id: string;
+	integration_name: string;
+	integration_kind: IntegrationKind;
+	event: 'firing' | 'repeat' | 'resolved';
+	status: 'pending' | 'sent' | 'failed' | 'skipped';
+	attempts: number;
+	/** Held back by quiet hours */
+	deferred: boolean;
+	last_error: string | null;
+	next_attempt_at: string | null;
+	sent_at: string | null;
+	created_at: string;
+}
+
+export interface AlertEpisodeDetail {
+	episode: AlertEpisode;
+	deliveries: AlertDelivery[];
+}
+
+/** A daily window when notifications wait (critical ones can bypass it). */
+export interface QuietHours {
+	enabled: boolean;
+	/** "HH:MM" */
+	start: string;
+	end: string;
+	/** IANA time zone, e.g. "Europe/Berlin" */
+	timezone: string;
+	critical_bypass: boolean;
+}
+
+/** A channel follows the global quiet hours, has none, or its own. */
+export type ChannelQuietHours =
+	{ mode: 'global' } | { mode: 'off' } | ({ mode: 'custom' } & QuietHours);
+
+export interface AlertSettings {
+	quiet_hours: QuietHours;
+}
+
+export async function listAlertKinds(): Promise<AlertKindInfo[]> {
+	return request<AlertKindInfo[]>('/alerts/kinds');
 }
 
 export async function listAlertRules(): Promise<AlertRule[]> {
@@ -1818,35 +2641,14 @@ export async function getAlertRule(id: string): Promise<AlertRule> {
 	return request<AlertRule>(`/alerts/${id}`);
 }
 
-export async function createAlertRule(data: {
-	app_id?: string;
-	name: string;
-	metric?: AlertMetric;
-	threshold?: number;
-	/** Optional webhook ('' = none). A rule needs a webhook or at least one channel. */
-	webhook_url?: string;
-	events?: AlertEvent[];
-	/** Notification channels (integration ids) to link when the rule is created. */
-	integration_ids?: string[];
-}): Promise<AlertRule> {
+export async function createAlertRule(data: AlertRuleInput): Promise<AlertRule> {
 	return request<AlertRule>('/alerts', {
 		method: 'POST',
 		body: JSON.stringify(data)
 	});
 }
 
-export async function updateAlertRule(
-	id: string,
-	data: Partial<{
-		name: string;
-		metric: AlertMetric | null;
-		threshold: number;
-		/** Omit to keep the saved URL, "" to remove it */
-		webhook_url: string;
-		enabled: boolean;
-		events: AlertEvent[];
-	}>
-): Promise<AlertRule> {
+export async function updateAlertRule(id: string, data: AlertRuleUpdate): Promise<AlertRule> {
 	return request<AlertRule>(`/alerts/${id}`, {
 		method: 'PATCH',
 		body: JSON.stringify(data)
@@ -1858,7 +2660,8 @@ export async function deleteAlertRule(id: string): Promise<void> {
 }
 
 export interface AlertChannelTestResult {
-	/** "webhook" or the integration kind ("slack", "email", …). */
+	integration_id: string;
+	/** The channel kind ("slack", "ntfy", "webhook", …) */
 	kind: string;
 	name: string;
 	ok: boolean;
@@ -1868,6 +2671,58 @@ export interface AlertChannelTestResult {
 /** Send a test message to every channel of a rule; one result per channel. */
 export async function testAlertRule(id: string): Promise<AlertChannelTestResult[]> {
 	return request<AlertChannelTestResult[]>(`/alerts/${id}/test`, { method: 'POST' });
+}
+
+/** Pending and firing alerts, firing first. */
+export async function listActiveAlerts(): Promise<ActiveAlert[]> {
+	return request<ActiveAlert[]>('/alerts/active');
+}
+
+export async function listAlertHistory(filter: AlertHistoryFilter = {}): Promise<AlertHistoryPage> {
+	const params = new URLSearchParams();
+	for (const [key, value] of Object.entries(filter)) {
+		if (value !== undefined && value !== '') params.set(key, String(value));
+	}
+	const qs = params.toString();
+	return request<AlertHistoryPage>(`/alerts/history${qs ? `?${qs}` : ''}`);
+}
+
+export async function getAlertEpisode(id: string): Promise<AlertEpisodeDetail> {
+	return request<AlertEpisodeDetail>(`/alerts/history/${id}`);
+}
+
+/** Stop repeat notifications for a firing alert. */
+export async function acknowledgeAlert(episodeId: string): Promise<void> {
+	await request(`/alerts/history/${episodeId}/acknowledge`, { method: 'POST' });
+}
+
+/** Mute one target of a rule (or the whole rule without `target`). */
+export async function snoozeAlert(
+	ruleId: string,
+	snooze: { target?: string; minutes?: number; until_resolved?: boolean }
+): Promise<void> {
+	await request(`/alerts/${ruleId}/snooze`, {
+		method: 'POST',
+		body: JSON.stringify(snooze)
+	});
+}
+
+export async function unsnoozeAlert(ruleId: string, target?: string): Promise<void> {
+	await request(`/alerts/${ruleId}/unsnooze`, {
+		method: 'POST',
+		body: JSON.stringify(target ? { target } : {})
+	});
+}
+
+export async function getAlertSettings(): Promise<AlertSettings> {
+	return request<AlertSettings>('/alerts/settings');
+}
+
+export async function updateAlertSettings(settings: AlertSettings): Promise<AlertSettings> {
+	return request<AlertSettings>('/alerts/settings', {
+		method: 'PUT',
+		body: JSON.stringify(settings)
+	});
 }
 
 // ── Audit log ──
@@ -2689,11 +3544,13 @@ export function openTerminalSession(
 
 // ── Notification Integrations ─────────────────────────────────────────────────
 
-export type IntegrationKind = 'telegram' | 'discord' | 'slack' | 'email';
+export type IntegrationKind =
+	'telegram' | 'discord' | 'slack' | 'email' | 'ntfy' | 'pushover' | 'gotify' | 'webhook';
 
-// Secret fields (bot_token, webhook_url, smtp_password) are write-only: the
-// server never returns them (see `Integration.saved_secrets`), and an update
-// that omits one, or sends "", keeps the saved value.
+// Secret fields (bot_token, webhook_url, smtp_password, topic, token,
+// user_key, app_token, signing_secret) are write-only: the server never
+// returns them (see `Integration.saved_secrets`); an update that omits one, or
+// sends "", keeps the saved value, and `null` clears an optional one.
 
 export interface TelegramConfig {
 	bot_token?: string;
@@ -2721,7 +3578,39 @@ export interface EmailConfig {
 	to_addrs: string[];
 }
 
-export type IntegrationConfig = TelegramConfig | DiscordConfig | SlackConfig | EmailConfig;
+export interface NtfyConfig {
+	server_url?: string;
+	/** Secret: on a public server the topic name is the password */
+	topic?: string;
+	/** Access token for protected topics (null clears it) */
+	token?: string | null;
+}
+
+export interface PushoverConfig {
+	user_key?: string;
+	app_token?: string;
+}
+
+export interface GotifyConfig {
+	server_url?: string;
+	app_token?: string;
+}
+
+export interface WebhookChannelConfig {
+	webhook_url?: string;
+	/** HMAC-SHA256 key for X-Tond-Signature-256 (null clears it) */
+	signing_secret?: string | null;
+}
+
+export type IntegrationConfig =
+	| TelegramConfig
+	| DiscordConfig
+	| SlackConfig
+	| EmailConfig
+	| NtfyConfig
+	| PushoverConfig
+	| GotifyConfig
+	| WebhookChannelConfig;
 
 export interface Integration {
 	id: string;
@@ -2732,17 +3621,14 @@ export interface Integration {
 	/** Secret fields that have a saved value, e.g. ["bot_token"] */
 	saved_secrets: string[];
 	enabled: boolean;
+	quiet_hours: ChannelQuietHours;
+	/** Last successful delivery */
+	last_sent_at: string | null;
+	/** Last delivery error, until a delivery succeeds again */
+	last_error: string | null;
+	last_error_at: string | null;
 	created_at: string;
 	updated_at: string;
-}
-
-export interface AlertIntegrationLink {
-	id: string;
-	rule_id: string;
-	integration_id: string;
-	integration_name: string;
-	integration_kind: IntegrationKind;
-	created_at: string;
 }
 
 // API functions
@@ -2759,6 +3645,7 @@ export async function createIntegration(data: {
 	name: string;
 	kind: IntegrationKind;
 	config: IntegrationConfig;
+	quiet_hours?: ChannelQuietHours;
 }): Promise<Integration> {
 	return request<Integration>('/integrations', {
 		method: 'POST',
@@ -2768,7 +3655,12 @@ export async function createIntegration(data: {
 
 export async function updateIntegration(
 	id: string,
-	data: { name?: string; config?: IntegrationConfig; enabled?: boolean }
+	data: {
+		name?: string;
+		config?: IntegrationConfig;
+		enabled?: boolean;
+		quiet_hours?: ChannelQuietHours;
+	}
 ): Promise<Integration> {
 	return request<Integration>(`/integrations/${id}`, {
 		method: 'PATCH',
@@ -2782,26 +3674,6 @@ export async function deleteIntegration(id: string): Promise<void> {
 
 export async function testIntegration(id: string): Promise<{ message: string }> {
 	return request<{ message: string }>(`/integrations/${id}/test`, { method: 'POST' });
-}
-
-// Alert ↔ integration links
-
-export async function listAlertIntegrations(ruleId: string): Promise<AlertIntegrationLink[]> {
-	return request<AlertIntegrationLink[]>(`/alerts/${ruleId}/integrations`);
-}
-
-export async function linkAlertIntegration(
-	ruleId: string,
-	integrationId: string
-): Promise<{ id: string; rule_id: string; integration_id: string }> {
-	return request(`/alerts/${ruleId}/integrations`, {
-		method: 'POST',
-		body: JSON.stringify({ integration_id: integrationId })
-	});
-}
-
-export async function unlinkAlertIntegration(ruleId: string, integrationId: string): Promise<void> {
-	await request(`/alerts/${ruleId}/integrations/${integrationId}`, { method: 'DELETE' });
 }
 
 // ── Storage Providers ─────────────────────────────────────────────────────────

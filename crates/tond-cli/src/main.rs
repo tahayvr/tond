@@ -30,6 +30,7 @@
 
 mod client;
 mod commands;
+mod deploy_follow;
 mod signature;
 
 use std::path::PathBuf;
@@ -170,6 +171,14 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Behave like other Unix tools when the reader goes away (`tond apps logs
+    // | head`, `| grep -q`): exit quietly on SIGPIPE instead of panicking on
+    // the failed write. Rust ignores SIGPIPE by default.
+    // SAFETY: called first thing in main, before any other thread starts
+    // writing; restoring the default disposition is always sound.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     tond_common::install_crypto_provider();
     let cli = Cli::parse();
 

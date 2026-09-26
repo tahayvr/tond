@@ -74,6 +74,9 @@
 	import * as Select from '$lib/components/ui/select/index.js';
 	import Breadcrumb from '$lib/components/nav/breadcrumb.svelte';
 	import AppOverview from '$lib/components/tabs/app-page/app-overview.svelte';
+	import UptimePanel from '$lib/components/uptime/UptimePanel.svelte';
+	import AppEventsStrip from '$lib/components/events/app-events-strip.svelte';
+	import AppEventsList from '$lib/components/events/app-events-list.svelte';
 	import AppLogs from '$lib/components/tabs/app-page/app-logs.svelte';
 	import AppDeployments from '$lib/components/tabs/app-page/app-deployments.svelte';
 	import AppEnvironment from '$lib/components/tabs/app-page/app-environment.svelte';
@@ -86,6 +89,7 @@
 	import AppPreviews from '$lib/components/tabs/app-page/app-previews.svelte';
 	import PreviewDomainRequiredAlert from '$lib/components/alerts/preview-domain-required-alert.svelte';
 	import MetricsPanel from '$lib/components/metrics/metrics-panel.svelte';
+	import RequestMetricsPanel from '$lib/components/metrics/request-metrics-panel.svelte';
 	import AppHistory from '$lib/components/tabs/app-page/app-history.svelte';
 	import AppWebhooks from '$lib/components/tabs/app-page/app-webhooks.svelte';
 	import { safeUrl } from '$lib/utils';
@@ -1010,12 +1014,26 @@
 				{/if}
 				<!-- Overview tab -->
 				{#if viewAllowed && activeTab === 'overview'}
-					<AppOverview {app} />
+					<div class="pt-4">
+						<AppEventsStrip appId={app.id} />
+					</div>
+					<AppOverview
+						{app}
+						uptimeHref={can('metrics:read') ? appTabHref(appId, 'uptime') : null}
+					/>
+				{/if}
+
+				<!-- Uptime tab -->
+				{#if viewAllowed && activeTab === 'uptime'}
+					{#key appId}
+						<UptimePanel target={appId} canEdit={can('apps:write')} />
+					{/key}
 				{/if}
 
 				<!-- Logs tab -->
 				{#if viewAllowed && activeTab === 'logs'}
 					<AppLogs
+						appId={app.id}
 						appName={app.name}
 						{logLines}
 						streaming={logStreaming}
@@ -1036,6 +1054,7 @@
 						onRollback={handleRollback}
 						canRollback={can('apps:rollback')}
 						onViewGeneratedDockerfile={handleViewGeneratedDockerfile}
+						sourceUrl={app.source_url}
 					/>
 				{/if}
 
@@ -1842,8 +1861,22 @@
 				<!-- Metrics tab -->
 				{#if viewAllowed && activeTab === 'metrics'}
 					{#key appId}
-						<MetricsPanel owner="apps" id={appId} noun="app" />
+						<div class="space-y-8 pt-4">
+							<section aria-labelledby="request-metrics-heading" class="space-y-3">
+								<h2 id="request-metrics-heading" class="text-base font-semibold">Requests</h2>
+								<RequestMetricsPanel owner="apps" id={appId} noun="app" />
+							</section>
+							<section aria-labelledby="resource-metrics-heading">
+								<h2 id="resource-metrics-heading" class="text-base font-semibold">Resources</h2>
+								<MetricsPanel owner="apps" id={appId} noun="app" />
+							</section>
+						</div>
 					{/key}
+				{/if}
+
+				<!-- Events tab -->
+				{#if viewAllowed && activeTab === 'events'}
+					<AppEventsList appId={app.id} />
 				{/if}
 
 				<!-- History tab -->

@@ -54,6 +54,12 @@
 //       and a DNS pre-check. Results go to tond-server over the control
 //       socket; tond-proxy never writes the database.
 //
+// Request metrics (traffic.rs): every request is counted per route (app,
+// preview, dashboard, one bucket for unknown hosts) in Pingora's `logging()`
+// hook — status class, bytes, a fixed latency histogram — with atomic
+// increments only. tond-server reads the totals over the control socket.
+// Opt-in per-app access logs (access_log.rs) are queued to a writer task.
+//
 // Logging: nothing is logged per request at info (routing decisions are at
 // debug), and the route refresh only logs when a route is added, removed or
 // changed. Set RUST_LOG=tond_proxy=debug to trace routing.
@@ -68,11 +74,13 @@
 // (TOND_DASHBOARD_DOMAIN moved to tond-server, which seeds the setting; the
 // proxy reads the dashboard domain from the database like everything else.)
 
+mod access_log;
 mod acme;
 mod certs;
 mod control;
 mod issuance;
 mod meters;
+mod traffic;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -93,13 +101,33 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, RwLock, Semaphore};
 use tond_common::proxy_control::FALLBACK_POLL_SECS;
+use tond_common::traffic::RouteKind;
 
+use crate::access_log::{AccessConfig, AccessLog};
 use crate::acme::ChallengeMap;
 use crate::certs::CertStore;
 use crate::issuance::{IssuanceLoop, Outbox};
+use crate::traffic::{Registry, RouteStats};
 
-/// Route map: domain -> upstream (host:port)
-type RouteMap = Arc<RwLock<HashMap<String, String>>>;
+/// One routed domain.
+#[derive(Clone)]
+pub struct Route {
+    /// host:port of the container.
+    pub upstream: String,
+    /// The app's / preview's request counters.
+    pub stats: Arc<RouteStats>,
+    /// Access logging, when the app opted in.
+    pub access: Option<AccessConfig>,
+}
+
+impl std::fmt::Debug for Route {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.upstream)
+    }
+}
+
+/// Route map: domain -> route
+type RouteMap = Arc<RwLock<HashMap<String, Arc<Route>>>>;
 
 /// Shared, live dashboard domain — updated on every DB poll.
 type DashboardDomain = Arc<RwLock<Option<String>>>;
@@ -199,12 +227,27 @@ struct TondProxy {
     server_addr: String,
     /// Poked when the set of served domains changes (certificate loop).
     domains_changed: Arc<Notify>,
+    /// Per-route request counters.
+    traffic: Arc<Registry>,
+    /// Opt-in access logs.
+    access: Arc<AccessLog>,
+}
+
+/// Per-request state (lives inline in Pingora's session: no allocation).
+pub struct RequestCtx {
+    started: Instant,
+    /// Counters this request is recorded in (set by request_filter).
+    stats: Option<Arc<RouteStats>>,
+    route: Option<Arc<Route>>,
+    dashboard: bool,
+    upstream_started: Option<Instant>,
+    upstream_ttfb: Option<Duration>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum RouteTarget {
+enum RouteTarget<V = Arc<Route>> {
     Dashboard,
-    Upstream(String),
+    Upstream(V),
     /// Unknown host: friendly 502 page.
     Missing,
     /// Host under the preview domain without a matching preview: plain 404.
@@ -220,17 +263,56 @@ fn is_under_domain(host: &str, domain: &str) -> bool {
 }
 
 fn normalize_host(host_header: Option<&str>) -> String {
+    host_str(host_header).to_string()
+}
+
+/// The host without a port, borrowed (the per-request path avoids allocating).
+fn host_str(host_header: Option<&str>) -> &str {
     host_header
-        .map(|h| h.split(':').next().unwrap_or(h).to_string())
+        .map(|h| h.split(':').next().unwrap_or(h))
         .unwrap_or_default()
 }
 
-fn resolve_route(
+/// The request's Host header, without the port.
+fn request_host(session: &Session) -> &str {
+    host_str(
+        session
+            .req_header()
+            .headers
+            .get("host")
+            .and_then(|v| v.to_str().ok()),
+    )
+}
+
+/// Status for a failed proxy attempt: 504 for upstream timeouts, otherwise
+/// what Pingora answers by default (502 upstream, 400 client, 500 internal,
+/// 0 when the client is gone).
+fn failure_status(e: &pingora::Error) -> u16 {
+    use pingora::{ErrorSource, ErrorType};
+    match e.etype() {
+        ErrorType::HTTPStatus(code) => *code,
+        ErrorType::ConnectTimedout | ErrorType::ReadTimedout | ErrorType::WriteTimedout
+            if e.esource() == &ErrorSource::Upstream =>
+        {
+            504
+        }
+        _ => match e.esource() {
+            ErrorSource::Upstream => 502,
+            ErrorSource::Downstream => match e.etype() {
+                ErrorType::WriteError | ErrorType::ReadError | ErrorType::ConnectionClosed => 0,
+                _ => 400,
+            },
+            ErrorSource::Internal | ErrorSource::Unset => 500,
+        },
+    }
+}
+
+fn resolve_route<V: Clone>(
     host: &str,
     dashboard_domain: Option<&str>,
     preview_domain: Option<&str>,
-    routes: &HashMap<String, String>,
-) -> RouteTarget {
+    routes: &HashMap<String, V>,
+) -> RouteTarget<V> {
     // Checked first: the preview domain never reaches the dashboard/API.
     // `routes` only holds hosts under the preview domain that are previews
     // (refresh_routes drops app domains under it).
@@ -388,6 +470,14 @@ impl HttpContext {
     }
 }
 
+/// domain -> upstream view of a route map (for change logging).
+fn upstreams(routes: &HashMap<String, Arc<Route>>) -> HashMap<String, String> {
+    routes
+        .iter()
+        .map(|(d, r)| (d.clone(), r.upstream.clone()))
+        .collect()
+}
+
 /// Human-readable differences between two route maps, sorted by domain:
 /// "added a -> b", "removed a", "changed a: b -> c". Empty when identical.
 fn route_changes(old: &HashMap<String, String>, new: &HashMap<String, String>) -> Vec<String> {
@@ -420,7 +510,16 @@ impl TondProxy {
             preview_domain: Arc::new(RwLock::new(None)),
             server_addr,
             domains_changed: Arc::new(Notify::new()),
+            traffic: Arc::new(Registry::default()),
+            // Replaced by with_access_log in main(); without a writer every
+            // line is dropped (and counted).
+            access: Arc::new(access_log::channel(std::path::Path::new("/nonexistent")).0),
         }
+    }
+
+    fn with_access_log(mut self, access: Arc<AccessLog>) -> Self {
+        self.access = access;
+        self
     }
 
     fn route_db(&self) -> &RouteDb {
@@ -451,7 +550,7 @@ impl TondProxy {
         result
     }
 
-    async fn resolve(&self, host: &str) -> RouteTarget {
+    async fn resolve(&self, host: &str) -> RouteTarget<Arc<Route>> {
         let dd = self.dashboard_domain.read().await;
         let pd = self.preview_domain.read().await;
         let routes = self.routes.read().await;
@@ -521,19 +620,21 @@ impl TondProxy {
                 .is_some_and(|pd| is_under_domain(host, pd))
         };
 
-        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(String, String, String, i64, bool, bool)> = sqlx::query_as(
             // Background workers (readiness 'none') serve nothing: never routed,
             // even if a domain lingers on the row.
-            "SELECT name, domain, host_port FROM apps
+            "SELECT id, name, domain, host_port, access_log, access_log_query FROM apps
              WHERE status = 'running' AND domain IS NOT NULL AND host_port IS NOT NULL
                AND readiness != 'none'",
         )
         .fetch_all(&mut *tx)
         .await?;
 
-        let mut new_routes = HashMap::new();
+        let mut new_routes: HashMap<String, Arc<Route>> = HashMap::new();
+        let mut live: Vec<(RouteKind, String)> = Vec::new();
 
-        for (name, domain, host_port) in &rows {
+        for (id, name, domain, host_port, access_log, access_query) in &rows {
             // The preview domain is reserved for previews.
             if under_preview_domain(domain) {
                 tracing::warn!(
@@ -544,13 +645,25 @@ impl TondProxy {
                 continue;
             }
             let upstream = format!("127.0.0.1:{}", host_port);
-            new_routes.insert(domain.clone(), upstream);
+            let access = access_log.then(|| AccessConfig {
+                app_id: Arc::from(id.as_str()),
+                include_query: *access_query,
+            });
+            new_routes.insert(
+                domain.clone(),
+                Arc::new(Route {
+                    upstream,
+                    stats: self.traffic.route(RouteKind::App, id),
+                    access,
+                }),
+            );
+            live.push((RouteKind::App, id.clone()));
         }
 
         // Also load active preview deployments (subdomain routing).
         // Previews always have a stored host_port — no Docker fallback needed.
-        let preview_rows: Vec<(Option<String>, i64)> = sqlx::query_as(
-            "SELECT subdomain, host_port FROM preview_deployments
+        let preview_rows: Vec<(String, Option<String>, i64)> = sqlx::query_as(
+            "SELECT id, subdomain, host_port FROM preview_deployments
              WHERE status = 'running'
                AND subdomain IS NOT NULL
                AND host_port IS NOT NULL
@@ -560,18 +673,29 @@ impl TondProxy {
         .await?;
         tx.commit().await?;
 
-        for (subdomain, host_port) in preview_rows {
+        for (id, subdomain, host_port) in preview_rows {
             if let Some(sub) = subdomain {
                 // Previews are served only under the current preview domain.
                 if !under_preview_domain(&sub) {
                     continue;
                 }
-                new_routes.insert(sub, format!("127.0.0.1:{}", host_port));
+                new_routes.insert(
+                    sub,
+                    Arc::new(Route {
+                        upstream: format!("127.0.0.1:{}", host_port),
+                        stats: self.traffic.route(RouteKind::Preview, &id),
+                        access: None,
+                    }),
+                );
+                live.push((RouteKind::Preview, id));
             }
         }
+        let live: Vec<(RouteKind, &str)> = live.iter().map(|(k, id)| (*k, id.as_str())).collect();
+        self.traffic.retire_except(&live);
+        self.access.routes_reloaded();
 
         let mut routes = self.routes.write().await;
-        let changes = route_changes(&routes, &new_routes);
+        let changes = route_changes(&upstreams(&routes), &upstreams(&new_routes));
         if !changes.is_empty() {
             for change in &changes {
                 tracing::info!("Route {}", change);
@@ -595,30 +719,41 @@ impl TondProxy {
 
 #[async_trait]
 impl ProxyHttp for TondProxy {
-    type CTX = ();
+    type CTX = RequestCtx;
 
-    fn new_ctx(&self) -> Self::CTX {}
+    fn new_ctx(&self) -> Self::CTX {
+        RequestCtx {
+            started: Instant::now(),
+            stats: None,
+            route: None,
+            dashboard: false,
+            upstream_started: None,
+            upstream_ttfb: None,
+        }
+    }
 
-    /// Check if the requested host has a known route. If not, write a
-    /// friendly HTML error page directly and short-circuit (return Ok(true)).
+    /// Resolve the route (once per request; later hooks use `ctx`). Unknown
+    /// hosts get a friendly HTML error page written directly (Ok(true)).
     async fn request_filter(
         &self,
         session: &mut Session,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> pingora::Result<bool> {
-        let host = normalize_host(
-            session
-                .req_header()
-                .headers
-                .get("host")
-                .and_then(|v| v.to_str().ok()),
-        );
-
-        let route_target = self.resolve(&host).await;
+        let route_target = self.resolve(request_host(session)).await;
 
         match route_target {
-            RouteTarget::Dashboard | RouteTarget::Upstream(_) => return Ok(false),
+            RouteTarget::Dashboard => {
+                ctx.stats = Some(self.traffic.dashboard().clone());
+                ctx.dashboard = true;
+                return Ok(false);
+            }
+            RouteTarget::Upstream(route) => {
+                ctx.stats = Some(route.stats.clone());
+                ctx.route = Some(route);
+                return Ok(false);
+            }
             RouteTarget::NotFound => {
+                ctx.stats = Some(self.traffic.unknown().clone());
                 let body = "404 Not Found\n";
                 let mut resp = pingora::http::ResponseHeader::build(404, None)?;
                 resp.insert_header("Content-Type", "text/plain; charset=utf-8")?;
@@ -630,9 +765,12 @@ impl ProxyHttp for TondProxy {
                     .await?;
                 return Ok(true);
             }
-            RouteTarget::Missing => {}
+            RouteTarget::Missing => {
+                ctx.stats = Some(self.traffic.unknown().clone());
+            }
         }
 
+        let host = request_host(session).to_string();
         // No route found — return a friendly HTML 502 page. Debug only:
         // scanners hit unknown hosts constantly.
         tracing::debug!("No route found for host '{}', returning 502 page", host);
@@ -682,39 +820,30 @@ impl ProxyHttp for TondProxy {
     async fn upstream_peer(
         &self,
         session: &mut Session,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> pingora::Result<Box<HttpPeer>> {
-        let host = normalize_host(
-            session
-                .req_header()
-                .headers
-                .get("host")
-                .and_then(|v| v.to_str().ok()),
+        ctx.upstream_started = Some(Instant::now());
+        tracing::debug!(
+            "Routing request for host {:?} -> {:?}",
+            request_host(session),
+            ctx.route
         );
 
-        let route_target = self.resolve(&host).await;
-
-        tracing::debug!("Routing request for host {:?} -> {:?}", host, route_target);
-
-        match route_target {
-            RouteTarget::Dashboard => {
-                if let Some((addr, port)) = parse_upstream_addr(&self.server_addr, 3001) {
-                    return Ok(Box::new(HttpPeer::new((addr, port), false, String::new())));
-                }
+        if ctx.dashboard {
+            if let Some((addr, port)) = parse_upstream_addr(&self.server_addr, 3001) {
+                return Ok(Box::new(HttpPeer::new((addr, port), false, String::new())));
             }
-            RouteTarget::Upstream(upstream) => {
-                if let Some((addr, port)) = parse_upstream_addr(&upstream, 8080) {
-                    return Ok(Box::new(HttpPeer::new((addr, port), false, String::new())));
-                }
-            }
-            RouteTarget::Missing | RouteTarget::NotFound => {}
+        } else if let Some(route) = &ctx.route
+            && let Some((addr, port)) = parse_upstream_addr(&route.upstream, 8080)
+        {
+            return Ok(Box::new(HttpPeer::new((addr, port), false, String::new())));
         }
 
         // request_filter already handled the no-route case; if we somehow
         // reach here just use a dummy peer (should not happen in practice).
         tracing::warn!(
             "upstream_peer reached for unknown host '{}' — this should not happen",
-            host
+            request_host(session)
         );
         let peer = Box::new(HttpPeer::new(("127.0.0.1", 9999), false, String::new()));
         Ok(peer)
@@ -725,17 +854,9 @@ impl ProxyHttp for TondProxy {
         &self,
         session: &mut Session,
         upstream_request: &mut pingora::http::RequestHeader,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> pingora::Result<()> {
-        let host = normalize_host(
-            session
-                .req_header()
-                .headers
-                .get("host")
-                .and_then(|v| v.to_str().ok()),
-        );
-        let is_dashboard = self.dashboard_domain.read().await.as_deref() == Some(host.as_str());
-        if is_dashboard {
+        if ctx.dashboard {
             let client_ip = session
                 .client_addr()
                 .and_then(|addr| addr.as_inet())
@@ -744,16 +865,94 @@ impl ProxyHttp for TondProxy {
         }
         Ok(())
     }
+
+    /// The upstream answered: its time to first byte.
+    async fn upstream_response_filter(
+        &self,
+        _session: &mut Session,
+        _upstream_response: &mut pingora::http::ResponseHeader,
+        ctx: &mut Self::CTX,
+    ) -> pingora::Result<()> {
+        if ctx.upstream_ttfb.is_none() {
+            ctx.upstream_ttfb = ctx.upstream_started.map(|t| t.elapsed());
+        }
+        Ok(())
+    }
+
+    /// Pingora's default error response, except that upstream timeouts are
+    /// a 504 (so request metrics can tell them from a refused connection).
+    async fn fail_to_proxy(
+        &self,
+        session: &mut Session,
+        e: &pingora::Error,
+        _ctx: &mut Self::CTX,
+    ) -> pingora::proxy::FailToProxy {
+        let code = failure_status(e);
+        if code > 0 {
+            session.respond_error(code).await.unwrap_or_else(|e| {
+                tracing::error!("failed to send error response to downstream: {e}");
+            });
+        }
+        pingora::proxy::FailToProxy {
+            error_code: code,
+            can_reuse_downstream: false,
+        }
+    }
+
+    /// Count the finished request (atomic increments, no allocation) and,
+    /// if the app opted in, queue its access line.
+    async fn logging(
+        &self,
+        session: &mut Session,
+        _e: Option<&pingora::Error>,
+        ctx: &mut Self::CTX,
+    ) {
+        let total = ctx.started.elapsed();
+        let status = session.response_written().map_or(0, |r| r.status.as_u16());
+        let upstream = ctx
+            .upstream_ttfb
+            .or_else(|| ctx.upstream_started.map(|t| t.elapsed()));
+        let bytes_out = session.body_bytes_sent() as u64;
+        let stats = ctx.stats.as_ref().unwrap_or(self.traffic.unknown());
+        stats.record(
+            status,
+            session.body_bytes_read() as u64,
+            bytes_out,
+            total,
+            upstream,
+        );
+
+        if let Some(cfg) = ctx.route.as_ref().and_then(|r| r.access.as_ref()) {
+            let req = session.req_header();
+            self.access.log(
+                cfg,
+                &access_log::Request {
+                    method: req.method.as_str(),
+                    path: req.uri.path(),
+                    query: req.uri.query(),
+                    status,
+                    duration: total,
+                    bytes_out,
+                    client: session
+                        .client_addr()
+                        .and_then(|a| a.as_inet())
+                        .map(|a| a.ip()),
+                },
+            );
+        }
+    }
 }
 
 fn main() {
     tond_common::install_crypto_provider();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(tond_common::logging::fmt_layer(
+                tond_common::logging::LogFormat::from_env(),
+            ))
+            .init();
+    }
 
     tracing::info!("Starting Tond Proxy (Pingora) with TLS support...");
 
@@ -776,14 +975,25 @@ fn main() {
     });
     let challenges = acme::new_challenge_map();
 
-    let mut server = Server::new(None).unwrap();
+    // Pingora waits 300 s (+ a final step) for connections on SIGTERM by
+    // default, which makes every restart of tond-proxy crawl. Proxied requests
+    // are short; give them a few seconds to finish.
+    let mut server = Server::new_with_opt_and_conf(
+        None,
+        pingora::server::configuration::ServerConf {
+            grace_period_seconds: Some(5),
+            graceful_shutdown_timeout_seconds: Some(5),
+            ..pingora::server::configuration::ServerConf::new().unwrap_or_default()
+        },
+    );
     server.bootstrap();
 
     let route_db = Arc::new(
         RouteDb::open(&db_path)
             .unwrap_or_else(|err| panic!("invalid database path {db_path}: {err}")),
     );
-    let proxy = TondProxy::new(route_db, server_addr);
+    let (access_log, access_writer) = access_log::channel(std::path::Path::new(&data_dir));
+    let proxy = TondProxy::new(route_db, server_addr).with_access_log(Arc::new(access_log));
 
     // ── Background tasks: one OS thread, one current-thread runtime ──
 
@@ -798,6 +1008,7 @@ fn main() {
         .spawn(move || {
             current_thread_runtime().block_on(background(
                 proxy_bg,
+                access_writer,
                 cert_store_bg,
                 challenges_bg,
                 data_dir_bg,
@@ -837,6 +1048,7 @@ fn current_thread_runtime() -> tokio::runtime::Runtime {
 /// Everything besides the TLS proxy itself.
 async fn background(
     proxy: TondProxy,
+    access_writer: access_log::Writer,
     cert_store: CertStore,
     challenges: ChallengeMap,
     data_dir: PathBuf,
@@ -846,6 +1058,9 @@ async fn background(
     if let Err(e) = proxy.refresh_routes().await {
         tracing::warn!("Initial route load failed (retrying on the next nudge or check): {e:#}");
     }
+
+    // Opt-in access logs: appended off the request path.
+    tokio::spawn(access_writer.run());
 
     // Port 80: ACME challenges + redirect to HTTPS.
     let http_ctx = HttpContext {
@@ -1064,7 +1279,9 @@ mod tests {
                 container_port INTEGER NOT NULL DEFAULT 3000,
                 status TEXT NOT NULL DEFAULT 'pending',
                 host_port INTEGER,
-                readiness TEXT NOT NULL DEFAULT 'http'
+                readiness TEXT NOT NULL DEFAULT 'http',
+                access_log INTEGER NOT NULL DEFAULT 0,
+                access_log_query INTEGER NOT NULL DEFAULT 0
             )",
         )
         .execute(&pool)
@@ -1283,6 +1500,18 @@ mod tests {
         );
     }
 
+    fn test_route(upstream: &str) -> Arc<Route> {
+        Arc::new(Route {
+            upstream: upstream.to_string(),
+            stats: Registry::default().route(RouteKind::App, "test"),
+            access: None,
+        })
+    }
+
+    fn upstream_of<'a>(routes: &'a HashMap<String, Arc<Route>>, domain: &str) -> Option<&'a str> {
+        routes.get(domain).map(|r| r.upstream.as_str())
+    }
+
     fn http_ctx(routes: &[(&str, &str)], dashboard: Option<&str>) -> HttpContext {
         http_ctx_with_preview(routes, dashboard, None)
     }
@@ -1297,7 +1526,7 @@ mod tests {
             routes: Arc::new(RwLock::new(
                 routes
                     .iter()
-                    .map(|(d, u)| (d.to_string(), u.to_string()))
+                    .map(|(d, u)| (d.to_string(), test_route(u)))
                     .collect(),
             )),
             dashboard_domain: Arc::new(RwLock::new(dashboard.map(str::to_string))),
@@ -1471,6 +1700,36 @@ mod tests {
     }
 
     #[test]
+    fn upstream_timeouts_are_504_and_other_failures_keep_pingoras_codes() {
+        use pingora::{Error, ErrorType};
+        assert_eq!(
+            failure_status(&Error::new_up(ErrorType::ConnectTimedout)),
+            504
+        );
+        assert_eq!(failure_status(&Error::new_up(ErrorType::ReadTimedout)), 504);
+        assert_eq!(
+            failure_status(&Error::new_up(ErrorType::ConnectRefused)),
+            502
+        );
+        assert_eq!(
+            failure_status(&Error::new_down(ErrorType::ReadTimedout)),
+            400
+        );
+        assert_eq!(
+            failure_status(&Error::new_down(ErrorType::ConnectionClosed)),
+            0
+        );
+        assert_eq!(
+            failure_status(&Error::new_in(ErrorType::InternalError)),
+            500
+        );
+        assert_eq!(
+            failure_status(&Error::new_in(ErrorType::HTTPStatus(413))),
+            413
+        );
+    }
+
+    #[test]
     fn route_changes_reports_only_differences() {
         let old = HashMap::from([
             ("a.com".to_string(), "127.0.0.1:1".to_string()),
@@ -1506,7 +1765,7 @@ mod tests {
         *proxy.dashboard_domain.write().await = Some("dashboard.example.com".to_string());
         proxy.routes.write().await.insert(
             "app.example.com".to_string(),
-            "127.0.0.1:not-a-port".to_string(),
+            test_route("127.0.0.1:not-a-port"),
         );
 
         let dashboard_target = {
@@ -1530,7 +1789,7 @@ mod tests {
         };
         let app_peer = match app_target {
             RouteTarget::Upstream(upstream) => {
-                let (addr, port) = parse_upstream_addr(&upstream, 8080)
+                let (addr, port) = parse_upstream_addr(&upstream.upstream, 8080)
                     .unwrap_or_else(|| panic!("expected app upstream to produce a peer address"));
                 HttpPeer::new((addr, port), false, String::new())
             }
@@ -1709,13 +1968,13 @@ mod tests {
             "refresh_routes should load exactly the running app route and active preview route"
         );
         assert_eq!(
-            routes.get("frontend.example.com"),
-            Some(&"127.0.0.1:4100".to_string()),
+            upstream_of(&routes, "frontend.example.com"),
+            Some("127.0.0.1:4100"),
             "refresh_routes should route running apps with stored host_port values"
         );
         assert_eq!(
-            routes.get("pr-42-frontend.previews.test"),
-            Some(&"127.0.0.1:5100".to_string()),
+            upstream_of(&routes, "pr-42-frontend.previews.test"),
+            Some("127.0.0.1:5100"),
             "refresh_routes should route active preview deployments with stored host_port values"
         );
         assert!(
@@ -1817,13 +2076,13 @@ mod tests {
             "refresh_routes should remove app routes that no longer exist in the database"
         );
         assert_eq!(
-            routes.get("api.example.com"),
-            Some(&"127.0.0.1:6200".to_string()),
+            upstream_of(&routes, "api.example.com"),
+            Some("127.0.0.1:6200"),
             "refresh_routes should load newly added running app routes"
         );
         assert_eq!(
-            routes.get("pr-99-api.previews.test"),
-            Some(&"127.0.0.1:6300".to_string()),
+            upstream_of(&routes, "pr-99-api.previews.test"),
+            Some("127.0.0.1:6300"),
             "refresh_routes should retain only active preview routes from the latest refresh"
         );
 
@@ -1900,10 +2159,10 @@ mod tests {
             Some("previews.test"),
             "refresh_routes should load the preview domain"
         );
-        assert_eq!(
+        assert!(matches!(
             proxy.resolve("squatter.previews.test").await,
             RouteTarget::NotFound
-        );
+        ));
     }
 
     async fn bump_version(pool: &SqlitePool) {
@@ -1983,7 +2242,7 @@ mod tests {
             "CREATE TABLE route_state (id INTEGER PRIMARY KEY, version INTEGER NOT NULL)",
             "INSERT INTO route_state VALUES (1, 1)",
             "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-            "CREATE TABLE apps (id TEXT PRIMARY KEY, name TEXT, domain TEXT, status TEXT, host_port INTEGER, readiness TEXT NOT NULL DEFAULT 'http')",
+            "CREATE TABLE apps (id TEXT PRIMARY KEY, name TEXT, domain TEXT, status TEXT, host_port INTEGER, readiness TEXT NOT NULL DEFAULT 'http', access_log INTEGER NOT NULL DEFAULT 0, access_log_query INTEGER NOT NULL DEFAULT 0)",
             "CREATE TABLE preview_deployments (id TEXT PRIMARY KEY, subdomain TEXT, host_port INTEGER, status TEXT, expires_at TEXT)",
             "INSERT INTO apps (id, name, domain, status, host_port) VALUES ('a', 'web', 'web.example.com', 'running', 4100)",
         ] {

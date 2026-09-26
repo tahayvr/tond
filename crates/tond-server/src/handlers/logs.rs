@@ -67,6 +67,7 @@ use crate::{
     auth::{MaybePrincipal, Principal, principal::AuthFailure},
     docker,
     log_bus::{self, DeployEvent},
+    log_scrub,
     state::AppState,
 };
 use tond_common::{CronJobRun, DeployLog, ManagedDatabase, Scope};
@@ -256,6 +257,12 @@ struct FollowTarget {
 }
 
 impl ContainerScope {
+    /// App containers are scrubbed with their app's secrets; database
+    /// containers only for URL credentials and key patterns.
+    fn is_app(&self) -> bool {
+        matches!(self, Self::App(_) | Self::AllApps)
+    }
+
     async fn targets(&self, db: &sqlx::SqlitePool) -> Result<Vec<FollowTarget>, sqlx::Error> {
         let rows: Vec<(String, String, String)> = match self {
             Self::App(id) => {
@@ -414,12 +421,18 @@ async fn supervise_containers(
             } else {
                 Some(last_scan_unix)
             };
+            let scrub = if scope.is_app() {
+                Scrub::App(db.clone(), target.key.clone())
+            } else {
+                Scrub::Generic
+            };
             let handle = set.spawn(follow_container(
                 tx.clone(),
                 docker.clone(),
                 target.container_id.clone(),
                 target.tag.clone(),
                 since,
+                scrub,
             ));
             followers.insert(
                 target.key.clone(),
@@ -435,6 +448,34 @@ async fn supervise_containers(
     }
 }
 
+/// How container log lines are cleaned before they leave the server.
+#[derive(Clone)]
+enum Scrub {
+    /// With the app's secret values (cached, see log_scrub.rs).
+    App(sqlx::SqlitePool, String),
+    /// URL credentials and key patterns only.
+    Generic,
+}
+
+impl Scrub {
+    async fn line(&self, line: &str) -> String {
+        match self {
+            Scrub::App(db, app_id) => log_scrub::scrub_for_app(db, app_id, line).await,
+            Scrub::Generic => log_scrub::scrub(line, &[]),
+        }
+    }
+}
+
+/// Split and scrub snapshot lines (`<ts> <line>` as Docker returns them).
+async fn snapshot_lines_of(raw: Vec<String>, scrub: &Scrub) -> Vec<(Option<String>, String)> {
+    let mut out = Vec::with_capacity(raw.len());
+    for r in &raw {
+        let (ts, line) = split_docker_ts(r);
+        out.push((ts.map(str::to_string), scrub.line(line).await));
+    }
+    out
+}
+
 /// Follow one container's logs until the stream ends or the receiver is gone.
 async fn follow_container(
     tx: mpsc::Sender<String>,
@@ -442,6 +483,7 @@ async fn follow_container(
     container_id: String,
     tag: Option<(&'static str, &'static str, String, String)>,
     since_unix: Option<i64>,
+    scrub: Scrub,
 ) {
     let mut options = LogsOptionsBuilder::default()
         .stdout(true)
@@ -459,6 +501,7 @@ async fn follow_container(
             Ok(output) => {
                 let raw = output.to_string();
                 let (ts, line) = split_docker_ts(&raw);
+                let line = scrub.line(line).await;
                 let mut frame = json!({ "type": "container", "ts": ts, "line": line });
                 if let Some((id_field, name_field, id, name)) = &tag {
                     frame[*id_field] = json!(id);
@@ -530,6 +573,11 @@ async fn handle_socket(
     } else {
         vec![]
     };
+    let container_logs = snapshot_lines_of(
+        container_logs,
+        &Scrub::App(state.db.clone(), app.id.clone()),
+    )
+    .await;
 
     // Deploy logs arrive newest-first from DB; reverse so they appear chronologically
     let snapshot = json!({
@@ -539,8 +587,7 @@ async fn handle_socket(
             "message": l.message,
             "ts": l.created_at,
         })).collect::<Vec<_>>(),
-        "container_logs": container_logs.iter().map(|raw| {
-            let (ts, line) = split_docker_ts(raw);
+        "container_logs": container_logs.iter().map(|(ts, line)| {
             json!({ "ts": ts, "line": line })
         }).collect::<Vec<_>>(),
     });
@@ -690,8 +737,7 @@ async fn handle_all_databases_socket(
             let lines = docker::get_logs(&state.docker, cid, 50)
                 .await
                 .unwrap_or_default();
-            for raw in &lines {
-                let (ts, line) = split_docker_ts(raw);
+            for (ts, line) in snapshot_lines_of(lines, &Scrub::Generic).await {
                 snapshot_lines.push(json!({
                     "db_id": db.id,
                     "db_name": db.name,
@@ -767,11 +813,11 @@ async fn handle_database_socket(
     } else {
         vec![]
     };
+    let container_logs = snapshot_lines_of(container_logs, &Scrub::Generic).await;
 
     let snapshot = json!({
         "type": "snapshot",
-        "container_logs": container_logs.iter().map(|raw| {
-            let (ts, line) = split_docker_ts(raw);
+        "container_logs": container_logs.iter().map(|(ts, line)| {
             json!({ "ts": ts, "line": line })
         }).collect::<Vec<_>>(),
     });

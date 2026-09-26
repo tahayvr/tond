@@ -15,6 +15,7 @@
 
 const MODEL_SOURCES: &[(&str, &str)] = &[
     ("access.rs", include_str!("access.rs")),
+    ("alerts.rs", include_str!("alerts.rs")),
     ("api.rs", include_str!("api.rs")),
     ("apps.rs", include_str!("apps.rs")),
     ("auth.rs", include_str!("auth.rs")),
@@ -144,6 +145,31 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     (
         "EmailConfig",
         "smtp_password",
+        "internal config; IntegrationResponse strips secret fields",
+    ),
+    (
+        "NtfyConfig",
+        "token",
+        "internal config; IntegrationResponse strips secret fields",
+    ),
+    (
+        "PushoverConfig",
+        "app_token",
+        "internal config; IntegrationResponse strips secret fields",
+    ),
+    (
+        "GotifyConfig",
+        "app_token",
+        "internal config; IntegrationResponse strips secret fields",
+    ),
+    (
+        "WebhookConfig",
+        "webhook_url",
+        "internal config; IntegrationResponse strips secret fields",
+    ),
+    (
+        "WebhookConfig",
+        "signing_secret",
         "internal config; IntegrationResponse strips secret fields",
     ),
     (

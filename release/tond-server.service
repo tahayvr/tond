@@ -67,6 +67,11 @@ Environment=TOND_DASHBOARD_DIR=/opt/tond/dashboard
 # Logging level: trace, debug, info, warn, error
 Environment=RUST_LOG=info
 
+# Log format: text (default, readable in journalctl) or json (one JSON object
+# per line with level, target, message and span fields, for log shippers).
+# Set it with: systemctl edit tond-server
+# Environment=TOND_LOG_FORMAT=json
+
 # Non-root shell user used by the dashboard terminal pane
 Environment=TOND_TERMINAL_USER=tond
 

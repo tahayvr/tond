@@ -24,6 +24,7 @@ async-trait = { workspace = true }
 instant-acme = { workspace = true }
 rcgen = { workspace = true }
 openssl = { workspace = true }
+rustix = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]

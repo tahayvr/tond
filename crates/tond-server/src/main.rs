@@ -68,8 +68,10 @@
 //   There is no root API key: automation gets a scoped token from
 //   `tond token create` over the root-only socket.
 
+mod access_logs;
 mod alerts;
 mod audit_log;
+mod audit_ship;
 mod auth;
 mod backup;
 mod compose_policy;
@@ -100,6 +102,7 @@ mod state;
 mod static_files;
 mod storage;
 mod upload;
+mod uptime;
 mod volumes;
 
 use std::future::IntoFuture;
@@ -112,7 +115,6 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use tower_http::trace::TraceLayer;
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
 use crate::runtime::{dbstats::DbStatsLayer, http_metrics, selfstats, shutdown};
@@ -143,10 +145,9 @@ async fn run() -> Result<()> {
     tond_common::install_crypto_provider();
     // Logging: the journal gets RUST_LOG (default info); DbStatsLayer counts
     // every SQL statement through its own filter (runtime/dbstats.rs).
+    let log_format = tond_common::logging::LogFormat::from_env();
     tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        ))
+        .with(tond_common::logging::fmt_layer(log_format))
         .with(DbStatsLayer.with_filter(DbStatsLayer::filter()))
         .init();
 
@@ -228,11 +229,13 @@ async fn run() -> Result<()> {
     // it watches changes (runtime/changes.rs), so an idle server barely wakes.
     tokio::spawn(health::run_health_checker(state.clone()));
     tokio::spawn(metrics::run_metrics_collector(state.clone()));
-    tokio::spawn(alerts::run_alert_checker(state.clone()));
+    tokio::spawn(alerts::run_alert_engine(state.clone()));
     tokio::spawn(cron::run_cron_scheduler(state.clone()));
     tokio::spawn(janitor::run_janitor(state.clone()));
+    tokio::spawn(audit_ship::run(state.clone()));
     tokio::spawn(backup::backup_scheduler(state.clone()));
     tokio::spawn(run_preview_cleanup_loop(state.clone()));
+    tokio::spawn(uptime::run(state.clone()));
 
     // Control connection to tond-proxy: route nudges, cutover acks, cert results.
     tokio::spawn(proxy_link::run(state.clone()));
@@ -378,6 +381,10 @@ async fn run() -> Result<()> {
             get(handlers::deployments::list_deployments),
         )
         .route(
+            "/api/apps/{id}/deployments/stats",
+            get(handlers::deploy_stats::deploy_stats),
+        )
+        .route(
             "/api/apps/{id}/deployments/{deployment_id}",
             get(handlers::deployments::get_deployment),
         )
@@ -401,11 +408,18 @@ async fn run() -> Result<()> {
             post(handlers::deployments::rollback_app),
         )
         // Certificate management
-        .route("/api/certs", get(handlers::list_certs))
-        .route("/api/certs/{domain}/retry", post(handlers::retry_cert))
+        .route("/api/certs", get(handlers::certificates::list_certs))
+        .route(
+            "/api/certs/{domain}/retry",
+            post(handlers::certificates::retry_cert),
+        )
         // Server settings
         .route("/api/settings", get(handlers::settings::get_settings))
         .route("/api/settings", put(handlers::settings::update_settings))
+        .route(
+            "/api/settings/retention",
+            get(handlers::retention::get_retention).put(handlers::retention::update_retention),
+        )
         // Host terminal switch: readable by any authenticated caller, writable
         // only over the root-only Unix socket (`tond settings host-terminal`)
         .route(
@@ -576,6 +590,10 @@ async fn run() -> Result<()> {
         )
         // Metrics
         .route(
+            "/api/apps/{id}/events",
+            get(handlers::app_events::list_app_events),
+        )
+        .route(
             "/api/apps/{id}/metrics",
             get(handlers::metrics::get_app_metrics),
         )
@@ -591,11 +609,54 @@ async fn run() -> Result<()> {
             "/api/system/metrics",
             get(handlers::metrics::get_system_metrics),
         )
+        // Request metrics (tond-proxy traffic) and access logs
+        .route(
+            "/api/apps/{id}/requests",
+            get(handlers::requests::get_app_requests),
+        )
+        .route(
+            "/api/previews/{id}/requests",
+            get(handlers::requests::get_preview_requests),
+        )
+        .route(
+            "/api/previews/{id}/metrics",
+            get(handlers::requests::get_preview_metrics),
+        )
+        .route(
+            "/api/system/requests",
+            get(handlers::requests::get_system_requests),
+        )
+        .route(
+            "/api/apps/{id}/access-log",
+            get(handlers::access_log::get_access_log)
+                .put(handlers::access_log::update_access_log)
+                .delete(handlers::access_log::delete_access_log),
+        )
+        .route(
+            "/api/apps/{id}/access-log/download",
+            get(handlers::access_log::download_access_log),
+        )
         .route("/api/system/self", get(handlers::system_self::get_self))
+        // Host history, disk, Docker, heartbeat; uptime checks
+        .merge(handlers::host::routes())
+        .merge(handlers::uptime::routes())
         .route("/metrics", get(handlers::system_self::metrics))
-        // Alert rules
+        // Alerts: rules, live alerts, history, snooze, quiet hours
         .route("/api/alerts", get(handlers::alerts::list_alerts))
         .route("/api/alerts", post(handlers::alerts::create_alert))
+        .route("/api/alerts/kinds", get(handlers::alerts::list_kinds))
+        .route("/api/alerts/active", get(handlers::alerts::list_active))
+        .route("/api/alerts/history", get(handlers::alerts::list_history))
+        .route(
+            "/api/alerts/history/{id}",
+            get(handlers::alerts::get_episode),
+        )
+        .route(
+            "/api/alerts/history/{id}/acknowledge",
+            post(handlers::alerts::acknowledge),
+        )
+        .route("/api/alerts/settings", get(handlers::alerts::get_settings))
+        .route("/api/alerts/settings", put(handlers::alerts::put_settings))
         .route("/api/alerts/{id}", get(handlers::alerts::get_alert))
         .route(
             "/api/alerts/{id}",
@@ -603,18 +664,10 @@ async fn run() -> Result<()> {
         )
         .route("/api/alerts/{id}", delete(handlers::alerts::delete_alert))
         .route("/api/alerts/{id}/test", post(handlers::alerts::test_alert))
-        // Alert ↔ integration links
+        .route("/api/alerts/{id}/snooze", post(handlers::alerts::snooze))
         .route(
-            "/api/alerts/{id}/integrations",
-            get(handlers::alerts::list_alert_integrations),
-        )
-        .route(
-            "/api/alerts/{id}/integrations",
-            post(handlers::alerts::link_alert_integration),
-        )
-        .route(
-            "/api/alerts/{id}/integrations/{int_id}",
-            delete(handlers::alerts::unlink_alert_integration),
+            "/api/alerts/{id}/unsnooze",
+            post(handlers::alerts::unsnooze),
         )
         // Notification integrations
         .route(
@@ -643,6 +696,15 @@ async fn run() -> Result<()> {
         )
         // Audit log
         .route("/api/audit-log", get(handlers::audit_log::list_audit_log))
+        .route(
+            "/api/audit-log/shipping",
+            get(handlers::audit_shipping::get_shipping)
+                .put(handlers::audit_shipping::update_shipping),
+        )
+        .route(
+            "/api/audit-log/shipping/test",
+            post(handlers::audit_shipping::test_shipping),
+        )
         .route(
             "/api/audit-log/verify",
             get(handlers::audit_log::verify_audit_log),

@@ -169,7 +169,7 @@ spinner() {
 # signing (TOND_UNSIGNED_RELEASES) or TOND_ALLOW_UNSIGNED=1 is set. The check
 # needs only openssl (Ed25519 over the file's BLAKE2b-512 hash, which is what
 # minisign's default "ED" signatures are).
-TOND_RELEASE_PUBKEY=""
+TOND_RELEASE_PUBKEY="RWRyw6SNQq+I90HcxHS9ho+7FUE9drT12DfUN0W1vyS7nU3W6PZ0XeXL"
 TOND_UNSIGNED_RELEASES="v0.1.0"
 
 # verify_minisig FILE SIGFILE PUBKEY_B64 — succeeds when SIGFILE is a valid
@@ -251,7 +251,7 @@ is_bundled() {
 # Download latest release from GitHub
 download_release() {
     step "Downloading Tond release"
-    
+
     local arch
     arch="$(host_arch)"
     [[ -n "$arch" ]] || fatal "Unsupported architecture: $(uname -m). Tond supports x86_64 (amd64) and aarch64 (arm64)."
@@ -262,10 +262,10 @@ download_release() {
     [[ -n "$tag" ]] || fatal "Could not look up the latest Tond release"
     local release_url="https://github.com/tahayvr/tond/releases/download/${tag}/tond-linux-${arch}.tar.gz"
     local checksum_url="${release_url}.sha256"
-    
+
     info "Downloading tond-linux-${arch} ${tag} from GitHub..."
     curl -fsSL -o "${tmp_dir}/tond.tar.gz" "$release_url" || fatal "Failed to download release"
-    
+
     info "Verifying checksum..."
     curl -fsSL -o "${tmp_dir}/tond.tar.gz.sha256" "$checksum_url" || fatal "Failed to download checksum"
     # The .sha256 file contains "HASH  filename" — rewrite the filename to match our local path
@@ -286,7 +286,7 @@ download_release() {
 
     info "Extracting..."
     tar -xzf "${tmp_dir}/tond.tar.gz" -C "$tmp_dir" || fatal "Failed to extract archive"
-    
+
     # Find the extracted directory
     local extracted_dir=""
     if [[ -d "${tmp_dir}/tond-linux-${arch}" ]]; then
@@ -299,17 +299,17 @@ download_release() {
         # Try to find install.sh
         extracted_dir=$(dirname "$(find "$tmp_dir" -name "install.sh" -type f 2>/dev/null | head -1)")
     fi
-    
+
     if [[ -z "$extracted_dir" || ! -f "${extracted_dir}/install.sh" ]]; then
         fatal "Could not find extracted files"
     fi
-    
+
     # Copy files to script directory
     cp -r "${extracted_dir}/"* "$SCRIPT_DIR/" 2>/dev/null || true
-    
+
     # Cleanup
     rm -rf "$tmp_dir"
-    
+
     info "Download complete"
 }
 
@@ -477,17 +477,17 @@ check_prerequisites() {
         mark_warn "Preview domain: ${PREVIEW_DOMAIN} (needs a wildcard DNS record *.${PREVIEW_DOMAIN})"
     fi
     echo ""
-    
+
     # Root check
     if [[ $EUID -ne 0 ]]; then
         fatal "This script must be run as root. Try: curl -fsSL https://tond.io/install | sudo bash"
     fi
-    
+
     # OS check
     if [[ "$(uname -s)" != "Linux" ]]; then
         fatal "Tond only supports Linux servers. Detected: $(uname -s)"
     fi
-    
+
     # Ubuntu version check (recommended but not enforced)
     if [[ -f /etc/os-release ]]; then
         source /etc/os-release
@@ -503,13 +503,13 @@ check_prerequisites() {
                 fi
             fi
         fi
-        
+
         # Version check
         if [[ "$ID" == "ubuntu" && ! "$VERSION_ID" =~ ^(22|24)\. ]]; then
             warn "Ubuntu $VERSION_ID detected. Tond is tested on 22.04 and 24.04."
         fi
     fi
-    
+
     # Architecture check
     if [[ -z "$(host_arch)" ]]; then
         fatal "Unsupported architecture: $arch. Tond supports x86_64 (amd64) and aarch64 (arm64)."
@@ -517,7 +517,7 @@ check_prerequisites() {
     if [[ -f "${SCRIPT_DIR}/ARCH" && "$(cat "${SCRIPT_DIR}/ARCH")" != "$(host_arch)" ]]; then
         fatal "This bundle is for $(cat "${SCRIPT_DIR}/ARCH") but this server is $(host_arch). Use tond-linux-$(host_arch).tar.gz."
     fi
-    
+
     # Check ports
     if command -v ss &> /dev/null; then
         if ss -tlnp | grep -q ':80 '; then
@@ -527,7 +527,7 @@ check_prerequisites() {
             warn "Port 443 is already in use"
         fi
     fi
-    
+
     info "Prerequisites OK"
 }
 
@@ -537,15 +537,15 @@ check_prerequisites() {
 
 install_dependencies() {
     step "Installing system dependencies"
-    
+
     info "Updating package list..."
     apt-get update -qq > /dev/null 2>&1 &
     spinner $!
-    
+
     info "Installing required packages..."
     apt-get install -y -qq curl git ca-certificates gnupg openssl jq ufw > /dev/null 2>&1 &
     spinner $!
-    
+
     info "Dependencies installed"
 
     # Private-repo clones pass credentials through GIT_CONFIG_COUNT/KEY_n/VALUE_n
@@ -660,9 +660,40 @@ configure_docker_daemon() {
     fi
 }
 
+# Cap the systemd journal (tond-server, tond-proxy and everything else log
+# there) at 500 MB. A drop-in, so /etc/systemd/journald.conf stays untouched,
+# and only when no SystemMaxUse is configured anywhere yet: an operator's
+# choice always wins.
+JOURNALD_DROPIN_DIR="/etc/systemd/journald.conf.d"
+JOURNALD_DROPIN="${JOURNALD_DROPIN_DIR}/tond.conf"
+configure_journald() {
+    [[ -d /etc/systemd ]] || return 0
+    if [[ -f "$JOURNALD_DROPIN" ]]; then
+        return 0
+    fi
+    local existing
+    existing=$(grep -lsE '^[[:space:]]*SystemMaxUse[[:space:]]*=' \
+        /etc/systemd/journald.conf "${JOURNALD_DROPIN_DIR}"/*.conf 2>/dev/null | head -n1 || true)
+    if [[ -n "$existing" ]]; then
+        info "Journal size already capped in ${existing}; leaving it"
+        return 0
+    fi
+    mkdir -p "$JOURNALD_DROPIN_DIR"
+    printf '%s\n' \
+        '# Written by the Tond installer: keep the journal under 500 MB.' \
+        '# Delete this file or set SystemMaxUse elsewhere to change it.' \
+        '[Journal]' \
+        'SystemMaxUse=500M' > "$JOURNALD_DROPIN"
+    chmod 0644 "$JOURNALD_DROPIN"
+    if command -v systemctl > /dev/null && systemctl is-active --quiet systemd-journald; then
+        systemctl restart systemd-journald || warn "Could not restart systemd-journald; the cap applies after the next reboot"
+    fi
+    info "Capped the systemd journal at 500 MB (${JOURNALD_DROPIN})"
+}
+
 create_directories() {
     step "Creating directory structure"
-    
+
     mkdir -p "${BIN_DIR}" "${DATA_DIR}" "${DATA_DIR}/certs" "${DASHBOARD_DIR}"
     info "Created ${INSTALL_DIR}"
 }
@@ -731,7 +762,7 @@ secure_data_dir() {
     # the proxy's own state, handled below.
     find "$DATA_DIR" -mindepth 1 -maxdepth 1 \
         ! -name 'tond.db' ! -name 'tond.db-wal' ! -name 'tond.db-shm' \
-        ! -name certs ! -name acme_account.json ! -name proxy.sock \
+        ! -name certs ! -name acme_account.json ! -name proxy.sock ! -name access \
         -exec chmod go-rwx {} +
 
     # Pre-create the database so the proxy can open it on first start; an
@@ -751,6 +782,14 @@ secure_data_dir() {
     chown -R "$PROXY_USER":"$PROXY_USER" "${DATA_DIR}/certs"
     find "${DATA_DIR}/certs" -type d -exec chmod u=rwx,go=,g-s {} +
     find "${DATA_DIR}/certs" -type f -exec chmod 0600 {} +
+    # Opt-in per-app access logs: written by the proxy only (tond-server reads
+    # them as root and refuses symlinks / hard links, see access_logs.rs).
+    # The proxy owns this directory, so never follow a symlink it left there.
+    if [[ -L "${DATA_DIR}/access" ]]; then rm -f "${DATA_DIR}/access"; fi
+    mkdir -p "${DATA_DIR}/access"
+    chown -R "$PROXY_USER":"$PROXY_USER" "${DATA_DIR}/access"
+    chmod u=rwx,go=,g-s "${DATA_DIR}/access"
+    find "${DATA_DIR}/access" -type f -exec chmod 0600 {} +
     if [[ -e "${DATA_DIR}/acme_account.json" ]]; then
         chown "$PROXY_USER":"$PROXY_USER" "${DATA_DIR}/acme_account.json"
         chmod 0600 "${DATA_DIR}/acme_account.json"
@@ -800,30 +839,30 @@ ensure_secret_key() {
 
 install_binaries() {
     step "Installing Tond binaries"
-    
+
     # Check bundled files
     for bin in tond-server tond-proxy tond; do
         if [[ ! -f "${SCRIPT_DIR}/${bin}" ]]; then
             fatal "Missing binary: ${SCRIPT_DIR}/${bin}"
         fi
     done
-    
+
     if [[ ! -f "${SCRIPT_DIR}/dashboard/index.html" ]]; then
         fatal "Missing dashboard build at ${SCRIPT_DIR}/dashboard/index.html"
     fi
-    
+
     # Stop existing services if upgrading
     systemctl stop tond-server tond-proxy 2>/dev/null || true
-    
+
     # Copy binaries
     cp "${SCRIPT_DIR}/tond-server" "${BIN_DIR}/tond-server"
     cp "${SCRIPT_DIR}/tond-proxy"  "${BIN_DIR}/tond-proxy"
     cp "${SCRIPT_DIR}/tond"        "${BIN_DIR}/tond"
     chmod +x "${BIN_DIR}/tond-server" "${BIN_DIR}/tond-proxy" "${BIN_DIR}/tond"
-    
+
     # Install CLI to PATH
     cp "${BIN_DIR}/tond" /usr/local/bin/tond
-    
+
     # Copy update script if available
     if [[ -f "${SCRIPT_DIR}/update.sh" ]]; then
         cp "${SCRIPT_DIR}/update.sh" "${BIN_DIR}/update.sh"
@@ -843,41 +882,41 @@ install_binaries() {
 
 install_dashboard() {
     step "Installing dashboard"
-    
+
     # Remove old dashboard
     rm -rf "${DASHBOARD_DIR:?}/"*
-    
+
     # Copy new dashboard
     cp -r "${SCRIPT_DIR}/dashboard/." "${DASHBOARD_DIR}/"
-    
+
     info "Dashboard installed to ${DASHBOARD_DIR}"
 }
 
 install_services() {
     step "Installing systemd services"
-    
+
     # Copy service files
     cp "${SCRIPT_DIR}/tond-server.service" /etc/systemd/system/tond-server.service
     cp "${SCRIPT_DIR}/tond-proxy.service"  /etc/systemd/system/tond-proxy.service
     # Memory cap for image builds (docker build --cgroup-parent tondbuild.slice)
     cp "${SCRIPT_DIR}/tondbuild.slice"    /etc/systemd/system/tondbuild.slice
-    
+
     systemctl daemon-reload
-    
+
     info "Services installed"
 }
 
 start_services() {
     step "Starting Tond services"
-    
+
     systemctl enable tond-server tond-proxy > /dev/null 2>&1
     systemctl start tond-server
-    
+
     # Give the API server a moment to initialize
     sleep 2
-    
+
     systemctl start tond-proxy
-    
+
     # Wait for API to be ready
     info "Waiting for API to start..."
     local retries=30
@@ -887,7 +926,7 @@ start_services() {
         fi
         sleep 1
     done
-    
+
     if curl -sf http://localhost:3001/health > /dev/null 2>&1; then
         info "✓ API is ready"
     else
@@ -1164,9 +1203,9 @@ print_summary() {
 
 verify_installation() {
     step "Verifying installation"
-    
+
     local failed=false
-    
+
     # Check services
     for svc in tond-server tond-proxy; do
         if systemctl is-active --quiet "$svc"; then
@@ -1176,7 +1215,7 @@ verify_installation() {
             failed=true
         fi
     done
-    
+
     # Check health endpoint
     if curl -sf http://localhost:3001/health > /dev/null 2>&1; then
         info "  ✓ API health check passed"
@@ -1184,14 +1223,14 @@ verify_installation() {
         error "  ✗ API health check failed"
         failed=true
     fi
-    
+
     # Check CLI
     if command -v tond &> /dev/null; then
         info "  ✓ CLI is available"
     else
         warn "  ⚠ CLI not in PATH"
     fi
-    
+
     if [[ "$failed" == true ]]; then
         echo ""
         warn "Some services failed to start. Check the logs:"
@@ -1199,7 +1238,7 @@ verify_installation() {
         warn "  journalctl -u tond-proxy --no-pager -n 50"
         return 1
     fi
-    
+
     return 0
 }
 
@@ -1287,12 +1326,13 @@ main() {
         warn "Running in download mode (binaries not found)"
         download_release
     fi
-    
+
     # Run installation steps
     check_prerequisites
     install_dependencies
     install_docker
     configure_docker_daemon
+    configure_journald
     ensure_proxy_user
     ensure_terminal_user
     create_directories

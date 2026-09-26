@@ -1,46 +1,156 @@
-// handlers/alerts.rs — Alert rule CRUD + alert↔integration linking
+// handlers/alerts.rs — alert rules, live alerts, history, snooze, settings
 //
 // Routes:
-//   GET    /api/alerts              — list all alert rules
-//   GET    /api/alerts/{id}         — get a single alert rule
-//   POST   /api/alerts              — create a new alert rule
-//   PATCH  /api/alerts/{id}         — update an existing rule (partial)
-//   DELETE /api/alerts/{id}         — delete a rule
-//   GET    /api/alerts/{id}/integrations        — list linked integrations for a rule
-//   POST   /api/alerts/{id}/integrations        — link an integration to a rule
-//   DELETE /api/alerts/{id}/integrations/{int}  — unlink an integration from a rule
-//   POST   /api/alerts/{id}/test                 — send a test message to every channel
+//   GET    /api/alerts                          rules (metrics:read)
+//   POST   /api/alerts                          create a rule (settings:write)
+//   GET    /api/alerts/kinds                    rule kinds and whether their data exists
+//   GET    /api/alerts/active                   pending and firing alerts
+//   GET    /api/alerts/history                  episodes, filtered and paginated
+//   GET    /api/alerts/history/{id}             one episode with its deliveries
+//   POST   /api/alerts/history/{id}/acknowledge stop repeats (apps:control)
+//   GET    /api/alerts/settings                 global quiet hours
+//   PUT    /api/alerts/settings                 (settings:write)
+//   GET    /api/alerts/{id}                     one rule
+//   PATCH  /api/alerts/{id}                     change a rule (settings:write)
+//   DELETE /api/alerts/{id}                     delete a rule (settings:write)
+//   POST   /api/alerts/{id}/test                send a test to every channel
+//   POST   /api/alerts/{id}/snooze              mute a target or the rule (apps:control)
+//   POST   /api/alerts/{id}/unsnooze            (apps:control)
 //
-// A rule must always notify someone: creating one needs a channel or a webhook
-// URL, and removing the last channel (or clearing the webhook) is refused.
+// A rule must always notify someone: it needs at least one channel, and the
+// channel list can't be emptied.
+
+use std::collections::HashMap;
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
 };
+use serde::Deserialize;
 use tond_common::*;
 use uuid::Uuid;
 
+use crate::alerts::{evaluate, quiet, send_test_notifications};
 use crate::audit_log::{AuditEntry, record};
 use crate::{
-    alerts::{channel_count, send_test_notifications},
     auth::{Authz, RateLimit, scope},
     error::AppError,
-    secrets,
     state::AppState,
 };
 
-const NO_CHANNEL: &str =
-    "Choose at least one notification channel or add a webhook URL, so this rule notifies someone.";
+const NO_CHANNEL: &str = "Choose at least one notification channel, so this rule notifies someone.";
+const MAX_WINDOW_SECS: i64 = 24 * 3600;
+const MAX_FOR_SECS: i64 = 24 * 3600;
+const MIN_REPEAT_SECS: i64 = 300;
+const MAX_REPEAT_SECS: i64 = 7 * 86_400;
+const MAX_SNOOZE_MINUTES: i64 = 30 * 24 * 60;
 
-fn rule_response(rule: AlertRule) -> Result<AlertRuleResponse, AppError> {
-    let url = secrets::alert_webhook_url(&rule.webhook_url)?;
-    Ok(AlertRuleResponse::new(rule, &url))
+fn invalid(msg: impl Into<String>) -> AppError {
+    AppError(TondError::InvalidInput(msg.into()))
 }
 
-// ── List ──
+fn now_unix() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+fn rfc3339(ts: i64) -> String {
+    chrono::DateTime::from_timestamp(ts, 0)
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_default()
+}
+
+fn opt_rfc3339(ts: Option<i64>) -> Option<String> {
+    ts.map(rfc3339)
+}
+
+async fn fetch_rule(db: &sqlx::SqlitePool, id: &str) -> Result<AlertRule, AppError> {
+    sqlx::query_as::<_, AlertRule>("SELECT * FROM alert_rules WHERE id = ?")
+        .bind(id)
+        .fetch_optional(db)
+        .await?
+        .ok_or_else(|| AppError(TondError::NotFound(format!("Alert rule {id} not found"))))
+}
+
+/// Build responses for `rules` with a handful of grouped queries.
+async fn rule_responses(
+    db: &sqlx::SqlitePool,
+    rules: Vec<AlertRule>,
+) -> Result<Vec<AlertRuleResponse>, AppError> {
+    let links: Vec<(String, String)> =
+        sqlx::query_as("SELECT rule_id, integration_id FROM alert_rule_notifications")
+            .fetch_all(db)
+            .await?;
+    let mut by_rule: HashMap<String, Vec<String>> = HashMap::new();
+    for (rule, integration) in links {
+        by_rule.entry(rule).or_default().push(integration);
+    }
+    let counts: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT rule_id, state, COUNT(*) FROM alert_states
+         WHERE state IN ('pending', 'firing') GROUP BY rule_id, state",
+    )
+    .fetch_all(db)
+    .await?;
+    let last: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT rule_id, MAX(fired_at) FROM alert_history WHERE rule_id IS NOT NULL GROUP BY rule_id",
+    )
+    .fetch_all(db)
+    .await?;
+    let last: HashMap<String, i64> = last.into_iter().collect();
+    let apps: Vec<(String, String)> = sqlx::query_as("SELECT id, name FROM apps")
+        .fetch_all(db)
+        .await?;
+    let apps: HashMap<String, String> = apps.into_iter().collect();
+    let now = now_unix();
+
+    Ok(rules
+        .into_iter()
+        .map(|r| {
+            let count = |state: &str| {
+                counts
+                    .iter()
+                    .find(|(id, s, _)| id == &r.id && s == state)
+                    .map(|c| c.2)
+                    .unwrap_or(0)
+            };
+            let mut integration_ids = by_rule.remove(&r.id).unwrap_or_default();
+            integration_ids.sort();
+            AlertRuleResponse {
+                firing: count("firing"),
+                pending: count("pending"),
+                last_fired_at: last.get(&r.id).copied().map(rfc3339),
+                app_name: r.app_id.as_ref().and_then(|a| apps.get(a).cloned()),
+                snoozed_until: r.snoozed_until.filter(|t| *t > now).map(rfc3339),
+                integration_ids,
+                id: r.id,
+                name: r.name,
+                kind: r.kind,
+                app_id: r.app_id,
+                threshold: r.threshold,
+                window_secs: r.window_secs,
+                for_secs: r.for_secs,
+                severity: r.severity,
+                repeat_secs: r.repeat_secs,
+                enabled: r.enabled != 0,
+                created_at: r.created_at,
+                updated_at: r.updated_at,
+            }
+        })
+        .collect())
+}
+
+async fn one_response(
+    db: &sqlx::SqlitePool,
+    rule: AlertRule,
+) -> Result<AlertRuleResponse, AppError> {
+    rule_responses(db, vec![rule])
+        .await?
+        .pop()
+        .ok_or_else(|| AppError(TondError::Internal("rule response missing".to_string())))
+}
+
+// ── Rules ────────────────────────────────────────────────────────────────────
 
 pub async fn list_alerts(
     _rate: RateLimit,
@@ -48,18 +158,14 @@ pub async fn list_alerts(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     let rules =
-        sqlx::query_as::<_, AlertRule>("SELECT * FROM alert_rules ORDER BY created_at DESC")
+        sqlx::query_as::<_, AlertRule>("SELECT * FROM alert_rules ORDER BY name COLLATE NOCASE")
             .fetch_all(&state.db)
             .await?;
-
-    let mut resp: Vec<AlertRuleResponse> = Vec::with_capacity(rules.len());
-    for rule in rules {
-        resp.push(rule_response(rule)?);
-    }
-    Ok((StatusCode::OK, Json(ApiResponse::ok(resp))))
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(rule_responses(&state.db, rules).await?)),
+    ))
 }
-
-// ── Get single ──
 
 pub async fn get_alert(
     _rate: RateLimit,
@@ -67,47 +173,142 @@ pub async fn get_alert(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
-    let rule = sqlx::query_as::<_, AlertRule>("SELECT * FROM alert_rules WHERE id = ?")
-        .bind(&id)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or_else(|| AppError(TondError::NotFound(format!("Alert rule {id} not found"))))?;
-
-    Ok((StatusCode::OK, Json(ApiResponse::ok(rule_response(rule)?))))
+    let rule = fetch_rule(&state.db, &id).await?;
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(one_response(&state.db, rule).await?)),
+    ))
 }
 
-// ── Helpers ──
+/// Kinds whose data this server can't provide yet, with the reason. Every
+/// kind is available today (request metrics included); the hook stays for
+/// kinds that depend on optional data sources.
+fn unavailable_reason(_kind: &str) -> Option<String> {
+    None
+}
 
-fn validate_metric(metric: &str) -> Result<(), AppError> {
-    if !VALID_ALERT_METRICS.contains(&metric) {
-        return Err(AppError(TondError::InvalidInput(format!(
-            "metric must be one of: {}",
-            VALID_ALERT_METRICS.join(", ")
-        ))));
+pub async fn list_kinds(
+    _rate: RateLimit,
+    _auth: Authz<scope::MetricsRead>,
+    State(_state): State<AppState>,
+) -> Result<impl IntoResponse, AppError> {
+    let mut kinds = Vec::with_capacity(ALERT_KINDS.len());
+    for info in ALERT_KINDS {
+        let reason = unavailable_reason(info.kind);
+        kinds.push(AlertKindResponse {
+            info: *info,
+            available: reason.is_none(),
+            unavailable_reason: reason,
+        });
     }
-    Ok(())
+    Ok((StatusCode::OK, Json(ApiResponse::ok(kinds))))
 }
 
-fn validate_events(events: &[String]) -> Result<(), AppError> {
-    for event in events {
-        if !VALID_ALERT_EVENTS.contains(&event.as_str()) {
-            return Err(AppError(TondError::InvalidInput(format!(
-                "unknown event '{}'; valid events: {}",
-                event,
-                VALID_ALERT_EVENTS.join(", ")
-            ))));
+/// Checked rule settings, ready to store.
+struct RuleFields {
+    threshold: f64,
+    window_secs: i64,
+    for_secs: i64,
+    severity: String,
+    repeat_secs: i64,
+}
+
+fn check_fields(
+    info: &AlertKindInfo,
+    threshold: Option<f64>,
+    window_secs: Option<i64>,
+    for_secs: Option<i64>,
+    severity: Option<String>,
+    repeat_secs: Option<i64>,
+) -> Result<RuleFields, AppError> {
+    let threshold = match info.default_threshold {
+        None => 0.0,
+        Some(default) => {
+            let t = threshold.unwrap_or(default);
+            let ok = t.is_finite()
+                && match info.unit {
+                    "%" if info.kind == "cpu" => t > 0.0 && t <= 12_800.0,
+                    "%" => t > 0.0 && t <= 100.0,
+                    "restarts" => (1.0..=1000.0).contains(&t),
+                    _ => t > 0.0 && t <= 1_000_000.0,
+                };
+            if !ok {
+                return Err(invalid(match info.unit {
+                    "%" if info.kind == "cpu" => {
+                        "CPU threshold must be above 0% (100% is one full core).".to_string()
+                    }
+                    "%" => "Threshold must be between 0% and 100%.".to_string(),
+                    "restarts" => "Restarts must be between 1 and 1000.".to_string(),
+                    unit => format!("Threshold must be a positive number of {unit}."),
+                }));
+            }
+            t
+        }
+    };
+    let window_secs = match info.default_window_secs {
+        None => 0,
+        Some(default) => {
+            let w = window_secs.unwrap_or(default);
+            if !(60..=MAX_WINDOW_SECS).contains(&w) {
+                return Err(invalid("The window must be between 1 minute and 24 hours."));
+            }
+            w
+        }
+    };
+    let for_secs = for_secs.unwrap_or(info.default_for_secs);
+    if !(0..=MAX_FOR_SECS).contains(&for_secs) {
+        return Err(invalid("\"For\" must be between 0 and 24 hours."));
+    }
+    let severity = severity.unwrap_or_else(|| info.default_severity.to_string());
+    if !ALERT_SEVERITIES.contains(&severity.as_str()) {
+        return Err(invalid("Severity must be info, warning or critical."));
+    }
+    let repeat_secs = repeat_secs.unwrap_or(ALERT_DEFAULT_REPEAT_SECS);
+    if repeat_secs != 0 && !(MIN_REPEAT_SECS..=MAX_REPEAT_SECS).contains(&repeat_secs) {
+        return Err(invalid(
+            "Repeat must be off, or between 5 minutes and 7 days.",
+        ));
+    }
+    Ok(RuleFields {
+        threshold,
+        window_secs,
+        for_secs,
+        severity,
+        repeat_secs,
+    })
+}
+
+async fn check_channels(db: &sqlx::SqlitePool, ids: &[String]) -> Result<Vec<String>, AppError> {
+    let mut ids: Vec<String> = ids.iter().map(|s| s.trim().to_string()).collect();
+    ids.sort();
+    ids.dedup();
+    ids.retain(|s| !s.is_empty());
+    if ids.is_empty() {
+        return Err(invalid(NO_CHANNEL));
+    }
+    for id in &ids {
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM integrations WHERE id = ?)")
+                .bind(id)
+                .fetch_one(db)
+                .await?;
+        if !exists {
+            return Err(invalid(format!("Notification channel {id} doesn't exist.")));
         }
     }
-    Ok(())
+    Ok(ids)
 }
 
-fn events_to_json(events: &Option<Vec<String>>) -> Option<String> {
-    events
-        .as_ref()
-        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()))
+fn check_name(name: &str) -> Result<String, AppError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(invalid("Give the rule a name."));
+    }
+    if name.chars().count() > 100 {
+        return Err(invalid("Keep the name under 100 characters."));
+    }
+    Ok(name.to_string())
 }
-
-// ── Create ──
 
 pub async fn create_alert(
     _rate: RateLimit,
@@ -115,90 +316,85 @@ pub async fn create_alert(
     State(state): State<AppState>,
     Json(req): Json<CreateAlertRuleRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    // Validate metric if provided
-    if let Some(ref m) = req.metric {
-        validate_metric(m)?;
+    let name = check_name(&req.name)?;
+    let info = alert_kind(&req.kind).ok_or_else(|| {
+        invalid(format!(
+            "Unknown rule kind '{}'. Choose one of: {}.",
+            req.kind,
+            ALERT_KINDS
+                .iter()
+                .map(|k| k.kind)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    })?;
+    if let Some(reason) = unavailable_reason(info.kind) {
+        return Err(invalid(reason));
     }
-    // Validate events if provided
-    if let Some(ref evts) = req.events {
-        validate_events(evts)?;
-    }
-    // Must have at least one of metric or events
-    if req.metric.is_none() && req.events.as_ref().map(|e| e.is_empty()).unwrap_or(true) {
-        return Err(AppError(TondError::InvalidInput(
-            "alert rule must have at least one metric or one event subscription".to_string(),
-        )));
-    }
-
-    // Must notify someone
-    let webhook_url = req.webhook_url.trim().to_string();
-    let mut integration_ids = req.integration_ids.clone();
-    integration_ids.sort();
-    integration_ids.dedup();
-    if webhook_url.is_empty() && integration_ids.is_empty() {
-        return Err(AppError(TondError::InvalidInput(NO_CHANNEL.to_string())));
-    }
-    for integration_id in &integration_ids {
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM integrations WHERE id = ?)")
-                .bind(integration_id)
-                .fetch_one(&state.db)
-                .await?;
+    let app_id = match info.scope {
+        AlertScope::App => req.app_id.filter(|a| !a.trim().is_empty()),
+        _ => None,
+    };
+    if let Some(app) = &app_id {
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM apps WHERE id = ?)")
+            .bind(app)
+            .fetch_one(&state.db)
+            .await?;
         if !exists {
-            return Err(AppError(TondError::InvalidInput(format!(
-                "Notification channel {integration_id} doesn't exist"
-            ))));
+            return Err(invalid(format!("App {app} doesn't exist.")));
         }
     }
+    let f = check_fields(
+        info,
+        req.threshold,
+        req.window_secs,
+        req.for_secs,
+        req.severity,
+        req.repeat_secs,
+    )?;
+    let channels = check_channels(&state.db, &req.integration_ids).await?;
 
     let id = Uuid::new_v4().to_string();
-    let threshold = req.threshold.unwrap_or(0.0);
-    let events_json = events_to_json(&req.events);
-
     let mut tx = state.db.begin().await?;
     sqlx::query(
-        "INSERT INTO alert_rules (id, app_id, name, metric, threshold, webhook_url, events)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO alert_rules (id, name, kind, app_id, threshold, window_secs, for_secs,
+            severity, repeat_secs)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
-    .bind(&req.app_id)
-    .bind(&req.name)
-    .bind(&req.metric)
-    .bind(threshold)
-    .bind(secrets::seal_alert_webhook_url(&webhook_url)?)
-    .bind(&events_json)
+    .bind(&name)
+    .bind(info.kind)
+    .bind(&app_id)
+    .bind(f.threshold)
+    .bind(f.window_secs)
+    .bind(f.for_secs)
+    .bind(&f.severity)
+    .bind(f.repeat_secs)
     .execute(&mut *tx)
     .await?;
-    for integration_id in &integration_ids {
-        sqlx::query(
-            "INSERT INTO alert_rule_notifications (id, rule_id, integration_id) VALUES (?, ?, ?)",
-        )
-        .bind(Uuid::new_v4().to_string())
-        .bind(&id)
-        .bind(integration_id)
-        .execute(&mut *tx)
-        .await?;
+    for integration_id in &channels {
+        sqlx::query("INSERT INTO alert_rule_notifications (rule_id, integration_id) VALUES (?, ?)")
+            .bind(&id)
+            .bind(integration_id)
+            .execute(&mut *tx)
+            .await?;
     }
     tx.commit().await?;
 
-    let rule = sqlx::query_as::<_, AlertRule>("SELECT * FROM alert_rules WHERE id = ?")
-        .bind(&id)
-        .fetch_one(&state.db)
-        .await?;
-
+    let rule = fetch_rule(&state.db, &id).await?;
     record(
         &state.db,
         &auth.audit_actor(),
-        AuditEntry::new("alert_create").resource("alert", &rule.id, &rule.name),
+        AuditEntry::new("alert_create")
+            .resource("alert", &rule.id, &rule.name)
+            .detail(format!("kind={}", rule.kind)),
     )
     .await;
     Ok((
         StatusCode::CREATED,
-        Json(ApiResponse::ok(rule_response(rule)?)),
+        Json(ApiResponse::ok(one_response(&state.db, rule).await?)),
     ))
 }
-
-// ── Update (PATCH — partial) ──
 
 pub async fn update_alert(
     _rate: RateLimit,
@@ -207,64 +403,79 @@ pub async fn update_alert(
     Path(id): Path<String>,
     Json(req): Json<UpdateAlertRuleRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    // Ensure rule exists
-    let rule = sqlx::query_as::<_, AlertRule>("SELECT * FROM alert_rules WHERE id = ?")
-        .bind(&id)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or_else(|| AppError(TondError::NotFound(format!("Alert rule {id} not found"))))?;
-
-    let name = req.name.unwrap_or(rule.name);
-    let metric = match req.metric {
-        Some(m) => {
-            validate_metric(&m)?;
-            Some(m)
-        }
-        None => rule.metric,
+    let rule = fetch_rule(&state.db, &id).await?;
+    let info = alert_kind(&rule.kind).ok_or_else(|| {
+        invalid(format!(
+            "Rule kind '{}' is not supported any more.",
+            rule.kind
+        ))
+    })?;
+    let name = match &req.name {
+        Some(n) => check_name(n)?,
+        None => rule.name.clone(),
     };
-    let threshold = req.threshold.unwrap_or(rule.threshold);
-    // Write-only: absent keeps the saved URL, "" clears it.
-    let webhook_url = match req.webhook_url {
-        Some(url) => secrets::seal_alert_webhook_url(url.trim())?,
-        None => rule.webhook_url,
+    let f = check_fields(
+        info,
+        req.threshold.or(Some(rule.threshold)),
+        req.window_secs.or(Some(rule.window_secs)),
+        req.for_secs.or(Some(rule.for_secs)),
+        req.severity.clone().or(Some(rule.severity.clone())),
+        req.repeat_secs.or(Some(rule.repeat_secs)),
+    )?;
+    let enabled = req.enabled.map(i64::from).unwrap_or(rule.enabled);
+    let snoozed_until = match req.snoozed_until.as_deref().map(str::trim) {
+        None => rule.snoozed_until,
+        Some("") => None,
+        Some(s) => Some(
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|_| invalid("snoozed_until must be an RFC 3339 time."))?
+                .timestamp(),
+        ),
     };
-    // Sealed URLs are empty exactly when no webhook is set.
-    if channel_count(&state.db, &id, &webhook_url).await == 0 {
-        return Err(AppError(TondError::InvalidInput(NO_CHANNEL.to_string())));
-    }
-    let enabled: i64 = req
-        .enabled
-        .map(|b| if b { 1 } else { 0 })
-        .unwrap_or(rule.enabled);
-    let events_json = match req.events {
-        Some(ref evts) => {
-            validate_events(evts)?;
-            Some(serde_json::to_string(evts).unwrap_or_else(|_| "[]".to_string()))
-        }
-        None => rule.events,
+    let channels = match &req.integration_ids {
+        Some(ids) => Some(check_channels(&state.db, ids).await?),
+        None => None,
     };
 
+    let mut tx = state.db.begin().await?;
     sqlx::query(
         "UPDATE alert_rules
-         SET name = ?, metric = ?, threshold = ?, webhook_url = ?, enabled = ?, events = ?,
-             updated_at = datetime('now')
+         SET name = ?, threshold = ?, window_secs = ?, for_secs = ?, severity = ?,
+             repeat_secs = ?, enabled = ?, snoozed_until = ?, updated_at = datetime('now')
          WHERE id = ?",
     )
     .bind(&name)
-    .bind(&metric)
-    .bind(threshold)
-    .bind(&webhook_url)
+    .bind(f.threshold)
+    .bind(f.window_secs)
+    .bind(f.for_secs)
+    .bind(&f.severity)
+    .bind(f.repeat_secs)
     .bind(enabled)
-    .bind(&events_json)
+    .bind(snoozed_until)
     .bind(&id)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await?;
+    if let Some(channels) = &channels {
+        sqlx::query("DELETE FROM alert_rule_notifications WHERE rule_id = ?")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        for integration_id in channels {
+            sqlx::query(
+                "INSERT INTO alert_rule_notifications (rule_id, integration_id) VALUES (?, ?)",
+            )
+            .bind(&id)
+            .bind(integration_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    tx.commit().await?;
+    if rule.enabled != 0 && enabled == 0 {
+        evaluate::close_rule(&state.db, &id, now_unix()).await?;
+    }
 
-    let updated = sqlx::query_as::<_, AlertRule>("SELECT * FROM alert_rules WHERE id = ?")
-        .bind(&id)
-        .fetch_one(&state.db)
-        .await?;
-
+    let updated = fetch_rule(&state.db, &id).await?;
     record(
         &state.db,
         &auth.audit_actor(),
@@ -273,11 +484,9 @@ pub async fn update_alert(
     .await;
     Ok((
         StatusCode::OK,
-        Json(ApiResponse::ok(rule_response(updated)?)),
+        Json(ApiResponse::ok(one_response(&state.db, updated).await?)),
     ))
 }
-
-// ── Delete ──
 
 pub async fn delete_alert(
     _rate: RateLimit,
@@ -285,28 +494,16 @@ pub async fn delete_alert(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
-    // Cascade-delete alert_rule_notifications rows first
-    sqlx::query("DELETE FROM alert_rule_notifications WHERE rule_id = ?")
+    let rule = fetch_rule(&state.db, &id).await?;
+    evaluate::close_rule(&state.db, &id, now_unix()).await?;
+    sqlx::query("DELETE FROM alert_rules WHERE id = ?")
         .bind(&id)
         .execute(&state.db)
         .await?;
-
-    let deleted = sqlx::query("DELETE FROM alert_rules WHERE id = ?")
-        .bind(&id)
-        .execute(&state.db)
-        .await?
-        .rows_affected();
-
-    if deleted == 0 {
-        return Err(AppError(TondError::NotFound(format!(
-            "Alert rule {id} not found"
-        ))));
-    }
-
     record(
         &state.db,
         &auth.audit_actor(),
-        AuditEntry::new("alert_delete").resource("alert", &id, &id),
+        AuditEntry::new("alert_delete").resource("alert", &id, &rule.name),
     )
     .await;
     Ok((
@@ -315,364 +512,523 @@ pub async fn delete_alert(
     ))
 }
 
-// ── List integrations linked to an alert rule ──
-
-pub async fn list_alert_integrations(
-    _rate: RateLimit,
-    _auth: Authz<scope::MetricsRead>,
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<impl IntoResponse, AppError> {
-    // Ensure the rule exists
-    let _rule = sqlx::query_as::<_, AlertRule>("SELECT * FROM alert_rules WHERE id = ?")
-        .bind(&id)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or_else(|| AppError(TondError::NotFound(format!("Alert rule {id} not found"))))?;
-
-    let links = sqlx::query_as::<_, AlertIntegrationLink>(
-        "SELECT arn.id, arn.rule_id, arn.integration_id,
-                i.name AS integration_name, i.kind AS integration_kind,
-                arn.created_at
-         FROM alert_rule_notifications arn
-         JOIN integrations i ON i.id = arn.integration_id
-         WHERE arn.rule_id = ?
-         ORDER BY arn.created_at DESC",
-    )
-    .bind(&id)
-    .fetch_all(&state.db)
-    .await?;
-
-    Ok((StatusCode::OK, Json(ApiResponse::ok(links))))
-}
-
-// ── Link an integration to an alert rule ──
-
-pub async fn link_alert_integration(
-    _rate: RateLimit,
-    _auth: Authz<scope::SettingsWrite>,
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(req): Json<LinkAlertIntegrationRequest>,
-) -> Result<impl IntoResponse, AppError> {
-    // Ensure rule exists
-    let exists_rule: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM alert_rules WHERE id = ?)")
-            .bind(&id)
-            .fetch_one(&state.db)
-            .await?;
-    if !exists_rule {
-        return Err(AppError(TondError::NotFound(format!(
-            "Alert rule {id} not found"
-        ))));
-    }
-
-    // Ensure integration exists
-    let exists_int: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM integrations WHERE id = ?)")
-            .bind(&req.integration_id)
-            .fetch_one(&state.db)
-            .await?;
-    if !exists_int {
-        return Err(AppError(TondError::NotFound(format!(
-            "Integration {} not found",
-            req.integration_id
-        ))));
-    }
-
-    // Prevent duplicate links
-    let already: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM alert_rule_notifications WHERE rule_id = ? AND integration_id = ?)",
-    )
-    .bind(&id)
-    .bind(&req.integration_id)
-    .fetch_one(&state.db)
-    .await?;
-    if already {
-        return Err(AppError(TondError::InvalidInput(
-            "Integration already linked to this rule".to_string(),
-        )));
-    }
-
-    let link_id = uuid::Uuid::new_v4().to_string();
-    sqlx::query(
-        "INSERT INTO alert_rule_notifications (id, rule_id, integration_id) VALUES (?, ?, ?)",
-    )
-    .bind(&link_id)
-    .bind(&id)
-    .bind(&req.integration_id)
-    .execute(&state.db)
-    .await?;
-
-    Ok((
-        StatusCode::CREATED,
-        Json(ApiResponse::ok(
-            serde_json::json!({ "id": link_id, "rule_id": id, "integration_id": req.integration_id }),
-        )),
-    ))
-}
-
-// ── Unlink an integration from an alert rule ──
-
-pub async fn unlink_alert_integration(
-    _rate: RateLimit,
-    _auth: Authz<scope::SettingsWrite>,
-    State(state): State<AppState>,
-    Path((rule_id, integration_id)): Path<(String, String)>,
-) -> Result<impl IntoResponse, AppError> {
-    let webhook_url: Option<String> =
-        sqlx::query_scalar("SELECT webhook_url FROM alert_rules WHERE id = ?")
-            .bind(&rule_id)
-            .fetch_optional(&state.db)
-            .await?;
-    let Some(webhook_url) = webhook_url else {
-        return Err(AppError(TondError::NotFound(format!(
-            "Alert rule {rule_id} not found"
-        ))));
-    };
-    if channel_count(&state.db, &rule_id, &webhook_url).await <= 1 {
-        return Err(AppError(TondError::InvalidInput(
-            "This is the rule's only notification channel. Add another channel or a webhook URL first, or delete the rule."
-                .to_string(),
-        )));
-    }
-
-    let deleted = sqlx::query(
-        "DELETE FROM alert_rule_notifications WHERE rule_id = ? AND integration_id = ?",
-    )
-    .bind(&rule_id)
-    .bind(&integration_id)
-    .execute(&state.db)
-    .await?
-    .rows_affected();
-
-    if deleted == 0 {
-        return Err(AppError(TondError::NotFound("Link not found".to_string())));
-    }
-
-    Ok((
-        StatusCode::OK,
-        Json(ApiResponse::ok(
-            serde_json::json!({ "unlinked": true, "rule_id": rule_id, "integration_id": integration_id }),
-        )),
-    ))
-}
-
-// ── Send a test notification ──
-
 pub async fn test_alert(
     _rate: RateLimit,
     _auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
-    let rule = sqlx::query_as::<_, AlertRule>("SELECT * FROM alert_rules WHERE id = ?")
-        .bind(&id)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or_else(|| AppError(TondError::NotFound(format!("Alert rule {id} not found"))))?;
-
+    let rule = fetch_rule(&state.db, &id).await?;
     let results = send_test_notifications(&state, &rule).await;
     if results.is_empty() {
-        return Err(AppError(TondError::InvalidInput(NO_CHANNEL.to_string())));
+        return Err(invalid(NO_CHANNEL));
     }
     Ok((StatusCode::OK, Json(ApiResponse::ok(results))))
 }
 
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
+// ── Live alerts ──────────────────────────────────────────────────────────────
 
-    use axum::{body::to_bytes, response::Response};
-    use bollard::{API_DEFAULT_VERSION, Docker};
-    use sqlx::SqlitePool;
-    use tokio::sync::RwLock;
+#[derive(sqlx::FromRow)]
+struct ActiveRow {
+    rule_id: String,
+    rule_name: String,
+    kind: String,
+    severity: String,
+    threshold: f64,
+    rule_snoozed_until: Option<i64>,
+    target: String,
+    target_label: String,
+    state: String,
+    since: i64,
+    value: Option<f64>,
+    episode_id: Option<String>,
+    snoozed_until: Option<i64>,
+    fired_at: Option<i64>,
+    acknowledged_at: Option<i64>,
+    acknowledged_by: Option<String>,
+    failed_deliveries: i64,
+}
 
-    use super::*;
-    use crate::{
-        alerts::ChannelTestResult,
-        auth::{Principal, RateLimiter},
-    };
-
-    async fn test_state() -> AppState {
-        let db = SqlitePool::connect("sqlite::memory:")
-            .await
-            .unwrap_or_else(|err| panic!("failed to open in-memory SQLite: {err}"));
-        crate::db::migrate(&db)
-            .await
-            .unwrap_or_else(|err| panic!("failed to migrate: {err}"));
-        AppState {
-            db,
-            docker: Docker::connect_with_http("http://127.0.0.1:2375", 5, API_DEFAULT_VERSION)
-                .unwrap_or_else(|err| panic!("failed to construct Docker client: {err}")),
-            rate_limiter: RateLimiter::new(60, 10.0),
-            settings: Arc::new(RwLock::new(ServerSettings::default())),
-        }
-    }
-
-    async fn body_json(response: Response) -> serde_json::Value {
-        let bytes = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap_or_else(|err| panic!("failed to read body: {err}"));
-        serde_json::from_slice(&bytes).unwrap_or_else(|err| panic!("invalid JSON: {err}"))
-    }
-
-    async fn seed_integration(state: &AppState, id: &str, enabled: bool) {
-        sqlx::query("INSERT INTO integrations (id, name, kind, config, enabled) VALUES (?, ?, 'slack', '{\"webhook_url\":\"https://hooks.invalid/x\"}', ?)")
-            .bind(id)
-            .bind(format!("channel {id}"))
-            .bind(i64::from(enabled))
-            .execute(&state.db)
-            .await
-            .unwrap_or_else(|err| panic!("failed to seed integration: {err}"));
-    }
-
-    fn request(webhook_url: &str, integration_ids: &[&str]) -> CreateAlertRuleRequest {
-        serde_json::from_value(serde_json::json!({
-            "name": "deploys",
-            "events": ["deployment_failure"],
-            "webhook_url": webhook_url,
-            "integration_ids": integration_ids,
-        }))
-        .unwrap_or_else(|err| panic!("request should deserialize: {err}"))
-    }
-
-    async fn create(state: &AppState, req: CreateAlertRuleRequest) -> Result<String, AppError> {
-        let response = create_alert(
-            RateLimit,
-            Authz::unchecked(Principal::test_user(Role::Admin)),
-            State(state.clone()),
-            Json(req),
-        )
-        .await?
-        .into_response();
-        let body = body_json(response).await;
-        Ok(body["data"]["id"].as_str().unwrap_or_default().to_string())
-    }
-
-    #[tokio::test]
-    async fn a_rule_without_any_channel_is_refused() {
-        let state = test_state().await;
-        let err = create(&state, request("  ", &[]))
-            .await
-            .err()
-            .unwrap_or_else(|| panic!("a rule that notifies nobody must be refused"));
-        assert!(
-            matches!(err.0, TondError::InvalidInput(ref msg) if msg.contains("notification channel"))
-        );
-
-        // An unknown channel id is refused too.
-        assert!(create(&state, request("", &["missing"])).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn channels_are_linked_on_creation_and_the_last_one_cannot_be_removed() {
-        let state = test_state().await;
-        seed_integration(&state, "int-a", true).await;
-        seed_integration(&state, "int-b", true).await;
-        let id = create(&state, request("", &["int-a", "int-b", "int-a"]))
-            .await
-            .unwrap_or_else(|err| panic!("rule with channels should be created: {}", err.0));
-        assert_eq!(crate::alerts::channel_count(&state.db, &id, "").await, 2);
-
-        assert!(
-            unlink_alert_integration(
-                RateLimit,
-                Authz::unchecked(Principal::test_user(Role::Admin)),
-                State(state.clone()),
-                Path((id.clone(), "int-a".to_string()))
-            )
-            .await
-            .is_ok(),
-            "removing one of two channels is fine"
-        );
-        let err = unlink_alert_integration(
-            RateLimit,
-            Authz::unchecked(Principal::test_user(Role::Admin)),
-            State(state.clone()),
-            Path((id.clone(), "int-b".to_string())),
-        )
-        .await
-        .err()
-        .unwrap_or_else(|| panic!("removing the only channel must be refused"));
-        assert!(matches!(err.0, TondError::InvalidInput(_)));
-
-        // Clearing the webhook of a rule with no other channel is refused too.
-        let webhook_only = create(&state, request("https://hooks.invalid/a", &[]))
-            .await
-            .unwrap_or_else(|err| panic!("webhook-only rule should be created: {}", err.0));
-        let patch: UpdateAlertRuleRequest =
-            serde_json::from_value(serde_json::json!({ "webhook_url": "" }))
-                .unwrap_or_else(|err| panic!("patch should deserialize: {err}"));
-        assert!(
-            update_alert(
-                RateLimit,
-                Authz::unchecked(Principal::test_user(Role::Admin)),
-                State(state.clone()),
-                Path(webhook_only),
-                Json(patch)
-            )
-            .await
-            .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn send_test_reports_each_channel() {
-        let state = test_state().await;
-        // A local webhook receiver that answers 200.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap_or_else(|err| panic!("failed to bind test listener: {err}"));
-        let addr = listener
-            .local_addr()
-            .unwrap_or_else(|err| panic!("no local addr: {err}"));
-        tokio::spawn(async move {
-            let app = axum::Router::new().route("/hook", axum::routing::post(|| async { "ok" }));
-            let _ = axum::serve(listener, app).await;
-        });
-        seed_integration(&state, "int-off", false).await;
-        let id = create(
-            &state,
-            request(&format!("http://{addr}/hook"), &["int-off"]),
-        )
-        .await
-        .unwrap_or_else(|err| panic!("rule should be created: {}", err.0));
-
-        let response = test_alert(
-            RateLimit,
-            Authz::unchecked(Principal::test_user(Role::Admin)),
-            State(state.clone()),
-            Path(id.clone()),
-        )
-        .await
-        .unwrap_or_else(|err| panic!("test send should succeed: {}", err.0))
-        .into_response();
-        let body = body_json(response).await;
-        let results: Vec<ChannelTestResult> = serde_json::from_value(body["data"].clone())
-            .unwrap_or_else(|err| panic!("results should decode: {err}"));
-        assert_eq!(results.len(), 2, "{results:?}");
-        assert_eq!((results[0].kind.as_str(), results[0].ok), ("webhook", true));
-        assert_eq!(results[1].kind, "slack");
-        assert!(
-            !results[1].ok,
-            "a switched-off channel is reported, not silently skipped"
-        );
-        assert!(
-            results[1]
-                .error
-                .as_deref()
-                .unwrap_or_default()
-                .contains("switched off")
-        );
-
-        // Firing a test never marks the rule as fired.
-        let fired: Option<String> =
-            sqlx::query_scalar("SELECT last_fired_at FROM alert_rules WHERE id = ?")
-                .bind(&id)
-                .fetch_one(&state.db)
-                .await
-                .unwrap_or_else(|err| panic!("failed to read rule: {err}"));
-        assert_eq!(fired, None);
+fn severity_order(s: &str) -> i32 {
+    match s {
+        "critical" => 0,
+        "warning" => 1,
+        _ => 2,
     }
 }
+
+/// Pending and firing alerts: firing first, then by severity and age.
+pub async fn active_alerts(db: &sqlx::SqlitePool) -> Result<Vec<ActiveAlert>, AppError> {
+    let rows: Vec<ActiveRow> = sqlx::query_as(
+        "SELECT s.rule_id, r.name AS rule_name, r.kind, r.severity, r.threshold,
+                r.snoozed_until AS rule_snoozed_until, s.target, s.target_label, s.state,
+                s.since, s.value, s.episode_id, s.snoozed_until, h.fired_at,
+                h.acknowledged_at, h.acknowledged_by,
+                (SELECT COUNT(*) FROM alert_deliveries d
+                 WHERE d.episode_id = s.episode_id AND d.status = 'failed') AS failed_deliveries
+         FROM alert_states s
+         JOIN alert_rules r ON r.id = s.rule_id
+         LEFT JOIN alert_history h ON h.id = s.episode_id
+         WHERE s.state IN ('pending', 'firing') AND r.enabled = 1",
+    )
+    .fetch_all(db)
+    .await?;
+    let now = now_unix();
+    let mut out: Vec<ActiveAlert> = rows
+        .into_iter()
+        .map(|r| {
+            let info = alert_kind(&r.kind);
+            let until_resolved = r.snoozed_until == Some(ALERT_SNOOZE_UNTIL_RESOLVED);
+            let snoozed_until = [r.rule_snoozed_until, r.snoozed_until]
+                .into_iter()
+                .flatten()
+                .filter(|t| *t > now && *t != ALERT_SNOOZE_UNTIL_RESOLVED)
+                .max();
+            ActiveAlert {
+                value: evaluate::live_value(&r.rule_id, &r.target).or(r.value),
+                app_id: r.target.strip_prefix("app:").map(str::to_string),
+                unit: info.map(|i| i.unit).unwrap_or("").to_string(),
+                comparison: info.map(|i| i.comparison).unwrap_or(AlertComparison::None),
+                since: rfc3339(r.since),
+                fired_at: opt_rfc3339(r.fired_at),
+                acknowledged_at: opt_rfc3339(r.acknowledged_at),
+                acknowledged_by: r.acknowledged_by,
+                snoozed_until: snoozed_until.map(rfc3339),
+                snoozed_until_resolved: until_resolved,
+                failed_deliveries: r.failed_deliveries,
+                rule_id: r.rule_id,
+                rule_name: r.rule_name,
+                kind: r.kind,
+                severity: r.severity,
+                target: r.target,
+                target_label: r.target_label,
+                state: r.state,
+                threshold: r.threshold,
+                episode_id: r.episode_id,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        (a.state != "firing", severity_order(&a.severity), &a.since).cmp(&(
+            b.state != "firing",
+            severity_order(&b.severity),
+            &b.since,
+        ))
+    });
+    Ok(out)
+}
+
+pub async fn list_active(
+    _rate: RateLimit,
+    _auth: Authz<scope::MetricsRead>,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, AppError> {
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(active_alerts(&state.db).await?)),
+    ))
+}
+
+// ── History ──────────────────────────────────────────────────────────────────
+
+#[derive(sqlx::FromRow)]
+struct EpisodeRow {
+    id: String,
+    rule_id: Option<String>,
+    rule_name: String,
+    kind: String,
+    severity: String,
+    target: String,
+    target_label: String,
+    app_id: Option<String>,
+    threshold: f64,
+    value: Option<f64>,
+    last_value: Option<f64>,
+    pending_since: i64,
+    fired_at: i64,
+    resolved_at: Option<i64>,
+    acknowledged_at: Option<i64>,
+    acknowledged_by: Option<String>,
+    notifications_sent: i64,
+    failed_deliveries: i64,
+}
+
+impl From<EpisodeRow> for AlertEpisode {
+    fn from(r: EpisodeRow) -> Self {
+        let info = alert_kind(&r.kind);
+        AlertEpisode {
+            unit: info.map(|i| i.unit).unwrap_or("").to_string(),
+            comparison: info.map(|i| i.comparison).unwrap_or(AlertComparison::None),
+            state: if r.resolved_at.is_some() {
+                "resolved"
+            } else {
+                "firing"
+            }
+            .to_string(),
+            pending_since: rfc3339(r.pending_since),
+            fired_at: rfc3339(r.fired_at),
+            resolved_at: opt_rfc3339(r.resolved_at),
+            acknowledged_at: opt_rfc3339(r.acknowledged_at),
+            id: r.id,
+            rule_id: r.rule_id,
+            rule_name: r.rule_name,
+            kind: r.kind,
+            severity: r.severity,
+            target: r.target,
+            target_label: r.target_label,
+            app_id: r.app_id,
+            threshold: r.threshold,
+            value: r.value,
+            last_value: r.last_value,
+            acknowledged_by: r.acknowledged_by,
+            notifications_sent: r.notifications_sent,
+            failed_deliveries: r.failed_deliveries,
+        }
+    }
+}
+
+const EPISODE_COLUMNS: &str = "h.id, h.rule_id, h.rule_name, h.kind, h.severity, h.target,
+    h.target_label, h.app_id, h.threshold, h.value, h.last_value, h.pending_since, h.fired_at,
+    h.resolved_at, h.acknowledged_at, h.acknowledged_by,
+    (SELECT COUNT(*) FROM alert_deliveries d WHERE d.episode_id = h.id AND d.status = 'sent')
+        AS notifications_sent,
+    (SELECT COUNT(*) FROM alert_deliveries d WHERE d.episode_id = h.id AND d.status = 'failed')
+        AS failed_deliveries";
+
+pub async fn list_history(
+    _rate: RateLimit,
+    _auth: Authz<scope::MetricsRead>,
+    State(state): State<AppState>,
+    Query(q): Query<AlertHistoryQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let per_page = q.per_page.unwrap_or(25).clamp(1, 100);
+    let page = q.page.unwrap_or(1).max(1);
+    let state_filter = match q.state.as_deref() {
+        None | Some("") => "",
+        Some("firing") => " AND h.resolved_at IS NULL",
+        Some("resolved") => " AND h.resolved_at IS NOT NULL",
+        Some(_) => return Err(invalid("state must be firing or resolved.")),
+    };
+    let rule = q.rule_id.filter(|s| !s.is_empty());
+    let app = q.app_id.filter(|s| !s.is_empty());
+    let filter = format!(
+        "WHERE (?1 IS NULL OR h.rule_id = ?1) AND (?2 IS NULL OR h.app_id = ?2){state_filter}"
+    );
+    let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM alert_history h {filter}"
+    )))
+    .bind(&rule)
+    .bind(&app)
+    .fetch_one(&state.db)
+    .await?;
+    let rows: Vec<EpisodeRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {EPISODE_COLUMNS} FROM alert_history h {filter}
+         ORDER BY h.fired_at DESC LIMIT ?3 OFFSET ?4"
+    )))
+    .bind(&rule)
+    .bind(&app)
+    .bind(per_page)
+    .bind((page - 1) * per_page)
+    .fetch_all(&state.db)
+    .await?;
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(AlertHistoryPage {
+            episodes: rows.into_iter().map(AlertEpisode::from).collect(),
+            total,
+        })),
+    ))
+}
+
+#[derive(sqlx::FromRow)]
+struct DeliveryRow {
+    id: String,
+    episode_id: String,
+    integration_id: String,
+    integration_name: String,
+    integration_kind: String,
+    event: String,
+    status: String,
+    attempts: i64,
+    deferred: i64,
+    last_error: Option<String>,
+    next_attempt_at: i64,
+    sent_at: Option<i64>,
+    created_at: i64,
+}
+
+pub async fn get_episode(
+    _rate: RateLimit,
+    _auth: Authz<scope::MetricsRead>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let row: EpisodeRow = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {EPISODE_COLUMNS} FROM alert_history h WHERE h.id = ?"
+    )))
+    .bind(&id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError(TondError::NotFound(format!("Alert {id} not found"))))?;
+    let deliveries: Vec<DeliveryRow> = sqlx::query_as(
+        "SELECT d.id, d.episode_id, d.integration_id, i.name AS integration_name,
+                i.kind AS integration_kind, d.event, d.status, d.attempts, d.deferred,
+                d.last_error, d.next_attempt_at, d.sent_at, d.created_at
+         FROM alert_deliveries d JOIN integrations i ON i.id = d.integration_id
+         WHERE d.episode_id = ? ORDER BY d.created_at, i.name",
+    )
+    .bind(&id)
+    .fetch_all(&state.db)
+    .await?;
+    let deliveries = deliveries
+        .into_iter()
+        .map(|d| AlertDelivery {
+            next_attempt_at: (d.status == "pending").then(|| rfc3339(d.next_attempt_at)),
+            sent_at: opt_rfc3339(d.sent_at),
+            created_at: rfc3339(d.created_at),
+            deferred: d.deferred != 0,
+            id: d.id,
+            episode_id: d.episode_id,
+            integration_id: d.integration_id,
+            integration_name: d.integration_name,
+            integration_kind: d.integration_kind,
+            event: d.event,
+            status: d.status,
+            attempts: d.attempts,
+            last_error: d.last_error,
+        })
+        .collect();
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(AlertEpisodeDetail {
+            episode: row.into(),
+            deliveries,
+        })),
+    ))
+}
+
+pub async fn acknowledge(
+    _rate: RateLimit,
+    auth: Authz<scope::AppsControl>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let actor = auth.audit_actor();
+    let updated = sqlx::query(
+        "UPDATE alert_history SET acknowledged_at = ?, acknowledged_by = ?
+         WHERE id = ? AND resolved_at IS NULL",
+    )
+    .bind(now_unix())
+    .bind(&actor.label)
+    .bind(&id)
+    .execute(&state.db)
+    .await?
+    .rows_affected();
+    if updated == 0 {
+        return Err(AppError(TondError::NotFound(
+            "That alert isn't firing any more.".to_string(),
+        )));
+    }
+    let name: String = sqlx::query_scalar("SELECT rule_name FROM alert_history WHERE id = ?")
+        .bind(&id)
+        .fetch_one(&state.db)
+        .await?;
+    record(
+        &state.db,
+        &actor,
+        AuditEntry::new("alert_acknowledge").resource("alert", &id, &name),
+    )
+    .await;
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(serde_json::json!({ "acknowledged": id }))),
+    ))
+}
+
+// ── Snooze ───────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct SnoozeBody {
+    /// Target to mute ("app:<id>", "host", …); None mutes the whole rule
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(flatten)]
+    pub snooze: SnoozeAlertRequest,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UnsnoozeBody {
+    #[serde(default)]
+    pub target: Option<String>,
+}
+
+pub async fn snooze(
+    _rate: RateLimit,
+    auth: Authz<scope::AppsControl>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<SnoozeBody>,
+) -> Result<impl IntoResponse, AppError> {
+    let rule = fetch_rule(&state.db, &id).await?;
+    let now = now_unix();
+    let until = if body.snooze.until_resolved {
+        if body.target.is_none() {
+            return Err(invalid(
+                "Snooze a single alert until it resolves, not a whole rule.",
+            ));
+        }
+        ALERT_SNOOZE_UNTIL_RESOLVED
+    } else {
+        let minutes = body
+            .snooze
+            .minutes
+            .ok_or_else(|| invalid("Say how long to snooze for, or until it resolves."))?;
+        if !(1..=MAX_SNOOZE_MINUTES).contains(&minutes) {
+            return Err(invalid("Snooze for between 1 minute and 30 days."));
+        }
+        now + minutes * 60
+    };
+    match &body.target {
+        None => {
+            sqlx::query("UPDATE alert_rules SET snoozed_until = ? WHERE id = ?")
+                .bind(until)
+                .bind(&id)
+                .execute(&state.db)
+                .await?;
+        }
+        Some(target) => {
+            let updated = sqlx::query(
+                "UPDATE alert_states SET snoozed_until = ? WHERE rule_id = ? AND target = ?",
+            )
+            .bind(until)
+            .bind(&id)
+            .bind(target)
+            .execute(&state.db)
+            .await?
+            .rows_affected();
+            if updated == 0 {
+                if until == ALERT_SNOOZE_UNTIL_RESOLVED {
+                    return Err(AppError(TondError::NotFound(
+                        "That alert isn't pending or firing any more.".to_string(),
+                    )));
+                }
+                sqlx::query(
+                    "INSERT INTO alert_states (rule_id, target, target_label, state, since, snoozed_until)
+                     VALUES (?, ?, ?, 'inactive', ?, ?)",
+                )
+                .bind(&id)
+                .bind(target)
+                .bind(target)
+                .bind(now)
+                .bind(until)
+                .execute(&state.db)
+                .await?;
+            }
+        }
+    }
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("alert_snooze")
+            .resource("alert", &id, &rule.name)
+            .detail(match (&body.target, until) {
+                (Some(t), ALERT_SNOOZE_UNTIL_RESOLVED) => format!("{t} until resolved"),
+                (Some(t), u) => format!("{t} until {}", rfc3339(u)),
+                (None, u) => format!("rule until {}", rfc3339(u)),
+            }),
+    )
+    .await;
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(serde_json::json!({
+            "snoozed_until": (until != ALERT_SNOOZE_UNTIL_RESOLVED).then(|| rfc3339(until)),
+            "until_resolved": until == ALERT_SNOOZE_UNTIL_RESOLVED,
+        }))),
+    ))
+}
+
+pub async fn unsnooze(
+    _rate: RateLimit,
+    auth: Authz<scope::AppsControl>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<UnsnoozeBody>,
+) -> Result<impl IntoResponse, AppError> {
+    let rule = fetch_rule(&state.db, &id).await?;
+    match &body.target {
+        None => {
+            sqlx::query("UPDATE alert_rules SET snoozed_until = NULL WHERE id = ?")
+                .bind(&id)
+                .execute(&state.db)
+                .await?;
+        }
+        Some(target) => {
+            sqlx::query(
+                "DELETE FROM alert_states WHERE rule_id = ? AND target = ? AND state = 'inactive'",
+            )
+            .bind(&id)
+            .bind(target)
+            .execute(&state.db)
+            .await?;
+            sqlx::query(
+                "UPDATE alert_states SET snoozed_until = NULL WHERE rule_id = ? AND target = ?",
+            )
+            .bind(&id)
+            .bind(target)
+            .execute(&state.db)
+            .await?;
+        }
+    }
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("alert_unsnooze").resource("alert", &id, &rule.name),
+    )
+    .await;
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(serde_json::json!({ "unsnoozed": true }))),
+    ))
+}
+
+// ── Settings (global quiet hours) ────────────────────────────────────────────
+
+pub async fn get_settings(
+    _rate: RateLimit,
+    _auth: Authz<scope::MetricsRead>,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, AppError> {
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(AlertSettings {
+            quiet_hours: quiet::load_global(&state.db).await,
+        })),
+    ))
+}
+
+pub async fn put_settings(
+    _rate: RateLimit,
+    auth: Authz<scope::SettingsWrite>,
+    State(state): State<AppState>,
+    Json(req): Json<AlertSettings>,
+) -> Result<impl IntoResponse, AppError> {
+    quiet::validate(&req.quiet_hours).map_err(invalid)?;
+    quiet::save_global(&state.db, &req.quiet_hours).await?;
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("alert_settings_update").detail(if req.quiet_hours.enabled {
+            format!(
+                "quiet hours {}–{} {}",
+                req.quiet_hours.start, req.quiet_hours.end, req.quiet_hours.timezone
+            )
+        } else {
+            "quiet hours off".to_string()
+        }),
+    )
+    .await;
+    Ok((StatusCode::OK, Json(ApiResponse::ok(req))))
+}
+
+#[cfg(test)]
+mod tests;

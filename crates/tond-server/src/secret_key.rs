@@ -3,7 +3,7 @@
 // Every secret tond-server stores is encrypted with one format: app env vars
 // and preview overrides, project and cron env, app webhook secrets, managed
 // database passwords and connection-string overrides, GitHub App credentials,
-// GitLab PATs, notification integration secrets, alert webhook URLs, registry
+// GitLab PATs, notification integration secrets, registry
 // passwords, storage provider secret keys and users' TOTP secrets:
 //
 //   "v1." base64(nonce || AES-256-GCM ciphertext)
@@ -70,10 +70,14 @@ pub enum Purpose {
     GithubWebhookSecret,
     GithubPrivateKey,
     /// Secret fields inside integrations.config (bot tokens, webhook URLs,
-    /// SMTP passwords)
+    /// SMTP passwords, ntfy topics/tokens, Pushover/Gotify tokens, webhook
+    /// signing secrets; see INTEGRATION_SECRET_FIELDS)
     IntegrationSecret,
-    /// alert_rules.webhook_url (Slack/Discord-style URLs are bearer secrets)
-    AlertWebhookUrl,
+    /// heartbeat_config.url_enc (a heartbeat URL is a bearer secret: anyone
+    /// holding it can report the server healthy)
+    HeartbeatUrl,
+    /// audit_shipping.webhook_secret (HMAC key for shipped audit entries)
+    AuditWebhookSecret,
 }
 
 impl Purpose {
@@ -96,7 +100,8 @@ impl Purpose {
             Purpose::GithubWebhookSecret => b"tond:github_apps.webhook_secret",
             Purpose::GithubPrivateKey => b"tond:github_apps.private_key",
             Purpose::IntegrationSecret => b"tond:integrations.config",
-            Purpose::AlertWebhookUrl => b"tond:alert_rules.webhook_url",
+            Purpose::HeartbeatUrl => b"tond:heartbeat_config.url_enc",
+            Purpose::AuditWebhookSecret => b"tond:audit_shipping.webhook_secret",
         }
     }
 }
@@ -455,6 +460,7 @@ pub async fn reencrypt_stored_secrets(
 /// counts as one value). Key rotation walks this list: a new secret column
 /// must be added here.
 pub const SCALAR_SECRET_COLUMNS: &[(&str, &str, Purpose)] = &[
+    ("heartbeat_config", "url_enc", Purpose::HeartbeatUrl),
     (
         "registry_credentials",
         "password_enc",
@@ -486,7 +492,11 @@ pub const SCALAR_SECRET_COLUMNS: &[(&str, &str, Purpose)] = &[
         Purpose::GithubWebhookSecret,
     ),
     ("github_apps", "private_key", Purpose::GithubPrivateKey),
-    ("alert_rules", "webhook_url", Purpose::AlertWebhookUrl),
+    (
+        "audit_shipping",
+        "webhook_secret",
+        Purpose::AuditWebhookSecret,
+    ),
 ];
 
 /// Secrets stored as string fields inside a `config` JSON column.
@@ -741,11 +751,17 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap_or_else(|err| panic!("insert integration: {err}"));
-        sqlx::query("INSERT INTO alert_rules (id, name, metric, threshold, webhook_url) VALUES ('r1', 'cpu', 'cpu', 80, ?)")
-            .bind(enc(Purpose::AlertWebhookUrl, "https://hooks.example.com/x"))
-            .execute(&pool)
-            .await
-            .unwrap_or_else(|err| panic!("insert alert rule: {err}"));
+        let webhook = serde_json::json!({
+            "webhook_url": enc(Purpose::IntegrationSecret, "https://hooks.example.com/x"),
+            "signing_secret": enc(Purpose::IntegrationSecret, "sig"),
+        });
+        sqlx::query(
+            "INSERT INTO integrations (id, name, kind, config) VALUES ('i2', 'hook', 'webhook', ?)",
+        )
+        .bind(webhook.to_string())
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|err| panic!("insert webhook integration: {err}"));
 
         let report = reencrypt_stored_secrets(&pool, &new, &old)
             .await
@@ -753,7 +769,7 @@ mod tests {
         assert_eq!(
             report,
             RotationReport {
-                reencrypted: 9,
+                reencrypted: 10,
                 undecryptable: 0
             },
             "every encrypted column must be rotated; the empty preview map is skipped"

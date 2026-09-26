@@ -5,10 +5,18 @@
 
 import type {
 	App,
+	ActiveAlert,
+	AlertDelivery,
+	AlertEpisode,
+	AlertKindInfo,
 	AlertRule,
+	AlertSettings,
 	AuditLogEntry,
 	BackupConfig,
 	Certificate,
+	RetentionSettings,
+	AuditShipping,
+	AppEvent,
 	CronJob,
 	CronJobRun,
 	Deployment,
@@ -25,6 +33,9 @@ import type {
 	TemplateCatalogEntry,
 	MetricsRange,
 	MetricsResponse,
+	RequestMetricsResponse,
+	RequestRange,
+	TrafficOverview,
 	OnboardingStatus,
 	PreviewDeployment,
 	Project,
@@ -619,9 +630,219 @@ export const MOCK_DATABASE_LINKS: { database_id: string; app_id: string }[] = [
 	{ database_id: 'db_redis1', app_id: 'app_pending' }
 ];
 
+// ── Retention ──────────────────────────────────────────────────────────────
+
+const MB = 1024 * 1024;
+
+export const MOCK_RETENTION: RetentionSettings = {
+	fields: [
+		{
+			key: 'retention_deploy_logs_deployments',
+			value: 30,
+			default: 30,
+			min: 1,
+			max: 500,
+			unit: 'deploys'
+		},
+		{ key: 'retention_deploy_logs_days', value: 90, default: 90, min: 1, max: 365, unit: 'days' },
+		{
+			key: 'retention_deployments_per_app',
+			value: 50,
+			default: 50,
+			min: 30,
+			max: 1000,
+			unit: 'deploys'
+		},
+		{
+			key: 'retention_cron_runs_per_job',
+			value: 100,
+			default: 100,
+			min: 10,
+			max: 1000,
+			unit: 'runs'
+		},
+		{ key: 'retention_cron_runs_days', value: 30, default: 30, min: 1, max: 365, unit: 'days' },
+		{ key: 'retention_audit_log_days', value: 180, default: 180, min: 30, max: 3650, unit: 'days' },
+		{ key: 'retention_app_events_days', value: 90, default: 90, min: 7, max: 365, unit: 'days' },
+		{
+			key: 'retention_alert_history_days',
+			value: 90,
+			default: 90,
+			min: 7,
+			max: 365,
+			unit: 'days'
+		},
+		{ key: 'retention_uptime_days', value: 90, default: 90, min: 7, max: 365, unit: 'days' },
+		{
+			key: 'retention_request_metrics_days',
+			value: 90,
+			default: 90,
+			min: 7,
+			max: 365,
+			unit: 'days'
+		},
+		{
+			key: 'retention_host_history_days',
+			value: 365,
+			default: 365,
+			min: 30,
+			max: 1095,
+			unit: 'days'
+		}
+	],
+	database: {
+		file_bytes: 38.4 * MB,
+		wal_bytes: 4.1 * MB,
+		free_bytes: 1.2 * MB,
+		tables: [
+			{ name: 'deploy_logs', bytes: 14.2 * MB },
+			{ name: 'metrics_1h', bytes: 7.9 * MB },
+			{ name: 'metrics_5m', bytes: 5.1 * MB },
+			{ name: 'audit_log', bytes: 3.6 * MB },
+			{ name: 'metrics_raw', bytes: 2.8 * MB },
+			{ name: 'cron_job_runs', bytes: 1.9 * MB },
+			{ name: 'deployments', bytes: 0.9 * MB },
+			{ name: 'metric_events', bytes: 0.3 * MB },
+			{ name: 'apps', bytes: 0.1 * MB },
+			{ name: 'sessions', bytes: 0.05 * MB }
+		],
+		measured_at: new Date().toISOString()
+	}
+};
+
+// ── Audit log shipping ─────────────────────────────────────────────────────
+
+export const MOCK_AUDIT_SHIPPING: AuditShipping = {
+	syslog: {
+		enabled: true,
+		host: 'logs.example.net',
+		port: 6514,
+		tls: true,
+		status: {
+			shipped_seq: 1284,
+			pending: 0,
+			failures: 0,
+			last_attempt_at: new Date(Date.now() - 4 * 60_000).toISOString(),
+			last_success_at: new Date(Date.now() - 4 * 60_000).toISOString(),
+			last_error: null,
+			next_attempt_at: null,
+			dropped: 0
+		}
+	},
+	webhook: {
+		enabled: false,
+		url: '',
+		has_secret: false,
+		status: {
+			shipped_seq: 0,
+			pending: 1284,
+			failures: 0,
+			last_attempt_at: null,
+			last_success_at: null,
+			last_error: null,
+			next_attempt_at: null,
+			dropped: 0
+		}
+	},
+	latest_seq: 1284
+};
+
+// ── App events ─────────────────────────────────────────────────────────────
+
+const hoursAgo = (h: number) => new Date(Date.now() - h * 3_600_000).toISOString();
+
+export function makeMockAppEvents(appId: string): AppEvent[] {
+	const events: AppEvent[] = [
+		{
+			at: hoursAgo(0.3),
+			kind: 'deploy_succeeded',
+			severity: 'success',
+			title: 'Deploy succeeded in 1 min 12 s',
+			detail: 'a1b2c3d Fix login redirect',
+			actor: 'dev@example.com',
+			deployment_id: 'dep_001'
+		},
+		{
+			at: hoursAgo(2),
+			kind: 'resources_changed',
+			severity: 'info',
+			title: 'Resource limits changed',
+			detail: 'memory=512MiB cpu=1',
+			actor: 'dev@example.com',
+			deployment_id: null
+		},
+		{
+			at: hoursAgo(5),
+			kind: 'oom',
+			severity: 'danger',
+			title: 'Killed: out of memory',
+			detail: 'exit code 137 (killed by the kernel: out of memory)',
+			actor: null,
+			deployment_id: null
+		},
+		{
+			at: hoursAgo(4.9),
+			kind: 'alert_fired',
+			severity: 'danger',
+			title: 'Alert fired: Out of memory',
+			detail: 'severity critical',
+			actor: null,
+			deployment_id: null
+		},
+		{
+			at: hoursAgo(5.1),
+			kind: 'restart',
+			severity: 'warning',
+			title: 'Container restarted',
+			detail: 'exit code 137',
+			actor: null,
+			deployment_id: null
+		},
+		{
+			at: hoursAgo(26),
+			kind: 'deploy_failed',
+			severity: 'danger',
+			title: 'Deploy failed',
+			detail: 'build failed: npm ERR! missing script: build',
+			actor: 'github push',
+			deployment_id: 'dep_002'
+		},
+		{
+			at: hoursAgo(49),
+			kind: 'cert_issued',
+			severity: 'success',
+			title: 'HTTPS certificate issued for api.example.com',
+			detail: null,
+			actor: null,
+			deployment_id: null
+		},
+		{
+			at: hoursAgo(50),
+			kind: 'domain_changed',
+			severity: 'info',
+			title: 'Domain changed',
+			detail: 'domain=api.example.com',
+			actor: 'dev@example.com',
+			deployment_id: null
+		},
+		{
+			at: hoursAgo(72),
+			kind: 'control',
+			severity: 'info',
+			title: 'Restarted',
+			detail: null,
+			actor: 'ops-token',
+			deployment_id: null
+		}
+	];
+	return appId === 'app_running' ? events : events.slice(4);
+}
+
 // ── Certificates ───────────────────────────────────────────────────────────
 
 const minutesFromNow = (m: number) => new Date(Date.now() + m * 60_000).toISOString();
+
+const daysFromNow = (d: number) => new Date(Date.now() + d * 86_400_000).toISOString();
 
 export const MOCK_CERTIFICATES: Certificate[] = [
 	{
@@ -629,12 +850,16 @@ export const MOCK_CERTIFICATES: Certificate[] = [
 		domain: 'api.example.com',
 		cert_type: 'acme',
 		status: 'active',
-		issued_at: '2026-08-01T00:00:00Z',
-		expires_at: '2026-10-30T00:00:00Z',
+		issued_at: daysFromNow(-24),
+		expires_at: daysFromNow(66),
 		last_error: null,
-		last_attempt_at: '2026-08-01T00:00:00Z',
+		last_attempt_at: daysFromNow(-24),
 		next_retry_at: null,
-		failure_count: 0
+		failure_count: 0,
+		issuer: "Let's Encrypt R11",
+		issuer_kind: 'letsencrypt',
+		last_renewed_at: daysFromNow(-24),
+		serves: { kind: 'app', app_id: 'app_running', app_name: 'api-service' }
 	},
 	{
 		id: 'cert-002',
@@ -647,7 +872,11 @@ export const MOCK_CERTIFICATES: Certificate[] = [
 			"DNS for app.example.com points to 1.2.3.4, expected 5.6.7.8. Update the domain's A/AAAA record to this server.",
 		last_attempt_at: minutesFromNow(-4),
 		next_retry_at: minutesFromNow(12),
-		failure_count: 4
+		failure_count: 4,
+		issuer: null,
+		issuer_kind: 'unknown',
+		last_renewed_at: null,
+		serves: { kind: 'app', app_id: 'app_stopped', app_name: 'web-frontend' }
 	},
 	{
 		id: 'cert-003',
@@ -660,7 +889,66 @@ export const MOCK_CERTIFICATES: Certificate[] = [
 			'polling order ready: order failed: 403 urn:ietf:params:acme:error:unauthorized: Invalid response from http://dash.example.com/.well-known/acme-challenge/abc: 404',
 		last_attempt_at: minutesFromNow(-1),
 		next_retry_at: minutesFromNow(1),
-		failure_count: 1
+		failure_count: 1,
+		issuer: null,
+		issuer_kind: 'unknown',
+		last_renewed_at: null,
+		serves: { kind: 'dashboard' }
+	},
+	{
+		id: 'cert-004',
+		domain: 'shop.example.com',
+		cert_type: 'acme',
+		status: 'active',
+		issued_at: daysFromNow(-80),
+		expires_at: daysFromNow(10),
+		last_error:
+			'polling order ready: order failed: urn:ietf:params:acme:error:connection: Timeout during connect (likely firewall problem)',
+		last_attempt_at: minutesFromNow(-90),
+		next_retry_at: minutesFromNow(150),
+		failure_count: 6,
+		issuer: "Let's Encrypt R10",
+		issuer_kind: 'letsencrypt',
+		last_renewed_at: daysFromNow(-80),
+		serves: { kind: 'app', app_id: 'app_running', app_name: 'api-service' }
+	},
+	{
+		id: 'cert-005',
+		domain: 'a1b2c3-api-service.example-previews.com',
+		cert_type: 'acme',
+		status: 'active',
+		issued_at: daysFromNow(-2),
+		expires_at: daysFromNow(88),
+		last_error: null,
+		last_attempt_at: daysFromNow(-2),
+		next_retry_at: null,
+		failure_count: 0,
+		issuer: "(STAGING) Let's Encrypt (STAGING) Riddling Rhubarb R12",
+		issuer_kind: 'letsencrypt_staging',
+		last_renewed_at: daysFromNow(-2),
+		serves: {
+			kind: 'preview',
+			app_id: 'app_running',
+			app_name: 'api-service',
+			preview_id: 'prev_1',
+			pr_number: 42
+		}
+	},
+	{
+		id: 'cert-006',
+		domain: 'old.example.com',
+		cert_type: 'acme',
+		status: 'active',
+		issued_at: daysFromNow(-50),
+		expires_at: daysFromNow(40),
+		last_error: null,
+		last_attempt_at: daysFromNow(-50),
+		next_retry_at: null,
+		failure_count: 0,
+		issuer: "Let's Encrypt R11",
+		issuer_kind: 'letsencrypt',
+		last_renewed_at: daysFromNow(-50),
+		serves: { kind: 'unused' }
 	}
 ];
 
@@ -782,6 +1070,237 @@ export function makeMockMetrics(range: string, empty = false): MetricsResponse {
 			pids: 14
 		}
 	};
+}
+
+// ── Request metrics (tond-proxy traffic) ───────────────────────────────────
+
+const REQUEST_SPAN: Record<RequestRange, number> = {
+	'1h': 3600,
+	'6h': 6 * 3600,
+	'24h': 86_400,
+	'7d': 7 * 86_400,
+	'30d': 30 * 86_400,
+	'90d': 90 * 86_400
+};
+const REQUEST_STEP: Record<RequestRange, number> = {
+	'1h': 60,
+	'6h': 60,
+	'24h': 180,
+	'7d': 3600,
+	'30d': 7200,
+	'90d': 18_000
+};
+
+/** Interpolated percentile of a latency around `base` ms. */
+function latency(base: number, wave: number, q: number): number {
+	return Math.round((base * (1 + wave * 0.3) * q + Math.random() * base * 0.2) * 10) / 10;
+}
+
+/**
+ * Traffic with a daily wave, a burst of 5xx after a deploy two thirds in,
+ * and a restart. `scale` sets the requests per second; `empty` is an app
+ * without traffic.
+ */
+export function makeMockRequestMetrics(
+	range: string,
+	{ empty = false, scale = 4, withDeploys = true } = {}
+): RequestMetricsResponse {
+	const r: RequestRange = (Object.keys(REQUEST_SPAN) as RequestRange[]).includes(
+		range as RequestRange
+	)
+		? (range as RequestRange)
+		: '24h';
+	const step = REQUEST_STEP[r];
+	const to = Math.floor(Date.now() / 1000);
+	const from = Math.floor((to - REQUEST_SPAN[r]) / step) * step;
+	const n = Math.floor((to - from) / step);
+	const series: RequestMetricsResponse['series'] = {
+		t: [],
+		rps: [],
+		rps_1xx: [],
+		rps_2xx: [],
+		rps_3xx: [],
+		rps_4xx: [],
+		rps_5xx: [],
+		err_pct: [],
+		p50: [],
+		p95: [],
+		p99: [],
+		bytes_in: [],
+		bytes_out: []
+	};
+	const incidentAt = Math.floor(n * 0.66);
+	let requests = 0;
+	let s2 = 0;
+	let s3 = 0;
+	let s4 = 0;
+	let s5 = 0;
+	let bytesOut = 0;
+	let bytesIn = 0;
+	for (let i = 0; i <= n; i++) {
+		const t = from + i * step;
+		series.t.push(t);
+		if (empty) {
+			for (const k of ['rps', 'rps_1xx', 'rps_2xx', 'rps_3xx', 'rps_4xx', 'rps_5xx'] as const)
+				series[k].push(0);
+			series.err_pct.push(null);
+			series.p50.push(null);
+			series.p95.push(null);
+			series.p99.push(null);
+			series.bytes_in.push(0);
+			series.bytes_out.push(0);
+			continue;
+		}
+		const wave = Math.sin((t / 86_400) * Math.PI * 2) * 0.5 + 0.5;
+		const total = Math.max(0.05, scale * (0.4 + wave) + Math.random() * scale * 0.3);
+		const incident = i >= incidentAt && i < incidentAt + Math.max(1, Math.round(900 / step));
+		const e5 = incident ? total * 0.18 : total * 0.002;
+		const e4 = total * 0.04;
+		const e3 = total * 0.08;
+		const ok = total - e5 - e4 - e3;
+		const round = (v: number) => Math.round(v * 100) / 100;
+		series.rps.push(round(total));
+		series.rps_1xx.push(0);
+		series.rps_2xx.push(round(ok));
+		series.rps_3xx.push(round(e3));
+		series.rps_4xx.push(round(e4));
+		series.rps_5xx.push(round(e5));
+		series.err_pct.push(round((e5 / total) * 100));
+		const base = incident ? 90 : 24;
+		series.p50.push(latency(base, wave, 1));
+		series.p95.push(latency(base, wave, 3.2));
+		series.p99.push(latency(base, wave, 7));
+		series.bytes_in.push(Math.round(total * 420));
+		series.bytes_out.push(Math.round(total * 18_000));
+		requests += total * step;
+		s2 += ok * step;
+		s3 += e3 * step;
+		s4 += e4 * step;
+		s5 += e5 * step;
+		bytesIn += total * 420 * step;
+		bytesOut += total * 18_000 * step;
+	}
+	const incidentT = from + incidentAt * step;
+	const markers: RequestMetricsResponse['markers'] =
+		empty || !withDeploys
+			? []
+			: [
+					{
+						t: from + Math.floor(n * 0.2) * step,
+						kind: 'deploy',
+						detail: 'succeeded',
+						deployment_id: 'dep-1'
+					},
+					{ t: incidentT, kind: 'deploy', detail: 'succeeded', deployment_id: 'dep-2' },
+					{ t: incidentT + 600, kind: 'restart', detail: 'exit code 1', deployment_id: null }
+				];
+	const R = Math.round(requests);
+	return {
+		range: r,
+		step,
+		from,
+		to,
+		series,
+		summary: {
+			requests: R,
+			rps: Math.round((requests / (to - from)) * 100) / 100,
+			s1xx: 0,
+			s2xx: Math.round(s2),
+			s3xx: Math.round(s3),
+			s4xx: Math.round(s4),
+			s5xx: Math.round(s5),
+			s502: Math.round(s5 * 0.7),
+			s504: Math.round(s5 * 0.1),
+			err_pct: R ? Math.round((s5 / requests) * 10_000) / 100 : null,
+			p50: empty ? null : 26.4,
+			p95: empty ? null : 88.1,
+			p99: empty ? null : 212.5,
+			upstream_p50: empty ? null : 23.9,
+			upstream_p95: empty ? null : 81.3,
+			upstream_p99: empty ? null : 204.2,
+			bytes_in: Math.round(bytesIn),
+			bytes_out: Math.round(bytesOut)
+		},
+		current: empty
+			? null
+			: {
+					t: to,
+					secs: 60,
+					rps: series.rps.at(-1) ?? 0,
+					err_pct: series.err_pct.at(-1) ?? null,
+					p95: series.p95.at(-1) ?? null
+				},
+		markers,
+		proxy_connected: true
+	};
+}
+
+/** Server-wide traffic for the home page tile. */
+export function makeMockTrafficOverview(range = '24h'): TrafficOverview {
+	const running = MOCK_APPS.filter((a) => a.status === 'running' || a.status === 'unhealthy');
+	const busiest = running.map((a, i) => {
+		const requests = Math.round(180_000 / (i + 1));
+		const s5xx = i === 1 ? 1_420 : i === 0 ? 12 : 0;
+		return {
+			id: a.id,
+			name: a.name,
+			requests,
+			rps: Math.round((requests / 86_400) * 100) / 100,
+			s4xx: Math.round(requests * 0.03),
+			s5xx,
+			err_pct: Math.round((s5xx / requests) * 10_000) / 100,
+			p95: 40 + i * 35,
+			bytes_out: requests * 18_000
+		};
+	});
+	const total = busiest.reduce((sum, a) => sum + a.requests, 0) + 4_210;
+	const s5xx = busiest.reduce((sum, a) => sum + a.s5xx, 0);
+	return {
+		range: range as RequestRange,
+		from: Math.floor(Date.now() / 1000) - 86_400,
+		to: Math.floor(Date.now() / 1000),
+		total: {
+			requests: total,
+			rps: Math.round((total / 86_400) * 100) / 100,
+			s1xx: 0,
+			s2xx: total - s5xx - 9_000,
+			s3xx: 3_000,
+			s4xx: 6_000,
+			s5xx,
+			s502: s5xx,
+			s504: 0,
+			err_pct: Math.round((s5xx / total) * 10_000) / 100,
+			p50: 21.3,
+			p95: 74.9,
+			p99: 190.2,
+			upstream_p50: 19.8,
+			upstream_p95: 70.1,
+			upstream_p99: 182.4,
+			bytes_in: total * 400,
+			bytes_out: total * 18_000
+		},
+		unknown_requests: 4_210,
+		busiest,
+		errors: busiest.filter((a) => a.s5xx > 0).sort((a, b) => b.s5xx - a.s5xx),
+		proxy_connected: true
+	};
+}
+
+/** Access log lines in tond-proxy's format, oldest first. */
+export function makeMockAccessLog(count = 300): string[] {
+	const paths = ['/', '/api/cart', '/api/products', '/login', '/assets/app.js', '/favicon.ico'];
+	const statuses = [200, 200, 200, 200, 304, 301, 404, 200, 500, 200];
+	const now = Date.now();
+	return Array.from({ length: count }, (_, i) => {
+		const t = new Date(now - (count - i) * 7_000).toISOString();
+		const path = paths[i % paths.length];
+		const status = statuses[i % statuses.length];
+		const ms = (4 + ((i * 37) % 180) + (status >= 500 ? 400 : 0)).toFixed(1);
+		const bytes = status === 304 ? 0 : 400 + ((i * 131) % 24_000);
+		const ip = `203.0.113.${(i * 17) % 250}`;
+		const method = path.startsWith('/api/cart') && i % 3 === 0 ? 'POST' : 'GET';
+		return `${t} ${method} ${path} ${status} ${ms}ms ${bytes} ${ip}`;
+	});
 }
 
 // ── Deployments ────────────────────────────────────────────────────────────
@@ -1208,52 +1727,501 @@ export const MOCK_PROJECT_PREVIEWS: Record<string, ProjectPreview[]> = {
 	proj_2: []
 };
 
-// ── Alert Rules ────────────────────────────────────────────────────────────
+// ── Alerts ─────────────────────────────────────────────────────────────────
 
-export const MOCK_ALERT_RULES: AlertRule[] = [
+/** Mirrors tond_common::ALERT_KINDS (request metrics not collected in the mock). */
+export const MOCK_ALERT_KINDS: AlertKindInfo[] = [
 	{
-		id: 'alert_1',
-		app_id: 'app_running',
-		name: 'High CPU on api-service',
-		metric: 'cpu',
-		threshold: 80,
-		has_webhook_url: true,
-		webhook_host: 'hooks.example.com',
-		enabled: true,
-		events: [],
-		last_fired_at: '2025-03-06T04:12:00.000Z',
-		created_at: '2025-01-20T00:00:00.000Z',
-		updated_at: '2025-03-06T04:12:00.000Z'
+		kind: 'app_down',
+		label: 'App down',
+		description:
+			"The app is not running (it crashed or failed to start), or its public URL fails the uptime check. Apps you stopped don't count.",
+		scope: 'app',
+		unit: '',
+		comparison: 'none',
+		default_threshold: null,
+		default_window_secs: null,
+		default_for_secs: 120,
+		default_severity: 'critical',
+		available: true,
+		unavailable_reason: null
 	},
 	{
-		id: 'alert_2',
-		app_id: null,
-		name: 'Global Memory Usage',
-		metric: 'memory',
-		threshold: 85,
-		has_webhook_url: true,
-		webhook_host: 'hooks.example.com',
-		enabled: false,
-		events: [],
-		last_fired_at: null,
-		created_at: '2025-02-01T00:00:00.000Z',
-		updated_at: '2025-02-01T00:00:00.000Z'
+		kind: 'crash_loop',
+		label: 'Crash loop',
+		description: 'The app restarted after crashing this many times within the window.',
+		scope: 'app',
+		unit: 'restarts',
+		comparison: 'at_least',
+		default_threshold: 3,
+		default_window_secs: 600,
+		default_for_secs: 0,
+		default_severity: 'critical',
+		available: true,
+		unavailable_reason: null
 	},
 	{
-		id: 'alert_3',
-		app_id: null,
-		name: 'Deployment Notifications',
-		metric: null,
-		threshold: 0,
-		has_webhook_url: false,
-		webhook_host: null,
-		enabled: true,
-		events: ['deployment_success', 'deployment_failure'],
-		last_fired_at: null,
-		created_at: '2025-03-01T00:00:00.000Z',
-		updated_at: '2025-03-01T00:00:00.000Z'
+		kind: 'oom',
+		label: 'Out of memory',
+		description: 'A process in the app was killed for running out of memory within the window.',
+		scope: 'app',
+		unit: '',
+		comparison: 'none',
+		default_threshold: null,
+		default_window_secs: 900,
+		default_for_secs: 0,
+		default_severity: 'warning',
+		available: true,
+		unavailable_reason: null
+	},
+	{
+		kind: 'cpu',
+		label: 'CPU usage',
+		description: 'CPU used by the app, in percent of one core.',
+		scope: 'app',
+		unit: '%',
+		comparison: 'above',
+		default_threshold: 80,
+		default_window_secs: null,
+		default_for_secs: 300,
+		default_severity: 'warning',
+		available: true,
+		unavailable_reason: null
+	},
+	{
+		kind: 'memory',
+		label: 'Memory usage',
+		description:
+			'Memory used by the app, in percent of its memory limit. Apps without a limit are skipped.',
+		scope: 'app',
+		unit: '%',
+		comparison: 'above',
+		default_threshold: 90,
+		default_window_secs: null,
+		default_for_secs: 300,
+		default_severity: 'warning',
+		available: true,
+		unavailable_reason: null
+	},
+	{
+		kind: 'http_5xx_rate',
+		label: '5xx error rate',
+		description: "Share of the app's requests that answered with a 5xx status within the window.",
+		scope: 'app',
+		unit: '%',
+		comparison: 'above',
+		default_threshold: 5,
+		default_window_secs: 300,
+		default_for_secs: 120,
+		default_severity: 'warning',
+		available: true,
+		unavailable_reason: null
+	},
+	{
+		kind: 'http_p95_latency',
+		label: 'Slow responses (p95)',
+		description: '95th percentile response time of the app within the window.',
+		scope: 'app',
+		unit: 'ms',
+		comparison: 'above',
+		default_threshold: 1000,
+		default_window_secs: 300,
+		default_for_secs: 300,
+		default_severity: 'warning',
+		available: true,
+		unavailable_reason: null
+	},
+	{
+		kind: 'deploy_failed',
+		label: 'Deploy failed',
+		description: "The app's latest deploy failed. Resolves when a deploy succeeds.",
+		scope: 'app',
+		unit: '',
+		comparison: 'none',
+		default_threshold: null,
+		default_window_secs: null,
+		default_for_secs: 0,
+		default_severity: 'warning',
+		available: true,
+		unavailable_reason: null
+	},
+	{
+		kind: 'disk_usage',
+		label: 'Disk usage',
+		description: "How full the disk holding Tond's data is.",
+		scope: 'host',
+		unit: '%',
+		comparison: 'above',
+		default_threshold: 90,
+		default_window_secs: null,
+		default_for_secs: 300,
+		default_severity: 'critical',
+		available: true,
+		unavailable_reason: null
+	},
+	{
+		kind: 'disk_forecast',
+		label: 'Disk full forecast',
+		description:
+			'At the growth rate of the last 24 hours, the disk will be full within this many hours.',
+		scope: 'host',
+		unit: 'hours',
+		comparison: 'below',
+		default_threshold: 48,
+		default_window_secs: null,
+		default_for_secs: 900,
+		default_severity: 'warning',
+		available: true,
+		unavailable_reason: null
+	},
+	{
+		kind: 'cert_expiry',
+		label: 'Certificate expiry',
+		description: 'A TLS certificate expires within this many days (renewal should have happened).',
+		scope: 'certificate',
+		unit: 'days',
+		comparison: 'below',
+		default_threshold: 14,
+		default_window_secs: null,
+		default_for_secs: 0,
+		default_severity: 'warning',
+		available: true,
+		unavailable_reason: null
+	},
+	{
+		kind: 'backup_failed',
+		label: 'Backup failed',
+		description: 'The latest snapshot or its upload failed. Resolves when a snapshot succeeds.',
+		scope: 'backup',
+		unit: '',
+		comparison: 'none',
+		default_threshold: null,
+		default_window_secs: null,
+		default_for_secs: 0,
+		default_severity: 'critical',
+		available: true,
+		unavailable_reason: null
+	},
+	{
+		kind: 'cron_failed',
+		label: 'Cron job failed',
+		description: "A cron job's latest run failed (after its retries). Resolves when it succeeds.",
+		scope: 'cron',
+		unit: '',
+		comparison: 'none',
+		default_threshold: null,
+		default_window_secs: null,
+		default_for_secs: 0,
+		default_severity: 'warning',
+		available: true,
+		unavailable_reason: null
 	}
 ];
+
+function rule(r: Partial<AlertRule> & Pick<AlertRule, 'id' | 'name' | 'kind'>): AlertRule {
+	return {
+		app_id: null,
+		app_name: null,
+		threshold: 0,
+		window_secs: 0,
+		for_secs: 0,
+		severity: 'warning',
+		repeat_secs: 14_400,
+		enabled: true,
+		snoozed_until: null,
+		integration_ids: ['int_ntfy_1'],
+		firing: 0,
+		pending: 0,
+		last_fired_at: null,
+		created_at: '2025-01-20T00:00:00.000Z',
+		updated_at: '2025-03-06T04:12:00.000Z',
+		...r
+	};
+}
+
+export const MOCK_ALERT_RULES: AlertRule[] = [
+	rule({
+		id: 'alert_1',
+		name: 'API memory',
+		kind: 'memory',
+		app_id: 'app_running',
+		app_name: 'api-service',
+		threshold: 90,
+		for_secs: 300,
+		severity: 'critical',
+		firing: 1,
+		last_fired_at: minutesAgo(14),
+		integration_ids: ['int_ntfy_1', 'int_webhook_1']
+	}),
+	rule({
+		id: 'alert_2',
+		name: 'Apps down',
+		kind: 'app_down',
+		for_secs: 120,
+		severity: 'critical',
+		firing: 1,
+		last_fired_at: minutesAgo(52),
+		integration_ids: ['int_ntfy_1', 'int_email_1']
+	}),
+	rule({
+		id: 'alert_3',
+		name: 'Busy CPU',
+		kind: 'cpu',
+		threshold: 80,
+		for_secs: 300,
+		pending: 1,
+		last_fired_at: minutesAgo(60 * 26)
+	}),
+	rule({
+		id: 'alert_4',
+		name: 'Disk filling up',
+		kind: 'disk_forecast',
+		threshold: 48,
+		for_secs: 900,
+		integration_ids: ['int_discord_1']
+	}),
+	rule({
+		id: 'alert_5',
+		name: 'Nightly backups',
+		kind: 'backup_failed',
+		severity: 'critical',
+		last_fired_at: minutesAgo(60 * 24 * 3),
+		integration_ids: ['int_email_1']
+	}),
+	rule({
+		id: 'alert_6',
+		name: 'Crash loops',
+		kind: 'crash_loop',
+		threshold: 3,
+		window_secs: 600,
+		severity: 'critical',
+		enabled: false
+	})
+];
+
+export const MOCK_ACTIVE_ALERTS: ActiveAlert[] = [
+	{
+		rule_id: 'alert_1',
+		rule_name: 'API memory',
+		kind: 'memory',
+		severity: 'critical',
+		target: 'app:app_running',
+		target_label: 'api-service',
+		app_id: 'app_running',
+		state: 'firing',
+		since: minutesAgo(19),
+		fired_at: minutesAgo(14),
+		value: 94.6,
+		threshold: 90,
+		unit: '%',
+		comparison: 'above',
+		episode_id: 'ep_1',
+		acknowledged_at: null,
+		acknowledged_by: null,
+		snoozed_until: null,
+		snoozed_until_resolved: false,
+		failed_deliveries: 1
+	},
+	{
+		rule_id: 'alert_2',
+		rule_name: 'Apps down',
+		kind: 'app_down',
+		severity: 'critical',
+		target: 'app:app_failed',
+		target_label: 'worker',
+		app_id: 'app_failed',
+		state: 'firing',
+		since: minutesAgo(54),
+		fired_at: minutesAgo(52),
+		value: 1,
+		threshold: 0,
+		unit: '',
+		comparison: 'none',
+		episode_id: 'ep_2',
+		acknowledged_at: minutesAgo(40),
+		acknowledged_by: 'admin@example.com',
+		snoozed_until: null,
+		snoozed_until_resolved: false,
+		failed_deliveries: 0
+	},
+	{
+		rule_id: 'alert_3',
+		rule_name: 'Busy CPU',
+		kind: 'cpu',
+		severity: 'warning',
+		target: 'app:app_unhealthy',
+		target_label: 'frontend',
+		app_id: 'app_unhealthy',
+		state: 'pending',
+		since: minutesAgo(2),
+		fired_at: null,
+		value: 87.3,
+		threshold: 80,
+		unit: '%',
+		comparison: 'above',
+		episode_id: null,
+		acknowledged_at: null,
+		acknowledged_by: null,
+		snoozed_until: null,
+		snoozed_until_resolved: false,
+		failed_deliveries: 0
+	}
+];
+
+function episode(
+	e: Partial<AlertEpisode> & Pick<AlertEpisode, 'id' | 'rule_name' | 'kind'>
+): AlertEpisode {
+	return {
+		rule_id: null,
+		severity: 'warning',
+		target: 'host',
+		target_label: 'Server',
+		app_id: null,
+		threshold: 0,
+		unit: '',
+		comparison: 'none',
+		value: 1,
+		last_value: 1,
+		state: 'resolved',
+		pending_since: minutesAgo(100),
+		fired_at: minutesAgo(95),
+		resolved_at: minutesAgo(80),
+		acknowledged_at: null,
+		acknowledged_by: null,
+		notifications_sent: 2,
+		failed_deliveries: 0,
+		...e
+	};
+}
+
+export const MOCK_ALERT_HISTORY: AlertEpisode[] = [
+	episode({
+		id: 'ep_1',
+		rule_id: 'alert_1',
+		rule_name: 'API memory',
+		kind: 'memory',
+		severity: 'critical',
+		target: 'app:app_running',
+		target_label: 'api-service',
+		app_id: 'app_running',
+		threshold: 90,
+		unit: '%',
+		comparison: 'above',
+		value: 91.2,
+		last_value: 94.6,
+		state: 'firing',
+		pending_since: minutesAgo(19),
+		fired_at: minutesAgo(14),
+		resolved_at: null,
+		notifications_sent: 1,
+		failed_deliveries: 1
+	}),
+	episode({
+		id: 'ep_2',
+		rule_id: 'alert_2',
+		rule_name: 'Apps down',
+		kind: 'app_down',
+		severity: 'critical',
+		target: 'app:app_failed',
+		target_label: 'worker',
+		app_id: 'app_failed',
+		state: 'firing',
+		pending_since: minutesAgo(54),
+		fired_at: minutesAgo(52),
+		resolved_at: null,
+		acknowledged_at: minutesAgo(40),
+		acknowledged_by: 'admin@example.com'
+	}),
+	episode({
+		id: 'ep_3',
+		rule_id: 'alert_3',
+		rule_name: 'Busy CPU',
+		kind: 'cpu',
+		target: 'app:app_running',
+		target_label: 'api-service',
+		app_id: 'app_running',
+		threshold: 80,
+		unit: '%',
+		comparison: 'above',
+		value: 88.1,
+		last_value: 42.0,
+		pending_since: minutesAgo(60 * 26 + 5),
+		fired_at: minutesAgo(60 * 26),
+		resolved_at: minutesAgo(60 * 25 + 20)
+	}),
+	episode({
+		id: 'ep_4',
+		rule_id: 'alert_5',
+		rule_name: 'Nightly backups',
+		kind: 'backup_failed',
+		severity: 'critical',
+		target: 'backup',
+		target_label: 'Backups',
+		pending_since: minutesAgo(60 * 72),
+		fired_at: minutesAgo(60 * 72),
+		resolved_at: minutesAgo(60 * 48)
+	}),
+	...Array.from({ length: 24 }, (_, i) =>
+		episode({
+			id: `ep_old_${i}`,
+			rule_id: 'alert_2',
+			rule_name: 'Apps down',
+			kind: 'app_down',
+			severity: 'critical',
+			target: 'app:app_stopped',
+			target_label: 'legacy',
+			app_id: 'app_stopped',
+			pending_since: minutesAgo(60 * 24 * (4 + i) + 10),
+			fired_at: minutesAgo(60 * 24 * (4 + i)),
+			resolved_at: minutesAgo(60 * 24 * (4 + i) - 7)
+		})
+	)
+];
+
+export const MOCK_ALERT_DELIVERIES: Record<string, AlertDelivery[]> = {
+	ep_1: [
+		{
+			id: 'd_1',
+			episode_id: 'ep_1',
+			integration_id: 'int_ntfy_1',
+			integration_name: 'Phone (ntfy)',
+			integration_kind: 'ntfy',
+			event: 'firing',
+			status: 'sent',
+			attempts: 1,
+			deferred: false,
+			last_error: null,
+			next_attempt_at: null,
+			sent_at: minutesAgo(14),
+			created_at: minutesAgo(14)
+		},
+		{
+			id: 'd_2',
+			episode_id: 'ep_1',
+			integration_id: 'int_webhook_1',
+			integration_name: 'PagerBridge',
+			integration_kind: 'webhook',
+			event: 'firing',
+			status: 'failed',
+			attempts: 6,
+			deferred: false,
+			last_error: 'HTTP 502 from hooks.example.com: Bad Gateway',
+			next_attempt_at: null,
+			sent_at: null,
+			created_at: minutesAgo(14)
+		}
+	]
+};
+
+export const MOCK_ALERT_SETTINGS: AlertSettings = {
+	quiet_hours: {
+		enabled: true,
+		start: '22:00',
+		end: '07:00',
+		timezone: 'Europe/Berlin',
+		critical_bypass: true
+	}
+};
 
 // ── Audit Log ──────────────────────────────────────────────────────────────
 
@@ -1765,6 +2733,10 @@ export const MOCK_INTEGRATIONS: Integration[] = [
 		config: { chat_id: '-1001234567890' },
 		saved_secrets: ['bot_token'],
 		enabled: true,
+		quiet_hours: { mode: 'global' },
+		last_sent_at: '2025-03-06T04:12:00.000Z',
+		last_error: null,
+		last_error_at: null,
 		created_at: '2025-03-01T10:00:00.000Z',
 		updated_at: '2025-03-01T10:00:00.000Z'
 	},
@@ -1775,6 +2747,10 @@ export const MOCK_INTEGRATIONS: Integration[] = [
 		config: {},
 		saved_secrets: ['webhook_url'],
 		enabled: true,
+		quiet_hours: { mode: 'off' },
+		last_sent_at: null,
+		last_error: null,
+		last_error_at: null,
 		created_at: '2025-03-05T12:00:00.000Z',
 		updated_at: '2025-03-05T12:00:00.000Z'
 	},
@@ -1785,6 +2761,10 @@ export const MOCK_INTEGRATIONS: Integration[] = [
 		config: {},
 		saved_secrets: ['webhook_url'],
 		enabled: false,
+		quiet_hours: { mode: 'global' },
+		last_sent_at: null,
+		last_error: null,
+		last_error_at: null,
 		created_at: '2025-03-10T08:00:00.000Z',
 		updated_at: '2025-03-10T08:00:00.000Z'
 	},
@@ -1803,8 +2783,47 @@ export const MOCK_INTEGRATIONS: Integration[] = [
 		},
 		saved_secrets: ['smtp_password'],
 		enabled: true,
+		quiet_hours: {
+			mode: 'custom',
+			enabled: true,
+			start: '20:00',
+			end: '08:00',
+			timezone: 'Europe/Berlin',
+			critical_bypass: false
+		},
+		last_sent_at: '2025-03-12T09:30:00.000Z',
+		last_error: null,
+		last_error_at: null,
 		created_at: '2025-03-12T09:00:00.000Z',
 		updated_at: '2025-03-12T09:00:00.000Z'
+	},
+	{
+		id: 'int_ntfy_1',
+		name: 'Phone (ntfy)',
+		kind: 'ntfy',
+		config: { server_url: 'https://ntfy.sh' },
+		saved_secrets: ['topic'],
+		enabled: true,
+		quiet_hours: { mode: 'global' },
+		last_sent_at: new Date(Date.now() - 14 * 60_000).toISOString(),
+		last_error: null,
+		last_error_at: null,
+		created_at: '2025-03-14T09:00:00.000Z',
+		updated_at: '2025-03-14T09:00:00.000Z'
+	},
+	{
+		id: 'int_webhook_1',
+		name: 'PagerBridge',
+		kind: 'webhook',
+		config: {},
+		saved_secrets: ['webhook_url', 'signing_secret'],
+		enabled: true,
+		quiet_hours: { mode: 'off' },
+		last_sent_at: '2025-03-12T09:30:00.000Z',
+		last_error: 'HTTP 502 from hooks.example.com: Bad Gateway',
+		last_error_at: new Date(Date.now() - 3 * 60_000).toISOString(),
+		created_at: '2025-03-15T09:00:00.000Z',
+		updated_at: '2025-03-15T09:00:00.000Z'
 	}
 ];
 
@@ -2050,7 +3069,12 @@ export function makeMockSystemSelf(): SystemSelf {
 			loop('backup-scheduler', { next_wake_at: new Date(now + 9 * 3_600_000).toISOString() }),
 			loop('preview-cleanup'),
 			loop('proxy-link', { next_wake_at: null }),
-			loop('route-nudge', { last_duration_ms: 11.3, next_wake_at: null })
+			loop('route-nudge', { last_duration_ms: 11.3, next_wake_at: null }),
+			loop('uptime', {
+				last_run_at: new Date(now - 23_000).toISOString(),
+				last_duration_ms: 212.4,
+				next_wake_at: new Date(now + 37_000).toISOString()
+			})
 		],
 		db: {
 			size_bytes: 1.8 * 1024 * 1024,

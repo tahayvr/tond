@@ -15,13 +15,21 @@
 //   cron_job_runs  — per job, keep the last N runs and drop runs older than M
 //                    days (the latest run is always kept; running rows never
 //                    deleted).
-//   audit_log      — drop rows older than N days (security data: default 90)
+//   audit_log      — drop rows older than N days (security data: default 180)
 //                    through audit_log::prune_before, which removes a prefix
 //                    of the hash chain and records a checkpoint so the rest
 //                    still verifies.
 //   metrics        — tiered retention (raw 25 h, 5-minute rollups 8 days,
-//                    hourly rollups and events 90 days) plus targets whose
-//                    owner is gone; see metrics::store::prune.
+//                    hourly rollups 90 days; restart/crash/OOM events for
+//                    `retention_app_events_days`) plus targets whose owner
+//                    is gone; see metrics::store::prune. Host history
+//                    (1-minute 48 h, hourly `retention_host_history_days`;
+//                    metrics::host_history) and uptime results (1-minute
+//                    48 h, hourly and incidents `retention_uptime_days`;
+//                    uptime::store) are counted here too.
+//   alert_history  — drop episodes resolved more than N days ago (default 90;
+//                    their deliveries go with them) and close episodes whose
+//                    rule disappeared with its app.
 //   sessions / mfa_pending / password_links — drop expired rows (sessions
 //                    also when idle past the idle timeout).
 //   terminal_tickets / github_app_flows — drop expired rows.
@@ -47,7 +55,7 @@ use chrono::Utc;
 use sqlx::SqlitePool;
 
 use crate::runtime::loops;
-use crate::{docker, metrics, state::AppState};
+use crate::{alerts, docker, metrics, state::AppState};
 
 /// Rows deleted per statement.
 const BATCH_SIZE: i64 = 2_000;
@@ -62,7 +70,8 @@ const INTERVAL: Duration = Duration::from_secs(3600);
 /// such images plus the running one, so this never trims a live target.
 const KEEP_ROLLBACK_IMAGES: i64 = 5;
 
-/// Retention settings. Each field maps to a key in the `settings` table.
+/// Retention settings. Each field maps to a key in the `settings` table;
+/// defaults and bounds are `tond_common::RETENTION_RULES`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetentionPolicy {
     /// `retention_deploy_logs_deployments` — deployments per app whose logs are kept.
@@ -77,17 +86,36 @@ pub struct RetentionPolicy {
     pub cron_run_days: i64,
     /// `retention_audit_log_days` — max age of audit log rows.
     pub audit_log_days: i64,
+    /// `retention_app_events_days` — max age of restart / crash / OOM events.
+    pub app_events_days: i64,
+    /// `retention_alert_history_days` — how long resolved alerts are kept.
+    pub alert_history_days: i64,
+    /// `retention_uptime_days` — hourly uptime rollups and ended incidents.
+    pub uptime_days: i64,
+    /// `retention_host_history_days` — hourly host history.
+    pub host_history_days: i64,
+    /// `retention_request_metrics_days` — hourly request metrics.
+    pub request_metrics_days: i64,
+}
+
+fn rule_default(key: &str) -> i64 {
+    tond_common::retention_rule(key).map_or(0, |r| r.default)
 }
 
 impl Default for RetentionPolicy {
     fn default() -> Self {
         Self {
-            deploy_log_deployments: 20,
-            deploy_log_days: 30,
-            deployments_per_app: 50,
-            cron_runs_per_job: 100,
-            cron_run_days: 30,
-            audit_log_days: 90,
+            deploy_log_deployments: rule_default("retention_deploy_logs_deployments"),
+            deploy_log_days: rule_default("retention_deploy_logs_days"),
+            deployments_per_app: rule_default("retention_deployments_per_app"),
+            cron_runs_per_job: rule_default("retention_cron_runs_per_job"),
+            cron_run_days: rule_default("retention_cron_runs_days"),
+            audit_log_days: rule_default("retention_audit_log_days"),
+            app_events_days: rule_default("retention_app_events_days"),
+            alert_history_days: rule_default("retention_alert_history_days"),
+            uptime_days: rule_default("retention_uptime_days"),
+            host_history_days: rule_default("retention_host_history_days"),
+            request_metrics_days: rule_default("retention_request_metrics_days"),
         }
     }
 }
@@ -104,24 +132,40 @@ impl RetentionPolicy {
         Self::from_pairs(rows.iter().map(|(k, v)| (k.as_str(), v.as_str())))
     }
 
-    fn from_pairs<'a>(pairs: impl Iterator<Item = (&'a str, &'a str)>) -> Self {
+    pub(crate) fn from_pairs<'a>(pairs: impl Iterator<Item = (&'a str, &'a str)>) -> Self {
         let mut policy = Self::default();
         for (key, value) in pairs {
             let Ok(n) = value.trim().parse::<i64>() else {
                 continue;
             };
-            let field = match key {
-                "retention_deploy_logs_deployments" => &mut policy.deploy_log_deployments,
-                "retention_deploy_logs_days" => &mut policy.deploy_log_days,
-                "retention_deployments_per_app" => &mut policy.deployments_per_app,
-                "retention_cron_runs_per_job" => &mut policy.cron_runs_per_job,
-                "retention_cron_runs_days" => &mut policy.cron_run_days,
-                "retention_audit_log_days" => &mut policy.audit_log_days,
-                _ => continue,
-            };
-            *field = n;
+            if let Some(field) = policy.field_mut(key) {
+                *field = n;
+            }
         }
         policy
+    }
+
+    fn field_mut(&mut self, key: &str) -> Option<&mut i64> {
+        Some(match key {
+            "retention_deploy_logs_deployments" => &mut self.deploy_log_deployments,
+            "retention_deploy_logs_days" => &mut self.deploy_log_days,
+            "retention_deployments_per_app" => &mut self.deployments_per_app,
+            "retention_cron_runs_per_job" => &mut self.cron_runs_per_job,
+            "retention_cron_runs_days" => &mut self.cron_run_days,
+            "retention_audit_log_days" => &mut self.audit_log_days,
+            "retention_app_events_days" => &mut self.app_events_days,
+            "retention_alert_history_days" => &mut self.alert_history_days,
+            "retention_uptime_days" => &mut self.uptime_days,
+            "retention_host_history_days" => &mut self.host_history_days,
+            "retention_request_metrics_days" => &mut self.request_metrics_days,
+            _ => return None,
+        })
+    }
+
+    /// The value for a settings key (None for an unknown key).
+    pub fn get(&self, key: &str) -> Option<i64> {
+        let mut copy = self.clone();
+        copy.field_mut(key).map(|v| *v)
     }
 }
 
@@ -133,6 +177,7 @@ pub struct JanitorReport {
     pub cron_job_runs: u64,
     pub audit_log: u64,
     pub metrics: u64,
+    pub alerts: u64,
     pub sessions: u64,
 }
 
@@ -143,6 +188,7 @@ impl JanitorReport {
             + self.cron_job_runs
             + self.audit_log
             + self.metrics
+            + self.alerts
             + self.sessions
     }
 }
@@ -174,6 +220,14 @@ pub async fn run_janitor(state: AppState) {
             Ok(n) if n > 0 => tracing::info!("Janitor: removed {n} preview volume folder(s)"),
             Ok(_) => {}
             Err(e) => tracing::warn!("Janitor: preview volume prune failed: {e}"),
+        }
+        // Access logs of deleted apps (<data>/access, written by tond-proxy).
+        match crate::access_logs::prune_orphans(&state.db, &crate::auth::secret_file::data_dir())
+            .await
+        {
+            Ok(n) if n > 0 => tracing::info!("Janitor: removed {n} access log file(s)"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("Janitor: access log prune failed: {e}"),
         }
         // Networks of finished previews and cron runs, deleted apps, …
         match docker::prune_networks(&state.docker).await {
@@ -320,7 +374,41 @@ pub async fn run_once(db: &SqlitePool, policy: &RetentionPolicy) -> Result<Janit
     }
 
     // ── metrics (fixed tiers, see metrics/store.rs) ──
-    report.metrics += metrics::store::prune(db, now.timestamp()).await?;
+    let event_keep_secs = if policy.app_events_days > 0 {
+        policy.app_events_days.saturating_mul(86_400)
+    } else {
+        i64::MAX / 2
+    };
+    report.metrics += metrics::store::prune(db, now.timestamp(), event_keep_secs).await?;
+    let days = |d: i64| {
+        if d > 0 {
+            d.saturating_mul(86_400)
+        } else {
+            i64::MAX / 2
+        }
+    };
+    report.metrics +=
+        metrics::host_history::prune(db, now.timestamp(), days(policy.host_history_days)).await?;
+    report.metrics +=
+        crate::uptime::store::prune(db, now.timestamp(), days(policy.uptime_days)).await?;
+    report.metrics +=
+        metrics::requests::prune(db, now.timestamp(), days(policy.request_metrics_days)).await?;
+
+    // ── alert history (unix seconds; deliveries cascade) ──
+    let _ = alerts::evaluate::close_orphans(db, now.timestamp()).await;
+    if policy.alert_history_days > 0 {
+        let cutoff = now.timestamp() - policy.alert_history_days * 86_400;
+        report.alerts += delete_in_batches(|| {
+            sqlx::query(
+                "DELETE FROM alert_history WHERE id IN (
+                    SELECT id FROM alert_history WHERE resolved_at < ? LIMIT ?)",
+            )
+            .bind(cutoff)
+            .bind(BATCH_SIZE)
+            .execute(db)
+        })
+        .await?;
+    }
 
     // ── expired sessions and MFA challenges (RFC 3339 timestamps) ──
     let now_str = now.to_rfc3339();
@@ -601,11 +689,14 @@ mod tests {
         );
         assert_eq!(policy.audit_log_days, 365);
         assert_eq!(
-            policy.deploy_log_days, 30,
+            policy.deploy_log_days, 90,
             "garbage falls back to the default"
         );
         assert_eq!(policy.cron_runs_per_job, 0, "0 disables the rule");
-        assert_eq!(policy.deploy_log_deployments, 20);
+        assert_eq!(policy.deploy_log_deployments, 30);
+        assert_eq!(policy.app_events_days, 90);
+        assert_eq!(policy.get("retention_audit_log_days"), Some(365));
+        assert_eq!(policy.get("retention_nope"), None);
     }
 
     #[tokio::test]
@@ -667,6 +758,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolved_alerts_are_kept_90_days_and_orphans_are_closed() {
+        let db = test_db().await;
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO integrations (id, name, kind, config) VALUES ('i', 'i', 'webhook', '{}')",
+        )
+        .execute(&db)
+        .await
+        .unwrap_or_else(|err| panic!("seed integration: {err}"));
+        for (id, resolved) in [
+            ("old", Some(now - 91 * 86_400)),
+            ("recent", Some(now - 89 * 86_400)),
+            ("open", None),
+        ] {
+            sqlx::query(
+                "INSERT INTO alert_history (id, rule_name, kind, severity, target, target_label,
+                    threshold, pending_since, fired_at, resolved_at)
+                 VALUES (?, 'r', 'cpu', 'warning', 'host', 'Server', 1, 0, 0, ?)",
+            )
+            .bind(id)
+            .bind(resolved)
+            .execute(&db)
+            .await
+            .unwrap_or_else(|err| panic!("seed episode: {err}"));
+            sqlx::query(
+                "INSERT INTO alert_deliveries (id, episode_id, integration_id, event, next_attempt_at, created_at)
+                 VALUES (?, ?, 'i', 'firing', 0, 0)",
+            )
+            .bind(format!("d-{id}"))
+            .bind(id)
+            .execute(&db)
+            .await
+            .unwrap_or_else(|err| panic!("seed delivery: {err}"));
+        }
+        let report = run_once(&db, &RetentionPolicy::default())
+            .await
+            .unwrap_or_else(|err| panic!("janitor pass: {err}"));
+        assert_eq!(report.alerts, 1);
+        assert_eq!(
+            ids(&db, "SELECT id FROM alert_history ORDER BY id").await,
+            vec!["open", "recent"]
+        );
+        assert_eq!(
+            ids(&db, "SELECT id FROM alert_deliveries ORDER BY id").await,
+            vec!["d-open", "d-recent"],
+            "deliveries go with their episode"
+        );
+        let open_resolved: Option<i64> =
+            sqlx::query_scalar("SELECT resolved_at FROM alert_history WHERE id = 'open'")
+                .fetch_one(&db)
+                .await
+                .unwrap_or_else(|err| panic!("read: {err}"));
+        assert!(
+            open_resolved.is_some(),
+            "an episode no state points at is closed"
+        );
+    }
+
+    #[tokio::test]
     async fn cron_runs_audit_metrics_and_sessions_are_pruned() {
         let db = test_db().await;
         sqlx::query("INSERT INTO cron_jobs (id, name, schedule, image) VALUES ('j1', 'job', '* * * * *', 'alpine')")
@@ -694,7 +844,7 @@ mod tests {
         }
 
         let actor = crate::audit_log::AuditActor::system("test");
-        for (action, days) in [("au-old", 100), ("au-new", 1)] {
+        for (action, days) in [("au-old", 200), ("au-new", 1)] {
             crate::audit_log::record_at(
                 &db,
                 &actor,

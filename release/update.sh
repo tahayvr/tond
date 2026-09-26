@@ -46,7 +46,7 @@ step()  { echo -e "\n${CYAN}▶${NC} ${BOLD}$*${NC}"; }
 # signing (TOND_UNSIGNED_RELEASES) or TOND_ALLOW_UNSIGNED=1 is set. The check
 # needs only openssl (Ed25519 over the file's BLAKE2b-512 hash, which is what
 # minisign's default "ED" signatures are).
-TOND_RELEASE_PUBKEY=""
+TOND_RELEASE_PUBKEY="RWRyw6SNQq+I90HcxHS9ho+7FUE9drT12DfUN0W1vyS7nU3W6PZ0XeXL"
 TOND_UNSIGNED_RELEASES="v0.1.0"
 
 # verify_minisig FILE SIGFILE PUBKEY_B64 — succeeds when SIGFILE is a valid
@@ -239,7 +239,7 @@ secure_data_dir() {
     # the proxy's own state, handled below.
     find "$DATA_DIR" -mindepth 1 -maxdepth 1 \
         ! -name 'tond.db' ! -name 'tond.db-wal' ! -name 'tond.db-shm' \
-        ! -name certs ! -name acme_account.json ! -name proxy.sock \
+        ! -name certs ! -name acme_account.json ! -name proxy.sock ! -name access \
         -exec chmod go-rwx {} +
 
     # Pre-create the database so the proxy can open it on first start; an
@@ -259,6 +259,12 @@ secure_data_dir() {
     chown -R "$PROXY_USER":"$PROXY_USER" "${DATA_DIR}/certs"
     find "${DATA_DIR}/certs" -type d -exec chmod u=rwx,go=,g-s {} +
     find "${DATA_DIR}/certs" -type f -exec chmod 0600 {} +
+    # Opt-in per-app access logs (proxy-owned; see install.sh).
+    if [[ -L "${DATA_DIR}/access" ]]; then rm -f "${DATA_DIR}/access"; fi
+    mkdir -p "${DATA_DIR}/access"
+    chown -R "$PROXY_USER":"$PROXY_USER" "${DATA_DIR}/access"
+    chmod u=rwx,go=,g-s "${DATA_DIR}/access"
+    find "${DATA_DIR}/access" -type f -exec chmod 0600 {} +
     if [[ -e "${DATA_DIR}/acme_account.json" ]]; then
         chown "$PROXY_USER":"$PROXY_USER" "${DATA_DIR}/acme_account.json"
         chmod 0600 "${DATA_DIR}/acme_account.json"
@@ -273,6 +279,37 @@ secure_data_dir() {
 }
 
 # Get current installed version
+# Cap the systemd journal (tond-server, tond-proxy and everything else log
+# there) at 500 MB. A drop-in, so /etc/systemd/journald.conf stays untouched,
+# and only when no SystemMaxUse is configured anywhere yet: an operator's
+# choice always wins.
+JOURNALD_DROPIN_DIR="/etc/systemd/journald.conf.d"
+JOURNALD_DROPIN="${JOURNALD_DROPIN_DIR}/tond.conf"
+configure_journald() {
+    [[ -d /etc/systemd ]] || return 0
+    if [[ -f "$JOURNALD_DROPIN" ]]; then
+        return 0
+    fi
+    local existing
+    existing=$(grep -lsE '^[[:space:]]*SystemMaxUse[[:space:]]*=' \
+        /etc/systemd/journald.conf "${JOURNALD_DROPIN_DIR}"/*.conf 2>/dev/null | head -n1 || true)
+    if [[ -n "$existing" ]]; then
+        info "Journal size already capped in ${existing}; leaving it"
+        return 0
+    fi
+    mkdir -p "$JOURNALD_DROPIN_DIR"
+    printf '%s\n' \
+        '# Written by the Tond installer: keep the journal under 500 MB.' \
+        '# Delete this file or set SystemMaxUse elsewhere to change it.' \
+        '[Journal]' \
+        'SystemMaxUse=500M' > "$JOURNALD_DROPIN"
+    chmod 0644 "$JOURNALD_DROPIN"
+    if command -v systemctl > /dev/null && systemctl is-active --quiet systemd-journald; then
+        systemctl restart systemd-journald || warn "Could not restart systemd-journald; the cap applies after the next reboot"
+    fi
+    info "Capped the systemd journal at 500 MB (${JOURNALD_DROPIN})"
+}
+
 get_current_version() {
     if [[ -f "${INSTALL_DIR}/VERSION" ]]; then
         cat "${INSTALL_DIR}/VERSION"
@@ -354,38 +391,38 @@ create_backup() {
         warn "Skipping backup (--skip-backup specified)"
         return 0
     fi
-    
+
     step "Creating backup"
-    
+
     local timestamp=$(date +%Y%m%d_%H%M%S)
     local backup_name="tond_backup_${timestamp}"
     local backup_path="${BACKUP_DIR}/${backup_name}"
-    
+
     if [[ "$DRY_RUN" == true ]]; then
         info "[DRY RUN] Would create backup at: ${backup_path}"
         return 0
     fi
-    
+
     mkdir -p "$backup_path"
-    
+
     # Backup database
     if [[ -f "${DATA_DIR}/tond.db" ]]; then
         cp "${DATA_DIR}/tond.db" "${backup_path}/tond.db"
         info "✓ Database backed up"
     fi
-    
+
     # Backup current binaries
     if [[ -d "${INSTALL_DIR}/bin" ]]; then
         cp -r "${INSTALL_DIR}/bin" "${backup_path}/bin"
         info "✓ Binaries backed up"
     fi
-    
+
     # Backup dashboard
     if [[ -d "${INSTALL_DIR}/dashboard" ]]; then
         cp -r "${INSTALL_DIR}/dashboard" "${backup_path}/dashboard"
         info "✓ Dashboard backed up"
     fi
-    
+
     # Backup service files
     if [[ -f "/etc/systemd/system/tond-server.service" ]]; then
         cp "/etc/systemd/system/tond-server.service" "${backup_path}/"
@@ -395,13 +432,13 @@ create_backup() {
         cp "/etc/systemd/system/tond-proxy.service" "${backup_path}/"
         info "✓ tond-proxy service backed up"
     fi
-    
+
     # Save backup info
     cat > "${backup_path}/info.txt" <<EOF
 Backup created: $(date)
 Previous version: $(get_current_version)
 EOF
-    
+
     info "Backup created: ${backup_path}"
     echo "${backup_path}"
 }
@@ -409,22 +446,22 @@ EOF
 # Pre-update checks
 pre_update_checks() {
     step "Running pre-update checks"
-    
+
     # Check root
     if [[ $EUID -ne 0 ]]; then
         fatal "This script must be run as root"
     fi
-    
+
     # Check Tond is installed
     if [[ ! -d "$INSTALL_DIR" ]]; then
         fatal "Tond is not installed at ${INSTALL_DIR}"
     fi
-    
+
     # Check services exist
     if ! systemctl list-unit-files | grep -q tond-server; then
         fatal "Tond services not found. Is Tond installed?"
     fi
-    
+
     # Check for running containers (optional warning)
     if command -v docker &> /dev/null; then
         local running=$(docker ps --filter "label=tond.managed=true" --format "{{.Names}}" 2>/dev/null || true)
@@ -434,7 +471,7 @@ pre_update_checks() {
             warn "These will be briefly interrupted during the update"
         fi
     fi
-    
+
     info "Pre-update checks passed"
 }
 
@@ -455,9 +492,9 @@ ensure_secret_key() {
 perform_update() {
     local new_version="$1"
     local download_path="$2"
-    
+
     step "Performing update to v${new_version}"
-    
+
     if [[ "$DRY_RUN" == true ]]; then
         info "[DRY RUN] Would perform the following:"
         info "  1. Stop tond-proxy (external traffic stops)"
@@ -474,15 +511,15 @@ perform_update() {
         info "  6. Verify services are healthy"
         return 0
     fi
-    
+
     # Step 1: Stop proxy first (stops external traffic)
     info "Stopping tond-proxy..."
     systemctl stop tond-proxy
-    
+
     # Step 2: Stop server
     info "Stopping tond-server..."
     systemctl stop tond-server
-    
+
     # Step 3: Update files
     info "Updating binaries..."
     cp "${download_path}/tond-server" "${INSTALL_DIR}/bin/tond-server"
@@ -490,12 +527,12 @@ perform_update() {
     cp "${download_path}/tond" "${INSTALL_DIR}/bin/tond"
     cp "${download_path}/tond" /usr/local/bin/tond
     chmod +x "${INSTALL_DIR}/bin/"*
-    
+
     info "Updating dashboard..."
     rm -rf "${INSTALL_DIR}/dashboard"
     mkdir -p "${INSTALL_DIR}/dashboard"
     cp -r "${download_path}/dashboard/." "${INSTALL_DIR}/dashboard/"
-    
+
     ensure_secret_key
 
     info "Updating service files..."
@@ -511,11 +548,12 @@ perform_update() {
     ensure_proxy_user
     ensure_terminal_user
     secure_data_dir
-    
+    configure_journald
+
     # Step 4: Start server (runs migrations)
     info "Starting tond-server..."
     systemctl start tond-server
-    
+
     # Wait for server to be ready
     local retries=30
     for i in $(seq 1 $retries); do
@@ -531,14 +569,14 @@ perform_update() {
         return 1
     fi
     info "✓ Server is running and healthy"
-    
+
     # Step 5: Start proxy
     info "Starting tond-proxy..."
     systemctl start tond-proxy
-    
+
     # Wait a moment for proxy to initialize
     sleep 2
-    
+
     # Step 6: Verify
     if ! systemctl is-active --quiet tond-proxy; then
         error "Proxy failed to start!"
@@ -546,17 +584,17 @@ perform_update() {
         return 1
     fi
     info "✓ Proxy is running"
-    
+
     # Save new version
     echo "$new_version" > "${INSTALL_DIR}/VERSION"
-    
+
     info "Update completed successfully"
 }
 
 # Verify update
 verify_update() {
     step "Verifying update"
-    
+
     if [[ "$DRY_RUN" == true ]]; then
         info "[DRY RUN] Would verify:"
         info "  - Services are running"
@@ -564,7 +602,7 @@ verify_update() {
         info "  - Dashboard is accessible"
         return 0
     fi
-    
+
     # Check services
     local failed=false
     for svc in tond-server tond-proxy; do
@@ -575,7 +613,7 @@ verify_update() {
             failed=true
         fi
     done
-    
+
     # Check health endpoint
     if curl -sf "http://localhost:${TOND_PORT}/health" > /dev/null 2>&1; then
         info "✓ API health check passed"
@@ -583,7 +621,7 @@ verify_update() {
         error "✗ API health check failed"
         failed=true
     fi
-    
+
     # Check dashboard file exists
     if [[ -f "${INSTALL_DIR}/dashboard/index.html" ]]; then
         info "✓ Dashboard files present"
@@ -591,11 +629,11 @@ verify_update() {
         error "✗ Dashboard files missing"
         failed=true
     fi
-    
+
     if [[ "$failed" == true ]]; then
         return 1
     fi
-    
+
     return 0
 }
 
@@ -665,25 +703,25 @@ rollback() {
 # Main function
 main() {
     parse_args "$@"
-    
+
     # Show header
     echo -e "${CYAN}"
     echo "╔════════════════════════════════════╗"
     echo "║        Tond Update Tool            ║"
     echo "╚════════════════════════════════════╝"
     echo -e "${NC}"
-    
+
     # Check if this is a fresh install
     if [[ ! -d "$INSTALL_DIR" ]]; then
         error "Tond is not installed."
         error "To install, run: curl -fsSL https://tond.io/install | sudo bash"
         exit 1
     fi
-    
+
     # Get current version
     local current_version=$(get_current_version)
     info "Current version: ${current_version}"
-    
+
     # Determine target version
     local target_version
     if [[ "$VERSION" == "latest" ]]; then
@@ -693,20 +731,20 @@ main() {
         target_version="$VERSION"
         info "Target version: ${target_version}"
     fi
-    
+
     # Check if already up to date
     if [[ "$current_version" == "$target_version" && "$FORCE" == false && "$DRY_RUN" == false ]]; then
         info "Already on version ${current_version}. Nothing to do."
         info "Use --force to update anyway, or --version to specify a different version."
         exit 0
     fi
-    
+
     # Pre-update checks
     pre_update_checks
-    
+
     # Create backup
     local backup_path=$(create_backup)
-    
+
     # Allocate a single temp directory for the download; pass it to download_version
     # so that cleanup() can remove the whole parent dir (tarball + extracted files).
     local tmp_dir
@@ -718,7 +756,7 @@ main() {
     # Download new version (reuses $tmp_dir)
     local download_path
     download_path=$(download_version "$target_version" "$tmp_dir")
-    
+
     # Perform update
     if perform_update "$target_version" "$download_path"; then
         # Verify

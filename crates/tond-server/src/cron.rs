@@ -45,7 +45,7 @@ use uuid::Uuid;
 
 use crate::runtime::changes::{Table, Watch};
 use crate::runtime::{loops, shutdown};
-use crate::{alerts, docker, metrics, networks, secrets, state::AppState, volumes};
+use crate::{docker, metrics, networks, secrets, state::AppState, volumes};
 
 /// Longest sleep when no job is scheduled soon (a cron_jobs change wakes us).
 const MAX_SLEEP: std::time::Duration = std::time::Duration::from_secs(3600);
@@ -579,15 +579,6 @@ pub async fn run_cron_job(state: &AppState, job: &CronJob, _initial_attempt: i64
             finish_job_run(&state.db, &job.id, "idle", &finished_at, Some("success")).await;
 
             tracing::info!("Cron job '{}' succeeded on attempt {}", job.name, attempt);
-
-            alerts::fire_event_alerts(
-                state,
-                "cron_success",
-                None,
-                Some(job.name.as_str()),
-                Some(&format!("exit_code={}", exit_code_opt.unwrap_or(0))),
-            )
-            .await;
             return;
         }
 
@@ -614,15 +605,6 @@ pub async fn run_cron_job(state: &AppState, job: &CronJob, _initial_attempt: i64
             job.name,
             max_attempts
         );
-
-        alerts::fire_event_alerts(
-            state,
-            "cron_failure",
-            None,
-            Some(job.name.as_str()),
-            Some(&output_str),
-        )
-        .await;
     }
 }
 
