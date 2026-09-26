@@ -40,7 +40,7 @@ use std::str::FromStr;
 use tond_common::{CronJob, CronVolume};
 use uuid::Uuid;
 
-use crate::{alerts, docker, state::AppState, volumes};
+use crate::{alerts, docker, metrics, state::AppState, volumes};
 
 fn should_run_due_job(job: &CronJob) -> bool {
     !(job.status == "running" && job.concurrency_policy == "skip")
@@ -505,6 +505,7 @@ async fn run_cron_container(
             let mut m = HashMap::new();
             m.insert("managed-by".to_string(), "tond".to_string());
             m.insert("tond-type".to_string(), "cron".to_string());
+            m.insert(metrics::CRON_JOB_LABEL.to_string(), job.id.clone());
             Some(m)
         },
         host_config: Some(host_config),

@@ -100,6 +100,8 @@ tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 
 # System info
 sysinfo = "0.39.6"
+# statvfs for the host disk gauge (already in the tree via tempfile)
+rustix = { version = "1.1.5", features = ["fs"] }
 
 # Cron expression parsing + next-run computation
 cron = "0.17.0"

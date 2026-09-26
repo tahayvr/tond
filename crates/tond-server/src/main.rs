@@ -151,7 +151,7 @@ async fn main() -> Result<()> {
     // Spawn background health check poller
     tokio::spawn(health::run_health_checker(state.clone()));
 
-    // Spawn background metrics collector (every 30 s)
+    // Spawn the metrics collector (cgroup sampling every 30 s, Docker events)
     tokio::spawn(metrics::run_metrics_collector(state.clone()));
 
     // Spawn background alert checker (every 60 s)
@@ -462,6 +462,14 @@ async fn main() -> Result<()> {
         .route(
             "/api/apps/{id}/metrics",
             get(handlers::metrics::get_app_metrics),
+        )
+        .route(
+            "/api/databases/{id}/metrics",
+            get(handlers::metrics::get_database_metrics),
+        )
+        .route(
+            "/api/cron/{id}/metrics",
+            get(handlers::metrics::get_cron_metrics),
         )
         .route(
             "/api/system/metrics",

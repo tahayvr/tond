@@ -1,10 +1,12 @@
 // alerts.rs — Background alert checker + event firing helper
 //
 // Threshold-based checks (run every 60 s via run_alert_checker):
-//   - "cpu"        → fires if cpu_percent > threshold (app-scoped or MAX across all apps)
-//   - "memory"     → fires if (mem_used/mem_limit)*100 > threshold (app-scoped only)
+//   - "cpu"        → fires if CPU (% of one core) > threshold (app-scoped or MAX
+//                    across all apps), from the latest metrics sample
+//   - "memory"     → fires if memory / limit * 100 > threshold (app-scoped only)
 //   - "app_down"   → fires if app non-running for >= threshold minutes (specific app only)
-//   - "disk_usage" → fires if host disk_percent > threshold (global; app_id ignored)
+//   - "disk_usage" → fires if the data directory's filesystem is fuller than the
+//                    threshold (global; app_id ignored) — same number as the UI
 //
 // Event-based firing (called by deploy/cron code on completion):
 //   fire_event_alerts(state, event_slug, app_id?, app_name?, detail?)
@@ -16,7 +18,7 @@
 // A rule will not re-fire within 5 minutes of its last firing (threshold-based
 // only; event-based rules always fire).
 
-use crate::{notifications, state::AppState};
+use crate::{metrics, notifications, state::AppState};
 use tond_common::{AlertRule, IntegrationConfig};
 
 const CHECK_INTERVAL_SECS: u64 = 60;
@@ -95,45 +97,42 @@ async fn check_all_rules(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn check_cpu_rule(state: &AppState, rule: &AlertRule) -> anyhow::Result<Option<f64>> {
-    let row: Option<(f64,)> = if let Some(app_id) = &rule.app_id {
-        sqlx::query_as(
-            "SELECT cpu_percent FROM metrics WHERE app_id = ?
-             ORDER BY collected_at DESC LIMIT 1",
-        )
-        .bind(app_id)
-        .fetch_optional(&state.db)
-        .await?
-    } else {
-        sqlx::query_as(
-            "SELECT MAX(cpu_percent) FROM metrics
-             WHERE collected_at >= datetime('now', '-2 minutes')",
-        )
-        .fetch_optional(&state.db)
-        .await?
+/// Latest sample of an app's metrics target, if sampled in the last 2 minutes.
+async fn latest_app_sample(
+    state: &AppState,
+    app_id: &str,
+) -> anyhow::Result<Option<(metrics::Sample, i64)>> {
+    let owner = metrics::Owner::new(metrics::TargetKind::App, app_id);
+    let Some((target, mem_limit)) = metrics::store::find_target(&state.db, &owner).await? else {
+        return Ok(None);
     };
+    let since = chrono::Utc::now().timestamp() - 120;
+    Ok(metrics::store::latest_sample(&state.db, target, since)
+        .await?
+        .map(|(_, s)| (s, mem_limit)))
+}
 
-    Ok(row.and_then(|(v,)| if v > rule.threshold { Some(v) } else { None }))
+/// CPU in percent of one core (100 = one full core), as shown in the dashboard.
+async fn check_cpu_rule(state: &AppState, rule: &AlertRule) -> anyhow::Result<Option<f64>> {
+    let value = if let Some(app_id) = &rule.app_id {
+        latest_app_sample(state, app_id)
+            .await?
+            .map(|(s, _)| metrics::store::centi_to_percent(s.cpu as f64))
+    } else {
+        let since = chrono::Utc::now().timestamp() - 120;
+        metrics::store::max_app_cpu_since(&state.db, since).await?
+    };
+    Ok(value.filter(|v| *v > rule.threshold))
 }
 
 async fn check_memory_rule(state: &AppState, rule: &AlertRule) -> anyhow::Result<Option<f64>> {
-    let row: Option<(f64, f64)> = if let Some(app_id) = &rule.app_id {
-        sqlx::query_as(
-            "SELECT CAST(mem_used AS REAL), CAST(mem_limit AS REAL)
-             FROM metrics WHERE app_id = ?
-             ORDER BY collected_at DESC LIMIT 1",
-        )
-        .bind(app_id)
-        .fetch_optional(&state.db)
-        .await?
-    } else {
-        None
+    let Some(app_id) = &rule.app_id else {
+        return Ok(None);
     };
-
-    if let Some((used, limit)) = row
-        && limit > 0.0
+    if let Some((sample, limit)) = latest_app_sample(state, app_id).await?
+        && limit > 0
     {
-        let pct = (used / limit) * 100.0;
+        let pct = sample.mem as f64 / limit as f64 * 100.0;
         if pct > rule.threshold {
             return Ok(Some(pct));
         }
@@ -166,31 +165,17 @@ async fn check_app_down_rule(state: &AppState, rule: &AlertRule) -> anyhow::Resu
     Ok(None)
 }
 
+/// Disk usage of the filesystem holding the data directory — the same number
+/// the dashboard shows (both read the collector's host cache).
 async fn check_disk_usage_rule(_state: &AppState, rule: &AlertRule) -> anyhow::Result<Option<f64>> {
-    use sysinfo::Disks;
-    let disks = Disks::new_with_refreshed_list();
-
-    // Sum across all disks
-    let (used, total) = disks
-        .list()
-        .iter()
-        .fold((0u64, 0u64), |(u, t), d: &sysinfo::Disk| {
-            (
-                u + (d.total_space() - d.available_space()),
-                t + d.total_space(),
-            )
-        });
-
-    if total == 0 {
+    let Some(snapshot) = metrics::host::snapshot() else {
+        return Ok(None);
+    };
+    if snapshot.disk_total == 0 {
         return Ok(None);
     }
-
-    let pct = (used as f64 / total as f64) * 100.0;
-    if pct > rule.threshold {
-        Ok(Some(pct))
-    } else {
-        Ok(None)
-    }
+    let pct = snapshot.disk_percent();
+    Ok((pct > rule.threshold).then_some(pct))
 }
 
 async fn fire_threshold_alert(
@@ -306,6 +291,8 @@ fn build_event_message(event: &str, app_name: Option<&str>, detail: Option<&str>
         "deployment_failure" => format!("Deployment failed for '{}'", name),
         "cron_success" => format!("Scheduled task '{}' completed successfully", name),
         "cron_failure" => format!("Scheduled task '{}' failed", name),
+        "container_restart" => format!("'{}' stopped unexpectedly", name),
+        "container_oom" => format!("'{}' ran out of memory", name),
         _ => format!("Event '{}' occurred for '{}'", event, name),
     };
     match detail {
@@ -407,6 +394,38 @@ mod tests {
 
     use super::*;
     use crate::{auth::RateLimiter, state::AppState};
+
+    /// Store one metrics sample for `app_id`, `age_secs` ago.
+    async fn seed_sample(
+        state: &AppState,
+        app_id: &str,
+        age_secs: i64,
+        cpu_percent: f64,
+        mem: i64,
+        mem_limit: i64,
+    ) {
+        let owner = metrics::Owner::new(metrics::TargetKind::App, app_id);
+        let target = metrics::store::ensure_target(&state.db, &owner)
+            .await
+            .unwrap_or_else(|err| panic!("target: {err}"));
+        metrics::store::insert_tick(
+            &state.db,
+            chrono::Utc::now().timestamp() - age_secs,
+            &[metrics::store::TickRow {
+                target,
+                sample: metrics::Sample {
+                    cpu: (cpu_percent * 100.0) as i64,
+                    mem,
+                    rx: 0,
+                    tx: 0,
+                    pids: 1,
+                },
+                mem_limit: Some(mem_limit),
+            }],
+        )
+        .await
+        .unwrap_or_else(|err| panic!("sample: {err}"));
+    }
 
     async fn test_state() -> AppState {
         let db = SqlitePool::connect("sqlite::memory:")
@@ -554,6 +573,14 @@ mod tests {
             "build_event_message should use the cron failure template when no detail is provided"
         );
         assert_eq!(
+            build_event_message(
+                "container_restart",
+                Some("web"),
+                Some("restarted after exiting unexpectedly (exit code 1)")
+            ),
+            "'web' stopped unexpectedly: restarted after exiting unexpectedly (exit code 1)"
+        );
+        assert_eq!(
             build_event_message("custom_event", None, Some("extra")),
             "Event 'custom_event' occurred for 'unknown': extra",
             "build_event_message should fall back to the generic template for unknown events"
@@ -600,52 +627,9 @@ mod tests {
         )
         .await;
 
-        sqlx::query(
-            "INSERT INTO metrics (id, app_id, cpu_percent, mem_used, mem_limit, net_rx, net_tx, restarts, collected_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind("metric-1")
-        .bind("app-1")
-        .bind(72.0)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind("2026-01-01 00:00:00")
-        .execute(&state.db)
-        .await
-        .unwrap_or_else(|err| panic!("failed to insert first cpu metric: {err}"));
-        sqlx::query(
-            "INSERT INTO metrics (id, app_id, cpu_percent, mem_used, mem_limit, net_rx, net_tx, restarts, collected_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
-        )
-        .bind("metric-2")
-        .bind("app-1")
-        .bind(88.5)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .execute(&state.db)
-        .await
-        .unwrap_or_else(|err| panic!("failed to insert second cpu metric: {err}"));
-        sqlx::query(
-            "INSERT INTO metrics (id, app_id, cpu_percent, mem_used, mem_limit, net_rx, net_tx, restarts, collected_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
-        )
-        .bind("metric-3")
-        .bind("app-2")
-        .bind(91.0)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .execute(&state.db)
-        .await
-        .unwrap_or_else(|err| panic!("failed to insert global cpu metric: {err}"));
+        seed_sample(&state, "app-1", 3600, 72.0, 0_i64, 0_i64).await;
+        seed_sample(&state, "app-1", 0, 88.5, 0_i64, 0_i64).await;
+        seed_sample(&state, "app-2", 0, 91.0, 0_i64, 0_i64).await;
 
         let app_rule = load_rule(&state, "rule-app").await;
         let global_rule = load_rule(&state, "rule-global").await;
@@ -707,36 +691,8 @@ mod tests {
         )
         .await;
 
-        sqlx::query(
-            "INSERT INTO metrics (id, app_id, cpu_percent, mem_used, mem_limit, net_rx, net_tx, restarts, collected_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
-        )
-        .bind("metric-memory")
-        .bind("app-1")
-        .bind(0.0)
-        .bind(800_i64)
-        .bind(1000_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .execute(&state.db)
-        .await
-        .unwrap_or_else(|err| panic!("failed to insert memory metric: {err}"));
-        sqlx::query(
-            "INSERT INTO metrics (id, app_id, cpu_percent, mem_used, mem_limit, net_rx, net_tx, restarts, collected_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
-        )
-        .bind("metric-memory-zero-limit")
-        .bind("app-2")
-        .bind(0.0)
-        .bind(999_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .execute(&state.db)
-        .await
-        .unwrap_or_else(|err| panic!("failed to insert zero-limit memory metric: {err}"));
+        seed_sample(&state, "app-1", 0, 0.0, 800_i64, 1000_i64).await;
+        seed_sample(&state, "app-2", 0, 0.0, 999_i64, 0_i64).await;
 
         let memory_rule = load_rule(&state, "rule-memory").await;
         let no_app_rule = load_rule(&state, "rule-no-app").await;
@@ -935,21 +891,7 @@ mod tests {
             },
         )
         .await;
-        sqlx::query(
-            "INSERT INTO metrics (id, app_id, cpu_percent, mem_used, mem_limit, net_rx, net_tx, restarts, collected_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
-        )
-        .bind("metric-recent")
-        .bind("app-1")
-        .bind(99.0)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .execute(&state.db)
-        .await
-        .unwrap_or_else(|err| panic!("failed to insert cpu metric for refire test: {err}"));
+        seed_sample(&state, "app-1", 0, 99.0, 0_i64, 0_i64).await;
 
         let before = load_rule(&state, "rule-recent")
             .await
