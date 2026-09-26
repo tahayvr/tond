@@ -1,17 +1,17 @@
 // handlers/database_ops.rs — managed database essentials
 //
-//   GET  /api/databases/catalog                  — engines, versions and variants
-//   GET  /api/databases/{id}/backup-schedule     — schedule + backup health
-//   PUT  /api/databases/{id}/backup-schedule     — set/clear the schedule, retention
-//   GET  /api/databases/{id}/extensions          — postgres extensions (offered/installed)
-//   POST /api/databases/{id}/extensions          — CREATE EXTENSION (offered ones only)
-//   POST /api/databases/{id}/upgrade             — start a major-version upgrade (admin)
-//   POST /api/databases/{id}/upgrade/confirm     — keep the new version, drop the old data
-//   POST /api/databases/{id}/upgrade/rollback    — go back to the old version and data
-//   POST /api/databases/{id}/upgrade/dismiss     — clear a failed upgrade's banner
+//   GET  /api/v1/databases/catalog                  — engines, versions and variants
+//   GET  /api/v1/databases/{id}/backup-schedule     — schedule + backup health
+//   PUT  /api/v1/databases/{id}/backup-schedule     — set/clear the schedule, retention
+//   GET  /api/v1/databases/{id}/extensions          — postgres extensions (offered/installed)
+//   POST /api/v1/databases/{id}/extensions          — CREATE EXTENSION (offered ones only)
+//   POST /api/v1/databases/{id}/upgrade             — start a major-version upgrade (admin)
+//   POST /api/v1/databases/{id}/upgrade/confirm     — keep the new version, drop the old data
+//   POST /api/v1/databases/{id}/upgrade/rollback    — go back to the old version and data
+//   POST /api/v1/databases/{id}/upgrade/dismiss     — clear a failed upgrade's banner
 //
 // Restoring a backup into a new database is POST
-// /api/snapshots/{id}/restore-new-database (handlers/backups.rs).
+// /api/v1/snapshots/{id}/restore-new-database (handlers/backups.rs).
 
 use std::time::Duration;
 
@@ -34,7 +34,7 @@ use crate::{
 
 // ── Catalog ──────────────────────────────────────────────────────────────────
 
-/// GET /api/databases/catalog
+/// GET /api/v1/databases/catalog
 pub async fn get_catalog(
     _rate: RateLimit,
     _auth: Authz<scope::DbRead>,
@@ -100,7 +100,7 @@ async fn backup_status(
     })
 }
 
-/// GET /api/databases/{id}/backup-schedule
+/// GET /api/v1/databases/{id}/backup-schedule
 pub async fn get_backup_schedule(
     _rate: RateLimit,
     _auth: Authz<scope::SnapshotsRead>,
@@ -114,7 +114,7 @@ pub async fn get_backup_schedule(
     ))
 }
 
-/// PUT /api/databases/{id}/backup-schedule
+/// PUT /api/v1/databases/{id}/backup-schedule
 pub async fn update_backup_schedule(
     _rate: RateLimit,
     auth: Authz<scope::DbWrite>,
@@ -221,7 +221,7 @@ pub fn parse_extension_rows(output: &str, offered: &[&str]) -> Vec<DatabaseExten
     found
 }
 
-/// GET /api/databases/{id}/extensions
+/// GET /api/v1/databases/{id}/extensions
 pub async fn list_extensions(
     _rate: RateLimit,
     _auth: Authz<scope::DbRead>,
@@ -270,7 +270,7 @@ pub async fn list_extensions(
     ))
 }
 
-/// POST /api/databases/{id}/extensions
+/// POST /api/v1/databases/{id}/extensions
 pub async fn create_extension(
     _rate: RateLimit,
     auth: Authz<scope::DbWrite>,
@@ -327,7 +327,7 @@ pub async fn create_extension(
 
 // ── Major-version upgrades ───────────────────────────────────────────────────
 
-/// POST /api/databases/{id}/upgrade — admins only: a guarded but
+/// POST /api/v1/databases/{id}/upgrade — admins only: a guarded but
 /// long-running change of the engine version.
 pub async fn start_upgrade(
     _rate: RateLimit,
@@ -353,7 +353,7 @@ pub async fn start_upgrade(
     Ok((StatusCode::ACCEPTED, Json(ApiResponse::ok(upgrade))))
 }
 
-/// POST /api/databases/{id}/upgrade/confirm
+/// POST /api/v1/databases/{id}/upgrade/confirm
 pub async fn confirm_upgrade(
     _rate: RateLimit,
     auth: Authz<scope::DbWrite>,
@@ -381,7 +381,7 @@ pub async fn confirm_upgrade(
     ))
 }
 
-/// POST /api/databases/{id}/upgrade/rollback
+/// POST /api/v1/databases/{id}/upgrade/rollback
 pub async fn rollback_upgrade(
     _rate: RateLimit,
     auth: Authz<scope::DbWrite>,
@@ -413,7 +413,7 @@ pub async fn rollback_upgrade(
     ))
 }
 
-/// POST /api/databases/{id}/upgrade/dismiss
+/// POST /api/v1/databases/{id}/upgrade/dismiss
 pub async fn dismiss_upgrade(
     _rate: RateLimit,
     _auth: Authz<scope::DbWrite>,

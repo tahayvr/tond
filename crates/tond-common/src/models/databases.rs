@@ -567,7 +567,7 @@ pub struct DbUpgradeState {
 }
 
 /// Backup schedule and health of one database
-/// (GET /api/databases/{id}/backup-schedule).
+/// (GET /api/v1/databases/{id}/backup-schedule).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DatabaseBackupStatus {
@@ -588,7 +588,7 @@ pub struct DatabaseBackupStatus {
     pub warning: Option<String>,
 }
 
-/// PUT /api/databases/{id}/backup-schedule
+/// PUT /api/v1/databases/{id}/backup-schedule
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateDatabaseBackupSchedule {
@@ -598,7 +598,7 @@ pub struct UpdateDatabaseBackupSchedule {
     pub retention: Option<i64>,
 }
 
-/// POST /api/snapshots/{id}/restore-new-database
+/// POST /api/v1/snapshots/{id}/restore-new-database
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RestoreToNewDatabaseRequest {
@@ -611,14 +611,14 @@ pub struct RestoreToNewDatabaseRequest {
     pub project_id: Option<String>,
 }
 
-/// POST /api/databases/{id}/upgrade
+/// POST /api/v1/databases/{id}/upgrade
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpgradeDatabaseRequest {
     pub version: String,
 }
 
-/// One extension of a postgres database (GET /api/databases/{id}/extensions).
+/// One extension of a postgres database (GET /api/v1/databases/{id}/extensions).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DatabaseExtension {
@@ -630,7 +630,7 @@ pub struct DatabaseExtension {
     pub comment: Option<String>,
 }
 
-/// POST /api/databases/{id}/extensions
+/// POST /api/v1/databases/{id}/extensions
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreateExtensionRequest {

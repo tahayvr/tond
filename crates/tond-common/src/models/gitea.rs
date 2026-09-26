@@ -40,7 +40,7 @@ impl From<GiteaToken> for GiteaTokenResponse {
     }
 }
 
-/// POST /api/gitea-tokens — store a new token
+/// POST /api/v1/gitea-tokens — store a new token
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreateGiteaTokenRequest {
@@ -50,7 +50,7 @@ pub struct CreateGiteaTokenRequest {
     pub base_url: String,
 }
 
-/// PUT /api/apps/{id}/gitea-token — link or unlink a Gitea token
+/// PUT /api/v1/apps/{id}/gitea-token — link or unlink a Gitea token
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SetGiteaTokenRequest {

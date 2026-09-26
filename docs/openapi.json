@@ -2610,7 +2610,7 @@
         "type": "object"
       },
       "CreateExtensionRequest": {
-        "description": "POST /api/databases/{id}/extensions",
+        "description": "POST /api/v1/databases/{id}/extensions",
         "properties": {
           "name": {
             "type": "string"
@@ -2642,7 +2642,7 @@
         "type": "object"
       },
       "CreateGiteaTokenRequest": {
-        "description": "POST /api/gitea-tokens — store a new token",
+        "description": "POST /api/v1/gitea-tokens — store a new token",
         "properties": {
           "base_url": {
             "description": "Instance URL (Gitea, Forgejo, Codeberg…)",
@@ -3547,7 +3547,7 @@
         "type": "object"
       },
       "DatabaseBackupStatus": {
-        "description": "Backup schedule and health of one database\n(GET /api/databases/{id}/backup-schedule).",
+        "description": "Backup schedule and health of one database\n(GET /api/v1/databases/{id}/backup-schedule).",
         "properties": {
           "full_schedule": {
             "type": [
@@ -3670,7 +3670,7 @@
         "type": "object"
       },
       "DatabaseExtension": {
-        "description": "One extension of a postgres database (GET /api/databases/{id}/extensions).",
+        "description": "One extension of a postgres database (GET /api/v1/databases/{id}/extensions).",
         "properties": {
           "available": {
             "description": "Offered by the image",
@@ -3765,7 +3765,7 @@
         "type": "object"
       },
       "DbCatalogEntry": {
-        "description": "GET /api/databases/catalog — what can be created.",
+        "description": "GET /api/v1/databases/catalog — what can be created.",
         "properties": {
           "available": {
             "description": "Available on this server (false for x86_64-only images on ARM64)",
@@ -8498,7 +8498,7 @@
         "type": "object"
       },
       "RestoreToNewDatabaseRequest": {
-        "description": "POST /api/snapshots/{id}/restore-new-database",
+        "description": "POST /api/v1/snapshots/{id}/restore-new-database",
         "properties": {
           "name": {
             "description": "Name of the new database",
@@ -9034,7 +9034,7 @@
         "type": "object"
       },
       "SetGiteaTokenRequest": {
-        "description": "PUT /api/apps/{id}/gitea-token — link or unlink a Gitea token",
+        "description": "PUT /api/v1/apps/{id}/gitea-token — link or unlink a Gitea token",
         "properties": {
           "gitea_token_id": {
             "description": "Token ID to link; `null` = detach.",
@@ -10492,7 +10492,7 @@
         "type": "object"
       },
       "UpdateDatabaseBackupSchedule": {
-        "description": "PUT /api/databases/{id}/backup-schedule",
+        "description": "PUT /api/v1/databases/{id}/backup-schedule",
         "properties": {
           "retention": {
             "description": "Scheduled backups to keep (1–365); omitted = unchanged",
@@ -10984,7 +10984,7 @@
         "type": "object"
       },
       "UpgradeDatabaseRequest": {
-        "description": "POST /api/databases/{id}/upgrade",
+        "description": "POST /api/v1/databases/{id}/upgrade",
         "properties": {
           "version": {
             "type": "string"

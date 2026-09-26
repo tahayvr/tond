@@ -1,10 +1,10 @@
 // handlers/gitea_tokens.rs — Gitea/Forgejo access tokens
 //
-//   GET    /api/gitea-tokens           — stored tokens (never the token itself)
-//   POST   /api/gitea-tokens           — store a token (checked against
+//   GET    /api/v1/gitea-tokens           — stored tokens (never the token itself)
+//   POST   /api/v1/gitea-tokens           — store a token (checked against
 //                                        <base_url>/api/v1/user first)
-//   DELETE /api/gitea-tokens/{id}      — remove (apps using it are detached)
-//   PUT    /api/apps/{id}/gitea-token  — link or unlink a token and an app
+//   DELETE /api/v1/gitea-tokens/{id}      — remove (apps using it are detached)
+//   PUT    /api/v1/apps/{id}/gitea-token  — link or unlink a token and an app
 //
 // A linked token lets Tond clone the app's private repository, set commit
 // statuses (tond/deploy, tond/preview) and comment the preview URL on pull
@@ -64,7 +64,7 @@ pub fn gitea_git_credentials(token: &GiteaToken) -> anyhow::Result<GitHttpAuth> 
     })
 }
 
-/// GET /api/gitea-tokens
+/// GET /api/v1/gitea-tokens
 pub async fn list_gitea_tokens(
     _rate: RateLimit,
     _auth: Authz<scope::AppsRead>,
@@ -77,7 +77,7 @@ pub async fn list_gitea_tokens(
     Ok((StatusCode::OK, Json(ApiResponse::ok(out))))
 }
 
-/// POST /api/gitea-tokens
+/// POST /api/v1/gitea-tokens
 pub async fn create_gitea_token(
     _rate: RateLimit,
     auth: Authz<scope::SettingsWrite>,
@@ -148,7 +148,7 @@ pub async fn create_gitea_token(
     ))
 }
 
-/// DELETE /api/gitea-tokens/{id}
+/// DELETE /api/v1/gitea-tokens/{id}
 pub async fn delete_gitea_token(
     _rate: RateLimit,
     auth: Authz<scope::SettingsWrite>,
@@ -173,7 +173,7 @@ pub async fn delete_gitea_token(
     Ok((StatusCode::OK, Json(ApiResponse::<()>::ok(()))))
 }
 
-/// PUT /api/apps/{id}/gitea-token
+/// PUT /api/v1/apps/{id}/gitea-token
 pub async fn set_app_gitea_token(
     _rate: RateLimit,
     auth: Authz<scope::AppsWrite>,

@@ -243,7 +243,7 @@ pub fn offered_extensions(variant: &str) -> Vec<&'static str> {
 
 // ── API shapes ──────────────────────────────────────────────────────────────
 
-/// GET /api/databases/catalog — what can be created.
+/// GET /api/v1/databases/catalog — what can be created.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DbCatalogEntry {
