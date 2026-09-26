@@ -153,6 +153,21 @@ for entry in $TOND_SUPPORTED_SYSTEMS; do
     [[ -n "$codename" ]] && ok || fail "$entry has no codename"
 done
 
+echo "Docker Engine version: ${TOND_MIN_DOCKER_MAJOR} or newer"
+assert_eq 25 "$TOND_MIN_DOCKER_MAJOR" "minimum major"
+assert_eq 27 "$(docker_major "27.3.1")" "plain version"
+assert_eq 24 "$(docker_major "24.0.7-0ubuntu4~24.04.1")" "distro package version"
+assert_eq 24 "$(docker_major "Docker version 24.0.7, build afdd53b")" "docker --version"
+assert_eq "" "$(docker_major "")" "no version"
+if docker_too_old "24.0.7"; then ok; else fail "Docker 24 must be too old"; fi
+if docker_too_old "20.10.24"; then ok; else fail "Docker 20.10 must be too old"; fi
+if docker_too_old "25.0.0"; then fail "Docker 25 is new enough"; else ok; fi
+if docker_too_old "28.1.1"; then fail "Docker 28 is new enough"; else ok; fi
+if docker_too_old ""; then fail "an unknown version is not refused"; else ok; fi
+assert_contains "$(docker_too_old_message 24.0.7)" "Docker Engine 25 or newer" "message names the minimum"
+assert_contains "$(docker_too_old_message 24.0.7)" "has Docker 24.0.7" "message names the installed version"
+assert_contains "$(docker_too_old_message 24.0.7)" "Upgrade Docker Engine" "message says what to do"
+
 echo "install.sh: flags"
 help="$(bash "$INSTALL_SH" --help 2>&1 || true)"
 assert_contains "$help" "--allow-unsupported-os" "--help documents the override"

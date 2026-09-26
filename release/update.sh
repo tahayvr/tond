@@ -250,6 +250,35 @@ docker_codename_fallback() {
         fi
     done
 }
+# Oldest Docker Engine Tond works with: one-click templates use the compose
+# healthcheck `start_interval`, which needs Docker Engine 25.
+TOND_MIN_DOCKER_MAJOR=25
+
+# docker_major VERSION — the major number of a Docker version string
+# ("27.3.1", "24.0.7-0ubuntu4", "Docker version 24.0.7, build afdd53b");
+# empty when there is none.
+docker_major() {
+    printf '%s\n' "$1" | sed -n 's/^[^0-9]*\([0-9][0-9]*\)\..*/\1/p' | head -n 1
+}
+
+# installed_docker_version — the Docker Engine version (the daemon's, or the
+# client's when the daemon doesn't answer); empty without Docker.
+installed_docker_version() {
+    docker version --format '{{.Server.Version}}' 2>/dev/null \
+        || docker version --format '{{.Client.Version}}' 2>/dev/null \
+        || true
+}
+
+# docker_too_old VERSION — succeeds when VERSION is older than
+# TOND_MIN_DOCKER_MAJOR (an unreadable version is not "too old").
+docker_too_old() {
+    _dm="$(docker_major "$1")"
+    [ -n "$_dm" ] && [ "$_dm" -lt "$TOND_MIN_DOCKER_MAJOR" ]
+}
+
+docker_too_old_message() {
+    echo "Tond needs Docker Engine ${TOND_MIN_DOCKER_MAJOR} or newer, and this server has Docker ${1}. Upgrade Docker Engine (https://docs.docker.com/engine/install/), then run this again."
+}
 # ── end supported systems ──
 
 # ── Arguments ──
@@ -664,6 +693,19 @@ preflight() {
             warn "${SYSTEM_NAME} is not a supported system (${TOND_SUPPORTED_SYSTEMS_TEXT}); continuing because it was explicitly allowed."
         else
             fail_unchanged "$(unsupported_system_message | tr '\n' ' ')"
+        fi
+    fi
+    # The new release may rely on newer Docker features; a rollback returns
+    # to what ran before, so it only warns.
+    if command -v docker &> /dev/null; then
+        local docker_version
+        docker_version="$(installed_docker_version | head -n 1)"
+        if docker_too_old "$docker_version"; then
+            if [[ "$RUN_KIND" == rollback ]]; then
+                warn "$(docker_too_old_message "$docker_version")"
+            else
+                fail_unchanged "$(docker_too_old_message "$docker_version")"
+            fi
         fi
     fi
 }

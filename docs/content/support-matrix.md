@@ -19,7 +19,7 @@ The system is read from `/etc/os-release` (`ID` and `VERSION_ID`), so minimal im
 
 Tond installs Docker Engine from Docker's own apt repository, not from the distribution's packages, and trusts that repository only after checking its signing key's fingerprint (`9DC8 5822 9FC7 DD38 854A E2D8 8D81 803C 0EBF CD88`). The repository line uses the codename of your release.
 
-When a new release comes out before Docker publishes packages for it, the installer falls back to the previous release's packages (Debian 13 → bookworm, Ubuntu 26.04 → noble) and says so. If Docker is already installed, the installer leaves it alone.
+When a new release comes out before Docker publishes packages for it, the installer falls back to the previous release's packages (Debian 13 → bookworm, Ubuntu 26.04 → noble) and says so. If Docker is already installed, the installer leaves it alone, as long as it is **Docker Engine 25 or newer**: one-click templates use compose healthcheck options that older engines don't have. With an older engine, the installer and `update.sh` stop before changing anything and ask you to upgrade Docker first. A rollback only warns.
 
 ## Hardware
 

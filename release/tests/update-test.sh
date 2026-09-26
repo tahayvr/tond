@@ -110,6 +110,13 @@ case "$*" in
     *) echo 0 ;;
 esac
 EOF
+    # docker: answers `docker version` with $DOCKER_VERSION (default: new
+    # enough), so the host's own Docker never matters.
+    cat > "$bin/docker" <<'EOF'
+#!/usr/bin/env bash
+[[ "${1:-}" == version ]] && echo "${DOCKER_VERSION:-28.1.1}"
+exit 0
+EOF
     local noop
     for noop in chown getent groupadd useradd gpasswd passwd sleep; do
         printf '#!/usr/bin/env bash\nexit 0\n' > "$bin/$noop"
@@ -391,6 +398,26 @@ test_unsupported_system_is_refused_unless_allowed() {
     run_update --bundle "$T/new" --allow-unsupported-os
     assert_eq 0 "$RC" "allowed ($OUT)"
     assert_contains "$OUT" "not a supported system" "warns"
+    teardown
+}
+
+test_old_docker_engine_is_refused_before_anything_changes() {
+    setup
+    fake_release "$T/new" 0.4.0 61
+    DOCKER_VERSION=24.0.7 run_update --bundle "$T/new"
+    assert_eq 1 "$RC" "exit code ($OUT)"
+    assert_eq failed "$(json state)" "status state"
+    assert_contains "$(json message)" "Docker Engine 25 or newer" "names the minimum"
+    assert_contains "$(json message)" "has Docker 24.0.7" "names the installed version"
+    assert_contains "$(json message)" "Nothing was changed" "nothing changed"
+    assert_eq 0.3.0 "$(installed_version)" "nothing installed"
+    assert_eq "" "$(grep 'systemctl stop' "$T/state/calls" || true)" "no service stopped"
+    DOCKER_VERSION=25.0.3 run_update --bundle "$T/new"
+    assert_eq 0 "$RC" "Docker 25 is enough ($OUT)"
+    # A rollback goes back to what ran before: it only warns.
+    DOCKER_VERSION=24.0.7 run_update --rollback
+    assert_eq 0 "$RC" "rollback with an old engine ($OUT)"
+    assert_contains "$OUT" "Docker Engine 25 or newer" "rollback warns"
     teardown
 }
 
