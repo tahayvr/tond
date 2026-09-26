@@ -1350,8 +1350,9 @@ api /api/apps/e2e-whoami/deployments | jq -e --arg id "$D2" --arg by "$D3" \
     || fail "the waiting deploy must be marked superseded by the newest one"
 pass "3 deploys → first ran, second superseded by the third, third succeeded"
 wait_for_app_running e2e-whoami 120
-tond apps logs e2e-whoami 2>/dev/null | grep -q "Proxy confirmed the new route in" \
-    || { tond apps logs e2e-whoami | tail -20 >&2; fail "the cutover must wait for tond-proxy's acknowledgement"; }
+whoami_logs=$(tond apps logs e2e-whoami 2>/dev/null || true)
+grep -q "Proxy confirmed the new route in" <<< "$whoami_logs" \
+    || { tail -20 <<< "$whoami_logs" >&2; fail "the cutover must wait for tond-proxy's acknowledgement"; }
 pass "cutover waited for the proxy's acknowledgement ($(tond apps logs e2e-whoami | grep -o 'confirmed the new route in [0-9]* ms' | tail -1))"
 wait_for 30 "route after queued deploys" bash -c "curl -sk --resolve '${WHOAMI_DOMAIN}:443:${IP}' 'https://${WHOAMI_DOMAIN}/' | grep -q Hostname:"
 
