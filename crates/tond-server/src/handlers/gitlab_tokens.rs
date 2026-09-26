@@ -36,8 +36,9 @@ use tond_common::{
 };
 use uuid::Uuid;
 
+use crate::audit_log::{AuditEntry, record};
 use crate::{
-    auth::{RateLimit, RequireAdmin, RequireAuth},
+    auth::{Authz, RateLimit, scope},
     deploy::GitHttpAuth,
     error::AppError,
     secret_key::{self, Purpose},
@@ -49,7 +50,7 @@ use crate::{
 /// GET /api/gitlab-tokens
 pub async fn list_gitlab_tokens(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsRead>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     let tokens = sqlx::query_as::<_, GitLabToken>("SELECT * FROM gitlab_tokens ORDER BY name")
@@ -63,7 +64,7 @@ pub async fn list_gitlab_tokens(
 /// POST /api/gitlab-tokens
 pub async fn create_gitlab_token(
     _rate: RateLimit,
-    _admin: RequireAdmin,
+    auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Json(payload): Json<CreateGitLabTokenRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -144,6 +145,12 @@ pub async fn create_gitlab_token(
         .fetch_one(&state.db)
         .await?;
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("gitlab_token_create").resource("gitlab_token", &token.id, &token.name),
+    )
+    .await;
     Ok((
         StatusCode::CREATED,
         Json(ApiResponse::ok(GitLabTokenResponse::from(token))),
@@ -153,7 +160,7 @@ pub async fn create_gitlab_token(
 /// DELETE /api/gitlab-tokens/{id}
 pub async fn delete_gitlab_token(
     _rate: RateLimit,
-    _admin: RequireAdmin,
+    auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Path(token_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -170,13 +177,19 @@ pub async fn delete_gitlab_token(
         ))));
     }
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("gitlab_token_delete").resource("gitlab_token", &token_id, &token_id),
+    )
+    .await;
     Ok((StatusCode::OK, Json(ApiResponse::<()>::ok(()))))
 }
 
 /// GET /api/gitlab-tokens/{id}/repos
 pub async fn list_gitlab_repos(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Path(token_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -278,7 +291,7 @@ pub async fn list_gitlab_repos(
 /// GET /api/gitlab-tokens/{id}/repos/{project_id}/branches
 pub async fn list_gitlab_branches(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Path((token_id, project_id)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -342,7 +355,7 @@ pub async fn list_gitlab_branches(
 /// Attach or detach a GitLab token from an app.
 pub async fn set_app_gitlab_token(
     _rate: RateLimit,
-    _admin: RequireAdmin,
+    auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Path(app_id): Path<String>,
     Json(payload): Json<SetGitLabTokenRequest>,
@@ -384,6 +397,12 @@ pub async fn set_app_gitlab_token(
         .fetch_one(&state.db)
         .await?;
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("gitlab_token_assign").resource("app", &updated.id, &updated.name),
+    )
+    .await;
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(AppResponse::from(updated))),
@@ -475,7 +494,9 @@ mod tests {
     use tond_common::{ServerSettings, SetGitLabTokenRequest};
 
     use super::*;
+    use crate::auth::Principal;
     use crate::{auth::RateLimiter, state::AppState};
+    use tond_common::Role;
 
     async fn test_state() -> AppState {
         let db = SqlitePool::connect("sqlite::memory:")
@@ -524,7 +545,7 @@ mod tests {
         );
 
         sqlx::query(
-            "INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, host_port, memory_limit, cpu_limit, status, env_vars, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, deploy_key_pub, project_id, registry_credential_id, github_app_id, gitlab_token_id, preview_enabled, preview_excluded_keys, preview_env_vars, dockerfile_content, compose_content, base_dir, static_build, created_at, updated_at)
+            "INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, host_port, memory_limit, cpu_limit, status, env_vars, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, deploy_key_pub, project_id, registry_credential_id, github_app_id, gitlab_token_id, preview_enabled, preview_shared_keys, preview_env_vars, dockerfile_content, compose_content, base_dir, static_build, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(id)
@@ -556,7 +577,7 @@ mod tests {
         .bind(&app.github_app_id)
         .bind(&app.gitlab_token_id)
         .bind(app.preview_enabled)
-        .bind(&app.preview_excluded_keys)
+        .bind(&app.preview_shared_keys)
         .bind(&app.preview_env_vars)
         .bind(&app.dockerfile_content)
         .bind(&app.compose_content)
@@ -635,7 +656,7 @@ mod tests {
 
         let response = set_app_gitlab_token(
             crate::auth::rate_limit::RateLimit,
-            crate::auth::RequireAdmin,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path("app-1".to_string()),
             Json(SetGitLabTokenRequest {
@@ -656,7 +677,7 @@ mod tests {
 
         let response = set_app_gitlab_token(
             crate::auth::rate_limit::RateLimit,
-            crate::auth::RequireAdmin,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path("app-1".to_string()),
             Json(SetGitLabTokenRequest {

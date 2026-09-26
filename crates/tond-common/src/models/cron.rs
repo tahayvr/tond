@@ -32,7 +32,9 @@ pub struct CronJob {
     pub updated_at: String,
     /// Maximum wall-clock seconds the container may run. NULL = no timeout.
     pub timeout_seconds: Option<i64>,
-    /// Environment variables as a JSON object string, e.g. `{"KEY":"val"}`. NULL = none.
+    /// Environment variables: a JSON object, stored encrypted by the server.
+    /// NULL = none. Never serialized.
+    #[serde(skip_serializing)]
     pub env: Option<String>,
     /// Denormalised last-run outcome: "success" | "failed" | NULL (never run).
     pub last_run_status: Option<String>,
@@ -115,8 +117,9 @@ pub struct CronJobResponse {
     pub updated_at: String,
     /// Maximum wall-clock seconds the container may run. null = no timeout.
     pub timeout_seconds: Option<i64>,
-    /// Environment variables as a JSON object, e.g. `{"KEY":"val"}`. null = none.
-    pub env: Option<serde_json::Value>,
+    /// Environment variable keys with masked values (values are secrets).
+    #[serde(default)]
+    pub env: Vec<crate::EnvVarEntry>,
     /// Denormalised last-run outcome: "success" | "failed" | null (never run).
     pub last_run_status: Option<String>,
     /// Concurrency policy: "skip" or "allow".
@@ -167,10 +170,10 @@ pub struct CronVolumeRequest {
     pub container_path: String,
 }
 
-impl From<CronJob> for CronJobResponse {
-    fn from(j: CronJob) -> Self {
-        // Deserialize env JSON string → serde_json::Value for ergonomic API responses.
-        let env = j.env.as_deref().and_then(|s| serde_json::from_str(s).ok());
+impl CronJobResponse {
+    /// Build a response from a job and its (decrypted) env.
+    pub fn new(j: CronJob, env: &std::collections::BTreeMap<String, String>) -> Self {
+        let env = crate::masked_env_entries(env);
         let volumes = j
             .volumes
             .as_deref()
@@ -261,8 +264,14 @@ pub struct UpdateCronJobRequest {
     /// Pass `Some(None)` to clear (remove timeout), `Some(Some(n))` to set.
     #[serde(default, with = "::serde_with::rust::double_option")]
     pub timeout_seconds: Option<Option<i64>>,
-    /// Environment variables. None = no change; Some({}) = clear all.
+    /// Replace all environment variables. None = no change; Some({}) = clear all.
     pub env: Option<std::collections::HashMap<String, String>>,
+    /// Environment variables to add or overwrite (applied after `env`).
+    #[serde(default)]
+    pub env_set: std::collections::BTreeMap<String, String>,
+    /// Environment variables to remove (applied after `env_set`).
+    #[serde(default)]
+    pub env_unset: Vec<String>,
     /// Link/unlink a project. None = no change; Some(None) = unlink; Some(Some(id)) = link.
     #[serde(default, with = "::serde_with::rust::double_option")]
     pub project_id: Option<Option<String>>,
@@ -356,7 +365,8 @@ mod tests {
             ),
         };
 
-        let response = CronJobResponse::from(job);
+        let env = std::collections::BTreeMap::from([("KEY".to_string(), "value".to_string())]);
+        let response = CronJobResponse::new(job, &env);
 
         assert!(
             response.enabled,
@@ -364,8 +374,11 @@ mod tests {
         );
         assert_eq!(
             response.env,
-            Some(serde_json::json!({ "KEY": "value" })),
-            "CronJobResponse should deserialize env JSON into a JSON object"
+            vec![crate::EnvVarEntry {
+                key: "KEY".to_string(),
+                masked: crate::ENV_VALUE_MASK.to_string(),
+            }],
+            "CronJobResponse should list env keys with masked values"
         );
         assert_eq!(
             response.volumes,
@@ -406,16 +419,13 @@ mod tests {
             volumes: Some("still not json".to_string()),
         };
 
-        let response = CronJobResponse::from(job);
+        let response = CronJobResponse::new(job, &Default::default());
 
         assert!(
             !response.enabled,
             "CronJobResponse should convert zero enabled flags to false"
         );
-        assert_eq!(
-            response.env, None,
-            "invalid env JSON should be dropped rather than causing response conversion to fail"
-        );
+        assert!(response.env.is_empty());
         assert_eq!(
             response.volumes, None,
             "invalid volumes JSON should be dropped rather than causing response conversion to fail"

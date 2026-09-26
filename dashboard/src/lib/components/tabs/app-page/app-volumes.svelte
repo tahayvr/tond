@@ -1,8 +1,8 @@
 <script lang="ts">
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
-	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import LockIcon from '~icons/ri/lock-line';
 	import type { App } from '$lib/api';
 
@@ -48,12 +48,11 @@
 	<p class="text-sm text-muted-foreground">
 		Persistent volumes keep data between deploys. Each volume is a directory inside this app's
 		volume folder <span class="font-mono">{volumeDir}</span>; containers can't mount any other host
-		path. Changes take effect on the next deploy.
+		path. Changes take effect on the next deploy. Preview deployments get their own empty copies of
+		these folders, never this app's data.
 	</p>
 
-	{#if volumeError}
-		<ErrorAlert title="Volume not saved" description={volumeError} />
-	{/if}
+	<InlineError title="Volume not saved" message={volumeError} />
 
 	<!-- Current volumes list -->
 	{#if app.volumes.length > 0}
@@ -64,7 +63,7 @@
 						<th class="px-4 py-2 text-left font-medium text-muted-foreground">Container path</th>
 						<th class="px-4 py-2 text-left font-medium text-muted-foreground">Name</th>
 						<th class="px-4 py-2 text-left font-medium text-muted-foreground">Host path</th>
-						<th class="w-16 px-4 py-2"></th>
+						<th class="w-16 px-4 py-2"><span class="sr-only">Actions</span></th>
 					</tr>
 				</thead>
 				<tbody>
@@ -94,7 +93,7 @@
 		<div class="rounded-lg border border-dashed py-12 text-center">
 			<p class="text-muted-foreground">No volumes configured</p>
 			{#if canEdit}
-				<p class="mt-1 text-sm text-muted-foreground/60">
+				<p class="mt-1 text-sm text-muted-foreground">
 					Add a volume below to persist data between deploys
 				</p>
 			{/if}

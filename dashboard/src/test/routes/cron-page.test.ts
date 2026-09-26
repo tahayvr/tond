@@ -44,7 +44,7 @@ describe('cron page', () => {
 							created_at: '2026-01-01T00:00:00.000Z',
 							updated_at: '2026-01-01T00:00:00.000Z',
 							timeout_seconds: null,
-							env: null,
+							env: [],
 							last_run_status: null,
 							concurrency_policy: 'skip',
 							memory_mb: null,
@@ -60,6 +60,6 @@ describe('cron page', () => {
 		});
 
 		expect(screen.queryByText(/loading_schedules/i)).not.toBeInTheDocument();
-		expect(screen.getByText(/1\/1 schedules active/i)).toBeInTheDocument();
+		expect(screen.getByText(/1 of 1 enabled/i)).toBeInTheDocument();
 	});
 });

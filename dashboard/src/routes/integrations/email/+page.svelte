@@ -1,8 +1,12 @@
 <script lang="ts">
+	import PageTitle from '$lib/components/nav/page-title.svelte';
 	import ChevronLeft from '~icons/ri/arrow-left-s-line';
 	import Mail from '~icons/ri/mail-line';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
+	import SavedSecretField, {
+		secretFieldUpdate
+	} from '$lib/components/secrets/saved-secret-field.svelte';
 	import NotificationChannelList from '$lib/components/integrations/notification-channel-list.svelte';
 	import { setUiContext, clearUiContext, integrationsContext } from '$lib/ui-context.svelte';
 	import type { Integration, IntegrationConfig, EmailConfig } from '$lib/api';
@@ -17,7 +21,10 @@
 	let smtpHost = $state('');
 	let smtpPort = $state('587');
 	let smtpUser = $state('');
+	// The SMTP password is write-only: a saved one is never shown or prefilled.
 	let smtpPassword = $state('');
+	let passwordSaved = $state(false);
+	let passwordReplacing = $state(false);
 	let smtpEncryption = $state('starttls');
 	let toAddrs = $state('');
 
@@ -33,13 +40,22 @@
 			.map((a) => a.trim())
 			.filter(Boolean);
 		if (recipients.length === 0) throw new Error('At least one recipient address is required');
+		const password = secretFieldUpdate({
+			saved: passwordSaved,
+			replacing: passwordReplacing,
+			removed: false,
+			value: smtpPassword
+		});
+		if (password === undefined && (!passwordSaved || passwordReplacing)) {
+			throw new Error('SMTP password is required');
+		}
 		return {
 			from_name: fromName.trim() || 'Tond',
 			from_addr: fromAddr.trim(),
 			smtp_host: smtpHost.trim(),
 			smtp_port: port,
 			smtp_user: smtpUser.trim(),
-			smtp_password: smtpPassword,
+			...(password !== undefined && { smtp_password: password }),
 			smtp_encryption: smtpEncryption,
 			to_addrs: recipients
 		};
@@ -52,18 +68,22 @@
 		smtpPort = '587';
 		smtpUser = '';
 		smtpPassword = '';
+		passwordSaved = false;
+		passwordReplacing = false;
 		smtpEncryption = 'starttls';
 		toAddrs = '';
 	}
 
-	function loadConfig(config: IntegrationConfig) {
+	function loadConfig(config: IntegrationConfig, savedSecrets: string[]) {
 		const c = config as EmailConfig;
 		fromName = c.from_name ?? '';
 		fromAddr = c.from_addr;
 		smtpHost = c.smtp_host;
 		smtpPort = String(c.smtp_port);
 		smtpUser = c.smtp_user;
-		smtpPassword = c.smtp_password;
+		smtpPassword = '';
+		passwordReplacing = false;
+		passwordSaved = savedSecrets.includes('smtp_password');
 		smtpEncryption = c.smtp_encryption;
 		toAddrs = c.to_addrs.join(', ');
 	}
@@ -74,14 +94,20 @@
 	});
 </script>
 
+<PageTitle title="Email · Integrations" />
+
 <div class="space-y-8">
 	<div class="flex h-14 items-center gap-4">
-		<a href="/integrations" class="text-muted-foreground hover:text-foreground">
+		<a
+			href="/integrations"
+			class="text-muted-foreground hover:text-foreground"
+			aria-label="Back to integrations"
+		>
 			<ChevronLeft class="h-5 w-5" />
 		</a>
 		<div class="flex items-center gap-3">
 			<Mail class="h-6 w-6" />
-			<h2 class="text-3xl font-extrabold uppercase">Email (SMTP)</h2>
+			<h1 class="text-2xl font-extrabold sm:text-3xl">Email (SMTP)</h1>
 		</div>
 	</div>
 
@@ -137,12 +163,11 @@
 				</div>
 				<div class="grid gap-1.5">
 					<Label class="text-xs" for="em-pass">SMTP Password</Label>
-					<Input
+					<SavedSecretField
 						id="em-pass"
-						type="password"
-						class="h-8 text-xs"
+						saved={passwordSaved}
 						bind:value={smtpPassword}
-						placeholder="••••••••"
+						bind:replacing={passwordReplacing}
 					/>
 				</div>
 				<div class="grid gap-1.5">

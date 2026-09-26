@@ -1,8 +1,10 @@
 <script lang="ts">
+	import PageTitle from '$lib/components/nav/page-title.svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { checkSetupToken, setupAdmin } from '$lib/api';
 	import { setAuthenticated } from '$lib/auth.svelte';
+	import { passwordProblem } from '$lib/access';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import TondLogo from '$lib/components/brand/tond-logo.svelte';
@@ -26,15 +28,14 @@
 	let error = $state('');
 	let loading = $state(false);
 
+	// One length-based policy (no composition rules); the server also refuses
+	// common and breached passwords.
 	const requirements = $derived([
-		{ label: 'at least 12 characters', met: password.length >= 12 },
-		{ label: 'one uppercase letter (A–Z)', met: /[A-Z]/.test(password) },
-		{ label: 'one lowercase letter (a–z)', met: /[a-z]/.test(password) },
-		{ label: 'one number (0–9)', met: /[0-9]/.test(password) },
-		{ label: 'one special character (!@#$…)', met: /[^A-Za-z0-9]/.test(password) }
+		{ label: 'at least 12 characters', met: [...password].length >= 12 },
+		{ label: 'not a common or breached password (checked when you submit)', met: true }
 	]);
 
-	const passwordValid = $derived(requirements.every((r) => r.met));
+	const passwordValid = $derived(passwordProblem(password) === null);
 
 	async function verifyToken(candidate: string) {
 		const trimmed = candidate.trim();
@@ -68,7 +69,7 @@
 		error = '';
 
 		if (!passwordValid) {
-			error = 'password does not meet all requirements';
+			error = passwordProblem(password) ?? 'password does not meet the requirements';
 			return;
 		}
 		if (password !== confirmPassword) {
@@ -88,6 +89,8 @@
 		}
 	}
 </script>
+
+<PageTitle title="Set up" />
 
 <div class="flex min-h-[80vh] flex-col items-center justify-center px-4">
 	<div class="w-full max-w-lg space-y-8 font-mono">
@@ -131,7 +134,7 @@
 							placeholder="64-character token"
 							autocomplete="off"
 							spellcheck={false}
-							class="border-none bg-transparent p-1 font-mono text-sm shadow-none placeholder:text-muted-foreground/40 focus-visible:ring-0"
+							class="border-none bg-transparent p-1 font-mono text-sm shadow-none placeholder:text-muted-foreground focus-visible:ring-2"
 						/>
 					</div>
 					<div class="h-px bg-border"></div>
@@ -161,7 +164,7 @@
 							placeholder="admin@example.com"
 							required
 							autocomplete="email"
-							class="border-none bg-transparent p-1 font-mono text-sm shadow-none placeholder:text-muted-foreground/40 focus-visible:ring-0"
+							class="border-none bg-transparent p-1 font-mono text-sm shadow-none placeholder:text-muted-foreground focus-visible:ring-2"
 						/>
 					</div>
 					<div class="h-px bg-border"></div>
@@ -179,18 +182,14 @@
 							required
 							minlength={12}
 							autocomplete="new-password"
-							class="border-none bg-transparent p-1 font-mono text-sm shadow-none placeholder:text-muted-foreground/40 focus-visible:ring-0"
+							class="border-none bg-transparent p-1 font-mono text-sm shadow-none placeholder:text-muted-foreground focus-visible:ring-2"
 						/>
 					</div>
 					<div class="h-px bg-border"></div>
 					{#if password.length > 0}
 						<ul class="mt-2 space-y-0.5">
 							{#each requirements as req (req.label)}
-								<li
-									class="text-xs {req.met
-										? 'text-green-600 dark:text-green-500'
-										: 'text-muted-foreground'}"
-								>
+								<li class="text-xs {req.met ? 'text-success' : 'text-muted-foreground'}">
 									{req.met ? '✓' : '○'}
 									{req.label}
 								</li>
@@ -213,7 +212,7 @@
 							required
 							minlength={12}
 							autocomplete="new-password"
-							class="border-none bg-transparent p-1 font-mono text-sm shadow-none placeholder:text-muted-foreground/40 focus-visible:ring-0"
+							class="border-none bg-transparent p-1 font-mono text-sm shadow-none placeholder:text-muted-foreground focus-visible:ring-2"
 						/>
 					</div>
 					<div class="h-px bg-border"></div>

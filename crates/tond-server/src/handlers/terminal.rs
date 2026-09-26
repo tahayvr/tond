@@ -2,13 +2,13 @@
 //
 // Two kinds of sessions, both over a WebSocket (`/api/terminal/ws`):
 //
-//   * Container exec (`docker exec` into a running app or database) — admins,
-//     for app debugging.
+//   * Container exec (`docker exec` into a running app or database) — for app
+//     debugging. Needs the `terminal:host` scope (admins).
 //   * Host shell (`su -l $TOND_TERMINAL_USER`) — off by default. It can only be
 //     switched on from the host itself (`tond settings host-terminal on`, which
 //     calls PUT /api/settings/host-terminal over the root-only Unix socket),
-//     so no dashboard session or API key can enable it. When on, it is limited
-//     to the owner (the admin role today) and every session needs step-up
+//     so no dashboard session or API token can enable it. When on, it needs the
+//     `terminal:host` scope (admins) and every session needs step-up
 //     re-authentication: the password, plus a TOTP code when 2FA is enabled.
 //
 // Opening a session is two steps. The dashboard first POSTs to
@@ -16,8 +16,8 @@
 // for the host shell); the server returns a single-use ticket valid for 30
 // seconds, bound to the user, the target and the requesting dashboard origin.
 // The WebSocket then presents `?ticket=`; the ticket is consumed atomically and
-// the socket's Origin must match the one it was issued to. API keys can't
-// obtain tickets. Sessions close after 15 minutes without input, and opening
+// the socket's Origin must match the one it was issued to. API tokens can't
+// obtain tickets (they can't do step-up). Sessions close after 15 minutes without input, and opening
 // and closing are written to the audit log.
 
 use std::{
@@ -46,13 +46,14 @@ use tokio::{
     task::{JoinHandle, spawn_blocking},
     time::Instant,
 };
-use tond_common::{ApiResponse, TondError, User, generate_raw_key, hash_key};
+use tond_common::{ApiResponse, Scope, TondError, User, generate_raw_key, hash_key};
 
 use crate::{
-    audit_log::write_audit_log,
+    audit_log::{AuditActor, AuditEntry, record, write_audit_log},
     auth::{
-        ClientIp, LocalPeer, RateLimit, RequireAuth,
+        Authz, ClientIp, LocalPeer, Principal, RateLimit,
         csrf::{origin_allowed, request_origin},
+        scope,
     },
     error::AppError,
     handlers::auth::{Rejection, extract_session_token, validate_session, verify_step_up},
@@ -181,7 +182,7 @@ struct TerminalSessionRuntime {
 
 pub async fn list_targets(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsRead>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     let shell_user = terminal_shell_user_from_env()?;
@@ -217,7 +218,7 @@ pub async fn host_terminal_enabled(db: &sqlx::SqlitePool) -> Result<bool, sqlx::
 
 pub async fn get_host_terminal(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Principal,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     let enabled = host_terminal_enabled(&state.db).await?;
@@ -258,17 +259,15 @@ pub async fn set_host_terminal(
         return AppError::from(e).into_response();
     }
 
-    write_audit_log(
+    record(
         &state.db,
-        None,
-        None,
-        if req.enabled {
+        &AuditActor::local_socket(),
+        AuditEntry::new(if req.enabled {
             "host_terminal_enabled"
         } else {
             "host_terminal_disabled"
-        },
-        "root (tond CLI)",
-        None,
+        })
+        .kind("settings"),
     )
     .await;
 
@@ -312,12 +311,12 @@ async fn issue_ticket(
     if headers.contains_key(header::AUTHORIZATION) {
         return Err(reject(
             StatusCode::FORBIDDEN,
-            "Terminal sessions can't be opened with an API key. Sign in to the dashboard.",
+            "Terminal sessions can't be opened with an API token. Sign in to the dashboard.",
         ));
     }
     let token = extract_session_token(headers)
         .ok_or_else(|| reject(StatusCode::UNAUTHORIZED, "Not authenticated"))?;
-    let user = match validate_session(&state.db, &token).await {
+    let user = match validate_session(state, &token).await {
         Ok(Some(user)) => user,
         Ok(None) => {
             return Err(reject(
@@ -327,10 +326,10 @@ async fn issue_ticket(
         }
         Err(e) => return Err(Box::new(AppError::from(e).into_response())),
     };
-    if user.role != "admin" {
+    if !user.role().scopes().contains(Scope::TerminalHost) {
         return Err(reject(
             StatusCode::FORBIDDEN,
-            "Only admins can open terminal sessions",
+            "Your role doesn't allow terminal sessions: they need the terminal:host permission. Ask an admin of this server.",
         ));
     }
 
@@ -440,11 +439,13 @@ async fn redeem_ticket(
         .fetch_optional(&state.db)
         .await
         .map_err(|e| Box::new(AppError::from(e).into_response()))?
-        .filter(|u: &User| u.role == "admin")
+        .filter(|u: &User| {
+            u.disabled_at.is_none() && u.role().scopes().contains(Scope::TerminalHost)
+        })
         .ok_or_else(|| {
             reject(
                 StatusCode::FORBIDDEN,
-                "Only admins can open terminal sessions",
+                "Your role doesn't allow terminal sessions: they need the terminal:host permission.",
             )
         })?;
 
@@ -473,13 +474,14 @@ async fn redeem_ticket(
 
 pub async fn terminal_ws(
     ws: WebSocketUpgrade,
+    ClientIp(ip): ClientIp,
     State(state): State<AppState>,
     Query(query): Query<TerminalWsQuery>,
     headers: HeaderMap,
 ) -> Response {
     match redeem_ticket(&state, &query.ticket, request_origin(&headers)).await {
         Ok(grant) => ws
-            .on_upgrade(move |socket| handle_terminal_socket(socket, state, grant))
+            .on_upgrade(move |socket| handle_terminal_socket(socket, state, grant, ip))
             .into_response(),
         Err(response) => *response,
     }
@@ -505,7 +507,12 @@ async fn target_label(db: &sqlx::SqlitePool, kind: &TerminalTargetKind, id: &str
     )
 }
 
-async fn handle_terminal_socket(mut socket: WebSocket, state: AppState, grant: TerminalGrant) {
+async fn handle_terminal_socket(
+    mut socket: WebSocket,
+    state: AppState,
+    grant: TerminalGrant,
+    ip: Option<IpAddr>,
+) {
     let shell_user = match terminal_shell_user_from_env() {
         Ok(user) => user,
         Err(err) => {
@@ -541,12 +548,13 @@ async fn handle_terminal_socket(mut socket: WebSocket, state: AppState, grant: T
         TerminalTargetKind::App => (Some(grant.target_id.as_str()), None::<&str>),
         _ => (None, None),
     };
+    let actor = AuditActor::user(&grant.user.id, &grant.user.email, ip.map(|i| i.to_string()));
     write_audit_log(
         &state.db,
         app_id,
         app_name,
         "terminal_opened",
-        &grant.user.email,
+        &actor,
         Some(&label),
     )
     .await;
@@ -559,7 +567,7 @@ async fn handle_terminal_socket(mut socket: WebSocket, state: AppState, grant: T
         app_id,
         app_name,
         "terminal_closed",
-        &grant.user.email,
+        &actor,
         Some(&format!(
             "{label}; {close_reason} after {}s",
             started.elapsed().as_secs()
@@ -798,6 +806,9 @@ fn spawn_terminal_process(spec: &TerminalSessionSpec) -> anyhow::Result<Terminal
 
     let command = build_terminal_command(spec);
     let child = pair.slave.spawn_command(command)?;
+    if let Some(pid) = child.process_id() {
+        crate::process::reset_oom_score(pid);
+    }
     let writer = pair.master.take_writer()?;
 
     Ok(TerminalSessionRuntime {
@@ -1036,6 +1047,7 @@ mod tests {
     use sqlx::SqlitePool;
     use std::sync::Arc;
     use tokio::sync::RwLock;
+    use tond_common::Role;
     use tond_common::ServerSettings;
 
     use crate::auth::RateLimiter;
@@ -1216,15 +1228,19 @@ mod tests {
         seed_database(&state, "db-running", "postgres", "running", Some("cont-db")).await;
         seed_database(&state, "db-pending", "redis", "pending", Some("cont-redis")).await;
 
-        let response = list_targets(RateLimit, RequireAuth, State(state))
-            .await
-            .unwrap_or_else(|err| {
-                panic!(
-                    "list_targets should succeed for authenticated requests: {}",
-                    err.0
-                )
-            })
-            .into_response();
+        let response = list_targets(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            State(state),
+        )
+        .await
+        .unwrap_or_else(|err| {
+            panic!(
+                "list_targets should succeed for authenticated requests: {}",
+                err.0
+            )
+        })
+        .into_response();
         let body = response_json(response).await;
         let targets: Vec<TerminalTargetResponse> =
             serde_json::from_value(body.get("data").cloned().unwrap_or_else(|| {
@@ -1418,7 +1434,7 @@ mod tests {
         assert_eq!(
             remote.status(),
             StatusCode::FORBIDDEN,
-            "dashboard sessions and API keys must not be able to enable the host terminal"
+            "dashboard sessions and API tokens must not be able to enable the host terminal"
         );
         assert!(
             !host_terminal_enabled(&state.db)
@@ -1503,7 +1519,7 @@ mod tests {
             ticket_request(TerminalTargetKind::App, "app-1", None),
         )
         .await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "API keys must be refused");
+        assert_eq!(status, StatusCode::FORBIDDEN, "API tokens must be refused");
 
         let (status, _) = request_ticket(
             &state,
@@ -1626,19 +1642,27 @@ mod tests {
     #[tokio::test]
     async fn list_targets_reports_host_terminal_state() {
         let state = test_state().await;
-        let response = list_targets(RateLimit, RequireAuth, State(state.clone()))
-            .await
-            .unwrap_or_else(|err| panic!("{}", err.0))
-            .into_response();
+        let response = list_targets(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            State(state.clone()),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{}", err.0))
+        .into_response();
         let body = response_json(response).await;
         assert_eq!(body["data"][0]["enabled"], serde_json::json!(false));
         assert_eq!(body["data"][0]["requires_step_up"], serde_json::json!(true));
 
         enable_host_terminal(&state).await;
-        let response = list_targets(RateLimit, RequireAuth, State(state))
-            .await
-            .unwrap_or_else(|err| panic!("{}", err.0))
-            .into_response();
+        let response = list_targets(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            State(state),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{}", err.0))
+        .into_response();
         let body = response_json(response).await;
         assert_eq!(body["data"][0]["enabled"], serde_json::json!(true));
     }

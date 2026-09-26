@@ -1,8 +1,9 @@
 // health.rs — background health check poller
 //
-// run_health_checker(state) is spawned once at startup. It loops forever,
-// waking every second to check if any running app's health check interval
-// has elapsed.
+// run_health_checker(state) is spawned once at startup. It sleeps until the
+// next app's health check is due (checks due within CHECK_SLACK of each other
+// share one wakeup) or until the apps table changes; with no health-checked
+// app it sleeps for up to IDLE_SLEEP. It used to wake every second.
 //
 // For each running app with a health_check_path set:
 //   1. HTTP GET http://127.0.0.1:{host_port}{health_check_path} (5 s timeout)
@@ -18,11 +19,37 @@
 // The last_health_check timestamp is tracked in memory (HashMap keyed by
 // app_id) to avoid storing it in the DB and to reset cleanly on restart.
 
+use crate::runtime::changes::{Table, Watch};
+use crate::runtime::loops;
 use crate::state::AppState;
 use crate::{docker::start_container, docker::stop_container};
 use std::collections::HashMap;
-use tokio::time::{Duration, sleep};
+use tokio::time::Duration;
 use tond_common::App;
+
+/// Checks due within this window of each other run in the same wakeup.
+const CHECK_SLACK: Duration = Duration::from_secs(5);
+/// Longest sleep when no app has a health check (a change to apps wakes us).
+const IDLE_SLEEP: Duration = Duration::from_secs(3600);
+/// Never re-query more often than this.
+const MIN_SLEEP: Duration = Duration::from_secs(1);
+
+/// When the next check is due, given each app's last check and interval.
+fn next_due(
+    last_checked: &HashMap<String, tokio::time::Instant>,
+    apps: &[(String, i64)],
+    now: tokio::time::Instant,
+) -> Duration {
+    apps.iter()
+        .map(|(id, interval)| {
+            let interval = Duration::from_secs((*interval).max(1) as u64);
+            last_checked.get(id).map_or(Duration::ZERO, |last| {
+                (*last + interval).saturating_duration_since(now)
+            })
+        })
+        .min()
+        .map_or(IDLE_SLEEP, |d| d.max(MIN_SLEEP))
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum HealthUpdate {
@@ -87,8 +114,13 @@ pub async fn run_health_checker(state: AppState) {
         .build()
         .expect("Failed to build reqwest client for health checker");
 
+    let lp = loops::register("health");
+    let mut watch = Watch::new(&[Table::Apps]);
+    let mut sleep_for = Duration::ZERO;
+
     loop {
-        sleep(Duration::from_secs(1)).await;
+        lp.wait(Some(sleep_for), &mut watch).await;
+        let _run = lp.run();
 
         // Fetch all running apps that have a health check path configured
         let apps: Vec<App> = match sqlx::query_as::<_, App>(
@@ -100,17 +132,25 @@ pub async fn run_health_checker(state: AppState) {
             Ok(rows) => rows,
             Err(e) => {
                 tracing::warn!("Health checker: failed to query apps: {}", e);
+                sleep_for = Duration::from_secs(30);
                 continue;
             }
         };
 
         let now = tokio::time::Instant::now();
+        let schedule: Vec<(String, i64)> = apps
+            .iter()
+            .map(|a| (a.id.clone(), a.health_check_interval))
+            .collect();
+        // Forget apps that no longer have a health check.
+        last_checked.retain(|id, _| schedule.iter().any(|(s, _)| s == id));
 
         for app in apps {
             let last = last_checked.get(&app.id).copied();
 
-            // Skip if the interval hasn't elapsed yet
-            if !should_run_check(last, now, app.health_check_interval) {
+            // Skip if the interval hasn't elapsed yet (checks due within
+            // CHECK_SLACK run now, sharing this wakeup)
+            if !should_run_check(last, now + CHECK_SLACK, app.health_check_interval) {
                 continue;
             }
 
@@ -216,6 +256,8 @@ pub async fn run_health_checker(state: AppState) {
                 }
             }
         }
+
+        sleep_for = next_due(&last_checked, &schedule, tokio::time::Instant::now());
     }
 }
 
@@ -271,7 +313,7 @@ mod tests {
         app.container_id = container_id.map(ToString::to_string);
 
         sqlx::query(
-            "INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, host_port, memory_limit, cpu_limit, status, env_vars, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, deploy_key_pub, project_id, registry_credential_id, github_app_id, gitlab_token_id, preview_enabled, preview_excluded_keys, preview_env_vars, dockerfile_content, compose_content, base_dir, static_build, created_at, updated_at)
+            "INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, host_port, memory_limit, cpu_limit, status, env_vars, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, deploy_key_pub, project_id, registry_credential_id, github_app_id, gitlab_token_id, preview_enabled, preview_shared_keys, preview_env_vars, dockerfile_content, compose_content, base_dir, static_build, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&app.id)
@@ -303,7 +345,7 @@ mod tests {
         .bind(&app.github_app_id)
         .bind(&app.gitlab_token_id)
         .bind(app.preview_enabled)
-        .bind(&app.preview_excluded_keys)
+        .bind(&app.preview_shared_keys)
         .bind(&app.preview_env_vars)
         .bind(&app.dockerfile_content)
         .bind(&app.compose_content)
@@ -314,6 +356,24 @@ mod tests {
         .execute(&state.db)
         .await
         .unwrap_or_else(|err| panic!("failed to seed health app {name}: {err}"));
+    }
+
+    #[test]
+    fn next_due_sleeps_until_the_earliest_check_and_long_when_idle() {
+        let now = tokio::time::Instant::now();
+        let mut last = HashMap::new();
+        assert_eq!(next_due(&last, &[], now), IDLE_SLEEP, "nothing to check");
+        assert_eq!(
+            next_due(&last, &[("a".into(), 30)], now),
+            MIN_SLEEP,
+            "never-checked apps are due now (but never busy-loop)"
+        );
+        last.insert("a".to_string(), now);
+        last.insert("b".to_string(), now - Duration::from_secs(50));
+        assert_eq!(
+            next_due(&last, &[("a".into(), 30), ("b".into(), 60)], now),
+            Duration::from_secs(10)
+        );
     }
 
     #[test]

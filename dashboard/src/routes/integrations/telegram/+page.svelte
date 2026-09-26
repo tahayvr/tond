@@ -1,8 +1,12 @@
 <script lang="ts">
+	import PageTitle from '$lib/components/nav/page-title.svelte';
 	import ChevronLeft from '~icons/ri/arrow-left-s-line';
 	import Send from '~icons/ri/send-plane-line';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
+	import SavedSecretField, {
+		secretFieldUpdate
+	} from '$lib/components/secrets/saved-secret-field.svelte';
 	import NotificationChannelList from '$lib/components/integrations/notification-channel-list.svelte';
 	import { setUiContext, clearUiContext, integrationsContext } from '$lib/ui-context.svelte';
 	import type { Integration, IntegrationConfig, TelegramConfig } from '$lib/api';
@@ -12,15 +16,26 @@
 	let integrations = $derived((data as { integrations: Integration[] }).integrations);
 
 	// ── Form fields ───────────────────────────────────────────────────────────
+	// The bot token is write-only: a saved one is never shown or prefilled.
 	let botToken = $state('');
+	let tokenSaved = $state(false);
+	let tokenReplacing = $state(false);
 	let chatId = $state('');
 	let threadId = $state('');
 
 	function buildConfig(): IntegrationConfig {
-		if (!botToken.trim()) throw new Error('Bot Token is required');
+		const token = secretFieldUpdate({
+			saved: tokenSaved,
+			replacing: tokenReplacing,
+			removed: false,
+			value: botToken
+		});
+		if (token === undefined && (!tokenSaved || tokenReplacing)) {
+			throw new Error('Bot Token is required');
+		}
 		if (!chatId.trim()) throw new Error('Chat ID is required');
 		return {
-			bot_token: botToken.trim(),
+			...(token !== undefined && { bot_token: token }),
 			chat_id: chatId.trim(),
 			thread_id: threadId.trim() || undefined
 		};
@@ -28,13 +43,17 @@
 
 	function resetConfig() {
 		botToken = '';
+		tokenSaved = false;
+		tokenReplacing = false;
 		chatId = '';
 		threadId = '';
 	}
 
-	function loadConfig(config: IntegrationConfig) {
+	function loadConfig(config: IntegrationConfig, savedSecrets: string[]) {
 		const c = config as TelegramConfig;
-		botToken = c.bot_token;
+		botToken = '';
+		tokenReplacing = false;
+		tokenSaved = savedSecrets.includes('bot_token');
 		chatId = c.chat_id;
 		threadId = c.thread_id ?? '';
 	}
@@ -45,14 +64,20 @@
 	});
 </script>
 
+<PageTitle title="Telegram · Integrations" />
+
 <div class="space-y-8">
 	<div class="flex h-14 items-center gap-4">
-		<a href="/integrations" class="text-muted-foreground hover:text-foreground">
+		<a
+			href="/integrations"
+			class="text-muted-foreground hover:text-foreground"
+			aria-label="Back to integrations"
+		>
 			<ChevronLeft class="h-5 w-5" />
 		</a>
 		<div class="flex items-center gap-3">
 			<Send class="h-6 w-6" />
-			<h2 class="text-3xl font-extrabold uppercase">Telegram</h2>
+			<h1 class="text-2xl font-extrabold sm:text-3xl">Telegram</h1>
 		</div>
 	</div>
 
@@ -68,10 +93,11 @@
 			<div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
 				<div class="grid gap-1.5">
 					<Label class="text-xs" for="tg-token">Bot Token</Label>
-					<Input
+					<SavedSecretField
 						id="tg-token"
-						class="h-8 text-xs"
+						saved={tokenSaved}
 						bind:value={botToken}
+						bind:replacing={tokenReplacing}
 						placeholder="123456:ABCdef..."
 					/>
 				</div>

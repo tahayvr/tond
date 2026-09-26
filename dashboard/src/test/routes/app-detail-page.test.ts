@@ -3,13 +3,6 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { App } from '$lib/api';
 
-const state = vi.hoisted(() => ({
-	page: {
-		url: new URL('http://localhost/apps/app_1'),
-		params: { id: 'app_1' }
-	}
-}));
-
 const { goto, setUiContext, clearUiContext, appContext, openFeedPanel } = vi.hoisted(() => ({
 	goto: vi.fn(),
 	setUiContext: vi.fn(),
@@ -38,6 +31,7 @@ const api = vi.hoisted(() => ({
 	setWebhookSecret: vi.fn(),
 	getWebhookConfig: vi.fn(),
 	rotateWebhookSecret: vi.fn(),
+	revealWebhookSecret: vi.fn(),
 	setAutoDeploy: vi.fn(),
 	updateSource: vi.fn(),
 	listPreviews: vi.fn(),
@@ -46,7 +40,7 @@ const api = vi.hoisted(() => ({
 	deletePreview: vi.fn(),
 	updatePreviewConfig: vi.fn(),
 	listOpenPRs: vi.fn(),
-	getAppMetrics: vi.fn(),
+	getMetrics: vi.fn(),
 	listRegistryCredentials: vi.fn(),
 	createRegistryCredential: vi.fn(),
 	deleteRegistryCredential: vi.fn(),
@@ -55,21 +49,27 @@ const api = vi.hoisted(() => ({
 	listGitHubRepos: vi.fn(),
 	listGitHubBranches: vi.fn(),
 	setAppGitHubApp: vi.fn(),
-	getApp: vi.fn()
+	getApp: vi.fn(),
+	updateContainerPort: vi.fn(),
+	openLogStream: vi.fn((url: string) => {
+		const ws = new WebSocket(url);
+		return () => ws.close();
+	})
 }));
 
-vi.mock('$lib/auth.svelte', () => ({ isAdmin: () => true }));
+const authz = vi.hoisted(() => ({ deny: new Set<string>() }));
+vi.mock('$lib/auth.svelte', () => ({
+	isAdmin: () => true,
+	can: (scope: string) => !authz.deny.has(scope)
+}));
 
-vi.mock('$app/state', () => ({
-	page: state.page
+vi.mock('$app/state', async () => ({
+	page: (await import('../mocks/page-state.svelte')).page
 }));
 
 vi.mock('$app/navigation', () => ({
-	goto
-}));
-
-vi.mock('$lib/components/dialogs/confirm-delete-dialog.svelte', async () => ({
-	default: (await import('../mocks/ConfirmDeleteDialog.svelte')).default
+	goto,
+	invalidateAll: vi.fn()
 }));
 
 vi.mock('$lib/components/tabs/app-page/app-overview.svelte', async () => ({
@@ -92,6 +92,14 @@ vi.mock('$lib/components/tabs/app-page/app-domain.svelte', async () => ({
 	default: (await import('../mocks/EmptyComponent.svelte')).default
 }));
 
+vi.mock('$lib/components/tabs/app-page/app-readiness.svelte', async () => ({
+	default: (await import('../mocks/EmptyComponent.svelte')).default
+}));
+
+vi.mock('$lib/components/tabs/app-page/app-port.svelte', async () => ({
+	default: (await import('../mocks/EmptyComponent.svelte')).default
+}));
+
 vi.mock('$lib/components/tabs/app-page/app-health.svelte', async () => ({
 	default: (await import('../mocks/EmptyComponent.svelte')).default
 }));
@@ -104,7 +112,7 @@ vi.mock('$lib/components/tabs/app-page/app-previews.svelte', async () => ({
 	default: (await import('../mocks/EmptyComponent.svelte')).default
 }));
 
-vi.mock('$lib/components/tabs/app-page/app-metrics.svelte', async () => ({
+vi.mock('$lib/components/metrics/time-chart.svelte', async () => ({
 	default: (await import('../mocks/EmptyComponent.svelte')).default
 }));
 
@@ -120,10 +128,14 @@ vi.mock('$lib/ui-context.svelte', () => ({
 }));
 
 vi.mock('$lib/api', () => ({
-	...api
+	...api,
+	appReadiness: (a: { readiness?: string }) => a.readiness ?? 'http'
 }));
 
 import AppDetailPage from '../../routes/apps/[id]/+page.svelte';
+import { setPageUrl } from '../mocks/page-state.svelte';
+import { confirmDialog, renderConfirmHost } from '../confirm';
+import { tick } from 'svelte';
 
 const app: App = {
 	id: 'app_1',
@@ -154,19 +166,26 @@ const app: App = {
 	base_dir: null,
 	static_build: false,
 	preview_enabled: false,
-	preview_excluded_keys: [],
+	preview_shared_keys: [],
 	created_at: '2026-01-01T00:00:00.000Z',
 	updated_at: '2026-01-01T00:00:00.000Z'
 };
 
 function renderPage(appOverride = app) {
+	renderConfirmHost();
 	render(AppDetailPage, { props: { data: { app: appOverride }, params: { id: 'app_1' } } });
+}
+
+/** Tabs live in the URL: "navigate" by changing the page URL. */
+async function goToTab(query: string) {
+	setPageUrl(`http://localhost/apps/app_1${query}`, { id: 'app_1' });
+	await tick();
 }
 
 describe('apps/[id] page', () => {
 	beforeEach(() => {
-		state.page.url = new URL('http://localhost/apps/app_1');
-		state.page.params = { id: 'app_1' };
+		setPageUrl('http://localhost/apps/app_1', { id: 'app_1' });
+		authz.deny.clear();
 		goto.mockReset();
 		setUiContext.mockReset();
 		clearUiContext.mockReset();
@@ -183,12 +202,25 @@ describe('apps/[id] page', () => {
 			preview_domain: 'example-previews.com'
 		});
 		api.listOpenPRs.mockResolvedValue([]);
-		api.getAppMetrics.mockResolvedValue([]);
+		api.getMetrics.mockResolvedValue({
+			range: '1h',
+			step: 30,
+			from: 0,
+			to: 3600,
+			mem_limit: null,
+			series: { t: [], cpu: [], cpu_max: [], mem: [], mem_max: [], rx: [], tx: [], pids: [] },
+			events: [],
+			current: null
+		});
 		api.listRegistryCredentials.mockResolvedValue([]);
 		api.listGitHubApps.mockResolvedValue([]);
 		api.listGitHubRepos.mockResolvedValue([]);
 		api.listGitHubBranches.mockResolvedValue([]);
 		api.getApp.mockResolvedValue({ ...app });
+		api.openLogStream.mockImplementation((url: string) => {
+			const ws = new WebSocket(url);
+			return () => ws.close();
+		});
 	});
 
 	it('renders app detail from route data without an initial loading state', () => {
@@ -203,27 +235,50 @@ describe('apps/[id] page', () => {
 	});
 
 	it('fills the settings forms with the saved values on first load', async () => {
-		const user = userEvent.setup();
 		renderPage({ ...app, source_url: 'https://github.com/o/r' });
 
-		await user.click(screen.getByRole('tab', { name: 'Git' }));
+		await goToTab('?tab=settings&section=git');
 		expect(screen.getByLabelText('Git URL')).toHaveValue('https://github.com/o/r');
 
 		expect(api.getApp).not.toHaveBeenCalled();
 	});
 
-	it('re-deploys the app and refreshes its data', async () => {
-		api.deployApp.mockResolvedValue(undefined);
-		api.getApp.mockResolvedValue({ ...app, status: 'building' });
+	it('re-deploys the app and opens the live deploy view', async () => {
+		api.deployApp.mockResolvedValue({
+			message: 'Deployment started',
+			app_id: 'app_1',
+			deployment_id: 'dep_9'
+		});
 
 		const user = userEvent.setup();
 		renderPage();
 
-		await user.click(screen.getByRole('button', { name: /re-deploy/i }));
+		await user.click(screen.getByRole('button', { name: /^deploy$/i }));
 
-		expect(openFeedPanel).toHaveBeenCalledOnce();
 		expect(api.deployApp).toHaveBeenCalledWith('app_1');
-		expect(api.getApp).toHaveBeenCalledWith('app_1');
+		expect(goto).toHaveBeenCalledWith('/apps/app_1/deployments/dep_9');
+	});
+
+	it('links to the running deployment while the app builds', async () => {
+		api.listDeployments.mockResolvedValue([
+			{ id: 'dep_live', status: 'running' },
+			{ id: 'dep_old', status: 'succeeded' }
+		]);
+		renderPage({ ...app, status: 'building' });
+
+		const link = await screen.findByRole('link', { name: /view deploy/i });
+		expect(link).toHaveAttribute('href', '/apps/app_1/deployments/dep_live');
+	});
+
+	it('opens the tab named in ?tab=', async () => {
+		setPageUrl('http://localhost/apps/app_1?tab=deployments', { id: 'app_1' });
+		renderPage();
+		expect(
+			within(screen.getByRole('navigation', { name: 'App sections' })).getByRole('link', {
+				name: 'Deployments'
+			})
+		).toHaveAttribute('aria-current', 'page');
+		await vi.waitFor(() => expect(api.listDeployments).toHaveBeenCalledWith('app_1'));
 	});
 
 	it('stops a running app and refreshes its data', async () => {
@@ -234,6 +289,8 @@ describe('apps/[id] page', () => {
 		renderPage();
 
 		await user.click(screen.getByRole('button', { name: /^stop$/i }));
+		expect(api.stopApp).not.toHaveBeenCalled();
+		await confirmDialog(user);
 
 		expect(openFeedPanel).toHaveBeenCalledOnce();
 		expect(api.stopApp).toHaveBeenCalledWith('app_1');
@@ -254,17 +311,96 @@ describe('apps/[id] page', () => {
 		expect(api.getApp).toHaveBeenCalledWith('app_1');
 	});
 
-	it('deletes the app after confirmation and redirects home', async () => {
+	it('keeps delete out of the header and requires typing the name in the danger zone', async () => {
 		api.deleteApp.mockResolvedValue(undefined);
 
 		const user = userEvent.setup();
 		renderPage();
 
-		await user.click(screen.getByRole('button', { name: /^delete$/i }));
-		await user.click(screen.getByRole('button', { name: /confirm delete/i }));
+		expect(screen.queryByRole('button', { name: /delete/i })).not.toBeInTheDocument();
+		await goToTab('?tab=settings&section=danger');
+		await user.click(screen.getByRole('button', { name: /delete app/i }));
+
+		const dialog = await screen.findByRole('alertdialog');
+		const submit = within(dialog).getByRole('button', { name: /delete app/i });
+		expect(submit).toBeDisabled();
+		await confirmDialog(user, { typed: 'api-service' });
 
 		expect(api.deleteApp).toHaveBeenCalledWith('app_1');
-		expect(goto).toHaveBeenCalledWith('/');
+		expect(goto).toHaveBeenCalledWith('/apps', { invalidateAll: true });
+	});
+
+	it('restarts only after confirmation', async () => {
+		api.restartApp.mockResolvedValue(undefined);
+		const user = userEvent.setup();
+		renderPage();
+
+		await user.click(screen.getByRole('button', { name: /^restart$/i }));
+		expect(api.restartApp).not.toHaveBeenCalled();
+		await confirmDialog(user);
+		expect(api.restartApp).toHaveBeenCalledWith('app_1');
+	});
+
+	it('ignores a double click on deploy while the first request is pending', async () => {
+		let resolve: () => void = () => {};
+		api.deployApp.mockReturnValue(
+			new Promise((r) => (resolve = () => r({ deployment_id: 'dep_9' })))
+		);
+		const user = userEvent.setup();
+		renderPage();
+
+		const button = screen.getByRole('button', { name: /^deploy$/i });
+		await user.click(button);
+		await user.click(button);
+		expect(api.deployApp).toHaveBeenCalledTimes(1);
+		expect(screen.getByRole('button', { name: /starting deploy/i })).toBeDisabled();
+		resolve();
+	});
+
+	it('hides what a viewer can’t use and explains read-only settings', async () => {
+		for (const scope of ['apps:deploy', 'apps:control', 'apps:write', 'apps:delete', 'logs:read']) {
+			authz.deny.add(scope);
+		}
+		setPageUrl('http://localhost/apps/app_1?tab=settings&section=git', { id: 'app_1' });
+		renderPage();
+
+		expect(screen.queryByRole('button', { name: /^deploy$/i })).not.toBeInTheDocument();
+		expect(screen.queryByRole('button', { name: /^stop$/i })).not.toBeInTheDocument();
+		const tabs = screen.getByRole('navigation', { name: 'App sections' });
+		expect(within(tabs).queryByRole('link', { name: 'Logs' })).not.toBeInTheDocument();
+		const sections = screen.getByRole('navigation', { name: 'Settings sections' });
+		expect(within(sections).queryByRole('link', { name: 'Danger zone' })).not.toBeInTheDocument();
+		expect(screen.getByText(/changing them needs the/i)).toBeInTheDocument();
+		// The webhook config (apps:write) is explained instead of failing with a 403.
+		expect(api.getWebhookConfig).not.toHaveBeenCalled();
+		expect(screen.getByText(/webhook urls and secrets are shown to users/i)).toBeInTheDocument();
+
+		await goToTab('?tab=logs');
+		expect(
+			screen.getByText(/your role can’t open this section|your role can't open this section/i)
+		).toBeInTheDocument();
+	});
+
+	it('opens the tab named in the URL and groups settings sections', async () => {
+		setPageUrl('http://localhost/apps/app_1?tab=domain', { id: 'app_1' });
+		renderPage();
+
+		// Old flat links (?tab=domain) land on Settings → Domain.
+		const sections = screen.getByRole('navigation', { name: 'Settings sections' });
+		expect(within(sections).getByRole('link', { name: 'Domain' })).toHaveAttribute(
+			'aria-current',
+			'page'
+		);
+		const tabs = screen.getByRole('navigation', { name: 'App sections' });
+		expect(
+			within(tabs)
+				.getAllByRole('link')
+				.map((a) => a.textContent?.trim())
+		).toEqual(['Overview', 'Deployments', 'Logs', 'Metrics', 'Settings']);
+		expect(within(tabs).getByRole('link', { name: 'Logs' })).toHaveAttribute(
+			'href',
+			'/apps/app_1?tab=logs'
+		);
 	});
 
 	it('shows an inline error when redeploy fails', async () => {
@@ -273,7 +409,7 @@ describe('apps/[id] page', () => {
 		const user = userEvent.setup();
 		renderPage();
 
-		await user.click(screen.getByRole('button', { name: /re-deploy/i }));
+		await user.click(screen.getByRole('button', { name: /^deploy$/i }));
 
 		expect(await screen.findByText(/deploy failed/i)).toBeInTheDocument();
 		expect(api.getApp).not.toHaveBeenCalled();
@@ -281,7 +417,11 @@ describe('apps/[id] page', () => {
 
 	it('wires the environment tab to the registry credential and redeploy actions', async () => {
 		api.setAppRegistryCredential.mockResolvedValue(undefined);
-		api.deployApp.mockResolvedValue(undefined);
+		api.deployApp.mockResolvedValue({
+			message: 'Deployment started',
+			app_id: 'app_1',
+			deployment_id: 'dep_env'
+		});
 		api.getApp.mockResolvedValue({
 			...app,
 			source_type: 'image',
@@ -291,7 +431,7 @@ describe('apps/[id] page', () => {
 		const user = userEvent.setup();
 		renderPage({ ...app, source_type: 'image', registry_credential_id: null });
 
-		await user.click(screen.getByRole('tab', { name: /environment/i }));
+		await goToTab('?tab=settings&section=environment');
 		expect(screen.getByText('Environment for app_1')).toBeInTheDocument();
 
 		await user.click(screen.getByRole('button', { name: /attach credential/i }));
@@ -299,7 +439,7 @@ describe('apps/[id] page', () => {
 
 		await user.click(screen.getByRole('button', { name: /redeploy from environment/i }));
 		expect(api.deployApp).toHaveBeenCalledWith('app_1');
-		expect(api.getApp).toHaveBeenCalledWith('app_1');
+		expect(goto).toHaveBeenCalledWith('/apps/app_1/deployments/dep_env');
 	});
 
 	it('saves resource limits and updates app context', async () => {
@@ -312,7 +452,7 @@ describe('apps/[id] page', () => {
 		const user = userEvent.setup();
 		renderPage();
 
-		await user.click(screen.getByRole('tab', { name: /resources/i }));
+		await goToTab('?tab=settings&section=resources');
 		const numberInputs = document.querySelectorAll('input[type="number"]');
 		await user.clear(numberInputs[0] as HTMLInputElement);
 		await user.type(numberInputs[0] as HTMLInputElement, '2');
@@ -346,25 +486,30 @@ describe('apps/[id] page', () => {
 				gitea: 'https://dash.example.com/api/webhooks/gitea/app_1',
 				generic: 'https://dash.example.com/api/webhooks/generic/app_1'
 			},
+			has_secret: true,
 			secret,
 			auto_deploy: false,
 			watch_branch: 'main'
 		};
 	}
 
-	it('shows the webhook URL and secret with provider-specific instructions', async () => {
+	it('shows the webhook URL, and the secret only after an explicit reveal', async () => {
 		api.getWebhookConfig.mockResolvedValue(webhookConfig('generated-secret-0123456789'));
+		api.revealWebhookSecret.mockResolvedValue({ secret: 'generated-secret-0123456789' });
 
 		const user = userEvent.setup();
 		renderPage();
 
-		await user.click(screen.getByRole('tab', { name: /^git$/i }));
+		await goToTab('?tab=settings&section=git');
 
 		const url = (await screen.findByLabelText(/payload url/i)) as HTMLInputElement;
 		expect(url.value).toBe('https://dash.example.com/api/webhooks/github/app_1');
-		expect((screen.getByLabelText(/^secret$/i) as HTMLInputElement).value).toBe(
-			'generated-secret-0123456789'
-		);
+		const secretField = screen.getByLabelText(/^secret$/i) as HTMLInputElement;
+		expect(secretField.value).not.toContain('generated-secret');
+		expect(api.revealWebhookSecret).not.toHaveBeenCalled();
+		await user.click(screen.getByRole('button', { name: /^reveal$/i }));
+		expect(api.revealWebhookSecret).toHaveBeenCalledWith('app_1');
+		expect(await screen.findByDisplayValue('generated-secret-0123456789')).toBeInTheDocument();
 		expect(screen.getByText(/just the push event/i)).toBeInTheDocument();
 
 		await user.click(screen.getByRole('tab', { name: /^gitlab$/i }));
@@ -386,7 +531,7 @@ describe('apps/[id] page', () => {
 		const user = userEvent.setup();
 		renderPage();
 
-		await user.click(screen.getByRole('tab', { name: /^git$/i }));
+		await goToTab('?tab=settings&section=git');
 		await user.click(await screen.findByRole('button', { name: /rotate secret/i }));
 		expect(api.rotateWebhookSecret).not.toHaveBeenCalled();
 		await user.click(screen.getByRole('button', { name: /rotate now/i }));
@@ -405,7 +550,7 @@ describe('apps/[id] page', () => {
 		const user = userEvent.setup();
 		renderPage();
 
-		await user.click(screen.getByRole('tab', { name: /^git$/i }));
+		await goToTab('?tab=settings&section=git');
 		await user.click(await screen.findByText(/use your own secret/i));
 
 		const input = screen.getByLabelText(/custom secret/i);
@@ -433,7 +578,7 @@ describe('apps/[id] page', () => {
 		const user = userEvent.setup();
 		renderPage({ ...app, github_app_id: 'gh_1', preview_enabled: false });
 
-		await user.click(screen.getByRole('tab', { name: /previews/i }));
+		await goToTab('?tab=settings&section=previews');
 		await user.click(screen.getByRole('button', { name: /enable pr previews/i }));
 
 		expect(api.updatePreviewConfig).toHaveBeenCalledWith('app_1', true);
@@ -447,10 +592,9 @@ describe('apps/[id] page', () => {
 			preview_domain: ''
 		});
 
-		const user = userEvent.setup();
 		renderPage({ ...app, github_app_id: 'gh_1', preview_enabled: false });
 
-		await user.click(screen.getByRole('tab', { name: /previews/i }));
+		await goToTab('?tab=settings&section=previews');
 
 		expect(await screen.findByText(/previews need a preview domain/i)).toBeInTheDocument();
 		expect(screen.getByRole('button', { name: /enable pr previews/i })).toBeDisabled();
@@ -471,7 +615,7 @@ describe('apps/[id] page', () => {
 		const user = userEvent.setup();
 		renderPage({ ...app, github_app_id: 'gh_1', preview_enabled: true });
 
-		await user.click(screen.getByRole('tab', { name: /previews/i }));
+		await goToTab('?tab=settings&section=previews');
 		await user.click(screen.getByRole('button', { name: /load open prs/i }));
 
 		expect(api.listOpenPRs).toHaveBeenCalledWith('app_1');
@@ -505,18 +649,19 @@ describe('apps/[id] page', () => {
 		});
 
 		it('keeps the log stream open and the feed paused when the app reloads', async () => {
-			api.deployApp.mockResolvedValue(undefined);
+			api.restartApp.mockResolvedValue(undefined);
 			api.getApp.mockResolvedValue({ ...app, status: 'running' });
 
 			const user = userEvent.setup();
 			renderPage();
 
-			await user.click(screen.getByRole('tab', { name: /^logs$/i }));
+			await goToTab('?tab=logs');
 			expect(FakeWebSocket.instances).toHaveLength(1);
 			expect(FakeWebSocket.instances[0].url).toMatch(/\/api\/apps\/app_1\/logs\/stream$/);
 
-			// Re-deploying reloads the app data, which used to tear everything down.
-			await user.click(screen.getByRole('button', { name: /re-deploy/i }));
+			// Restarting reloads the app data, which used to tear everything down.
+			await user.click(screen.getByRole('button', { name: /^restart$/i }));
+			await confirmDialog(user);
 			await vi.waitFor(() => expect(api.getApp).toHaveBeenCalled());
 
 			expect(FakeWebSocket.instances).toHaveLength(1);
@@ -528,30 +673,31 @@ describe('apps/[id] page', () => {
 		});
 
 		it('closes the log stream when leaving the Logs tab', async () => {
-			const user = userEvent.setup();
 			renderPage();
 
-			await user.click(screen.getByRole('tab', { name: /^logs$/i }));
-			await user.click(screen.getByRole('tab', { name: /overview/i }));
+			await goToTab('?tab=logs');
+			await goToTab('');
 
 			expect(FakeWebSocket.instances).toHaveLength(1);
 			expect(FakeWebSocket.instances[0].closed).toBe(true);
 		});
 
 		it('keeps a single metrics poller across app reloads', async () => {
-			api.deployApp.mockResolvedValue(undefined);
+			api.restartApp.mockResolvedValue(undefined);
 			api.getApp.mockResolvedValue({ ...app, status: 'running' });
 
 			const user = userEvent.setup();
 			renderPage();
 
-			await user.click(screen.getByRole('tab', { name: /metrics/i }));
-			await vi.waitFor(() => expect(api.getAppMetrics).toHaveBeenCalledTimes(1));
+			await goToTab('?tab=metrics');
+			await vi.waitFor(() => expect(api.getMetrics).toHaveBeenCalledTimes(1));
+			expect(api.getMetrics).toHaveBeenCalledWith('apps', app.id, '1h');
 
-			await user.click(screen.getByRole('button', { name: /re-deploy/i }));
+			await user.click(screen.getByRole('button', { name: /^restart$/i }));
+			await confirmDialog(user);
 			await vi.waitFor(() => expect(api.getApp).toHaveBeenCalled());
 
-			expect(api.getAppMetrics).toHaveBeenCalledTimes(1);
+			expect(api.getMetrics).toHaveBeenCalledTimes(1);
 		});
 	});
 });

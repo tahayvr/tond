@@ -39,7 +39,7 @@
 			label="DISK_USAGE"
 			icon={HardDrive}
 			color="bg-warn/60"
-			detail="{fmt(metrics.disk_used)} / {fmt(metrics.disk_total)}"
+			detail="{fmt(metrics.disk_used)} / {fmt(metrics.disk_total)} on {metrics.disk_mount || '/'}"
 		/>
 	</div>
 
@@ -49,7 +49,7 @@
 			value={metrics.containers_running}
 			label="CONTAINERS"
 			icon={Box}
-			detail="Docker containers active"
+			detail="Run by Tond right now"
 		/>
 
 		<MetricCard value={metrics.apps_total} label="TOND_APPS" detail="Total registered" />
@@ -63,7 +63,7 @@
 		/>
 	</div>
 
-	<p class="font-mono text-[10px] text-muted-foreground/60">
+	<p class="font-mono text-[10px] text-muted-foreground">
 		SNAPSHOT: {new Date(metrics.collected_at).toLocaleString()}
 	</p>
 </div>

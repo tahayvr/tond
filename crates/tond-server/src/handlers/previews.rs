@@ -31,8 +31,9 @@ use tond_common::{
     UpdatePreviewConfigRequest,
 };
 
+use crate::audit_log::{AuditEntry, record};
 use crate::{
-    auth::{RateLimit, RequireAuth},
+    auth::{Authz, RateLimit, scope},
     deploy, docker,
     domains::{preview_host, require_preview_domain},
     error::AppError,
@@ -67,7 +68,7 @@ fn random_slug() -> String {
 /// Returns 202 immediately with the preview row (status = "building").
 pub async fn create_preview(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::PreviewsWrite>,
     State(state): State<AppState>,
     Path(app_id): Path<String>,
     body: Option<Json<CreatePreviewRequest>>,
@@ -163,6 +164,15 @@ pub async fn create_preview(
         }
     };
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("preview_create")
+            .app(&app.id, &app.name)
+            .detail(format!("slug={}", preview.slug)),
+    )
+    .await;
+
     let response_preview = preview.clone();
     let state_clone = state.clone();
     let app_clone = app.clone();
@@ -190,7 +200,7 @@ pub async fn create_preview(
 /// List active (non-expired) preview deployments for an app.
 pub async fn list_previews(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsRead>,
     State(state): State<AppState>,
     Path(app_id): Path<String>,
 ) -> Response {
@@ -231,7 +241,7 @@ pub async fn list_previews(
 /// Stop and remove a specific preview deployment.
 pub async fn delete_preview(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::PreviewsWrite>,
     State(state): State<AppState>,
     Path((app_id, preview_id)): Path<(String, String)>,
 ) -> Response {
@@ -278,6 +288,14 @@ pub async fn delete_preview(
         .await;
 
     tracing::info!("Preview {} deleted for app {}", preview.slug, app.name);
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("preview_delete")
+            .app(&app.id, &app.name)
+            .detail(format!("slug={}", preview.slug)),
+    )
+    .await;
 
     (
         StatusCode::OK,
@@ -295,7 +313,7 @@ pub async fn delete_preview(
 /// Body: `{ "preview_enabled": true }`
 pub async fn update_preview_config(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Path(app_id): Path<String>,
     Json(body): Json<UpdatePreviewConfigRequest>,
@@ -313,6 +331,14 @@ pub async fn update_preview_config(
 
     let enabled: i64 = if body.preview_enabled { 1 } else { 0 };
     let now = chrono::Utc::now().to_rfc3339();
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("preview_config_update")
+            .app(&app.id, &app.name)
+            .detail(format!("preview_enabled={}", body.preview_enabled)),
+    )
+    .await;
 
     // Update preview_enabled
     if let Err(e) = sqlx::query("UPDATE apps SET preview_enabled = ?, updated_at = ? WHERE id = ?")
@@ -365,9 +391,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        auth::{RateLimiter, RequireAuth, rate_limit::RateLimit},
+        auth::{Authz, Principal, RateLimiter, rate_limit::RateLimit},
         state::AppState,
     };
+    use tond_common::Role;
 
     async fn test_state() -> AppState {
         let db = SqlitePool::connect("sqlite::memory:")
@@ -381,6 +408,7 @@ mod tests {
             server_name: "tond".to_string(),
             dashboard_domain: "dash.example.com".to_string(),
             preview_domain: "example-previews.com".to_string(),
+            ..ServerSettings::default()
         };
 
         AppState {
@@ -411,7 +439,7 @@ mod tests {
         app.preview_enabled = 1;
 
         sqlx::query(
-            "INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, host_port, memory_limit, cpu_limit, status, env_vars, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, deploy_key_pub, project_id, registry_credential_id, github_app_id, gitlab_token_id, preview_enabled, preview_excluded_keys, preview_env_vars, dockerfile_content, compose_content, base_dir, static_build, created_at, updated_at)
+            "INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, host_port, memory_limit, cpu_limit, status, env_vars, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, deploy_key_pub, project_id, registry_credential_id, github_app_id, gitlab_token_id, preview_enabled, preview_shared_keys, preview_env_vars, dockerfile_content, compose_content, base_dir, static_build, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&app.id)
@@ -443,7 +471,7 @@ mod tests {
         .bind(&app.github_app_id)
         .bind(&app.gitlab_token_id)
         .bind(app.preview_enabled)
-        .bind(&app.preview_excluded_keys)
+        .bind(&app.preview_shared_keys)
         .bind(&app.preview_env_vars)
         .bind(&app.dockerfile_content)
         .bind(&app.compose_content)
@@ -465,7 +493,7 @@ mod tests {
 
         let response = create_preview(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.id.clone()),
             Some(Json(CreatePreviewRequest {
@@ -493,7 +521,7 @@ mod tests {
 
         let response = create_preview(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.id.clone()),
             Some(Json(CreatePreviewRequest {
@@ -619,7 +647,13 @@ mod tests {
         .await
         .unwrap_or_else(|err| panic!("failed to seed expired preview: {err}"));
 
-        let response = list_previews(RateLimit, RequireAuth, State(state), Path(app.id)).await;
+        let response = list_previews(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            State(state),
+            Path(app.id),
+        )
+        .await;
 
         assert_eq!(
             response.status(),
@@ -646,7 +680,7 @@ mod tests {
     async fn update_preview_config_persists_enable_flag_without_touching_preview_env() {
         let state = test_state().await;
         let app = seed_preview_app(&state, "frontend", "git").await;
-        sqlx::query("UPDATE apps SET preview_excluded_keys = ?, preview_env_vars = ? WHERE id = ?")
+        sqlx::query("UPDATE apps SET preview_shared_keys = ?, preview_env_vars = ? WHERE id = ?")
             .bind(r#"["TOKEN"]"#)
             .bind(r#"{"MODE":"preview"}"#)
             .bind(&app.id)
@@ -656,7 +690,7 @@ mod tests {
 
         let response = update_preview_config(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.id.clone()),
             Json(UpdatePreviewConfigRequest {
@@ -671,7 +705,7 @@ mod tests {
             "update_preview_config should succeed for existing apps"
         );
         let row: (i64, String, String) = sqlx::query_as(
-            "SELECT preview_enabled, preview_excluded_keys, preview_env_vars FROM apps WHERE id = ?",
+            "SELECT preview_enabled, preview_shared_keys, preview_env_vars FROM apps WHERE id = ?",
         )
         .bind(&app.id)
         .fetch_one(&state.db)
@@ -696,7 +730,7 @@ mod tests {
 
         let response = create_preview(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.id.clone()),
             None,
@@ -722,7 +756,7 @@ mod tests {
 
         let response = update_preview_config(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.id.clone()),
             Json(UpdatePreviewConfigRequest {
@@ -766,7 +800,7 @@ mod tests {
 
         let response = delete_preview(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path((app.id.clone(), "preview-1".to_string())),
         )

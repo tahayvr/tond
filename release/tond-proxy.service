@@ -10,17 +10,29 @@ Type=simple
 # dedicated unprivileged user whose only capability is binding ports 80/443.
 # File access (see install.sh secure_data_dir):
 #   /opt/tond/data                  root:tond-proxy 3770 (setgid + sticky: it can
-#                                   create files, e.g. SQLite's -wal/-shm, but not
-#                                   remove or replace root's files)
-#   tond.db, tond.db-wal, -shm      root:tond-proxy 0660 (shared with tond-server)
+#                                   create its own files, but not remove or
+#                                   replace root's files)
+#   tond.db, tond.db-wal, -shm      root:tond-proxy 0640: read-only for the proxy,
+#                                   which also opens the database with mode=ro
+#   proxy.sock                      tond-proxy 0600: control socket; only root
+#                                   (tond-server) and tond-proxy may connect
 #   certs/, acme_account.json       tond-proxy only (0700 / 0600)
-#   tond.env, root-api-key, setup-token, tond.sock, keys/, backups/, ...  root only
+#   tond.env, setup-token, tond.sock, keys/, backups/, ...  root only
 User=tond-proxy
 Group=tond-proxy
 WorkingDirectory=/opt/tond
 ExecStart=/opt/tond/bin/tond-proxy
 Restart=on-failure
 RestartSec=5
+
+# ── Resource guard rails ──
+# Idle tond-proxy uses ~10 MB; buffers grow with concurrent connections.
+MemoryHigh=192M
+MemoryMax=384M
+TasksMax=128
+# Never the OOM victim: without the proxy no app is reachable.
+OOMScoreAdjust=-900
+Environment=MALLOC_ARENA_MAX=2
 
 # Environment Configuration
 # These can be overridden with: systemctl edit tond-proxy
@@ -34,10 +46,11 @@ Environment=TOND_DATA_DIR=/opt/tond/data
 # Upstream server address (tond-server)
 Environment=TOND_SERVER_ADDR=127.0.0.1:3001
 
-# Dashboard domain (optional)
-# Set this to serve the dashboard on a subdomain via HTTPS
-# Example: dash.yourdomain.com
-# Environment=TOND_DASHBOARD_DOMAIN=
+# The dashboard domain is a setting (tond-server seeds it from its own
+# TOND_DASHBOARD_DOMAIN, see install.sh); the proxy reads it from tond.db.
+
+# Control socket shared with tond-server (default: $TOND_DATA_DIR/proxy.sock)
+# Environment=TOND_PROXY_SOCKET=
 
 # ACME/Let's Encrypt configuration
 # Use staging for testing to avoid rate limits

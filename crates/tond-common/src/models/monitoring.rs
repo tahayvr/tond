@@ -2,100 +2,111 @@
 
 use serde::{Deserialize, Serialize};
 
-// ── MetricPoint (single resource sample for one app) ──
+// ── Resource metrics (per app / database / cron job) ──
 
-/// One 30-second resource sample stored in the `metrics` table.
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-pub struct MetricPoint {
-    pub id: String,
-    pub app_id: String,
-    /// CPU usage as a percentage (0.0 – 100.0)
-    pub cpu_percent: f64,
-    /// Memory used by the container in bytes
-    pub mem_used: i64,
-    /// Memory limit for the container in bytes (0 = no limit)
-    pub mem_limit: i64,
-    /// Cumulative bytes received on all network interfaces
-    pub net_rx: i64,
-    /// Cumulative bytes transmitted on all network interfaces
-    pub net_tx: i64,
-    /// Container restart count at sample time
-    pub restarts: i64,
-    pub collected_at: String,
-}
-
-/// API response shape for a single metric data point.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MetricPointResponse {
-    pub cpu_percent: f64,
-    pub mem_used: i64,
-    pub mem_limit: i64,
-    pub mem_percent: f64,
-    pub net_rx: i64,
-    pub net_tx: i64,
-    pub restarts: i64,
-    pub collected_at: String,
-}
-
-impl From<MetricPoint> for MetricPointResponse {
-    fn from(m: MetricPoint) -> Self {
-        let mem_percent = if m.mem_limit > 0 {
-            (m.mem_used as f64 / m.mem_limit as f64) * 100.0
-        } else {
-            0.0
-        };
-        Self {
-            cpu_percent: m.cpu_percent,
-            mem_used: m.mem_used,
-            mem_limit: m.mem_limit,
-            mem_percent,
-            net_rx: m.net_rx,
-            net_tx: m.net_tx,
-            restarts: m.restarts,
-            collected_at: m.collected_at,
-        }
-    }
-}
-
-/// Query parameters for `GET /api/apps/{id}/metrics?period=`
+/// Query parameters for `GET /api/{apps,databases,cron}/{id}/metrics?range=`
 #[derive(Debug, Deserialize)]
 pub struct MetricsQuery {
-    /// Time window: "1h" | "24h" | "7d" (default "1h")
-    #[serde(default = "default_period")]
-    pub period: String,
+    /// Time window: "1h" | "24h" | "7d" | "30d" (default "1h")
+    #[serde(default = "default_range")]
+    pub range: String,
 }
 
-fn default_period() -> String {
+fn default_range() -> String {
     "1h".to_string()
+}
+
+/// Downsampled time series, one entry per bucket, as parallel arrays (about
+/// half the JSON of an array of objects). Rates are computed server-side.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MetricSeries {
+    /// Bucket start, unix seconds.
+    pub t: Vec<i64>,
+    /// Average CPU in the bucket, percent of one core (100 = one full core).
+    pub cpu: Vec<f64>,
+    /// Highest CPU sample in the bucket.
+    pub cpu_max: Vec<f64>,
+    /// Average working-set memory in bytes.
+    pub mem: Vec<i64>,
+    /// Highest memory sample in the bucket.
+    pub mem_max: Vec<i64>,
+    /// Received bytes per second.
+    pub rx: Vec<i64>,
+    /// Transmitted bytes per second.
+    pub tx: Vec<i64>,
+    /// Highest process count in the bucket.
+    pub pids: Vec<i64>,
+}
+
+/// A restart, crash or OOM kill.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MetricEventResponse {
+    /// Unix seconds.
+    pub t: i64,
+    /// "restart" | "crash" | "oom"
+    pub kind: String,
+    pub detail: Option<String>,
+}
+
+/// The most recent sample (not averaged).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MetricCurrentResponse {
+    pub t: i64,
+    pub cpu: f64,
+    pub mem: i64,
+    /// Peak memory since the container started, when the kernel reports it.
+    pub mem_peak: Option<i64>,
+    pub rx: i64,
+    pub tx: i64,
+    pub pids: i64,
+}
+
+/// Response of the metrics endpoints.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MetricsResponse {
+    pub range: String,
+    /// Bucket width in seconds.
+    pub step: i64,
+    /// Window start / end, unix seconds.
+    pub from: i64,
+    pub to: i64,
+    /// Memory limit in bytes (None when unlimited or never measured).
+    pub mem_limit: Option<i64>,
+    pub series: MetricSeries,
+    pub events: Vec<MetricEventResponse>,
+    pub current: Option<MetricCurrentResponse>,
 }
 
 // ── SystemMetrics (host-level snapshot, not persisted) ──
 
-/// Point-in-time snapshot of host-level system resources.
-/// Returned by `GET /api/system/metrics`.
+/// Point-in-time snapshot of host-level system resources, sampled by the
+/// metrics collector every tick. Returned by `GET /api/system/metrics`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SystemMetrics {
-    /// Host CPU usage as a percentage (0.0 – 100.0)
+    /// Host CPU usage as a percentage of all cores (0.0 – 100.0)
     pub cpu_percent: f64,
-    /// Host memory used in bytes
+    /// Host memory used in bytes (total − available)
     pub mem_used: i64,
     /// Total host memory in bytes
     pub mem_total: i64,
     /// Memory usage percentage
     pub mem_percent: f64,
-    /// Host disk used in bytes
+    /// Used bytes on the filesystem holding the Tond data directory
     pub disk_used: i64,
-    /// Total host disk in bytes
+    /// Size of that filesystem in bytes
     pub disk_total: i64,
-    /// Disk usage percentage
+    /// Disk usage percentage (the number the disk alert compares)
     pub disk_percent: f64,
-    /// Number of running Docker containers (all, not just tond apps)
+    /// Mount point of that filesystem (usually "/")
+    pub disk_mount: String,
+    /// Number of running containers Tond manages (apps, databases, cron,
+    /// compose services, previews)
     pub containers_running: i64,
     /// Total number of apps managed by tond
     pub apps_total: i64,
     /// Number of apps with status = "running"
     pub apps_running: i64,
-    /// Timestamp of this snapshot
+    /// Timestamp of the sample (RFC 3339)
     pub collected_at: String,
 }
 
@@ -107,11 +118,15 @@ pub struct SystemMetrics {
 /// Groups:
 ///   Deployments  → deployment_success, deployment_failure
 ///   Scheduled Tasks → cron_success, cron_failure
+///   Containers   → container_restart (crashed and restarted, or exited),
+///                  container_oom (a process was killed for running out of memory)
 pub const VALID_ALERT_EVENTS: &[&str] = &[
     "deployment_success",
     "deployment_failure",
     "cron_success",
     "cron_failure",
+    "container_restart",
+    "container_oom",
 ];
 
 /// Valid metric slugs for threshold-based alert rules.
@@ -138,7 +153,9 @@ pub struct AlertRule {
     ///
     /// Ignored when metric is NULL.
     pub threshold: f64,
-    /// Webhook URL to POST to when the condition fires
+    /// Webhook URL to POST to when the condition fires. Stored encrypted by
+    /// the server (such URLs are bearer secrets); `""` = none.
+    #[serde(skip_serializing)]
     pub webhook_url: String,
     /// Whether this rule is active (1 = active, 0 = paused)
     pub enabled: i64,
@@ -161,7 +178,8 @@ impl AlertRule {
     }
 }
 
-/// API response for an alert rule (same shape, with `enabled` as bool)
+/// API response for an alert rule. The webhook URL is write-only: the
+/// response says whether one is set and shows its host.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AlertRuleResponse {
     pub id: String,
@@ -169,7 +187,12 @@ pub struct AlertRuleResponse {
     pub name: String,
     pub metric: Option<String>,
     pub threshold: f64,
-    pub webhook_url: String,
+    /// Whether a webhook URL is set
+    #[serde(default)]
+    pub has_webhook_url: bool,
+    /// Host of the webhook URL (e.g. `hooks.slack.com`), for recognition
+    #[serde(default)]
+    pub webhook_host: Option<String>,
     pub enabled: bool,
     /// Parsed event slugs (never null in the response — empty array if none).
     pub events: Vec<String>,
@@ -178,8 +201,17 @@ pub struct AlertRuleResponse {
     pub updated_at: String,
 }
 
-impl From<AlertRule> for AlertRuleResponse {
-    fn from(r: AlertRule) -> Self {
+/// Host part of a URL (`https://hooks.slack.com/x` → `hooks.slack.com`).
+pub fn url_host(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map(|(_, r)| r)?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+impl AlertRuleResponse {
+    /// Build a response from a rule and its decrypted webhook URL.
+    pub fn new(r: AlertRule, webhook_url: &str) -> Self {
         let events = r.parse_events();
         Self {
             id: r.id,
@@ -187,7 +219,8 @@ impl From<AlertRule> for AlertRuleResponse {
             name: r.name,
             metric: r.metric,
             threshold: r.threshold,
-            webhook_url: r.webhook_url,
+            has_webhook_url: !webhook_url.is_empty(),
+            webhook_host: url_host(webhook_url),
             enabled: r.enabled != 0,
             events,
             last_fired_at: r.last_fired_at,
@@ -205,9 +238,15 @@ pub struct CreateAlertRuleRequest {
     /// "cpu" | "memory" | "app_down" | "disk_usage" — optional for pure event rules
     pub metric: Option<String>,
     pub threshold: Option<f64>,
+    /// Optional webhook POSTed on every firing (empty or missing = none).
+    #[serde(default)]
     pub webhook_url: String,
     /// Event slugs to subscribe to (optional)
     pub events: Option<Vec<String>>,
+    /// Notification channels (integration ids) to link on creation. A rule
+    /// needs at least one channel or a webhook URL, so it always notifies someone.
+    #[serde(default)]
+    pub integration_ids: Vec<String>,
 }
 
 /// PATCH /api/alerts/{id} request body — all optional
@@ -216,6 +255,7 @@ pub struct UpdateAlertRuleRequest {
     pub name: Option<String>,
     pub metric: Option<String>,
     pub threshold: Option<f64>,
+    /// New webhook URL: omit (or null) to keep the saved one, `""` to clear.
     pub webhook_url: Option<String>,
     pub enabled: Option<bool>,
     /// Replace the full events list (None = leave unchanged)
@@ -236,60 +276,101 @@ pub struct AlertRuleNotification {
     pub created_at: String,
 }
 
-// ── AuditLog (state-changing operation record) ──
+// ── AuditLog (hash-chained security and change record) ──
 
-/// A single entry in the immutable audit log.
+/// A single entry in the append-only, hash-chained audit log.
+///
+/// The actor is always derived from the request's authentication (a user, an
+/// API token, the root-only local socket) or is `system` for background work;
+/// it is never taken from a client-supplied field.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct AuditLog {
-    pub id: String,
-    /// Which app this action affected (None for server-wide actions)
-    pub app_id: Option<String>,
-    /// Name of the app at the time of the action (denormalised for readability)
-    pub app_name: Option<String>,
-    /// Short verb: "create" | "deploy" | "delete" | "stop" | "start" | "restart"
-    ///   | "env_update" | "domain_update" | "health_update" | "volume_add"
-    ///   | "volume_remove" | "rollback" | "settings_update"
-    pub action: String,
-    /// Who performed the action: "api_key:<name>" | "session:<email>" | "system"
-    pub actor: String,
-    /// Optional extra context (JSON blob, e.g. changed keys)
-    pub detail: Option<String>,
+    /// Position in the chain (1, 2, 3, … with no gaps).
+    pub seq: i64,
     pub created_at: String,
+    /// "user" | "token" | "local_socket" | "system" | "anonymous"
+    pub actor_kind: String,
+    /// User id or token id (None for local_socket/system/anonymous)
+    pub actor_id: Option<String>,
+    /// Human-readable actor: an email, a token name, "local-socket", …
+    pub actor_label: String,
+    /// Short verb, e.g. "deploy", "login", "login_failed", "token_create"
+    pub action: String,
+    /// "app" | "database" | "cron" | "project" | "user" | "token" | "snapshot" | "settings" | …
+    pub resource_type: Option<String>,
+    pub resource_id: Option<String>,
+    /// Name at the time of the action (denormalised for readability)
+    pub resource_name: Option<String>,
+    /// "success" | "failure"
+    pub outcome: String,
+    /// Client address the request came from (None for the socket/system)
+    pub ip: Option<String>,
+    /// Optional extra context
+    pub detail: Option<String>,
+    /// Hash of the previous entry (or the retention checkpoint)
+    pub prev_hash: String,
+    /// sha256(prev_hash || canonical row)
+    pub hash: String,
 }
 
 /// API response for an audit log entry.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AuditLogResponse {
-    pub id: String,
-    pub app_id: Option<String>,
-    pub app_name: Option<String>,
-    pub action: String,
-    pub actor: String,
-    pub detail: Option<String>,
+    pub seq: i64,
     pub created_at: String,
+    pub actor_kind: String,
+    pub actor_id: Option<String>,
+    pub actor_label: String,
+    pub action: String,
+    pub resource_type: Option<String>,
+    pub resource_id: Option<String>,
+    pub resource_name: Option<String>,
+    pub outcome: String,
+    pub ip: Option<String>,
+    pub detail: Option<String>,
 }
 
 impl From<AuditLog> for AuditLogResponse {
     fn from(e: AuditLog) -> Self {
         Self {
-            id: e.id,
-            app_id: e.app_id,
-            app_name: e.app_name,
-            action: e.action,
-            actor: e.actor,
-            detail: e.detail,
+            seq: e.seq,
             created_at: e.created_at,
+            actor_kind: e.actor_kind,
+            actor_id: e.actor_id,
+            actor_label: e.actor_label,
+            action: e.action,
+            resource_type: e.resource_type,
+            resource_id: e.resource_id,
+            resource_name: e.resource_name,
+            outcome: e.outcome,
+            ip: e.ip,
+            detail: e.detail,
         }
     }
 }
 
-/// Query parameters for `GET /api/audit-log`
-#[derive(Debug, Deserialize)]
-pub struct AuditLogQuery {
-    /// Filter by app_id (optional)
-    pub app_id: Option<String>,
-    /// Maximum number of rows to return (default 50, max 200)
-    pub limit: Option<i64>,
+/// One page of GET /api/audit-log.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AuditLogPage {
+    pub entries: Vec<AuditLogResponse>,
+    /// Pass as `before` to get the next (older) page; None on the last page.
+    pub next_before: Option<i64>,
+}
+
+/// Result of verifying the audit log's hash chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditVerifyReport {
+    pub ok: bool,
+    /// Entries checked.
+    pub checked: i64,
+    /// Entries before this sequence number were removed by retention.
+    pub checkpoint_seq: i64,
+    pub first_seq: Option<i64>,
+    pub last_seq: Option<i64>,
+    /// The first entry that failed verification, if any.
+    pub broken_at: Option<i64>,
+    /// Why verification failed.
+    pub problem: Option<String>,
 }
 
 #[cfg(test)]
@@ -297,51 +378,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn metric_point_response_computes_memory_percentage_and_handles_zero_limit() {
-        let with_limit = MetricPoint {
-            id: "metric-1".to_string(),
-            app_id: "app-1".to_string(),
-            cpu_percent: 12.5,
-            mem_used: 50,
-            mem_limit: 200,
-            net_rx: 100,
-            net_tx: 200,
-            restarts: 1,
-            collected_at: "2026-01-01T00:00:00Z".to_string(),
-        };
-        let with_limit_response = MetricPointResponse::from(with_limit);
-        assert_eq!(
-            with_limit_response.mem_percent, 25.0,
-            "MetricPointResponse should compute mem_percent from mem_used / mem_limit"
-        );
-
-        let without_limit = MetricPoint {
-            id: "metric-2".to_string(),
-            app_id: "app-1".to_string(),
-            cpu_percent: 12.5,
-            mem_used: 50,
-            mem_limit: 0,
-            net_rx: 100,
-            net_tx: 200,
-            restarts: 1,
-            collected_at: "2026-01-01T00:00:00Z".to_string(),
-        };
-        let without_limit_response = MetricPointResponse::from(without_limit);
-        assert_eq!(
-            without_limit_response.mem_percent, 0.0,
-            "MetricPointResponse should report 0.0 mem_percent when no memory limit is set"
-        );
-    }
-
-    #[test]
-    fn metrics_query_defaults_period_to_one_hour() {
+    fn metrics_query_defaults_range_to_one_hour() {
         let query: MetricsQuery = serde_json::from_value(serde_json::json!({}))
             .unwrap_or_else(|err| panic!("failed to deserialize MetricsQuery: {err}"));
-
-        assert_eq!(
-            query.period, "1h",
-            "MetricsQuery should default the period to 1h"
-        );
+        assert_eq!(query.range, "1h");
     }
 
     #[test]
@@ -402,7 +442,15 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         };
 
-        let response = AlertRuleResponse::from(rule);
+        let response =
+            AlertRuleResponse::new(rule, "https://hooks.example.com/services/T0/B0/secret");
+        let json = serde_json::to_string(&response).unwrap_or_default();
+        assert!(
+            !json.contains("secret"),
+            "webhook URL must not be returned: {json}"
+        );
+        assert!(response.has_webhook_url);
+        assert_eq!(response.webhook_host.as_deref(), Some("hooks.example.com"));
 
         assert!(
             response.enabled,

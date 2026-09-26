@@ -1,9 +1,10 @@
 <script lang="ts">
+	import PageTitle from '$lib/components/nav/page-title.svelte';
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { createDatabase, type Project } from '$lib/api';
 	import { Button } from '$lib/components/ui/button/index.js';
-	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import { setUiContext, clearUiContext, projectsContext } from '$lib/ui-context.svelte';
 	import Database from '~icons/ri/database-2-line';
 	import Breadcrumb from '$lib/components/nav/breadcrumb.svelte';
@@ -52,12 +53,13 @@
 	}
 </script>
 
-<div class="space-y-6 pb-12">
-	<Breadcrumb items={[{ label: 'Databases', href: '/databases' }, { label: 'New Database' }]} />
+<PageTitle title="New database" />
 
-	{#if error}
-		<ErrorAlert title="Error" description={error} />
-	{/if}
+<div class="space-y-6 pb-12">
+	<Breadcrumb items={[{ label: 'Databases', href: '/databases' }, { label: 'New database' }]} />
+	<h1 class="text-2xl font-extrabold sm:text-3xl">New database</h1>
+
+	<InlineError message={error} />
 
 	<DbWizardConfig bind:name bind:dbType bind:selectedProjectId {projects} />
 

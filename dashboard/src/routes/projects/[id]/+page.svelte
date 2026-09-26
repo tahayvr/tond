@@ -1,4 +1,5 @@
 <script lang="ts">
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { page } from '$app/state';
 	import { pollWhileVisible } from '$lib/polling';
 	import {
@@ -20,7 +21,6 @@
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
-	import { Badge } from '$lib/components/ui/badge/index.js';
 	import { goto } from '$app/navigation';
 	import {
 		setUiContext,
@@ -28,10 +28,12 @@
 		projectContext,
 		openFeedPanel
 	} from '$lib/ui-context.svelte';
-	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import ProjectBlueprint from '$lib/components/cards/project-blueprint/project-blueprint.svelte';
 	import Breadcrumb from '$lib/components/nav/breadcrumb.svelte';
-	import ConfirmDeleteDialog from '$lib/components/dialogs/confirm-delete-dialog.svelte';
+	import ConfirmDialog from '$lib/components/dialogs/confirm-dialog.svelte';
+	import StatusBadge from '$lib/components/feedback/status-badge.svelte';
+	import PageTitle from '$lib/components/nav/page-title.svelte';
+	import { confirmAction } from '$lib/confirm.svelte';
 	import CreateProjectPreviewDialog from '$lib/components/dialogs/create-project-preview-dialog.svelte';
 	import PreviewDomainRequiredAlert from '$lib/components/alerts/preview-domain-required-alert.svelte';
 	import ProjectPreviewCard from '$lib/components/cards/project-preview-card/project-preview-card.svelte';
@@ -146,16 +148,15 @@
 		}
 	}
 
+	// Throws so ConfirmDialog shows the error inside the dialog.
 	async function handleDelete() {
 		if (!project) return;
 		deleting = true;
 		try {
 			await deleteProject(project.id);
-			goto('/projects');
-		} catch (e: any) {
-			error = e.message ?? 'Failed to delete project';
+			goto('/projects', { invalidateAll: true });
+		} finally {
 			deleting = false;
-			showDeleteDialog = false;
 		}
 	}
 
@@ -183,17 +184,24 @@
 		}
 	}
 
-	async function handleDeletePreview(previewId: string) {
-		deletingPreviewId = previewId;
+	function handleDeletePreview(previewId: string) {
 		previewsError = '';
-		try {
-			await deleteProjectPreview(projectId, previewId);
-			await loadPreviews();
-		} catch (e: any) {
-			previewsError = e.message ?? 'Failed to delete preview';
-		} finally {
-			deletingPreviewId = null;
-		}
+		return confirmAction({
+			title: 'Delete this project preview?',
+			description:
+				"All of the preview's app containers are stopped and removed, and its URLs stop working.",
+			confirmLabel: 'Delete preview',
+			pendingLabel: 'Deleting…',
+			onconfirm: async () => {
+				deletingPreviewId = previewId;
+				try {
+					await deleteProjectPreview(projectId, previewId);
+					await loadPreviews();
+				} finally {
+					deletingPreviewId = null;
+				}
+			}
+		});
 	}
 
 	function formatDate(dt: string) {
@@ -246,24 +254,24 @@
 	});
 </script>
 
+<PageTitle title={project?.name ?? 'Project'} />
+
 <div class="space-y-6">
 	<!-- Breadcrumb -->
 	<Breadcrumb
 		items={[{ label: 'Projects', href: '/projects' }, { label: project?.name ?? 'Loading...' }]}
 	/>
 
-	{#if error}
-		<ErrorAlert title="Error" description={error} />
-	{/if}
+	<InlineError message={error} />
 
 	{#if project}
 		<!-- Blueprint diagram -->
 		<ProjectBlueprint projectName={project.name} apps={project.apps} databases={projectDatabases} />
 
 		<!-- Header -->
-		<div class="flex items-start justify-between gap-4">
-			<div>
-				<h3 class="text-xl font-semibold">{project.name}</h3>
+		<div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+			<div class="min-w-0">
+				<h1 class="text-2xl font-extrabold break-words sm:text-3xl">{project.name}</h1>
 				{#if project.description}
 					<p class="text-sm text-muted-foreground">{project.description}</p>
 				{/if}
@@ -271,7 +279,7 @@
 					Created {formatDate(project.created_at)} · Updated {formatDate(project.updated_at)}
 				</p>
 			</div>
-			<div class="flex shrink-0 gap-2">
+			<div class="flex shrink-0 flex-wrap gap-2">
 				<Button
 					variant="outline"
 					size="sm"
@@ -285,16 +293,8 @@
 				>
 					{editing ? 'Cancel' : 'Edit'}
 				</Button>
-				<Button size="sm" disabled={deploying} onclick={handleDeploy}>
-					{deploying ? 'Deploying…' : 'Deploy All'}
-				</Button>
-				<Button
-					variant="destructive"
-					size="sm"
-					disabled={deleting}
-					onclick={() => (showDeleteDialog = true)}
-				>
-					Delete
+				<Button size="sm" disabled={deploying} aria-busy={deploying} onclick={handleDeploy}>
+					{deploying ? 'Deploying…' : 'Deploy all'}
 				</Button>
 			</div>
 		</div>
@@ -316,9 +316,7 @@
 							<Input id="edit-desc" bind:value={editDescription} placeholder="Optional" />
 						</div>
 					</div>
-					{#if editError}
-						<p class="mt-3 text-sm text-destructive">{editError}</p>
-					{/if}
+					<InlineError message={editError} />
 				</Card.Content>
 				<Card.Footer class="flex justify-end gap-2">
 					<Button variant="outline" onclick={() => (editing = false)}>Cancel</Button>
@@ -357,13 +355,7 @@
 						<PreviewDomainRequiredAlert />
 					</div>
 				{/if}
-				{#if previewsError}
-					<div
-						class="mb-4 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive"
-					>
-						{previewsError}
-					</div>
-				{/if}
+				<InlineError message={previewsError} />
 
 				{#if previewsLoading && projectPreviews.length === 0}
 					<div class="py-8 text-center text-muted-foreground">Loading...</div>
@@ -371,7 +363,7 @@
 					<div class="rounded-lg border border-dashed py-10 text-center">
 						<p class="text-sm text-muted-foreground">No active preview environments</p>
 						{#if project.apps.length === 0}
-							<p class="mt-1 text-xs text-muted-foreground/60">
+							<p class="mt-1 text-xs text-muted-foreground">
 								Add member apps first before creating a preview
 							</p>
 						{:else if previewDomain}
@@ -409,7 +401,7 @@
 						<Card.Title>Member Apps ({project.apps.length})</Card.Title>
 						<Card.Description>Apps assigned to this project.</Card.Description>
 					</div>
-					<Button size="sm" onclick={() => goto(`/apps/new?project_id=${projectId}`)}>
+					<Button size="sm" href={`/apps/new?project_id=${projectId}`}>
 						<Plus class="mr-1 h-4 w-4" />
 						Add App
 					</Button>
@@ -419,7 +411,7 @@
 				{#if project.apps.length === 0}
 					<div class="rounded-lg border border-dashed py-8 text-center">
 						<p class="text-sm text-muted-foreground">No apps assigned yet.</p>
-						<p class="mt-1 text-xs text-muted-foreground/60">
+						<p class="mt-1 text-xs text-muted-foreground">
 							Create a new app or add from unassigned apps below
 						</p>
 					</div>
@@ -428,21 +420,8 @@
 						{#each project.apps as app (app.id)}
 							<div class="flex items-center justify-between rounded-md border p-3">
 								<div class="flex items-center gap-3">
-									<button
-										class="font-medium hover:underline"
-										onclick={() => goto(`/apps/${app.id}`)}
-									>
-										{app.name}
-									</button>
-									<Badge
-										variant={app.status === 'running'
-											? 'default'
-											: app.status === 'failed'
-												? 'destructive'
-												: 'secondary'}
-									>
-										{app.status}
-									</Badge>
+									<a href={`/apps/${app.id}`} class="font-medium hover:underline">{app.name}</a>
+									<StatusBadge status={app.status} kind="app" size="sm" />
 								</div>
 								<Button
 									variant="outline"
@@ -476,21 +455,8 @@
 								{#each unassignedApps as app (app.id)}
 									<div class="flex items-center justify-between rounded-md border bg-muted/30 p-3">
 										<div class="flex items-center gap-3">
-											<button
-												class="font-medium hover:underline"
-												onclick={() => goto(`/apps/${app.id}`)}
-											>
-												{app.name}
-											</button>
-											<Badge
-												variant={app.status === 'running'
-													? 'default'
-													: app.status === 'failed'
-														? 'destructive'
-														: 'secondary'}
-											>
-												{app.status}
-											</Badge>
+											<a href={`/apps/${app.id}`} class="font-medium hover:underline">{app.name}</a>
+											<StatusBadge status={app.status} kind="app" size="sm" />
 										</div>
 										<Button
 											size="sm"
@@ -507,14 +473,35 @@
 				{/if}
 			</Card.Content>
 		</Card.Root>
+
+		<section
+			aria-labelledby="project-danger-heading"
+			class="space-y-3 rounded-sm border border-destructive/40 p-4"
+		>
+			<h2 id="project-danger-heading" class="text-sm font-semibold text-destructive">
+				Danger zone
+			</h2>
+			<p class="text-sm text-muted-foreground">
+				Delete the project. Its apps are kept and become unassigned.
+			</p>
+			<Button
+				variant="destructive"
+				size="sm"
+				disabled={deleting}
+				onclick={() => (showDeleteDialog = true)}
+			>
+				Delete project…
+			</Button>
+		</section>
 	{/if}
 </div>
 
-<ConfirmDeleteDialog
+<ConfirmDialog
 	bind:open={showDeleteDialog}
-	title="Delete &quot;{project?.name}&quot;?"
-	description="This will permanently delete the project and all its apps. This action cannot be undone."
-	confirmation={project?.name ?? ''}
+	title={`Delete project ${project?.name ?? ''}?`}
+	description="The project and its shared environment variables are deleted. Its apps are kept and become unassigned; nothing is stopped."
+	confirmLabel="Delete project"
+	pendingLabel="Deleting…"
 	onconfirm={handleDelete}
 />
 

@@ -31,6 +31,7 @@ use tond_common::{CronVolume, CronVolumeRequest, Volume, VolumeRequest};
 const VOLUMES_DIR: &str = "volumes";
 /// Directory under `volumes/` for cron jobs' own volumes.
 const CRON_DIR: &str = "_cron";
+const PREVIEW_DIR: &str = "_preview";
 /// Longest accepted volume name / container path.
 const MAX_NAME_LEN: usize = 64;
 const MAX_CONTAINER_PATH_LEN: usize = 255;
@@ -53,6 +54,17 @@ pub fn app_volume_dir(data_dir: &Path, app_name: &str) -> PathBuf {
 /// `<data>/volumes/_cron/<job-id>` — where a cron job's own volumes live.
 pub fn cron_volume_dir(data_dir: &Path, job_id: &str) -> PathBuf {
     volumes_root(data_dir).join(CRON_DIR).join(job_id)
+}
+
+/// `<data>/volumes/_preview` — parent of every preview's own volume folder.
+pub fn preview_volumes_root(data_dir: &Path) -> PathBuf {
+    volumes_root(data_dir).join(PREVIEW_DIR)
+}
+
+/// `<data>/volumes/_preview/<slug>` — a preview's own, initially empty volumes.
+/// Previews run pull-request code, so they never mount the app's real data.
+pub fn preview_volume_dir(data_dir: &Path, slug: &str) -> PathBuf {
+    preview_volumes_root(data_dir).join(slug)
 }
 
 /// Validate the mount point inside the container.
@@ -356,7 +368,20 @@ pub fn prepare_host_dir(
 /// Build Docker bind strings (`host:container`) for an app's stored volumes,
 /// re-deriving and re-verifying every host path from the volume name.
 pub fn app_binds(data_dir: &Path, app_name: &str, volumes: &[Volume]) -> Result<Vec<String>> {
-    let root = app_volume_dir(data_dir, app_name);
+    binds_under(data_dir, &app_volume_dir(data_dir, app_name), volumes)
+}
+
+/// Bind strings for a preview: the app's volume layout, but each volume is a
+/// fresh directory under the preview's own folder instead of the app's data.
+pub fn preview_binds(data_dir: &Path, slug: &str, volumes: &[Volume]) -> Result<Vec<String>> {
+    anyhow::ensure!(
+        !slug.is_empty() && slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+        "invalid preview slug"
+    );
+    binds_under(data_dir, &preview_volume_dir(data_dir, slug), volumes)
+}
+
+fn binds_under(data_dir: &Path, root: &Path, volumes: &[Volume]) -> Result<Vec<String>> {
     volumes
         .iter()
         .map(|vol| {
@@ -367,7 +392,7 @@ pub fn app_binds(data_dir: &Path, app_name: &str, volumes: &[Volume]) -> Result<
                 vol.name.clone()
             };
             validate_volume_name(&name).map_err(anyhow::Error::msg)?;
-            let host = prepare_host_dir(data_dir, &root, Path::new(&name), false)?;
+            let host = prepare_host_dir(data_dir, root, Path::new(&name), false)?;
             Ok(format!("{}:{}", host.display(), vol.container_path))
         })
         .collect()
@@ -397,6 +422,27 @@ pub fn cron_binds(data_dir: &Path, job_id: &str, volumes: &[CronVolume]) -> Resu
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn preview_binds_never_point_at_the_apps_data() {
+        let dir = tempfile::TempDir::new().unwrap_or_else(|err| panic!("tempdir: {err}"));
+        let volumes = vec![Volume {
+            name: "uploads".to_string(),
+            host_path: String::new(),
+            container_path: "/app/uploads".to_string(),
+        }];
+        let binds = preview_binds(dir.path(), "a1b2c3", &volumes)
+            .unwrap_or_else(|err| panic!("preview binds: {err}"));
+        assert_eq!(binds.len(), 1);
+        // Host paths are canonicalized (e.g. /var → /private/var on macOS).
+        assert!(
+            binds[0].ends_with("/volumes/_preview/a1b2c3/uploads:/app/uploads"),
+            "{}",
+            binds[0]
+        );
+        assert!(preview_binds(dir.path(), "../web", &volumes).is_err());
+    }
+
     use super::*;
 
     fn req(container_path: &str, name: Option<&str>, host_path: Option<&str>) -> VolumeRequest {

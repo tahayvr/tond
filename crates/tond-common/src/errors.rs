@@ -34,8 +34,18 @@ pub enum TondError {
     #[error("Forbidden: {0}")]
     Forbidden(String),
 
+    /// The caller is authenticated but its role or token lacks a scope (or
+    /// the resource is outside the token's filter). Carries a stable error
+    /// code for clients: `SCOPE_DENIED` or `RESOURCE_DENIED`.
+    #[error("{message}")]
+    ScopeDenied { code: &'static str, message: String },
+
     #[error("Internal error: {0}")]
     Internal(String),
+
+    /// The request body (e.g. an uploaded archive) exceeds a configured limit.
+    #[error("Too large: {0}")]
+    PayloadTooLarge(String),
 }
 
 impl TondError {
@@ -46,7 +56,17 @@ impl TondError {
             TondError::AppAlreadyExists(_) => 409,
             TondError::InvalidInput(_) => 400,
             TondError::Forbidden(_) => 403,
+            TondError::PayloadTooLarge(_) => 413,
+            TondError::ScopeDenied { .. } => 403,
             _ => 500,
+        }
+    }
+
+    /// Stable machine-readable error code, when the variant has one.
+    pub fn code(&self) -> Option<&'static str> {
+        match self {
+            TondError::ScopeDenied { code, .. } => Some(code),
+            _ => None,
         }
     }
 }
@@ -91,6 +111,11 @@ mod tests {
             TondError::Internal("boom".to_string()).status_code(),
             500,
             "Internal should map to HTTP 500"
+        );
+        assert_eq!(
+            TondError::PayloadTooLarge("big".to_string()).status_code(),
+            413,
+            "PayloadTooLarge should map to HTTP 413"
         );
     }
 

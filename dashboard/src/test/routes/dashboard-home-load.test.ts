@@ -32,7 +32,7 @@ describe('dashboard home page load', () => {
 		listApps.mockResolvedValue([{ id: 'app_1', name: 'api-service', status: 'running' }]);
 		listDatabases.mockResolvedValue([{ id: 'db_1', name: 'postgres', status: 'running' }]);
 		listCronJobs.mockResolvedValue([{ id: 'cron_1', name: 'hourly-report', enabled: true }]);
-		listAuditLog.mockResolvedValue([{ id: 'log_1', action: 'deploy' }]);
+		listAuditLog.mockResolvedValue({ entries: [{ seq: 1, action: 'deploy' }], next_before: null });
 		getSettings.mockResolvedValue({ server_name: 'Tond Server' });
 	});
 
@@ -46,7 +46,7 @@ describe('dashboard home page load', () => {
 			apps: [{ id: 'app_1', name: 'api-service', status: 'running' }],
 			databases: [{ id: 'db_1', name: 'postgres', status: 'running' }],
 			cronJobs: [{ id: 'cron_1', name: 'hourly-report', enabled: true }],
-			recentActivity: [{ id: 'log_1', action: 'deploy' }],
+			recentActivity: [{ seq: 1, action: 'deploy' }],
 			serverName: 'Tond Server'
 		});
 		expect(listAuditLog).toHaveBeenCalledWith({ limit: 5 });

@@ -7,13 +7,15 @@
 import { http, HttpResponse, ws, delay } from 'msw';
 
 // WebSocket links must be declared at module scope so MSW can track clients
-// across the service worker boundary via a stable BroadcastChannel.
-const appLogStream = ws.link('ws://*/api/apps/*/logs/stream');
-const systemLogStream = ws.link('ws://*/api/system/logs/stream');
-const allDatabaseLogStream = ws.link('ws://*/api/databases/logs/stream');
-const databaseLogStream = ws.link('ws://*/api/databases/*/logs/stream');
-const cronRunStream = ws.link('ws://*/api/cron/*/runs/stream');
-const terminalStream = ws.link('ws://*/api/terminal/ws*');
+// across the service worker boundary via a stable BroadcastChannel. Use paths
+// relative to the page origin: a wildcard host ("ws://*/…") never matches.
+const appLogStream = ws.link('/api/apps/:id/logs/stream');
+const systemLogStream = ws.link('/api/system/logs/stream');
+const allDatabaseLogStream = ws.link('/api/databases/logs/stream');
+const databaseLogStream = ws.link('/api/databases/:id/logs/stream');
+const cronRunStream = ws.link('/api/cron/:id/runs/stream');
+const terminalStream = ws.link('/api/terminal/ws');
+const deploymentStream = ws.link('/api/apps/:id/deployments/:deploymentId/stream');
 
 import {
 	MOCK_USER,
@@ -24,11 +26,15 @@ import {
 	MOCK_SETTINGS,
 	MOCK_ONBOARDING_STATUS,
 	MOCK_DEPLOYMENTS,
+	MOCK_DEPLOYMENT_LOGS,
+	mockBuildLog,
 	MOCK_GENERATED_DOCKERFILES,
 	MOCK_DEPLOY_KEYS,
 	MOCK_PREVIEWS,
 	MOCK_PROJECT_PREVIEWS,
 	MOCK_AUDIT_LOG,
+	MOCK_TOKEN_CATALOG,
+	MOCK_TOKENS,
 	MOCK_DATABASES,
 	MOCK_CRON_JOBS,
 	MOCK_CRON_RUNS,
@@ -43,8 +49,11 @@ import {
 	MOCK_APP_ENV_VARS,
 	MOCK_PREVIEW_ENV_VARS,
 	MOCK_CERTIFICATES,
+	MOCK_DATABASE_LINKS,
 	makeMockSystemMetrics,
-	makeMockAppMetrics
+	makeMockSystemSelf,
+	makeMockMetrics,
+	MOCK_DATABASE_SECRETS
 } from './fixtures';
 import type {
 	AlertRule,
@@ -54,6 +63,9 @@ import type {
 	CronJob,
 	CronJobRun,
 	Deployment,
+	DeploymentLogLine,
+	DeployPhase,
+	PhaseRecord,
 	GitHubApp,
 	GithubPR,
 	Integration,
@@ -68,7 +80,9 @@ import type {
 	ProjectPreview,
 	RegistryCredential,
 	Snapshot,
-	StorageProvider
+	StorageProvider,
+	EnvVarEntry,
+	DatabaseCredentials
 } from '$lib/api';
 import { MOCK_ALERT_RULES } from './fixtures';
 
@@ -79,9 +93,28 @@ function ok<T>(data: T) {
 	return HttpResponse.json({ success: true, data, error: null });
 }
 
-function err(message: string, status = 400) {
-	return HttpResponse.json({ success: false, data: null, error: message }, { status });
+function err(message: string, status = 400, code?: string) {
+	return HttpResponse.json(
+		{ success: false, data: null, error: message, ...(code ? { code } : {}) },
+		{ status }
+	);
 }
+
+/** The mock password policy: 12–256 characters, no common passwords. */
+function mockPasswordProblem(password: string): string | null {
+	const n = [...password].length;
+	if (n < 12)
+		return "Use at least 12 characters. A few random words make a strong password that's easy to remember.";
+	if (n > 256) return 'Use at most 256 characters.';
+	const core = password.toLowerCase().replace(/^[\d\W]+|[\d\W]+$/g, '');
+	if (['password', 'qwerty', 'iloveyou', 'welcome', 'admin', 'letmein'].includes(core)) {
+		return "This password is too common: it's on lists of breached passwords that attackers try first. Pick something unique, like a few random words.";
+	}
+	return null;
+}
+
+/** Valid set-password link token in the mock (any other token is refused). */
+const MOCK_PASSWORD_LINK = 'mock-link';
 
 // ── Mock helpers mirroring server-side confinement rules ─────────────────────
 
@@ -173,13 +206,13 @@ function mockComposeProblems(content: string): string[] {
 	return problems;
 }
 
-/** Public connection string (only when public access is on). */
-function mockPublicUrl(db: ManagedDatabase): string | null {
+/** Public connection string (only when public access is on), plaintext. */
+function mockPublicUrl(db: ManagedDatabase, password: string | null): string | null {
 	if (!db.public_access || !db.host_port) return null;
 	const isRedisLike = db.db_type === 'redis' || db.db_type === 'keydb';
 	return isRedisLike
-		? `redis://${db.db_user}:${db.db_password}@tond.example.com:${db.host_port}`
-		: `${db.db_type}://${db.db_user}:${db.db_password}@tond.example.com:${db.host_port}/${db.db_name}`;
+		? `redis://${db.db_user}:${password}@tond.example.com:${db.host_port}`
+		: `${db.db_type}://${db.db_user}:${password}@tond.example.com:${db.host_port}/${db.db_name}`;
 }
 
 // Mirrors tond-server's domains.rs: previews need a preview domain on a different
@@ -208,6 +241,67 @@ function mockPreviewDomainError(preview: string, dashboard: string): string | nu
 
 function normalizeDomain(value: string): string {
 	return value.trim().toLowerCase().replace(/\.$/, '');
+}
+
+/** Two hostnames on the same site (approximated by their last two labels). */
+function mockSameSite(a: string, b: string): boolean {
+	if (!a || !b) return false;
+	return a === b || a.endsWith(`.${b}`) || b.endsWith(`.${a}`) || mockSite(a) === mockSite(b);
+}
+
+// Mirrors domains.rs validate_apps_domain.
+function mockAppsDomainError(apps: string, dashboard: string, preview: string): string | null {
+	if (!apps) return null;
+	if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(apps)) {
+		return `'${apps}' is not a valid domain name (expected something like example-apps.com)`;
+	}
+	if (mockSameSite(apps, dashboard)) {
+		return `The apps domain must be a different site from the dashboard (${dashboard}): every app would be same-site with the dashboard. Use a separate domain, such as example-apps.com.`;
+	}
+	if (mockSameSite(apps, preview)) {
+		return `The apps domain must be a different site from the preview domain (${preview}). Previews run pull-request code and must not share a site with your production apps.`;
+	}
+	return null;
+}
+
+function mockDomainWarning(domain: string | null): string | null {
+	const dashboard = MOCK_SETTINGS.dashboard_domain;
+	if (!domain || !mockSameSite(domain, dashboard)) return null;
+	return `${domain} is on the same site as your dashboard (${dashboard}). The app can send same-site requests to the dashboard and set cookies for it; use a domain on a different site for code you don't fully trust.`;
+}
+
+// ── Database links (networks.rs) ──
+let databaseLinks = structuredClone(MOCK_DATABASE_LINKS);
+
+const DB_PORTS: Record<string, number> = {
+	postgres: 5432,
+	mysql: 3306,
+	mariadb: 3306,
+	redis: 6379,
+	keydb: 6379,
+	mongodb: 27017
+};
+
+function mockDatabaseAccess(db: ManagedDatabase) {
+	const ref = (a: App) => ({
+		id: a.id,
+		name: a.name,
+		status: a.status,
+		project_id: a.project_id
+	});
+	const project = db.project_id ? projects.find((p) => p.id === db.project_id) : undefined;
+	return {
+		database_id: db.id,
+		project: project ? { id: project.id, name: project.name } : null,
+		project_apps: db.project_id ? apps.filter((a) => a.project_id === db.project_id).map(ref) : [],
+		linked_apps: databaseLinks
+			.filter((l) => l.database_id === db.id)
+			.map((l) => apps.find((a) => a.id === l.app_id))
+			.filter((a): a is App => !!a)
+			.map(ref),
+		internal_host: db.name,
+		internal_port: DB_PORTS[db.db_type] ?? 0
+	};
 }
 
 const certificates = MOCK_CERTIFICATES.map((c) => ({ ...c }));
@@ -258,6 +352,50 @@ function mockHostTerminalEnabled(): boolean {
 		return false;
 	}
 }
+/** Tiny cron evaluator for the mock schedule preview (UTC, minute resolution). */
+function mockNextRuns(schedule: string, count: number): string[] | null {
+	const fields = schedule.trim().split(/\s+/);
+	if (fields.length !== 5) return null;
+	const ranges: [number, number][] = [
+		[0, 59],
+		[0, 23],
+		[1, 31],
+		[1, 12],
+		[0, 7]
+	];
+	const sets: Set<number>[] = [];
+	for (let i = 0; i < 5; i++) {
+		const [min, max] = ranges[i];
+		const set = new Set<number>();
+		for (const part of fields[i].split(',')) {
+			const [range, stepStr] = part.split('/');
+			const step = stepStr ? Number(stepStr) : 1;
+			if (!Number.isInteger(step) || step < 1) return null;
+			const [a, rawB] = range === '*' ? [min, max] : range.split('-').map(Number);
+			const b = rawB === undefined ? (stepStr ? max : a) : rawB;
+			if (!Number.isInteger(a) || !Number.isInteger(b) || a < min || b > max || a > b) return null;
+			for (let v = a; v <= b; v += step) set.add(i === 4 ? v % 7 : v);
+		}
+		sets.push(set);
+	}
+	const runs: string[] = [];
+	const t = new Date();
+	t.setUTCSeconds(0, 0);
+	for (let n = 0; n < 60 * 24 * 400 && runs.length < count; n++) {
+		t.setUTCMinutes(t.getUTCMinutes() + 1);
+		if (
+			sets[0].has(t.getUTCMinutes()) &&
+			sets[1].has(t.getUTCHours()) &&
+			sets[2].has(t.getUTCDate()) &&
+			sets[3].has(t.getUTCMonth() + 1) &&
+			sets[4].has(t.getUTCDay())
+		) {
+			runs.push(t.toISOString());
+		}
+	}
+	return runs;
+}
+
 const MOCK_STEP_UP_PASSWORD = 'ValidPass123!';
 // ticket → target, consumed by the terminal WebSocket mock
 const terminalTickets = new Map<string, { kind: string; id: string }>();
@@ -276,6 +414,121 @@ let githubApps: GitHubApp[] = structuredClone(MOCK_GITHUB_APPS);
 
 // Per-app webhook secrets (the real server generates one at app creation).
 const webhookSecrets: Record<string, string> = {};
+
+// Stored secrets live beside the rows, like the server's encrypted columns:
+// responses only ever carry masked values or `has_*` flags.
+const ENV_MASK = '••••••••';
+
+function urlHost(url: string): string | null {
+	try {
+		return new URL(url).host || null;
+	} catch {
+		return null;
+	}
+}
+
+/** Mirrors tond_common::mask_url_password. */
+function maskUrlPassword(url: string): string {
+	return url.replace(/(:\/\/[^:/@\s]+):[^/\s]+@/g, `$1:${ENV_MASK}@`);
+}
+
+const INTEGRATION_SECRET_FIELDS = ['bot_token', 'webhook_url', 'smtp_password'] as const;
+const integrationSecrets: Record<string, Record<string, string>> = {};
+
+/** Split a submitted integration config into its plain part and saved secrets. */
+function storeIntegrationConfig(
+	id: string,
+	config: Record<string, unknown>
+): { config: Integration['config']; saved_secrets: string[] } {
+	const saved = (integrationSecrets[id] ??= {});
+	const plain: Record<string, unknown> = { ...config };
+	for (const field of INTEGRATION_SECRET_FIELDS) {
+		const value = plain[field];
+		delete plain[field];
+		if (typeof value === 'string' && value.trim()) saved[field] = value.trim();
+	}
+	return {
+		config: plain as unknown as Integration['config'],
+		saved_secrets: INTEGRATION_SECRET_FIELDS.filter((f) => saved[f])
+	};
+}
+
+const cronEnv: Record<string, Record<string, string>> = Object.fromEntries(
+	cronJobs.map((job) => [job.id, Object.fromEntries(job.env.map((e) => [e.key, 'mock-value']))])
+);
+const projectEnv: Record<string, Record<string, string>> = {};
+
+// Managed database secrets, stored beside the rows (see MOCK_DATABASE_SECRETS).
+const dbSecrets: Record<string, { db_password: string | null; root_password: string | null }> =
+	structuredClone(MOCK_DATABASE_SECRETS);
+/** Plaintext connection-string overrides (rows carry the masked form). */
+const dbCustomUrls: Record<string, { external: string | null; internal: string | null }> = {};
+
+/** Plaintext connection strings, as the credentials reveal returns them. */
+function dbCredentials(db: ManagedDatabase): DatabaseCredentials {
+	const password = dbSecrets[db.id]?.db_password ?? null;
+	const isRedisLike = db.db_type === 'redis' || db.db_type === 'keydb';
+	const port = db.db_type === 'mysql' || db.db_type === 'mariadb' ? 3306 : 5432;
+	const auth = db.db_user && password ? `${db.db_user}:${password}@` : '';
+	const computedExternal = db.host_port
+		? isRedisLike
+			? `redis://${auth}localhost:${db.host_port}`
+			: `${db.db_type}://${auth}localhost:${db.host_port}/${db.db_name}`
+		: null;
+	// Apps with access (project members, linked apps) reach it by its name.
+	const computedInternal = isRedisLike
+		? `redis://${auth}${db.name}:6379`
+		: `${db.db_type}://${auth}${db.name}:${port}/${db.db_name}`;
+	const custom = dbCustomUrls[db.id];
+	return {
+		db_user: db.db_user,
+		db_password: password,
+		root_password: dbSecrets[db.id]?.root_password ?? null,
+		connection_string: custom?.external ?? computedExternal,
+		public_connection_string: mockPublicUrl(db, password),
+		internal_connection_string: custom?.internal ?? computedInternal
+	};
+}
+
+/** A database detail response: connection strings with the password masked. */
+function dbDetail(db: ManagedDatabase) {
+	const creds = dbCredentials(db);
+	const mask = (url: string | null) => (url ? maskUrlPassword(url) : null);
+	return {
+		...db,
+		connection_string: mask(creds.connection_string),
+		public_connection_string: mask(creds.public_connection_string),
+		internal_connection_string: mask(creds.internal_connection_string)
+	};
+}
+
+function mockDatabaseSnapshot(dbName: string, trigger: 'manual' | 'pre_restore'): Snapshot {
+	const now = new Date().toISOString();
+	const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
+	return {
+		id: `snap_${trigger}_${Date.now()}`,
+		name: trigger === 'manual' ? `${dbName} ${stamp}` : `pre-restore ${dbName} ${stamp}`,
+		status: 'completed',
+		trigger,
+		scope: `database:${dbName}`,
+		trigger_app: null,
+		deployment_id: null,
+		parent_snapshot_id: null,
+		created_at: now,
+		completed_at: now,
+		delta_bytes: 3_145_728,
+		total_bytes: 3_145_728,
+		local_path: `/opt/tond/data/backups/snapshots/snap_${Date.now()}`,
+		remote_key: null,
+		storage_provider_id: null,
+		checksum_sha256: null,
+		error_message: null,
+		notes: null,
+		remote_status: backupConfig.storage_provider_id ? 'uploading' : null,
+		remote_error: null,
+		archive_bytes: null
+	};
+}
 
 function randomHex(bytes: number): string {
 	const buf = new Uint8Array(bytes);
@@ -304,12 +557,14 @@ function webhookConfig(app: App) {
 		app_id: app.id,
 		paths,
 		urls,
-		secret: webhookSecrets[app.id],
+		has_secret: true,
 		auto_deploy: app.auto_deploy,
 		watch_branch: app.watch_branch
 	};
 }
 let users = structuredClone(MOCK_USERS);
+let apiTokens = structuredClone(MOCK_TOKENS);
+const auditLog = structuredClone(MOCK_AUDIT_LOG);
 let integrations: Integration[] = structuredClone(MOCK_INTEGRATIONS);
 let storageProviders: StorageProvider[] = structuredClone(MOCK_STORAGE_PROVIDERS);
 let snapshots: Snapshot[] = structuredClone(MOCK_SNAPSHOTS);
@@ -328,7 +583,7 @@ function previewStore(appId: string) {
 	return (previewEnvVars[appId] ??= {});
 }
 
-function maskedEntries(vars: Record<string, string>) {
+function maskedEntries(vars: Record<string, string>): EnvVarEntry[] {
 	return Object.keys(vars)
 		.sort()
 		.map((key) => ({ key, masked: vars[key] ? '••••••••' : '' }));
@@ -339,7 +594,7 @@ function appEnvResponse(app: App) {
 		vars: maskedEntries(envStore(app.id)),
 		preview: {
 			enabled: app.preview_enabled,
-			excluded_keys: app.preview_excluded_keys,
+			shared_keys: app.preview_shared_keys,
 			overrides: maskedEntries(previewStore(app.id))
 		}
 	};
@@ -417,6 +672,388 @@ function currentMockUser() {
 }
 
 const CREDENTIAL_PATHS = ['/api/auth/'];
+
+// ── Mock deploy engine ────────────────────────────────────────────────────────
+//
+// POST /api/apps/:id/deploy (and rollback) start a scripted deployment that
+// walks through the phases and writes log lines over ~15 s, so the live deploy
+// view can be developed without a server. Apps named "worker-queue" fail the
+// health step (nothing listening on the port); everything else succeeds.
+
+const deploymentLogs: Record<string, DeploymentLogLine[]> = structuredClone(MOCK_DEPLOYMENT_LOGS);
+type DeployFrame = { type: 'log' | 'deployment'; [key: string]: unknown };
+const deployListeners = new Map<string, Set<(frame: DeployFrame) => void>>();
+
+function emitDeploy(deploymentId: string, frame: DeployFrame) {
+	for (const listener of deployListeners.get(deploymentId) ?? []) listener(frame);
+}
+
+function mockPhasePlan(plan: string, healthPath: string | null): PhaseRecord[] {
+	const health = healthPath ? 'Health check' : 'Wait for the app to listen';
+	const table: Record<string, (string | null)[]> = {
+		git: ['Clone repository', 'Build image', 'Start container', health, 'Switch traffic'],
+		image: ['Pull image', null, 'Start container', health, 'Switch traffic'],
+		tarball: [null, 'Build uploaded source', 'Start container', health, 'Switch traffic'],
+		dockerfile: [null, 'Build image', 'Start container', health, 'Switch traffic'],
+		compose: [null, 'docker compose up', 'Find the service port', null, 'Switch traffic'],
+		rollback: [null, null, 'Start container', health, 'Switch traffic']
+	};
+	const labels = table[plan] ?? table.rollback;
+	const phases: DeployPhase[] = ['clone', 'build', 'start', 'health', 'release'];
+	return phases.map((phase, i) =>
+		labels[i] === null
+			? { phase, status: 'skipped' as const }
+			: { phase, status: 'pending' as const, label: labels[i] as string }
+	);
+}
+
+function updateDeployment(appId: string, id: string, change: (d: Deployment) => Deployment) {
+	const list = deployments[appId] ?? [];
+	const idx = list.findIndex((d) => d.id === id);
+	if (idx === -1) return;
+	list[idx] = change(list[idx]);
+	emitDeploy(id, { type: 'deployment', deployment: list[idx] });
+}
+
+function startMockDeploy(
+	app: App,
+	opts: { trigger_source: string; trigger_detail: string | null; rollbackOf?: Deployment }
+): Deployment {
+	const id = `dep_${Date.now().toString(36)}`;
+	const now = new Date().toISOString();
+	const plan = opts.rollbackOf ? 'rollback' : app.source_type;
+	const deployment: Deployment = {
+		id,
+		app_id: app.id,
+		image_tag: opts.rollbackOf?.image_tag ?? null,
+		status: 'running',
+		trigger_source: opts.trigger_source,
+		trigger_detail: opts.trigger_detail,
+		rollback_of: opts.rollbackOf?.id ?? null,
+		commit_sha: opts.rollbackOf?.commit_sha ?? null,
+		commit_message: opts.rollbackOf?.commit_message ?? null,
+		commit_author: opts.rollbackOf?.commit_author ?? null,
+		has_generated_dockerfile: false,
+		started_at: now,
+		finished_at: null,
+		created_at: now,
+		duration_secs: null,
+		phases: mockPhasePlan(plan, app.health_check_path).map((p) =>
+			p.phase === 'health' && p.status !== 'skipped' && app.readiness === 'none'
+				? { ...p, label: `Stay up for ${app.ready_after_secs ?? 10}s` }
+				: p.phase === 'health' && p.status !== 'skipped' && app.readiness === 'tcp'
+					? { ...p, label: 'Wait for the port to accept connections' }
+					: p.phase === 'release' && app.readiness === 'none'
+						? { ...p, label: 'Replace the old container' }
+						: p
+		),
+		failure: null,
+		image_pruned: false,
+		is_current: false,
+		rollback_available: false,
+		rollback_unavailable_reason: null
+	};
+	deployments[app.id] = [deployment, ...(deployments[app.id] ?? [])];
+	deploymentLogs[id] = [];
+	const appIdx = apps.findIndex((a) => a.id === app.id);
+	if (appIdx !== -1) apps[appIdx] = { ...apps[appIdx], status: 'building' };
+
+	const fail = app.name === 'worker-queue';
+	const tag = `tond-${app.name}:${id.slice(4, 16).padEnd(12, '0')}`;
+	const log = (level: string, message: string) => {
+		const line = { level, message, ts: new Date().toISOString() };
+		deploymentLogs[id].push(line);
+		emitDeploy(id, { type: 'log', ...line });
+	};
+	const phase = (name: DeployPhase) =>
+		updateDeployment(app.id, id, (d) => {
+			const ts = new Date().toISOString();
+			return {
+				...d,
+				phases: (d.phases ?? []).map((p) =>
+					p.phase === name
+						? { ...p, status: 'running' as const, started_at: ts }
+						: p.status === 'running'
+							? { ...p, status: 'succeeded' as const, finished_at: ts }
+							: p
+				)
+			};
+		});
+	const finish = () => {
+		const ts = new Date().toISOString();
+		const duration = Math.round((Date.parse(ts) - Date.parse(now)) / 1000);
+		if (fail) {
+			log('error', `Deployment failed: Nothing answered on port ${app.container_port} within 60s`);
+			updateDeployment(app.id, id, (d) => ({
+				...d,
+				status: 'failed',
+				finished_at: ts,
+				duration_secs: duration,
+				phases: (d.phases ?? []).map((p) =>
+					p.status === 'running' ? { ...p, status: 'failed' as const, finished_at: ts } : p
+				),
+				failure: {
+					phase: 'health',
+					code: 'port_not_listening',
+					title: `Nothing answered on port ${app.container_port} within 60s`,
+					hint: `Tond expected the app to listen on port ${app.container_port} inside the container. If it uses another port (nginx listens on 80, many Node apps on 3000), change the app's port; make sure the app binds to 0.0.0.0, not localhost.`,
+					detail:
+						'the new container did not become ready within 60s; the previous version keeps serving',
+					excerpt: [
+						'/docker-entrypoint.sh: Configuration complete; ready for start up',
+						'nginx: [notice] start worker processes'
+					]
+				}
+			}));
+			if (appIdx !== -1) apps[appIdx] = { ...apps[appIdx], status: 'failed' };
+			return;
+		}
+		log('info', `Deployed successfully! Container: ${id.slice(4, 16)}`);
+		deployments[app.id] = (deployments[app.id] ?? []).map((d) =>
+			d.id === id
+				? d
+				: {
+						...d,
+						is_current: false,
+						rollback_available: d.status === 'succeeded' && !d.image_pruned,
+						rollback_unavailable_reason:
+							d.status === 'succeeded' && !d.image_pruned ? null : d.rollback_unavailable_reason
+					}
+		);
+		updateDeployment(app.id, id, (d) => ({
+			...d,
+			status: 'succeeded',
+			finished_at: ts,
+			duration_secs: duration,
+			image_tag: d.image_tag ?? tag,
+			is_current: true,
+			rollback_unavailable_reason: 'This image is already running',
+			phases: (d.phases ?? []).map((p) =>
+				p.status === 'running'
+					? { ...p, status: 'succeeded' as const, finished_at: ts }
+					: p.status === 'pending'
+						? { ...p, status: 'skipped' as const }
+						: p
+			)
+		}));
+		if (appIdx !== -1) apps[appIdx] = { ...apps[appIdx], status: 'running' };
+	};
+
+	const script: [number, () => void][] = [
+		[300, () => log('info', opts.rollbackOf ? 'Starting rollback...' : 'Starting deployment...')]
+	];
+	if (plan === 'git') {
+		script.push(
+			[400, () => phase('clone')],
+			[300, () => log('info', `Cloning ${app.source_url ?? 'repository'} (main)`)],
+			[
+				1200,
+				() => {
+					updateDeployment(app.id, id, (d) => ({
+						...d,
+						commit_sha: '4e5f6a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5',
+						commit_message: 'Tidy up the order totals',
+						commit_author: 'Ada Lovelace'
+					}));
+					log('info', 'Commit 4e5f6a7 by Ada Lovelace: Tidy up the order totals');
+				}
+			],
+			[300, () => phase('build')]
+		);
+		for (const line of mockBuildLog(now, 'Tidy up the order totals', true).slice(4, 15)) {
+			script.push([500, () => log(line.level, line.message)]);
+		}
+		script.push([1500, () => log('info', '#15 exporting to image')]);
+	} else if (plan === 'image') {
+		script.push(
+			[400, () => phase('clone')],
+			[300, () => log('info', `Pulling image: ${app.source_url ?? 'image'}`)],
+			[2000, () => log('info', `Pinned ${app.source_url} as ${tag}`)]
+		);
+	} else if (plan !== 'rollback') {
+		script.push(
+			[400, () => phase('build')],
+			[1500, () => log('info', '#1 [internal] load build definition from Dockerfile')],
+			[1500, () => log('info', `#6 naming to docker.io/library/${tag} \u001b[32mdone\u001b[0m`)]
+		);
+	} else {
+		script.push([300, () => log('info', `Rolling back to image: ${opts.rollbackOf?.image_tag}`)]);
+	}
+	script.push(
+		[500, () => phase('start')],
+		[300, () => log('info', `Starting new container on port 8108:${app.container_port}`)],
+		[800, () => phase('health')],
+		[
+			300,
+			() =>
+				log(
+					'info',
+					app.readiness === 'none'
+						? `Background worker: waiting ${app.ready_after_secs ?? 10}s to make sure it stays up`
+						: app.health_check_path
+							? `Waiting up to 30s for the health check on port ${app.container_port}${app.health_check_path} to pass`
+							: `Waiting up to 60s for the app to answer on port ${app.container_port}`
+				)
+		]
+	);
+	if (fail) {
+		script.push([4000, finish]);
+	} else {
+		script.push(
+			[
+				2000,
+				() =>
+					log(
+						'info',
+						app.readiness === 'none'
+							? 'The worker stayed up — replacing the old container'
+							: 'New container is ready — cutting over traffic'
+					)
+			],
+			[200, () => phase('release')],
+			[
+				300,
+				() =>
+					app.readiness !== 'none' &&
+					log('info', 'Waiting 3s for proxy to pick up new port before stopping old container')
+			],
+			[1500, () => log('info', 'Draining old container 4be1c2a9d0f3 (30s grace)')],
+			[800, finish]
+		);
+	}
+
+	let wait = 0;
+	for (const [ms, action] of script) {
+		wait += ms;
+		setTimeout(action, wait);
+	}
+	return deployment;
+}
+
+function deploymentDetail(app: App, d: Deployment) {
+	return {
+		...d,
+		logs: deploymentLogs[d.id] ?? [],
+		logs_truncated: false,
+		container_port: app.container_port,
+		health_check_path: app.health_check_path,
+		source_type: app.source_type
+	};
+}
+
+function isFinishedStatus(status: string) {
+	return ['succeeded', 'failed', 'superseded', 'cancelled'].includes(status);
+}
+
+const deploymentStreamHandler = deploymentStream.addEventListener('connection', ({ client }) => {
+	const match = client.url.pathname.match(/\/api\/apps\/([^/]+)\/deployments\/([^/]+)\/stream/);
+	const app = match ? apps.find((a) => a.id === match[1] || a.name === match[1]) : undefined;
+	const d = app ? (deployments[app.id] ?? []).find((x) => x.id === match?.[2]) : undefined;
+	if (!app || !d) {
+		client.close(4004, 'Deployment not found');
+		return;
+	}
+	const detail = deploymentDetail(app, d);
+	client.send(
+		JSON.stringify({
+			type: 'snapshot',
+			deployment: d,
+			logs: detail.logs,
+			logs_truncated: false,
+			container_port: detail.container_port,
+			health_check_path: detail.health_check_path,
+			source_type: detail.source_type
+		})
+	);
+	if (isFinishedStatus(d.status)) {
+		setTimeout(() => client.close(1000, 'Deployment finished'), 50);
+		return;
+	}
+	const listener = (frame: DeployFrame) => {
+		client.send(JSON.stringify(frame));
+		const dep = frame.deployment as Deployment | undefined;
+		if (frame.type === 'deployment' && dep && isFinishedStatus(dep.status)) {
+			// Let the last frames go out before closing, as a real socket would.
+			setTimeout(() => client.close(1000, 'Deployment finished'), 50);
+		}
+	};
+	const set = deployListeners.get(d.id) ?? new Set();
+	set.add(listener);
+	deployListeners.set(d.id, set);
+	client.addEventListener('close', () => set.delete(listener));
+});
+
+/** Mock of GET /api/domains/check (server: handlers/domains.rs). */
+function mockDomainCheck(domain: string) {
+	const serverIp = '203.0.113.10';
+	const parts = domain.split('.');
+	const zone = parts.length >= 2 ? parts.slice(-2).join('.') : null;
+	const rel = (host: string) =>
+		zone && host === zone ? '@' : zone ? host.slice(0, -(zone.length + 1)) : host;
+	const appsDomain = MOCK_SETTINGS.apps_domain || null;
+	const under = !!appsDomain && domain.endsWith(`.${appsDomain}`);
+	const record = (host: string) => ({
+		type: 'A' as const,
+		name: rel(host),
+		host,
+		value: serverIp
+	});
+	const resolved: Record<string, string[]> = {
+		'api.example.com': [serverIp],
+		'app.example.com': ['198.51.100.23'],
+		'db.example.com': [serverIp, '198.51.100.23']
+	};
+	const ips = under ? [serverIp] : (resolved[domain] ?? []);
+	const stray = ips.filter((ip) => ip !== serverIp);
+	let status: 'ok' | 'mismatch' | 'missing' | 'inconclusive';
+	let message: string;
+	if (ips.length === 0) {
+		status = 'missing';
+		message = `${domain} has no A or AAAA record yet. Create the record below; DNS changes usually show up within a few minutes.`;
+	} else if (ips.includes(serverIp)) {
+		status = 'ok';
+		message = stray.length
+			? `${domain} points at this server, but also at ${stray.join(', ')}. Remove that record: visitors and Let's Encrypt may reach the other address.`
+			: `${domain} points at this server.`;
+	} else {
+		status = 'mismatch';
+		message = `DNS for ${domain} points to ${ips.join(', ')}, expected ${serverIp}. Update the domain's A/AAAA record to this server.`;
+	}
+	const cert = certificates.find((c) => c.domain === domain) ?? null;
+	return {
+		domain,
+		zone,
+		apps_domain: appsDomain,
+		under_apps_domain: under,
+		records: [record(domain)],
+		wildcard_records: under ? [record(`*.${appsDomain}`)] : [],
+		warning: mockDomainWarning(domain),
+		server_ips: [serverIp],
+		dns: { status, resolved: ips, expected: [serverIp], stray, message },
+		certificate: cert
+			? {
+					status: cert.status,
+					issued_at: cert.issued_at,
+					expires_at: cert.expires_at,
+					last_error: cert.last_error,
+					last_attempt_at: cert.last_attempt_at,
+					next_retry_at: cert.next_retry_at,
+					failure_count: cert.failure_count
+				}
+			: null,
+		checked_at: new Date().toISOString()
+	};
+}
+
+/** Ports a few well-known images expose (mock of POST /api/images/inspect). */
+function mockImagePorts(image: string): { exposed: number[]; env: number | null } {
+	const name = image.toLowerCase();
+	if (/nginx|httpd|caddy|whoami|apache/.test(name)) return { exposed: [80], env: null };
+	if (/grafana|metabase/.test(name)) return { exposed: [3000], env: null };
+	if (/ghost/.test(name)) return { exposed: [2368], env: null };
+	if (/node|next/.test(name)) return { exposed: [], env: 3000 };
+	return { exposed: [], env: null };
+}
 
 export const handlers = [
 	// Scenario gate: runs first and falls through (returns undefined) when idle.
@@ -500,9 +1137,243 @@ export const handlers = [
 		return ok({ user: MOCK_USER });
 	}),
 
-	http.get('/api/auth/users', async () => {
+	// ── Users (users:admin) ───────────────────────────────────────────────────
+
+	http.get('/api/users', async () => {
 		await delay(LATENCY);
 		return ok(users);
+	}),
+
+	http.post('/api/users', async ({ request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as { email?: string; role?: string };
+		const email = body.email?.trim() ?? '';
+		if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+			return err('Invalid input: Enter a valid email address, like name@example.com.', 400);
+		}
+		if (users.some((u) => u.email.toLowerCase() === email.toLowerCase())) {
+			return err(`App already exists: a user with the email ${email}`, 409);
+		}
+		const role = (body.role ?? 'viewer') as 'admin' | 'deployer' | 'viewer';
+		const newUser = {
+			id: `usr_${Date.now()}`,
+			email,
+			role,
+			totp_enabled: false,
+			created_at: new Date().toISOString(),
+			disabled: false,
+			password_set: false,
+			last_login_at: null,
+			scopes: [],
+			active_sessions: 0,
+			is_you: false
+		};
+		users = [...users, newUser];
+		return HttpResponse.json(
+			{
+				success: true,
+				data: {
+					user: newUser,
+					token: MOCK_PASSWORD_LINK,
+					path: `/set-password?token=${MOCK_PASSWORD_LINK}`,
+					expires_at: new Date(Date.now() + 86400_000).toISOString()
+				},
+				error: null
+			},
+			{ status: 201 }
+		);
+	}),
+
+	http.patch('/api/users/:id', async ({ params, request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as { role?: string; disabled?: boolean };
+		const target = users.find((u) => u.id === params.id);
+		if (!target) return err('Not found: user', 404);
+		if (target.is_you) {
+			return err(
+				"Invalid input: You can't change your own role or disable yourself. Ask another admin."
+			);
+		}
+		users = users.map((u) =>
+			u.id === params.id
+				? {
+						...u,
+						role: (body.role as typeof u.role) ?? u.role,
+						disabled: body.disabled ?? u.disabled,
+						active_sessions: 0
+					}
+				: u
+		);
+		return ok(users.find((u) => u.id === params.id));
+	}),
+
+	http.delete('/api/users/:id', async ({ params }) => {
+		await delay(LATENCY);
+		const target = users.find((u) => u.id === params.id);
+		if (!target) return err('Not found: user', 404);
+		if (target.is_you)
+			return err("Invalid input: You can't delete your own account. Ask another admin.");
+		users = users.filter((u) => u.id !== params.id);
+		return ok({ deleted: params.id });
+	}),
+
+	http.post('/api/users/:id/password-link', async ({ params }) => {
+		await delay(LATENCY);
+		const target = users.find((u) => u.id === params.id);
+		if (!target) return err('Not found: user', 404);
+		return HttpResponse.json(
+			{
+				success: true,
+				data: {
+					user: target,
+					token: MOCK_PASSWORD_LINK,
+					path: `/set-password?token=${MOCK_PASSWORD_LINK}`,
+					expires_at: new Date(Date.now() + 86400_000).toISOString()
+				},
+				error: null
+			},
+			{ status: 201 }
+		);
+	}),
+
+	http.get('/api/users/:id/sessions', async ({ params }) => {
+		await delay(LATENCY);
+		const target = users.find((u) => u.id === params.id);
+		if (!target) return err('Not found: user', 404);
+		return ok(
+			Array.from({ length: target.active_sessions }, (_, i) => ({
+				id: `sess_${target.id}_${i}`,
+				user_agent:
+					i === 0
+						? 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/128.0'
+						: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5) Safari/604.1',
+				ip_address: i === 0 ? '198.51.100.7' : '192.0.2.18',
+				created_at: new Date(Date.now() - (i + 1) * 5 * 3600_000).toISOString(),
+				last_used_at: new Date(Date.now() - (i + 1) * 20 * 60_000).toISOString(),
+				expires_at: new Date(Date.now() + 29 * 86400_000).toISOString(),
+				idle_expires_at: new Date(Date.now() + 11 * 3600_000).toISOString(),
+				is_current: target.is_you && i === 0
+			}))
+		);
+	}),
+
+	http.delete('/api/users/:id/sessions', async ({ params }) => {
+		await delay(LATENCY);
+		const target = users.find((u) => u.id === params.id);
+		if (!target) return err('Not found: user', 404);
+		const revoked = target.is_you ? target.active_sessions - 1 : target.active_sessions;
+		users = users.map((u) =>
+			u.id === params.id ? { ...u, active_sessions: u.active_sessions - revoked } : u
+		);
+		return ok({ revoked });
+	}),
+
+	http.delete('/api/users/:id/sessions/:sessionId', async ({ params }) => {
+		await delay(LATENCY);
+		users = users.map((u) =>
+			u.id === params.id ? { ...u, active_sessions: Math.max(0, u.active_sessions - 1) } : u
+		);
+		return ok({ revoked: 1 });
+	}),
+
+	// ── Set-password links (public) ───────────────────────────────────────────
+
+	http.post('/api/auth/password-link/check', async ({ request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as { token?: string };
+		if (body.token !== MOCK_PASSWORD_LINK) {
+			return err(
+				'This link is invalid, has expired or was already used. Ask an admin of this server for a new one.',
+				403
+			);
+		}
+		return ok({
+			email: 'victor@example.com',
+			purpose: 'invite',
+			expires_at: new Date(Date.now() + 20 * 3600_000).toISOString()
+		});
+	}),
+
+	http.post('/api/auth/password-link/complete', async ({ request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as { token?: string; password?: string };
+		if (body.token !== MOCK_PASSWORD_LINK) {
+			return err(
+				'This link is invalid, has expired or was already used. Ask an admin of this server for a new one.',
+				403
+			);
+		}
+		const problem = mockPasswordProblem(body.password ?? '');
+		if (problem) return err(problem, 400);
+		mockSignedIn = true;
+		return ok({ signed_in: true, user: currentMockUser() });
+	}),
+
+	// ── API tokens ────────────────────────────────────────────────────────────
+
+	http.get('/api/tokens/catalog', async () => {
+		await delay(LATENCY);
+		return ok(MOCK_TOKEN_CATALOG);
+	}),
+
+	http.get('/api/tokens', async () => {
+		await delay(LATENCY);
+		return ok(apiTokens);
+	}),
+
+	http.post('/api/tokens', async ({ request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as {
+			name?: string;
+			kind?: string;
+			scopes?: string[];
+			app_ids?: string[];
+			project_ids?: string[];
+			allowed_ips?: string[];
+			expires_in_hours?: number;
+		};
+		if (!body.name?.trim()) {
+			return err(
+				'Invalid input: Give the token a name, e.g. the machine or workflow that uses it.'
+			);
+		}
+		if (!body.scopes?.length) return err('Invalid input: Choose at least one scope or a preset.');
+		const hex = Array.from({ length: 64 }, () => Math.floor(Math.random() * 16).toString(16)).join(
+			''
+		);
+		const secret = `tond_pat_${hex}`;
+		const hours = body.expires_in_hours ?? 24 * 90;
+		const token = {
+			id: `tok_${Date.now()}`,
+			name: body.name.trim(),
+			prefix: secret.slice(0, 17),
+			kind: (body.kind ?? 'personal') as 'personal' | 'service' | 'agent' | 'ci',
+			scopes: body.scopes,
+			app_ids: body.app_ids ?? [],
+			project_ids: body.project_ids ?? [],
+			allowed_ips: body.allowed_ips ?? [],
+			owner_id: MOCK_USER.id,
+			owner_label: MOCK_USER.email,
+			expires_at: hours === 0 ? null : new Date(Date.now() + hours * 3600_000).toISOString(),
+			last_used_at: null,
+			last_used_ip: null,
+			revoked_at: null,
+			created_at: new Date().toISOString()
+		};
+		apiTokens = [token, ...apiTokens];
+		return HttpResponse.json(
+			{ success: true, data: { token, secret }, error: null },
+			{ status: 201 }
+		);
+	}),
+
+	http.delete('/api/tokens/:id', async ({ params }) => {
+		await delay(LATENCY);
+		const token = apiTokens.find((t) => t.id === params.id);
+		if (!token) return err('Not found: token', 404);
+		const updated = { ...token, revoked_at: token.revoked_at ?? new Date().toISOString() };
+		apiTokens = apiTokens.map((t) => (t.id === params.id ? updated : t));
+		return ok(updated);
 	}),
 
 	http.get('/api/terminal/targets', async () => {
@@ -585,20 +1456,6 @@ export const handlers = [
 		);
 	}),
 
-	http.post('/api/auth/users', async ({ request }) => {
-		await delay(LATENCY);
-		const body = (await request.json()) as { email: string; role?: string };
-		const newUser = {
-			id: `usr_${Date.now()}`,
-			email: body.email,
-			role: body.role ?? 'member',
-			totp_enabled: false,
-			created_at: new Date().toISOString()
-		};
-		users = [...users, newUser];
-		return ok(newUser);
-	}),
-
 	// ── Phase 7.1 — Password Management ─────────────────────────────────────
 
 	http.post('/api/auth/change-password', async ({ request }) => {
@@ -610,9 +1467,8 @@ export const handlers = [
 		if (body.current_password === 'wrong') {
 			return err('Current password is incorrect', 401);
 		}
-		if ((body.new_password?.length ?? 0) < 8) {
-			return err('New password must be at least 8 characters', 400);
-		}
+		const problem = mockPasswordProblem(body.new_password ?? '');
+		if (problem) return err(problem, 400);
 		return ok({ message: 'Password changed successfully' });
 	}),
 
@@ -625,7 +1481,8 @@ export const handlers = [
 				ip_address: '127.0.0.1',
 				created_at: new Date(Date.now() - 3600_000).toISOString(),
 				last_used_at: new Date().toISOString(),
-				expires_at: new Date(Date.now() + 82800_000).toISOString(),
+				expires_at: new Date(Date.now() + 29 * 86400_000).toISOString(),
+				idle_expires_at: new Date(Date.now() + 12 * 3600_000).toISOString(),
 				is_current: true
 			},
 			{
@@ -634,7 +1491,8 @@ export const handlers = [
 				ip_address: '192.168.1.42',
 				created_at: new Date(Date.now() - 86400_000).toISOString(),
 				last_used_at: new Date(Date.now() - 7200_000).toISOString(),
-				expires_at: new Date(Date.now() + 3600_000).toISOString(),
+				expires_at: new Date(Date.now() + 20 * 86400_000).toISOString(),
+				idle_expires_at: new Date(Date.now() + 10 * 3600_000).toISOString(),
 				is_current: false
 			}
 		]);
@@ -735,11 +1593,13 @@ export const handlers = [
 			description?: string;
 			env_vars?: Record<string, string>;
 		};
+		const newProjectId = `proj_${Date.now()}`;
+		projectEnv[newProjectId] = body.env_vars ?? {};
 		const newProject: Project = {
-			id: `proj_${Date.now()}`,
+			id: newProjectId,
 			name: body.name,
 			description: body.description ?? null,
-			env_vars: body.env_vars ?? {},
+			env: maskedEntries(body.env_vars ?? {}),
 			active_preview_count: 0,
 			created_at: new Date().toISOString(),
 			updated_at: new Date().toISOString()
@@ -760,10 +1620,16 @@ export const handlers = [
 		await delay(LATENCY);
 		const idx = projects.findIndex((p) => p.id === params.id || p.name === params.id);
 		if (idx === -1) return err('Project not found', 404);
-		const body = (await request.json()) as Partial<
-			Pick<Project, 'name' | 'description' | 'env_vars'>
+		const { env_vars, ...body } = (await request.json()) as Partial<
+			Pick<Project, 'name' | 'description'> & { env_vars: Record<string, string> }
 		>;
-		projects[idx] = { ...projects[idx], ...body, updated_at: new Date().toISOString() };
+		if (env_vars) projectEnv[projects[idx].id] = env_vars;
+		projects[idx] = {
+			...projects[idx],
+			...body,
+			...(env_vars && { env: maskedEntries(env_vars) }),
+			updated_at: new Date().toISOString()
+		};
 		return ok(projects[idx]);
 	}),
 
@@ -828,6 +1694,11 @@ export const handlers = [
 			const problem = mockVolumeError(v, `${MOCK_VOLUMES_DIR}/${appName}`);
 			if (problem) return err(problem, 400);
 		}
+		if (body.readiness === 'none' && body.domain) {
+			return err(
+				'Invalid input: Background workers have no domain: they serve no traffic. Leave the domain empty.'
+			);
+		}
 		const newApp: App = {
 			id: `app_${Date.now()}`,
 			name: body.name ?? 'new-app',
@@ -860,7 +1731,9 @@ export const handlers = [
 			base_dir: body.base_dir ?? null,
 			static_build: body.static_build ?? false,
 			preview_enabled: false,
-			preview_excluded_keys: [],
+			preview_shared_keys: [],
+			readiness: body.readiness ?? 'http',
+			ready_after_secs: body.ready_after_secs ?? 10,
 			created_at: new Date().toISOString(),
 			updated_at: new Date().toISOString()
 		};
@@ -872,21 +1745,159 @@ export const handlers = [
 		await delay(LATENCY);
 		const app = apps.find((a) => a.id === params.id);
 		if (!app) return err('App not found', 404);
-		return ok(app);
+		return ok({ ...app, domain_warning: mockDomainWarning(app.domain) });
+	}),
+
+	http.get('/api/apps/:id/databases', async ({ params }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
+		if (!app) return err('App not found', 404);
+		if (app.source_type === 'compose') return ok([]);
+		const toAccess = (db: ManagedDatabase, via: 'project' | 'link') => ({
+			id: db.id,
+			name: db.name,
+			db_type: db.db_type,
+			status: db.status,
+			via,
+			internal_host: db.name,
+			internal_port: DB_PORTS[db.db_type] ?? 0
+		});
+		const viaProject = app.project_id
+			? databases.filter((d) => d.project_id === app.project_id).map((d) => toAccess(d, 'project'))
+			: [];
+		const viaLink = databaseLinks
+			.filter((l) => l.app_id === app.id)
+			.map((l) => databases.find((d) => d.id === l.database_id))
+			.filter((d): d is ManagedDatabase => !!d && !viaProject.some((p) => p.id === d.id))
+			.map((d) => toAccess(d, 'link'));
+		return ok([...viaProject, ...viaLink]);
 	}),
 
 	http.delete('/api/apps/:id', async ({ params }) => {
 		await delay(LATENCY);
 		apps = apps.filter((a) => a.id !== params.id);
+		databaseLinks = databaseLinks.filter((l) => l.app_id !== params.id);
 		return ok(null);
 	}),
 
 	http.post('/api/apps/:id/deploy', async ({ params }) => {
-		await delay(LATENCY * 3);
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
+		if (!app) return err('App not found', 404);
+		const d = startMockDeploy(app, { trigger_source: 'manual', trigger_detail: MOCK_USER.email });
+		return HttpResponse.json(
+			{
+				success: true,
+				data: {
+					message: 'Deployment queued',
+					app_id: app.id,
+					deployment_id: d.id,
+					status: 'queued',
+					// The mock never has to wait: the build queue is always free.
+					queue_position: 1,
+					superseded: null
+				},
+				error: null
+			},
+			{ status: 202 }
+		);
+	}),
+
+	http.put('/api/apps/:id/readiness', async ({ params, request }) => {
+		await delay(LATENCY);
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx === -1) return err('App not found', 404);
-		apps[idx] = { ...apps[idx], status: 'running', updated_at: new Date().toISOString() };
-		return ok(null);
+		const body = (await request.json()) as { readiness: string; ready_after_secs?: number };
+		if (!['http', 'tcp', 'none'].includes(body.readiness)) {
+			return err('Invalid input: readiness must be one of: http, tcp, none');
+		}
+		const readiness = body.readiness as 'http' | 'tcp' | 'none';
+		apps[idx] = {
+			...apps[idx],
+			readiness,
+			ready_after_secs: body.ready_after_secs ?? apps[idx].ready_after_secs ?? 10,
+			...(readiness === 'none' ? { domain: null, health_check_path: null } : {}),
+			updated_at: new Date().toISOString()
+		};
+		return ok(apps[idx]);
+	}),
+
+	http.put('/api/apps/:id/port', async ({ params, request }) => {
+		await delay(LATENCY);
+		const idx = apps.findIndex((a) => a.id === params.id);
+		if (idx === -1) return err('App not found', 404);
+		const body = (await request.json()) as { container_port: number };
+		const port = Number(body.container_port);
+		if (!Number.isInteger(port) || port < 1 || port > 65535) {
+			return err('Invalid input: container_port must be between 1 and 65535');
+		}
+		apps[idx] = { ...apps[idx], container_port: port, updated_at: new Date().toISOString() };
+		return ok(apps[idx]);
+	}),
+
+	// ── Source inspection and domain checks ──
+
+	http.post('/api/git/branches', async ({ request }) => {
+		await delay(LATENCY * 2);
+		const body = (await request.json()) as { url: string; github_app_id?: string };
+		if (!/^https?:\/\//.test(body.url ?? '')) {
+			return err(
+				'Invalid input: Branches can only be listed for http(s) Git URLs; type the branch name instead'
+			);
+		}
+		if (/private/.test(body.url) && !body.github_app_id) {
+			return err(
+				"Invalid input: Tond couldn't read this repository. If it's private, pick a connected GitHub App or add credentials; you can also type the branch name."
+			);
+		}
+		const trunk = /legacy/.test(body.url) ? 'master' : 'main';
+		return ok({
+			default_branch: trunk,
+			branches: [trunk, 'develop', 'feature/checkout', 'release/2.4'],
+			truncated: false
+		});
+	}),
+
+	http.post('/api/images/inspect', async ({ request }) => {
+		await delay(LATENCY * 4);
+		const body = (await request.json()) as { image: string; registry_credential_id?: string };
+		const image = (body.image ?? '').trim();
+		if (!image || /\s/.test(image)) {
+			return err(
+				'Invalid input: Enter an image reference like nginx:alpine or ghcr.io/org/app:1.2'
+			);
+		}
+		if (/does-not-exist|private/.test(image) && !body.registry_credential_id) {
+			// Soft failure, as the server does for a pull the registry refuses.
+			return ok({
+				image,
+				exposed_ports: [],
+				env_port: null,
+				suggested_port: null,
+				pulled: false,
+				unavailable: `Tond couldn't read ${image}. If it's private, choose registry credentials on the Environment step and Tond reads its port then; otherwise check the name and tag.`,
+				needs_credentials: true
+			});
+		}
+		const { exposed, env } = mockImagePorts(image);
+		const suggested =
+			env && (exposed.length === 0 || exposed.includes(env)) ? env : (exposed[0] ?? null);
+		return ok({
+			image,
+			exposed_ports: exposed,
+			env_port: env,
+			suggested_port: suggested,
+			pulled: true
+		});
+	}),
+
+	http.get('/api/domains/check', async ({ request }) => {
+		await delay(LATENCY * 2);
+		const domain = (new URL(request.url).searchParams.get('domain') ?? '').trim().toLowerCase();
+		if (!/^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z][a-z0-9-]*$/.test(domain)) {
+			return err(`Invalid input: '${domain}' isn't a valid domain name`);
+		}
+		return ok(mockDomainCheck(domain));
 	}),
 
 	http.post('/api/apps/:id/stop', async ({ params }) => {
@@ -963,18 +1974,18 @@ export const handlers = [
 		const body = (await request.json()) as {
 			set?: Record<string, string>;
 			unset?: string[];
-			exclude?: string[];
-			include?: string[];
+			share?: string[];
+			unshare?: string[];
 		};
-		const hasExclusions = (body.exclude?.length ?? 0) + (body.include?.length ?? 0) > 0;
-		const problem = hasExclusions && !body.set && !body.unset ? null : validateEnvPatch(body);
+		const hasSharing = (body.share?.length ?? 0) + (body.unshare?.length ?? 0) > 0;
+		const problem = hasSharing && !body.set && !body.unset ? null : validateEnvPatch(body);
 		if (problem) return err(problem);
 		const app = apps[idx];
 		previewEnvVars[app.id] = applyEnvPatch(previewStore(app.id), body);
-		const excluded = new Set(app.preview_excluded_keys);
-		for (const key of body.exclude ?? []) excluded.add(key);
-		for (const key of body.include ?? []) excluded.delete(key);
-		apps[idx] = { ...app, preview_excluded_keys: [...excluded].sort() };
+		const shared = new Set(app.preview_shared_keys);
+		for (const key of body.share ?? []) shared.add(key);
+		for (const key of body.unshare ?? []) shared.delete(key);
+		apps[idx] = { ...app, preview_shared_keys: [...shared].sort() };
 		return ok(appEnvResponse(apps[idx]));
 	}),
 
@@ -983,9 +1994,30 @@ export const handlers = [
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx === -1) return err('App not found', 404);
 		const body = (await request.json()) as { domain: string };
-		apps[idx] = { ...apps[idx], domain: body.domain, updated_at: new Date().toISOString() };
-		queueMockCertificate(body.domain);
-		return ok(apps[idx]);
+		const domain = normalizeDomain(body.domain);
+		if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(domain)) {
+			return err(
+				`Invalid input: '${domain}' is not a valid domain name (expected something like app.example.com)`
+			);
+		}
+		if (domain === MOCK_SETTINGS.dashboard_domain) {
+			return err(
+				`Invalid input: ${domain} is the dashboard domain; choose another hostname for the app`
+			);
+		}
+		const preview = MOCK_SETTINGS.preview_domain;
+		if (preview && (domain === preview || domain.endsWith(`.${preview}`))) {
+			return err(
+				`Invalid input: ${domain} is under the preview domain (${preview}), which only serves previews; choose a hostname outside it`
+			);
+		}
+		apps[idx] = { ...apps[idx], domain, updated_at: new Date().toISOString() };
+		queueMockCertificate(domain);
+		return ok({
+			message: 'Domain updated, certificate provisioning queued',
+			domain,
+			warning: mockDomainWarning(domain)
+		});
 	}),
 
 	// ── Certificates ──────────────────────────────────────────────────────────
@@ -1124,23 +2156,39 @@ export const handlers = [
 				400
 			);
 		}
-		const idx = apps.findIndex((a) => a.id === params.id);
-		if (idx !== -1) {
-			apps[idx] = { ...apps[idx], status: 'running', updated_at: new Date().toISOString() };
-		}
-		// The restored image becomes current.
-		deployments[params.id as string] = list.map((d) => ({
-			...d,
-			is_current: d.id === target.id,
-			rollback_available: d.id !== target.id && d.status === 'succeeded' && !d.image_pruned,
-			rollback_unavailable_reason:
-				d.id === target.id ? 'This image is already running' : d.rollback_unavailable_reason
-		}));
-		return ok({
-			message: 'Rollback started',
-			image_tag: target.image_tag,
-			deployment_id: target.id
+		const app = apps.find((a) => a.id === params.id);
+		if (!app) return err('App not found', 404);
+		const d = startMockDeploy(app, {
+			trigger_source: 'rollback',
+			trigger_detail: MOCK_USER.email,
+			rollbackOf: target
 		});
+		return HttpResponse.json(
+			{
+				success: true,
+				data: {
+					message: 'Rollback queued',
+					app_id: app.id,
+					image_tag: target.image_tag,
+					target_deployment_id: target.id,
+					deployment_id: d.id,
+					status: 'queued',
+					queue_position: 1,
+					superseded: null
+				},
+				error: null
+			},
+			{ status: 202 }
+		);
+	}),
+
+	http.get('/api/apps/:id/deployments/:deploymentId', async ({ params }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
+		if (!app) return err('App not found', 404);
+		const d = (deployments[app.id] ?? []).find((x) => x.id === params.deploymentId);
+		if (!d) return err(`Not found: deployment '${params.deploymentId}'`, 404);
+		return ok(deploymentDetail(app, d));
 	}),
 
 	http.post('/api/compose/validate', async ({ request }) => {
@@ -1192,12 +2240,20 @@ export const handlers = [
 		return ok(webhookConfig(app));
 	}),
 
+	http.get('/api/apps/:id/webhook-secret', async ({ params }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
+		if (!app) return err('App not found', 404);
+		webhookConfig(app);
+		return ok({ secret: webhookSecrets[app.id] });
+	}),
+
 	http.post('/api/apps/:id/webhook-secret/rotate', async ({ params }) => {
 		await delay(LATENCY);
 		const app = apps.find((a) => a.id === params.id || a.name === params.id);
 		if (!app) return err('App not found', 404);
 		webhookSecrets[app.id] = randomHex(32);
-		return ok(webhookConfig(app));
+		return ok({ secret: webhookSecrets[app.id] });
 	}),
 
 	http.put('/api/apps/:id/auto-deploy', async ({ params, request }) => {
@@ -1425,11 +2481,28 @@ export const handlers = [
 
 	// ── Metrics ───────────────────────────────────────────────────────────────
 
-	http.get('/api/apps/:id/metrics', async ({ request }) => {
+	// Stopped / never-deployed apps have no samples (shows the empty state).
+	http.get('/api/apps/:id/metrics', async ({ request, params }) => {
 		await delay(LATENCY);
-		const url = new URL(request.url);
-		const period = url.searchParams.get('period') ?? '1h';
-		return ok(makeMockAppMetrics(period));
+		const range = new URL(request.url).searchParams.get('range') ?? '1h';
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
+		const measured = app?.status === 'running' || app?.status === 'unhealthy';
+		return ok(makeMockMetrics(range, !measured));
+	}),
+
+	http.get('/api/databases/:id/metrics', async ({ request }) => {
+		await delay(LATENCY);
+		return ok(makeMockMetrics(new URL(request.url).searchParams.get('range') ?? '1h'));
+	}),
+
+	http.get('/api/cron/:id/metrics', async ({ request }) => {
+		await delay(LATENCY);
+		return ok(makeMockMetrics(new URL(request.url).searchParams.get('range') ?? '1h', true));
+	}),
+
+	http.get('/api/system/self', async () => {
+		await delay(LATENCY);
+		return ok(makeMockSystemSelf());
 	}),
 
 	http.get('/api/system/metrics', async () => {
@@ -1451,6 +2524,27 @@ export const handlers = [
 		MOCK_ONBOARDING_STATUS.has_apps = apps.length > 0;
 		MOCK_ONBOARDING_STATUS.has_databases = databases.length > 0;
 		MOCK_ONBOARDING_STATUS.has_cron_jobs = cronJobs.length > 0;
+		MOCK_ONBOARDING_STATUS.has_source_integration =
+			githubApps.some((g) => g.installed) || registryCredentials.length > 0;
+		const allDeployments = Object.values(deployments)
+			.flat()
+			.sort((a, b) => b.created_at.localeCompare(a.created_at));
+		MOCK_ONBOARDING_STATUS.has_successful_deploy = allDeployments.some(
+			(d) => d.status === 'succeeded'
+		);
+		MOCK_ONBOARDING_STATUS.has_notification_channel = integrations.length > 0;
+		const latest = allDeployments[0];
+		MOCK_ONBOARDING_STATUS.last_deployment = latest
+			? {
+					id: latest.id,
+					app_id: latest.app_id,
+					app_name: apps.find((a) => a.id === latest.app_id)?.name ?? latest.app_id,
+					status: latest.status,
+					trigger_source: latest.trigger_source,
+					created_at: latest.created_at,
+					finished_at: latest.finished_at
+				}
+			: null;
 		MOCK_ONBOARDING_STATUS.is_fresh_install =
 			!MOCK_ONBOARDING_STATUS.has_projects &&
 			!MOCK_ONBOARDING_STATUS.has_apps &&
@@ -1480,11 +2574,26 @@ export const handlers = [
 		if (body.preview_domain !== undefined) {
 			body.preview_domain = normalizeDomain(body.preview_domain);
 		}
+		if (body.apps_domain !== undefined) {
+			body.apps_domain = normalizeDomain(body.apps_domain);
+		}
 		const previewError = mockPreviewDomainError(
 			body.preview_domain ?? MOCK_SETTINGS.preview_domain,
 			body.dashboard_domain ?? MOCK_SETTINGS.dashboard_domain
 		);
 		if (previewError) return err(previewError);
+		const appsError = mockAppsDomainError(
+			body.apps_domain ?? MOCK_SETTINGS.apps_domain,
+			body.dashboard_domain ?? MOCK_SETTINGS.dashboard_domain,
+			body.preview_domain ?? MOCK_SETTINGS.preview_domain
+		);
+		if (appsError) return err(appsError);
+		if (
+			body.upload_max_bytes !== undefined &&
+			(body.upload_max_bytes < 1024 * 1024 || body.upload_max_bytes > 64 * 1024 ** 3)
+		) {
+			return err('The upload limit must be between 1.0 MiB and 64.0 GiB');
+		}
 		Object.assign(MOCK_SETTINGS, body);
 		if (body.dashboard_domain) queueMockCertificate(body.dashboard_domain);
 		MOCK_ONBOARDING_STATUS.dashboard_domain = MOCK_SETTINGS.dashboard_domain;
@@ -1520,8 +2629,14 @@ export const handlers = [
 		await delay(LATENCY);
 		const body = (await request.json()) as Omit<
 			AlertRule,
-			'id' | 'enabled' | 'last_fired_at' | 'created_at' | 'updated_at'
-		>;
+			| 'id'
+			| 'enabled'
+			| 'last_fired_at'
+			| 'created_at'
+			| 'updated_at'
+			| 'has_webhook_url'
+			| 'webhook_host'
+		> & { webhook_url?: string; integration_ids?: string[] };
 		const validMetrics = ['cpu', 'memory', 'app_down', 'disk_usage'];
 		const validEvents = [
 			'deployment_success',
@@ -1542,13 +2657,26 @@ export const handlers = [
 		if (!body.metric && (!body.events || body.events.length === 0)) {
 			return err('At least one metric or event is required', 400);
 		}
+		const channelIds = [...new Set(body.integration_ids ?? [])];
+		if (!(body.webhook_url ?? '').trim() && channelIds.length === 0) {
+			return err(
+				'Choose at least one notification channel or add a webhook URL, so this rule notifies someone.',
+				400
+			);
+		}
+		for (const id of channelIds) {
+			if (!integrations.some((i) => i.id === id)) {
+				return err(`Notification channel ${id} doesn't exist`, 400);
+			}
+		}
 		const newRule: AlertRule = {
 			id: `alert_${Date.now()}`,
 			app_id: body.app_id ?? null,
 			name: body.name,
 			metric: body.metric ?? null,
 			threshold: body.threshold ?? 0,
-			webhook_url: body.webhook_url,
+			has_webhook_url: !!body.webhook_url?.trim(),
+			webhook_host: urlHost(body.webhook_url?.trim() ?? ''),
 			enabled: true,
 			events: body.events ?? [],
 			last_fired_at: null,
@@ -1556,6 +2684,20 @@ export const handlers = [
 			updated_at: new Date().toISOString()
 		};
 		alertRules = [...alertRules, newRule];
+		alertIntegrationLinks = {
+			...alertIntegrationLinks,
+			[newRule.id]: channelIds.map((id, i) => {
+				const integration = integrations.find((x) => x.id === id)!;
+				return {
+					id: `link_${Date.now()}_${i}`,
+					rule_id: newRule.id,
+					integration_id: id,
+					integration_name: integration.name,
+					integration_kind: integration.kind,
+					created_at: new Date().toISOString()
+				};
+			})
+		};
 		return HttpResponse.json({ success: true, data: newRule, error: null }, { status: 201 });
 	}),
 
@@ -1563,9 +2705,28 @@ export const handlers = [
 		await delay(LATENCY);
 		const idx = alertRules.findIndex((r) => r.id === params.id);
 		if (idx === -1) return err('Alert rule not found', 404);
-		const body = (await request.json()) as Partial<
-			Pick<AlertRule, 'name' | 'metric' | 'threshold' | 'webhook_url' | 'enabled' | 'events'>
+		const { webhook_url, ...body } = (await request.json()) as Partial<
+			Pick<AlertRule, 'name' | 'metric' | 'threshold' | 'enabled' | 'events'> & {
+				webhook_url: string;
+			}
 		>;
+		if (
+			webhook_url !== undefined &&
+			!webhook_url.trim() &&
+			(alertIntegrationLinks[params.id as string] ?? []).length === 0
+		) {
+			return err(
+				'Choose at least one notification channel or add a webhook URL, so this rule notifies someone.',
+				400
+			);
+		}
+		if (webhook_url !== undefined) {
+			alertRules[idx] = {
+				...alertRules[idx],
+				has_webhook_url: !!webhook_url.trim(),
+				webhook_host: urlHost(webhook_url.trim())
+			};
+		}
 		if (body.metric) {
 			const validMetrics = ['cpu', 'memory', 'app_down', 'disk_usage'];
 			if (!validMetrics.includes(body.metric)) {
@@ -1589,6 +2750,34 @@ export const handlers = [
 		return ok(alertRules[idx]);
 	}),
 
+	http.post('/api/alerts/:id/test', async ({ params }) => {
+		await delay(LATENCY * 3);
+		const rule = alertRules.find((r) => r.id === params.id);
+		if (!rule) return err('Alert rule not found', 404);
+		const results = [
+			...(rule.has_webhook_url
+				? [{ kind: 'webhook', name: rule.webhook_host ?? 'Webhook', ok: true, error: null }]
+				: []),
+			...(alertIntegrationLinks[rule.id] ?? []).map((link) => {
+				const integration = integrations.find((i) => i.id === link.integration_id);
+				const enabled = integration?.enabled ?? false;
+				return {
+					kind: link.integration_kind,
+					name: link.integration_name,
+					ok: enabled,
+					error: enabled ? null : 'This channel is switched off on the Integrations page'
+				};
+			})
+		];
+		if (results.length === 0) {
+			return err(
+				'Choose at least one notification channel or add a webhook URL, so this rule notifies someone.',
+				400
+			);
+		}
+		return ok(results);
+	}),
+
 	http.delete('/api/alerts/:id', async ({ params }) => {
 		await delay(LATENCY);
 		const exists = alertRules.some((r) => r.id === params.id);
@@ -1599,14 +2788,51 @@ export const handlers = [
 
 	// ── Audit Log ─────────────────────────────────────────────────────────────
 
+	// Same filters as the server, applied before the limit.
 	http.get('/api/audit-log', async ({ request }) => {
 		await delay(LATENCY);
-		const url = new URL(request.url);
-		const appId = url.searchParams.get('app_id');
-		const limit = parseInt(url.searchParams.get('limit') ?? '50', 10);
-		let entries = MOCK_AUDIT_LOG;
-		if (appId) entries = entries.filter((e) => e.app_id === appId);
-		return ok(entries.slice(0, limit));
+		const p = new URL(request.url).searchParams;
+		const limit = Math.min(Math.max(parseInt(p.get('limit') ?? '50', 10) || 50, 1), 200);
+		const before = p.get('before') ? Number(p.get('before')) : null;
+		const actor = p.get('actor');
+		const action = p.get('action');
+		const resourceType = p.get('resource_type');
+		const resourceId = p.get('resource_id');
+		const outcome = p.get('outcome');
+		const q = p.get('q')?.toLowerCase();
+		const matches = auditLog.filter(
+			(e) =>
+				(before === null || e.seq < before) &&
+				(!actor || e.actor_label === actor) &&
+				(!action ||
+					(action.endsWith('*')
+						? e.action.startsWith(action.slice(0, -1))
+						: e.action === action)) &&
+				(!resourceType || e.resource_type === resourceType) &&
+				(!resourceId || e.resource_id === resourceId) &&
+				(!outcome || e.outcome === outcome) &&
+				(!q ||
+					[e.actor_label, e.action, e.resource_name ?? '', e.detail ?? ''].some((f) =>
+						f.toLowerCase().includes(q)
+					))
+		);
+		const entries = matches.slice(0, limit);
+		const nextBefore = matches.length > limit ? entries[entries.length - 1].seq : null;
+		return ok({ entries, next_before: nextBefore });
+	}),
+
+	http.get('/api/audit-log/verify', async () => {
+		await delay(LATENCY * 2);
+		const seqs = auditLog.map((e) => e.seq);
+		return ok({
+			ok: true,
+			checked: auditLog.length,
+			checkpoint_seq: Math.min(...seqs) - 1,
+			first_seq: Math.min(...seqs),
+			last_seq: Math.max(...seqs),
+			broken_at: null,
+			problem: null
+		});
 	}),
 
 	// ── App Logs (REST fallback — real traffic uses WebSocket) ────────────────
@@ -1643,6 +2869,9 @@ export const handlers = [
 	}),
 
 	// ── Managed Databases (Phase 6.3) ─────────────────────────────────────────
+	// Passwords and connection-string overrides are write-only, like the
+	// server: responses carry has_password flags and masked strings, and the
+	// plaintext comes only from the (audited) credentials reveal.
 
 	http.get('/api/databases', async () => {
 		await delay(LATENCY);
@@ -1677,8 +2906,8 @@ export const handlers = [
 			status: 'running',
 			db_name: isRedisLike ? null : body.name.replace(/-/g, '_'),
 			db_user: isRedisLike ? 'default' : body.name.replace(/-/g, '_') + '_user',
-			db_password: 'mock_password_new',
-			root_password: isMysqlLike ? 'mock_root_password_new' : null,
+			has_password: true,
+			has_root_password: isMysqlLike,
 			memory_limit: body.memory_limit ?? null,
 			custom_external_url: null,
 			custom_internal_url: null,
@@ -1688,49 +2917,92 @@ export const handlers = [
 			updated_at: new Date().toISOString(),
 			public_access: body.public_access ?? false
 		};
+		dbSecrets[newDb.id] = {
+			db_password: randomHex(12),
+			root_password: isMysqlLike ? randomHex(12) : null
+		};
 		databases = [...databases, newDb];
-		const newDbUser = newDb.db_user!;
-		const newDbPass = newDb.db_password!;
-		const newConnectionString = isRedisLike
-			? `redis://${newDbUser}:${newDbPass}@localhost:${newDb.host_port}`
-			: `${body.db_type}://${newDbUser}:${newDbPass}@localhost:${newDb.host_port}/${newDb.db_name}`;
-		return ok({
-			...newDb,
-			connection_string: newConnectionString,
-			public_connection_string: mockPublicUrl(newDb),
-			internal_connection_string: null
-		});
+		// The creator gets the generated credentials once.
+		return ok({ ...dbDetail(newDb), credentials: dbCredentials(newDb) });
+	}),
+
+	http.get('/api/databases/:id/access', async ({ params }) => {
+		await delay(LATENCY);
+		const db = databases.find((d) => d.id === params.id || d.name === params.id);
+		if (!db) return err('Database not found', 404);
+		return ok(mockDatabaseAccess(db));
+	}),
+
+	http.put('/api/databases/:id/links/:app', async ({ params }) => {
+		await delay(LATENCY);
+		const db = databases.find((d) => d.id === params.id || d.name === params.id);
+		if (!db) return err('Not found: database', 404);
+		const app = apps.find((a) => a.id === params.app || a.name === params.app);
+		if (!app) return err('App not found', 404);
+		if (app.source_type === 'compose') {
+			return err(
+				`Invalid input: '${app.name}' is a compose app: compose apps run on their own compose network and can't be linked.`
+			);
+		}
+		if (db.project_id && db.project_id === app.project_id) {
+			return err(
+				`Invalid input: '${app.name}' is in the same project as '${db.name}' and can already reach it.`
+			);
+		}
+		if (!databaseLinks.some((l) => l.database_id === db.id && l.app_id === app.id)) {
+			databaseLinks = [...databaseLinks, { database_id: db.id, app_id: app.id }];
+		}
+		return ok(mockDatabaseAccess(db));
+	}),
+
+	http.delete('/api/databases/:id/links/:app', async ({ params }) => {
+		await delay(LATENCY);
+		const db = databases.find((d) => d.id === params.id || d.name === params.id);
+		if (!db) return err('Not found: database', 404);
+		const app = apps.find((a) => a.id === params.app || a.name === params.app);
+		if (!app) return err('App not found', 404);
+		databaseLinks = databaseLinks.filter((l) => !(l.database_id === db.id && l.app_id === app.id));
+		return ok(mockDatabaseAccess(db));
 	}),
 
 	http.get('/api/databases/:id', async ({ params }) => {
 		await delay(LATENCY);
 		const db = databases.find((d) => d.id === params.id || d.name === params.id);
 		if (!db) return err('Database not found', 404);
-		const isRedisLike = db.db_type === 'redis' || db.db_type === 'keydb';
-		const redisPort = 6379;
-		const computedExternal = db.host_port
-			? isRedisLike
-				? db.db_user && db.db_password
-					? `redis://${db.db_user}:${db.db_password}@localhost:${db.host_port}`
-					: `redis://localhost:${db.host_port}`
-				: `${db.db_type}://${db.db_user}:${db.db_password}@localhost:${db.host_port}/${db.db_name}`
-			: null;
-		const computedInternal = isRedisLike
-			? db.db_user && db.db_password
-				? `redis://${db.db_user}:${db.db_password}@tond-db-${db.name}:${redisPort}`
-				: `redis://tond-db-${db.name}:${redisPort}`
-			: `${db.db_type}://${db.db_user}:${db.db_password}@tond-db-${db.name}:${db.db_type === 'mysql' || db.db_type === 'mariadb' ? 3306 : 5432}/${db.db_name}`;
-		return ok({
-			...db,
-			connection_string: db.custom_external_url ?? computedExternal,
-			public_connection_string: mockPublicUrl(db),
-			internal_connection_string: db.custom_internal_url ?? computedInternal
-		});
+		return ok(dbDetail(db));
+	}),
+
+	http.get('/api/databases/:id/credentials', async ({ params }) => {
+		await delay(LATENCY);
+		const db = databases.find((d) => d.id === params.id || d.name === params.id);
+		if (!db) return err('Database not found', 404);
+		if (currentMockUser().role !== 'admin') {
+			return err('Forbidden: only admins can reveal database credentials', 403);
+		}
+		return ok(dbCredentials(db));
+	}),
+
+	http.get('/api/databases/:id/backups', async ({ params }) => {
+		await delay(LATENCY);
+		const db = databases.find((d) => d.id === params.id || d.name === params.id);
+		if (!db) return err(`database '${params.id}' not found`, 404);
+		return ok(snapshots.filter((s) => s.scope === 'full' || s.scope === `database:${db.name}`));
+	}),
+
+	http.post('/api/databases/:id/backups', async ({ params }) => {
+		await delay(LATENCY * 4);
+		const db = databases.find((d) => d.id === params.id || d.name === params.id);
+		if (!db) return err(`database '${params.id}' not found`, 404);
+		const snap = mockDatabaseSnapshot(db.name, 'manual');
+		snapshots = [snap, ...snapshots];
+		return HttpResponse.json({ success: true, data: snap, error: null }, { status: 201 });
 	}),
 
 	http.delete('/api/databases/:id', async ({ params }) => {
 		await delay(LATENCY);
+		const gone = databases.find((d) => d.id === params.id || d.name === params.id);
 		databases = databases.filter((d) => d.id !== params.id && d.name !== params.id);
+		if (gone) databaseLinks = databaseLinks.filter((l) => l.database_id !== gone.id);
 		return ok(null);
 	}),
 
@@ -1747,17 +3019,15 @@ export const handlers = [
 		};
 		// Apply updates — empty string clears the override (mirrors backend behaviour)
 		const updated = { ...databases[idx] };
+		const urls = (dbCustomUrls[updated.id] ??= { external: null, internal: null });
+		const clean = (v: string | null) => (v === null || v.trim() === '' ? null : v.trim());
 		if (body.custom_external_url !== undefined) {
-			updated.custom_external_url =
-				body.custom_external_url === '' || body.custom_external_url === null
-					? null
-					: body.custom_external_url;
+			urls.external = clean(body.custom_external_url);
+			updated.custom_external_url = urls.external && maskUrlPassword(urls.external);
 		}
 		if (body.custom_internal_url !== undefined) {
-			updated.custom_internal_url =
-				body.custom_internal_url === '' || body.custom_internal_url === null
-					? null
-					: body.custom_internal_url;
+			urls.internal = clean(body.custom_internal_url);
+			updated.custom_internal_url = urls.internal && maskUrlPassword(urls.internal);
 		}
 		if (body.custom_image !== undefined) {
 			updated.custom_image =
@@ -1771,28 +3041,7 @@ export const handlers = [
 		}
 		updated.updated_at = new Date().toISOString();
 		databases[idx] = updated;
-		const db = databases[idx];
-		// Return ManagedDatabaseDetail with resolved connection strings
-		const isRedisLike2 = db.db_type === 'redis' || db.db_type === 'keydb';
-		const redisPort2 = 6379;
-		const computedExternal = db.host_port
-			? isRedisLike2
-				? db.db_user && db.db_password
-					? `redis://${db.db_user}:${db.db_password}@localhost:${db.host_port}`
-					: `redis://localhost:${db.host_port}`
-				: `${db.db_type}://${db.db_user}:${db.db_password}@localhost:${db.host_port}/${db.db_name}`
-			: null;
-		const computedInternal = isRedisLike2
-			? db.db_user && db.db_password
-				? `redis://${db.db_user}:${db.db_password}@tond-db-${db.name}:${redisPort2}`
-				: `redis://tond-db-${db.name}:${redisPort2}`
-			: `${db.db_type}://${db.db_user}:${db.db_password}@tond-db-${db.name}:${db.db_type === 'mysql' || db.db_type === 'mariadb' ? 3306 : 5432}/${db.db_name}`;
-		return ok({
-			...db,
-			connection_string: db.custom_external_url ?? computedExternal,
-			public_connection_string: mockPublicUrl(db),
-			internal_connection_string: db.custom_internal_url ?? computedInternal
-		});
+		return ok(dbDetail(updated));
 	}),
 
 	http.patch('/api/databases/:id/credentials', async ({ params, request }) => {
@@ -1808,6 +3057,7 @@ export const handlers = [
 		// Mirrors the server: passwords change inside the running engine; renames,
 		// Redis/KeyDB and stopped databases are refused and nothing is saved.
 		const current = databases[idx];
+		const secrets = (dbSecrets[current.id] ??= { db_password: null, root_password: null });
 		const renamed = (next: string | null | undefined, now: string | null) =>
 			!!next?.trim() && next.trim() !== now;
 		if (renamed(body.db_name, current.db_name) || renamed(body.db_user, current.db_user)) {
@@ -1816,17 +3066,10 @@ export const handlers = [
 			);
 		}
 		const changed: string[] = [];
-		const updated = { ...current };
 		const nextPw = body.db_password?.trim();
-		if (nextPw && nextPw !== current.db_password) {
-			updated.db_password = nextPw;
-			changed.push('db_password');
-		}
+		if (nextPw && nextPw !== secrets.db_password) changed.push('db_password');
 		const nextRoot = body.root_password?.trim();
-		if (nextRoot && nextRoot !== current.root_password) {
-			updated.root_password = nextRoot;
-			changed.push('root_password');
-		}
+		if (nextRoot && nextRoot !== secrets.root_password) changed.push('root_password');
 		if (changed.length === 0) return err('Invalid input: Nothing to change: enter a new password.');
 		if (current.db_type === 'redis' || current.db_type === 'keydb') {
 			return err(
@@ -1839,32 +3082,16 @@ export const handlers = [
 			);
 		}
 		await delay(LATENCY * 3); // simulate the docker exec
-		updated.updated_at = new Date().toISOString();
+		if (changed.includes('db_password')) secrets.db_password = nextPw!;
+		if (changed.includes('root_password')) secrets.root_password = nextRoot!;
+		const updated = {
+			...current,
+			has_password: !!secrets.db_password,
+			has_root_password: !!secrets.root_password,
+			updated_at: new Date().toISOString()
+		};
 		databases[idx] = updated;
-		const db = databases[idx];
-		const isRedisLikeC = db.db_type === 'redis' || db.db_type === 'keydb';
-		const redisPortC = 6379;
-		const computedExternalC = db.host_port
-			? isRedisLikeC
-				? db.db_user && db.db_password
-					? `redis://${db.db_user}:${db.db_password}@localhost:${db.host_port}`
-					: `redis://localhost:${db.host_port}`
-				: `${db.db_type}://${db.db_user}:${db.db_password}@localhost:${db.host_port}/${db.db_name}`
-			: null;
-		const computedInternalC = isRedisLikeC
-			? db.db_user && db.db_password
-				? `redis://${db.db_user}:${db.db_password}@tond-db-${db.name}:${redisPortC}`
-				: `redis://tond-db-${db.name}:${redisPortC}`
-			: `${db.db_type}://${db.db_user}:${db.db_password}@tond-db-${db.name}:${db.db_type === 'mysql' || db.db_type === 'mariadb' ? 3306 : 5432}/${db.db_name}`;
-		return ok({
-			database: {
-				...db,
-				connection_string: db.custom_external_url ?? computedExternalC,
-				public_connection_string: mockPublicUrl(db),
-				internal_connection_string: db.custom_internal_url ?? computedInternalC
-			},
-			changed
-		});
+		return ok({ database: dbDetail(updated), changed });
 	}),
 
 	http.post('/api/databases/:id/stop', async ({ params }) => {
@@ -1915,26 +3142,7 @@ export const handlers = [
 			updated_at: new Date().toISOString()
 		};
 		databases[idx] = updated;
-		const isRedisLike = updated.db_type === 'redis' || updated.db_type === 'keydb';
-		const redisPort = 6379;
-		const computedExternal = updated.host_port
-			? isRedisLike
-				? updated.db_user && updated.db_password
-					? `redis://${updated.db_user}:${updated.db_password}@localhost:${updated.host_port}`
-					: `redis://localhost:${updated.host_port}`
-				: `${updated.db_type}://${updated.db_user}:${updated.db_password}@localhost:${updated.host_port}/${updated.db_name}`
-			: null;
-		const computedInternal = isRedisLike
-			? updated.db_user && updated.db_password
-				? `redis://${updated.db_user}:${updated.db_password}@tond-db-${updated.name}:${redisPort}`
-				: `redis://tond-db-${updated.name}:${redisPort}`
-			: `${updated.db_type}://${updated.db_user}:${updated.db_password}@tond-db-${updated.name}:${updated.db_type === 'mysql' || updated.db_type === 'mariadb' ? 3306 : 5432}/${updated.db_name}`;
-		return ok({
-			...updated,
-			connection_string: updated.custom_external_url ?? computedExternal,
-			public_connection_string: mockPublicUrl(updated),
-			internal_connection_string: updated.custom_internal_url ?? computedInternal
-		});
+		return ok(dbDetail(updated));
 	}),
 
 	// ── Cron Jobs (Phase 6.4) ──────────────────────────────────────────────────
@@ -1942,6 +3150,17 @@ export const handlers = [
 	http.get('/api/cron', async () => {
 		await delay(LATENCY);
 		return ok(cronJobs);
+	}),
+
+	http.get('/api/cron/schedule-preview', async ({ request }) => {
+		await delay(LATENCY);
+		const url = new URL(request.url);
+		const schedule = url.searchParams.get('schedule') ?? '';
+		const timezone = url.searchParams.get('timezone') || 'UTC';
+		const count = Number(url.searchParams.get('count') ?? 5);
+		const runs = mockNextRuns(schedule, count);
+		if (!runs) return err(`Invalid cron expression '${schedule}'`, 400);
+		return ok({ next_runs: runs, timezone });
 	}),
 
 	http.post('/api/cron', async ({ request }) => {
@@ -1976,7 +3195,7 @@ export const handlers = [
 			created_at: new Date().toISOString(),
 			updated_at: new Date().toISOString(),
 			timeout_seconds: body.timeout_seconds ?? null,
-			env: body.env && Object.keys(body.env).length > 0 ? body.env : null,
+			env: maskedEntries(body.env ?? {}),
 			last_run_status: null,
 			concurrency_policy: body.concurrency_policy ?? 'skip',
 			memory_mb: body.memory_mb ?? null,
@@ -1987,6 +3206,7 @@ export const handlers = [
 			volumes: mockCronVolumes(`cron_${Date.now()}`, body.volumes)
 		};
 		cronJobs = [...cronJobs, newJob];
+		cronEnv[newJob.id] = body.env ?? {};
 		cronRuns[newJob.id] = [];
 		return ok(newJob);
 	}),
@@ -2011,6 +3231,8 @@ export const handlers = [
 			enabled: boolean;
 			timeout_seconds: number | null;
 			env: Record<string, string>;
+			env_set: Record<string, string>;
+			env_unset: string[];
 			concurrency_policy: string;
 			memory_mb: number | null;
 			cpu_shares: number | null;
@@ -2019,6 +3241,11 @@ export const handlers = [
 			retry_delay_seconds: number;
 			volumes: CronVolumeInput[] | null;
 		}>;
+		// Env: full replace, then set/unset patches (values stay write-only)
+		const jobId = cronJobs[idx].id;
+		const nextEnv = { ...(body.env ?? cronEnv[jobId] ?? {}), ...(body.env_set ?? {}) };
+		for (const key of body.env_unset ?? []) delete nextEnv[key];
+		cronEnv[jobId] = nextEnv;
 		// Check for name conflict
 		if (body.name !== undefined && body.name !== cronJobs[idx].name) {
 			const conflict = cronJobs.some((j, i) => i !== idx && j.name === body.name);
@@ -2033,9 +3260,7 @@ export const handlers = [
 			...(body.command !== undefined && { command: JSON.stringify(body.command) }),
 			...(body.enabled !== undefined && { enabled: body.enabled }),
 			...('timeout_seconds' in body && { timeout_seconds: body.timeout_seconds ?? null }),
-			...('env' in body && {
-				env: body.env && Object.keys(body.env).length > 0 ? body.env : null
-			}),
+			env: maskedEntries(nextEnv),
 			...(body.concurrency_policy !== undefined && {
 				concurrency_policy: body.concurrency_policy
 			}),
@@ -2141,6 +3366,9 @@ export const handlers = [
 
 		client.addEventListener('close', () => clearInterval(timer));
 	}),
+
+	// ── WebSocket: live deploy view (see the mock deploy engine above) ─────────
+	deploymentStreamHandler,
 
 	// ── WebSocket: App log stream ─────────────────────────────────────────────
 	//
@@ -2374,12 +3602,27 @@ export const handlers = [
 
 	http.post('/api/integrations', async ({ request }) => {
 		await delay(LATENCY * 2);
-		const body = (await request.json()) as { name: string; kind: string; config: unknown };
+		const body = (await request.json()) as {
+			name: string;
+			kind: string;
+			config: Record<string, unknown>;
+		};
+		const newId = `int_${Date.now()}`;
+		const stored = storeIntegrationConfig(newId, body.config ?? {});
+		const needed: Record<string, string> = {
+			telegram: 'bot_token',
+			discord: 'webhook_url',
+			slack: 'webhook_url',
+			email: 'smtp_password'
+		};
+		if (!stored.saved_secrets.includes(needed[body.kind])) {
+			return err(`invalid config for ${body.kind}: missing field \`${needed[body.kind]}\``, 400);
+		}
 		const newIntegration: Integration = {
-			id: `int_${Date.now()}`,
+			id: newId,
 			name: body.name,
 			kind: body.kind as Integration['kind'],
-			config: body.config as Integration['config'],
+			...stored,
 			enabled: true,
 			created_at: new Date().toISOString(),
 			updated_at: new Date().toISOString()
@@ -2399,10 +3642,15 @@ export const handlers = [
 		await delay(LATENCY);
 		const idx = integrations.findIndex((i) => i.id === params.id);
 		if (idx === -1) return err('Integration not found', 404);
-		const body = (await request.json()) as Partial<
-			Pick<Integration, 'name' | 'config' | 'enabled'>
+		const { config, ...body } = (await request.json()) as Partial<
+			Pick<Integration, 'name' | 'enabled'> & { config: Record<string, unknown> }
 		>;
-		integrations[idx] = { ...integrations[idx], ...body, updated_at: new Date().toISOString() };
+		integrations[idx] = {
+			...integrations[idx],
+			...body,
+			...(config && storeIntegrationConfig(integrations[idx].id, config)),
+			updated_at: new Date().toISOString()
+		};
 		return ok(integrations[idx]);
 	}),
 
@@ -2472,6 +3720,12 @@ export const handlers = [
 		const links = alertIntegrationLinks[ruleId] ?? [];
 		const exists = links.some((l) => l.integration_id === params.integrationId);
 		if (!exists) return err('Integration link not found', 404);
+		if (links.length + (rule.has_webhook_url ? 1 : 0) <= 1) {
+			return err(
+				"This is the rule's only notification channel. Add another channel or a webhook URL first, or delete the rule.",
+				400
+			);
+		}
 		alertIntegrationLinks = {
 			...alertIntegrationLinks,
 			[ruleId]: links.filter((l) => l.integration_id !== params.integrationId)
@@ -2719,7 +3973,10 @@ export const handlers = [
 			storage_provider_id: null,
 			checksum_sha256: null,
 			error_message: null,
-			notes: null
+			notes: null,
+			remote_status: backupConfig.storage_provider_id ? 'uploading' : null,
+			remote_error: null,
+			archive_bytes: null
 		};
 		snapshots = [snap, ...snapshots];
 		return ok(snap);
@@ -2756,7 +4013,10 @@ export const handlers = [
 			storage_provider_id: null,
 			checksum_sha256: null,
 			error_message: null,
-			notes: null
+			notes: null,
+			remote_status: backupConfig.storage_provider_id ? 'uploading' : null,
+			remote_error: null,
+			archive_bytes: null
 		};
 		snapshots = [preRestore, ...snapshots];
 		return ok({
@@ -2777,8 +4037,20 @@ export const handlers = [
 		await delay(LATENCY * 2);
 		const snap = snapshots.find((s) => s.id === params.id);
 		if (!snap) return err('Snapshot not found', 404);
-		const body = (await request.json()) as any;
-		return ok({ message: `Database '${body.db_name}' restored successfully.` });
+		const body = (await request.json()) as { db_name: string };
+		if (snap.scope !== 'full' && snap.scope !== `database:${body.db_name}`) {
+			return err(
+				`Database restore failed: This snapshot doesn't include the database '${body.db_name}'`,
+				500
+			);
+		}
+		await delay(LATENCY * 3);
+		const safetyNet = mockDatabaseSnapshot(body.db_name, 'pre_restore');
+		snapshots = [safetyNet, ...snapshots];
+		return ok({
+			message: `Database '${body.db_name}' restored. The data it held just before is saved as a backup.`,
+			pre_restore_snapshot_id: safetyNet.id
+		});
 	}),
 
 	http.get('/api/snapshots/config', async () => {

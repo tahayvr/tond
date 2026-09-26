@@ -1,4 +1,6 @@
 <script lang="ts">
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
+	import { confirmAction } from '$lib/confirm.svelte';
 	import {
 		listStorageProviders,
 		createStorageProvider,
@@ -10,7 +12,6 @@
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
-	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import Badge from '$lib/components/ui/badge/badge.svelte';
 	import Trash2 from '~icons/ri/delete-bin-line';
 	import Plus from '~icons/ri/add-line';
@@ -184,17 +185,25 @@
 	// ── Delete ────────────────────────────────────────────────────────────────
 
 	async function handleDelete(id: string) {
-		deletingId = id;
+		const target = providers.find((p) => p.id === id);
 		error = '';
-		try {
-			await deleteStorageProvider(id);
-			providers = providers.filter((p) => p.id !== id);
-			if (editingId === id) cancelEdit();
-		} catch (e: any) {
-			error = e.message ?? 'Failed to delete storage provider';
-		} finally {
-			deletingId = null;
-		}
+		await confirmAction({
+			title: `Delete storage provider ${target?.name ?? ''}?`.replace(/ \?$/, '?'),
+			description:
+				'Tond forgets these credentials. Files already uploaded stay in the bucket, but snapshots stored only on this provider can no longer be downloaded or restored from Tond. A provider that backs your backup settings can’t be deleted until you pick another one.',
+			confirmLabel: 'Delete provider',
+			pendingLabel: 'Deleting…',
+			onconfirm: async () => {
+				deletingId = id;
+				try {
+					await deleteStorageProvider(id);
+					providers = providers.filter((p) => p.id !== id);
+					if (editingId === id) cancelEdit();
+				} finally {
+					deletingId = null;
+				}
+			}
+		});
 	}
 
 	// ── Test ──────────────────────────────────────────────────────────────────
@@ -226,16 +235,14 @@
 	load();
 </script>
 
-{#if error}
-	<ErrorAlert title="Storage Provider Error" description={error} />
-{/if}
+<InlineError title="Storage Provider Error" message={error} />
 
 {#if testMessage}
 	<div
 		class={[
 			'rounded border p-3 text-xs',
 			testOk
-				? 'border-green-500 bg-green-500/10 text-green-600'
+				? 'border-success bg-success/10 text-success'
 				: 'border-destructive bg-destructive/10 text-destructive'
 		].join(' ')}
 	>
@@ -264,9 +271,7 @@
 			class="space-y-3 border bg-muted/30 p-4"
 		>
 			<p class="text-xs font-semibold uppercase">New Storage Provider</p>
-			{#if addError}
-				<p class="text-xs text-destructive">{addError}</p>
-			{/if}
+			<InlineError message={addError} />
 			<div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
 				<div class="grid gap-1.5">
 					<Label class="text-xs" for="sp-name">Display Name</Label>
@@ -397,6 +402,7 @@
 								variant="ghost"
 								size="icon"
 								class="h-7 w-7 text-destructive hover:text-destructive"
+								aria-label={`Delete ${provider.name}`}
 								disabled={deletingId === provider.id}
 								onclick={() => handleDelete(provider.id)}
 							>
@@ -414,9 +420,7 @@
 							class="space-y-3 border-t bg-muted/30 px-4 py-4"
 						>
 							<p class="text-xs font-semibold uppercase">Edit Storage Provider</p>
-							{#if editError}
-								<p class="text-xs text-destructive">{editError}</p>
-							{/if}
+							<InlineError message={editError} />
 							<div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
 								<div class="grid gap-1.5">
 									<Label class="text-xs" for="edit-sp-name">Display Name</Label>

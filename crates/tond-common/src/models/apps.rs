@@ -40,13 +40,15 @@ pub struct App {
     pub container_id: Option<String>,
     /// Host port that the container is bound to (set after deploy)
     pub host_port: Option<i64>,
-    /// Memory limit in bytes (None = no limit; default 256 MiB)
+    /// Memory limit in bytes (None = the host default cap, 75% of RAM)
     pub memory_limit: Option<i64>,
-    /// CPU limit as nano_cpus (None = no limit; default 0.5 CPU = 500_000_000)
+    /// CPU limit as nano_cpus (None = no limit; 1 CPU = 1_000_000_000)
     pub cpu_limit: Option<i64>,
     /// "building" | "running" | "stopped" | "failed" | "unhealthy"
     pub status: String,
-    /// Environment variables as JSON object
+    /// Environment variables: a JSON object, stored encrypted by the server
+    /// (`{}` when empty). Never serialized.
+    #[serde(skip_serializing)]
     pub env_vars: Option<String>,
     /// HTTP path polled for health checks (None = disabled)
     pub health_check_path: Option<String>,
@@ -68,7 +70,9 @@ pub struct App {
     // ── Phase 4: Git Integration & Automation ──
     /// Per-app webhook secret: the HMAC-SHA256 key for GitHub/Gitea/generic
     /// signatures and the GitLab `X-Gitlab-Token`. Generated at creation;
-    /// webhooks are rejected when it is missing.
+    /// webhooks are rejected when it is missing. Stored encrypted by the
+    /// server; never serialized.
+    #[serde(skip_serializing)]
     pub webhook_secret: Option<String>,
     /// 1 = automatically trigger a deploy when a webhook fires for the
     /// configured branch; 0 = disabled (webhook exists but does not auto-deploy).
@@ -94,9 +98,13 @@ pub struct App {
     /// 1 = automatically create a preview deployment when a GitHub pull_request
     /// webhook event is received for this app; 0 = opt-out (default).
     pub preview_enabled: i64,
-    /// JSON array of env var keys excluded from preview containers (e.g. `["SECRET_KEY"]`)
-    pub preview_excluded_keys: String,
-    /// JSON object of key-value overrides applied only to preview containers
+    /// JSON array of app env var keys shared with preview containers (e.g.
+    /// `["NODE_ENV"]`). Previews get nothing else from the app's environment:
+    /// they run pull-request code and must not see production secrets.
+    pub preview_shared_keys: String,
+    /// JSON object of key-value overrides applied only to preview containers,
+    /// stored encrypted by the server. Never serialized.
+    #[serde(skip_serializing)]
     pub preview_env_vars: String,
     // ── Inline source content ──
     /// Raw Dockerfile content supplied by the user (used when source_type = "dockerfile")
@@ -107,11 +115,72 @@ pub struct App {
     pub base_dir: Option<String>,
     /// 1 = serve final build output as a static site; 0 = run as a process
     pub static_build: i64,
+    /// How a deploy decides the new container is ready: "http" | "tcp" | "none"
+    /// (see [`Readiness`])
+    #[sqlx(default)]
+    pub readiness: String,
+    /// For readiness "none": seconds the container must stay up
+    #[sqlx(default)]
+    pub ready_after_secs: i64,
     pub created_at: String,
     pub updated_at: String,
 }
 
+/// Default for [`App::ready_after_secs`].
+pub const DEFAULT_READY_AFTER_SECS: i64 = 10;
+/// Bounds for [`App::ready_after_secs`].
+pub const READY_AFTER_SECS_RANGE: std::ops::RangeInclusive<i64> = 1..=600;
+
+/// How a deploy decides a new container is ready to take over.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Readiness {
+    /// The health check path answers 2xx, or (without one) any HTTP answer on
+    /// the container port. Web apps; routed by domain.
+    #[default]
+    Http,
+    /// The container port accepts TCP connections. Non-HTTP services.
+    Tcp,
+    /// Background worker: no port, no domain, never routed. Ready once the
+    /// container has stayed up for `ready_after_secs` without exiting.
+    None,
+}
+
+impl Readiness {
+    /// Parse a stored value; anything unknown is `Http` (the old behaviour).
+    pub fn parse(value: &str) -> Self {
+        Self::from_input(value).unwrap_or(Readiness::Http)
+    }
+
+    /// Parse user input strictly.
+    pub fn from_input(value: &str) -> Option<Self> {
+        match value {
+            "http" => Some(Readiness::Http),
+            "tcp" => Some(Readiness::Tcp),
+            "none" => Some(Readiness::None),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Readiness::Http => "http",
+            Readiness::Tcp => "tcp",
+            Readiness::None => "none",
+        }
+    }
+
+    /// Whether the app serves traffic (gets a domain and a route).
+    pub fn serves_traffic(self) -> bool {
+        self != Readiness::None
+    }
+}
+
 impl App {
+    /// This app's readiness mode.
+    pub fn readiness(&self) -> Readiness {
+        Readiness::parse(&self.readiness)
+    }
+
     pub fn new(
         name: String,
         source_type: String,
@@ -130,8 +199,10 @@ impl App {
             container_port,
             container_id: None,
             host_port: None,
-            memory_limit: Some(268_435_456), // 256 MiB
-            cpu_limit: Some(500_000_000),    // 0.5 CPU
+            // No explicit caps: containers get the host default (75% of RAM,
+            // docker::default_memory_limit) and may use every CPU.
+            memory_limit: None,
+            cpu_limit: None,
             status: "pending".to_string(),
             env_vars: Some("{}".to_string()),
             health_check_path: None,
@@ -150,12 +221,14 @@ impl App {
             github_app_id: None,
             gitlab_token_id: None,
             preview_enabled: 0,
-            preview_excluded_keys: "[]".to_string(),
+            preview_shared_keys: "[]".to_string(),
             preview_env_vars: "{}".to_string(),
             dockerfile_content: None,
             compose_content: None,
             base_dir: None,
             static_build: 0,
+            readiness: Readiness::Http.as_str().to_string(),
+            ready_after_secs: DEFAULT_READY_AFTER_SECS,
             created_at: now.clone(),
             updated_at: now,
         }
@@ -177,9 +250,9 @@ pub struct CreateAppRequest {
     pub domain: Option<String>,
     /// Project to associate this app with
     pub project_id: Option<String>,
-    /// Memory limit in bytes (None = use server default 256 MiB)
+    /// Memory limit in bytes (None = the host default cap, 75% of RAM)
     pub memory_limit: Option<i64>,
-    /// CPU limit as nano_cpus (None = use server default 0.5 CPU)
+    /// CPU limit as nano_cpus (None = no limit)
     pub cpu_limit: Option<i64>,
     /// HTTP path to poll for health checks (e.g. "/health"); None = disabled
     pub health_check_path: Option<String>,
@@ -212,6 +285,12 @@ pub struct CreateAppRequest {
     /// Serve build output as a static site (default false)
     #[serde(default)]
     pub static_build: bool,
+    /// "http" (default) | "tcp" | "none" (background worker: no port, no domain)
+    #[serde(default)]
+    pub readiness: Option<String>,
+    /// For readiness "none": seconds the container must stay up (default 10)
+    #[serde(default)]
+    pub ready_after_secs: Option<i64>,
 }
 
 fn default_port() -> i64 {
@@ -223,6 +302,10 @@ pub struct AppResponse {
     pub id: String,
     pub name: String,
     pub domain: Option<String>,
+    /// Set (on GET /api/apps/{id}) when the app's domain is on the same site
+    /// as the dashboard: allowed, but the dashboard shows this warning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_warning: Option<String>,
     pub source_type: String,
     pub source_url: Option<String>,
     pub status: String,
@@ -261,8 +344,8 @@ pub struct AppResponse {
     // ── Phase 4.6: PR Preview Deployments ──
     /// Whether PR preview deployments are enabled for this app
     pub preview_enabled: bool,
-    /// Env var keys excluded from preview containers
-    pub preview_excluded_keys: Vec<String>,
+    /// App env var keys shared with preview containers (all others are withheld)
+    pub preview_shared_keys: Vec<String>,
     // Preview override values are secrets: read them (masked) through
     // GET /api/apps/{id}/env, never through the app response.
     // ── Inline source content ──
@@ -274,6 +357,12 @@ pub struct AppResponse {
     pub base_dir: Option<String>,
     /// Whether the build output is served as a static site
     pub static_build: bool,
+    /// "http" | "tcp" | "none" (background worker)
+    #[serde(default)]
+    pub readiness: String,
+    /// For readiness "none": seconds the container must stay up
+    #[serde(default)]
+    pub ready_after_secs: i64,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -281,8 +370,8 @@ pub struct AppResponse {
 impl From<App> for AppResponse {
     fn from(app: App) -> Self {
         let volumes: Vec<Volume> = serde_json::from_str(&app.volumes).unwrap_or_default();
-        let preview_excluded_keys: Vec<String> =
-            serde_json::from_str(&app.preview_excluded_keys).unwrap_or_default();
+        let preview_shared_keys: Vec<String> =
+            serde_json::from_str(&app.preview_shared_keys).unwrap_or_default();
         let expose_build_method =
             matches!(app.source_type.as_str(), "git" | "tarball" | "dockerfile");
         Self {
@@ -311,13 +400,16 @@ impl From<App> for AppResponse {
             github_app_id: app.github_app_id,
             gitlab_token_id: app.gitlab_token_id,
             preview_enabled: app.preview_enabled != 0,
-            preview_excluded_keys,
+            preview_shared_keys,
             dockerfile_content: app.dockerfile_content,
             compose_content: app.compose_content,
             base_dir: app.base_dir,
             static_build: app.static_build != 0,
+            readiness: Readiness::parse(&app.readiness).as_str().to_string(),
+            ready_after_secs: app.ready_after_secs,
             created_at: app.created_at,
             updated_at: app.updated_at,
+            domain_warning: None,
         }
     }
 }
@@ -345,8 +437,9 @@ pub struct EnvVarEntry {
 pub struct PreviewEnvResponse {
     /// Whether PR preview deployments are enabled for this app
     pub enabled: bool,
-    /// App env var keys that preview containers do not receive
-    pub excluded_keys: Vec<String>,
+    /// App env var keys preview containers receive. Every other app variable
+    /// is withheld: previews run pull-request code.
+    pub shared_keys: Vec<String>,
     /// Values that replace or add env vars in preview containers only
     pub overrides: Vec<EnvVarEntry>,
 }
@@ -386,12 +479,12 @@ pub struct PatchPreviewEnvRequest {
     /// Preview overrides to remove
     #[serde(default)]
     pub unset: Vec<String>,
-    /// App env var keys to hide from preview containers
+    /// App env var keys to share with preview containers
     #[serde(default)]
-    pub exclude: Vec<String>,
-    /// App env var keys to pass to preview containers again
+    pub share: Vec<String>,
+    /// App env var keys to stop sharing with preview containers
     #[serde(default)]
-    pub include: Vec<String>,
+    pub unshare: Vec<String>,
 }
 
 /// Build the masked list of an env var map, sorted by key.
@@ -515,10 +608,18 @@ pub struct WebhookConfigResponse {
     pub paths: WebhookUrls,
     /// Absolute URLs when `dashboard_domain` is configured, else None.
     pub urls: Option<WebhookUrls>,
-    /// The current webhook secret (shown to authenticated users only).
-    pub secret: String,
+    /// Whether a webhook secret is set. The secret itself is write-only: read
+    /// it with GET /api/apps/{id}/webhook-secret (admin only, audit-logged).
+    pub has_secret: bool,
     pub auto_deploy: bool,
     pub watch_branch: Option<String>,
+}
+
+/// GET /api/apps/{id}/webhook-secret (reveal) and
+/// POST /api/apps/{id}/webhook-secret/rotate (the new secret, shown once).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookSecretResponse {
+    pub secret: String,
 }
 
 /// Response returned after generating or fetching a deploy key.
@@ -580,15 +681,15 @@ mod tests {
             "new apps should start in pending status before first deploy"
         );
         assert_eq!(
-            app.memory_limit,
-            Some(268_435_456),
-            "new apps should default to a 256 MiB memory limit"
+            app.memory_limit, None,
+            "new apps have no explicit memory cap (the host default applies)"
         );
-        assert_eq!(
-            app.cpu_limit,
-            Some(500_000_000),
-            "new apps should default to 0.5 CPU"
-        );
+        assert_eq!(app.cpu_limit, None, "new apps may use every CPU");
+        assert_eq!(app.readiness(), Readiness::Http, "new apps are web apps");
+        assert_eq!(app.ready_after_secs, DEFAULT_READY_AFTER_SECS);
+        assert_eq!(Readiness::parse("bogus"), Readiness::Http);
+        assert_eq!(Readiness::from_input("bogus"), None);
+        assert!(!Readiness::None.serves_traffic());
         assert_eq!(
             app.env_vars.as_deref(),
             Some("{}"),
@@ -661,10 +762,8 @@ mod tests {
             container_path: "/data".to_string(),
         }])
         .unwrap_or_else(|err| panic!("failed to serialize volumes fixture: {err}"));
-        app.preview_excluded_keys = serde_json::to_string(&vec!["SECRET_KEY", "TOKEN"])
-            .unwrap_or_else(|err| {
-                panic!("failed to serialize preview_excluded_keys fixture: {err}")
-            });
+        app.preview_shared_keys = serde_json::to_string(&vec!["SECRET_KEY", "TOKEN"])
+            .unwrap_or_else(|err| panic!("failed to serialize preview_shared_keys fixture: {err}"));
 
         let response = AppResponse::from(app);
 
@@ -686,9 +785,9 @@ mod tests {
             "AppResponse should deserialize persisted volume JSON into typed volumes"
         );
         assert_eq!(
-            response.preview_excluded_keys,
+            response.preview_shared_keys,
             vec!["SECRET_KEY".to_string(), "TOKEN".to_string()],
-            "AppResponse should deserialize preview excluded keys from JSON"
+            "AppResponse should deserialize preview shared keys from JSON"
         );
         assert_eq!(
             response.build_method.as_deref(),
@@ -701,7 +800,7 @@ mod tests {
     fn app_response_from_app_falls_back_for_invalid_json_fields() {
         let mut app = App::new("demo".to_string(), "git".to_string(), None, None, 3000);
         app.volumes = "not json".to_string();
-        app.preview_excluded_keys = "{ definitely not an array }".to_string();
+        app.preview_shared_keys = "{ definitely not an array }".to_string();
 
         let response = AppResponse::from(app);
 
@@ -710,9 +809,9 @@ mod tests {
             "invalid persisted volumes JSON should fall back to an empty list"
         );
         assert_eq!(
-            response.preview_excluded_keys,
+            response.preview_shared_keys,
             Vec::<String>::new(),
-            "invalid persisted preview_excluded_keys JSON should fall back to an empty list"
+            "invalid persisted preview_shared_keys JSON should fall back to an empty list"
         );
     }
 

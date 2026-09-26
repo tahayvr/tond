@@ -7,7 +7,10 @@
 //   GET   /api/apps/{id}/env/{key}         — reveal one value (admin only, audit-logged)
 //   PATCH /api/apps/{id}/env               — {set: {K: V}, unset: [K]}
 //   GET   /api/apps/{id}/preview-env/{key} — reveal one preview override (admin only, audit-logged)
-//   PATCH /api/apps/{id}/preview-env       — {set, unset, exclude, include}
+//   PATCH /api/apps/{id}/preview-env       — {set, unset, share, unshare}
+//
+// Previews never inherit the app's environment: they get their own overrides
+// plus only the app variables an admin explicitly shares (shared_keys).
 //
 // Changes are stored immediately and reach the container on the next deploy.
 // Each patch is applied inside one IMMEDIATE transaction so two concurrent
@@ -25,44 +28,14 @@ use tond_common::*;
 
 use super::fetch_app;
 use crate::{
-    audit_log::{AuthActor, write_audit_log},
-    auth::{RateLimit, RequireAdmin, RequireAuth},
+    audit_log::write_audit_log,
+    auth::{Authz, RateLimit, scope},
     error::AppError,
+    log_scrub, secrets,
     state::AppState,
 };
 
 // ── Pure helpers ──
-
-/// Parse a stored env JSON object. A missing or corrupt column reads as empty
-/// only when it is blank; corrupt JSON is an error so a patch never silently
-/// replaces data it could not read.
-fn parse_env_map(raw: Option<&str>) -> Result<BTreeMap<String, String>, AppError> {
-    let raw = raw.map(str::trim).unwrap_or_default();
-    if raw.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
-        AppError(TondError::Internal(format!(
-            "stored environment is not valid JSON: {e}"
-        )))
-    })?;
-    let object = value.as_object().ok_or_else(|| {
-        AppError(TondError::Internal(
-            "stored environment is not a JSON object".to_string(),
-        ))
-    })?;
-    Ok(object
-        .iter()
-        .map(|(k, v)| {
-            let value = match v {
-                serde_json::Value::String(s) => s.clone(),
-                serde_json::Value::Null => String::new(),
-                other => other.to_string(),
-            };
-            (k.clone(), value)
-        })
-        .collect())
-}
 
 fn parse_key_list(raw: &str) -> Vec<String> {
     serde_json::from_str(raw).unwrap_or_default()
@@ -103,43 +76,39 @@ fn apply_patch(
     Ok(current)
 }
 
-/// Apply exclude/include to the preview exclusion list, keeping it sorted and
-/// free of duplicates.
-fn apply_exclusions(
+/// Apply share/unshare to the list of app variables previews receive, keeping
+/// it sorted and free of duplicates.
+fn apply_sharing(
     current: Vec<String>,
-    exclude: &[String],
-    include: &[String],
+    share: &[String],
+    unshare: &[String],
 ) -> Result<Vec<String>, AppError> {
-    validate_keys(exclude)?;
-    validate_keys(include)?;
-    if let Some(key) = include.iter().find(|k| exclude.contains(k)) {
+    validate_keys(share)?;
+    validate_keys(unshare)?;
+    if let Some(key) = unshare.iter().find(|k| share.contains(k)) {
         return Err(AppError(TondError::InvalidInput(format!(
-            "'{key}' is both excluded and included in the same request"
+            "'{key}' is both shared and unshared in the same request"
         ))));
     }
     let mut keys: BTreeSet<String> = current.into_iter().collect();
-    keys.extend(exclude.iter().cloned());
-    for key in include {
+    keys.extend(share.iter().cloned());
+    for key in unshare {
         keys.remove(key);
     }
     Ok(keys.into_iter().collect())
 }
 
 fn env_response(app: &App) -> Result<AppEnvResponse, AppError> {
-    let vars = parse_env_map(app.env_vars.as_deref())?;
-    let overrides = parse_env_map(Some(&app.preview_env_vars))?;
+    let vars = secrets::app_env(app)?;
+    let overrides = secrets::app_preview_env(app)?;
     Ok(AppEnvResponse {
         vars: masked_env_entries(&vars),
         preview: PreviewEnvResponse {
             enabled: app.preview_enabled != 0,
-            excluded_keys: parse_key_list(&app.preview_excluded_keys),
+            shared_keys: parse_key_list(&app.preview_shared_keys),
             overrides: masked_env_entries(&overrides),
         },
     })
-}
-
-fn to_json(map: &BTreeMap<String, String>) -> Result<String, AppError> {
-    serde_json::to_string(map).map_err(|e| AppError(TondError::Internal(e.to_string())))
 }
 
 async fn fetch_app_in_tx(tx: &mut sqlx::SqliteConnection, app_id: &str) -> Result<App, AppError> {
@@ -154,7 +123,7 @@ async fn fetch_app_in_tx(tx: &mut sqlx::SqliteConnection, app_id: &str) -> Resul
 
 pub async fn get_env(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::EnvReadNames>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -164,13 +133,12 @@ pub async fn get_env(
 
 pub async fn reveal_env_var(
     _rate: RateLimit,
-    _admin: RequireAdmin,
-    actor: AuthActor,
+    auth: Authz<scope::EnvReadValues>,
     State(state): State<AppState>,
     Path((id, key)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
     let app = fetch_app(&state.db, &id).await?;
-    let vars = parse_env_map(app.env_vars.as_deref())?;
+    let vars = secrets::app_env(&app)?;
     let value = vars
         .get(&key)
         .cloned()
@@ -181,7 +149,7 @@ pub async fn reveal_env_var(
         Some(&app.id),
         Some(&app.name),
         "env_reveal",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("key={key}")),
     )
     .await;
@@ -194,8 +162,7 @@ pub async fn reveal_env_var(
 
 pub async fn patch_env(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::EnvWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<PatchEnvRequest>,
@@ -209,18 +176,15 @@ pub async fn patch_env(
 
     let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
     let app = fetch_app_in_tx(&mut tx, &app_id).await?;
-    let next = apply_patch(
-        parse_env_map(app.env_vars.as_deref())?,
-        &req.set,
-        &req.unset,
-    )?;
+    let next = apply_patch(secrets::app_env(&app)?, &req.set, &req.unset)?;
     sqlx::query("UPDATE apps SET env_vars = ?, updated_at = datetime('now') WHERE id = ?")
-        .bind(to_json(&next)?)
+        .bind(secrets::seal_app_env(&next)?)
         .bind(&app.id)
         .execute(&mut *tx)
         .await?;
     let updated = fetch_app_in_tx(&mut tx, &app.id).await?;
     tx.commit().await?;
+    log_scrub::forget_app(&updated.id);
 
     // Record which keys changed, never their values.
     let detail = format!(
@@ -233,7 +197,7 @@ pub async fn patch_env(
         Some(&updated.id),
         Some(&updated.name),
         "env_update",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&detail),
     )
     .await;
@@ -246,13 +210,12 @@ pub async fn patch_env(
 
 pub async fn reveal_preview_env_var(
     _rate: RateLimit,
-    _admin: RequireAdmin,
-    actor: AuthActor,
+    auth: Authz<scope::EnvReadValues>,
     State(state): State<AppState>,
     Path((id, key)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
     let app = fetch_app(&state.db, &id).await?;
-    let overrides = parse_env_map(Some(&app.preview_env_vars))?;
+    let overrides = secrets::app_preview_env(&app)?;
     let value = overrides
         .get(&key)
         .cloned()
@@ -263,7 +226,7 @@ pub async fn reveal_preview_env_var(
         Some(&app.id),
         Some(&app.name),
         "preview_env_reveal",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("key={key}")),
     )
     .await;
@@ -276,61 +239,54 @@ pub async fn reveal_preview_env_var(
 
 pub async fn patch_preview_env(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::EnvWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<PatchPreviewEnvRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    if req.set.is_empty()
-        && req.unset.is_empty()
-        && req.exclude.is_empty()
-        && req.include.is_empty()
+    if req.set.is_empty() && req.unset.is_empty() && req.share.is_empty() && req.unshare.is_empty()
     {
         return Err(AppError(TondError::InvalidInput(
-            "nothing to change: send at least one override or exclusion change".to_string(),
+            "nothing to change: send at least one override or sharing change".to_string(),
         )));
     }
     let app_id = fetch_app(&state.db, &id).await?.id;
 
     let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
     let app = fetch_app_in_tx(&mut tx, &app_id).await?;
-    let overrides = apply_patch(
-        parse_env_map(Some(&app.preview_env_vars))?,
-        &req.set,
-        &req.unset,
+    let overrides = apply_patch(secrets::app_preview_env(&app)?, &req.set, &req.unset)?;
+    let shared = apply_sharing(
+        parse_key_list(&app.preview_shared_keys),
+        &req.share,
+        &req.unshare,
     )?;
-    let excluded = apply_exclusions(
-        parse_key_list(&app.preview_excluded_keys),
-        &req.exclude,
-        &req.include,
-    )?;
-    let excluded_json = serde_json::to_string(&excluded)
-        .map_err(|e| AppError(TondError::Internal(e.to_string())))?;
+    let shared_json =
+        serde_json::to_string(&shared).map_err(|e| AppError(TondError::Internal(e.to_string())))?;
     sqlx::query(
-        "UPDATE apps SET preview_env_vars = ?, preview_excluded_keys = ?, updated_at = datetime('now') WHERE id = ?",
+        "UPDATE apps SET preview_env_vars = ?, preview_shared_keys = ?, updated_at = datetime('now') WHERE id = ?",
     )
-    .bind(to_json(&overrides)?)
-    .bind(excluded_json)
+    .bind(secrets::seal_app_preview_env(&overrides)?)
+    .bind(shared_json)
     .bind(&app.id)
     .execute(&mut *tx)
     .await?;
     let updated = fetch_app_in_tx(&mut tx, &app.id).await?;
     tx.commit().await?;
+    log_scrub::forget_app(&updated.id);
 
     let detail = format!(
-        "set={} unset={} exclude={} include={}",
+        "set={} unset={} share={} unshare={}",
         req.set.keys().cloned().collect::<Vec<_>>().join(","),
         req.unset.join(","),
-        req.exclude.join(","),
-        req.include.join(",")
+        req.share.join(","),
+        req.unshare.join(",")
     );
     write_audit_log(
         &state.db,
         Some(&updated.id),
         Some(&updated.name),
         "preview_env_update",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&detail),
     )
     .await;
@@ -353,6 +309,7 @@ mod tests {
     use axum::{extract::FromRequestParts, http::header};
 
     use super::*;
+    use crate::auth::Principal;
     use crate::auth::{LocalSocket, RateLimiter};
     use crate::handlers::auth::SESSION_COOKIE;
 
@@ -372,10 +329,18 @@ mod tests {
         }
     }
 
-    async fn seed_app(state: &AppState, env: &str, preview_env: &str, excluded: &str) -> App {
+    fn seal(purpose: crate::secret_key::Purpose, json: &str) -> String {
+        let map: BTreeMap<String, String> =
+            serde_json::from_str(json).unwrap_or_else(|err| panic!("bad fixture JSON: {err}"));
+        crate::secret_key::seal_map(purpose, &map).unwrap_or_else(|err| panic!("seal: {err}"))
+    }
+
+    async fn seed_app(state: &AppState, env: &str, preview_env: &str, shared: &str) -> App {
+        let env = seal(crate::secret_key::Purpose::AppEnv, env);
+        let preview_env = seal(crate::secret_key::Purpose::AppPreviewEnv, preview_env);
         let app = App::new("demo".to_string(), "image".to_string(), None, None, 3000);
         sqlx::query(
-            "INSERT INTO apps (id, name, source_type, container_port, status, env_vars, preview_env_vars, preview_excluded_keys, created_at, updated_at)
+            "INSERT INTO apps (id, name, source_type, container_port, status, env_vars, preview_env_vars, preview_shared_keys, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&app.id)
@@ -383,9 +348,9 @@ mod tests {
         .bind(&app.source_type)
         .bind(app.container_port)
         .bind(&app.status)
-        .bind(env)
-        .bind(preview_env)
-        .bind(excluded)
+        .bind(&env)
+        .bind(&preview_env)
+        .bind(shared)
         .bind(&app.created_at)
         .bind(&app.updated_at)
         .execute(&state.db)
@@ -400,7 +365,8 @@ mod tests {
             .fetch_one(&state.db)
             .await
             .unwrap_or_else(|err| panic!("failed to read env_vars: {err}"));
-        parse_env_map(raw.as_deref()).unwrap_or_else(|err| panic!("bad env JSON: {}", err.0))
+        crate::secret_key::open_map(crate::secret_key::Purpose::AppEnv, raw.as_deref())
+            .unwrap_or_else(|err| panic!("bad stored env: {err}"))
     }
 
     async fn body_json(response: axum::response::Response) -> serde_json::Value {
@@ -409,10 +375,6 @@ mod tests {
             .unwrap_or_else(|err| panic!("failed to read response body: {err}"));
         serde_json::from_slice(&bytes)
             .unwrap_or_else(|err| panic!("failed to decode JSON response body: {err}"))
-    }
-
-    fn actor() -> AuthActor {
-        AuthActor("admin@example.com".to_string())
     }
 
     /// Seed a user with `role` and a live session; returns the raw session token.
@@ -444,7 +406,8 @@ mod tests {
         token
     }
 
-    async fn admin_gate(state: &AppState, headers: &[(header::HeaderName, String)]) -> bool {
+    /// HTTP status the reveal route's `Authz<scope::EnvReadValues>` gives these headers (200 = passes).
+    async fn reveal_gate(state: &AppState, headers: &[(header::HeaderName, String)]) -> u16 {
         let mut builder = axum::http::Request::builder().uri("/api/apps/x/env/K");
         for (name, value) in headers {
             builder = builder.header(name, value);
@@ -453,49 +416,51 @@ mod tests {
             .body(())
             .unwrap_or_else(|err| panic!("failed to build request: {err}"))
             .into_parts();
-        RequireAdmin::from_request_parts(&mut parts, state)
-            .await
-            .is_ok()
+        match Authz::<scope::EnvReadValues>::from_request_parts(&mut parts, state).await {
+            Ok(_) => 200,
+            Err(response) => response.status().as_u16(),
+        }
+    }
+
+    async fn token_with(state: &AppState, scopes: &[&str]) -> String {
+        crate::auth::tokens::create_token(
+            &state.db,
+            &Principal::local_socket(),
+            &CreateTokenRequest {
+                name: "e2e".into(),
+                scopes: scopes.iter().map(|s| s.to_string()).collect(),
+                ..CreateTokenRequest::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|err| panic!("failed to create token: {err}"))
+        .secret
     }
 
     #[tokio::test]
-    async fn only_admins_pass_the_reveal_gate() {
+    async fn only_callers_with_env_read_values_pass_the_reveal_gate() {
         let state = test_state().await;
         let admin = seed_session_for(&state, "admin").await;
-        let member = seed_session_for(&state, "member").await;
+        let deployer = seed_session_for(&state, "deployer").await;
         let cookie = |t: &str| (header::COOKIE, format!("{SESSION_COOKIE}={t}"));
+        let bearer = |t: &str| (header::AUTHORIZATION, format!("Bearer {t}"));
 
-        assert!(admin_gate(&state, &[cookie(&admin)]).await, "admin session");
-        assert!(
-            !admin_gate(&state, &[cookie(&member)]).await,
-            "member session must be refused"
+        assert_eq!(
+            reveal_gate(&state, &[cookie(&admin)]).await,
+            200,
+            "admin session"
         );
-        let (api_key, raw_key) = ApiKey::generate("e2e");
-        sqlx::query("INSERT INTO api_keys (id, name, key_hash, created_at) VALUES (?, ?, ?, ?)")
-            .bind(&api_key.id)
-            .bind(&api_key.name)
-            .bind(&api_key.key_hash)
-            .bind(&api_key.created_at)
-            .execute(&state.db)
-            .await
-            .unwrap_or_else(|err| panic!("failed to seed API key: {err}"));
-        assert!(
-            admin_gate(
-                &state,
-                &[(header::AUTHORIZATION, format!("Bearer {raw_key}"))]
-            )
-            .await,
-            "API keys count as admin"
+        assert_eq!(
+            reveal_gate(&state, &[cookie(&deployer)]).await,
+            403,
+            "deployers can write env vars but not read values"
         );
-        assert!(
-            !admin_gate(
-                &state,
-                &[(header::AUTHORIZATION, "Bearer bogus".to_string())]
-            )
-            .await,
-            "an invalid API key is refused"
-        );
-        assert!(!admin_gate(&state, &[]).await, "no credential");
+        let reader = token_with(&state, &["env:read-values"]).await;
+        assert_eq!(reveal_gate(&state, &[bearer(&reader)]).await, 200);
+        let names_only = token_with(&state, &["env:read-names"]).await;
+        assert_eq!(reveal_gate(&state, &[bearer(&names_only)]).await, 403);
+        assert_eq!(reveal_gate(&state, &[bearer("bogus")]).await, 401);
+        assert_eq!(reveal_gate(&state, &[]).await, 401, "no credential");
 
         let (mut parts, _) = axum::http::Request::builder()
             .extension(LocalSocket)
@@ -503,10 +468,10 @@ mod tests {
             .unwrap_or_else(|err| panic!("failed to build request: {err}"))
             .into_parts();
         assert!(
-            RequireAdmin::from_request_parts(&mut parts, &state)
+            Authz::<scope::EnvReadValues>::from_request_parts(&mut parts, &state)
                 .await
                 .is_ok(),
-            "the root-only Unix socket counts as admin"
+            "the root-only Unix socket holds every scope"
         );
     }
 
@@ -549,23 +514,49 @@ mod tests {
     }
 
     #[test]
-    fn parse_env_map_refuses_corrupt_json_instead_of_reading_it_as_empty() {
-        assert!(parse_env_map(Some("not json")).is_err());
-        assert!(parse_env_map(Some("[1,2]")).is_err());
-        assert_eq!(
-            parse_env_map(None).map_err(|e| e.0.to_string()),
-            Ok(BTreeMap::new())
+    fn stored_env_that_does_not_decrypt_is_an_error_not_an_empty_map() {
+        use crate::secret_key::{Purpose, open_map};
+        assert!(open_map(Purpose::AppEnv, Some("not json")).is_err());
+        assert!(open_map(Purpose::AppEnv, Some(r#"{"A":"plaintext"}"#)).is_err());
+        assert_eq!(open_map(Purpose::AppEnv, None).ok(), Some(BTreeMap::new()));
+    }
+
+    #[tokio::test]
+    async fn patch_env_stores_values_encrypted() {
+        let state = test_state().await;
+        let app = seed_app(&state, "{}", "{}", "[]").await;
+        patch_env(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            State(state.clone()),
+            Path(app.id.clone()),
+            Json(PatchEnvRequest {
+                set: BTreeMap::from([("API_KEY".to_string(), "sk-very-secret".to_string())]),
+                unset: vec![],
+            }),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("patch_env should succeed: {}", err.0));
+        let raw: String = sqlx::query_scalar("SELECT env_vars FROM apps WHERE id = ?")
+            .bind(&app.id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_else(|err| panic!("failed to read env_vars: {err}"));
+        assert!(
+            raw.starts_with("v1."),
+            "env must be stored encrypted: {raw}"
         );
+        assert!(!raw.contains("sk-very-secret") && !raw.contains("API_KEY"));
     }
 
     #[test]
-    fn apply_exclusions_dedupes_and_sorts() {
-        let next = apply_exclusions(
+    fn apply_sharing_dedupes_and_sorts() {
+        let next = apply_sharing(
             vec!["TOKEN".to_string(), "API_KEY".to_string()],
             &["SECRET".to_string(), "TOKEN".to_string()],
             &["API_KEY".to_string()],
         )
-        .unwrap_or_else(|err| panic!("exclusions should apply: {}", err.0));
+        .unwrap_or_else(|err| panic!("sharing should apply: {}", err.0));
         assert_eq!(next, vec!["SECRET".to_string(), "TOKEN".to_string()]);
     }
 
@@ -580,10 +571,15 @@ mod tests {
         )
         .await;
 
-        let response = get_env(RateLimit, RequireAuth, State(state.clone()), Path(app.id))
-            .await
-            .unwrap_or_else(|err| panic!("get_env should succeed: {}", err.0))
-            .into_response();
+        let response = get_env(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            State(state.clone()),
+            Path(app.id),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("get_env should succeed: {}", err.0))
+        .into_response();
         assert_eq!(response.status(), StatusCode::OK);
         let json = body_json(response).await;
         let text = json.to_string();
@@ -595,7 +591,7 @@ mod tests {
         assert_eq!(json["data"]["vars"][0]["key"], "DATABASE_URL");
         assert_eq!(json["data"]["vars"][0]["masked"], ENV_VALUE_MASK);
         assert_eq!(json["data"]["vars"][1]["masked"], "");
-        assert_eq!(json["data"]["preview"]["excluded_keys"][0], "DATABASE_URL");
+        assert_eq!(json["data"]["preview"]["shared_keys"][0], "DATABASE_URL");
         assert_eq!(json["data"]["preview"]["overrides"][0]["key"], "MODE");
     }
 
@@ -606,8 +602,7 @@ mod tests {
 
         let response = patch_env(
             RateLimit,
-            RequireAuth,
-            actor(),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.name.clone()),
             Json(PatchEnvRequest {
@@ -630,7 +625,7 @@ mod tests {
         );
 
         let audit: String = sqlx::query_scalar(
-            "SELECT detail FROM audit_log WHERE action = 'env_update' AND app_id = ?",
+            "SELECT detail FROM audit_log WHERE action = 'env_update' AND resource_id = ?",
         )
         .bind(&app.id)
         .fetch_one(&state.db)
@@ -649,8 +644,7 @@ mod tests {
 
         let result = patch_env(
             RateLimit,
-            RequireAuth,
-            actor(),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.id.clone()),
             Json(PatchEnvRequest::default()),
@@ -671,8 +665,7 @@ mod tests {
 
         let response = reveal_env_var(
             RateLimit,
-            RequireAdmin,
-            actor(),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path((app.id.clone(), "TOKEN".to_string())),
         )
@@ -684,7 +677,7 @@ mod tests {
         assert!(!json.to_string().contains("zzz"));
 
         let reveals: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM audit_log WHERE action = 'env_reveal' AND app_id = ?",
+            "SELECT COUNT(*) FROM audit_log WHERE action = 'env_reveal' AND resource_id = ?",
         )
         .bind(&app.id)
         .fetch_one(&state.db)
@@ -694,8 +687,7 @@ mod tests {
 
         let missing = reveal_env_var(
             RateLimit,
-            RequireAdmin,
-            actor(),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path((app.id.clone(), "NOPE".to_string())),
         )
@@ -704,7 +696,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn patch_preview_env_edits_overrides_and_exclusions_independently() {
+    async fn patch_preview_env_edits_overrides_and_sharing_independently() {
         let state = test_state().await;
         let app = seed_app(
             &state,
@@ -716,15 +708,14 @@ mod tests {
 
         let response = patch_preview_env(
             RateLimit,
-            RequireAuth,
-            actor(),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.id.clone()),
             Json(PatchPreviewEnvRequest {
                 set: BTreeMap::from([("MODE".to_string(), "staging".to_string())]),
                 unset: vec![],
-                exclude: vec!["SECRET".to_string()],
-                include: vec!["A".to_string()],
+                share: vec!["NODE_ENV".to_string()],
+                unshare: vec!["A".to_string()],
             }),
         )
         .await
@@ -732,20 +723,24 @@ mod tests {
         .into_response();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let (overrides, excluded): (String, String) =
-            sqlx::query_as("SELECT preview_env_vars, preview_excluded_keys FROM apps WHERE id = ?")
+        let (overrides, shared): (String, String) =
+            sqlx::query_as("SELECT preview_env_vars, preview_shared_keys FROM apps WHERE id = ?")
                 .bind(&app.id)
                 .fetch_one(&state.db)
                 .await
                 .unwrap_or_else(|err| panic!("failed to read preview env: {err}"));
         assert_eq!(
-            parse_env_map(Some(&overrides)).map_err(|e| e.0.to_string()),
-            Ok(BTreeMap::from([
+            crate::secret_key::open_map(
+                crate::secret_key::Purpose::AppPreviewEnv,
+                Some(&overrides)
+            )
+            .ok(),
+            Some(BTreeMap::from([
                 ("KEEP".to_string(), "k".to_string()),
                 ("MODE".to_string(), "staging".to_string()),
             ]))
         );
-        assert_eq!(parse_key_list(&excluded), vec!["SECRET".to_string()]);
+        assert_eq!(parse_key_list(&shared), vec!["NODE_ENV".to_string()]);
         assert_eq!(
             stored_env(&state, &app.id).await,
             BTreeMap::from([("A".to_string(), "1".to_string())]),

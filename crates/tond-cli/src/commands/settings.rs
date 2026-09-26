@@ -34,10 +34,20 @@ pub enum SettingsAction {
         /// Domain name (e.g. example-previews.com). Pass an empty string to clear.
         domain: String,
     },
+    /// Set the domain automatic app hostnames live under (<app>.<domain>)
+    ///
+    /// Must be a separate site from the dashboard and preview domains (apps
+    /// run your code; keeping them off the dashboard's site keeps them away
+    /// from its cookies), with a wildcard DNS record *.<domain> pointing at
+    /// this server. Without it, apps need a custom domain.
+    SetAppsDomain {
+        /// Domain name (e.g. example-apps.com). Pass an empty string to clear.
+        domain: String,
+    },
     /// Turn the dashboard's host terminal (a shell on this server) on or off
     ///
     /// Off by default. It can only be switched from the server itself (this
-    /// command, run as root), never from the dashboard or with an API key. When
+    /// command, run as root), never from the dashboard or with an API token. When
     /// on, only admins can use it and every session asks for their password
     /// (and 2FA code).
     HostTerminal {
@@ -70,6 +80,11 @@ pub async fn handle(client: &TondClient, action: Option<SettingsAction>) -> Resu
             } else {
                 println!("dashboard-domain  {}", s.dashboard_domain);
             }
+            if s.apps_domain.is_empty() {
+                println!("apps-domain       (not set — apps need a custom domain)");
+            } else {
+                println!("apps-domain       {}", s.apps_domain);
+            }
             if s.preview_domain.is_empty() {
                 println!("preview-domain    (not set — previews disabled)");
             } else {
@@ -100,6 +115,7 @@ pub async fn handle(client: &TondClient, action: Option<SettingsAction>) -> Resu
                     server_name: Some(name.clone()),
                     dashboard_domain: None,
                     preview_domain: None,
+                    ..UpdateSettingsRequest::default()
                 })
                 .await?;
             if name.is_empty() {
@@ -111,9 +127,9 @@ pub async fn handle(client: &TondClient, action: Option<SettingsAction>) -> Resu
         Some(SettingsAction::SetDashboardDomain { domain }) => {
             let s = client
                 .update_settings(UpdateSettingsRequest {
-                    server_name: None,
                     dashboard_domain: Some(domain.clone()),
                     preview_domain: None,
+                    ..UpdateSettingsRequest::default()
                 })
                 .await?;
             if domain.is_empty() {
@@ -123,12 +139,30 @@ pub async fn handle(client: &TondClient, action: Option<SettingsAction>) -> Resu
                 println!("tond-proxy will pick up the change within 5 seconds.");
             }
         }
+        Some(SettingsAction::SetAppsDomain { domain }) => {
+            let s = client
+                .update_settings(UpdateSettingsRequest {
+                    apps_domain: Some(domain.clone()),
+                    ..Default::default()
+                })
+                .await?;
+            if domain.is_empty() {
+                println!(
+                    "apps-domain cleared. New apps get no automatic hostname; give them a custom domain."
+                );
+            } else {
+                println!("apps-domain set to: {}", s.apps_domain);
+                println!(
+                    "Point a wildcard DNS record *.{} at this server. New apps are served at <app>.{}",
+                    s.apps_domain, s.apps_domain
+                );
+            }
+        }
         Some(SettingsAction::SetPreviewDomain { domain }) => {
             let s = client
                 .update_settings(UpdateSettingsRequest {
-                    server_name: None,
-                    dashboard_domain: None,
                     preview_domain: Some(domain.clone()),
+                    ..UpdateSettingsRequest::default()
                 })
                 .await?;
             if domain.is_empty() {
@@ -149,18 +183,19 @@ pub async fn handle(client: &TondClient, action: Option<SettingsAction>) -> Resu
 /// Prompts for current password and new password (+ confirmation),
 /// then calls POST /api/auth/change-password.
 ///
-/// Note: The change-password endpoint uses a session cookie for auth.
-/// The CLI sends the API key in the Authorization header — the server
-/// accepts both. Input is read from stdin (characters are visible; pipe
-/// a password manager's output for non-interactive use).
+/// Note: The change-password endpoint needs a dashboard session; API tokens
+/// and the root socket can't change a user's password. Root on the host can
+/// instead issue a one-time reset link: `tond users reset-link <email>`.
+/// Input is read from stdin (characters are visible; pipe a password
+/// manager's output for non-interactive use).
 pub async fn handle_passwd(client: &TondClient) -> Result<()> {
     use std::io::{self, Write};
 
     let current = read_line_prompt("Current password: ")?;
     let new_pw = read_line_prompt("New password: ")?;
 
-    if new_pw.len() < 8 {
-        anyhow::bail!("New password must be at least 8 characters");
+    if new_pw.chars().count() < 12 {
+        anyhow::bail!("New password must be at least 12 characters");
     }
 
     let confirm = read_line_prompt("Confirm new password: ")?;

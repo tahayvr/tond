@@ -3,8 +3,9 @@
 // Exports:
 //   run_cron_scheduler(state)        — long-running Tokio task. On start it closes out
 //                                      runs a previous process left 'running' (see
-//                                      reconcile_interrupted_runs). Then it wakes every
-//                                      30 s, finds enabled jobs whose next_run_at <= now,
+//                                      reconcile_interrupted_runs). Then it sleeps until
+//                                      the earliest next_run_at (or until cron_jobs
+//                                      changes), finds enabled jobs whose next_run_at <= now,
 //                                      advances next_run_at to the next slot (a
 //                                      compare-and-set, *before* the run starts, so a
 //                                      long 'allow' run is never re-started every tick)
@@ -25,6 +26,8 @@
 //   • Resource limits: memory_mb and cpu_shares wired into Docker HostConfig.
 //   • Volume mounts: volumes JSON array wired into Docker HostConfig.binds, every
 //     host path re-derived and confined by `volumes::cron_binds`.
+//   • Isolation: the container runs on the job's own network, or its project's
+//     (networks.rs), never on Docker's default bridge.
 //   • Hardening: the same no-new-privileges / capability / pids / memory / log
 //     rotation policy as app containers (`docker::harden_host_config`).
 //   • Retry logic: on non-zero exit, re-queues the job up to max_retries times with
@@ -40,17 +43,24 @@ use std::str::FromStr;
 use tond_common::{CronJob, CronVolume};
 use uuid::Uuid;
 
-use crate::{alerts, docker, state::AppState, volumes};
+use crate::runtime::changes::{Table, Watch};
+use crate::runtime::{loops, shutdown};
+use crate::{alerts, docker, metrics, networks, secrets, state::AppState, volumes};
+
+/// Longest sleep when no job is scheduled soon (a cron_jobs change wakes us).
+const MAX_SLEEP: std::time::Duration = std::time::Duration::from_secs(3600);
 
 fn should_run_due_job(job: &CronJob) -> bool {
     !(job.status == "running" && job.concurrency_policy == "skip")
 }
 
-fn cron_env_vec(env_json: Option<&str>) -> Vec<String> {
-    env_json
-        .and_then(|s| serde_json::from_str::<std::collections::HashMap<String, String>>(s).ok())
-        .map(|m| m.into_iter().map(|(k, v)| format!("{}={}", k, v)).collect())
-        .unwrap_or_default()
+/// Decrypt the stored env into `KEY=value` strings. An env that cannot be
+/// decrypted fails the run instead of silently running without it.
+fn cron_env_vec(stored: Option<&str>) -> Result<Vec<String>> {
+    Ok(secrets::cron_env(stored)?
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect())
 }
 
 /// Parse the stored volumes JSON and turn it into confined Docker bind strings.
@@ -81,14 +91,147 @@ fn cron_attempt_plan(max_retries: i64) -> i64 {
 
 // ── Next-run computation ──────────────────────────────────────────────────────
 
+/// Expand the `@hourly`-style macros to their 5-field form.
+fn expand_macro(expr: &str) -> &str {
+    match expr {
+        "@yearly" | "@annually" => "0 0 1 1 *",
+        "@monthly" => "0 0 1 * *",
+        "@weekly" => "0 0 * * 0",
+        "@daily" | "@midnight" => "0 0 * * *",
+        "@hourly" => "0 * * * *",
+        other => other,
+    }
+}
+
+/// Translate a standard day-of-week field (0–7, Sunday = 0 or 7, names allowed)
+/// into the `cron` crate's numbering (1–7, Sunday = 1).
+///
+/// Without this, `1-5` would mean Sunday–Thursday and `0` (Sunday) would be
+/// rejected outright.
+fn to_crate_day_of_week(field: &str) -> Result<String> {
+    if field == "*" || field == "?" {
+        return Ok("*".to_string());
+    }
+    let day = |token: &str| -> Result<u32> {
+        let names = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+        let lower = token.to_ascii_lowercase();
+        if let Some(i) = names.iter().position(|n| lower.starts_with(n)) {
+            return Ok(i as u32);
+        }
+        let n: u32 = token
+            .parse()
+            .map_err(|_| anyhow::anyhow!("'{token}' is not a day of the week"))?;
+        if n > 7 {
+            anyhow::bail!("day of week {n} is out of range (0-7)");
+        }
+        Ok(n)
+    };
+    let mut days = [false; 7];
+    for part in field.split(',') {
+        let (range, step) = match part.split_once('/') {
+            Some((r, s)) => {
+                let step: u32 = s
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("invalid step '{s}' in day of week"))?;
+                if step == 0 {
+                    anyhow::bail!("day-of-week step must be at least 1");
+                }
+                (r, step)
+            }
+            None => (part, 1),
+        };
+        let (start, end) = if range == "*" {
+            (0, 6)
+        } else if let Some((a, b)) = range.split_once('-') {
+            let (a, b) = (day(a)?, day(b)?);
+            if a > b {
+                anyhow::bail!("day-of-week range {range} runs backwards");
+            }
+            (a, b)
+        } else {
+            let d = day(range)?;
+            // "5/2" means "from Friday, every second day" in Vixie cron.
+            (d, if step > 1 { 6 } else { d })
+        };
+        let mut d = start;
+        while d <= end {
+            days[(d % 7) as usize] = true;
+            d += step;
+        }
+    }
+    let list: Vec<String> = days
+        .iter()
+        .enumerate()
+        .filter(|(_, on)| **on)
+        .map(|(i, _)| (i + 1).to_string())
+        .collect();
+    if list.is_empty() {
+        anyhow::bail!("day-of-week field '{field}' selects no days");
+    }
+    Ok(list.join(","))
+}
+
+/// Parse a standard 5-field cron expression (or an `@daily`-style macro).
+pub fn parse_schedule(schedule_str: &str) -> Result<Schedule> {
+    let normalized = schedule_str
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let expr = expand_macro(normalized.as_str());
+    let fields: Vec<&str> = expr.split(' ').collect();
+    if fields.len() != 5 {
+        anyhow::bail!(
+            "a schedule needs 5 fields (minute hour day-of-month month day-of-week), got {}",
+            fields.len()
+        );
+    }
+    let dow = to_crate_day_of_week(fields[4])?;
+    // The `cron` crate uses 7-field expressions: sec min hour dom month dow year.
+    let padded = format!(
+        "0 {} {} {} {} {} *",
+        fields[0], fields[1], fields[2], fields[3], dow
+    );
+    Ok(Schedule::from_str(&padded)?)
+}
+
+/// Resolve an optional IANA time zone. `None`/empty means UTC; an unknown name is an error.
+pub fn parse_timezone(timezone: Option<&str>) -> Result<Option<chrono_tz::Tz>> {
+    match timezone.map(str::trim).filter(|tz| !tz.is_empty()) {
+        None => Ok(None),
+        Some(name) => name
+            .parse::<chrono_tz::Tz>()
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("'{name}' is not a known IANA time zone")),
+    }
+}
+
+/// The next `count` run times (RFC 3339, UTC) of a schedule evaluated in `timezone`.
+pub fn upcoming_runs(
+    schedule_str: &str,
+    timezone: Option<&str>,
+    count: usize,
+) -> Result<Vec<String>> {
+    let schedule = parse_schedule(schedule_str)?;
+    let runs = match parse_timezone(timezone)? {
+        Some(tz) => schedule
+            .upcoming(tz)
+            .take(count)
+            .map(|t| t.with_timezone(&Utc).to_rfc3339())
+            .collect(),
+        None => schedule
+            .upcoming(Utc)
+            .take(count)
+            .map(|t| t.to_rfc3339())
+            .collect(),
+    };
+    Ok(runs)
+}
+
 /// Parse a 5-field standard cron expression and return the next datetime
 /// as an RFC 3339 string.  If `timezone` is a valid IANA tz name the schedule
 /// is evaluated in that timezone; otherwise UTC is used.
 pub fn compute_next_run(schedule_str: &str, timezone: Option<&str>) -> Result<String> {
-    // The `cron` crate uses 7-field expressions: sec min hour dom month dow year.
-    // Pad a 5-field expression by prepending "0 " (sec=0) and appending " *" (year=any).
-    let padded = format!("0 {} *", schedule_str);
-    let schedule = Schedule::from_str(&padded)?;
+    let schedule = parse_schedule(schedule_str)?;
 
     if let Some(tz_name) = timezone {
         use chrono_tz::Tz;
@@ -100,7 +243,7 @@ pub fn compute_next_run(schedule_str: &str, timezone: Option<&str>) -> Result<St
             // Convert to UTC RFC 3339
             return Ok(next.with_timezone(&Utc).to_rfc3339());
         }
-        // Unknown tz — fall through to UTC
+        // Unknown tz — fall through to UTC (new jobs are validated by the API).
         tracing::warn!("Unknown timezone '{}'; falling back to UTC", tz_name);
     }
 
@@ -141,10 +284,37 @@ pub async fn run_cron_scheduler(state: AppState) {
     }
     remove_orphaned_cron_containers(&state.docker).await;
 
+    let lp = loops::register("cron");
+    let mut watch = Watch::new(&[Table::CronJobs]);
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        let sleep = next_due_in(&state.db).await;
+        lp.wait(Some(sleep), &mut watch).await;
+        if shutdown::is_shutting_down() {
+            return;
+        }
+        let _run = lp.run();
         schedule_due_jobs(&state).await;
     }
+}
+
+/// Time until the earliest enabled job is due (zero if one is overdue),
+/// capped at MAX_SLEEP.
+async fn next_due_in(db: &sqlx::SqlitePool) -> std::time::Duration {
+    let next: Option<String> = sqlx::query_scalar(
+        "SELECT MIN(next_run_at) FROM cron_jobs WHERE enabled = 1 AND next_run_at IS NOT NULL",
+    )
+    .fetch_one(db)
+    .await
+    .ok()
+    .flatten();
+    next.as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|at| {
+            (at.with_timezone(&Utc) - Utc::now())
+                .to_std()
+                .unwrap_or(std::time::Duration::ZERO)
+        })
+        .map_or(MAX_SLEEP, |d| d.min(MAX_SLEEP))
 }
 
 /// One scheduler tick: claim every due job (advancing `next_run_at` *before*
@@ -153,7 +323,8 @@ pub async fn run_cron_scheduler(state: AppState) {
 async fn schedule_due_jobs(state: &AppState) {
     for job in claim_due_jobs(&state.db).await {
         let state_clone = state.clone();
-        tokio::spawn(async move {
+        // Tracked: a graceful shutdown waits for the run to finish.
+        shutdown::spawn_tracked(async move {
             run_cron_job(&state_clone, &job, 1).await;
         });
     }
@@ -476,8 +647,8 @@ async fn run_cron_container(
 
     let docker: &Docker = &state.docker;
 
-    // Build env vec from the stored JSON object string, e.g. {"KEY":"val"} → ["KEY=val"]
-    let env_vec = cron_env_vec(job.env.as_deref());
+    // Decrypt the stored env, e.g. {"KEY":"val"} → ["KEY=val"]
+    let env_vec = cron_env_vec(job.env.as_deref())?;
 
     let cmd_vec: Option<Vec<&str>> = cmd.map(|c| c.iter().map(|s| s.as_str()).collect());
 
@@ -488,11 +659,15 @@ async fn run_cron_container(
     let memory = cron_memory_limit_bytes(job.memory_mb);
     let cpu_shares: Option<i64> = job.cpu_shares;
 
+    // The job's own network (or its project's) — never the default bridge.
+    let network = networks::ensure_cron_home(docker, job).await?;
+
     let mut host_config = HostConfig {
         auto_remove: Some(false), // we remove manually after collecting logs
         memory,
         cpu_shares,
         binds,
+        network_mode: Some(network),
         ..Default::default()
     };
     docker::harden_host_config(&mut host_config, docker::default_memory_limit());
@@ -505,6 +680,7 @@ async fn run_cron_container(
             let mut m = HashMap::new();
             m.insert("managed-by".to_string(), "tond".to_string());
             m.insert("tond-type".to_string(), "cron".to_string());
+            m.insert(metrics::CRON_JOB_LABEL.to_string(), job.id.clone());
             Some(m)
         },
         host_config: Some(host_config),
@@ -629,7 +805,11 @@ mod tests {
             Some(r#"["echo","hello"]"#.to_string()),
             None,
             Some(60),
-            Some(r#"{"RUST_LOG":"info","MODE":"prod"}"#.to_string()),
+            secrets::seal_cron_env(&std::collections::BTreeMap::from([
+                ("RUST_LOG".to_string(), "info".to_string()),
+                ("MODE".to_string(), "prod".to_string()),
+            ]))
+            .unwrap_or_else(|err| panic!("seal: {err}")),
             "skip".to_string(),
             Some(256),
             Some(512),
@@ -820,6 +1000,75 @@ mod tests {
     }
 
     #[test]
+    fn day_of_week_uses_standard_cron_numbering() {
+        use chrono::{Datelike, Weekday};
+        let weekday_of = |expr: &str| -> Vec<Weekday> {
+            upcoming_runs(expr, None, 7)
+                .unwrap_or_else(|err| panic!("{expr} should parse: {err}"))
+                .iter()
+                .map(|t| {
+                    chrono::DateTime::parse_from_rfc3339(t)
+                        .unwrap_or_else(|err| panic!("bad timestamp {t}: {err}"))
+                        .weekday()
+                })
+                .collect()
+        };
+        assert!(
+            weekday_of("0 0 * * 0").iter().all(|d| *d == Weekday::Sun),
+            "0 is Sunday"
+        );
+        assert!(
+            weekday_of("0 0 * * 7").iter().all(|d| *d == Weekday::Sun),
+            "7 is Sunday too"
+        );
+        let weekdays = weekday_of("0 9 * * 1-5");
+        assert!(
+            weekdays
+                .iter()
+                .all(|d| !matches!(d, Weekday::Sat | Weekday::Sun)),
+            "1-5 is Monday to Friday, got {weekdays:?}"
+        );
+        assert!(
+            weekday_of("0 0 * * mon").iter().all(|d| *d == Weekday::Mon),
+            "names work"
+        );
+        assert!(
+            weekday_of("0 0 * * 5-7")
+                .iter()
+                .all(|d| matches!(d, Weekday::Fri | Weekday::Sat | Weekday::Sun)),
+            "ranges ending at 7 wrap to Sunday"
+        );
+    }
+
+    #[test]
+    fn schedule_parsing_accepts_macros_and_rejects_bad_input() {
+        assert!(parse_schedule("@daily").is_ok());
+        assert!(
+            parse_schedule("*/15  *  * * *").is_ok(),
+            "extra spaces are fine"
+        );
+        assert!(parse_schedule("0 0 * *").is_err(), "four fields");
+        assert!(parse_schedule("0 0 * * 8").is_err(), "day 8");
+        assert!(parse_schedule("0 0 * * 5-1").is_err(), "backwards range");
+    }
+
+    #[test]
+    fn upcoming_runs_respects_the_time_zone() {
+        let utc = upcoming_runs("0 12 * * *", None, 3)
+            .unwrap_or_else(|err| panic!("UTC schedule should parse: {err}"));
+        assert_eq!(utc.len(), 3);
+        assert!(utc.iter().all(|t| t.contains("T12:00:00")), "{utc:?}");
+        let tokyo = upcoming_runs("0 12 * * *", Some("Asia/Tokyo"), 2)
+            .unwrap_or_else(|err| panic!("Tokyo schedule should parse: {err}"));
+        assert!(
+            tokyo.iter().all(|t| t.contains("T03:00:00")),
+            "noon in Tokyo is 03:00 UTC: {tokyo:?}"
+        );
+        assert!(upcoming_runs("0 12 * * *", Some("Mars/Phobos"), 1).is_err());
+        assert!(parse_timezone(Some("")).is_ok_and(|tz| tz.is_none()));
+    }
+
+    #[test]
     fn compute_next_run_rejects_invalid_cron_expressions() {
         assert!(
             compute_next_run("not a cron", Some("UTC")).is_err(),
@@ -855,17 +1104,17 @@ mod tests {
     fn cron_env_and_bind_helpers_parse_json_and_tolerate_invalid_input() {
         let job = sample_job();
 
-        let env = cron_env_vec(job.env.as_deref());
+        let env = cron_env_vec(job.env.as_deref()).unwrap_or_default();
         assert!(
             env.contains(&"RUST_LOG=info".to_string()) && env.contains(&"MODE=prod".to_string()),
             "cron_env_vec should convert the stored JSON object into KEY=value strings"
         );
 
-        assert_eq!(
-            cron_env_vec(Some("not-json")),
-            Vec::<String>::new(),
-            "cron_env_vec should fall back to an empty environment on invalid JSON"
+        assert!(
+            cron_env_vec(Some("not-json")).is_err(),
+            "cron_env_vec should fail loudly on a value that does not decrypt"
         );
+        assert_eq!(cron_env_vec(None).ok(), Some(Vec::new()));
 
         let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
         let binds = cron_binds(tmp.path(), &job.id, job.volumes.as_deref())

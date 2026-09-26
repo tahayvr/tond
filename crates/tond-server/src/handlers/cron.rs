@@ -2,7 +2,7 @@
 //
 // Creates and manages scheduled jobs that run Docker containers on a cron schedule.
 //
-// Routes (all require RequireAuth + RateLimit):
+// Routes (all require RateLimit + an Authz scope, see each handler):
 //   GET    /api/cron                      — list all cron jobs
 //   POST   /api/cron                      — create a new cron job
 //   GET    /api/cron/{id}                 — get cron job details
@@ -10,6 +10,10 @@
 //   DELETE /api/cron/{id}                 — delete cron job
 //   POST   /api/cron/{id}/trigger         — manually trigger a run immediately
 //   GET    /api/cron/{id}/runs            — get execution history (supports ?limit=&offset=)
+//   GET    /api/cron/schedule-preview     — validate a schedule, list its next runs
+//                                           (?schedule=&timezone=&count=)
+
+use std::collections::BTreeMap;
 
 use axum::{
     Json,
@@ -21,11 +25,12 @@ use serde::Deserialize;
 use tond_common::*;
 
 use crate::{
-    audit_log::{AuthActor, write_audit_log},
-    auth::{RateLimit, RequireAdmin, RequireAuth},
+    audit_log::write_audit_log,
+    auth::{Authz, RateLimit, scope},
     cron,
     cron::compute_next_run,
     error::AppError,
+    secrets,
     state::AppState,
     volumes,
 };
@@ -64,17 +69,71 @@ async fn confined_cron_volumes(
     })?))
 }
 
+/// API view of a job: env keys with masked values.
+fn cron_response(job: CronJob) -> Result<CronJobResponse, AppError> {
+    let env = secrets::cron_env(job.env.as_deref())?;
+    Ok(CronJobResponse::new(job, &env))
+}
+
+fn validate_env_keys<'a>(keys: impl IntoIterator<Item = &'a String>) -> Result<(), AppError> {
+    for key in keys {
+        if !is_valid_env_key(key) {
+            return Err(AppError(TondError::InvalidInput(format!(
+                "'{key}' is not a valid variable name: use letters, digits and underscores, \
+                 not starting with a digit"
+            ))));
+        }
+    }
+    Ok(())
+}
+
+// ── Schedule preview ──
+
+#[derive(Debug, Deserialize)]
+pub struct SchedulePreviewQuery {
+    pub schedule: String,
+    pub timezone: Option<String>,
+    pub count: Option<usize>,
+}
+
+/// Validate a schedule and return its next runs, so the dashboard can show
+/// exactly what the scheduler will do (same parser, same time zone rules).
+pub async fn preview_schedule(
+    _rate: RateLimit,
+    _auth: Authz<scope::CronRead>,
+    Query(query): Query<SchedulePreviewQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let count = query.count.unwrap_or(5).clamp(1, 20);
+    let timezone = query
+        .timezone
+        .as_deref()
+        .map(str::trim)
+        .filter(|tz| !tz.is_empty());
+    let next_runs = cron::upcoming_runs(&query.schedule, timezone, count)
+        .map_err(|e| AppError(TondError::InvalidInput(e.to_string())))?;
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(serde_json::json!({
+            "next_runs": next_runs,
+            "timezone": timezone.unwrap_or("UTC"),
+        }))),
+    ))
+}
+
 // ── List cron jobs ──
 
 pub async fn list_cron_jobs(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::CronRead>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     let jobs: Vec<CronJob> = sqlx::query_as("SELECT * FROM cron_jobs ORDER BY created_at DESC")
         .fetch_all(&state.db)
         .await?;
-    let responses: Vec<CronJobResponse> = jobs.into_iter().map(CronJobResponse::from).collect();
+    let mut responses: Vec<CronJobResponse> = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        responses.push(cron_response(job)?);
+    }
     Ok((StatusCode::OK, Json(ApiResponse::ok(responses))))
 }
 
@@ -82,25 +141,21 @@ pub async fn list_cron_jobs(
 
 pub async fn get_cron_job(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::CronRead>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let job = fetch_cron_job(&state.db, &id).await?;
-    Ok((
-        StatusCode::OK,
-        Json(ApiResponse::ok(CronJobResponse::from(job))),
-    ))
+    Ok((StatusCode::OK, Json(ApiResponse::ok(cron_response(job)?))))
 }
 
 // ── Create cron job ──
 
 pub async fn create_cron_job(
     _rate: RateLimit,
-    _admin: RequireAdmin,
-    actor: AuthActor,
+    auth: Authz<scope::CronWrite>,
     State(state): State<AppState>,
-    Json(req): Json<CreateCronJobRequest>,
+    Json(mut req): Json<CreateCronJobRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     // Validate name
     if !req.name.chars().all(|c| c.is_alphanumeric() || c == '-') {
@@ -117,10 +172,18 @@ pub async fn create_cron_job(
         )));
     }
 
-    // Validate cron expression by attempting to compute the next run time
-    let next_run = compute_next_run(&req.schedule, req.timezone.as_deref()).map_err(|_| {
+    // Validate the time zone (an unknown name used to fall back to UTC silently)
+    // and the cron expression, by computing the next run time.
+    cron::parse_timezone(req.timezone.as_deref())
+        .map_err(|e| AppError(TondError::InvalidInput(e.to_string())))?;
+    req.timezone = req
+        .timezone
+        .take()
+        .map(|tz| tz.trim().to_string())
+        .filter(|tz| !tz.is_empty());
+    let next_run = compute_next_run(&req.schedule, req.timezone.as_deref()).map_err(|e| {
         AppError(TondError::InvalidInput(format!(
-            "Invalid cron expression: '{}'",
+            "Invalid cron expression '{}': {e}",
             req.schedule
         )))
     })?;
@@ -143,12 +206,10 @@ pub async fn create_cron_job(
         .filter(|cmd| !cmd.is_empty())
         .map(|cmd| serde_json::to_string(cmd).unwrap_or_default());
 
-    // Serialize env map → JSON string for storage
-    let env_str = req
-        .env
-        .as_ref()
-        .filter(|m| !m.is_empty())
-        .map(|m| serde_json::to_string(m).unwrap_or_default());
+    // Env map → encrypted JSON for storage
+    let env: BTreeMap<String, String> = req.env.clone().unwrap_or_default().into_iter().collect();
+    validate_env_keys(env.keys())?;
+    let env_str = secrets::seal_cron_env(&env)?;
 
     let mut job = CronJob::new(
         req.name.clone(),
@@ -217,14 +278,14 @@ pub async fn create_cron_job(
         None,
         None,
         "cron_create",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("name={} schedule={}", job.name, job.schedule)),
     )
     .await;
 
     Ok((
         StatusCode::CREATED,
-        Json(ApiResponse::ok(CronJobResponse::from(job))),
+        Json(ApiResponse::ok(CronJobResponse::new(job, &env))),
     ))
 }
 
@@ -232,8 +293,7 @@ pub async fn create_cron_job(
 
 pub async fn update_cron_job(
     _rate: RateLimit,
-    _admin: RequireAdmin,
-    actor: AuthActor,
+    auth: Authz<scope::CronWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateCronJobRequest>,
@@ -252,10 +312,9 @@ pub async fn update_cron_job(
 
     // ── schedule ──────────────────────────────────────────────────────────────
     if let Some(ref schedule) = req.schedule {
-        let next_run = compute_next_run(schedule, job.timezone.as_deref()).map_err(|_| {
+        let next_run = compute_next_run(schedule, job.timezone.as_deref()).map_err(|e| {
             AppError(TondError::InvalidInput(format!(
-                "Invalid cron expression: '{}'",
-                schedule
+                "Invalid cron expression '{schedule}': {e}"
             )))
         })?;
         job.schedule = schedule.clone();
@@ -293,13 +352,18 @@ pub async fn update_cron_job(
         job.timeout_seconds = new_timeout;
     }
 
-    // ── env ───────────────────────────────────────────────────────────────────
-    if let Some(ref new_env) = req.env {
-        job.env = if new_env.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_string(new_env).unwrap_or_default())
+    // ── env: full replace, then set/unset patches ─────────────────────────────
+    if req.env.is_some() || !req.env_set.is_empty() || !req.env_unset.is_empty() {
+        let mut env: BTreeMap<String, String> = match req.env {
+            Some(ref new_env) => new_env.clone().into_iter().collect(),
+            None => secrets::cron_env(job.env.as_deref())?,
         };
+        validate_env_keys(env.keys().chain(req.env_set.keys()))?;
+        env.extend(req.env_set.clone());
+        for key in &req.env_unset {
+            env.remove(key);
+        }
+        job.env = secrets::seal_cron_env(&env)?;
     }
 
     // ── project_id: Option<Option<String>> — None=no change, Some(None)=unlink ──
@@ -339,7 +403,11 @@ pub async fn update_cron_job(
 
     // ── timezone: Option<Option<String>> — Some(None) reverts to UTC ─────────
     if let Some(new_tz) = req.timezone {
-        job.timezone = new_tz;
+        cron::parse_timezone(new_tz.as_deref())
+            .map_err(|e| AppError(TondError::InvalidInput(e.to_string())))?;
+        job.timezone = new_tz
+            .map(|tz| tz.trim().to_string())
+            .filter(|tz| !tz.is_empty());
         // Recompute next_run with the new timezone if job is enabled
         if job.enabled != 0
             && let Ok(next) = compute_next_run(&job.schedule, job.timezone.as_deref())
@@ -406,7 +474,7 @@ pub async fn update_cron_job(
         None,
         None,
         "cron_update",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("name={}", job.name)),
     )
     .await;
@@ -415,7 +483,7 @@ pub async fn update_cron_job(
     let updated = fetch_cron_job(&state.db, &job.id).await?;
     Ok((
         StatusCode::OK,
-        Json(ApiResponse::ok(CronJobResponse::from(updated))),
+        Json(ApiResponse::ok(cron_response(updated)?)),
     ))
 }
 
@@ -423,8 +491,7 @@ pub async fn update_cron_job(
 
 pub async fn delete_cron_job(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::CronWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -440,7 +507,7 @@ pub async fn delete_cron_job(
         None,
         None,
         "cron_delete",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("name={}", job.name)),
     )
     .await;
@@ -455,8 +522,7 @@ pub async fn delete_cron_job(
 
 pub async fn trigger_cron_job(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::CronTrigger>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -465,7 +531,7 @@ pub async fn trigger_cron_job(
     // Spawn the run in the background (same as the scheduler does)
     let state_clone = state.clone();
     let job_clone = job.clone();
-    tokio::spawn(async move {
+    crate::runtime::shutdown::spawn_tracked(async move {
         cron::run_cron_job(&state_clone, &job_clone, 1).await;
     });
 
@@ -474,7 +540,7 @@ pub async fn trigger_cron_job(
         None,
         None,
         "cron_trigger",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("name={}", job.name)),
     )
     .await;
@@ -500,7 +566,7 @@ pub struct CronRunsQuery {
 
 pub async fn list_cron_job_runs(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::CronRead>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(query): Query<CronRunsQuery>,
@@ -542,8 +608,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        audit_log::AuthActor,
-        auth::{RateLimiter, RequireAuth, rate_limit::RateLimit},
+        auth::{Authz, Principal, RateLimiter, rate_limit::RateLimit},
         state::AppState,
     };
 
@@ -595,7 +660,8 @@ mod tests {
             Some("[\"echo\",\"hello\"]".to_string()),
             None,
             Some(60),
-            Some("{\"MODE\":\"prod\"}".to_string()),
+            secrets::seal_cron_env(&BTreeMap::from([("MODE".to_string(), "prod".to_string())]))
+                .unwrap_or_else(|err| panic!("seal: {err}")),
             "skip".to_string(),
             Some(256),
             Some(1024),
@@ -648,8 +714,7 @@ mod tests {
 
         let error = create_cron_job(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(CreateCronJobRequest {
                 name: "bad name".to_string(),
@@ -685,8 +750,7 @@ mod tests {
 
         let error = create_cron_job(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(CreateCronJobRequest {
                 name: "nightly".to_string(),
@@ -724,8 +788,7 @@ mod tests {
 
         let error = create_cron_job(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(CreateCronJobRequest {
                 name: "nightly".to_string(),
@@ -750,9 +813,87 @@ mod tests {
 
         assert_eq!(
             error.0.to_string(),
-            "Invalid input: Invalid cron expression: 'not a cron'",
+            "Invalid input: Invalid cron expression 'not a cron': a schedule needs 5 fields (minute hour day-of-month month day-of-week), got 3",
             "create_cron_job should reject invalid cron expressions"
         );
+    }
+
+    #[tokio::test]
+    async fn create_cron_job_rejects_unknown_time_zones() {
+        let state = test_state().await;
+
+        let error = create_cron_job(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            State(state),
+            Json(CreateCronJobRequest {
+                name: "nightly".to_string(),
+                schedule: "0 3 * * *".to_string(),
+                image: "alpine:latest".to_string(),
+                command: None,
+                project_id: None,
+                timeout_seconds: None,
+                env: None,
+                concurrency_policy: None,
+                memory_mb: None,
+                cpu_shares: None,
+                timezone: Some("Europe/Atlantis".to_string()),
+                max_retries: None,
+                retry_delay_seconds: None,
+                volumes: None,
+            }),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("an unknown time zone must be rejected, not silently UTC"));
+        assert!(
+            error.0.to_string().contains("not a known IANA time zone"),
+            "{}",
+            error.0
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_preview_lists_next_runs_and_rejects_bad_input() {
+        let ok = preview_schedule(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            Query(SchedulePreviewQuery {
+                schedule: "0 9 * * 1-5".to_string(),
+                timezone: Some("Europe/Berlin".to_string()),
+                count: Some(3),
+            }),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("valid preview should succeed: {}", err.0))
+        .into_response();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let body = response_json(ok).await;
+        assert_eq!(body["data"]["timezone"], "Europe/Berlin");
+        assert_eq!(
+            body["data"]["next_runs"]
+                .as_array()
+                .map(|runs| runs.len())
+                .unwrap_or_default(),
+            3
+        );
+
+        for (schedule, timezone) in [("61 * * * *", None), ("0 9 * * *", Some("Nowhere/City"))] {
+            assert!(
+                preview_schedule(
+                    RateLimit,
+                    Authz::unchecked(Principal::test_user(Role::Admin)),
+                    Query(SchedulePreviewQuery {
+                        schedule: schedule.to_string(),
+                        timezone: timezone.map(str::to_string),
+                        count: None,
+                    }),
+                )
+                .await
+                .is_err(),
+                "{schedule} / {timezone:?} should be rejected"
+            );
+        }
     }
 
     #[tokio::test]
@@ -761,8 +902,7 @@ mod tests {
 
         let error = create_cron_job(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(CreateCronJobRequest {
                 name: "nightly".to_string(),
@@ -801,8 +941,7 @@ mod tests {
 
         let response = create_cron_job(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Json(CreateCronJobRequest {
                 name: "nightly".to_string(),
@@ -871,8 +1010,7 @@ mod tests {
         let state = test_state().await;
         let error = create_cron_job(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Json(CreateCronJobRequest {
                 name: "escape".to_string(),
@@ -915,8 +1053,7 @@ mod tests {
 
         let bad_name = update_cron_job(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(job.id.clone()),
             Json(UpdateCronJobRequest {
@@ -927,6 +1064,8 @@ mod tests {
                 enabled: None,
                 timeout_seconds: None,
                 env: None,
+                env_set: Default::default(),
+                env_unset: vec![],
                 project_id: None,
                 concurrency_policy: None,
                 memory_mb: None,
@@ -948,8 +1087,7 @@ mod tests {
 
         let bad_schedule = update_cron_job(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(job.id.clone()),
             Json(UpdateCronJobRequest {
@@ -960,6 +1098,8 @@ mod tests {
                 enabled: None,
                 timeout_seconds: None,
                 env: None,
+                env_set: Default::default(),
+                env_unset: vec![],
                 project_id: None,
                 concurrency_policy: None,
                 memory_mb: None,
@@ -975,14 +1115,13 @@ mod tests {
         .unwrap_or_else(|| panic!("expected update_cron_job to reject invalid schedules"));
         assert_eq!(
             bad_schedule.0.to_string(),
-            "Invalid input: Invalid cron expression: 'not a cron'",
+            "Invalid input: Invalid cron expression 'not a cron': a schedule needs 5 fields (minute hour day-of-month month day-of-week), got 3",
             "update_cron_job should reject invalid cron expressions"
         );
 
         let bad_policy = update_cron_job(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Path(job.id),
             Json(UpdateCronJobRequest {
@@ -993,6 +1132,8 @@ mod tests {
                 enabled: None,
                 timeout_seconds: None,
                 env: None,
+                env_set: Default::default(),
+                env_unset: vec![],
                 project_id: None,
                 concurrency_policy: Some("queue".to_string()),
                 memory_mb: None,
@@ -1023,8 +1164,7 @@ mod tests {
 
         let response = update_cron_job(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(job.id.clone()),
             Json(UpdateCronJobRequest {
@@ -1035,6 +1175,8 @@ mod tests {
                 enabled: Some(false),
                 timeout_seconds: Some(None),
                 env: Some(HashMap::new()),
+                env_set: Default::default(),
+                env_unset: vec![],
                 project_id: Some(Some("project-1".to_string())),
                 concurrency_policy: Some("allow".to_string()),
                 memory_mb: Some(None),
@@ -1072,7 +1214,7 @@ mod tests {
         );
         assert_eq!(
             body["data"]["env"],
-            serde_json::Value::Null,
+            serde_json::json!([]),
             "empty env maps should clear stored env vars"
         );
         assert_eq!(
@@ -1134,8 +1276,7 @@ mod tests {
 
         let error = update_cron_job(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Path(job.id),
             Json(UpdateCronJobRequest {
@@ -1146,6 +1287,8 @@ mod tests {
                 enabled: None,
                 timeout_seconds: None,
                 env: None,
+                env_set: Default::default(),
+                env_unset: vec![],
                 project_id: Some(Some("missing-project".to_string())),
                 concurrency_policy: None,
                 memory_mb: None,
@@ -1191,7 +1334,7 @@ mod tests {
 
         let response = list_cron_job_runs(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Path(job.id),
             Query(CronRunsQuery {

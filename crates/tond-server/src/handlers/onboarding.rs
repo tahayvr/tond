@@ -6,7 +6,7 @@ use sqlx::AssertSqlSafe;
 
 use crate::{
     AppState,
-    auth::{RateLimit, RequireAuth},
+    auth::{Authz, RateLimit, scope},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,6 +18,18 @@ pub struct DomainStatusResponse {
     pub certificate_status: Option<String>,
 }
 
+/// The most recent deployment of any app (home page "last deploy" tile).
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq, Eq)]
+pub struct LastDeploymentResponse {
+    pub id: String,
+    pub app_id: String,
+    pub app_name: String,
+    pub status: String,
+    pub trigger_source: String,
+    pub created_at: String,
+    pub finished_at: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OnboardingStatusResponse {
     pub dashboard_domain: String,
@@ -26,13 +38,20 @@ pub struct OnboardingStatusResponse {
     pub has_apps: bool,
     pub has_databases: bool,
     pub has_cron_jobs: bool,
+    /// A GitHub App is installed, or a GitLab token or registry credential exists.
+    pub has_source_integration: bool,
+    /// At least one deployment finished successfully.
+    pub has_successful_deploy: bool,
+    /// At least one notification channel (Slack, Discord, Telegram, email) exists.
+    pub has_notification_channel: bool,
+    pub last_deployment: Option<LastDeploymentResponse>,
     pub server_public_ip: Option<String>,
     pub domain_status: DomainStatusResponse,
 }
 
 pub async fn get_status(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsRead>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     let settings = state.settings.read().await.clone();
@@ -47,6 +66,29 @@ pub async fn get_status(
     let has_apps = has_any_rows(&state.db, "apps").await;
     let has_databases = has_any_rows(&state.db, "databases").await;
     let has_cron_jobs = has_any_rows(&state.db, "cron_jobs").await;
+    let has_source_integration = has_any_match(
+        &state.db,
+        "SELECT 1 FROM github_apps WHERE installation_id IS NOT NULL
+         UNION ALL SELECT 1 FROM gitlab_tokens
+         UNION ALL SELECT 1 FROM registry_credentials LIMIT 1",
+    )
+    .await;
+    let has_successful_deploy = has_any_match(
+        &state.db,
+        "SELECT 1 FROM deployments WHERE status = 'succeeded' LIMIT 1",
+    )
+    .await;
+    let has_notification_channel = has_any_rows(&state.db, "integrations").await;
+    let last_deployment = sqlx::query_as::<_, LastDeploymentResponse>(
+        "SELECT d.id, d.app_id, a.name AS app_name, d.status, d.trigger_source,
+                d.created_at, d.finished_at
+         FROM deployments d JOIN apps a ON a.id = d.app_id
+         ORDER BY d.created_at DESC LIMIT 1",
+    )
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
     let domain_status = build_domain_status(
         &settings.dashboard_domain,
         server_public_ip,
@@ -61,6 +103,10 @@ pub async fn get_status(
         has_apps,
         has_databases,
         has_cron_jobs,
+        has_source_integration,
+        has_successful_deploy,
+        has_notification_channel,
+        last_deployment,
         server_public_ip: domain_status.expected_target.clone(),
         domain_status,
     };
@@ -72,6 +118,16 @@ async fn has_any_rows(db: &sqlx::SqlitePool, table: &'static str) -> bool {
     // `table` is always a compile-time literal, so interpolating it is injection-safe.
     let query = format!("SELECT 1 FROM {table} LIMIT 1");
     sqlx::query(AssertSqlSafe(query))
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+/// True when `query` (a constant, injection-free statement) returns a row.
+async fn has_any_match(db: &sqlx::SqlitePool, query: &'static str) -> bool {
+    sqlx::query(query)
         .fetch_optional(db)
         .await
         .ok()
@@ -129,7 +185,7 @@ async fn certificate_status(db: &sqlx::SqlitePool, dashboard_domain: &str) -> Op
     .flatten()
 }
 
-async fn fetch_public_ip() -> Option<IpAddr> {
+pub(crate) async fn fetch_public_ip() -> Option<IpAddr> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
@@ -330,7 +386,7 @@ mod tests {
         .bind("curl/8.0")
         .bind("127.0.0.1")
         .bind("2026-01-01T00:00:00Z")
-        .bind("2026-01-01T00:00:00Z")
+        .bind(chrono::Utc::now().to_rfc3339())
         .bind("2099-01-01T00:00:00Z")
         .execute(&state.db)
         .await
@@ -349,7 +405,10 @@ mod tests {
             .unwrap_or_else(|err| panic!("failed to decode onboarding response JSON: {err}"))
     }
 
-    async fn require_auth_for_test(state: &AppState, session_token: &str) -> RequireAuth {
+    async fn require_auth_for_test(
+        state: &AppState,
+        session_token: &str,
+    ) -> Authz<scope::AppsRead> {
         let mut parts = axum::http::Request::builder()
             .uri("/api/onboarding/status")
             .body(())
@@ -362,9 +421,10 @@ mod tests {
                 .unwrap_or_else(|err| panic!("failed to build session cookie header: {err}")),
         );
 
-        RequireAuth::from_request_parts(&mut parts, state)
-            .await
-            .unwrap_or_else(|err| panic!("RequireAuth should accept a valid session: {err:?}"))
+        match Authz::<scope::AppsRead>::from_request_parts(&mut parts, state).await {
+            Ok(auth) => auth,
+            Err(response) => panic!("a valid session should pass: {}", response.status()),
+        }
     }
 
     #[tokio::test]
@@ -399,6 +459,13 @@ mod tests {
                 && !status.has_cron_jobs,
             "fresh installs should report no managed resources"
         );
+        assert!(
+            !status.has_source_integration
+                && !status.has_successful_deploy
+                && !status.has_notification_channel,
+            "fresh installs have no checklist items done"
+        );
+        assert_eq!(status.last_deployment, None);
         assert!(
             status.dashboard_domain.is_empty(),
             "fresh installs should return the current dashboard domain setting"
@@ -437,7 +504,7 @@ mod tests {
         .unwrap_or_else(|err| panic!("failed to seed project: {err}"));
 
         sqlx::query(
-            "INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, host_port, memory_limit, cpu_limit, status, env_vars, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, deploy_key_pub, project_id, registry_credential_id, github_app_id, gitlab_token_id, preview_enabled, preview_excluded_keys, preview_env_vars, dockerfile_content, compose_content, base_dir, static_build, created_at, updated_at)
+            "INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, host_port, memory_limit, cpu_limit, status, env_vars, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, deploy_key_pub, project_id, registry_credential_id, github_app_id, gitlab_token_id, preview_enabled, preview_shared_keys, preview_env_vars, dockerfile_content, compose_content, base_dir, static_build, created_at, updated_at)
              VALUES (?, ?, NULL, 'git', ?, 'main', 3000, NULL, NULL, NULL, NULL, 'created', '{}', NULL, 30, 3, 0, '[]', 30, 'tbuild', NULL, 0, NULL, NULL, ?, NULL, NULL, NULL, 0, '[]', '{}', NULL, NULL, NULL, 0, ?, ?)",
         )
         .bind("app-1")
@@ -501,6 +568,33 @@ mod tests {
         .await
         .unwrap_or_else(|err| panic!("failed to seed certificate: {err}"));
 
+        for (id, status, created_at) in [
+            ("dep-1", "succeeded", "2026-01-02T00:00:00Z"),
+            ("dep-2", "failed", "2026-01-03T00:00:00Z"),
+        ] {
+            sqlx::query(
+                "INSERT INTO deployments (id, app_id, status, started_at, created_at, trigger_source)
+                 VALUES (?, 'app-1', ?, ?, ?, 'manual')",
+            )
+            .bind(id)
+            .bind(status)
+            .bind(created_at)
+            .bind(created_at)
+            .execute(&state.db)
+            .await
+            .unwrap_or_else(|err| panic!("failed to seed deployment: {err}"));
+        }
+        sqlx::query("INSERT INTO integrations (id, name, kind, config) VALUES ('int-1', 'ops', 'slack', '{}')")
+            .execute(&state.db)
+            .await
+            .unwrap_or_else(|err| panic!("failed to seed integration: {err}"));
+        sqlx::query(
+            "INSERT INTO registry_credentials (id, name, server, username, password_enc) VALUES ('rc-1', 'hub', 'docker.io', 'me', 'x')",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap_or_else(|err| panic!("failed to seed registry credential: {err}"));
+
         let response = get_status(RateLimit, auth, State(state))
             .await
             .into_response();
@@ -517,6 +611,31 @@ mod tests {
         assert!(status.has_apps, "seeded app should be reported");
         assert!(status.has_databases, "seeded database should be reported");
         assert!(status.has_cron_jobs, "seeded cron job should be reported");
+        assert!(
+            status.has_source_integration,
+            "a registry credential counts as a source integration"
+        );
+        assert!(
+            status.has_successful_deploy,
+            "a succeeded deployment ticks the first-deploy item"
+        );
+        assert!(
+            status.has_notification_channel,
+            "seeded channel should be reported"
+        );
+        let last = status
+            .last_deployment
+            .clone()
+            .unwrap_or_else(|| panic!("the latest deployment should be reported"));
+        assert_eq!(
+            (
+                last.id.as_str(),
+                last.app_name.as_str(),
+                last.status.as_str()
+            ),
+            ("dep-2", "web", "failed"),
+            "the newest deployment wins, with its app name"
+        );
         assert_eq!(
             status.dashboard_domain, "dash.example.com",
             "current dashboard domain should be included in onboarding status"

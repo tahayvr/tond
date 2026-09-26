@@ -10,28 +10,89 @@
 // raw main branch, so the logic is stable and matches the target artefact. The
 // tarball is the one for this host's architecture (tond-linux-x86_64 or
 // tond-linux-aarch64 — the CLI is built for the host it runs on) and is
-// verified against the release's .sha256 before anything in it is run.
+// verified against the release's .sha256 and its minisign signature
+// (signature.rs: fail closed) before anything in it is run. "latest" is
+// resolved to a tag first so the tarball and signature come from one release.
+// A download that fails verification is never replaced by the local script.
 
 use std::path::{Path, PathBuf};
 use std::process;
 
 use anyhow::{Context, Result, bail};
 
+use crate::signature::{self, Verdict};
+
 const FALLBACK_SCRIPT: &str = "/opt/tond/bin/update.sh";
+
+/// Why a release could not be used.
+enum DownloadError {
+    /// Network trouble etc.: falling back to the installed script is fine.
+    Unavailable(anyhow::Error),
+    /// The download failed verification: stop, never fall back.
+    Untrusted(anyhow::Error),
+}
+
+impl From<anyhow::Error> for DownloadError {
+    fn from(e: anyhow::Error) -> Self {
+        DownloadError::Unavailable(e)
+    }
+}
 
 /// Release bundle name for this build's architecture, e.g. `tond-linux-aarch64`.
 fn bundle_name() -> String {
     format!("tond-linux-{}", std::env::consts::ARCH)
 }
 
-/// Tarball URL for the latest release, or a specific version (without leading `v`).
-fn tarball_url(version: Option<&str>) -> String {
+/// Tarball URL of a release tag (e.g. `v0.2.0`).
+fn tarball_url(tag: &str) -> String {
     let bundle = bundle_name();
-    match version {
-        Some(v) => {
-            format!("https://github.com/tahayvr/tond/releases/download/v{v}/{bundle}.tar.gz")
-        }
-        None => format!("https://github.com/tahayvr/tond/releases/latest/download/{bundle}.tar.gz"),
+    format!("https://github.com/tahayvr/tond/releases/download/{tag}/{bundle}.tar.gz")
+}
+
+/// The tag GitHub's `releases/latest` redirects to, from the final URL.
+fn tag_from_latest_url(url: &str) -> Option<String> {
+    let tag = url.trim().rsplit_once("/releases/tag/")?.1;
+    let tag = tag.split(['?', '#', '/']).next()?;
+    (tag.starts_with('v') && tag.len() > 1).then(|| tag.to_string())
+}
+
+/// Resolve the release tag to install: `v<version>`, or the latest release.
+fn resolve_tag(version: Option<&str>) -> Result<String> {
+    if let Some(v) = version {
+        return Ok(format!("v{v}"));
+    }
+    let output = process::Command::new("curl")
+        .args([
+            "-fsSLI",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{url_effective}",
+            "https://github.com/tahayvr/tond/releases/latest",
+        ])
+        .output()
+        .context("Failed to run curl — is it installed?")?;
+    if !output.status.success() {
+        bail!("could not look up the latest release");
+    }
+    tag_from_latest_url(&String::from_utf8_lossy(&output.stdout))
+        .context("could not work out the latest release tag")
+}
+
+/// Download `url` to `dest`. `Ok(false)` when the server says 404.
+fn download_optional(url: &str, dest: &Path) -> Result<bool> {
+    let output = process::Command::new("curl")
+        .args(["-sSL", "-o"])
+        .arg(dest)
+        .args(["-w", "%{http_code}"])
+        .arg(url)
+        .output()
+        .context("Failed to run curl")?;
+    let code = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    match code.as_str() {
+        "200" if output.status.success() => Ok(true),
+        "404" => Ok(false),
+        _ => bail!("could not download {url} (HTTP {code})"),
     }
 }
 
@@ -92,7 +153,11 @@ pub fn handle(
             println!("Using update script from release tarball.");
             p
         }
-        Err(e) => {
+        Err(DownloadError::Untrusted(e)) => {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(e);
+        }
+        Err(DownloadError::Unavailable(e)) => {
             // Fall back to the locally-installed script.
             let fallback = Path::new(FALLBACK_SCRIPT);
             if !fallback.exists() {
@@ -149,8 +214,9 @@ fn run_script(
 /// Download `update.sh` from the appropriate release tarball into `dir`.
 ///
 /// Returns the path to the extracted script.
-fn download_update_script(dir: &Path, version: Option<&str>) -> Result<PathBuf> {
-    let url = tarball_url(version);
+fn download_update_script(dir: &Path, version: Option<&str>) -> Result<PathBuf, DownloadError> {
+    let tag = resolve_tag(version)?;
+    let url = tarball_url(&tag);
     let bundle = bundle_name();
 
     let tarball_path = dir.join("tond.tar.gz");
@@ -165,7 +231,7 @@ fn download_update_script(dir: &Path, version: Option<&str>) -> Result<PathBuf> 
         .context("Failed to run curl — is it installed?")?;
 
     if !status.success() {
-        bail!("curl failed to download {url}");
+        return Err(anyhow::anyhow!("curl failed to download {url}").into());
     }
 
     // Verify the tarball against the release checksum before extracting.
@@ -176,7 +242,7 @@ fn download_update_script(dir: &Path, version: Option<&str>) -> Result<PathBuf> 
         .status()
         .context("Failed to run curl")?;
     if !status.success() {
-        bail!("curl failed to download {url}.sha256");
+        return Err(anyhow::anyhow!("curl failed to download {url}.sha256").into());
     }
     let expected = std::fs::read_to_string(&checksum_path)
         .ok()
@@ -189,7 +255,29 @@ fn download_update_script(dir: &Path, version: Option<&str>) -> Result<PathBuf> 
     let actual = parse_sha256_line(&String::from_utf8_lossy(&output.stdout))
         .context("sha256sum produced no digest")?;
     if actual != expected {
-        bail!("checksum mismatch for {url} (download corrupted or tampered with)");
+        return Err(DownloadError::Untrusted(anyhow::anyhow!(
+            "checksum mismatch for {url} (download corrupted or tampered with)"
+        )));
+    }
+
+    // Verify the minisign signature (fail closed, see signature.rs).
+    let signature_path = dir.join("tond.tar.gz.minisig");
+    let signature = if download_optional(&format!("{url}.minisig"), &signature_path)? {
+        Some(std::fs::read_to_string(&signature_path).context("could not read the signature")?)
+    } else {
+        None
+    };
+    let tarball = std::fs::read(&tarball_path).context("could not read the download")?;
+    match signature::check_release(
+        &tarball,
+        signature.as_deref(),
+        &tag,
+        signature::release_public_key(),
+        signature::allow_unsigned_from_env(),
+    ) {
+        Ok(Verdict::Verified) => println!("Signature of {tag} verified."),
+        Ok(Verdict::Unverified(why)) => eprintln!("Warning: {why}."),
+        Err(e) => return Err(DownloadError::Untrusted(e)),
     }
 
     // Extract only the update.sh file from the tarball.
@@ -203,12 +291,12 @@ fn download_update_script(dir: &Path, version: Option<&str>) -> Result<PathBuf> 
         .context("Failed to run tar")?;
 
     if !extract_status.success() {
-        bail!("tar failed to extract update.sh from {url}");
+        return Err(anyhow::anyhow!("tar failed to extract update.sh from {url}").into());
     }
 
     let script = dir.join(format!("{bundle}/update.sh"));
     if !script.exists() {
-        bail!("update.sh not found in tarball at expected path");
+        return Err(anyhow::anyhow!("update.sh not found in tarball at expected path").into());
     }
 
     // Make it executable.
@@ -272,16 +360,26 @@ mod tests {
     fn tarball_url_names_the_bundle_for_this_architecture() {
         let arch = std::env::consts::ARCH;
         assert_eq!(
-            tarball_url(None),
-            format!(
-                "https://github.com/tahayvr/tond/releases/latest/download/tond-linux-{arch}.tar.gz"
-            )
-        );
-        assert_eq!(
-            tarball_url(Some("0.2.0")),
+            tarball_url("v0.2.0"),
             format!(
                 "https://github.com/tahayvr/tond/releases/download/v0.2.0/tond-linux-{arch}.tar.gz"
             )
+        );
+    }
+
+    #[test]
+    fn tag_from_latest_url_reads_the_redirect_target() {
+        assert_eq!(
+            tag_from_latest_url("https://github.com/tahayvr/tond/releases/tag/v0.2.0\n").as_deref(),
+            Some("v0.2.0")
+        );
+        assert_eq!(
+            tag_from_latest_url("https://github.com/tahayvr/tond/releases"),
+            None
+        );
+        assert_eq!(
+            tag_from_latest_url("https://github.com/x/releases/tag/"),
+            None
         );
     }
 

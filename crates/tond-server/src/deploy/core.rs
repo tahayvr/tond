@@ -1,17 +1,27 @@
 // deploy/core.rs — deployment orchestration
 //
 // This module coordinates the full lifecycle of deploying an app: from
-// source code to a running Docker container. It is called from two places:
-//   handlers::deploy_app()    — triggered by POST /api/apps/{id}/deploy
-//   handlers::upload_deploy() — triggered after a tarball upload
+// source code to a running Docker container.
 //
 // Public surface (re-exported from deploy/mod.rs):
 //
-//   deploy(state, app, trigger_source)
-//     Top-level deploy function. Always runs in a background tokio task.
+//   start(state, app, request) -> queue::Enqueued
+//     Create the deployment row (status 'queued') and hand it to the build
+//     queue (queue.rs: one deploy per app, a newer request supersedes a
+//     queued one, builds share the global build slots). Used by the deploy,
+//     upload, rollback, webhook and project handlers, which return the id and
+//     queue position so the dashboard can open the live deploy view.
 //
-//   deploy_image(state, app, image_tag)
-//     Skip the build step and re-run a specific image (used for rollbacks).
+//   create(state, app, request) + run(state, app, id, request, ctx)
+//     The two halves; the queue's runner calls run() with a DeployCtx that
+//     holds the build slot during the build phase and moves the row
+//     queued -> running.
+//
+// A deployment walks through phases — clone, build, start, health, release —
+// recorded by deploy::progress on the deployment row and published on the log
+// bus. A failure is classified into a likely cause with a fix hint
+// (deploy::failure) and stored on the row; the app keeps its previous status
+// when the old container is still serving.
 //
 // Image tags: every deployment runs `tond-<app>:<deployment-id-prefix>` (see
 // images.rs) — built images are tagged that way, pulled and uploaded images
@@ -24,30 +34,42 @@
 //
 // Helpers private to this module:
 //   update_status()            — update app.status in DB
-//   log_deploy()               — insert timestamped deploy log entry and publish
-//                                it on log_bus for live log streams
-//   wait_for_healthy()         — poll new container health endpoint
+//   log_deploy()               — insert timestamped deploy log entry (tied to
+//                                the app's active deployment) and publish it on
+//                                log_bus for live log streams
+//   probe_until_ready()        — poll the new container until it answers
 //   fetch_registry_credentials() — look up and decrypt registry credentials
 //   pull_image()               — stream a docker pull with bollard
 
 use anyhow::{Context, Result};
-use std::collections::HashMap;
-use tond_common::{App, PreviewDeployment, Volume};
+use std::collections::{BTreeMap, HashMap};
+use tond_common::{App, DeployFailure, DeployPhase, PreviewDeployment, Readiness, Volume};
 use uuid::Uuid;
 
+use crate::alerts;
 use crate::backup::{self, SnapshotTrigger};
 use crate::docker;
+use crate::domains;
 use crate::handlers::{github_apps, gitlab_tokens};
 use crate::log_bus::{self, DeployLogEvent};
+use crate::log_scrub;
+use crate::networks;
 use crate::secret_key::{self, Purpose};
+use crate::secrets;
 use crate::state::AppState;
 use crate::volumes;
 
 use super::build::{
-    BuildOptions, build_from_git, build_from_inline_dockerfile, run_inline_compose,
+    BuildOptions, build_from_dir_with_method, build_from_git, build_from_inline_dockerfile,
+    run_inline_compose,
 };
+use super::failure::{self, ContainerExit, FailureContext, ProbeResult};
 use super::git::{GitHttpAuth, redact_url_credentials, split_url_credentials};
 use super::images;
+use super::progress;
+use super::queue::{self, DeployCtx};
+use crate::proxy_link;
+use crate::runtime::shutdown;
 
 /// Work out the clone URL and HTTPS credentials for a git app.
 ///
@@ -142,71 +164,311 @@ async fn persist_generated_dockerfile(
     }
 }
 
-fn auto_domain(base_domain: &str, app_name: &str) -> String {
-    let base = if base_domain.is_empty() {
-        "localhost"
-    } else {
-        base_domain
-    };
-    format!("{}.{}", app_name, base)
+/// The automatic hostname for an app: `<app>.<apps_domain>`, or `None` when
+/// no apps domain is configured. Apps never default to a name under the
+/// dashboard domain: that would put user code on the dashboard's site.
+fn auto_domain(apps_domain: &str, app_name: &str) -> Option<String> {
+    (!apps_domain.is_empty()).then(|| domains::app_host(app_name, apps_domain))
 }
 
-fn preview_env_vars(
-    base_env: &str,
-    excluded_keys_json: &str,
-    preview_overrides_json: &str,
-) -> HashMap<String, String> {
-    let mut env_vars: HashMap<String, String> = serde_json::from_str(base_env).unwrap_or_default();
-    let excluded_keys: Vec<String> = serde_json::from_str(excluded_keys_json).unwrap_or_default();
-    for key in &excluded_keys {
-        env_vars.remove(key);
+/// Give an app without a domain its automatic hostname, or log how to reach
+/// it when there is no apps domain.
+async fn assign_automatic_domain(
+    state: &AppState,
+    app: &mut App,
+    trigger_source: &str,
+) -> Result<()> {
+    // Background workers serve no traffic: no address.
+    if app.domain.is_some() || !app.readiness().serves_traffic() {
+        return Ok(());
     }
+    let apps_domain = state.settings.read().await.apps_domain.clone();
+    match auto_domain(&apps_domain, &app.name) {
+        Some(domain) => {
+            sqlx::query("UPDATE apps SET domain = ? WHERE id = ?")
+                .bind(&domain)
+                .bind(&app.id)
+                .execute(&state.db)
+                .await?;
+            app.domain = Some(domain);
+        }
+        None => {
+            log_deploy(
+                state,
+                &app.id,
+                "info",
+                trigger_source,
+                "No apps domain is set, so this app has no public address yet. Add a custom \
+                 domain on the app's page, or set an apps domain in Settings.",
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
 
-    let preview_overrides: HashMap<String, String> =
-        serde_json::from_str(preview_overrides_json).unwrap_or_default();
+/// The environment of a preview container: only the app variables listed in
+/// `shared_keys_json`, then the preview overrides on top. Previews run
+/// pull-request code, so production variables (database URLs, API keys) are
+/// withheld unless an admin shared them explicitly.
+fn preview_env_vars(
+    base_env: BTreeMap<String, String>,
+    shared_keys_json: &str,
+    preview_overrides: BTreeMap<String, String>,
+) -> HashMap<String, String> {
+    let shared_keys: Vec<String> = serde_json::from_str(shared_keys_json).unwrap_or_default();
+    let mut env_vars: HashMap<String, String> = shared_keys
+        .iter()
+        .filter_map(|key| base_env.get(key).map(|value| (key.clone(), value.clone())))
+        .collect();
     env_vars.extend(preview_overrides);
     env_vars
 }
 
-/// Deploy an app by building source code into an image or pulling an image.
-///
-/// `trigger_source` records how the deployment was initiated:
-///   "manual"   — via the dashboard or API
-///   "webhook"  — via a GitHub/GitLab/generic webhook
-///   "upload"   — via a tarball upload
-pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Result<()> {
-    let app_id = app.id.clone();
-    let app_name = app.name.clone();
+/// What a deployment does.
+#[derive(Debug, Clone)]
+pub enum DeployKind {
+    /// Build or pull the app's configured source.
+    Source,
+    /// Build the source uploaded to `dir` (tarball uploads), then deploy it.
+    Upload { dir: String },
+    /// Re-run the exact image of an earlier deployment.
+    Rollback {
+        image_tag: String,
+        target_deployment_id: String,
+    },
+}
 
-    // Remember the old container so we can stop it after a successful swap.
-    let old_container_id = app.container_id.clone();
+/// A request to deploy an app.
+#[derive(Debug, Clone)]
+pub struct DeployRequest {
+    pub kind: DeployKind,
+    /// "manual" | "webhook" | "upload" | "rollback" | "cli" | "api"
+    pub trigger_source: String,
+    /// Who or what triggered it (user email, "api-key", webhook provider…)
+    pub trigger_detail: Option<String>,
+}
 
-    // ── Create a deployment history row ──
+impl DeployRequest {
+    pub fn source(trigger_source: &str, trigger_detail: Option<String>) -> Self {
+        Self {
+            kind: DeployKind::Source,
+            trigger_source: trigger_source.to_string(),
+            trigger_detail,
+        }
+    }
+}
+
+/// How a deployment ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeployOutcome {
+    Succeeded,
+    Failed(DeployFailure),
+}
+
+/// Insert the deployment row (status "queued") and return its id. The build
+/// queue runs it with [`run`]; use [`start`] for both.
+pub async fn create(state: &AppState, app: &App, req: &DeployRequest) -> Result<String> {
     let deployment_id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
+    let (image_tag, rollback_of) = match &req.kind {
+        DeployKind::Rollback {
+            image_tag,
+            target_deployment_id,
+        } => (Some(image_tag.clone()), Some(target_deployment_id.clone())),
+        _ => (None, None),
+    };
+    let plan_source = match req.kind {
+        DeployKind::Rollback { .. } => "rollback",
+        DeployKind::Upload { .. } => "tarball",
+        DeployKind::Source => app.source_type.as_str(),
+    };
+    let phases = progress::plan_for_app(plan_source, app);
+    let phases_json = serde_json::to_string(&phases).unwrap_or_else(|_| "[]".to_string());
+    let kind = match req.kind {
+        DeployKind::Rollback { .. } => "rollback",
+        DeployKind::Upload { .. } => "upload",
+        DeployKind::Source => "deploy",
+    };
     sqlx::query(
-        "INSERT INTO deployments (id, app_id, image_tag, status, trigger_source, started_at, created_at)
-         VALUES (?, ?, NULL, 'running', ?, ?, ?)",
+        "INSERT INTO deployments (id, app_id, image_tag, status, kind, trigger_source, trigger_detail, rollback_of, phases, started_at, created_at)
+         VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&deployment_id)
-    .bind(&app_id)
-    .bind(trigger_source)
+    .bind(&app.id)
+    .bind(image_tag)
+    .bind(kind)
+    .bind(&req.trigger_source)
+    .bind(&req.trigger_detail)
+    .bind(rollback_of)
+    .bind(phases_json)
     .bind(&now)
     .bind(&now)
     .execute(&state.db)
     .await?;
+    Ok(deployment_id)
+}
+
+/// Create a deployment and queue it (deploy/queue.rs). Returns its id and
+/// place in line at once so the caller can hand them to a live deploy view.
+pub async fn start(state: &AppState, app: App, req: DeployRequest) -> Result<queue::Enqueued> {
+    let deployment_id = create(state, &app, &req).await?;
+    Ok(queue::submit_request(state, &app.id, deployment_id, req).await)
+}
+
+/// Run a created deployment to completion: the pipeline, the result on the
+/// deployment row (phases, failure cause), the app status and alerts.
+pub async fn run(
+    state: &AppState,
+    app: &mut App,
+    deployment_id: &str,
+    req: &DeployRequest,
+    ctx: &DeployCtx,
+) -> DeployOutcome {
+    let app_id = app.id.clone();
+    // Leave the queue: wait for a build slot unless nothing is built
+    // (rollbacks re-run an existing image). The row becomes 'running'.
+    let started = if matches!(req.kind, DeployKind::Rollback { .. }) {
+        ctx.begin(state).await
+    } else {
+        ctx.begin_build(state).await
+    };
+    if let Err(e) = started {
+        tracing::warn!("Deployment {deployment_id} could not leave the queue: {e:#}");
+    }
+    let plan_source = match req.kind {
+        DeployKind::Rollback { .. } => "rollback",
+        DeployKind::Upload { .. } => "tarball",
+        DeployKind::Source => app.source_type.as_str(),
+    };
+    let phases = progress::plan_for_app(plan_source, app);
+    progress::begin(state, &app_id, deployment_id, phases).await;
+
+    let previous_status = app.status.clone();
+    let old_container_id = app.container_id.clone();
+    let mut facts = HealthFacts::default();
+    let result = pipeline(state, app, deployment_id, req, &mut facts, ctx).await;
+    ctx.release_build();
+
+    if let DeployKind::Upload { dir } = &req.kind {
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    match result {
+        Ok(()) => {
+            progress::finish_ok(state, &app_id, deployment_id).await;
+            alerts::fire_event_alerts(
+                state,
+                "deployment_success",
+                Some(app_id.as_str()),
+                Some(app.name.as_str()),
+                None,
+            )
+            .await;
+            DeployOutcome::Succeeded
+        }
+        Err(e) => {
+            let error = format!("{e:#}");
+            let recent = progress::recent_lines(&app_id);
+            let phase = progress::current_phase(&app_id);
+            let mut failure = failure::classify(&FailureContext {
+                phase: facts.probe.as_ref().map(|_| DeployPhase::Health).or(phase),
+                error: &error,
+                recent_lines: &recent,
+                container_port: app.container_port,
+                health_check_path: app.health_check_path.as_deref(),
+                health_timeout_secs: facts.timeout_secs,
+                probe: facts.probe.clone(),
+                container: facts.container.clone(),
+                container_logs: &facts.container_logs,
+                memory_limit: app.memory_limit,
+                has_registry_credential: app.registry_credential_id.is_some(),
+                readiness: app.readiness(),
+            });
+            // The excerpt may quote the app's own output: keep its secrets out.
+            for line in failure.excerpt.iter_mut() {
+                *line = log_scrub::scrub_for_app(&state.db, &app_id, line).await;
+            }
+            if let Some(detail) = failure.detail.as_mut() {
+                *detail = log_scrub::scrub_for_app(&state.db, &app_id, detail).await;
+            }
+            let _ = log_deploy(
+                state,
+                &app_id,
+                "error",
+                &req.trigger_source,
+                &format!("Deployment failed: {}", failure.title),
+            )
+            .await;
+            progress::finish_failed(state, &app_id, deployment_id, &failure).await;
+
+            // The previous container keeps serving when the failure happened
+            // before the cutover; only a first deploy (or compose) is "failed".
+            let restore = match (&old_container_id, app.source_type.as_str()) {
+                (Some(_), "compose") | (None, _) => "failed".to_string(),
+                (Some(_), _) if matches!(previous_status.as_str(), "building" | "pending") => {
+                    "running".to_string()
+                }
+                (Some(_), _) => previous_status,
+            };
+            let _ = update_status(state, &app_id, &restore).await;
+            app.status = restore;
+
+            tracing::error!("Deploy failed for {}: {}", app.name, error);
+            alerts::fire_event_alerts(
+                state,
+                "deployment_failure",
+                Some(app_id.as_str()),
+                Some(app.name.as_str()),
+                Some(&failure.title),
+            )
+            .await;
+            DeployOutcome::Failed(failure)
+        }
+    }
+}
+
+/// What the health phase saw, for classifying a failure.
+#[derive(Debug, Default)]
+struct HealthFacts {
+    probe: Option<ProbeResult>,
+    container: Option<ContainerExit>,
+    container_logs: Vec<String>,
+    timeout_secs: u64,
+}
+
+/// The deployment pipeline. Phase transitions are recorded as it goes; the
+/// caller turns an error into a classified failure.
+async fn pipeline(
+    state: &AppState,
+    app: &mut App,
+    deployment_id: &str,
+    req: &DeployRequest,
+    facts: &mut HealthFacts,
+    ctx: &DeployCtx,
+) -> Result<()> {
+    let app_id = app.id.clone();
+    let app_name = app.name.clone();
+    let trigger_source = req.trigger_source.as_str();
+    let is_rollback = matches!(req.kind, DeployKind::Rollback { .. });
+
+    // Remember the old container so we can stop it after a successful swap.
+    let old_container_id = app.container_id.clone();
 
     // The image this deployment runs, whatever the source: tond-<app>:<id>.
-    let deploy_tag = images::deployment_tag(&app_name, &deployment_id);
+    let deploy_tag = images::deployment_tag(&app_name, deployment_id);
 
-    // Update status to building
     update_status(state, &app_id, "building").await?;
     log_deploy(
         state,
         &app_id,
         "info",
         trigger_source,
-        "Starting deployment...",
+        if is_rollback {
+            "Starting rollback..."
+        } else {
+            "Starting deployment..."
+        },
     )
     .await?;
 
@@ -219,8 +481,8 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
         if !volumes.is_empty() {
             let snap_state = state.clone();
             let snap_app_name = app_name.clone();
-            let snap_deploy_id = deployment_id.clone();
-            tokio::spawn(async move {
+            let snap_deploy_id = deployment_id.to_string();
+            shutdown::spawn_tracked(async move {
                 let _ = backup::create_snapshot(
                     &snap_state,
                     SnapshotTrigger::PreDeploy {
@@ -234,146 +496,73 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
         }
     }
 
-    let image_name = match app.source_type.as_str() {
-        "git" => {
-            let source_url = app
-                .source_url
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Git source URL required"))?;
-            let branch = app.branch.as_deref().unwrap_or("main");
-
-            let (clone_url, git_auth) =
-                resolve_git_source(state, app, source_url, Some(trigger_source)).await?;
-
+    let image_name = match &req.kind {
+        DeployKind::Rollback { image_tag, .. } => {
+            if app.source_type == "compose" {
+                anyhow::bail!(
+                    "Rollback is not supported for compose apps. \
+                     Update the compose content and trigger a fresh deploy instead."
+                );
+            }
+            // The exact image must still be on the host (old ones are pruned).
+            if state.docker.inspect_image(image_tag).await.is_err() {
+                let _ = sqlx::query(
+                    "UPDATE deployments SET image_pruned = 1 WHERE app_id = ? AND image_tag = ?",
+                )
+                .bind(&app_id)
+                .bind(image_tag)
+                .execute(&state.db)
+                .await;
+                anyhow::bail!(
+                    "Image {} is no longer on this server (old images are pruned), so this deployment can't be restored",
+                    image_tag
+                );
+            }
             log_deploy(
                 state,
                 &app_id,
                 "info",
                 trigger_source,
-                &format!("Building from git: {} ({})", clone_url, branch),
+                &format!("Rolling back to image: {}", image_tag),
             )
             .await?;
-
-            build_from_git(
-                state,
-                &app_id,
-                &app_name,
-                &clone_url,
-                git_auth.as_ref(),
-                branch,
-                &BuildOptions {
-                    method: &app.build_method,
-                    static_build: app.static_build != 0,
-                    base_dir: app.base_dir.as_deref(),
-                },
-                &deploy_tag,
-                Some(&deployment_id),
-                trigger_source,
-            )
-            .await?
+            image_tag.clone()
         }
-        "image" => {
-            let image = app
-                .source_url
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Docker image reference required"))?;
-
-            log_deploy(
-                state,
-                &app_id,
-                "info",
-                trigger_source,
-                &format!("Pulling image: {}", image),
-            )
-            .await?;
-
-            // Look up registry credentials if one is attached to the app
-            let credentials = if let Some(cred_id) = &app.registry_credential_id {
-                fetch_registry_credentials(state, cred_id).await?
-            } else {
-                None
+        DeployKind::Upload { dir } => {
+            progress::start(state, &app_id, DeployPhase::Build).await;
+            let build_opts = BuildOptions {
+                method: &app.build_method,
+                static_build: app.static_build != 0,
+                base_dir: app.base_dir.as_deref(),
             };
-
-            pull_image(&state.docker, image, credentials).await?;
-
-            // Pin the pulled bytes under this deployment's tag so a rollback
-            // runs exactly this image even after `image` moves on upstream.
-            images::tag_image(&state.docker, image, &deploy_tag).await?;
-            log_deploy(
-                state,
-                &app_id,
-                "info",
-                trigger_source,
-                &format!("Pinned {} as {}", image, deploy_tag),
-            )
-            .await?;
-            deploy_tag.clone()
-        }
-        "tarball" => {
+            // Built as `tond-<app>:upload` (what a later redeploy re-runs),
+            // then pinned under this deployment's tag.
             let upload_tag = images::upload_tag(&app_name);
-            images::tag_image(&state.docker, &upload_tag, &deploy_tag)
-                .await
-                .with_context(|| format!("no uploaded image {upload_tag} to deploy"))?;
-            log_deploy(
+            build_from_dir_with_method(
                 state,
                 &app_id,
-                "info",
+                &upload_tag,
+                dir,
+                &build_opts,
+                Some(deployment_id),
                 trigger_source,
-                &format!("Using uploaded image: {}", deploy_tag),
             )
             .await?;
+            images::tag_image(&state.docker, &upload_tag, &deploy_tag).await?;
             deploy_tag.clone()
         }
-        "dockerfile" => {
-            let content = app.dockerfile_content.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("dockerfile_content is required for source_type='dockerfile'")
-            })?;
-            persist_generated_dockerfile(state, &deployment_id, Some(content)).await;
-
-            log_deploy(
-                state,
-                &app_id,
-                "info",
-                trigger_source,
-                "Building from inline Dockerfile...",
-            )
-            .await?;
-
-            build_from_inline_dockerfile(
-                state,
-                &app_id,
-                &app_name,
-                content,
-                &deploy_tag,
-                trigger_source,
-            )
-            .await?
-        }
-        "compose" => {
-            let content = app.compose_content.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("compose_content is required for source_type='compose'")
-            })?;
-
-            log_deploy(
-                state,
-                &app_id,
-                "info",
-                trigger_source,
-                "Starting inline Docker Compose application...",
-            )
-            .await?;
-
-            run_inline_compose(state, &app_id, &app_name, content, trigger_source).await?
-        }
-        other => {
-            anyhow::bail!("Unsupported source type: {}", other);
+        DeployKind::Source => {
+            source_image(state, app, deployment_id, &deploy_tag, trigger_source).await?
         }
     };
+
+    // The image exists: give the build slot to the next deployment.
+    ctx.release_build();
 
     // Record the image tag on the deployment row now that we know it.
     let _ = sqlx::query("UPDATE deployments SET image_tag = ? WHERE id = ?")
         .bind(&image_name)
-        .bind(&deployment_id)
+        .bind(deployment_id)
         .execute(&state.db)
         .await;
 
@@ -389,7 +578,8 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
     // ZDT for compose is handled by docker compose itself: `up -d` only
     // restarts services whose image/config changed, so existing connections
     // keep flowing through unchanged services.
-    if app.source_type == "compose" {
+    if app.source_type == "compose" && !is_rollback {
+        progress::start(state, &app_id, DeployPhase::Start).await;
         let container_port = app.container_port as u16;
 
         let host_port = docker::find_compose_host_port(
@@ -398,11 +588,11 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
             container_port,
         )
         .await
-        .map_err(|e| {
-            tracing::error!("[compose] could not discover host port: {}", e);
-            e
+        .with_context(|| {
+            format!("no compose service publishes container port {container_port}; set the app's port to the port your web service listens on")
         })?;
 
+        progress::start(state, &app_id, DeployPhase::Release).await;
         sqlx::query(
             "UPDATE apps SET container_id = ?, host_port = ?, status = 'running', updated_at = datetime('now') WHERE id = ?",
         )
@@ -414,20 +604,7 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
 
         app.host_port = Some(host_port as i64);
         app.status = "running".to_string();
-
-        // Auto-assign a domain if none is set (same logic as regular deploy).
-        if app.domain.is_none() {
-            let base = {
-                let s = state.settings.read().await;
-                s.dashboard_domain.clone()
-            };
-            let domain = auto_domain(&base, &app_name);
-            sqlx::query("UPDATE apps SET domain = ? WHERE id = ?")
-                .bind(&domain)
-                .bind(&app_id)
-                .execute(&state.db)
-                .await?;
-        }
+        assign_automatic_domain(state, app, trigger_source).await?;
 
         log_deploy(
             state,
@@ -440,33 +617,24 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
             ),
         )
         .await?;
-
-        let finished = chrono::Utc::now().to_rfc3339();
-        let _ = sqlx::query(
-            "UPDATE deployments SET status = 'succeeded', finished_at = ? WHERE id = ?",
-        )
-        .bind(&finished)
-        .bind(&deployment_id)
-        .execute(&state.db)
-        .await;
-
         return Ok(());
     }
+
+    // ── Start ──
+    progress::start(state, &app_id, DeployPhase::Start).await;
 
     // Always allocate a fresh host port for the new container. On redeployments
     // the old container still holds the old port while the new one starts up
     // (zero-downtime staging swap), so we cannot reuse the existing port here.
     // On the very first deploy there is no old container and no reserved port,
     // so this also handles that case correctly.
+    // Held until the new container owns its port (see queue::port_allocation).
+    let port_guard = queue::port_allocation().await;
     let new_host_port = docker::find_free_port(&state.docker, 8100).await?;
     let container_port = app.container_port as u16;
 
-    // Parse env vars (production deploy — no preview filtering)
-    let env_vars: HashMap<String, String> = app
-        .env_vars
-        .as_ref()
-        .and_then(|e| serde_json::from_str(e).ok())
-        .unwrap_or_default();
+    // Decrypt env vars (production deploy — no preview filtering)
+    let env_vars: HashMap<String, String> = secrets::app_env(app)?.into_iter().collect();
 
     // Host paths are re-derived from volume names and verified to stay inside
     // <data>/volumes/<app> (no symlink escapes) right before the mount.
@@ -485,17 +653,11 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
     )
     .await?;
 
-    // If the app belongs to a project, ensure the project's Docker network exists
-    // and connect this container to it (lazy creation on first deploy).
-    let network_name = if let Some(ref pid) = app.project_id {
-        let net = format!("tond-{}", pid);
-        if let Err(e) = docker::ensure_network(&state.docker, &net).await {
-            tracing::warn!("Could not ensure project network {}: {}", net, e);
-        }
-        Some(net)
-    } else {
-        None
-    };
+    // The container joins only its home network: the project network, or the
+    // app's own network (see networks.rs). Never the default bridge.
+    let network = networks::ensure_app_home(&state.docker, app)
+        .await
+        .context("could not create the app's Docker network")?;
 
     // Start the NEW container.
     //
@@ -510,6 +672,9 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
     let canonical_name = format!("tond-{}", app_name);
 
     let new_container_id = if old_container_id.is_some() {
+        // A staging container left over from an interrupted deploy would
+        // block the name.
+        let _ = docker::remove_container(&state.docker, &staging_name).await;
         docker::run_container_named(
             &state.docker,
             &image_name,
@@ -521,15 +686,12 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
             app.memory_limit,
             app.cpu_limit,
             binds,
-            network_name.as_deref(),
+            &network,
             Some(&app_name),
             None,
         )
         .await
-        .map_err(|e| {
-            tracing::error!("Failed to start new (staging) container: {}", e);
-            e
-        })?
+        .context("Docker could not start the new container")?
     } else {
         docker::run_container(
             &state.docker,
@@ -542,96 +704,134 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
             app.memory_limit,
             app.cpu_limit,
             binds,
-            network_name.as_deref(),
+            &network,
         )
         .await
-        .map_err(|e| {
-            tracing::error!("Failed to start new container: {}", e);
-            e
-        })?
+        .context("Docker could not start the new container")?
     };
+    drop(port_guard);
 
-    // ── Graceful health-check drain ──
+    // ── Health ──
     //
     // Poll the new container directly on its host port (bypassing the proxy)
     // so that the old container keeps serving traffic until we are confident
-    // the new one is ready. On the very first deploy there is no old container
-    // to keep serving, but we still run the health check so a broken first
-    // deploy is caught early and the DB is never updated to "running".
-    if let Some(ref path) = app.health_check_path.clone() {
-        let drain_timeout = app.drain_timeout as u64;
-        let url = format!("http://127.0.0.1:{}{}", new_host_port, path);
-
-        log_deploy(
-            state,
-            &app_id,
-            "info",
-            trigger_source,
-            &format!(
-                "Waiting up to {}s for new container to become healthy ({})",
-                drain_timeout, url
-            ),
-        )
-        .await?;
-
-        let healthy = wait_for_healthy(&url, drain_timeout).await?;
-
-        if !healthy {
-            // Rollback: tear down the new container, restore the old
-            // container's running status so it keeps serving traffic.
+    // the new one is ready. How depends on the app's readiness mode:
+    //   http  a health check path must answer 2xx; without one, any HTTP
+    //         answer on the app's port will do (so a wrong port is caught
+    //         here instead of as 502s after the cutover)
+    //   tcp   the container port accepts connections (probed on the
+    //         container's own address: docker-proxy accepts any connection)
+    //   none  background worker: the container stays up ready_after_secs
+    progress::start(state, &app_id, DeployPhase::Health).await;
+    let readiness = app.readiness();
+    let port_timeout = (app.drain_timeout.max(1) as u64).max(PORT_PROBE_MIN_SECS);
+    let (probe, timeout_secs) = match readiness {
+        Readiness::Http => {
+            let (path, require_2xx, timeout_secs) = match app.health_check_path.clone() {
+                Some(path) => (path, true, app.drain_timeout.max(1) as u64),
+                None => ("/".to_string(), false, port_timeout),
+            };
+            let url = format!("http://127.0.0.1:{}{}", new_host_port, path);
             log_deploy(
                 state,
                 &app_id,
-                "error",
+                "info",
+                trigger_source,
+                &if require_2xx {
+                    format!(
+                        "Waiting up to {}s for the health check on port {}{} to pass",
+                        timeout_secs, container_port, path
+                    )
+                } else {
+                    format!(
+                        "Waiting up to {}s for the app to answer on port {}",
+                        timeout_secs, container_port
+                    )
+                },
+            )
+            .await?;
+            let probe = probe_until_ready(
+                &state.docker,
+                &new_container_id,
+                &url,
+                require_2xx,
+                timeout_secs,
+            )
+            .await?;
+            (probe, timeout_secs)
+        }
+        Readiness::Tcp => {
+            log_deploy(
+                state,
+                &app_id,
+                "info",
                 trigger_source,
                 &format!(
-                    "New container did not become healthy within {}s — rolling back",
-                    drain_timeout
+                    "Waiting up to {}s for port {} to accept connections",
+                    port_timeout, container_port
                 ),
             )
             .await?;
-
-            let _ = docker::remove_container(&state.docker, &new_container_id).await;
-
-            // Restore appropriate status:
-            // - If there was an old container it is still serving → "running"
-            // - First deploy with no old container → "failed"
-            let restore_status = if old_container_id.is_some() {
-                "running"
-            } else {
-                "failed"
-            };
-            update_status(state, &app_id, restore_status).await?;
-
-            // Mark deployment as failed
-            let finished = chrono::Utc::now().to_rfc3339();
-            let _ = sqlx::query(
-                "UPDATE deployments SET status = 'failed', finished_at = ? WHERE id = ?",
+            let probe = probe_tcp_until_ready(
+                &state.docker,
+                &new_container_id,
+                container_port,
+                port_timeout,
             )
-            .bind(&finished)
-            .bind(&deployment_id)
-            .execute(&state.db)
             .await;
-
-            // Return Ok — the old container is still serving so the app is
-            // healthy. The caller must not overwrite status to "failed".
-            return Ok(());
+            (probe, port_timeout)
         }
-
-        log_deploy(
-            state,
-            &app_id,
-            "info",
-            trigger_source,
-            "New container is healthy — cutting over traffic",
-        )
-        .await?;
+        Readiness::None => {
+            let secs = app.ready_after_secs.max(1) as u64;
+            log_deploy(
+                state,
+                &app_id,
+                "info",
+                trigger_source,
+                &format!("Background worker: waiting {secs}s to make sure it stays up"),
+            )
+            .await?;
+            (
+                wait_stays_up(&state.docker, &new_container_id, secs).await,
+                secs,
+            )
+        }
+    };
+    if probe.result != ProbeResult::Healthy {
+        facts.timeout_secs = timeout_secs;
+        facts.probe = Some(probe.result);
+        facts.container = probe.container;
+        facts.container_logs = docker::get_logs(&state.docker, &new_container_id, 40)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|l| strip_docker_ts(l).to_string())
+            .collect();
+        let _ = docker::remove_container(&state.docker, &new_container_id).await;
+        anyhow::bail!(
+            "the new container did not become ready within {}s; the previous version keeps running",
+            timeout_secs
+        );
     }
+    log_deploy(
+        state,
+        &app_id,
+        "info",
+        trigger_source,
+        if readiness.serves_traffic() {
+            "New container is ready — cutting over traffic"
+        } else {
+            "The worker stayed up — replacing the old container"
+        },
+    )
+    .await?;
 
-    // ── Atomic traffic cutover ──
+    // ── Release: atomic traffic cutover ──
     //
-    // Update the DB in a single statement. tond-proxy reads host_port every
-    // 5 s; after this write the old port stops receiving new requests.
+    // Update the DB in a single statement (the route_state trigger bumps the
+    // route version), then have tond-proxy reload and acknowledge it before
+    // the old container is stopped.
+    progress::start(state, &app_id, DeployPhase::Release).await;
     sqlx::query(
         "UPDATE apps SET container_id = ?, host_port = ?, status = 'running', updated_at = datetime('now') WHERE id = ?",
     )
@@ -645,30 +845,20 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
     app.host_port = Some(new_host_port as i64);
     app.status = "running".to_string();
 
-    // ── Zero-downtime cutover: wait → SIGTERM old → rename staging ──
+    // ── Zero-downtime cutover: proxy ack → SIGTERM old → rename staging ──
     //
-    // After writing the new port to the DB the proxy needs up to PROXY_POLL_SECS
-    // to pick up the change and start routing to the new container. Only then
-    // can we safely SIGTERM the old one.
+    // tond-proxy must be routing to the new port before the old container is
+    // stopped: wait for its acknowledgement (tens of milliseconds).
     //
     // On the first deploy there is no old container and the new one already has
     // the canonical name, so skip this block entirely.
-    const PROXY_POLL_SECS: u64 = 3; // must be > the proxy's 2 s poll interval
     if let Some(ref old_id) = old_container_id
         && old_id != &new_container_id
     {
-        log_deploy(
-            state,
-            &app_id,
-            "info",
-            trigger_source,
-            &format!(
-                "Waiting {}s for proxy to pick up new port before stopping old container",
-                PROXY_POLL_SECS
-            ),
-        )
-        .await?;
-        tokio::time::sleep(std::time::Duration::from_secs(PROXY_POLL_SECS)).await;
+        // Workers are never routed: nothing for the proxy to pick up.
+        if readiness.serves_traffic() {
+            wait_for_proxy_cutover(state, &app_id, trigger_source).await?;
+        }
 
         log_deploy(
             state,
@@ -693,22 +883,7 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
         let _ = docker::rename_container(&state.docker, &staging_name, &canonical_name).await;
     }
 
-    // Auto-assign a domain if none set.
-    // Use <app-name>.<dashboard-domain> so the app gets a real, routable
-    // subdomain on the same server.  Fall back to <app-name>.localhost only
-    // if dashboard_domain has not been configured yet.
-    if app.domain.is_none() {
-        let base = {
-            let s = state.settings.read().await;
-            s.dashboard_domain.clone()
-        };
-        let domain = auto_domain(&base, &app_name);
-        sqlx::query("UPDATE apps SET domain = ? WHERE id = ?")
-            .bind(&domain)
-            .bind(&app_id)
-            .execute(&state.db)
-            .await?;
-    }
+    assign_automatic_domain(state, app, trigger_source).await?;
 
     log_deploy(
         state,
@@ -716,307 +891,217 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
         "info",
         trigger_source,
         &format!(
-            "Deployed successfully! Container: {}",
+            "{} Container: {}",
+            if is_rollback {
+                "Rollback succeeded!"
+            } else {
+                "Deployed successfully!"
+            },
             &new_container_id[..12.min(new_container_id.len())]
         ),
     )
     .await?;
 
-    // Mark deployment as succeeded
-    let finished = chrono::Utc::now().to_rfc3339();
-    let _ =
-        sqlx::query("UPDATE deployments SET status = 'succeeded', finished_at = ? WHERE id = ?")
-            .bind(&finished)
-            .bind(&deployment_id)
-            .execute(&state.db)
-            .await;
-
     images::prune_app_images(state, &app_id, &app_name).await;
+
+    // The home network may have just been (re)created: make sure the
+    // databases linked to this app are attached to it.
+    if let Err(e) = networks::reconcile_databases_for_app(state, app).await {
+        log_deploy(
+            state,
+            &app_id,
+            "warn",
+            trigger_source,
+            &format!("Could not attach linked databases to the app network: {e}"),
+        )
+        .await?;
+    }
 
     Ok(())
 }
 
-/// Deploy from a specific Docker image tag (used for rollbacks).
-/// Skips the build step and re-runs the given image directly.
-pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> Result<()> {
-    // Rollback is not supported for compose apps: there is no single image to
-    // re-run. Re-deploy with the desired compose content instead.
-    if app.source_type == "compose" {
-        anyhow::bail!(
-            "Rollback is not supported for compose apps. \
-             Update the compose content and trigger a fresh deploy instead."
-        );
+/// Wait until tond-proxy routes the app's new port (see proxy_link.rs), and
+/// say in the deploy log how the cutover was confirmed.
+async fn wait_for_proxy_cutover(
+    state: &AppState,
+    app_id: &str,
+    trigger_source: &str,
+) -> Result<()> {
+    let outcome = proxy_link::sync_routes(state).await;
+    log_deploy(state, app_id, "info", trigger_source, &outcome.describe()).await?;
+    if let Some(wait) = outcome.fallback_wait() {
+        tokio::time::sleep(wait).await;
     }
+    Ok(())
+}
 
-    let app_id = app.id.clone();
-    let app_name = app.name.clone();
-    let old_container_id = app.container_id.clone();
+/// Build, pull or re-tag the app's configured source into `deploy_tag`
+/// (compose apps start their services here and return a sentinel).
+async fn source_image(
+    state: &AppState,
+    app: &App,
+    deployment_id: &str,
+    deploy_tag: &str,
+    trigger_source: &str,
+) -> Result<String> {
+    let app_id = app.id.as_str();
+    let app_name = app.name.as_str();
+    Ok(match app.source_type.as_str() {
+        "git" => {
+            progress::start(state, app_id, DeployPhase::Clone).await;
+            let source_url = app
+                .source_url
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Git source URL required"))?;
+            let branch = app.branch.as_deref().unwrap_or("main");
 
-    // The exact image must still be on the host (old ones are pruned).
-    if state.docker.inspect_image(image_tag).await.is_err() {
-        let _ = sqlx::query(
-            "UPDATE deployments SET image_pruned = 1 WHERE app_id = ? AND image_tag = ?",
-        )
-        .bind(&app_id)
-        .bind(image_tag)
-        .execute(&state.db)
-        .await;
-        anyhow::bail!(
-            "Image {} is no longer on this server (old images are pruned), so this deployment can't be restored",
-            image_tag
-        );
-    }
+            let (clone_url, git_auth) =
+                resolve_git_source(state, app, source_url, Some(trigger_source)).await?;
 
-    // Deployment row
-    let deployment_id = Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query(
-        "INSERT INTO deployments (id, app_id, image_tag, status, trigger_source, started_at, created_at)
-         VALUES (?, ?, ?, 'running', 'rollback', ?, ?)",
-    )
-    .bind(&deployment_id)
-    .bind(&app_id)
-    .bind(image_tag)
-    .bind(&now)
-    .bind(&now)
-    .execute(&state.db)
-    .await?;
-
-    update_status(state, &app_id, "building").await?;
-    log_deploy(
-        state,
-        &app_id,
-        "info",
-        "rollback",
-        &format!("Rolling back to image: {}", image_tag),
-    )
-    .await?;
-
-    // Always allocate a fresh host port (same reasoning as in deploy()).
-    // For rollbacks the old container is still running on the existing port
-    // while we start the rollback container on a new port.
-    let new_host_port = docker::find_free_port(&state.docker, 8100).await?;
-    let container_port = app.container_port as u16;
-
-    let env_vars: HashMap<String, String> = app
-        .env_vars
-        .as_ref()
-        .and_then(|e| serde_json::from_str(e).ok())
-        .unwrap_or_default();
-
-    // Host paths are re-derived from volume names and verified to stay inside
-    // <data>/volumes/<app> (no symlink escapes) right before the mount.
-    let volumes: Vec<Volume> = serde_json::from_str(&app.volumes).unwrap_or_default();
-    let binds = volumes::app_binds(&volumes::data_dir(), &app_name, &volumes)?;
-
-    log_deploy(
-        state,
-        &app_id,
-        "info",
-        "rollback",
-        &format!(
-            "Starting rollback container on port {}:{}",
-            new_host_port, container_port
-        ),
-    )
-    .await?;
-
-    // Connect to project network if applicable (same as regular deploy).
-    let network_name = if let Some(ref pid) = app.project_id {
-        let net = format!("tond-{}", pid);
-        if let Err(e) = docker::ensure_network(&state.docker, &net).await {
-            tracing::warn!("Could not ensure project network {}: {}", net, e);
-        }
-        Some(net)
-    } else {
-        None
-    };
-
-    // Use staging name for rollbacks when there is an existing container,
-    // so traffic continues to flow to the old container until the rollback
-    // container is healthy and the DB has been updated.
-    let staging_name_rb = format!("tond-{}-next", app_name);
-    let canonical_name_rb = format!("tond-{}", app_name);
-
-    let new_container_id = if old_container_id.is_some() {
-        docker::run_container_named(
-            &state.docker,
-            image_tag,
-            &staging_name_rb,
-            container_port,
-            new_host_port,
-            docker::Exposure::Loopback,
-            env_vars,
-            app.memory_limit,
-            app.cpu_limit,
-            binds,
-            network_name.as_deref(),
-            Some(&app_name),
-            None,
-        )
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to start rollback (staging) container: {}", e);
-            e
-        })?
-    } else {
-        docker::run_container(
-            &state.docker,
-            image_tag,
-            &app_name,
-            container_port,
-            new_host_port,
-            docker::Exposure::Loopback,
-            env_vars,
-            app.memory_limit,
-            app.cpu_limit,
-            binds,
-            network_name.as_deref(),
-        )
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to start rollback container: {}", e);
-            e
-        })?
-    };
-
-    // Graceful drain (same logic as regular deploy)
-    if let Some(ref path) = app.health_check_path.clone() {
-        let drain_timeout = app.drain_timeout as u64;
-        let url = format!("http://127.0.0.1:{}{}", new_host_port, path);
-
-        log_deploy(
-            state,
-            &app_id,
-            "info",
-            "rollback",
-            &format!(
-                "Waiting up to {}s for rollback container to become healthy ({})",
-                drain_timeout, url
-            ),
-        )
-        .await?;
-
-        let healthy = wait_for_healthy(&url, drain_timeout).await?;
-        if !healthy {
             log_deploy(
                 state,
-                &app_id,
-                "error",
-                "rollback",
-                &format!(
-                    "Rollback container did not become healthy within {}s",
-                    drain_timeout
-                ),
+                app_id,
+                "info",
+                trigger_source,
+                &format!("Building from git: {} ({})", clone_url, branch),
             )
             .await?;
-            let _ = docker::remove_container(&state.docker, &new_container_id).await;
-            let restore_status = if old_container_id.is_some() {
-                "running"
-            } else {
-                "failed"
-            };
-            update_status(state, &app_id, restore_status).await?;
 
-            let finished = chrono::Utc::now().to_rfc3339();
-            let _ = sqlx::query(
-                "UPDATE deployments SET status = 'failed', finished_at = ? WHERE id = ?",
+            build_from_git(
+                state,
+                app_id,
+                app_name,
+                &clone_url,
+                git_auth.as_ref(),
+                branch,
+                &BuildOptions {
+                    method: &app.build_method,
+                    static_build: app.static_build != 0,
+                    base_dir: app.base_dir.as_deref(),
+                },
+                deploy_tag,
+                Some(deployment_id),
+                trigger_source,
             )
-            .bind(&finished)
-            .bind(&deployment_id)
-            .execute(&state.db)
-            .await;
-
-            anyhow::bail!(
-                "Rollback failed: container did not pass health checks within {}s",
-                drain_timeout
-            );
+            .await?
         }
+        "image" => {
+            progress::start(state, app_id, DeployPhase::Clone).await;
+            let image = app
+                .source_url
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Docker image reference required"))?;
 
-        log_deploy(
-            state,
-            &app_id,
-            "info",
-            "rollback",
-            "Rollback container is healthy — cutting over traffic",
-        )
-        .await?;
+            log_deploy(
+                state,
+                app_id,
+                "info",
+                trigger_source,
+                &format!("Pulling image: {}", image),
+            )
+            .await?;
+
+            // Look up registry credentials if one is attached to the app
+            let credentials = if let Some(cred_id) = &app.registry_credential_id {
+                fetch_registry_credentials(state, cred_id).await?
+            } else {
+                None
+            };
+
+            pull_image(&state.docker, image, credentials).await?;
+
+            // Pin the pulled bytes under this deployment's tag so a rollback
+            // runs exactly this image even after `image` moves on upstream.
+            images::tag_image(&state.docker, image, deploy_tag).await?;
+            log_deploy(
+                state,
+                app_id,
+                "info",
+                trigger_source,
+                &format!("Pinned {} as {}", image, deploy_tag),
+            )
+            .await?;
+            deploy_tag.to_string()
+        }
+        "tarball" => {
+            // A redeploy of an uploaded app re-runs the last uploaded build.
+            progress::relabel(state, app_id, DeployPhase::Build, "Use uploaded image").await;
+            progress::start(state, app_id, DeployPhase::Build).await;
+            let upload_tag = images::upload_tag(app_name);
+            images::tag_image(&state.docker, &upload_tag, deploy_tag)
+                .await
+                .with_context(|| format!("no uploaded image {upload_tag} to deploy"))?;
+            log_deploy(
+                state,
+                app_id,
+                "info",
+                trigger_source,
+                &format!("Using uploaded image: {}", deploy_tag),
+            )
+            .await?;
+            deploy_tag.to_string()
+        }
+        "dockerfile" => {
+            progress::start(state, app_id, DeployPhase::Build).await;
+            let content = app.dockerfile_content.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("dockerfile_content is required for source_type='dockerfile'")
+            })?;
+            persist_generated_dockerfile(state, deployment_id, Some(content)).await;
+
+            log_deploy(
+                state,
+                app_id,
+                "info",
+                trigger_source,
+                "Building from inline Dockerfile...",
+            )
+            .await?;
+
+            build_from_inline_dockerfile(
+                state,
+                app_id,
+                app_name,
+                content,
+                deploy_tag,
+                trigger_source,
+            )
+            .await?
+        }
+        "compose" => {
+            progress::start(state, app_id, DeployPhase::Build).await;
+            let content = app.compose_content.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("compose_content is required for source_type='compose'")
+            })?;
+
+            log_deploy(
+                state,
+                app_id,
+                "info",
+                trigger_source,
+                "Starting inline Docker Compose application...",
+            )
+            .await?;
+
+            run_inline_compose(state, app_id, app_name, content, trigger_source).await?
+        }
+        other => {
+            anyhow::bail!("Unsupported source type: {}", other);
+        }
+    })
+}
+
+/// Auto-assign `<app>.<dashboard domain>` when the app has no domain.
+/// Falls back to `<app>.localhost` if no dashboard domain is configured.
+/// Without a health check path the port probe waits at least this long, so a
+/// slow-booting app isn't failed by a short drain timeout.
+const PORT_PROBE_MIN_SECS: u64 = 60;
+
+/// Drop the RFC 3339 timestamp Docker prepends with `timestamps(true)`.
+fn strip_docker_ts(raw: &str) -> &str {
+    match raw.split_once(' ') {
+        Some((ts, rest)) if ts.len() <= 35 && ts.contains('T') => rest.trim_end(),
+        _ => raw.trim_end(),
     }
-
-    sqlx::query(
-        "UPDATE apps SET container_id = ?, host_port = ?, status = 'running', updated_at = datetime('now') WHERE id = ?",
-    )
-    .bind(&new_container_id)
-    .bind(new_host_port as i64)
-    .bind(&app_id)
-    .execute(&state.db)
-    .await?;
-
-    app.container_id = Some(new_container_id.clone());
-    app.host_port = Some(new_host_port as i64);
-    app.status = "running".to_string();
-
-    if let Some(ref old_id) = old_container_id
-        && old_id != &new_container_id
-    {
-        const PROXY_POLL_SECS: u64 = 3;
-        log_deploy(
-            state,
-            &app_id,
-            "info",
-            "rollback",
-            &format!(
-                "Waiting {}s for proxy to pick up new port before stopping old container",
-                PROXY_POLL_SECS
-            ),
-        )
-        .await?;
-        tokio::time::sleep(std::time::Duration::from_secs(PROXY_POLL_SECS)).await;
-
-        log_deploy(
-            state,
-            &app_id,
-            "info",
-            "rollback",
-            &format!(
-                "Draining old container {} ({}s grace)",
-                &old_id[..12.min(old_id.len())],
-                app.drain_timeout
-            ),
-        )
-        .await?;
-        let _ =
-            docker::stop_container_with_timeout(&state.docker, old_id, app.drain_timeout as u64)
-                .await;
-        let _ = docker::remove_container(&state.docker, old_id).await;
-
-        // Rename staging → canonical
-        let _ = docker::rename_container(&state.docker, &staging_name_rb, &canonical_name_rb).await;
-    }
-
-    log_deploy(
-        state,
-        &app_id,
-        "info",
-        "rollback",
-        &format!(
-            "Rollback succeeded! Container: {}",
-            &new_container_id[..12.min(new_container_id.len())]
-        ),
-    )
-    .await?;
-
-    let finished = chrono::Utc::now().to_rfc3339();
-    let _ =
-        sqlx::query("UPDATE deployments SET status = 'succeeded', finished_at = ? WHERE id = ?")
-            .bind(&finished)
-            .bind(&deployment_id)
-            .execute(&state.db)
-            .await;
-
-    images::prune_app_images(state, &app_id, &app_name).await;
-
-    Ok(())
 }
 
 /// Deploy a preview of an app with a unique subdomain and TTL.
@@ -1024,7 +1109,7 @@ pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> R
 /// Steps:
 ///   1. Build/pull the image (same as a regular deploy).
 ///   2. Pick a free host port (starting at 8200 to keep separate from main deploys).
-///   3. Start the container as `tond-preview-{slug}` with the same env vars and volumes.
+///   3. Start the container as `tond-preview-{slug}` with preview env vars and its own empty volumes.
 ///   4. Insert a `preview_deployments` row and update it once the container is running.
 ///
 /// The caller must provide the `slug` (short random hex) and the `ttl_hours`.
@@ -1039,6 +1124,12 @@ pub async fn deploy_preview(
     let slug = preview.slug.clone();
 
     tracing::info!("Starting preview deploy for {} (slug: {})", app_name, slug);
+
+    // Previews build outside the per-app queue but share the global build
+    // slots, and use their own build directory so they never race the app's
+    // production build.
+    let build_slot = queue::build_slot().await;
+    let work_name = format!("{app_name}-preview-{slug}");
 
     let image_name = match app.source_type.as_str() {
         "git" => {
@@ -1065,7 +1156,7 @@ pub async fn deploy_preview(
             build_from_git(
                 state,
                 &app_id,
-                &app_name,
+                &work_name,
                 &clone_url,
                 git_auth.as_ref(),
                 branch,
@@ -1103,7 +1194,7 @@ pub async fn deploy_preview(
             build_from_inline_dockerfile(
                 state,
                 &app_id,
-                &app_name,
+                &work_name,
                 content,
                 &images::preview_tag(&app_name, &slug),
                 "preview",
@@ -1121,6 +1212,7 @@ pub async fn deploy_preview(
         }
     };
 
+    drop(build_slot);
     preview.image_tag = Some(image_name.clone());
 
     // Update image_tag in DB now that we know it
@@ -1131,19 +1223,21 @@ pub async fn deploy_preview(
         .await;
 
     // Pick a free port in the preview range (8200+)
+    let port_guard = queue::port_allocation().await;
     let host_port = docker::find_free_port(&state.docker, 8200).await?;
     let container_port = app.container_port as u16;
 
     let env_vars = preview_env_vars(
-        app.env_vars.as_deref().unwrap_or("{}"),
-        app.preview_excluded_keys.as_str(),
-        app.preview_env_vars.as_str(),
+        secrets::app_env(app)?,
+        app.preview_shared_keys.as_str(),
+        secrets::app_preview_env(app)?,
     );
 
-    // Host paths are re-derived from volume names and verified to stay inside
-    // <data>/volumes/<app> (no symlink escapes) right before the mount.
+    // Previews run pull-request code: they get the app's volume layout but
+    // their own empty directories under <data>/volumes/_preview/<slug>, never
+    // the production data. The janitor removes them once the preview is gone.
     let volumes: Vec<Volume> = serde_json::from_str(&app.volumes).unwrap_or_default();
-    let binds = volumes::app_binds(&volumes::data_dir(), &app_name, &volumes)?;
+    let binds = volumes::preview_binds(&volumes::data_dir(), &slug, &volumes)?;
 
     let container_name = format!("tond-preview-{}", slug);
 
@@ -1154,16 +1248,12 @@ pub async fn deploy_preview(
         container_port
     );
 
-    // Connect preview containers to the project network if the app has one.
-    let network_name = if let Some(ref pid) = app.project_id {
-        let net = format!("tond-{}", pid);
-        if let Err(e) = docker::ensure_network(&state.docker, &net).await {
-            tracing::warn!("Could not ensure project network {}: {}", net, e);
-        }
-        Some(net)
-    } else {
-        None
-    };
+    // Previews run pull-request code: they get a network of their own and
+    // never join the project network, so they can't reach production
+    // databases or apps.
+    let network = networks::ensure_preview(&state.docker, &slug)
+        .await
+        .context("could not create the preview's Docker network")?;
 
     let container_id = docker::run_container_named(
         &state.docker,
@@ -1176,11 +1266,12 @@ pub async fn deploy_preview(
         app.memory_limit,
         app.cpu_limit,
         binds,
-        network_name.as_deref(),
+        &network,
         Some(&app_name),
         None,
     )
     .await?;
+    drop(port_guard);
 
     // Update the preview row with runtime details
     sqlx::query(
@@ -1322,25 +1413,168 @@ pub async fn deploy_preview(
     Ok(())
 }
 
-/// Poll `url` once per second until it returns a 2xx status code.
-/// Returns `true` if healthy within `timeout_secs`, `false` if timed out.
-async fn wait_for_healthy(url: &str, timeout_secs: u64) -> anyhow::Result<bool> {
+/// What [`probe_until_ready`] saw last.
+#[derive(Debug)]
+struct Probe {
+    result: ProbeResult,
+    /// Set when the container stopped (crash, OOM) before becoming ready.
+    container: Option<ContainerExit>,
+}
+
+/// The container's address on its first Docker network.
+async fn container_ip(docker: &bollard::Docker, container_id: &str) -> Option<std::net::IpAddr> {
+    let info = docker.inspect_container(container_id, None).await.ok()?;
+    let networks = info.network_settings?.networks?;
+    networks
+        .values()
+        .filter_map(|n| n.ip_address.as_deref())
+        .find_map(|ip| ip.parse().ok())
+}
+
+/// Poll until the container accepts TCP connections on `port`. Connects to
+/// the container's own address: the loopback-published port is held by
+/// docker-proxy, which accepts connections even when nothing listens.
+async fn probe_tcp_until_ready(
+    docker: &bollard::Docker,
+    container_id: &str,
+    port: u16,
+    timeout_secs: u64,
+) -> Probe {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let mut last = ProbeResult::NotListening;
+    loop {
+        if let Some(ip) = container_ip(docker, container_id).await {
+            let addr = std::net::SocketAddr::new(ip, port);
+            last = match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                tokio::net::TcpStream::connect(addr),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    return Probe {
+                        result: ProbeResult::Healthy,
+                        container: None,
+                    };
+                }
+                Ok(Err(_)) => ProbeResult::NotListening,
+                Err(_) => ProbeResult::Timeout,
+            };
+        }
+        let exit = container_exit(docker, container_id).await;
+        if let Some(exit) = exit.filter(|e| !e.running) {
+            return Probe {
+                result: last,
+                container: Some(exit),
+            };
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Probe {
+                result: last,
+                container: container_exit(docker, container_id).await,
+            };
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+/// Background workers: ready once the container has stayed up `secs`
+/// without exiting or being restarted.
+async fn wait_stays_up(docker: &bollard::Docker, container_id: &str, secs: u64) -> Probe {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        let exit = container_exit(docker, container_id).await;
+        match exit {
+            Some(exit) if !exit.running => {
+                return Probe {
+                    result: ProbeResult::NotListening,
+                    container: Some(exit),
+                };
+            }
+            None => {
+                return Probe {
+                    result: ProbeResult::NotListening,
+                    container: Some(ContainerExit::default()),
+                };
+            }
+            Some(_) => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Probe {
+                result: ProbeResult::Healthy,
+                container: None,
+            };
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+/// Whether one HTTP answer means "ready".
+fn probe_outcome(status: Option<u16>, timed_out: bool, require_2xx: bool) -> ProbeResult {
+    match status {
+        Some(code) if !require_2xx || (200..300).contains(&code) => ProbeResult::Healthy,
+        Some(code) => ProbeResult::HttpStatus(code),
+        None if timed_out => ProbeResult::Timeout,
+        None => ProbeResult::NotListening,
+    }
+}
+
+/// How the container is doing; `running` is false while Docker restarts a
+/// crashed container.
+async fn container_exit(docker: &bollard::Docker, container_id: &str) -> Option<ContainerExit> {
+    let info = docker.inspect_container(container_id, None).await.ok()?;
+    let crashed_before = info.restart_count.unwrap_or(0) > 0;
+    let st = info.state?;
+    Some(ContainerExit {
+        running: st.running.unwrap_or(false) && !st.restarting.unwrap_or(false) && !crashed_before,
+        exit_code: st.exit_code,
+        oom_killed: st.oom_killed.unwrap_or(false),
+    })
+}
+
+/// Poll `url` once per second until the app answers: any HTTP response, or a
+/// 2xx when `require_2xx` (a health check path). Stops early when the
+/// container exits.
+async fn probe_until_ready(
+    docker: &bollard::Docker,
+    container_id: &str,
+    url: &str,
+    require_2xx: bool,
+    timeout_secs: u64,
+) -> Result<Probe> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("building reqwest client for health check")?;
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
     loop {
-        if let Ok(resp) = client.get(url).send().await
-            && resp.status().is_success()
-        {
-            return Ok(true);
+        let last = match client.get(url).send().await {
+            Ok(resp) => probe_outcome(Some(resp.status().as_u16()), false, require_2xx),
+            Err(e) => probe_outcome(None, e.is_timeout(), require_2xx),
+        };
+        if last == ProbeResult::Healthy {
+            return Ok(Probe {
+                result: last,
+                container: None,
+            });
+        }
+
+        let exit = container_exit(docker, container_id).await;
+        if let Some(exit) = exit.filter(|e| !e.running) {
+            return Ok(Probe {
+                result: last,
+                container: Some(exit),
+            });
         }
 
         if tokio::time::Instant::now() >= deadline {
-            return Ok(false);
+            return Ok(Probe {
+                result: last,
+                container: container_exit(docker, container_id).await,
+            });
         }
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -1368,7 +1602,7 @@ fn parse_github_owner_repo(url: &str) -> Option<(String, String)> {
 
 /// Fetch and decrypt registry credentials for a given credential ID.
 /// Returns None if the credential is not found (non-fatal — fall back to unauthenticated pull).
-async fn fetch_registry_credentials(
+pub async fn fetch_registry_credentials(
     state: &AppState,
     cred_id: &str,
 ) -> Result<Option<bollard::auth::DockerCredentials>> {
@@ -1398,7 +1632,7 @@ async fn fetch_registry_credentials(
 }
 
 /// Pull a Docker image, optionally using registry credentials.
-async fn pull_image(
+pub async fn pull_image(
     docker: &bollard::Docker,
     image: &str,
     credentials: Option<bollard::auth::DockerCredentials>,
@@ -1451,16 +1685,26 @@ pub(super) async fn log_deploy(
     trigger_source: &str,
     message: &str,
 ) -> Result<()> {
-    let redacted = redact_url_credentials(message);
-    let message = redacted.as_str();
+    let scrubbed = log_scrub::scrub_for_app(&state.db, app_id, message).await;
+    let message = scrubbed.as_str();
     let id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
+    // Preview builds share the app id but are not part of its deployment.
+    let deployment_id = if trigger_source == "preview" {
+        None
+    } else {
+        progress::active_deployment(app_id)
+    };
+    if deployment_id.is_some() {
+        progress::record_line(app_id, message);
+    }
 
     sqlx::query(
-        "INSERT INTO deploy_logs (id, app_id, message, level, trigger_source, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO deploy_logs (id, app_id, deployment_id, message, level, trigger_source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(app_id)
+    .bind(&deployment_id)
     .bind(message)
     .bind(level)
     .bind(trigger_source)
@@ -1479,6 +1723,7 @@ pub(super) async fn log_deploy(
     log_bus::publish(DeployLogEvent {
         id,
         app_id: app_id.to_string(),
+        deployment_id,
         level: level.to_string(),
         message: message.to_string(),
         created_at: now,
@@ -1541,25 +1786,145 @@ mod tests {
     }
 
     #[test]
-    fn auto_domain_uses_dashboard_domain_or_localhost_fallback() {
+    fn probe_outcome_needs_2xx_only_for_a_health_path() {
+        assert_eq!(probe_outcome(Some(404), false, false), ProbeResult::Healthy);
+        assert_eq!(probe_outcome(Some(200), false, true), ProbeResult::Healthy);
         assert_eq!(
-            auto_domain("dashboard.example.com", "frontend"),
-            "frontend.dashboard.example.com",
-            "auto_domain should suffix the app name with the configured dashboard domain"
+            probe_outcome(Some(503), false, true),
+            ProbeResult::HttpStatus(503)
+        );
+        assert_eq!(probe_outcome(None, true, true), ProbeResult::Timeout);
+        assert_eq!(probe_outcome(None, false, false), ProbeResult::NotListening);
+    }
+
+    #[test]
+    fn strip_docker_ts_drops_the_timestamp_prefix() {
+        assert_eq!(
+            strip_docker_ts("2026-03-20T23:27:38.123456789Z listening on :80\n"),
+            "listening on :80"
+        );
+        assert_eq!(strip_docker_ts("plain line"), "plain line");
+    }
+
+    #[tokio::test]
+    async fn create_records_trigger_phases_and_rollback_target() {
+        let state = test_state().await;
+        let mut app = App::new("web".to_string(), "image".to_string(), None, None, 80);
+        app.health_check_path = Some("/up".to_string());
+        let id = create(
+            &state,
+            &app,
+            &DeployRequest::source("manual", Some("ada@example.com".to_string())),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create: {e}"));
+        let row: tond_common::Deployment = sqlx::query_as("SELECT * FROM deployments WHERE id = ?")
+            .bind(&id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_else(|e| panic!("read: {e}"));
+        assert_eq!(row.status, "queued", "the build queue moves it to running");
+        assert_eq!(row.trigger_detail.as_deref(), Some("ada@example.com"));
+        let phases = row.phase_records();
+        assert_eq!(phases.len(), 5);
+        assert_eq!(phases[0].label.as_deref(), Some("Pull image"));
+        assert_eq!(phases[3].label.as_deref(), Some("Health check"));
+
+        let rollback = DeployRequest {
+            kind: DeployKind::Rollback {
+                image_tag: "tond-web:abc".to_string(),
+                target_deployment_id: id.clone(),
+            },
+            trigger_source: "rollback".to_string(),
+            trigger_detail: None,
+        };
+        let rb = create(&state, &app, &rollback)
+            .await
+            .unwrap_or_else(|e| panic!("create: {e}"));
+        let row: tond_common::Deployment = sqlx::query_as("SELECT * FROM deployments WHERE id = ?")
+            .bind(&rb)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_else(|e| panic!("read: {e}"));
+        assert_eq!(row.rollback_of.as_deref(), Some(id.as_str()));
+        assert_eq!(row.image_tag.as_deref(), Some("tond-web:abc"));
+        assert_eq!(row.trigger_source, "rollback");
+        assert_eq!(
+            row.phase_records()[1].status,
+            tond_common::PhaseStatus::Skipped
+        );
+    }
+
+    #[tokio::test]
+    async fn log_lines_are_attributed_to_the_active_deployment() {
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO apps (id, name, created_at, updated_at) VALUES ('attrib-app', 'attrib', 't', 't')",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap_or_else(|e| panic!("seed: {e}"));
+        progress::begin(
+            &state,
+            "attrib-app",
+            "dep-attrib",
+            progress::plan_for("git", None),
+        )
+        .await;
+        log_deploy(&state, "attrib-app", "info", "manual", "cloning")
+            .await
+            .unwrap_or_else(|e| panic!("log: {e}"));
+        log_deploy(&state, "attrib-app", "info", "preview", "preview build")
+            .await
+            .unwrap_or_else(|e| panic!("log: {e}"));
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT message, deployment_id FROM deploy_logs WHERE app_id = 'attrib-app' ORDER BY rowid",
+        )
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_else(|e| panic!("read: {e}"));
+        assert_eq!(
+            rows,
+            vec![
+                ("cloning".to_string(), Some("dep-attrib".to_string())),
+                ("preview build".to_string(), None),
+            ]
+        );
+        assert_eq!(progress::recent_lines("attrib-app"), vec!["cloning"]);
+        progress::finish_ok(&state, "attrib-app", "dep-attrib").await;
+        assert!(progress::active_deployment("attrib-app").is_none());
+    }
+
+    #[test]
+    fn auto_domain_uses_the_apps_domain_and_nothing_else() {
+        assert_eq!(
+            auto_domain("example-apps.com", "frontend").as_deref(),
+            Some("frontend.example-apps.com"),
+            "auto_domain should suffix the app name with the apps domain"
         );
         assert_eq!(
             auto_domain("", "frontend"),
-            "frontend.localhost",
-            "auto_domain should fall back to localhost when the dashboard domain is not configured"
+            None,
+            "without an apps domain there is no automatic hostname (never the dashboard's site)"
         );
     }
 
     #[test]
-    fn preview_env_vars_removes_excluded_keys_and_applies_overrides() {
+    fn preview_env_vars_passes_only_shared_keys_and_applies_overrides() {
+        let map = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
         let env = preview_env_vars(
-            r#"{"DATABASE_URL":"prod","PUBLIC_FLAG":"1","KEEP":"yes"}"#,
-            r#"["DATABASE_URL","MISSING"]"#,
-            r#"{"PUBLIC_FLAG":"preview","NEW_KEY":"value"}"#,
+            map(&[
+                ("DATABASE_URL", "prod"),
+                ("PUBLIC_FLAG", "1"),
+                ("KEEP", "yes"),
+            ]),
+            r#"["PUBLIC_FLAG","KEEP","MISSING"]"#,
+            map(&[("PUBLIC_FLAG", "preview"), ("NEW_KEY", "value")]),
         );
 
         assert_eq!(
@@ -1569,7 +1934,13 @@ mod tests {
                 ("KEEP".to_string(), "yes".to_string()),
                 ("NEW_KEY".to_string(), "value".to_string()),
             ]),
-            "preview_env_vars should remove excluded keys and apply preview-specific overrides on top of the base environment"
+            "previews get only shared app variables (never DATABASE_URL here) plus their overrides"
+        );
+
+        let nothing_shared = preview_env_vars(map(&[("DATABASE_URL", "prod")]), "[]", map(&[]));
+        assert!(
+            nothing_shared.is_empty(),
+            "by default a preview receives none of the production environment"
         );
     }
 
@@ -1578,7 +1949,7 @@ mod tests {
         let state = test_state().await;
 
         sqlx::query(
-            "INSERT INTO apps (id, name, source_type, container_port, status, env_vars, volumes, drain_timeout, build_method, auto_deploy, preview_enabled, preview_excluded_keys, preview_env_vars, static_build, created_at, updated_at)
+            "INSERT INTO apps (id, name, source_type, container_port, status, env_vars, volumes, drain_timeout, build_method, auto_deploy, preview_enabled, preview_shared_keys, preview_env_vars, static_build, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))",
         )
         .bind("app-1")

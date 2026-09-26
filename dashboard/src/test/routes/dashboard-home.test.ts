@@ -1,5 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/svelte';
-import userEvent from '@testing-library/user-event';
+import { render, screen, waitFor, within } from '@testing-library/svelte';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { goto, setUiContext, clearUiContext, projectsContext } = vi.hoisted(() => ({
@@ -11,6 +10,42 @@ const { goto, setUiContext, clearUiContext, projectsContext } = vi.hoisted(() =>
 
 vi.mock('$app/navigation', () => ({
 	goto
+}));
+
+const api = vi.hoisted(() => ({
+	getOnboardingStatus: vi.fn(),
+	getSystemMetrics: vi.fn()
+}));
+
+vi.mock('$lib/api', async (importOriginal) => ({
+	...(await importOriginal<typeof import('$lib/api')>()),
+	...api
+}));
+
+const FRESH_STATUS = {
+	dashboard_domain: '',
+	is_fresh_install: true,
+	has_projects: false,
+	has_apps: false,
+	has_databases: false,
+	has_cron_jobs: false,
+	has_source_integration: true,
+	has_successful_deploy: false,
+	has_notification_channel: false,
+	last_deployment: null,
+	server_public_ip: '203.0.113.10',
+	domain_status: {
+		configured: false,
+		expected_target: '203.0.113.10',
+		dns_matches_server: null,
+		https_ready: null,
+		certificate_status: null
+	}
+};
+
+vi.mock('$lib/auth.svelte', () => ({
+	can: () => true,
+	getUser: () => ({ email: 'admin@example.com', role: 'admin', totp_enabled: false })
 }));
 
 vi.mock('$lib/ui-context.svelte', () => ({
@@ -27,7 +62,7 @@ const data = {
 			id: 'proj_1',
 			name: 'web-platform',
 			description: 'Main product',
-			env_vars: {},
+			env: [],
 			active_preview_count: 1,
 			created_at: '2026-01-01T00:00:00.000Z',
 			updated_at: '2026-01-01T00:00:00.000Z'
@@ -63,7 +98,7 @@ const data = {
 			base_dir: null,
 			static_build: false,
 			preview_enabled: false,
-			preview_excluded_keys: [],
+			preview_shared_keys: [],
 			created_at: '2026-01-01T00:00:00.000Z',
 			updated_at: '2026-01-01T00:00:00.000Z'
 		},
@@ -96,7 +131,7 @@ const data = {
 			base_dir: null,
 			static_build: false,
 			preview_enabled: false,
-			preview_excluded_keys: [],
+			preview_shared_keys: [],
 			created_at: '2026-01-01T00:00:00.000Z',
 			updated_at: '2026-01-01T00:00:00.000Z'
 		}
@@ -111,8 +146,8 @@ const data = {
 			status: 'running',
 			db_name: 'app_db',
 			db_user: 'app_user',
-			db_password: 'secret',
-			root_password: null,
+			has_password: true,
+			has_root_password: false,
 			memory_limit: null,
 			custom_external_url: null,
 			custom_internal_url: null,
@@ -138,7 +173,7 @@ const data = {
 			created_at: '2026-01-01T00:00:00.000Z',
 			updated_at: '2026-01-01T00:00:00.000Z',
 			timeout_seconds: null,
-			env: null,
+			env: [],
 			last_run_status: null,
 			concurrency_policy: 'skip',
 			memory_mb: null,
@@ -151,13 +186,18 @@ const data = {
 	],
 	recentActivity: [
 		{
-			id: 'log_1',
-			app_id: 'app_running',
-			app_name: 'api-service',
+			seq: 7,
+			created_at: '2026-01-01T12:00:00.000Z',
+			actor_kind: 'user',
+			actor_id: 'usr_1',
+			actor_label: 'admin@example.com',
 			action: 'deploy',
-			actor: 'admin@example.com',
-			detail: 'Deployed sha-123',
-			created_at: '2026-01-01T12:00:00.000Z'
+			resource_type: 'app',
+			resource_id: 'app_running',
+			resource_name: 'api-service',
+			outcome: 'success',
+			ip: null,
+			detail: 'Deployed sha-123'
 		}
 	],
 	serverName: 'Tond Server'
@@ -169,29 +209,61 @@ describe('dashboard home page', () => {
 		setUiContext.mockReset();
 		clearUiContext.mockReset();
 		projectsContext.mockClear();
+		api.getOnboardingStatus.mockReset().mockResolvedValue(FRESH_STATUS);
+		api.getSystemMetrics.mockReset().mockResolvedValue({
+			cpu_percent: 12,
+			mem_percent: 40,
+			disk_percent: 93,
+			mem_used: 0,
+			mem_total: 0,
+			disk_used: 0,
+			disk_total: 0,
+			containers_running: 2,
+			apps_total: 2,
+			apps_running: 1,
+			collected_at: '2026-01-01T00:00:00Z'
+		});
 	});
 
-	it('renders grouped dashboard data from route data without a local loading state', async () => {
+	it('renders health tiles and the app list from route data without a loading state', async () => {
 		render(DashboardHome, { props: { data, params: {} } });
 
 		expect(setUiContext).toHaveBeenCalledWith({ type: 'projects' });
-		expect(screen.queryByText(/loading server map/i)).not.toBeInTheDocument();
 		expect(screen.getByText('Tond Server')).toBeInTheDocument();
-		expect(screen.getAllByText('api-service').length).toBeGreaterThan(0);
-		expect(screen.getByText('app-postgres')).toBeInTheDocument();
-		expect(screen.getByText('hourly-report')).toBeInTheDocument();
-		expect(screen.getByText('UNASSIGNED_RESOURCES')).toBeInTheDocument();
-		expect(screen.getByText('worker')).toBeInTheDocument();
-		expect(screen.getByText('1/2')).toBeInTheDocument();
+		expect(screen.getByRole('link', { name: 'api-service' })).toHaveAttribute(
+			'href',
+			'/apps/app_running'
+		);
+		// The failing app is listed first and flagged.
+		expect(screen.getByText(/1 needs attention/i)).toBeInTheDocument();
+		expect(screen.getAllByRole('link', { name: /worker|api-service/ })[0]).toHaveTextContent(
+			'worker'
+		);
+		expect(screen.getByText(/1 cron job/i)).toBeInTheDocument();
 	});
 
-	it('navigates to the projects page from the new project action', async () => {
-		const user = userEvent.setup();
+	it('shows the setup checklist from the onboarding endpoint', async () => {
 		render(DashboardHome, { props: { data, params: {} } });
 
-		await user.click(screen.getByRole('button', { name: /new project/i }));
+		const checklist = await screen.findByTestId('setup-checklist');
+		expect(checklist).toHaveTextContent('1 of 5 done');
+		expect(within(checklist).getByRole('link', { name: 'Set domain' })).toHaveAttribute(
+			'href',
+			'/settings'
+		);
+		expect(within(checklist).getByRole('link', { name: 'Enable 2FA' })).toHaveAttribute(
+			'href',
+			'/profile?tab=2fa'
+		);
+		expect(within(checklist).queryByRole('link', { name: 'Connect' })).not.toBeInTheDocument();
+		expect(screen.getByTestId('last-deploy-tile')).toHaveTextContent('Nothing deployed yet.');
+	});
 
-		expect(goto).toHaveBeenCalledWith('/projects');
+	it('links the primary actions instead of navigating from click handlers', () => {
+		render(DashboardHome, { props: { data, params: {} } });
+
+		expect(screen.getByRole('link', { name: /new project/i })).toHaveAttribute('href', '/projects');
+		expect(screen.getByRole('link', { name: /new app/i })).toHaveAttribute('href', '/apps/new');
 	});
 
 	it('clears the ui context on unmount', async () => {

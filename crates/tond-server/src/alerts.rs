@@ -1,10 +1,14 @@
 // alerts.rs — Background alert checker + event firing helper
 //
-// Threshold-based checks (run every 60 s via run_alert_checker):
-//   - "cpu"        → fires if cpu_percent > threshold (app-scoped or MAX across all apps)
-//   - "memory"     → fires if (mem_used/mem_limit)*100 > threshold (app-scoped only)
+// Threshold-based checks (run every 60 s via run_alert_checker while at least
+// one enabled threshold rule exists; with none, the checker sleeps until
+// alert_rules changes):
+//   - "cpu"        → fires if CPU (% of one core) > threshold (app-scoped or MAX
+//                    across all apps), from the latest metrics sample
+//   - "memory"     → fires if memory / limit * 100 > threshold (app-scoped only)
 //   - "app_down"   → fires if app non-running for >= threshold minutes (specific app only)
-//   - "disk_usage" → fires if host disk_percent > threshold (global; app_id ignored)
+//   - "disk_usage" → fires if the data directory's filesystem is fuller than the
+//                    threshold (global; app_id ignored) — same number as the UI
 //
 // Event-based firing (called by deploy/cron code on completion):
 //   fire_event_alerts(state, event_slug, app_id?, app_name?, detail?)
@@ -16,10 +20,14 @@
 // A rule will not re-fire within 5 minutes of its last firing (threshold-based
 // only; event-based rules always fire).
 
-use crate::{notifications, state::AppState};
-use tond_common::{AlertRule, IntegrationConfig};
+use crate::runtime::changes::{Table, Watch};
+use crate::runtime::loops;
+use crate::{metrics, notifications, secrets, state::AppState};
+use tond_common::AlertRule;
 
 const CHECK_INTERVAL_SECS: u64 = 60;
+/// Longest sleep while no threshold rule exists (a rule change wakes us).
+const IDLE_SLEEP_SECS: u64 = 3600;
 /// Minimum gap between consecutive firings of the same threshold-based rule (seconds).
 const MIN_REFIRE_SECS: i64 = 300;
 
@@ -42,22 +50,34 @@ fn parse_sqlite_dt(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 // ── Threshold-based background checker ──────────────────────────────────────
 
 pub async fn run_alert_checker(state: AppState) {
+    let lp = loops::register("alerts");
+    let mut watch = Watch::new(&[Table::AlertRules]);
+    let mut sleep_secs = CHECK_INTERVAL_SECS;
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(CHECK_INTERVAL_SECS)).await;
-
-        if let Err(e) = check_all_rules(&state).await {
-            tracing::warn!("Alert checker error: {}", e);
+        lp.wait(Some(std::time::Duration::from_secs(sleep_secs)), &mut watch)
+            .await;
+        let run = lp.run();
+        match check_all_rules(&state).await {
+            Ok(0) => sleep_secs = IDLE_SLEEP_SECS,
+            Ok(_) => sleep_secs = CHECK_INTERVAL_SECS,
+            Err(e) => {
+                tracing::warn!("Alert checker error: {}", e);
+                run.fail(&e);
+                sleep_secs = CHECK_INTERVAL_SECS;
+            }
         }
     }
 }
 
-async fn check_all_rules(state: &AppState) -> anyhow::Result<()> {
+/// Evaluate every enabled threshold rule; returns how many there are.
+async fn check_all_rules(state: &AppState) -> anyhow::Result<usize> {
     // Only fetch rules that have a metric set (event-only rules skip this path)
     let rules = sqlx::query_as::<_, AlertRule>(
         "SELECT * FROM alert_rules WHERE enabled = 1 AND metric IS NOT NULL",
     )
     .fetch_all(&state.db)
     .await?;
+    let count = rules.len();
 
     for rule in rules {
         // Respect minimum re-fire interval
@@ -92,48 +112,45 @@ async fn check_all_rules(state: &AppState) -> anyhow::Result<()> {
         }
     }
 
-    Ok(())
+    Ok(count)
 }
 
-async fn check_cpu_rule(state: &AppState, rule: &AlertRule) -> anyhow::Result<Option<f64>> {
-    let row: Option<(f64,)> = if let Some(app_id) = &rule.app_id {
-        sqlx::query_as(
-            "SELECT cpu_percent FROM metrics WHERE app_id = ?
-             ORDER BY collected_at DESC LIMIT 1",
-        )
-        .bind(app_id)
-        .fetch_optional(&state.db)
-        .await?
-    } else {
-        sqlx::query_as(
-            "SELECT MAX(cpu_percent) FROM metrics
-             WHERE collected_at >= datetime('now', '-2 minutes')",
-        )
-        .fetch_optional(&state.db)
-        .await?
+/// Latest sample of an app's metrics target, if sampled in the last 2 minutes.
+async fn latest_app_sample(
+    state: &AppState,
+    app_id: &str,
+) -> anyhow::Result<Option<(metrics::Sample, i64)>> {
+    let owner = metrics::Owner::new(metrics::TargetKind::App, app_id);
+    let Some((target, mem_limit)) = metrics::store::find_target(&state.db, &owner).await? else {
+        return Ok(None);
     };
+    let since = chrono::Utc::now().timestamp() - 120;
+    Ok(metrics::store::latest_sample(&state.db, target, since)
+        .await?
+        .map(|(_, s)| (s, mem_limit)))
+}
 
-    Ok(row.and_then(|(v,)| if v > rule.threshold { Some(v) } else { None }))
+/// CPU in percent of one core (100 = one full core), as shown in the dashboard.
+async fn check_cpu_rule(state: &AppState, rule: &AlertRule) -> anyhow::Result<Option<f64>> {
+    let value = if let Some(app_id) = &rule.app_id {
+        latest_app_sample(state, app_id)
+            .await?
+            .map(|(s, _)| metrics::store::centi_to_percent(s.cpu as f64))
+    } else {
+        let since = chrono::Utc::now().timestamp() - 120;
+        metrics::store::max_app_cpu_since(&state.db, since).await?
+    };
+    Ok(value.filter(|v| *v > rule.threshold))
 }
 
 async fn check_memory_rule(state: &AppState, rule: &AlertRule) -> anyhow::Result<Option<f64>> {
-    let row: Option<(f64, f64)> = if let Some(app_id) = &rule.app_id {
-        sqlx::query_as(
-            "SELECT CAST(mem_used AS REAL), CAST(mem_limit AS REAL)
-             FROM metrics WHERE app_id = ?
-             ORDER BY collected_at DESC LIMIT 1",
-        )
-        .bind(app_id)
-        .fetch_optional(&state.db)
-        .await?
-    } else {
-        None
+    let Some(app_id) = &rule.app_id else {
+        return Ok(None);
     };
-
-    if let Some((used, limit)) = row
-        && limit > 0.0
+    if let Some((sample, limit)) = latest_app_sample(state, app_id).await?
+        && limit > 0
     {
-        let pct = (used / limit) * 100.0;
+        let pct = sample.mem as f64 / limit as f64 * 100.0;
         if pct > rule.threshold {
             return Ok(Some(pct));
         }
@@ -166,31 +183,17 @@ async fn check_app_down_rule(state: &AppState, rule: &AlertRule) -> anyhow::Resu
     Ok(None)
 }
 
+/// Disk usage of the filesystem holding the data directory — the same number
+/// the dashboard shows (both read the collector's host cache).
 async fn check_disk_usage_rule(_state: &AppState, rule: &AlertRule) -> anyhow::Result<Option<f64>> {
-    use sysinfo::Disks;
-    let disks = Disks::new_with_refreshed_list();
-
-    // Sum across all disks
-    let (used, total) = disks
-        .list()
-        .iter()
-        .fold((0u64, 0u64), |(u, t), d: &sysinfo::Disk| {
-            (
-                u + (d.total_space() - d.available_space()),
-                t + d.total_space(),
-            )
-        });
-
-    if total == 0 {
+    let Some(snapshot) = metrics::host::snapshot() else {
+        return Ok(None);
+    };
+    if snapshot.disk_total == 0 {
         return Ok(None);
     }
-
-    let pct = (used as f64 / total as f64) * 100.0;
-    if pct > rule.threshold {
-        Ok(Some(pct))
-    } else {
-        Ok(None)
-    }
+    let pct = snapshot.disk_percent();
+    Ok((pct > rule.threshold).then_some(pct))
 }
 
 async fn fire_threshold_alert(
@@ -201,11 +204,10 @@ async fn fire_threshold_alert(
     let metric = rule.metric.as_deref().unwrap_or("unknown");
 
     tracing::info!(
-        "Firing threshold alert '{}' (rule {}) metric={} → {}",
+        "Firing threshold alert '{}' (rule {}) metric={}",
         rule.name,
         rule.id,
-        metric,
-        rule.webhook_url
+        metric
     );
 
     let message = match metric {
@@ -257,7 +259,7 @@ async fn fire_threshold_alert(
 pub async fn fire_event_alerts(
     state: &AppState,
     event: &str,
-    _app_id: Option<&str>,
+    app_id: Option<&str>,
     app_name: Option<&str>,
     detail: Option<&str>,
 ) {
@@ -278,6 +280,14 @@ pub async fn fire_event_alerts(
     for rule in rules {
         let subscribed = rule.parse_events();
         if !subscribed.iter().any(|e| e == event) {
+            continue;
+        }
+        // Container events carry the id of what crashed; an app-scoped rule
+        // only hears about its own app.
+        if event.starts_with("container_")
+            && let (Some(scope), Some(id)) = (rule.app_id.as_deref(), app_id)
+            && scope != id
+        {
             continue;
         }
 
@@ -306,6 +316,8 @@ fn build_event_message(event: &str, app_name: Option<&str>, detail: Option<&str>
         "deployment_failure" => format!("Deployment failed for '{}'", name),
         "cron_success" => format!("Scheduled task '{}' completed successfully", name),
         "cron_failure" => format!("Scheduled task '{}' failed", name),
+        "container_restart" => format!("'{}' stopped unexpectedly", name),
+        "container_oom" => format!("'{}' ran out of memory", name),
         _ => format!("Event '{}' occurred for '{}'", event, name),
     };
     match detail {
@@ -317,9 +329,17 @@ fn build_event_message(event: &str, app_name: Option<&str>, detail: Option<&str>
 // ── Shared webhook helpers ───────────────────────────────────────────────────
 
 async fn post_webhook(rule: &AlertRule, event: &str, value: f64, threshold: f64, message: &str) {
-    if rule.webhook_url.is_empty() {
-        return;
-    }
+    let url = match secrets::alert_webhook_url(&rule.webhook_url) {
+        Ok(url) if !url.is_empty() => url,
+        Ok(_) => return,
+        Err(e) => {
+            tracing::warn!(
+                "alert rule {}: webhook URL cannot be decrypted: {e:#}",
+                rule.id
+            );
+            return;
+        }
+    };
     let payload = serde_json::json!({
         "rule_id":   rule.id,
         "alert":     rule.name,
@@ -333,7 +353,7 @@ async fn post_webhook(rule: &AlertRule, event: &str, value: f64, threshold: f64,
 
     let client = reqwest::Client::new();
     let _ = client
-        .post(&rule.webhook_url)
+        .post(&url)
         .json(&payload)
         .timeout(std::time::Duration::from_secs(10))
         .send()
@@ -379,7 +399,7 @@ async fn dispatch_integrations(
     };
 
     for (kind, config_json) in rows {
-        let config = match IntegrationConfig::parse(&kind, &config_json) {
+        let config = match secrets::open_integration_config(&kind, &config_json) {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(
@@ -396,6 +416,135 @@ async fn dispatch_integrations(
     }
 }
 
+// ── Test notifications ──────────────────────────────────────────────────────
+
+/// Outcome of sending a test notification to one of a rule's channels.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ChannelTestResult {
+    /// "webhook" or the integration kind ("slack", "email", …).
+    pub kind: String,
+    /// Human-readable channel name (the webhook URL's host for webhooks).
+    pub name: String,
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+/// Number of places a rule notifies: its webhook (if set) plus linked integrations.
+pub async fn channel_count(db: &sqlx::SqlitePool, rule_id: &str, webhook_url: &str) -> i64 {
+    let linked: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM alert_rule_notifications arn
+         JOIN integrations i ON i.id = arn.integration_id
+         WHERE arn.rule_id = ?",
+    )
+    .bind(rule_id)
+    .fetch_one(db)
+    .await
+    .unwrap_or(0);
+    linked + i64::from(!webhook_url.trim().is_empty())
+}
+
+/// Send a clearly-labelled test message to every channel of `rule` and report
+/// each result. Does not touch `last_fired_at`.
+pub async fn send_test_notifications(state: &AppState, rule: &AlertRule) -> Vec<ChannelTestResult> {
+    let message = format!(
+        "Test notification for alert rule '{}'. If you can read this, the channel works.",
+        rule.name
+    );
+    let mut results = Vec::new();
+
+    if !rule.webhook_url.trim().is_empty() {
+        let (name, outcome) = match secrets::alert_webhook_url(&rule.webhook_url) {
+            Ok(url) => {
+                let name = reqwest::Url::parse(&url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(str::to_string))
+                    .unwrap_or_else(|| "Webhook".to_string());
+                (
+                    name,
+                    post_webhook_checked(rule, &url, "test", &message).await,
+                )
+            }
+            Err(e) => (
+                "Webhook".to_string(),
+                Err(anyhow::anyhow!("The saved webhook URL can't be read: {e}")),
+            ),
+        };
+        results.push(ChannelTestResult {
+            kind: "webhook".to_string(),
+            name,
+            ok: outcome.is_ok(),
+            error: outcome.err().map(|e| e.to_string()),
+        });
+    }
+
+    let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
+        "SELECT i.name, i.kind, i.config, i.enabled
+         FROM alert_rule_notifications arn
+         JOIN integrations i ON i.id = arn.integration_id
+         WHERE arn.rule_id = ?
+         ORDER BY i.name",
+    )
+    .bind(&rule.id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    let payload = notifications::NotificationPayload {
+        rule_name: rule.name.clone(),
+        event_or_metric: "test".to_string(),
+        app_name: None,
+        detail: Some(message),
+        fired_at: chrono::Utc::now().to_rfc3339(),
+    };
+    for (name, kind, config_json, enabled) in rows {
+        let outcome = if enabled == 0 {
+            Err(anyhow::anyhow!(
+                "This channel is switched off on the Integrations page"
+            ))
+        } else {
+            match secrets::open_integration_config(&kind, &config_json) {
+                Ok(config) => notifications::dispatch(&config, &payload).await,
+                Err(e) => Err(anyhow::anyhow!("Invalid channel settings: {e}")),
+            }
+        };
+        results.push(ChannelTestResult {
+            kind,
+            name,
+            ok: outcome.is_ok(),
+            error: outcome.err().map(|e| e.to_string()),
+        });
+    }
+    results
+}
+
+async fn post_webhook_checked(
+    rule: &AlertRule,
+    url: &str,
+    event: &str,
+    message: &str,
+) -> anyhow::Result<()> {
+    let payload = serde_json::json!({
+        "rule_id":   rule.id,
+        "alert":     rule.name,
+        "event":     event,
+        "value":     0.0,
+        "threshold": 0.0,
+        "app_id":    rule.app_id,
+        "message":   message,
+        "fired_at":  chrono::Utc::now().to_rfc3339(),
+    });
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&payload)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        anyhow::bail!("Webhook answered HTTP {}", response.status().as_u16());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -407,6 +556,38 @@ mod tests {
 
     use super::*;
     use crate::{auth::RateLimiter, state::AppState};
+
+    /// Store one metrics sample for `app_id`, `age_secs` ago.
+    async fn seed_sample(
+        state: &AppState,
+        app_id: &str,
+        age_secs: i64,
+        cpu_percent: f64,
+        mem: i64,
+        mem_limit: i64,
+    ) {
+        let owner = metrics::Owner::new(metrics::TargetKind::App, app_id);
+        let target = metrics::store::ensure_target(&state.db, &owner)
+            .await
+            .unwrap_or_else(|err| panic!("target: {err}"));
+        metrics::store::insert_tick(
+            &state.db,
+            chrono::Utc::now().timestamp() - age_secs,
+            &[metrics::store::TickRow {
+                target,
+                sample: metrics::Sample {
+                    cpu: (cpu_percent * 100.0) as i64,
+                    mem,
+                    rx: 0,
+                    tx: 0,
+                    pids: 1,
+                },
+                mem_limit: Some(mem_limit),
+            }],
+        )
+        .await
+        .unwrap_or_else(|err| panic!("sample: {err}"));
+    }
 
     async fn test_state() -> AppState {
         let db = SqlitePool::connect("sqlite::memory:")
@@ -439,7 +620,7 @@ mod tests {
         app.created_at = updated_at.to_string();
 
         sqlx::query(
-            "INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, host_port, memory_limit, cpu_limit, status, env_vars, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, deploy_key_pub, project_id, registry_credential_id, github_app_id, gitlab_token_id, preview_enabled, preview_excluded_keys, preview_env_vars, dockerfile_content, compose_content, base_dir, static_build, created_at, updated_at)
+            "INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, host_port, memory_limit, cpu_limit, status, env_vars, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, deploy_key_pub, project_id, registry_credential_id, github_app_id, gitlab_token_id, preview_enabled, preview_shared_keys, preview_env_vars, dockerfile_content, compose_content, base_dir, static_build, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&app.id)
@@ -471,7 +652,7 @@ mod tests {
         .bind(&app.github_app_id)
         .bind(&app.gitlab_token_id)
         .bind(app.preview_enabled)
-        .bind(&app.preview_excluded_keys)
+        .bind(&app.preview_shared_keys)
         .bind(&app.preview_env_vars)
         .bind(&app.dockerfile_content)
         .bind(&app.compose_content)
@@ -554,6 +735,14 @@ mod tests {
             "build_event_message should use the cron failure template when no detail is provided"
         );
         assert_eq!(
+            build_event_message(
+                "container_restart",
+                Some("web"),
+                Some("restarted after exiting unexpectedly (exit code 1)")
+            ),
+            "'web' stopped unexpectedly: restarted after exiting unexpectedly (exit code 1)"
+        );
+        assert_eq!(
             build_event_message("custom_event", None, Some("extra")),
             "Event 'custom_event' occurred for 'unknown': extra",
             "build_event_message should fall back to the generic template for unknown events"
@@ -600,52 +789,9 @@ mod tests {
         )
         .await;
 
-        sqlx::query(
-            "INSERT INTO metrics (id, app_id, cpu_percent, mem_used, mem_limit, net_rx, net_tx, restarts, collected_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind("metric-1")
-        .bind("app-1")
-        .bind(72.0)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind("2026-01-01 00:00:00")
-        .execute(&state.db)
-        .await
-        .unwrap_or_else(|err| panic!("failed to insert first cpu metric: {err}"));
-        sqlx::query(
-            "INSERT INTO metrics (id, app_id, cpu_percent, mem_used, mem_limit, net_rx, net_tx, restarts, collected_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
-        )
-        .bind("metric-2")
-        .bind("app-1")
-        .bind(88.5)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .execute(&state.db)
-        .await
-        .unwrap_or_else(|err| panic!("failed to insert second cpu metric: {err}"));
-        sqlx::query(
-            "INSERT INTO metrics (id, app_id, cpu_percent, mem_used, mem_limit, net_rx, net_tx, restarts, collected_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
-        )
-        .bind("metric-3")
-        .bind("app-2")
-        .bind(91.0)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .execute(&state.db)
-        .await
-        .unwrap_or_else(|err| panic!("failed to insert global cpu metric: {err}"));
+        seed_sample(&state, "app-1", 3600, 72.0, 0_i64, 0_i64).await;
+        seed_sample(&state, "app-1", 0, 88.5, 0_i64, 0_i64).await;
+        seed_sample(&state, "app-2", 0, 91.0, 0_i64, 0_i64).await;
 
         let app_rule = load_rule(&state, "rule-app").await;
         let global_rule = load_rule(&state, "rule-global").await;
@@ -707,36 +853,8 @@ mod tests {
         )
         .await;
 
-        sqlx::query(
-            "INSERT INTO metrics (id, app_id, cpu_percent, mem_used, mem_limit, net_rx, net_tx, restarts, collected_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
-        )
-        .bind("metric-memory")
-        .bind("app-1")
-        .bind(0.0)
-        .bind(800_i64)
-        .bind(1000_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .execute(&state.db)
-        .await
-        .unwrap_or_else(|err| panic!("failed to insert memory metric: {err}"));
-        sqlx::query(
-            "INSERT INTO metrics (id, app_id, cpu_percent, mem_used, mem_limit, net_rx, net_tx, restarts, collected_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
-        )
-        .bind("metric-memory-zero-limit")
-        .bind("app-2")
-        .bind(0.0)
-        .bind(999_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .execute(&state.db)
-        .await
-        .unwrap_or_else(|err| panic!("failed to insert zero-limit memory metric: {err}"));
+        seed_sample(&state, "app-1", 0, 0.0, 800_i64, 1000_i64).await;
+        seed_sample(&state, "app-2", 0, 0.0, 999_i64, 0_i64).await;
 
         let memory_rule = load_rule(&state, "rule-memory").await;
         let no_app_rule = load_rule(&state, "rule-no-app").await;
@@ -839,6 +957,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn container_events_respect_the_rules_app_scope() {
+        let state = test_state().await;
+        seed_app(
+            &state,
+            "app-1",
+            "frontend",
+            "running",
+            "2026-01-01 00:00:00",
+        )
+        .await;
+        seed_app(&state, "app-2", "backend", "running", "2026-01-01 00:00:00").await;
+        for (id, app) in [
+            ("rule-app-1", Some("app-1")),
+            ("rule-app-2", Some("app-2")),
+            ("rule-all", None),
+        ] {
+            seed_alert_rule(
+                &state,
+                TestAlertRule {
+                    id,
+                    name: id,
+                    app_id: app,
+                    metric: Some("cpu"),
+                    threshold: 1000.0,
+                    events: Some(r#"["container_restart"]"#),
+                    last_fired_at: None,
+                },
+            )
+            .await;
+        }
+        fire_event_alerts(
+            &state,
+            "container_restart",
+            Some("app-1"),
+            Some("frontend"),
+            Some("restarted after exiting unexpectedly (exit code 1)"),
+        )
+        .await;
+        assert!(
+            load_rule(&state, "rule-app-1")
+                .await
+                .last_fired_at
+                .is_some()
+        );
+        assert!(load_rule(&state, "rule-all").await.last_fired_at.is_some());
+        assert!(
+            load_rule(&state, "rule-app-2")
+                .await
+                .last_fired_at
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn fire_event_alerts_updates_only_rules_subscribed_to_the_given_event() {
         let state = test_state().await;
 
@@ -935,21 +1107,7 @@ mod tests {
             },
         )
         .await;
-        sqlx::query(
-            "INSERT INTO metrics (id, app_id, cpu_percent, mem_used, mem_limit, net_rx, net_tx, restarts, collected_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
-        )
-        .bind("metric-recent")
-        .bind("app-1")
-        .bind(99.0)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .bind(0_i64)
-        .execute(&state.db)
-        .await
-        .unwrap_or_else(|err| panic!("failed to insert cpu metric for refire test: {err}"));
+        seed_sample(&state, "app-1", 0, 99.0, 0_i64, 0_i64).await;
 
         let before = load_rule(&state, "rule-recent")
             .await

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { Project, RegistryCredential } from '$lib/api';
+	import type { Project, Readiness, RegistryCredential } from '$lib/api';
 	import type { SourceSubType } from '$lib/components/wizard/app-wizard-source.svelte';
 
 	interface Volume {
@@ -17,11 +17,15 @@
 		composeContent: string;
 		buildMethod: 'dockerfile' | 'tbuild';
 		containerPort: number;
+		readiness?: Readiness;
+		readyAfterSecs?: number;
 		autoDeploy: boolean;
-		watchBranch: string;
+		branch: string;
 		baseDir: string;
 		staticBuild: boolean;
 		domain: string;
+		/** Settings' apps domain; null while unknown, '' when none is set */
+		appsDomain?: string | null;
 		healthCheckPath: string;
 		healthCheckInterval: number;
 		healthFailureThreshold: number;
@@ -46,11 +50,14 @@
 		composeContent,
 		buildMethod,
 		containerPort,
+		readiness = 'http',
+		readyAfterSecs = 10,
 		autoDeploy,
-		watchBranch,
+		branch,
 		baseDir,
 		staticBuild,
 		domain,
+		appsDomain = null,
 		healthCheckPath,
 		healthCheckInterval,
 		healthFailureThreshold,
@@ -79,16 +86,18 @@
 		dockerfile: 'Dockerfile'
 	};
 
-	let isGit = $derived(sourceSubType === 'git-public' || sourceSubType === 'git-github-app');
+	let isGit = $derived(
+		sourceSubType === 'git-public' || sourceSubType === 'git-github-app' || !!branch
+	);
 	let envKeys = $derived(Object.keys(envVars));
 
 	function getMemoryDisplay(limit: number | null, unit: 'mb' | 'gb'): string {
-		if (!limit) return 'Unlimited';
+		if (!limit) return 'No app limit (host cap: 75% of RAM)';
 		return `${limit} ${unit.toUpperCase()}`;
 	}
 
 	function getCpuDisplay(limit: number | null): string {
-		if (!limit) return 'Unlimited';
+		if (!limit) return 'All cores';
 		return `${limit} CPU${limit !== 1 ? 's' : ''}`;
 	}
 </script>
@@ -161,7 +170,18 @@
 				{:else if sourceSubType === 'image'}
 					<div><span class="text-muted-foreground">Method:</span> Pre-built image</div>
 				{/if}
-				<div><span class="text-muted-foreground">Container Port:</span> {containerPort}</div>
+				{#if readiness === 'none'}
+					<div>
+						<span class="text-muted-foreground">Kind:</span> Background worker (ready after {readyAfterSecs}s,
+						no port or domain)
+					</div>
+				{:else}
+					<div>
+						<span class="text-muted-foreground">Kind:</span>
+						{readiness === 'tcp' ? 'TCP service' : 'Web app'}
+					</div>
+					<div><span class="text-muted-foreground">Container Port:</span> {containerPort}</div>
+				{/if}
 				{#if baseDir}
 					<div>
 						<span class="text-muted-foreground">Base Directory:</span>
@@ -174,15 +194,13 @@
 				</div>
 				{#if isGit}
 					<div>
-						<span class="text-muted-foreground">Auto Deploy:</span>
-						{autoDeploy ? 'Yes' : 'No'}
+						<span class="text-muted-foreground">Branch:</span>
+						<span class="font-mono text-xs">{branch || 'main'}</span>
 					</div>
-					{#if autoDeploy}
-						<div>
-							<span class="text-muted-foreground">Watch Branch:</span>
-							<span class="font-mono text-xs">{watchBranch}</span>
-						</div>
-					{/if}
+					<div>
+						<span class="text-muted-foreground">Auto Deploy:</span>
+						{autoDeploy ? `Yes, on push to ${branch || 'main'}` : 'No'}
+					</div>
 				{/if}
 			</div>
 		</div>
@@ -195,7 +213,17 @@
 			<div class="space-y-1 text-sm">
 				<div>
 					<span class="text-muted-foreground">Domain:</span>
-					{domain || 'Auto-generated'}
+					{#if readiness === 'none'}
+						None (not routed)
+					{:else if domain}
+						{domain}
+					{:else if appsDomain}
+						<span class="font-mono">{name}.{appsDomain}</span> (automatic)
+					{:else if appsDomain === ''}
+						<span class="text-warn">None — add a custom domain after creating the app</span>
+					{:else}
+						Automatic
+					{/if}
 				</div>
 				<div>
 					<span class="text-muted-foreground">Health Path:</span>
@@ -233,7 +261,7 @@
 					<div class="pt-1">
 						<div class="text-muted-foreground">Volumes ({volumes.length}):</div>
 						{#each volumes as vol (vol.container_path)}
-							<div class="mt-0.5 truncate font-mono text-xs text-muted-foreground/80">
+							<div class="mt-0.5 truncate font-mono text-xs text-muted-foreground">
 								↳ {vol.container_path}
 							</div>
 						{/each}

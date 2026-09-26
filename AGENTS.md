@@ -115,12 +115,65 @@ VITE_MOCK_API=true          # start MSW service worker to intercept /api request
 - The base URL is `/api` (proxied to the Axum server in dev via `vite.config.ts`).
 - Add new interfaces alongside new API functions in `api.ts` — no separate type files.
 
-### Error handling (Dashboard)
+### Status, feedback and confirmations (Dashboard)
 
-- Wrap API calls in `try/catch`. Store the message in a local `$state('')` string and
-  display it in a `bg-destructive/10 text-destructive` banner near the form. Clear on
-  retry or dismiss.
-- Do not use global toast/notification stores — keep error state local to the component.
+One system for all of these — never hand-roll a pill, banner or `confirm()`:
+
+- **Status**: `<StatusBadge status={app.status} kind="app" />`
+  (`$lib/components/feedback/status-badge.svelte`). Colour + icon + text from
+  `describeStatus()` in `$lib/status.ts`; `kind` (`app`, `database`, `cron`, `run`,
+  `deployment`, `certificate`, `preview`, `snapshot`) decides whether `running` means
+  "up" or "in progress". Override with `tone`/`label` for non-API states. Add new
+  status slugs to `$lib/status.ts`, not to call sites.
+- **Errors**: `<InlineError message={error} ondismiss={() => (error = '')} />` next to
+  the form or action that failed (`role="alert"`; renders nothing when empty; optional
+  `title` and `actions` snippet). Error copy says what to do next.
+- **Success**: `<SuccessAlert message={saved} ondismiss={…} timeout={4000} />`
+  (`role="status"`, always mounted so screen readers announce it).
+- **Pending + live sync**: wrap actions in `useAction()` from `$lib/action.svelte`:
+  `const deploy = useAction(() => deployApp(id), { invalidate: true })`, then
+  `onclick={() => deploy.run()} disabled={deploy.pending}` and a pending label
+  ("Deploying…"). `run()` ignores calls while one is in flight (no double deploys),
+  records `error`, and `invalidate: true` re-runs the page's `load` so lists never go
+  stale. Per-row actions use `key` + `isPending(id)`.
+- **Confirmations**: every destructive or disruptive action goes through
+  `ConfirmDialog` (`$lib/components/dialogs/confirm-dialog.svelte`) or the imperative
+  `await confirmAction({ title, description, details, confirmLabel, onconfirm })`
+  (`$lib/confirm.svelte`, rendered by the `ConfirmHost` in the root layout). Use
+  `typedConfirmation={name}` only for irreversible data loss (delete an app or
+  database, restore a snapshot, roll back volumes); a simple confirm for stop, restart,
+  rollback, revoke and deleting config (cron jobs, alerts, channels, providers,
+  previews). `onconfirm` runs inside the dialog (pending label, inline error); make it
+  throw on failure. `details` lists exactly what is removed or overwritten.
+- Destructive actions never sit next to primary ones: put delete in a "Danger zone"
+  section (e.g. the app's Settings → Danger zone), not the page header.
+- Do not use global toast/notification stores for errors — keep error state local to
+  the component.
+- Tests: render `ConfirmHost` with `renderConfirmHost()` and drive dialogs with
+  `confirmDialog(user, { typed })` from `src/test/confirm.ts`.
+
+### Navigation, tabs and page structure (Dashboard)
+
+- Navigation is always a real link (`<a href>` or `<Button href>`), never
+  `onclick={() => goto(...)}`, so middle-click and "open in new tab" work. `goto` is for
+  redirects after an action (e.g. after delete, with `{ invalidateAll: true }`).
+- Every page sets a document title: `<PageHeader title=… section=…>` (renders the `<h1>`,
+  meta/actions snippets and the title) or `<PageTitle title=… />` for pages with a
+  custom header. Headings follow order (h1 → h2 → h3). User-provided names are never
+  re-cased (no `uppercase`/`capitalize` on names, headings or labels).
+- Tabs live in the URL (`?tab=`, plus `?section=` for the app's Settings): use
+  `<LinkTabs>` with the definitions and helpers in `$lib/tabs.ts` (`APP_TABS`,
+  `appTabHref`, `tabFromUrl`, `tabHref`) and render panels with
+  `{#if tab === '…'}`. Load a tab's data in an `$effect` on the active tab, not in a
+  click handler. Tests change the URL with `setPageUrl()` from
+  `src/test/mocks/page-state.svelte.ts`.
+- Colours: use the semantic tokens (`text-success`, `text-warn`, `text-destructive`,
+  `text-info`, `text-muted-foreground`); never raw palette colours or opacity-dimmed
+  text (`text-muted-foreground/60`). `src/test/contrast.test.ts` keeps every token at
+  WCAG AA (text 4.5:1, focus ring 3:1) in light and dark.
+- The global shell provides the Cmd/Ctrl+K palette (`$lib/command-palette.ts`), the `?`
+  shortcut overlay and `g` chords (`$lib/dashboard-shortcuts.ts` — keep `SHORTCUTS` in
+  sync), a navigation progress bar and a skip link.
 
 ### Styling
 
@@ -150,11 +203,15 @@ VITE_MOCK_API=true          # start MSW service worker to intercept /api request
 - Production target: a **single Linux VPS, x86_64 or aarch64 (ARM64)**. Both are built,
   packaged (`dist/tond-linux-<arch>`) and end-to-end tested. Keep resource usage minimal.
 - `tond-proxy` runs as the unprivileged `tond-proxy` user (only `CAP_NET_BIND_SERVICE`);
-  `tond-server` runs as root. They share `tond.db` through the `tond-proxy` group
-  (`/opt/tond/data` is `root:tond-proxy 3770`, `tond.db*` `0660`). Anything else under
-  `/opt/tond/data` must stay root-only; never make the proxy depend on Docker or on files
-  outside `tond.db`, `certs/` and `acme_account.json` (see `secure_data_dir` in
-  `release/install.sh`).
+  `tond-server` runs as root. The proxy reads `tond.db` through the `tond-proxy` group
+  (`/opt/tond/data` is `root:tond-proxy 3770`, `tond.db*` `0640`) and opens it `mode=ro`:
+  **the proxy never writes the database** — what it has to report (certificate results)
+  goes to tond-server over its control socket `proxy.sock` (owned by tond-proxy, 0600,
+  root/own-uid peers only; protocol in `tond_common::proxy_control`). tond-server keeps
+  the WAL persistent (`SQLITE_FCNTL_PERSIST_WAL`) because a read-only reader cannot
+  create `-wal`/`-shm`. Anything else under `/opt/tond/data` must stay root-only; never
+  make the proxy depend on Docker or on files outside `tond.db*`, `certs/`,
+  `acme_account.json` and `proxy.sock` (see `secure_data_dir` in `release/install.sh`).
 - Previews run pull-request code and are served only as `<id>-<app>.<preview_domain>`, a
   separate registrable domain from the dashboard (`preview_domain` setting, validated with
   the Public Suffix List in `crates/tond-server/src/domains.rs`). tond-proxy never serves
@@ -168,5 +225,21 @@ VITE_MOCK_API=true          # start MSW service worker to intercept /api request
   credential-free path is the root-only Unix socket (`TOND_SOCKET_PATH`), marked by the
   `LocalSocket` request extension that only the socket listener adds (see
   `crates/tond-server/src/auth/extractor.rs`). Never derive trust from a header either.
-- `tond-proxy` opens a fresh DB connection every 5s to poll for cert/route updates;
-  do not refactor this without considering the two-process architecture.
+- Routing is event-driven: SQL triggers bump `route_state.version` whenever anything the
+  proxy routes on changes; tond-server's SQLite update hook sees that and nudges the
+  proxy over `proxy.sock`, and a deploy stops the old container only after the proxy
+  acknowledges the new version (`proxy_link::sync_routes`). The proxy keeps one
+  persistent read-only connection and a 60 s fallback check. If you add a table or
+  column the proxy routes on, extend the `route_*` triggers (baseline schema) in a new migration.
+- Every production deploy goes through the build queue (`deploy/queue.rs`: one deploy
+  per app, newest supersedes a queued one, global build slots). Never spawn
+  `deploy::deploy` directly. Long-running work (deploys, cron runs, snapshots) is spawned
+  with `runtime::shutdown::spawn_tracked` so SIGTERM waits for it; `reconcile.rs` fixes
+  up whatever a crash left behind at startup.
+- Idle budget: background loops sleep until their next deadline or a table change
+  (`runtime::changes::Watch`), never on a short fixed tick; register them in
+  `runtime::loops` so `/api/system/self` shows their health. `e2e/budget.sh` checks RSS,
+  wakeups, DB queries and journal lines at idle.
+- Spawn child processes with `crate::process::command(..)`, not `tokio::process::Command::new`:
+  tond-server runs with `OOMScoreAdjust=-900`, and the helper resets children (git, docker CLI,
+  tar) to a neutral OOM score so they can't hide behind Tond's protection.

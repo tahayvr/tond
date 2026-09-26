@@ -1,7 +1,7 @@
 // deploy/build.rs — image build helpers
 //
 // Provides everything needed to turn source code into a Docker image:
-//   build_from_dir()             — public entry point for tarball-upload deploys
+//   build_from_dir_with_method() is also the entry point for tarball uploads
 //   build_from_git()             — clone a git repo then call build_from_dir_with_method()
 //   build_from_dir_with_method() — dispatch to the right builder based on build_method
 //   build_with_dockerfile()      — run `docker build` with streaming log output
@@ -11,18 +11,33 @@
 // All builder functions write timestamped log entries via super::core::log_deploy().
 
 use anyhow::Result;
-use tond_common::App;
+use tond_common::DeployPhase;
 
 use crate::state::AppState;
 use crate::{compose_policy, docker, volumes};
 
-use super::images;
+use super::progress;
 
 use super::core::log_deploy;
 use super::git::{
-    GIT_ALLOW_PROTOCOL, GitHttpAuth, clone_args, ensure_known_hosts, git_auth_env,
-    known_hosts_path, redact_url_credentials, ssh_command,
+    COMMIT_LOG_ARGS, CommitInfo, GIT_ALLOW_PROTOCOL, GitHttpAuth, clone_args, ensure_known_hosts,
+    git_auth_env, known_hosts_path, parse_commit_log, redact_url_credentials, ssh_command,
 };
+
+/// The commit checked out in `dir` (best-effort).
+async fn read_commit(dir: &str) -> Option<CommitInfo> {
+    let output = crate::process::command("git")
+        .args(COMMIT_LOG_ARGS)
+        .current_dir(dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_commit_log(&String::from_utf8_lossy(&output.stdout))
+}
 
 fn build_work_dir(data_dir: &str, app_name: &str) -> String {
     format!("{}/builds/{}", data_dir, app_name)
@@ -44,7 +59,7 @@ fn compose_file_path(work_dir: &str) -> String {
 /// environment: compose interpolates `${VAR}` from its own environment, and
 /// tond-server's holds TOND_SECRET_KEY. Only what docker needs is passed on.
 fn compose_command(compose_path: &str, app_name: &str) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new("docker");
+    let mut cmd = crate::process::command("docker");
     cmd.env_clear();
     for key in [
         "PATH",
@@ -76,12 +91,39 @@ pub fn compose_project_name(app_name: &str) -> String {
     app_name.to_ascii_lowercase()
 }
 
+/// Default cgroup parent for build containers: a systemd slice that
+/// install.sh caps at MemoryMax=60% (see release/tondbuild.slice).
+pub const DEFAULT_BUILD_CGROUP_PARENT: &str = "tondbuild.slice";
+
+/// Cgroup parent for `docker build` RUN steps: TOND_BUILD_CGROUP_PARENT, else
+/// DEFAULT_BUILD_CGROUP_PARENT; an empty value disables it.
+///
+/// Why a cgroup parent: BuildKit (the default builder behind `docker build`)
+/// ignores the classic builder's --memory flag, but honours --cgroup-parent
+/// for the containers that run RUN steps (the docker driver). With Docker's
+/// systemd cgroup driver the value names a slice, so every build step lands
+/// in tondbuild.slice and the slice's MemoryMax bounds all builds together.
+/// If the slice unit is missing, systemd creates it with no limit, so the flag
+/// is always safe to pass.
+fn build_cgroup_parent() -> Option<String> {
+    match std::env::var("TOND_BUILD_CGROUP_PARENT") {
+        Ok(v) if v.trim().is_empty() => None,
+        Ok(v) => Some(v.trim().to_string()),
+        Err(_) => Some(DEFAULT_BUILD_CGROUP_PARENT.to_string()),
+    }
+}
+
 fn docker_build_args<'a>(
     image_tag: &'a str,
     context_dir: &'a str,
     dockerfile_path: Option<&'a str>,
+    cgroup_parent: Option<&'a str>,
 ) -> Vec<&'a str> {
     let mut args = vec!["build"];
+    if let Some(parent) = cgroup_parent {
+        args.push("--cgroup-parent");
+        args.push(parent);
+    }
     if let Some(path) = dockerfile_path {
         args.push("-f");
         args.push(path);
@@ -232,23 +274,6 @@ pub(super) struct BuildOptions<'a> {
     pub base_dir: Option<&'a str>,
 }
 
-/// Build from a local directory (used for tarball uploads).
-///
-/// Constructs [`BuildOptions`] from the app record and delegates to
-/// [`build_from_dir_with_method`], which contains the single canonical
-/// implementation of the build-method dispatch logic.
-///
-/// The image is tagged `tond-<app>:upload`; `deploy()` re-tags it per deployment.
-pub async fn build_from_dir(state: &AppState, app: &App, dir: &str) -> Result<String> {
-    let build_opts = BuildOptions {
-        method: &app.build_method,
-        static_build: app.static_build != 0,
-        base_dir: app.base_dir.as_deref(),
-    };
-    let image_tag = images::upload_tag(&app.name);
-    build_from_dir_with_method(state, &app.id, &image_tag, dir, &build_opts, None, "upload").await
-}
-
 /// Clone a git repository and build a Docker image from it.
 ///
 /// `build_opts.method` controls which builder is used:
@@ -287,7 +312,7 @@ pub(super) async fn build_from_git(
     let key_path = deploy_key_path(&data_dir, app_id);
     let key_exists = tokio::fs::metadata(&key_path).await.is_ok();
 
-    // Clone the repo
+    // Clone the repo (the caller has started the clone phase)
     log_deploy(
         state,
         app_id,
@@ -297,7 +322,7 @@ pub(super) async fn build_from_git(
     )
     .await?;
 
-    let mut cmd = tokio::process::Command::new("git");
+    let mut cmd = crate::process::command("git");
     cmd.args(clone_args(branch, git_url, &work_dir))
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ALLOW_PROTOCOL", GIT_ALLOW_PROTOCOL);
@@ -330,9 +355,33 @@ pub(super) async fn build_from_git(
         );
     }
 
+    // Record which commit this deployment builds (before .git goes away).
+    if let Some(deployment_id) = deployment_id
+        && let Some(commit) = read_commit(&work_dir).await
+    {
+        log_deploy(
+            state,
+            app_id,
+            "info",
+            trigger_source,
+            &format!(
+                "Commit {} by {}: {}",
+                &commit.sha[..commit.sha.len().min(7)],
+                commit.author,
+                commit.message
+            ),
+        )
+        .await?;
+        progress::record_commit(state, app_id, deployment_id, &commit).await;
+    }
+
     // Drop the repository metadata before building: .git/config and history
     // must never end up in the build context or an image.
     tokio::fs::remove_dir_all(std::path::Path::new(&work_dir).join(".git")).await?;
+
+    if deployment_id.is_some() {
+        progress::start(state, app_id, DeployPhase::Build).await;
+    }
 
     let image_tag = build_from_dir_with_method(
         state,
@@ -483,9 +532,15 @@ pub(super) async fn build_with_dockerfile(
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     let dockerfile = format!("{dir}/Dockerfile");
-    let args = docker_build_args(image_tag, context_dir.unwrap_or(dir), Some(&dockerfile));
+    let cgroup_parent = build_cgroup_parent();
+    let args = docker_build_args(
+        image_tag,
+        context_dir.unwrap_or(dir),
+        Some(&dockerfile),
+        cgroup_parent.as_deref(),
+    );
 
-    let mut child = tokio::process::Command::new("docker")
+    let mut child = crate::process::command("docker")
         .args(&args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -792,7 +847,8 @@ mod tests {
             docker_build_args(
                 "tond-web",
                 "/tmp/repo",
-                Some("/tmp/repo/apps/web/Dockerfile")
+                Some("/tmp/repo/apps/web/Dockerfile"),
+                None,
             ),
             vec![
                 "build",
@@ -804,6 +860,34 @@ mod tests {
             ],
             "nested builds should point docker build at the selected Dockerfile while keeping the repo root as the build context"
         );
+    }
+
+    #[test]
+    fn builds_run_under_the_build_slice() {
+        assert_eq!(
+            docker_build_args("t", "/ctx", None, Some(DEFAULT_BUILD_CGROUP_PARENT)),
+            vec![
+                "build",
+                "--cgroup-parent",
+                "tondbuild.slice",
+                "-t",
+                "t",
+                "/ctx"
+            ]
+        );
+        // SAFETY: only this test reads TOND_BUILD_CGROUP_PARENT.
+        unsafe { std::env::remove_var("TOND_BUILD_CGROUP_PARENT") };
+        assert_eq!(
+            build_cgroup_parent().as_deref(),
+            Some(DEFAULT_BUILD_CGROUP_PARENT)
+        );
+        unsafe { std::env::set_var("TOND_BUILD_CGROUP_PARENT", " ") };
+        assert_eq!(
+            build_cgroup_parent(),
+            None,
+            "empty disables the cgroup parent"
+        );
+        unsafe { std::env::remove_var("TOND_BUILD_CGROUP_PARENT") };
     }
 
     #[tokio::test]
@@ -878,7 +962,7 @@ mod tests {
     async fn log_build_plan_metadata_writes_stack_and_runtime_details_to_deploy_logs() {
         let state = test_state().await;
         sqlx::query(
-            "INSERT INTO apps (id, name, source_type, container_port, status, env_vars, volumes, drain_timeout, build_method, auto_deploy, preview_enabled, preview_excluded_keys, preview_env_vars, static_build, created_at, updated_at)
+            "INSERT INTO apps (id, name, source_type, container_port, status, env_vars, volumes, drain_timeout, build_method, auto_deploy, preview_enabled, preview_shared_keys, preview_env_vars, static_build, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))",
         )
         .bind("app-1")

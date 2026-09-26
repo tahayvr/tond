@@ -39,8 +39,8 @@ describe('databases page', () => {
 							status: 'running',
 							db_name: 'app_db',
 							db_user: 'app_user',
-							db_password: 'secret',
-							root_password: null,
+							has_password: true,
+							has_root_password: false,
 							memory_limit: null,
 							custom_external_url: null,
 							custom_internal_url: null,
@@ -56,6 +56,6 @@ describe('databases page', () => {
 		});
 
 		expect(screen.queryByText(/loading_datastores/i)).not.toBeInTheDocument();
-		expect(screen.getByText(/1\/1 datastores_active/i)).toBeInTheDocument();
+		expect(screen.getByText(/1 of 1 running/i)).toBeInTheDocument();
 	});
 });

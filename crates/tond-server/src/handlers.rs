@@ -4,8 +4,8 @@
 // function maps directly to an Axum route registered in main.rs.
 //
 // All handlers except `health` require both:
-//   _rate: RateLimit    — enforces per-IP token bucket (429 if exceeded)
-//   _auth: RequireAuth  — requires Bearer API key or session cookie (401 if missing)
+//   _rate: RateLimit          — enforces per-IP token bucket (429 if exceeded)
+//   auth: Authz<scope::X>     — authenticated caller holding scope X (401/403)
 //
 // Return type convention:
 //   All handlers return Result<impl IntoResponse, AppError>. AppError wraps
@@ -26,6 +26,7 @@
 //   app_logs()          GET  /api/apps/{id}/logs   — last 50 deploy_logs + 100 container lines
 //   (env vars live in handlers/env.rs: masked GET, PATCH, per-key reveal)
 //   update_domain()     PUT  /api/apps/{id}/domain — set domain, upsert 'pending' cert record
+//   update_port()       PUT  /api/apps/{id}/port   — container port (next deploy)
 //   list_certs()        GET  /api/certs            — all certificate rows
 //   upload_deploy()     POST /api/apps/{id}/upload — accept .tar.gz, extract, build,
 //                                                    then deploy — all in background, returns 202
@@ -39,12 +40,15 @@ pub mod audit_log;
 pub mod auth;
 pub mod backups;
 pub mod cron;
+pub mod database_links;
 pub mod databases;
 pub mod deployments;
+pub mod domains;
 pub mod env;
 pub mod git;
 pub mod github_apps;
 pub mod gitlab_tokens;
+pub mod images;
 pub mod integrations;
 pub mod logs;
 pub mod metrics;
@@ -55,8 +59,11 @@ pub mod projects;
 pub mod registry_credentials;
 pub mod settings;
 pub mod storage_providers;
+pub mod system_self;
 pub mod templates;
 pub mod terminal;
+pub mod tokens;
+pub mod users;
 pub mod webhooks;
 
 use axum::{
@@ -69,20 +76,52 @@ use serde::Deserialize;
 use serde_json::json;
 use tond_common::*;
 
+use crate::audit_log::{AuditEntry, record};
 use crate::{
-    alerts::fire_event_alerts,
-    audit_log::{AuthActor, write_audit_log},
-    auth::{AuthRole, RateLimit, RequireAdmin, RequireAuth},
-    compose_policy, deploy, docker,
+    audit_log::write_audit_log,
+    auth::{Authz, Principal, RateLimit, principal::Actor, scope},
+    compose_policy, deploy, docker, domains as domain_rules,
     error::AppError,
+    networks, proxy_link, secrets,
     state::AppState,
-    volumes,
+    upload, volumes,
 };
 
 // ── Health ──
 
 pub async fn health() -> impl IntoResponse {
     Json(json!({ "status": "ok", "service": "tond" }))
+}
+
+/// Env vars from a request's JSON object: string values are kept, other
+/// scalars are stringified, keys must be valid variable names.
+pub(crate) fn env_map_from_json(
+    value: &serde_json::Value,
+) -> Result<std::collections::BTreeMap<String, String>, AppError> {
+    if value.is_null() {
+        return Ok(Default::default());
+    }
+    let object = value.as_object().ok_or_else(|| {
+        AppError(TondError::InvalidInput(
+            "env_vars must be an object of NAME: value pairs".to_string(),
+        ))
+    })?;
+    let mut env = std::collections::BTreeMap::new();
+    for (key, value) in object {
+        if !is_valid_env_key(key) {
+            return Err(AppError(TondError::InvalidInput(format!(
+                "'{key}' is not a valid variable name: use letters, digits and underscores, \
+                 not starting with a digit"
+            ))));
+        }
+        let value = match value {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Null => String::new(),
+            other => other.to_string(),
+        };
+        env.insert(key.clone(), value);
+    }
+    Ok(env)
 }
 
 // ── Shared lookup helper ──
@@ -112,13 +151,16 @@ pub struct ListAppsQuery {
 
 pub async fn list_apps(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::AppsRead>,
     State(state): State<AppState>,
     Query(query): Query<ListAppsQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     // If ?name= is provided, return just that one app (or 404).
     if let Some(name) = query.name {
         let app = fetch_app(&state.db, &name).await?;
+        if !auth.can_see_app(&app.id, app.project_id.as_deref()) {
+            return Err(AppError(TondError::AppNotFound(name)));
+        }
         let responses = vec![AppResponse::from(app)];
         return Ok((StatusCode::OK, Json(ApiResponse::ok(responses))));
     }
@@ -127,7 +169,12 @@ pub async fn list_apps(
         .fetch_all(&state.db)
         .await?;
 
-    let responses: Vec<AppResponse> = apps.into_iter().map(AppResponse::from).collect();
+    // Tokens limited to some apps only see those.
+    let responses: Vec<AppResponse> = apps
+        .into_iter()
+        .filter(|a| auth.can_see_app(&a.id, a.project_id.as_deref()))
+        .map(AppResponse::from)
+        .collect();
     Ok((StatusCode::OK, Json(ApiResponse::ok(responses))))
 }
 
@@ -135,32 +182,54 @@ pub async fn list_apps(
 
 pub async fn get_app(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsRead>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let app = fetch_app(&state.db, &id).await?;
-    Ok((
-        StatusCode::OK,
-        Json(ApiResponse::ok(AppResponse::from(app))),
-    ))
+    let mut response = AppResponse::from(app);
+    response.domain_warning = domain_warning(&state, response.domain.as_deref()).await;
+    Ok((StatusCode::OK, Json(ApiResponse::ok(response))))
+}
+
+/// The "same site as your dashboard" warning for an app domain, if it applies.
+async fn domain_warning(state: &AppState, domain: Option<&str>) -> Option<String> {
+    let domain = domain?;
+    let dashboard = state.settings.read().await.dashboard_domain.clone();
+    domain_rules::same_site(domain, &dashboard)
+        .then(|| domain_rules::same_site_warning(domain, &dashboard))
+}
+
+/// Normalize and validate a custom app domain against the current settings.
+/// Returns the normalized domain and the same-site warning, if any.
+async fn check_app_domain(
+    state: &AppState,
+    domain: &str,
+) -> Result<(String, Option<String>), AppError> {
+    let domain = domain_rules::normalize_domain(domain);
+    let (dashboard, preview) = {
+        let s = state.settings.read().await;
+        (s.dashboard_domain.clone(), s.preview_domain.clone())
+    };
+    let warning = domain_rules::check_custom_app_domain(&domain, &dashboard, &preview)
+        .map_err(|msg| AppError(TondError::InvalidInput(msg)))?;
+    Ok((domain, warning))
 }
 
 // ── Create App ──
 
 pub async fn create_app(
     _rate: RateLimit,
-    auth: AuthRole,
-    actor: AuthActor,
+    auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Json(req): Json<CreateAppRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    // Volumes and compose files reach the host, so only admins may set them.
+    // Volumes and compose files reach the host: they also need an admin scope.
     if req.volumes.as_ref().is_some_and(|v| !v.is_empty()) {
-        auth.ensure_admin("configure volumes")?;
+        auth.require_to(Scope::SettingsWrite, "configure volumes")?;
     }
     if req.source_type == "compose" {
-        auth.ensure_admin("deploy Docker Compose apps")?;
+        auth.require_to(Scope::SettingsWrite, "deploy Docker Compose apps")?;
     }
 
     // Validate name (alphanumeric + hyphens)
@@ -257,13 +326,15 @@ pub async fn create_app(
         req.container_port,
     );
 
-    if let Some(domain) = req.domain {
-        app.domain = Some(domain);
+    if let Some(domain) = req.domain.filter(|d| !d.trim().is_empty()) {
+        app.domain = Some(check_app_domain(&state, &domain).await?.0);
     }
 
-    if let Some(env) = req.env_vars {
-        app.env_vars = Some(env.to_string());
-    }
+    let env = match req.env_vars {
+        Some(value) => env_map_from_json(&value)?,
+        None => Default::default(),
+    };
+    secrets::seal_new_app(&mut app, &env)?;
 
     if let Some(memory_limit) = req.memory_limit {
         app.memory_limit = Some(memory_limit);
@@ -337,10 +408,16 @@ pub async fn create_app(
         app.base_dir = (!dir.is_empty()).then_some(dir);
     }
     app.static_build = if req.static_build { 1 } else { 0 };
+    apply_readiness(
+        &mut app,
+        req.readiness.as_deref(),
+        req.ready_after_secs,
+        ReadinessChange::Create,
+    )?;
 
     sqlx::query(
-		"INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, status, env_vars, memory_limit, cpu_limit, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, project_id, github_app_id, registry_credential_id, dockerfile_content, compose_content, base_dir, static_build, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		"INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, status, env_vars, memory_limit, cpu_limit, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, project_id, github_app_id, registry_credential_id, dockerfile_content, compose_content, base_dir, static_build, readiness, ready_after_secs, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 	)
 	.bind(&app.id)
 	.bind(&app.name)
@@ -371,6 +448,8 @@ pub async fn create_app(
 	.bind(&app.compose_content)
 	.bind(&app.base_dir)
 	.bind(app.static_build)
+	.bind(&app.readiness)
+	.bind(app.ready_after_secs)
 	.bind(&app.created_at)
 	.bind(&app.updated_at)
 	.execute(&state.db)
@@ -388,7 +467,7 @@ pub async fn create_app(
         Some(&app.id),
         Some(&app.name),
         "create",
-        &actor.0,
+        &auth.audit_actor(),
         None,
     )
     .await;
@@ -413,7 +492,7 @@ pub struct ValidateComposeRequest {
 
 pub async fn validate_compose(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsWrite>,
     Json(req): Json<ValidateComposeRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let name = req
@@ -439,8 +518,7 @@ pub async fn validate_compose(
 
 pub async fn delete_app(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::AppsDelete>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -454,6 +532,11 @@ pub async fn delete_app(
     } else if let Some(container_id) = &app.container_id {
         let _ = docker::remove_container(&state.docker, container_id).await;
     }
+    // The app's own network (linked databases are detached with it; the
+    // links themselves go with the row).
+    if app.project_id.is_none() {
+        docker::remove_network(&state.docker, &networks::app_network(&app.name)).await;
+    }
 
     sqlx::query("DELETE FROM apps WHERE id = ?")
         .bind(&app.id)
@@ -465,7 +548,7 @@ pub async fn delete_app(
         Some(&app.id),
         Some(&app.name),
         "delete",
-        &actor.0,
+        &auth.audit_actor(),
         None,
     )
     .await;
@@ -478,73 +561,81 @@ pub async fn delete_app(
 
 // ── Deploy App ──
 
+/// How a deploy request was triggered, for the deployment row:
+/// `(trigger_source, trigger_detail)`.
+pub(crate) fn deploy_trigger(principal: &Principal) -> (&'static str, Option<String>) {
+    match principal.actor() {
+        Actor::LocalSocket => ("cli", Some("tond CLI on the server".to_string())),
+        Actor::Token { name, .. } => ("api", Some(format!("token {name}"))),
+        Actor::User { email, .. } => ("manual", Some(email.clone())),
+    }
+}
+
+/// 202 body for a started deployment.
+pub(crate) fn deployment_started(
+    message: &str,
+    app_id: &str,
+    queued: &deploy::queue::Enqueued,
+) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiResponse::ok(queued_response(message, app_id, queued))),
+    )
+}
+
 pub async fn deploy_app(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::AppsDeploy>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
-    let mut app = fetch_app(&state.db, &id).await?;
+    let app = fetch_app(&state.db, &id).await?;
     let app_id = app.id.clone();
+    let app_name = app.name.clone();
 
-    // Deploy in background
-    let state_clone = state.clone();
-    let app_name_clone = app.name.clone();
-    let actor_str = actor.0.clone();
-    tokio::spawn(async move {
-        if let Err(e) = deploy::deploy(&state_clone, &mut app, "manual").await {
-            tracing::error!("Deploy failed for {}: {}", app.name, e);
-            let _ = sqlx::query(
-                "UPDATE apps SET status = 'failed', updated_at = datetime('now') WHERE id = ?",
-            )
-            .bind(&app.id)
-            .execute(&state_clone.db)
-            .await;
-            fire_event_alerts(
-                &state_clone,
-                "deployment_failure",
-                Some(app.id.as_str()),
-                Some(app.name.as_str()),
-                Some(&e.to_string()),
-            )
-            .await;
-        } else {
-            fire_event_alerts(
-                &state_clone,
-                "deployment_success",
-                Some(app.id.as_str()),
-                Some(app.name.as_str()),
-                None,
-            )
-            .await;
-        }
-    });
+    let (trigger, detail) = deploy_trigger(&auth);
+    let queued = deploy::start(&state, app, deploy::DeployRequest::source(trigger, detail))
+        .await
+        .map_err(|e| AppError(TondError::Internal(e.to_string())))?;
 
     write_audit_log(
         &state.db,
         Some(&app_id),
-        Some(&app_name_clone),
+        Some(&app_name),
         "deploy",
-        &actor_str,
-        None,
+        &auth.audit_actor(),
+        Some(&format!("deployment={}", queued.deployment_id)),
     )
     .await;
 
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(ApiResponse::ok(
-            json!({ "message": "Deployment started", "app_id": app_id }),
-        )),
-    ))
+    Ok(deployment_started("Deployment queued", &app_id, &queued))
+}
+
+/// Body of a 202 answer to a queued deployment (deploy/queue.rs).
+pub(crate) fn queued_response(
+    message: &str,
+    app_id: &str,
+    queued: &deploy::queue::Enqueued,
+) -> serde_json::Value {
+    json!({
+        "message": if queued.queue_position > 1 {
+            format!("{message} (position {} in the queue)", queued.queue_position)
+        } else {
+            message.to_string()
+        },
+        "app_id": app_id,
+        "deployment_id": queued.deployment_id,
+        "status": queued.status,
+        "queue_position": queued.queue_position,
+        "superseded": queued.superseded,
+    })
 }
 
 // ── Stop App ──
 
 pub async fn stop_app(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::AppsControl>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -569,7 +660,7 @@ pub async fn stop_app(
         Some(&app.id),
         Some(&app.name),
         "stop",
-        &actor.0,
+        &auth.audit_actor(),
         None,
     )
     .await;
@@ -584,8 +675,7 @@ pub async fn stop_app(
 
 pub async fn start_app(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::AppsControl>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -610,7 +700,7 @@ pub async fn start_app(
         Some(&app.id),
         Some(&app.name),
         "start",
-        &actor.0,
+        &auth.audit_actor(),
         None,
     )
     .await;
@@ -625,8 +715,7 @@ pub async fn start_app(
 
 pub async fn restart_app(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::AppsControl>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -654,7 +743,7 @@ pub async fn restart_app(
         Some(&app.id),
         Some(&app.name),
         "restart",
-        &actor.0,
+        &auth.audit_actor(),
         None,
     )
     .await;
@@ -669,7 +758,7 @@ pub async fn restart_app(
 
 pub async fn app_logs(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::LogsRead>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -706,13 +795,27 @@ pub async fn app_logs(
 
 pub async fn update_domain(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateDomainRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let app = fetch_app(&state.db, &id).await?;
+    let (domain, warning) = check_app_domain(&state, &req.domain).await?;
+    let req = UpdateDomainRequest { domain };
+
+    let taken: Option<String> =
+        sqlx::query_scalar("SELECT name FROM apps WHERE domain = ? AND id != ? LIMIT 1")
+            .bind(&req.domain)
+            .bind(&app.id)
+            .fetch_optional(&state.db)
+            .await?;
+    if let Some(other) = taken {
+        return Err(AppError(TondError::InvalidInput(format!(
+            "{} is already used by the app '{other}'",
+            req.domain
+        ))));
+    }
 
     sqlx::query("UPDATE apps SET domain = ?, updated_at = datetime('now') WHERE id = ?")
         .bind(&req.domain)
@@ -760,16 +863,18 @@ pub async fn update_domain(
         Some(&app.id),
         Some(&app.name),
         "domain_update",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("domain={}", req.domain)),
     )
     .await;
 
     Ok((
         StatusCode::OK,
-        Json(ApiResponse::ok(
-            json!({ "message": "Domain updated, certificate provisioning queued" }),
-        )),
+        Json(ApiResponse::ok(json!({
+            "message": "Domain updated, certificate provisioning queued",
+            "domain": req.domain,
+            "warning": warning,
+        }))),
     ))
 }
 
@@ -777,7 +882,7 @@ pub async fn update_domain(
 
 pub async fn list_certs(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsRead>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     let certs =
@@ -797,7 +902,7 @@ pub async fn list_certs(
 /// count is kept, so repeated retries of a broken domain still back off.
 pub async fn retry_cert(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Path(domain): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -814,6 +919,15 @@ pub async fn retry_cert(
         return Err(TondError::NotFound(format!("No certificate for {domain}")).into());
     }
 
+    // Ask tond-proxy to try right away instead of at its next scheduled pass.
+    tokio::spawn(proxy_link::request_certs(Some(domain.clone())));
+
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("cert_retry").resource("certificate", &domain, &domain),
+    )
+    .await;
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(
@@ -826,7 +940,7 @@ pub async fn retry_cert(
 
 pub async fn update_health(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateHealthRequest>,
@@ -846,6 +960,12 @@ pub async fn update_health(
     .execute(&state.db)
     .await?;
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("health_update").resource("app", &app.id, &app.name),
+    )
+    .await;
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(
@@ -858,8 +978,7 @@ pub async fn update_health(
 
 pub async fn add_volume(
     _rate: RateLimit,
-    _admin: RequireAdmin,
-    actor: AuthActor,
+    auth: Authz<(scope::AppsWrite, scope::SettingsWrite)>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<VolumeRequest>,
@@ -888,7 +1007,7 @@ pub async fn add_volume(
         Some(&app.id),
         Some(&app.name),
         "volume_add",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&detail),
     )
     .await;
@@ -905,7 +1024,7 @@ pub async fn add_volume(
 
 pub async fn remove_volume(
     _rate: RateLimit,
-    _admin: RequireAdmin,
+    auth: Authz<(scope::AppsWrite, scope::SettingsWrite)>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<VolumeRequest>,
@@ -932,6 +1051,14 @@ pub async fn remove_volume(
         .execute(&state.db)
         .await?;
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("volume_remove")
+            .resource("app", &app.id, &app.name)
+            .detail(req.container_path.clone()),
+    )
+    .await;
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(
@@ -944,8 +1071,7 @@ pub async fn remove_volume(
 
 pub async fn update_app_resources(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateAppResourcesRequest>,
@@ -968,7 +1094,7 @@ pub async fn update_app_resources(
         Some(&app.id),
         Some(&app.name),
         "resources_update",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!(
             "memory_limit={:?},cpu_limit={:?}",
             req.memory_limit, req.cpu_limit
@@ -986,7 +1112,7 @@ pub async fn update_app_resources(
 
 pub async fn update_drain_timeout(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateDrainTimeoutRequest>,
@@ -1005,6 +1131,12 @@ pub async fn update_drain_timeout(
         .execute(&state.db)
         .await?;
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("drain_timeout_update").resource("app", &app.id, &app.name),
+    )
+    .await;
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(
@@ -1013,60 +1145,281 @@ pub async fn update_drain_timeout(
     ))
 }
 
+/// Stream the multipart `file` field into `upload::extract_archive`, running
+/// on a blocking thread. Errors are user-facing (400/413 with what to do).
+async fn receive_upload(
+    multipart: &mut Multipart,
+    dest: &std::path::Path,
+    max_bytes: u64,
+) -> Result<(), AppError> {
+    let mut extracted = false;
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(e) => {
+                return Err(AppError(TondError::InvalidInput(format!(
+                    "Failed to read upload: {e}"
+                ))));
+            }
+        };
+        if field.name() != Some("file") || extracted {
+            continue;
+        }
+        extracted = true;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(8);
+        let dest_owned = dest.to_path_buf();
+        let job = tokio::task::spawn_blocking(move || {
+            upload::extract_archive(
+                upload::ArchiveReader::new(rx, max_bytes),
+                &dest_owned,
+                upload::ExtractLimits::with_max_bytes(max_bytes),
+            )
+        });
+
+        let mut field = field;
+        let mut received: u64 = 0;
+        let mut extractor_stopped = false;
+        loop {
+            match field.chunk().await {
+                Ok(Some(chunk)) => {
+                    received += chunk.len() as u64;
+                    // A send error means the extractor already stopped (it
+                    // refused the archive); its result says why. Keep reading
+                    // (and discarding) a bounded amount so the client gets
+                    // the error response instead of a reset connection.
+                    if !extractor_stopped && tx.send(Ok(chunk)).await.is_err() {
+                        extractor_stopped = true;
+                    }
+                    if extractor_stopped && received > max_bytes.saturating_mul(2) {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(std::io::Error::other(format!(
+                            "the upload was interrupted: {e}"
+                        ))))
+                        .await;
+                    break;
+                }
+            }
+        }
+        drop(tx);
+
+        let result = job.await.map_err(|e| {
+            AppError(TondError::Internal(format!(
+                "upload extraction failed: {e}"
+            )))
+        })?;
+        match result {
+            Ok(stats) => tracing::info!(
+                "Upload extracted: {} files, {} bytes",
+                stats.files,
+                stats.bytes
+            ),
+            Err(upload::UploadError::TooLarge(msg)) => {
+                return Err(AppError(TondError::PayloadTooLarge(msg)));
+            }
+            Err(upload::UploadError::Invalid(msg)) => {
+                return Err(AppError(TondError::InvalidInput(format!(
+                    "Upload refused: {msg}"
+                ))));
+            }
+            Err(upload::UploadError::Io(msg)) => {
+                return Err(AppError(TondError::Internal(format!(
+                    "Could not unpack the upload: {msg}"
+                ))));
+            }
+        }
+    }
+    if !extracted {
+        return Err(AppError(TondError::InvalidInput(
+            "The upload has no 'file' part: send the archive as multipart field 'file'".to_string(),
+        )));
+    }
+    Ok(())
+}
+
+// ── Readiness (web app / TCP service / background worker) ──
+
+/// Whether a readiness change comes from creating the app or editing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadinessChange {
+    Create,
+    Update,
+}
+
+/// Validate and apply a readiness mode to `app`. Background workers have no
+/// domain and no health check path: on create a domain is refused (it would
+/// never be routed); on update switching to a worker clears them.
+pub(crate) fn apply_readiness(
+    app: &mut App,
+    readiness: Option<&str>,
+    ready_after_secs: Option<i64>,
+    change: ReadinessChange,
+) -> Result<(), AppError> {
+    let invalid = |msg: &str| AppError(TondError::InvalidInput(msg.to_string()));
+    if let Some(value) = readiness {
+        let mode = Readiness::from_input(value)
+            .ok_or_else(|| invalid("readiness must be one of: http, tcp, none"))?;
+        app.readiness = mode.as_str().to_string();
+    }
+    if let Some(secs) = ready_after_secs {
+        if !READY_AFTER_SECS_RANGE.contains(&secs) {
+            return Err(invalid("ready_after_secs must be between 1 and 600"));
+        }
+        app.ready_after_secs = secs;
+    }
+    if app.readiness() == Readiness::None {
+        if app.source_type == "compose" {
+            return Err(invalid(
+                "Compose apps can't be background workers; publish a web service port instead",
+            ));
+        }
+        if change == ReadinessChange::Create && app.domain.is_some() {
+            return Err(invalid(
+                "Background workers have no domain: they serve no traffic. Leave the domain empty.",
+            ));
+        }
+        app.domain = None;
+        app.health_check_path = None;
+    }
+    Ok(())
+}
+
+/// PUT /api/apps/{id}/readiness body.
+#[derive(Debug, Deserialize)]
+pub struct UpdateReadinessRequest {
+    /// "http" | "tcp" | "none"
+    pub readiness: String,
+    /// For "none": seconds the container must stay up (default: unchanged)
+    pub ready_after_secs: Option<i64>,
+}
+
+// PUT /api/apps/{id}/readiness
+// How deploys decide the new container is ready. Switching to a background
+// worker ("none") removes the app's domain and health check path: a worker
+// serves no traffic and is never routed. Takes effect on the next deploy.
+pub async fn update_readiness(
+    _rate: RateLimit,
+    auth: Authz<scope::AppsWrite>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateReadinessRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let mut app = fetch_app(&state.db, &id).await?;
+    let had_domain = app.domain.clone();
+    apply_readiness(
+        &mut app,
+        Some(&req.readiness),
+        req.ready_after_secs,
+        ReadinessChange::Update,
+    )?;
+    sqlx::query(
+        "UPDATE apps SET readiness = ?, ready_after_secs = ?, domain = ?, health_check_path = ?,
+                updated_at = datetime('now') WHERE id = ?",
+    )
+    .bind(&app.readiness)
+    .bind(app.ready_after_secs)
+    .bind(&app.domain)
+    .bind(&app.health_check_path)
+    .bind(&app.id)
+    .execute(&state.db)
+    .await?;
+    let removed = match (&had_domain, &app.domain) {
+        (Some(d), None) => format!(" domain_removed={d}"),
+        _ => String::new(),
+    };
+    write_audit_log(
+        &state.db,
+        Some(&app.id),
+        Some(&app.name),
+        "readiness_update",
+        &auth.audit_actor(),
+        Some(&format!(
+            "readiness={} ready_after_secs={}{removed}",
+            app.readiness, app.ready_after_secs
+        )),
+    )
+    .await;
+    let updated = fetch_app(&state.db, &app.id).await?;
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(AppResponse::from(updated))),
+    ))
+}
+
+// ── Update Container Port ──
+//
+// PUT /api/apps/{id}/port  { "container_port": 80 }
+// The port the app listens on inside its container (also passed as $PORT).
+// Takes effect on the next deploy.
+
+#[derive(Debug, Deserialize)]
+pub struct UpdatePortRequest {
+    pub container_port: i64,
+}
+
+pub async fn update_port(
+    _rate: RateLimit,
+    auth: Authz<scope::AppsWrite>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdatePortRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let app = fetch_app(&state.db, &id).await?;
+    if !(1..=65535).contains(&req.container_port) {
+        return Err(AppError(TondError::InvalidInput(
+            "container_port must be between 1 and 65535".to_string(),
+        )));
+    }
+    sqlx::query("UPDATE apps SET container_port = ?, updated_at = datetime('now') WHERE id = ?")
+        .bind(req.container_port)
+        .bind(&app.id)
+        .execute(&state.db)
+        .await?;
+    write_audit_log(
+        &state.db,
+        Some(&app.id),
+        Some(&app.name),
+        "port_update",
+        &auth.audit_actor(),
+        Some(&format!("container_port={}", req.container_port)),
+    )
+    .await;
+    let updated = fetch_app(&state.db, &app.id).await?;
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(AppResponse::from(updated))),
+    ))
+}
+
 pub async fn upload_deploy(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::AppsDeploy>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, AppError> {
     let mut app = fetch_app(&state.db, &id).await?;
 
-    // Extract tarball from multipart upload
-    let extract_dir = format!("/tmp/tond-uploads/{}", app.name);
-    let _ = tokio::fs::remove_dir_all(&extract_dir).await;
-    tokio::fs::create_dir_all(&extract_dir).await.map_err(|e| {
+    // Extract the archive while it streams in, into a fresh private directory
+    // (see upload.rs for everything that is refused).
+    let data_dir = volumes::data_dir();
+    let extract_path = upload::create_upload_dir(&data_dir).map_err(|e| {
         AppError(TondError::Internal(format!(
-            "Failed to create upload dir: {}",
-            e
+            "Failed to create upload dir: {e}"
         )))
     })?;
-
-    while let Ok(Some(field)) = multipart.next_field().await {
-        if field.name() == Some("file") {
-            let data = field.bytes().await.map_err(|e| {
-                AppError(TondError::InvalidInput(format!(
-                    "Failed to read upload: {}",
-                    e
-                )))
-            })?;
-
-            let tar_path = format!("{}/upload.tar.gz", extract_dir);
-            tokio::fs::write(&tar_path, &data).await.map_err(|e| {
-                AppError(TondError::Internal(format!(
-                    "Failed to write tarball: {}",
-                    e
-                )))
-            })?;
-
-            // Extract tarball
-            let output = tokio::process::Command::new("tar")
-                .args(["xzf", &tar_path, "-C", &extract_dir])
-                .output()
-                .await
-                .map_err(|e| AppError(TondError::Internal(format!("Failed to run tar: {}", e))))?;
-
-            if !output.status.success() {
-                return Err(AppError(TondError::InvalidInput(
-                    "Failed to extract tarball".to_string(),
-                )));
-            }
-
-            // Remove the tar file
-            let _ = tokio::fs::remove_file(&tar_path).await;
-        }
+    let max_bytes = state.settings.read().await.upload_max_bytes;
+    if let Err(e) = receive_upload(&mut multipart, &extract_path, max_bytes).await {
+        let _ = tokio::fs::remove_dir_all(&extract_path).await;
+        return Err(e);
     }
+    let extract_dir = extract_path.to_string_lossy().into_owned();
 
     // Update source type
     sqlx::query(
@@ -1078,81 +1431,39 @@ pub async fn upload_deploy(
     app.source_type = "tarball".to_string();
 
     let app_id = app.id.clone();
-    let app_name_clone = app.name.clone();
-    let actor_str = actor.0.clone();
+    let app_name = app.name.clone();
 
-    // Build and deploy in background
-    let state_clone = state.clone();
-    let extract_dir_clone = extract_dir.clone();
-    tokio::spawn(async move {
-        // Build with the configured method.
-        match deploy::build_from_dir(&state_clone, &app, &extract_dir_clone).await {
-            Ok(_image_tag) => {
-                if let Err(e) = deploy::deploy(&state_clone, &mut app, "upload").await {
-                    tracing::error!("Deploy failed for {}: {}", app.name, e);
-                    let _ = sqlx::query(
-						"UPDATE apps SET status = 'failed', updated_at = datetime('now') WHERE id = ?",
-					)
-					.bind(&app.id)
-					.execute(&state_clone.db)
-					.await;
-                    fire_event_alerts(
-                        &state_clone,
-                        "deployment_failure",
-                        Some(app.id.as_str()),
-                        Some(app.name.as_str()),
-                        Some(&e.to_string()),
-                    )
-                    .await;
-                } else {
-                    fire_event_alerts(
-                        &state_clone,
-                        "deployment_success",
-                        Some(app.id.as_str()),
-                        Some(app.name.as_str()),
-                        None,
-                    )
-                    .await;
-                }
-            }
-            Err(e) => {
-                tracing::error!("Build failed for {}: {}", app.name, e);
-                let _ = sqlx::query(
-                    "UPDATE apps SET status = 'failed', updated_at = datetime('now') WHERE id = ?",
-                )
-                .bind(&app.id)
-                .execute(&state_clone.db)
-                .await;
-                fire_event_alerts(
-                    &state_clone,
-                    "deployment_failure",
-                    Some(app.id.as_str()),
-                    Some(app.name.as_str()),
-                    Some(&e.to_string()),
-                )
-                .await;
-            }
-        }
-
-        // Clean up
-        let _ = tokio::fs::remove_dir_all(&extract_dir_clone).await;
-    });
+    // Build and deploy in the background as one deployment (build phase
+    // included), so its log and progress show in the live deploy view.
+    let queued = deploy::start(
+        &state,
+        app,
+        deploy::DeployRequest {
+            kind: deploy::DeployKind::Upload { dir: extract_dir },
+            trigger_source: "upload".to_string(),
+            trigger_detail: deploy_trigger(&auth).1,
+        },
+    )
+    .await
+    .map_err(|e| AppError(TondError::Internal(e.to_string())))?;
 
     write_audit_log(
         &state.db,
         Some(&app_id),
-        Some(&app_name_clone),
+        Some(&app_name),
         "deploy",
-        &actor_str,
-        Some("source=upload"),
+        &auth.audit_actor(),
+        Some(&format!(
+            "source=upload deployment={}",
+            queued.deployment_id
+        )),
     )
     .await;
 
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(ApiResponse::ok(
-            json!({ "message": "Upload received, building & deploying...", "app_id": app_id }),
-        )),
+    Ok(deployment_started(
+        "Upload received; build queued",
+        &app_id,
+        &queued,
     ))
 }
 
@@ -1164,13 +1475,18 @@ pub async fn upload_deploy(
 
 pub async fn assign_project(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<AssignProjectRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let app = fetch_app(&state.db, &id).await?;
+
+    // Changing the project moves the app to another Docker network, which
+    // changes which databases it can reach (networks.rs).
+    if req.project_id != app.project_id {
+        auth.require_to(Scope::DbWrite, "move an app to another project's network")?;
+    }
 
     // If a project_id is provided, verify it exists
     if let Some(ref pid) = req.project_id {
@@ -1189,12 +1505,27 @@ pub async fn assign_project(
         .execute(&state.db)
         .await?;
 
+    // Move the running container to its new home network (project or own)
+    // and re-attach linked databases there; drop the now-unused own network.
+    if req.project_id != app.project_id {
+        let moved = App {
+            project_id: req.project_id.clone(),
+            ..app.clone()
+        };
+        networks::reconcile_app(&state, &moved)
+            .await
+            .map_err(|e| AppError(TondError::DockerError(e.to_string())))?;
+        if moved.project_id.is_some() {
+            docker::remove_network(&state.docker, &networks::app_network(&app.name)).await;
+        }
+    }
+
     write_audit_log(
         &state.db,
         Some(&app.id),
         Some(&app.name),
         "assign_project",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!(
             "project_id={}",
             req.project_id.as_deref().unwrap_or("null")
@@ -1231,8 +1562,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        audit_log::AuthActor,
-        auth::{RateLimiter, RequireAdmin, RequireAuth, extractor::Role, rate_limit::RateLimit},
+        auth::{Authz, Principal, RateLimiter, rate_limit::RateLimit},
         state::AppState,
     };
 
@@ -1330,8 +1660,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(CreateAppRequest {
                 name: "bad name".to_string(),
@@ -1358,6 +1687,8 @@ mod tests {
                 compose_content: None,
                 base_dir: None,
                 static_build: false,
+                readiness: None,
+                ready_after_secs: None,
             }),
         )
         .await
@@ -1377,8 +1708,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(CreateAppRequest {
                 name: "demo".to_string(),
@@ -1405,6 +1735,8 @@ mod tests {
                 compose_content: None,
                 base_dir: None,
                 static_build: false,
+                readiness: None,
+                ready_after_secs: None,
             }),
         )
         .await
@@ -1424,8 +1756,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(CreateAppRequest {
                 name: "demo".to_string(),
@@ -1452,6 +1783,8 @@ mod tests {
                 compose_content: None,
                 base_dir: None,
                 static_build: false,
+                readiness: None,
+                ready_after_secs: None,
             }),
         )
         .await
@@ -1471,8 +1804,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(CreateAppRequest {
                 name: "demo".to_string(),
@@ -1499,6 +1831,8 @@ mod tests {
                 compose_content: None,
                 base_dir: None,
                 static_build: false,
+                readiness: None,
+                ready_after_secs: None,
             }),
         )
         .await
@@ -1518,8 +1852,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(CreateAppRequest {
                 name: "demo".to_string(),
@@ -1546,6 +1879,8 @@ mod tests {
                 compose_content: None,
                 base_dir: None,
                 static_build: false,
+                readiness: None,
+                ready_after_secs: None,
             }),
         )
         .await
@@ -1565,8 +1900,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(CreateAppRequest {
                 name: "demo".to_string(),
@@ -1593,6 +1927,8 @@ mod tests {
                 compose_content: None,
                 base_dir: None,
                 static_build: false,
+                readiness: None,
+                ready_after_secs: None,
             }),
         )
         .await
@@ -1612,8 +1948,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(CreateAppRequest {
                 name: "demo-image".to_string(),
@@ -1640,6 +1975,8 @@ mod tests {
                 compose_content: None,
                 base_dir: None,
                 static_build: false,
+                readiness: None,
+                ready_after_secs: None,
             }),
         )
         .await
@@ -1659,8 +1996,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(CreateAppRequest {
                 name: "demo-dockerfile".to_string(),
@@ -1687,6 +2023,8 @@ mod tests {
                 compose_content: None,
                 base_dir: None,
                 static_build: false,
+                readiness: None,
+                ready_after_secs: None,
             }),
         )
         .await
@@ -1705,8 +2043,7 @@ mod tests {
         let state = test_state().await;
         let response = create_app(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(CreateAppRequest {
                 name: "inline-dockerfile".to_string(),
@@ -1733,6 +2070,8 @@ mod tests {
                 compose_content: None,
                 base_dir: None,
                 static_build: false,
+                readiness: None,
+                ready_after_secs: None,
             }),
         )
         .await
@@ -1754,8 +2093,7 @@ mod tests {
         let state = test_state().await;
         let response = create_app(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(CreateAppRequest {
                 name: "image-app".to_string(),
@@ -1782,6 +2120,8 @@ mod tests {
                 compose_content: None,
                 base_dir: None,
                 static_build: false,
+                readiness: None,
+                ready_after_secs: None,
             }),
         )
         .await
@@ -1802,8 +2142,7 @@ mod tests {
         let state = test_state().await;
         let response = create_app(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Json(CreateAppRequest {
                 name: "demo".to_string(),
@@ -1834,6 +2173,8 @@ mod tests {
                 compose_content: None,
                 base_dir: Some("services/api".to_string()),
                 static_build: true,
+                readiness: None,
+                ready_after_secs: None,
             }),
         )
         .await
@@ -1877,7 +2218,7 @@ mod tests {
 
         let response = list_apps(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Query(ListAppsQuery {
                 name: Some("demo".to_string()),
@@ -1904,14 +2245,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_port_validates_and_saves_the_container_port() {
+        let state = test_state().await;
+        let app = seed_app(&state, "portapp").await;
+        let bad = update_port(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            State(state.clone()),
+            Path(app.id.clone()),
+            Json(UpdatePortRequest { container_port: 0 }),
+        )
+        .await;
+        assert!(bad.is_err(), "port 0 is rejected");
+        update_port(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            State(state.clone()),
+            Path(app.id.clone()),
+            Json(UpdatePortRequest { container_port: 80 }),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("update_port should succeed: {}", err.0));
+        let port: i64 = sqlx::query_scalar("SELECT container_port FROM apps WHERE id = ?")
+            .bind(&app.id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_else(|err| panic!("read port: {err}"));
+        assert_eq!(port, 80);
+    }
+
+    #[test]
+    fn readiness_rules_for_workers() {
+        let mut app = App::new("w".into(), "image".into(), None, None, 3000);
+        app.domain = Some("w.example.com".into());
+        app.health_check_path = Some("/health".into());
+        assert!(
+            apply_readiness(
+                &mut app.clone(),
+                Some("none"),
+                None,
+                ReadinessChange::Create
+            )
+            .is_err(),
+            "a worker can't be created with a domain"
+        );
+        apply_readiness(&mut app, Some("none"), Some(20), ReadinessChange::Update)
+            .unwrap_or_else(|e| panic!("update to worker: {}", e.0));
+        assert_eq!(app.readiness(), Readiness::None);
+        assert_eq!(app.ready_after_secs, 20);
+        assert!(app.domain.is_none() && app.health_check_path.is_none());
+        assert!(apply_readiness(&mut app, Some("udp"), None, ReadinessChange::Update).is_err());
+        assert!(apply_readiness(&mut app, None, Some(0), ReadinessChange::Update).is_err());
+        let mut compose = App::new("c".into(), "compose".into(), None, None, 80);
+        assert!(
+            apply_readiness(&mut compose, Some("none"), None, ReadinessChange::Create).is_err()
+        );
+        let mut tcp = App::new("t".into(), "image".into(), None, None, 6379);
+        apply_readiness(&mut tcp, Some("tcp"), None, ReadinessChange::Create)
+            .unwrap_or_else(|e| panic!("tcp: {}", e.0));
+        assert_eq!(tcp.readiness(), Readiness::Tcp);
+    }
+
+    #[tokio::test]
+    async fn update_readiness_switches_to_a_worker_and_drops_the_domain() {
+        let state = test_state().await;
+        let app = seed_app(&state, "jobs").await;
+        sqlx::query("UPDATE apps SET domain = 'jobs.example.com' WHERE id = ?")
+            .bind(&app.id)
+            .execute(&state.db)
+            .await
+            .unwrap_or_else(|err| panic!("seed domain: {err}"));
+        update_readiness(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            State(state.clone()),
+            Path(app.id.clone()),
+            Json(UpdateReadinessRequest {
+                readiness: "none".into(),
+                ready_after_secs: Some(15),
+            }),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("update_readiness should succeed: {}", err.0));
+        let (readiness, secs, domain): (String, i64, Option<String>) =
+            sqlx::query_as("SELECT readiness, ready_after_secs, domain FROM apps WHERE id = ?")
+                .bind(&app.id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap_or_else(|err| panic!("read: {err}"));
+        assert_eq!((readiness.as_str(), secs, domain), ("none", 15, None));
+    }
+
+    #[test]
+    fn deploy_trigger_names_the_caller() {
+        assert_eq!(deploy_trigger(&Principal::local_socket()).0, "cli");
+        assert_eq!(
+            deploy_trigger(&Principal::test_token(ScopeSet::all(), None)),
+            ("api", Some("token test-token".to_string()))
+        );
+        assert_eq!(
+            deploy_trigger(&Principal::test_user(Role::Deployer)),
+            ("manual", Some("deployer@example.com".to_string()))
+        );
+    }
+
+    #[tokio::test]
     async fn update_domain_sets_domain_and_creates_pending_certificate_record() {
         let state = test_state().await;
         let app = seed_app(&state, "demo").await;
 
         let response = update_domain(
             RateLimit,
-            RequireAuth,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.id.clone()),
             Json(UpdateDomainRequest {
@@ -1965,7 +2410,7 @@ mod tests {
 
         let response = update_health(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.id.clone()),
             Json(UpdateHealthRequest {
@@ -2016,8 +2461,7 @@ mod tests {
 
         let error = add_volume(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Path(app.id),
             Json(VolumeRequest {
@@ -2044,8 +2488,7 @@ mod tests {
 
         let add_response = add_volume(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.id.clone()),
             Json(VolumeRequest {
@@ -2079,8 +2522,7 @@ mod tests {
 
         let error = add_volume(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.id.clone()),
             Json(VolumeRequest {
@@ -2100,7 +2542,7 @@ mod tests {
 
         let remove_response = remove_volume(
             RateLimit,
-            RequireAdmin,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.id.clone()),
             Json(VolumeRequest {
@@ -2138,8 +2580,7 @@ mod tests {
         for host_path in ["/", "/etc", "/var/run/docker.sock", "/opt/tond/data"] {
             let error = add_volume(
                 RateLimit,
-                RequireAdmin,
-                AuthActor("admin@example.com".to_string()),
+                Authz::unchecked(Principal::test_user(Role::Admin)),
                 State(state.clone()),
                 Path(app.id.clone()),
                 Json(VolumeRequest {
@@ -2199,12 +2640,13 @@ mod tests {
             compose_content: None,
             base_dir: None,
             static_build: false,
+            readiness: None,
+            ready_after_secs: None,
         };
 
         let error = create_app(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Json(request),
         )
@@ -2249,11 +2691,12 @@ mod tests {
             compose_content: None,
             base_dir: None,
             static_build: false,
+            readiness: None,
+            ready_after_secs: None,
         };
         let error = create_app(
             RateLimit,
-            AuthRole(Role::Member),
-            AuthActor("member@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Deployer)),
             State(state.clone()),
             Json(request),
         )
@@ -2289,6 +2732,8 @@ mod tests {
             compose_content: Some(content.to_string()),
             base_dir: None,
             static_build: false,
+            readiness: None,
+            ready_after_secs: None,
         }
     }
 
@@ -2297,8 +2742,7 @@ mod tests {
         let state = test_state().await;
         let error = create_app(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Json(compose_request(
                 "evil",
@@ -2316,8 +2760,7 @@ mod tests {
         // Members can't deploy compose apps at all; admins can deploy clean ones.
         let error = create_app(
             RateLimit,
-            AuthRole(Role::Member),
-            AuthActor("member@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Deployer)),
             State(state.clone()),
             Json(compose_request(
                 "member-compose",
@@ -2331,8 +2774,7 @@ mod tests {
 
         let response = create_app(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(compose_request(
                 "clean",
@@ -2349,7 +2791,7 @@ mod tests {
     async fn validate_compose_lists_problems_without_failing_the_request() {
         let response = validate_compose(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             Json(ValidateComposeRequest {
                 app_name: Some("web".to_string()),
                 compose_content: "services:\n  a:\n    image: x\n    privileged: true\n"
@@ -2369,7 +2811,7 @@ mod tests {
 
         let response = validate_compose(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             Json(ValidateComposeRequest {
                 app_name: None,
                 compose_content: "services:\n  a:\n    image: x\n".to_string(),
@@ -2389,7 +2831,7 @@ mod tests {
 
         let error = update_drain_timeout(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Path(app.id),
             Json(UpdateDrainTimeoutRequest { drain_timeout: -1 }),
@@ -2412,8 +2854,7 @@ mod tests {
 
         let error = assign_project(
             RateLimit,
-            RequireAuth,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.id.clone()),
             Json(AssignProjectRequest {
@@ -2432,8 +2873,7 @@ mod tests {
         seed_project(&state, "project-1", "Platform").await;
         let response = assign_project(
             RateLimit,
-            RequireAuth,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.id.clone()),
             Json(AssignProjectRequest {
@@ -2480,7 +2920,7 @@ mod tests {
 
         let response = retry_cert(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path("x.example.com".to_string()),
         )
@@ -2500,11 +2940,188 @@ mod tests {
 
         let missing = retry_cert(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Path("nope.example.com".to_string()),
         )
         .await;
         assert!(missing.is_err(), "unknown domains are a 404");
+    }
+
+    /// Run `receive_upload` behind a real axum router so the Multipart
+    /// extractor parses a genuine multipart body.
+    async fn post_upload(body: Vec<u8>, max_bytes: u64) -> (StatusCode, String, tempfile::TempDir) {
+        use tower::ServiceExt;
+
+        let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let dest = dir.path().to_path_buf();
+        let router = axum::Router::new().route(
+            "/upload",
+            axum::routing::post(move |mut multipart: Multipart| {
+                let dest = dest.clone();
+                async move {
+                    match receive_upload(&mut multipart, &dest, max_bytes).await {
+                        Ok(()) => StatusCode::OK.into_response(),
+                        Err(e) => e.into_response(),
+                    }
+                }
+            })
+            .layer(axum::extract::DefaultBodyLimit::disable()),
+        );
+        let boundary = "tondtestboundary";
+        let mut payload = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"upload.tar.gz\"\r\nContent-Type: application/gzip\r\n\r\n"
+        )
+        .into_bytes();
+        payload.extend_from_slice(&body);
+        payload.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(axum::body::Body::from(payload))
+            .unwrap_or_else(|e| panic!("request: {e}"));
+        let response = router
+            .oneshot(request)
+            .await
+            .unwrap_or_else(|e| panic!("router: {e}"));
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        (status, String::from_utf8_lossy(&bytes).into_owned(), dir)
+    }
+
+    fn gzip_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, content) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, *content)
+                .unwrap_or_else(|e| panic!("append: {e}"));
+        }
+        let tar = builder.into_inner().unwrap_or_else(|e| panic!("tar: {e}"));
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(&tar).unwrap_or_else(|e| panic!("gz: {e}"));
+        enc.finish().unwrap_or_else(|e| panic!("gz: {e}"))
+    }
+
+    #[tokio::test]
+    async fn receive_upload_extracts_a_streamed_multipart_archive() {
+        let archive = gzip_tar(&[("Dockerfile", b"FROM scratch\n"), ("src/app.txt", b"hi")]);
+        let (status, body, dir) = post_upload(archive, 1024 * 1024).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "valid upload should extract: {body}"
+        );
+        assert!(dir.path().join("Dockerfile").is_file());
+        assert!(dir.path().join("src/app.txt").is_file());
+    }
+
+    #[tokio::test]
+    async fn receive_upload_refuses_oversized_archives_with_413() {
+        let big = vec![0u8; 3 * 1024 * 1024];
+        let archive = gzip_tar(&[("big.bin", &big)]);
+        let (status, body, _dir) = post_upload(archive, 1024 * 1024).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "body: {body}");
+        assert!(
+            body.contains(".tondignore"),
+            "the error should say how to fix it: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_upload_refuses_malicious_archives_with_400() {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        builder
+            .append_link(&mut header, "passwd", "/etc/passwd")
+            .unwrap_or_else(|e| panic!("append link: {e}"));
+        let tar = builder.into_inner().unwrap_or_else(|e| panic!("tar: {e}"));
+        let (status, body, _dir) = post_upload(tar, 1024 * 1024).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(body.contains("outside the project"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn update_domain_warns_on_the_dashboard_site_and_refuses_unroutable_domains() {
+        let state = test_state().await;
+        {
+            let mut s = state.settings.write().await;
+            s.dashboard_domain = "dash.example.com".to_string();
+            s.preview_domain = "example-previews.com".to_string();
+        }
+        let app = seed_app(&state, "demo").await;
+        let set = |domain: &str| {
+            let state = state.clone();
+            let id = app.id.clone();
+            let domain = domain.to_string();
+            async move {
+                update_domain(
+                    RateLimit,
+                    Authz::unchecked(Principal::test_user(Role::Admin)),
+                    State(state),
+                    Path(id),
+                    Json(UpdateDomainRequest { domain }),
+                )
+                .await
+                .map(IntoResponse::into_response)
+            }
+        };
+
+        let response = set(" Shop.Example.com ")
+            .await
+            .unwrap_or_else(|err| panic!("same-site custom domains are allowed: {}", err.0));
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        assert_eq!(
+            json["data"]["domain"], "shop.example.com",
+            "domains are normalized"
+        );
+        assert!(
+            json["data"]["warning"]
+                .as_str()
+                .is_some_and(|w| w.contains("same site as your dashboard")),
+            "a same-site domain comes back with a warning: {json}"
+        );
+
+        let detail = get_app(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            State(state.clone()),
+            Path(app.id.clone()),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("get_app: {}", err.0))
+        .into_response();
+        let body = to_bytes(detail.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        assert!(
+            json["data"]["domain_warning"].is_string(),
+            "the app detail carries the warning too: {json}"
+        );
+
+        for bad in [
+            "dash.example.com",
+            "pr.example-previews.com",
+            "not a domain",
+        ] {
+            assert!(set(bad).await.is_err(), "{bad} must be refused");
+        }
     }
 }

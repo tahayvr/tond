@@ -1,113 +1,101 @@
 <script lang="ts">
-	import { goto } from '$app/navigation';
 	import { cn } from '$lib/utils';
-	import Activity from '~icons/ri/pulse-line';
-	import type { AuditLogEntry, App } from '$lib/api';
+	import { Badge } from '$lib/components/ui/badge/index.js';
+	import UserIcon from '~icons/ri/user-line';
+	import KeyIcon from '~icons/ri/key-2-line';
+	import TerminalIcon from '~icons/ri/terminal-box-line';
+	import CpuIcon from '~icons/ri/cpu-line';
+	import QuestionIcon from '~icons/ri/question-line';
+	import ShieldIcon from '~icons/ri/shield-keyhole-line';
+	import type { AuditLogEntry } from '$lib/api';
+	import { actionLabel, actorLabel, isSecurityAction, relativeTime } from '$lib/access';
 
 	interface Props {
 		entries: AuditLogEntry[];
-		apps: App[];
+		/** Show only entries from this actor when their name is clicked */
+		onFilterActor?: (actor: string) => void;
 	}
 
-	let { entries, apps }: Props = $props();
+	let { entries, onFilterActor }: Props = $props();
 
-	function appName(appId: string | null): string {
-		if (!appId) return '—';
-		return apps.find((a) => a.id === appId)?.name ?? appId.slice(0, 8);
-	}
+	const kindIcon = {
+		user: UserIcon,
+		token: KeyIcon,
+		local_socket: TerminalIcon,
+		system: CpuIcon,
+		anonymous: QuestionIcon
+	} as Record<string, typeof UserIcon>;
 
-	function actionColor(action: string): string {
-		switch (action) {
-			case 'delete':
-				return 'text-destructive';
-			case 'create':
-			case 'deploy':
-				return 'text-success';
-			case 'stop':
-				return 'text-warn';
+	function resourceHref(e: AuditLogEntry): string | null {
+		if (!e.resource_id) return null;
+		switch (e.resource_type) {
+			case 'app':
+				return `/apps/${e.resource_id}`;
+			case 'database':
+				return `/databases/${e.resource_id}`;
+			case 'project':
+				return `/projects/${e.resource_id}`;
 			default:
-				return 'text-muted-foreground';
+				return null;
 		}
+	}
+
+	function absolute(iso: string) {
+		return new Date(iso).toLocaleString();
 	}
 </script>
 
-<div class="relative overflow-hidden rounded-lg border border-border bg-card">
-	<div
-		class="pointer-events-none absolute inset-0 opacity-30"
-		style="background-image: 
-			linear-gradient(to right, rgba(255,255,255,0.03) 1px, transparent 1px),
-			linear-gradient(to bottom, rgba(255,255,255,0.03) 1px, transparent 1px);
-		background-size: 40px 40px;"
-	></div>
-
-	<div class="relative">
-		<div class="flex items-center gap-2 border-b border-border p-4">
-			<Activity class="h-4 w-4 text-muted-foreground/70" />
-			<span class="font-mono text-[10px] tracking-wider text-muted-foreground/70 uppercase">
-				EVENT_LOG ({entries.length} ENTRIES)
-			</span>
-		</div>
-
-		<table class="w-full text-sm">
-			<thead>
-				<tr class="border-b border-border bg-muted/50">
-					<th
-						class="px-4 py-3 text-left font-mono text-[10px] font-medium tracking-wider text-muted-foreground/70 uppercase"
+<ol class="divide-y divide-border rounded-lg border border-border bg-card" aria-label="Activity">
+	{#each entries as entry (entry.seq)}
+		{@const Icon = kindIcon[entry.actor_kind] ?? QuestionIcon}
+		{@const href = resourceHref(entry)}
+		<li
+			class={cn(
+				'grid gap-1 px-4 py-3 text-sm sm:grid-cols-[8rem_1fr] sm:gap-4',
+				entry.outcome === 'failure' && 'bg-destructive/5'
+			)}
+		>
+			<time
+				datetime={entry.created_at}
+				title={absolute(entry.created_at)}
+				class="text-xs text-muted-foreground sm:pt-0.5"
+			>
+				{relativeTime(entry.created_at)}
+			</time>
+			<div class="min-w-0 space-y-1">
+				<p class="flex flex-wrap items-center gap-x-1.5 gap-y-1">
+					<button
+						type="button"
+						class="inline-flex max-w-full items-center gap-1 font-medium hover:underline"
+						title="Show only this actor"
+						onclick={() => onFilterActor?.(entry.actor_label)}
 					>
-						Time
-					</th>
-					<th
-						class="px-4 py-3 text-left font-mono text-[10px] font-medium tracking-wider text-muted-foreground/70 uppercase"
-					>
-						Action
-					</th>
-					<th
-						class="px-4 py-3 text-left font-mono text-[10px] font-medium tracking-wider text-muted-foreground/70 uppercase"
-					>
-						Unit
-					</th>
-					<th
-						class="px-4 py-3 text-left font-mono text-[10px] font-medium tracking-wider text-muted-foreground/70 uppercase"
-					>
-						Operator
-					</th>
-					<th
-						class="px-4 py-3 text-left font-mono text-[10px] font-medium tracking-wider text-muted-foreground/70 uppercase"
-					>
-						Detail
-					</th>
-				</tr>
-			</thead>
-			<tbody>
-				{#each entries as entry (entry.id)}
-					<tr class="border-b border-border/50 last:border-0 hover:bg-muted/50">
-						<td class="px-4 py-3 font-mono text-[10px] whitespace-nowrap text-muted-foreground/60">
-							{new Date(entry.created_at).toLocaleString()}
-						</td>
-						<td class="px-4 py-3">
-							<span class={cn('font-mono text-[10px] uppercase', actionColor(entry.action))}>
-								{entry.action}
-							</span>
-						</td>
-						<td class="px-4 py-3 font-mono text-[10px]">
-							{#if entry.app_id}
-								<button
-									onclick={() => goto(`/apps/${entry.app_id}`)}
-									class="text-muted-foreground hover:text-foreground hover:underline"
-								>
-									{entry.app_name ?? appName(entry.app_id)}
-								</button>
-							{:else}
-								<span class="text-muted-foreground/60">{entry.app_name ?? '—'}</span>
-							{/if}
-						</td>
-						<td class="px-4 py-3 font-mono text-[10px] text-muted-foreground/60">{entry.actor}</td>
-						<td class="max-w-xs truncate px-4 py-3 font-mono text-[10px] text-muted-foreground/60">
-							{entry.detail ?? '—'}
-						</td>
-					</tr>
-				{/each}
-			</tbody>
-		</table>
-	</div>
-</div>
+						<Icon class="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+						<span class="truncate">{actorLabel(entry)}</span>
+					</button>
+					<span class="text-muted-foreground">{actionLabel(entry.action)}</span>
+					{#if entry.resource_name}
+						{#if href}
+							<a {href} class="font-medium hover:underline">{entry.resource_name}</a>
+						{:else}
+							<span class="font-medium">{entry.resource_name}</span>
+						{/if}
+					{/if}
+					{#if entry.outcome === 'failure'}
+						<Badge variant="destructive" class="text-[10px]">failed</Badge>
+					{:else if isSecurityAction(entry.action)}
+						<ShieldIcon class="size-3.5 text-muted-foreground" aria-label="Security event" />
+					{/if}
+				</p>
+				{#if entry.detail || entry.ip}
+					<p class="truncate font-mono text-xs text-muted-foreground" title={entry.detail ?? ''}>
+						{#if entry.detail}{entry.detail}{/if}
+						{#if entry.ip}<span class="text-muted-foreground">
+								{entry.detail ? ' · ' : ''}from {entry.ip}</span
+							>{/if}
+					</p>
+				{/if}
+			</div>
+		</li>
+	{/each}
+</ol>

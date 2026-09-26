@@ -247,7 +247,7 @@
 				background: 'transparent',
 				foreground: 'hsl(var(--foreground))'
 			},
-			fontFamily: 'JetBrains Mono, ui-monospace, monospace',
+			fontFamily: "'JetBrains Mono Variable', ui-monospace, monospace",
 			fontSize: 13,
 			scrollback: 4000
 		});

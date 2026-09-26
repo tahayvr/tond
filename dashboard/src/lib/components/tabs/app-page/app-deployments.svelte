@@ -1,40 +1,68 @@
 <script lang="ts">
+	// Deployment history: what ran (commit or image), who triggered it, how long
+	// it took and why it failed. Each row opens its deploy log; "Roll back to
+	// this" restores a deployment's exact image after a confirmation that names
+	// the target and what stays as it is.
 	import { Button } from '$lib/components/ui/button/index.js';
 	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import type { Deployment } from '$lib/api';
+	import {
+		deploymentSubject,
+		formatDuration,
+		relativeTime,
+		shortSha,
+		statusView,
+		triggerLabel
+	} from '$lib/deploy-view';
+	import { cn } from '$lib/utils';
 	import { Badge } from '$lib/components/ui/badge/index.js';
 	import * as Dialog from '$lib/components/ui/dialog/index.js';
 	import * as Tooltip from '$lib/components/ui/tooltip/index.js';
 	import { Textarea } from '$lib/components/ui/textarea/index.js';
 	import HistoryIcon from '~icons/ri/history-line';
+	import DoneIcon from '~icons/ri/checkbox-circle-fill';
+	import FailedIcon from '~icons/ri/close-circle-fill';
+	import SpinnerIcon from '~icons/ri/loader-4-line';
+	import WaitIcon from '~icons/ri/hourglass-line';
+	import NeutralIcon from '~icons/ri/indeterminate-circle-line';
+	import ChevronIcon from '~icons/ri/arrow-right-s-line';
 
 	interface Props {
+		appId: string;
+		appName?: string;
 		deployments: Deployment[];
 		loading: boolean;
 		error: string;
-		/** Restore a deployment's exact image; no id = the previous distinct image */
-		onRollback: (deploymentId?: string) => void | Promise<void>;
+		/** Restore a deployment's exact image */
+		onRollback: (deploymentId: string) => void | Promise<void>;
 		onViewGeneratedDockerfile: (deploymentId: string) => Promise<string>;
+		/** The user may roll back (apps:rollback). */
+		canRollback?: boolean;
 	}
 
-	let { deployments, loading, error, onRollback, onViewGeneratedDockerfile }: Props = $props();
+	let {
+		appId,
+		appName = 'this app',
+		deployments,
+		loading,
+		error,
+		onRollback,
+		onViewGeneratedDockerfile,
+		canRollback = true
+	}: Props = $props();
 	let dockerfileDialogOpen = $state(false);
 	let dockerfileLoading = $state(false);
 	let dockerfileError = $state('');
 	let dockerfileContent = $state('');
 	let selectedDeploymentId = $state('');
 
-	// Restore confirmation
+	// Rollback confirmation
 	let confirmTarget = $state<Deployment | null>(null);
 	let confirmOpen = $state(false);
 	let restoring = $state(false);
 
-	/** The deployment the plain "Roll back" button restores (server picks the same). */
+	/** What "Roll back to previous" restores (the server picks the same one). */
 	let previousTarget = $derived(deployments.find((d) => d.rollback_available) ?? null);
-
-	function shortImage(tag: string | null): string {
-		return tag ?? '-';
-	}
 
 	function handleAskRestore(d: Deployment) {
 		confirmTarget = d;
@@ -73,13 +101,14 @@
 		<ErrorAlert title="Rollback failed" description={error} />
 	{/if}
 
-	<div class="flex items-start justify-between gap-4">
+	<div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
 		<div class="space-y-1">
-			<p class="text-sm text-muted-foreground">Last 20 deployments for this app.</p>
-			<p class="text-xs text-muted-foreground/80">
-				Rolling back restores the exact image a deployment ran. Current environment variables,
-				volumes and resource limits are kept. Images of the last 3 successful deployments stay on
-				the server; older ones are pruned to save disk space.
+			<p class="text-sm text-muted-foreground">
+				The last 20 deployments. Open one to see its steps and log.
+			</p>
+			<p class="text-xs text-muted-foreground">
+				Images of the last 3 successful deployments stay on the server for rollback; older ones are
+				pruned to save disk space.
 			</p>
 		</div>
 		<Tooltip.Root>
@@ -89,7 +118,7 @@
 						<Button
 							variant="outline"
 							size="sm"
-							disabled={!previousTarget}
+							disabled={!previousTarget || !canRollback}
 							onclick={() => previousTarget && handleAskRestore(previousTarget)}
 						>
 							<HistoryIcon class="size-4" />
@@ -100,7 +129,7 @@
 			</Tooltip.Trigger>
 			<Tooltip.Content>
 				{#if previousTarget}
-					<p>Restore {shortImage(previousTarget.image_tag)}</p>
+					<p>Restore {deploymentSubject(previousTarget)}</p>
 				{:else}
 					<p>No earlier deployment with an image still on this server</p>
 				{/if}
@@ -111,21 +140,39 @@
 	<Dialog.Root bind:open={confirmOpen}>
 		<Dialog.Content class="max-w-lg">
 			<Dialog.Header>
-				<Dialog.Title>Restore this deployment?</Dialog.Title>
+				<Dialog.Title>Roll back {appName}?</Dialog.Title>
 				<Dialog.Description>
-					The app will run
-					<span class="font-mono">{shortImage(confirmTarget?.image_tag ?? null)}</span>
-					again, from {confirmTarget ? new Date(confirmTarget.started_at).toLocaleString() : ''}.
-					Traffic switches over once the container is healthy. Environment variables, volumes and
-					limits stay as they are now.
+					Tond runs the exact image of this deployment again and switches traffic once it answers.
 				</Dialog.Description>
 			</Dialog.Header>
+			{#if confirmTarget}
+				<dl class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 rounded-md border p-3 text-sm">
+					{#if confirmTarget.commit_sha}
+						<dt class="text-muted-foreground">Commit</dt>
+						<dd class="min-w-0">
+							<code class="text-xs">{shortSha(confirmTarget.commit_sha)}</code>
+							<span class="break-words">{confirmTarget.commit_message ?? ''}</span>
+						</dd>
+					{/if}
+					<dt class="text-muted-foreground">Image</dt>
+					<dd class="min-w-0 font-mono text-xs break-all">{confirmTarget.image_tag ?? '—'}</dd>
+					<dt class="text-muted-foreground">Deployed</dt>
+					<dd>
+						{new Date(confirmTarget.started_at).toLocaleString()}
+						<span class="text-muted-foreground">({relativeTime(confirmTarget.started_at)})</span>
+					</dd>
+				</dl>
+			{/if}
+			<p class="text-sm text-muted-foreground">
+				Kept as they are now: environment variables, volumes and their data, the domain and resource
+				limits. Only the code and its dependencies go back.
+			</p>
 			<Dialog.Footer>
 				<Button variant="outline" onclick={() => (confirmOpen = false)} disabled={restoring}>
 					Cancel
 				</Button>
 				<Button onclick={handleConfirmRestore} disabled={restoring}>
-					{restoring ? 'Starting rollback…' : 'Restore image'}
+					{restoring ? 'Starting rollback…' : 'Roll back'}
 				</Button>
 			</Dialog.Footer>
 		</Dialog.Content>
@@ -136,7 +183,7 @@
 			<Dialog.Header>
 				<Dialog.Title>Generated Dockerfile</Dialog.Title>
 				<Dialog.Description>
-					Deployment {selectedDeploymentId || 'artifact'} generated by TBuild or inline Dockerfile flow.
+					The Dockerfile deployment {shortSha(selectedDeploymentId)} was built with.
 				</Dialog.Description>
 			</Dialog.Header>
 			{#if dockerfileError}
@@ -149,102 +196,110 @@
 		</Dialog.Content>
 	</Dialog.Root>
 
-	{#if loading}
+	{#if loading && deployments.length === 0}
 		<div class="py-8 text-center text-muted-foreground">Loading...</div>
 	{:else if deployments.length === 0}
 		<div class="rounded-lg border border-dashed py-12 text-center">
 			<p class="text-muted-foreground">No deployments yet</p>
-			<p class="mt-1 text-sm text-muted-foreground/60">Deploy this app to see history here</p>
+			<p class="mt-1 text-sm text-muted-foreground">Deploy this app to see its history here</p>
 		</div>
 	{:else}
-		<div class="overflow-x-auto rounded-md border">
-			<table class="w-full text-sm">
-				<thead>
-					<tr class="border-b bg-muted/50">
-						<th class="px-4 py-2 text-left font-medium text-muted-foreground">Status</th>
-						<th class="px-4 py-2 text-left font-medium text-muted-foreground">Source</th>
-						<th class="px-4 py-2 text-left font-medium text-muted-foreground">Image</th>
-						<th class="px-4 py-2 text-left font-medium text-muted-foreground">Artifacts</th>
-						<th class="px-4 py-2 text-left font-medium text-muted-foreground">Started</th>
-						<th class="px-4 py-2 text-left font-medium text-muted-foreground">Finished</th>
-						<th class="px-4 py-2 text-right font-medium text-muted-foreground">Rollback</th>
-					</tr>
-				</thead>
-				<tbody>
-					{#each deployments as d (d.id)}
-						<tr class="border-b last:border-0">
-							<td class="px-4 py-2">
-								<div class="flex items-center gap-1.5">
-									<Badge
-										variant={d.status === 'succeeded'
-											? 'default'
-											: d.status === 'failed'
-												? 'destructive'
-												: 'outline'}>{d.status}</Badge
+		<ul class="divide-y rounded-md border" aria-label="Deployments">
+			{#each deployments as d (d.id)}
+				{@const view = statusView(d.status, d.queue_position)}
+				<li class="flex flex-col gap-2 p-3 sm:flex-row sm:items-center sm:gap-4">
+					<a
+						href="/apps/{appId}/deployments/{d.id}"
+						class="group flex min-w-0 flex-1 items-start gap-3 rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+						aria-label="Open deployment {shortSha(d.id)}: {view.label}"
+					>
+						<span class="mt-0.5 shrink-0" title={view.label}>
+							{#if view.tone === 'success'}
+								<DoneIcon class="size-5 text-success" />
+							{:else if view.tone === 'failure'}
+								<FailedIcon class="size-5 text-destructive" />
+							{:else if view.tone === 'running'}
+								<SpinnerIcon class="size-5 animate-spin" />
+							{:else if view.tone === 'waiting'}
+								<WaitIcon class="size-5 text-muted-foreground" />
+							{:else}
+								<NeutralIcon class="size-5 text-muted-foreground" />
+							{/if}
+						</span>
+						<span class="min-w-0 flex-1 space-y-0.5">
+							<span class="flex min-w-0 items-center gap-2">
+								<span
+									class={cn(
+										'truncate text-sm font-medium group-hover:underline',
+										!d.commit_sha && 'font-mono text-xs',
+										d.image_pruned && !d.commit_sha && 'line-through opacity-60'
+									)}>{deploymentSubject(d)}</span
+								>
+								{#if d.is_current}
+									<Badge variant="outline" class="shrink-0 border-success/50 text-success"
+										>current</Badge
 									>
-									{#if d.is_current}
-										<Badge variant="outline" class="text-xs">current</Badge>
-									{/if}
-								</div>
-							</td>
-							<td class="px-4 py-2">
-								<Badge variant="outline" class="font-mono text-xs"
-									>{d.trigger_source ?? 'manual'}</Badge
-								>
-							</td>
-							<td class="px-4 py-2 font-mono text-muted-foreground">
-								<span class={d.image_pruned ? 'line-through opacity-60' : ''}
-									>{shortImage(d.image_tag)}</span
-								>
+								{/if}
 								{#if d.image_pruned}
-									<span class="ml-1 font-sans text-xs">(pruned)</span>
+									<span class="shrink-0 text-xs text-muted-foreground">(pruned)</span>
 								{/if}
-							</td>
-							<td class="px-4 py-2">
-								{#if d.has_generated_dockerfile}
-									<Button
-										variant="outline"
-										size="sm"
-										onclick={() => handleViewGeneratedDockerfile(d.id)}
-									>
-										View Dockerfile
-									</Button>
-								{:else}
-									<span class="text-xs text-muted-foreground">-</span>
-								{/if}
-							</td>
-							<td class="px-4 py-2 text-muted-foreground"
-								>{new Date(d.started_at).toLocaleString()}</td
+							</span>
+							<span class="block truncate text-xs text-muted-foreground">
+								{view.tone === 'success' || view.tone === 'failure'
+									? ''
+									: `${view.label} · `}{triggerLabel(d)} · {relativeTime(
+									d.started_at
+								)}{d.duration_secs != null ? ` · ${formatDuration(d.duration_secs)}` : ''}
+							</span>
+							{#if d.status === 'failed'}
+								<span class="block truncate text-xs text-destructive">
+									{d.failure?.title ?? 'Failed'}
+								</span>
+							{/if}
+						</span>
+						<ChevronIcon class="mt-0.5 hidden size-4 shrink-0 text-muted-foreground sm:block" />
+					</a>
+					<div class="flex shrink-0 items-center gap-2 pl-8 sm:pl-0">
+						{#if d.has_generated_dockerfile}
+							<Button
+								variant="ghost"
+								size="sm"
+								class="h-7 text-xs"
+								onclick={() => handleViewGeneratedDockerfile(d.id)}
 							>
-							<td class="px-4 py-2 text-muted-foreground"
-								>{d.finished_at ? new Date(d.finished_at).toLocaleString() : '-'}</td
+								Dockerfile
+							</Button>
+						{/if}
+						{#if !canRollback}
+							<!-- This role cannot roll back. -->
+						{:else if d.rollback_available}
+							<Button
+								variant="outline"
+								size="sm"
+								class="h-7 text-xs"
+								onclick={() => handleAskRestore(d)}
 							>
-							<td class="px-4 py-2 text-right">
-								{#if d.rollback_available}
-									<Button variant="outline" size="sm" onclick={() => handleAskRestore(d)}>
-										Restore
-									</Button>
-								{:else if d.status === 'succeeded' && !d.is_current}
-									<Tooltip.Root>
-										<Tooltip.Trigger>
-											{#snippet child({ props })}
-												<span {...props} class="inline-block">
-													<Button variant="outline" size="sm" disabled>Restore</Button>
-												</span>
-											{/snippet}
-										</Tooltip.Trigger>
-										<Tooltip.Content>
-											<p>{d.rollback_unavailable_reason ?? 'Rollback unavailable'}</p>
-										</Tooltip.Content>
-									</Tooltip.Root>
-								{:else}
-									<span class="text-xs text-muted-foreground">-</span>
-								{/if}
-							</td>
-						</tr>
-					{/each}
-				</tbody>
-			</table>
-		</div>
+								Roll back to this
+							</Button>
+						{:else if d.status === 'succeeded' && !d.is_current}
+							<Tooltip.Root>
+								<Tooltip.Trigger>
+									{#snippet child({ props })}
+										<span {...props} class="inline-block">
+											<Button variant="outline" size="sm" class="h-7 text-xs" disabled>
+												Roll back to this
+											</Button>
+										</span>
+									{/snippet}
+								</Tooltip.Trigger>
+								<Tooltip.Content>
+									<p>{d.rollback_unavailable_reason ?? 'Rollback unavailable'}</p>
+								</Tooltip.Content>
+							</Tooltip.Root>
+						{/if}
+					</div>
+				</li>
+			{/each}
+		</ul>
 	{/if}
 </div>

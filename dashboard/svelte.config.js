@@ -7,7 +7,9 @@ const config = {
 			pages: 'build',
 			assets: 'build',
 			fallback: 'index.html',
-			precompress: false
+			// Write .br and .gz next to every text asset; tond-server serves them
+			// with Content-Encoding (see static_files.rs).
+			precompress: true
 		})
 	}
 };

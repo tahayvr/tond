@@ -48,12 +48,12 @@ use sha2::{Digest, Sha256};
 use tond_common::{ApiResponse, App, GitHubApp, GitLabToken, PreviewDeployment, TondError};
 
 use crate::{
-    alerts,
     auth::RateLimiter,
     deploy, docker,
     domains::preview_host,
     error::AppError,
     handlers::{github_apps, gitlab_tokens},
+    secrets,
     state::AppState,
 };
 
@@ -293,11 +293,27 @@ pub fn sanitize_provider_url(raw: Option<&str>) -> Option<String> {
 
 // ── Shared deploy trigger ──────────────────────────────────────────────────
 
-/// Check auto_deploy, the branch filter and the per-app rate limit, then spawn
-/// a background deploy.
+/// "GitHub push to main" — the deployment's trigger detail.
+fn webhook_trigger_detail(provider: &str, branch: Option<&str>) -> String {
+    let name = match provider {
+        "github" => "GitHub",
+        "github-app" => "GitHub App",
+        "gitlab" => "GitLab",
+        "gitea" => "Gitea",
+        "generic" => "Generic webhook",
+        other => other,
+    };
+    match branch {
+        Some(b) => format!("{name} push to {b}"),
+        None => name.to_string(),
+    }
+}
+
+/// Check auto_deploy, the branch filter and the per-app rate limit, then queue
+/// a deploy (deploy/queue.rs).
 async fn trigger_webhook_deploy(
     state: &AppState,
-    mut app: App,
+    app: App,
     provider: &str,
     branch: Option<&str>,
 ) -> Response {
@@ -340,37 +356,34 @@ async fn trigger_webhook_deploy(
         branch
     );
 
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = deploy::deploy(&state_clone, &mut app, "webhook").await {
-            tracing::error!("[webhook] deploy failed for {}: {}", app.id, e);
-            let _ = sqlx::query(
-                "UPDATE apps SET status = 'failed', updated_at = datetime('now') WHERE id = ?",
+    // A burst of pushes coalesces in the queue: the newest supersedes a
+    // deploy that has not started yet.
+    let detail = webhook_trigger_detail(provider, branch);
+    let app_id = app.id.clone();
+    match deploy::start(
+        state,
+        app,
+        deploy::DeployRequest::source("webhook", Some(detail)),
+    )
+    .await
+    {
+        Ok(queued) => (
+            StatusCode::ACCEPTED,
+            Json(ApiResponse::ok(crate::handlers::queued_response(
+                "Deployment queued",
+                &app_id,
+                &queued,
+            ))),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("[webhook/{}] could not queue deploy: {}", provider, e);
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not queue the deploy",
             )
-            .bind(&app.id)
-            .execute(&state_clone.db)
-            .await;
-            alerts::fire_event_alerts(
-                &state_clone,
-                "deployment_failure",
-                Some(app.id.as_str()),
-                Some(app.name.as_str()),
-                Some(&e.to_string()),
-            )
-            .await;
-        } else {
-            alerts::fire_event_alerts(
-                &state_clone,
-                "deployment_success",
-                Some(app.id.as_str()),
-                Some(app.name.as_str()),
-                None,
-            )
-            .await;
         }
-    });
-
-    (StatusCode::ACCEPTED, Json(ApiResponse::<()>::ok(()))).into_response()
+    }
 }
 
 /// Fetch an app by UUID for webhook use. Names are not accepted: webhook URLs
@@ -396,9 +409,13 @@ async fn authenticate_webhook(
     body: &[u8],
 ) -> Result<Result<App, Response>, AppError> {
     let app = fetch_app_for_webhook(&state.db, app_id).await?;
-    let secret = app.webhook_secret.as_deref().unwrap_or("");
+    // A secret that cannot be decrypted verifies nothing (fail closed).
+    let secret = secrets::app_webhook_secret(&app)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
 
-    if !verify_request(provider, headers, body, secret) {
+    if !verify_request(provider, headers, body, &secret) {
         tracing::warn!(
             "[webhook/{}/{}] rejected: missing or invalid signature",
             provider.as_str(),
@@ -929,8 +946,9 @@ async fn find_signing_github_app(
     };
 
     Ok(candidates.into_iter().find(|gh_app| {
-        !gh_app.webhook_secret.is_empty()
-            && verify_github_signature(signature, body, &gh_app.webhook_secret)
+        secrets::github_webhook_secret(gh_app).is_ok_and(|secret| {
+            !secret.is_empty() && verify_github_signature(signature, body, &secret)
+        })
     }))
 }
 
@@ -1453,7 +1471,10 @@ mod tests {
         .bind(&app.branch)
         .bind(app.container_port)
         .bind(&app.status)
-        .bind(&app.webhook_secret)
+        .bind(
+            crate::secrets::seal_webhook_secret(&secret_of(&app))
+                .unwrap_or_else(|err| panic!("seal: {err}")),
+        )
         .bind(&app.created_at)
         .bind(&app.updated_at)
         .execute(&state.db)
@@ -1500,6 +1521,15 @@ mod tests {
     }
 
     // ── Pure helpers ──
+
+    #[test]
+    fn webhook_trigger_detail_names_the_provider_and_branch() {
+        assert_eq!(
+            webhook_trigger_detail("github", Some("main")),
+            "GitHub push to main"
+        );
+        assert_eq!(webhook_trigger_detail("generic", None), "Generic webhook");
+    }
 
     #[test]
     fn verify_github_signature_accepts_valid_signature_and_rejects_invalid_formats() {
@@ -2026,13 +2056,17 @@ mod tests {
     // ── GitHub App events ──
 
     async fn seed_github_app(state: &AppState, id: &str, app_id: i64, secret: &str) {
+        let sealed = crate::secrets::seal_github_credentials("csecret", secret, "pem")
+            .unwrap_or_else(|err| panic!("seal: {err}"));
         sqlx::query(
             "INSERT INTO github_apps (id, name, app_id, client_id, client_secret, webhook_secret, private_key, slug)
-             VALUES (?, 'gh', ?, 'cid', 'csecret', ?, 'pem', 'slug')",
+             VALUES (?, 'gh', ?, 'cid', ?, ?, ?, 'slug')",
         )
         .bind(id)
         .bind(app_id)
-        .bind(secret)
+        .bind(sealed.0)
+        .bind(sealed.1)
+        .bind(sealed.2)
         .execute(&state.db)
         .await
         .unwrap_or_else(|err| panic!("failed to seed GitHub App: {err}"));

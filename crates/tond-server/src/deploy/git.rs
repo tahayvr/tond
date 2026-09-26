@@ -212,9 +212,132 @@ pub fn ssh_command(key_path: &str, known_hosts: &Path) -> String {
     )
 }
 
+/// The commit a checkout is at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitInfo {
+    pub sha: String,
+    pub message: String,
+    pub author: String,
+}
+
+/// `git log` arguments whose output [`parse_commit_log`] reads.
+pub const COMMIT_LOG_ARGS: [&str; 4] = ["log", "-1", "--no-color", "--format=%H%x1f%an%x1f%s"];
+
+/// Parse `git log -1 --format=%H%x1f%an%x1f%s`.
+pub fn parse_commit_log(output: &str) -> Option<CommitInfo> {
+    let line = output.lines().next()?.trim_end();
+    let mut parts = line.splitn(3, '\u{1f}');
+    let sha = parts.next()?.trim().to_string();
+    if sha.len() < 7 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let author = parts.next().unwrap_or_default().trim().to_string();
+    let message: String = parts
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(200)
+        .collect();
+    Some(CommitInfo {
+        sha,
+        message: redact_url_credentials(&message),
+        author,
+    })
+}
+
+/// `git ls-remote` arguments listing the default branch and all branches.
+pub fn ls_remote_args(url: &str) -> Vec<String> {
+    vec![
+        "ls-remote".to_string(),
+        "--symref".to_string(),
+        "--".to_string(),
+        url.to_string(),
+        "HEAD".to_string(),
+        "refs/heads/*".to_string(),
+    ]
+}
+
+/// Branches of a remote: the default branch (from `HEAD`) and every branch,
+/// default first, the rest sorted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteBranches {
+    pub default_branch: Option<String>,
+    pub branches: Vec<String>,
+}
+
+/// Parse `git ls-remote --symref <url> HEAD refs/heads/*`.
+pub fn parse_ls_remote(output: &str) -> RemoteBranches {
+    let mut default_branch = None;
+    let mut branches = Vec::new();
+    for line in output.lines() {
+        if let Some(rest) = line.strip_prefix("ref: ") {
+            // "ref: refs/heads/main\tHEAD"
+            let mut fields = rest.split('\t');
+            if let (Some(target), Some("HEAD")) = (fields.next(), fields.next()) {
+                default_branch = target.strip_prefix("refs/heads/").map(str::to_string);
+            }
+            continue;
+        }
+        if let Some(name) = line
+            .split('\t')
+            .nth(1)
+            .and_then(|r| r.strip_prefix("refs/heads/"))
+        {
+            branches.push(name.to_string());
+        }
+    }
+    branches.sort();
+    branches.dedup();
+    if let Some(default) = &default_branch
+        && let Some(pos) = branches.iter().position(|b| b == default)
+    {
+        let d = branches.remove(pos);
+        branches.insert(0, d);
+    }
+    RemoteBranches {
+        default_branch,
+        branches,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_commit_log_output() {
+        let c = parse_commit_log(
+            "0123456789abcdef0123456789abcdef01234567\u{1f}Ada Lovelace\u{1f}Fix login redirect\n",
+        )
+        .unwrap_or_else(|| panic!("commit should parse"));
+        assert_eq!(c.sha, "0123456789abcdef0123456789abcdef01234567");
+        assert_eq!(c.author, "Ada Lovelace");
+        assert_eq!(c.message, "Fix login redirect");
+        assert!(parse_commit_log("").is_none());
+        assert!(parse_commit_log("fatal: not a git repository").is_none());
+    }
+
+    #[test]
+    fn parses_ls_remote_with_default_branch_first() {
+        let out = "ref: refs/heads/trunk\tHEAD\n\
+                   aaa\tHEAD\n\
+                   bbb\trefs/heads/feature/x\n\
+                   ccc\trefs/heads/trunk\n\
+                   ddd\trefs/heads/alpha\n";
+        let r = parse_ls_remote(out);
+        assert_eq!(r.default_branch.as_deref(), Some("trunk"));
+        assert_eq!(r.branches, vec!["trunk", "alpha", "feature/x"]);
+        let r = parse_ls_remote("bbb\trefs/heads/main\n");
+        assert_eq!(r.default_branch, None);
+        assert_eq!(r.branches, vec!["main"]);
+        let args = ls_remote_args("--upload-pack=x");
+        let dd = args.iter().position(|a| a == "--").unwrap_or(usize::MAX);
+        assert_eq!(
+            args.get(dd + 1).map(String::as_str),
+            Some("--upload-pack=x")
+        );
+    }
 
     #[test]
     fn redact_url_credentials_masks_userinfo_everywhere() {

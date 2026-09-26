@@ -4,6 +4,104 @@ use serde::{Deserialize, Serialize};
 
 // ── Deployment (deployment history entry) ──
 
+/// The steps of a deployment, in order. On a single host images never leave
+/// the machine, so there is no registry push: `release` (switching traffic to
+/// the new container and draining the old one) is the step users wait on
+/// instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeployPhase {
+    /// Fetch the source: git clone, image pull, or the uploaded image.
+    Clone,
+    /// Build the image (TBuild or Dockerfile); compose runs `up --build` here.
+    Build,
+    /// Start the new container.
+    Start,
+    /// Wait for the new container to answer (health path or port probe).
+    Health,
+    /// Route traffic to the new container and stop the old one.
+    Release,
+}
+
+impl DeployPhase {
+    pub const ALL: [DeployPhase; 5] = [
+        DeployPhase::Clone,
+        DeployPhase::Build,
+        DeployPhase::Start,
+        DeployPhase::Health,
+        DeployPhase::Release,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeployPhase::Clone => "clone",
+            DeployPhase::Build => "build",
+            DeployPhase::Start => "start",
+            DeployPhase::Health => "health",
+            DeployPhase::Release => "release",
+        }
+    }
+}
+
+/// Where a phase is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PhaseStatus {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    /// Not part of this deployment (e.g. no build for an image app).
+    Skipped,
+}
+
+/// One phase's state and timing, stored as JSON in `deployments.phases`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhaseRecord {
+    pub phase: DeployPhase,
+    pub status: PhaseStatus,
+    /// Short label for this deployment's flavour of the phase ("Pull image").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+}
+
+impl PhaseRecord {
+    pub fn pending(phase: DeployPhase) -> Self {
+        Self {
+            phase,
+            status: PhaseStatus::Pending,
+            label: None,
+            started_at: None,
+            finished_at: None,
+        }
+    }
+}
+
+/// The classified likely cause of a failed deployment, stored as JSON in
+/// `deployments.failure`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeployFailure {
+    /// Phase that failed, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<DeployPhase>,
+    /// Stable machine-readable cause, e.g. "build_failed", "health_check_failed".
+    pub code: String,
+    /// One-line summary: "The build failed (exit code 1)".
+    pub title: String,
+    /// What to do about it.
+    pub hint: String,
+    /// The raw error, for reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// The log (or container output) lines that show the problem.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excerpt: Vec<String>,
+}
+
 /// A single deployment attempt for an app. One row per deploy invocation.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Deployment {
@@ -12,31 +110,118 @@ pub struct Deployment {
     /// Image this deployment ran: `tond-<app>:<deployment-id-prefix>` (compose
     /// apps record a `tond-compose-<app>` sentinel)
     pub image_tag: Option<String>,
-    /// "pending" | "running" | "succeeded" | "failed"
+    /// "queued" | "running" | "succeeded" | "failed" | "superseded"
     pub status: String,
-    /// How this deployment was triggered: "manual" | "webhook" | "upload" | "rollback"
+    /// How this deployment was triggered: "manual" | "webhook" | "upload" |
+    /// "rollback" | "cron" | "cli"
     pub trigger_source: String,
     pub generated_dockerfile: Option<String>,
+    /// When work began (equals `created_at` while queued)
     pub started_at: String,
     pub finished_at: Option<String>,
     pub created_at: String,
     /// The image was removed by pruning; rolling back to it is impossible
     #[sqlx(default)]
     pub image_pruned: bool,
+    /// "deploy" | "rollback" | "upload"
+    #[sqlx(default)]
+    pub kind: String,
+    /// Why it failed, was superseded or was interrupted
+    #[sqlx(default)]
+    pub error: Option<String>,
+    /// The deployment that replaced this one while it was queued
+    #[sqlx(default)]
+    pub superseded_by: Option<String>,
+    #[sqlx(default)]
+    pub commit_sha: Option<String>,
+    #[sqlx(default)]
+    pub commit_message: Option<String>,
+    #[sqlx(default)]
+    pub commit_author: Option<String>,
+    /// Who or what triggered it (user email, "api-key", webhook provider…)
+    #[sqlx(default)]
+    pub trigger_detail: Option<String>,
+    /// For rollbacks: the deployment whose image was restored
+    #[sqlx(default)]
+    pub rollback_of: Option<String>,
+    /// JSON array of [`PhaseRecord`]
+    #[sqlx(default)]
+    pub phases: String,
+    /// JSON [`DeployFailure`] for failed deployments
+    #[sqlx(default)]
+    pub failure: Option<String>,
 }
+
+impl Deployment {
+    /// Parsed phase records (empty for rows that predate phase tracking).
+    pub fn phase_records(&self) -> Vec<PhaseRecord> {
+        serde_json::from_str(&self.phases).unwrap_or_default()
+    }
+
+    /// Parsed failure, if any.
+    pub fn failure_info(&self) -> Option<DeployFailure> {
+        self.failure
+            .as_deref()
+            .and_then(|f| serde_json::from_str(f).ok())
+    }
+}
+
+/// Seconds between two RFC 3339 timestamps, if both parse.
+pub fn duration_secs(started_at: &str, finished_at: Option<&str>) -> Option<i64> {
+    let start = chrono::DateTime::parse_from_rfc3339(started_at).ok()?;
+    let end = chrono::DateTime::parse_from_rfc3339(finished_at?).ok()?;
+    Some((end - start).num_seconds().max(0))
+}
+
+/// Deployment statuses that are not final yet.
+pub const UNFINISHED_DEPLOYMENT_STATUSES: [&str; 2] = ["queued", "running"];
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeploymentResponse {
     pub id: String,
     pub app_id: String,
     pub image_tag: Option<String>,
+    /// "queued" | "building" | "deploying" | "succeeded" | "failed" | "superseded"
     pub status: String,
-    /// How this deployment was triggered: "manual" | "webhook" | "upload" | "rollback"
+    /// How this deployment was triggered: "manual" | "webhook" | "upload" |
+    /// "rollback" | "cron" | "cli"
     pub trigger_source: String,
+    /// "deploy" | "rollback" | "upload"
+    #[serde(default)]
+    pub kind: String,
+    /// Why it failed, was superseded or was interrupted
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub superseded_by: Option<String>,
+    /// 1-based place in the build queue while status is "queued"
+    #[serde(default)]
+    pub queue_position: Option<u32>,
+    /// Who or what triggered it (user email, "api-key", webhook provider…)
+    #[serde(default)]
+    pub trigger_detail: Option<String>,
     pub has_generated_dockerfile: bool,
     pub started_at: String,
     pub finished_at: Option<String>,
     pub created_at: String,
+    /// Wall-clock duration in seconds, once finished
+    #[serde(default)]
+    pub duration_secs: Option<i64>,
+    #[serde(default)]
+    pub commit_sha: Option<String>,
+    #[serde(default)]
+    pub commit_message: Option<String>,
+    #[serde(default)]
+    pub commit_author: Option<String>,
+    /// For rollbacks: the deployment whose image was restored
+    #[serde(default)]
+    pub rollback_of: Option<String>,
+    /// Step progress (clone, build, start, health, release)
+    #[serde(default)]
+    pub phases: Vec<PhaseRecord>,
+    /// Likely cause of a failure, with a fix hint
+    #[serde(default)]
+    pub failure: Option<DeployFailure>,
     /// The deployment's image was pruned from the host
     #[serde(default)]
     pub image_pruned: bool,
@@ -54,22 +239,64 @@ pub struct DeploymentResponse {
 
 impl From<Deployment> for DeploymentResponse {
     fn from(d: Deployment) -> Self {
+        let phases = d.phase_records();
+        let failure = d.failure_info();
+        let duration_secs = duration_secs(&d.started_at, d.finished_at.as_deref());
         Self {
             id: d.id,
             app_id: d.app_id,
             image_tag: d.image_tag,
             status: d.status,
             trigger_source: d.trigger_source,
+            kind: d.kind,
+            error: d.error,
+            superseded_by: d.superseded_by,
+            queue_position: None,
+            trigger_detail: d.trigger_detail,
             has_generated_dockerfile: d.generated_dockerfile.is_some(),
             started_at: d.started_at,
             finished_at: d.finished_at,
             created_at: d.created_at,
+            duration_secs,
+            commit_sha: d.commit_sha,
+            commit_message: d.commit_message,
+            commit_author: d.commit_author,
+            rollback_of: d.rollback_of,
+            phases,
+            failure,
             image_pruned: d.image_pruned,
             is_current: false,
             rollback_available: false,
             rollback_unavailable_reason: None,
         }
     }
+}
+
+/// One deploy log line of a deployment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeploymentLogLine {
+    pub level: String,
+    pub message: String,
+    pub ts: String,
+}
+
+/// `GET /api/apps/{id}/deployments/{deployment_id}`: the deployment plus its
+/// log (the newest lines, capped server-side).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeploymentDetailResponse {
+    #[serde(flatten)]
+    pub deployment: DeploymentResponse,
+    pub logs: Vec<DeploymentLogLine>,
+    /// True when older lines were left out
+    #[serde(default)]
+    pub logs_truncated: bool,
+    /// Port the app is expected to listen on (for the result card)
+    pub container_port: i64,
+    /// Health check path Tond polls, if any
+    #[serde(default)]
+    pub health_check_path: Option<String>,
+    /// The app's source type ("git", "image", ...)
+    pub source_type: String,
 }
 
 // ── Phase 4.4: Preview Deployments ──
@@ -264,9 +491,28 @@ mod tests {
             finished_at: Some("2026-01-01T00:01:00Z".to_string()),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             image_pruned: false,
+            kind: "deploy".to_string(),
+            error: Some("boom".to_string()),
+            superseded_by: None,
+            commit_sha: Some("0123456789abcdef".to_string()),
+            commit_message: Some("Fix login".to_string()),
+            commit_author: Some("Ada".to_string()),
+            trigger_detail: Some("ada@example.com".to_string()),
+            rollback_of: None,
+            phases: r#"[{"phase":"build","status":"succeeded","started_at":"2026-01-01T00:00:00Z","finished_at":"2026-01-01T00:00:40Z"}]"#.to_string(),
+            failure: None,
         };
 
         let response = DeploymentResponse::from(deployment);
+        assert_eq!(response.duration_secs, Some(60));
+        assert_eq!(response.commit_message.as_deref(), Some("Fix login"));
+        assert_eq!(response.phases.len(), 1);
+        assert_eq!(response.phases[0].phase, DeployPhase::Build);
+        assert_eq!(response.phases[0].status, PhaseStatus::Succeeded);
+        assert!(response.failure.is_none());
+        assert_eq!(response.kind, "deploy");
+        assert_eq!(response.error.as_deref(), Some("boom"));
+        assert_eq!(response.queue_position, None);
 
         assert_eq!(
             response.status, "succeeded",
@@ -280,6 +526,47 @@ mod tests {
         assert!(
             response.has_generated_dockerfile,
             "DeploymentResponse should expose whether a generated Dockerfile was persisted"
+        );
+    }
+
+    #[test]
+    fn deployment_parses_failure_and_tolerates_bad_json() {
+        let mut d = Deployment {
+            id: "d".into(),
+            app_id: "a".into(),
+            image_tag: None,
+            status: "failed".into(),
+            trigger_source: "manual".into(),
+            generated_dockerfile: None,
+            started_at: "2026-01-01T00:00:00Z".into(),
+            finished_at: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            image_pruned: false,
+            kind: "deploy".into(),
+            error: None,
+            superseded_by: None,
+            commit_sha: None,
+            commit_message: None,
+            commit_author: None,
+            trigger_detail: None,
+            rollback_of: None,
+            phases: "not json".into(),
+            failure: Some(
+                r#"{"phase":"health","code":"health_check_failed","title":"t","hint":"h"}"#.into(),
+            ),
+        };
+        assert!(d.phase_records().is_empty());
+        let failure = d
+            .failure_info()
+            .unwrap_or_else(|| panic!("failure should parse"));
+        assert_eq!(failure.phase, Some(DeployPhase::Health));
+        assert!(failure.excerpt.is_empty());
+        d.failure = Some("{".into());
+        assert!(d.failure_info().is_none());
+        assert_eq!(duration_secs(&d.started_at, None), None);
+        assert_eq!(
+            duration_secs("2026-01-01T00:00:00Z", Some("2026-01-01T00:02:05Z")),
+            Some(125)
         );
     }
 

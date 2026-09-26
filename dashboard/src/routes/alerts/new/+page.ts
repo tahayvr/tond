@@ -1,7 +1,6 @@
-import { listApps } from '$lib/api';
+import { listApps, listIntegrations } from '$lib/api';
 
 export async function load() {
-	return {
-		apps: await listApps()
-	};
+	const [apps, integrations] = await Promise.all([listApps(), listIntegrations()]);
+	return { apps, integrations };
 }

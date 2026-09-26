@@ -26,8 +26,10 @@
 // GET /api/cron/{id}/runs/stream — see the handlers below.
 //
 // Authentication (all endpoints): the local Unix socket (CLI on the host),
-// `?token=<api-key>` query param, or `__Host-tond_session` cookie (browser
-// upgrades must come from the dashboard origin, see auth/csrf.rs). Close code 4001 on failure.
+// `?token=<tond_pat_…>` query param, or `__Host-tond_session` cookie (browser
+// upgrades must come from the dashboard origin, see auth/csrf.rs). Close code
+// 4001 when unauthenticated, 4003 without the scope (logs:read; cron:read for
+// cron runs) or when a resource-limited token asks for another or every app.
 //
 // Task lifecycle: every stream owns a `JoinSet` holding its producer tasks
 // (deploy-log forwarder, container supervisor, cron poller). The socket loop
@@ -50,27 +52,24 @@ use std::time::{Duration, Instant};
 
 use axum::{
     extract::{
-        Path, Query, State,
+        Path, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::HeaderMap,
     response::IntoResponse,
 };
 use bollard::query_parameters::LogsOptionsBuilder;
 use futures::StreamExt;
-use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::{AbortHandle, JoinSet};
 
 use crate::{
-    auth::{self, LocalPeer},
+    auth::{MaybePrincipal, Principal, principal::AuthFailure},
     docker,
-    handlers::auth::{extract_session_token, validate_session},
-    log_bus::{self, DeployLogEvent},
+    log_bus::{self, DeployEvent},
     state::AppState,
 };
-use tond_common::{CronJobRun, DeployLog, ManagedDatabase};
+use tond_common::{CronJobRun, DeployLog, ManagedDatabase, Scope};
 
 /// How often container supervisors re-read the container set.
 const CONTAINER_RESCAN: Duration = Duration::from_secs(5);
@@ -103,16 +102,9 @@ fn split_docker_ts(raw: &str) -> (Option<&str>, &str) {
     (None, raw)
 }
 
-#[derive(Deserialize)]
-pub struct LogStreamQuery {
-    /// Optional API key passed as query parameter (for CLI / WebSocket clients
-    /// that cannot set the Authorization header).
-    pub token: Option<String>,
-}
-
 // ── Socket plumbing ───────────────────────────────────────────────────────────
 
-async fn close_with(socket: &mut WebSocket, code: u16, reason: &'static str) {
+pub(crate) async fn close_with(socket: &mut WebSocket, code: u16, reason: &'static str) {
     let _ = socket
         .send(Message::Close(Some(axum::extract::ws::CloseFrame {
             code,
@@ -174,7 +166,7 @@ enum DeployLogScope {
 /// snapshot rows (the subscription starts before the snapshot query, so a
 /// line may be in both).
 async fn forward_deploy_logs(
-    mut bus: broadcast::Receiver<Arc<DeployLogEvent>>,
+    mut bus: broadcast::Receiver<Arc<DeployEvent>>,
     tx: mpsc::Sender<String>,
     db: sqlx::SqlitePool,
     scope: DeployLogScope,
@@ -197,6 +189,9 @@ async fn forward_deploy_logs(
                 continue;
             }
             Err(broadcast::error::RecvError::Closed) => return,
+        };
+        let DeployEvent::Log(event) = event.as_ref() else {
+            continue;
         };
         if already_sent.contains(&event.id) {
             continue;
@@ -488,23 +483,19 @@ pub async fn stream_logs(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(query): Query<LogStreamQuery>,
-    headers: HeaderMap,
-    LocalPeer(local): LocalPeer,
+    MaybePrincipal(auth): MaybePrincipal,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state, id, query, headers, local))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, id, auth))
 }
 
 async fn handle_socket(
     mut socket: WebSocket,
     state: AppState,
     id: String,
-    query: LogStreamQuery,
-    headers: HeaderMap,
-    local: bool,
+    auth: Result<Principal, AuthFailure>,
 ) {
-    if !authenticate(&state, &query, &headers, local).await {
-        close_with(&mut socket, 4001, "Authentication required").await;
+    if let Err((code, reason)) = authorize(&state, auth, Scope::LogsRead, Some(&id)).await {
+        close_with(&mut socket, code, reason).await;
         return;
     }
 
@@ -588,22 +579,18 @@ async fn handle_socket(
 pub async fn stream_system_logs(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
-    Query(query): Query<LogStreamQuery>,
-    headers: HeaderMap,
-    LocalPeer(local): LocalPeer,
+    MaybePrincipal(auth): MaybePrincipal,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_system_socket(socket, state, query, headers, local))
+    ws.on_upgrade(move |socket| handle_system_socket(socket, state, auth))
 }
 
 async fn handle_system_socket(
     mut socket: WebSocket,
     state: AppState,
-    query: LogStreamQuery,
-    headers: HeaderMap,
-    local: bool,
+    auth: Result<Principal, AuthFailure>,
 ) {
-    if !authenticate(&state, &query, &headers, local).await {
-        close_with(&mut socket, 4001, "Authentication required").await;
+    if let Err((code, reason)) = authorize(&state, auth, Scope::LogsRead, None).await {
+        close_with(&mut socket, code, reason).await;
         return;
     }
 
@@ -676,22 +663,18 @@ async fn handle_system_socket(
 pub async fn stream_all_database_logs(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
-    Query(query): Query<LogStreamQuery>,
-    headers: HeaderMap,
-    LocalPeer(local): LocalPeer,
+    MaybePrincipal(auth): MaybePrincipal,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_all_databases_socket(socket, state, query, headers, local))
+    ws.on_upgrade(move |socket| handle_all_databases_socket(socket, state, auth))
 }
 
 async fn handle_all_databases_socket(
     mut socket: WebSocket,
     state: AppState,
-    query: LogStreamQuery,
-    headers: HeaderMap,
-    local: bool,
+    auth: Result<Principal, AuthFailure>,
 ) {
-    if !authenticate(&state, &query, &headers, local).await {
-        close_with(&mut socket, 4001, "Authentication required").await;
+    if let Err((code, reason)) = authorize(&state, auth, Scope::LogsRead, None).await {
+        close_with(&mut socket, code, reason).await;
         return;
     }
 
@@ -748,23 +731,19 @@ pub async fn stream_database_logs(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(query): Query<LogStreamQuery>,
-    headers: HeaderMap,
-    LocalPeer(local): LocalPeer,
+    MaybePrincipal(auth): MaybePrincipal,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_database_socket(socket, state, id, query, headers, local))
+    ws.on_upgrade(move |socket| handle_database_socket(socket, state, id, auth))
 }
 
 async fn handle_database_socket(
     mut socket: WebSocket,
     state: AppState,
     id: String,
-    query: LogStreamQuery,
-    headers: HeaderMap,
-    local: bool,
+    auth: Result<Principal, AuthFailure>,
 ) {
-    if !authenticate(&state, &query, &headers, local).await {
-        close_with(&mut socket, 4001, "Authentication required").await;
+    if let Err((code, reason)) = authorize(&state, auth, Scope::LogsRead, None).await {
+        close_with(&mut socket, code, reason).await;
         return;
     }
 
@@ -815,29 +794,30 @@ async fn handle_database_socket(
     serve(&mut socket, rx, tasks).await;
 }
 
-/// Returns true if the request carries valid authentication. `local` is true for
-/// requests accepted on the trusted local Unix socket (the CLI on the host).
-async fn authenticate(
+/// Check a WebSocket caller: authenticated, holding `scope`, and — for tokens
+/// limited to some apps — allowed to see `app`. Streams that span every app or
+/// database (`app = None`) are refused to limited tokens. On failure returns
+/// the close code (4001 unauthenticated, 4003 forbidden) and reason.
+pub(crate) async fn authorize(
     state: &AppState,
-    query: &LogStreamQuery,
-    headers: &HeaderMap,
-    local: bool,
-) -> bool {
-    if local {
-        return true;
+    auth: Result<Principal, AuthFailure>,
+    scope: Scope,
+    app: Option<&str>,
+) -> Result<(), (u16, &'static str)> {
+    let principal = auth.map_err(|_| (4001, "Authentication required"))?;
+    if !principal.has(scope) {
+        return Err((4003, "Missing permission for this stream"));
     }
-
-    // Try Bearer token from query param (?token=...)
-    if let Some(ref raw_key) = query.token {
-        return matches!(auth::validate_key(&state.db, raw_key).await, Ok(Some(_)));
+    if principal.filter().is_some() {
+        match app {
+            Some(app) => principal
+                .ensure_app_access(&state.db, app)
+                .await
+                .map_err(|_| (4003, "This token is limited to other apps"))?,
+            None => return Err((4003, "This token is limited to specific apps")),
+        }
     }
-
-    // Try session cookie
-    if let Some(token) = extract_session_token(headers) {
-        return matches!(validate_session(&state.db, &token).await, Ok(Some(_)));
-    }
-
-    false
+    Ok(())
 }
 
 // ── Cron run output stream ────────────────────────────────────────────────────
@@ -858,11 +838,9 @@ pub async fn stream_cron_runs(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(query): Query<LogStreamQuery>,
-    headers: HeaderMap,
-    LocalPeer(local): LocalPeer,
+    MaybePrincipal(auth): MaybePrincipal,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_cron_socket(socket, state, id, query, headers, local))
+    ws.on_upgrade(move |socket| handle_cron_socket(socket, state, id, auth))
 }
 
 fn run_json(r: &CronJobRun) -> serde_json::Value {
@@ -880,12 +858,10 @@ async fn handle_cron_socket(
     mut socket: WebSocket,
     state: AppState,
     id: String,
-    query: LogStreamQuery,
-    headers: HeaderMap,
-    local: bool,
+    auth: Result<Principal, AuthFailure>,
 ) {
-    if !authenticate(&state, &query, &headers, local).await {
-        close_with(&mut socket, 4001, "Authentication required").await;
+    if let Err((code, reason)) = authorize(&state, auth, Scope::CronRead, None).await {
+        close_with(&mut socket, code, reason).await;
         return;
     }
 
@@ -981,6 +957,7 @@ async fn poll_cron_runs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log_bus::DeployLogEvent;
 
     fn target(key: &str, cid: &str) -> FollowTarget {
         FollowTarget {
@@ -1050,6 +1027,7 @@ mod tests {
         DeployLogEvent {
             id: id.to_string(),
             app_id: app_id.to_string(),
+            deployment_id: None,
             level: "info".to_string(),
             message: format!("line {id}"),
             created_at: chrono::Utc::now().to_rfc3339(),
@@ -1085,7 +1063,7 @@ mod tests {
             event("other-app", "app-b"),
             event("new", "app-a"),
         ] {
-            let _ = bus_tx.send(Arc::new(ev));
+            let _ = bus_tx.send(Arc::new(DeployEvent::Log(ev)));
         }
 
         let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())

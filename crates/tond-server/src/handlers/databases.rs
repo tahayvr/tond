@@ -5,7 +5,7 @@
 // optional connection to a project Docker network for internal service-to-service
 // communication.
 //
-// Routes (all require RequireAuth + RateLimit):
+// Routes (all require RateLimit + an Authz scope, see each handler):
 //   GET    /api/databases                         — list all managed databases
 //   POST   /api/databases                         — create and start a new database container
 //   GET    /api/databases/{id}                    — get database details + connection strings
@@ -15,6 +15,13 @@
 //   POST   /api/databases/{id}/start              — start container (existing container)
 //   POST   /api/databases/{id}/redeploy           — recreate container (picks up custom_image)
 //   PATCH  /api/databases/{id}/credentials        — change passwords inside the running database
+//   GET    /api/databases/{id}/credentials        — reveal passwords + connection strings (admin, audited)
+//
+// Secrets at rest: passwords and connection-string overrides are stored
+// encrypted (`secrets::seal_database`); `fetch_db` returns them decrypted for
+// use inside this module. Responses never carry them: passwords become
+// `has_password` and connection strings are masked, except in the audited
+// credentials reveal.
 //
 // Network exposure (H6): database ports are published on 127.0.0.1 unless an
 // admin turns on `public_access`, which publishes on 0.0.0.0. Docker's iptables
@@ -30,16 +37,18 @@ use axum::{
 use tond_common::*;
 
 use crate::{
-    audit_log::{AuthActor, write_audit_log},
-    auth::{AuthRole, RateLimit, RequireAuth},
+    audit_log::write_audit_log,
+    auth::{Authz, RateLimit, scope},
     db_credentials::{CredentialField, container_running, password_change_step, run_step},
     docker,
     error::AppError,
+    networks, secrets,
     state::AppState,
 };
 
 // ── Shared lookup helper ──
 
+/// Load a database with its secret columns decrypted.
 async fn fetch_db(pool: &sqlx::SqlitePool, id_or_name: &str) -> Result<ManagedDatabase, AppError> {
     let db: Option<ManagedDatabase> =
         sqlx::query_as("SELECT * FROM databases WHERE id = ? OR name = ? LIMIT 1")
@@ -47,22 +56,25 @@ async fn fetch_db(pool: &sqlx::SqlitePool, id_or_name: &str) -> Result<ManagedDa
             .bind(id_or_name)
             .fetch_optional(pool)
             .await?;
-    db.ok_or_else(|| fetch_db_error(id_or_name))
+    let db = db.ok_or_else(|| fetch_db_error(id_or_name))?;
+    Ok(secrets::open_database(db)?)
 }
 
 // ── List databases ──
 
 pub async fn list_databases(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::DbRead>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     let dbs: Vec<ManagedDatabase> =
         sqlx::query_as("SELECT * FROM databases ORDER BY created_at DESC")
             .fetch_all(&state.db)
             .await?;
-    let responses: Vec<ManagedDatabaseResponse> =
-        dbs.into_iter().map(ManagedDatabaseResponse::from).collect();
+    let mut responses: Vec<ManagedDatabaseResponse> = Vec::with_capacity(dbs.len());
+    for db in dbs {
+        responses.push(ManagedDatabaseResponse::from(secrets::open_database(db)?));
+    }
     Ok((StatusCode::OK, Json(ApiResponse::ok(responses))))
 }
 
@@ -70,13 +82,40 @@ pub async fn list_databases(
 
 pub async fn get_database(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::DbRead>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let db = fetch_db(&state.db, &id).await?;
     let detail = build_detail(db, public_host(&state).await.as_deref());
     Ok((StatusCode::OK, Json(ApiResponse::ok(detail))))
+}
+
+// Responses never carry passwords, whatever the caller's scopes: they are
+// write-only (`build_detail` masks connection strings) and readable only
+// through the audited `reveal_database_credentials` (db:credentials).
+
+/// GET /api/databases/{id}/credentials — the plaintext passwords and
+/// connection strings, for copying into an app or a client. Needs
+/// db:credentials; every reveal is audit-logged.
+pub async fn reveal_database_credentials(
+    _rate: RateLimit,
+    auth: Authz<scope::DbCredentials>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let db = fetch_db(&state.db, &id).await?;
+    let credentials = credentials_response(&db, public_host(&state).await.as_deref());
+    write_audit_log(
+        &state.db,
+        None,
+        None,
+        "db_credentials_reveal",
+        &auth.audit_actor(),
+        Some(&format!("name={}", db.name)),
+    )
+    .await;
+    Ok((StatusCode::OK, Json(ApiResponse::ok(credentials))))
 }
 
 /// Placeholder host shown in public connection strings when the server has no
@@ -196,12 +235,31 @@ fn exposure_for(db: &ManagedDatabase) -> docker::Exposure {
     }
 }
 
-/// Build a `ManagedDatabaseDetail` from a `ManagedDatabase` row,
-/// computing both external and internal connection strings.
+/// Plaintext connection strings of a (decrypted) database.
+struct ConnectionStrings {
+    external: Option<String>,
+    public: Option<String>,
+    internal: Option<String>,
+}
+
+/// Build a `ManagedDatabaseDetail` from a decrypted `ManagedDatabase` row,
+/// with masked connection strings (see `connection_strings`).
+fn build_detail(db: ManagedDatabase, public_host: Option<&str>) -> ManagedDatabaseDetail {
+    let strings = connection_strings(&db, public_host);
+    let mask = |s: Option<String>| s.as_deref().map(mask_url_password);
+    ManagedDatabaseDetail {
+        database: ManagedDatabaseResponse::from(db),
+        connection_string: mask(strings.external),
+        public_connection_string: mask(strings.public),
+        internal_connection_string: mask(strings.internal),
+    }
+}
+
+/// Compute the external, public and internal connection strings.
 /// If the database row has custom URL overrides set, those take precedence
 /// over the auto-computed strings. `public_host` is the server's public
 /// address, used for the public connection string when public access is on.
-fn build_detail(db: ManagedDatabase, public_host: Option<&str>) -> ManagedDatabaseDetail {
+fn connection_strings(db: &ManagedDatabase, public_host: Option<&str>) -> ConnectionStrings {
     let public_connection_string = if db.public_access {
         db.host_port.and_then(|port| {
             engine_for(&db.db_type).map(|eng| {
@@ -234,10 +292,11 @@ fn build_detail(db: ManagedDatabase, public_host: Option<&str>) -> ManagedDataba
         })
     };
 
-    // Internal string: use override if set, otherwise compute (only when db has a project).
+    // Internal string: use override if set, otherwise compute. Apps in the
+    // database's project and linked apps reach it by its name (networks.rs).
     let internal_connection_string = if let Some(ref custom) = db.custom_internal_url {
         Some(custom.clone())
-    } else if db.project_id.is_some() {
+    } else {
         engine_for(&db.db_type).map(|eng| {
             eng.internal_connection_string(
                 &db.name,
@@ -246,15 +305,12 @@ fn build_detail(db: ManagedDatabase, public_host: Option<&str>) -> ManagedDataba
                 db.db_password.as_deref(),
             )
         })
-    } else {
-        None
     };
 
-    ManagedDatabaseDetail {
-        database: ManagedDatabaseResponse::from(db),
-        connection_string,
-        public_connection_string,
-        internal_connection_string,
+    ConnectionStrings {
+        external: connection_string,
+        public: public_connection_string,
+        internal: internal_connection_string,
     }
 }
 
@@ -299,13 +355,12 @@ fn next_credential(current: Option<String>, requested: Option<String>) -> Option
 
 pub async fn create_database(
     _rate: RateLimit,
-    auth: AuthRole,
-    actor: AuthActor,
+    auth: Authz<scope::DbWrite>,
     State(state): State<AppState>,
     Json(req): Json<CreateDatabaseRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     if req.public_access {
-        auth.ensure_admin("expose a database to the internet")?;
+        auth.require_to(Scope::SettingsWrite, "expose a database to the internet")?;
     }
 
     // Validate name (alphanumeric + hyphens)
@@ -380,17 +435,11 @@ pub async fn create_database(
     let mut binds = vec![bind_path];
     binds.extend(extra_binds);
 
-    // Connect to project network if applicable
-    let network_name_owned;
-    let network_name: Option<&str> = if let Some(ref pid) = req.project_id {
-        network_name_owned = format!("tond-{}", pid);
-        docker::ensure_network(&state.docker, &network_name_owned)
-            .await
-            .map_err(|e| AppError(TondError::DockerError(e.to_string())))?;
-        Some(&network_name_owned)
-    } else {
-        None
-    };
+    // Home network: the project network, or the database's own network.
+    // Apps outside the project get access through explicit links.
+    let network = networks::ensure_database_home(&state.docker, &db)
+        .await
+        .map_err(|e| AppError(TondError::DockerError(e.to_string())))?;
 
     let container_name = format!("tond-db-{}", db.name);
     let db_name_alias = db.name.clone();
@@ -407,7 +456,7 @@ pub async fn create_database(
         db.memory_limit,
         None, // no cpu limit for databases
         binds.clone(),
-        network_name,
+        &network,
         Some(&db_name_alias),
         db_cmd.clone(),
     )
@@ -419,13 +468,15 @@ pub async fn create_database(
     db.status = "running".to_string();
     db.image_used = Some(image.to_string());
 
-    // Insert into DB
+    // Insert into DB (secret columns encrypted)
+    let sealed = secrets::seal_database(&db)?;
     sqlx::query(
         "INSERT INTO databases
             (id, name, db_type, project_id, container_id, host_port, status,
              db_name, db_user, db_password, root_password, volume_path, memory_limit,
+             custom_external_url, custom_internal_url,
              image_used, created_at, updated_at, public_access)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&db.id)
     .bind(&db.name)
@@ -436,10 +487,12 @@ pub async fn create_database(
     .bind(&db.status)
     .bind(&db.db_name)
     .bind(&db.db_user)
-    .bind(&db.db_password)
-    .bind(&db.root_password)
+    .bind(&sealed.db_password)
+    .bind(&sealed.root_password)
     .bind(&db.volume_path)
     .bind(db.memory_limit)
+    .bind(&sealed.custom_external_url)
+    .bind(&sealed.custom_internal_url)
     .bind(&db.image_used)
     .bind(&db.created_at)
     .bind(&db.updated_at)
@@ -459,7 +512,7 @@ pub async fn create_database(
         None,
         None,
         "db_create",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!(
             "name={} type={} image={} public_access={}",
             db.name, db.db_type, image, db.public_access
@@ -467,16 +520,42 @@ pub async fn create_database(
     )
     .await;
 
-    let detail = build_detail(db, public_host(&state).await.as_deref());
-    Ok((StatusCode::CREATED, Json(ApiResponse::ok(detail))))
+    // The creator gets the generated credentials once (when allowed to read
+    // credentials at all); later reads are masked.
+    let host = public_host(&state).await;
+    let credentials = auth
+        .has(Scope::DbCredentials)
+        .then(|| credentials_response(&db, host.as_deref()));
+    let detail = build_detail(db, host.as_deref());
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiResponse::ok(CreatedDatabaseResponse {
+            detail,
+            credentials,
+        })),
+    ))
+}
+
+fn credentials_response(
+    db: &ManagedDatabase,
+    public_host: Option<&str>,
+) -> DatabaseCredentialsResponse {
+    let strings = connection_strings(db, public_host);
+    DatabaseCredentialsResponse {
+        db_user: db.db_user.clone(),
+        db_password: db.db_password.clone(),
+        root_password: db.root_password.clone(),
+        connection_string: strings.external,
+        public_connection_string: strings.public,
+        internal_connection_string: strings.internal,
+    }
 }
 
 // ── Delete database ──
 
 pub async fn delete_database(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::DbDelete>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -485,6 +564,12 @@ pub async fn delete_database(
     // Stop and remove the container (best-effort)
     if let Some(ref cid) = db.container_id {
         let _ = docker::remove_container(&state.docker, cid).await;
+    }
+
+    // Its own network (a project network belongs to the project); links go
+    // with the row (ON DELETE CASCADE).
+    if db.project_id.is_none() {
+        docker::remove_network(&state.docker, &networks::database_network(&db.name)).await;
     }
 
     // Remove the volume directory (and a generated Redis config) from disk (best-effort)
@@ -503,7 +588,7 @@ pub async fn delete_database(
         None,
         None,
         "db_delete",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("name={}", db.name)),
     )
     .await;
@@ -518,8 +603,7 @@ pub async fn delete_database(
 
 pub async fn stop_database(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::DbWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -547,7 +631,7 @@ pub async fn stop_database(
         None,
         None,
         "db_stop",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("name={}", db.name)),
     )
     .await;
@@ -564,8 +648,7 @@ pub async fn stop_database(
 
 pub async fn start_database(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::DbWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -593,7 +676,7 @@ pub async fn start_database(
         None,
         None,
         "db_start",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("name={}", db.name)),
     )
     .await;
@@ -610,8 +693,7 @@ pub async fn start_database(
 
 pub async fn update_database(
     _rate: RateLimit,
-    auth: AuthRole,
-    actor: AuthActor,
+    auth: Authz<scope::DbWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateDatabaseRequest>,
@@ -621,11 +703,11 @@ pub async fn update_database(
     // A custom image runs arbitrary code with the database volume mounted, and
     // public access opens the port to the internet: both are admin decisions.
     if req.custom_image.is_some() {
-        auth.ensure_admin("change a database's Docker image")?;
+        auth.require_to(Scope::SettingsWrite, "change a database's Docker image")?;
     }
     let exposure_changed = req.public_access.is_some_and(|p| p != db.public_access);
     if exposure_changed {
-        auth.ensure_admin("change a database's public access")?;
+        auth.require_to(Scope::SettingsWrite, "change a database's public access")?;
     }
     let public_access = req.public_access.unwrap_or(db.public_access);
 
@@ -661,8 +743,8 @@ pub async fn update_database(
              updated_at           = datetime('now')
          WHERE id = ?",
     )
-    .bind(&ext_url)
-    .bind(&int_url)
+    .bind(secrets::seal_db_external_url(ext_url.as_deref())?)
+    .bind(secrets::seal_db_internal_url(int_url.as_deref())?)
     .bind(&cust_image)
     .bind(mem_limit)
     .bind(public_access)
@@ -675,7 +757,7 @@ pub async fn update_database(
         None,
         None,
         "db_update",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("name={} public_access={}", db.name, public_access)),
     )
     .await;
@@ -708,8 +790,7 @@ pub async fn update_database(
 ///   5. Updates `container_id`, `host_port`, `status`, and `image_used` in the DB.
 pub async fn redeploy_database(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    _actor: AuthActor,
+    _auth: Authz<scope::DbWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -771,17 +852,10 @@ async fn recreate_container(
     let mut binds = vec![bind_path];
     binds.extend(extra_binds);
 
-    // Reconnect to project network if applicable.
-    let network_name_owned;
-    let network_name: Option<&str> = if let Some(ref pid) = db.project_id {
-        network_name_owned = format!("tond-{}", pid);
-        docker::ensure_network(&state.docker, &network_name_owned)
-            .await
-            .map_err(|e| AppError(TondError::DockerError(e.to_string())))?;
-        Some(&network_name_owned)
-    } else {
-        None
-    };
+    // Same home network; linked apps' networks are re-attached below.
+    let network = networks::ensure_database_home(&state.docker, &db)
+        .await
+        .map_err(|e| AppError(TondError::DockerError(e.to_string())))?;
 
     let container_name = format!("tond-db-{}", db.name);
     let db_name_alias = db.name.clone();
@@ -797,7 +871,7 @@ async fn recreate_container(
         db.memory_limit,
         None,
         binds.clone(),
-        network_name,
+        &network,
         Some(&db_name_alias),
         db_cmd.clone(),
     )
@@ -821,7 +895,11 @@ async fn recreate_container(
     .execute(&state.db)
     .await?;
 
-    fetch_db(&state.db, &db.id).await
+    let updated = fetch_db(&state.db, &db.id).await?;
+    networks::reconcile_database(state, &updated)
+        .await
+        .map_err(|e| AppError(TondError::DockerError(e.to_string())))?;
+    Ok(updated)
 }
 
 // ── Update credentials ──
@@ -854,8 +932,7 @@ fn refuse_rename(
 /// database isn't running, for renames, and for engines that can't do it.
 pub async fn update_database_credentials(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::DbCredentials>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateDatabaseCredentials>,
@@ -945,8 +1022,8 @@ pub async fn update_database_credentials(
                 sqlx::query(
                     "UPDATE databases SET db_password = ?, root_password = ?, updated_at = datetime('now') WHERE id = ?",
                 )
-                .bind(password)
-                .bind(root)
+                .bind(secrets::seal_db_password(Some(password))?)
+                .bind(secrets::seal_db_root_password(root.as_deref())?)
                 .bind(&db.id)
                 .execute(&state.db)
                 .await?;
@@ -956,7 +1033,7 @@ pub async fn update_database_credentials(
                 sqlx::query(
                     "UPDATE databases SET root_password = ?, updated_at = datetime('now') WHERE id = ?",
                 )
-                .bind(password)
+                .bind(secrets::seal_db_root_password(Some(password))?)
                 .bind(&db.id)
                 .execute(&state.db)
                 .await?;
@@ -970,7 +1047,7 @@ pub async fn update_database_credentials(
         None,
         None,
         "db_credentials_update",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("name={} changed={}", db.name, applied.join(","))),
     )
     .await;
@@ -1003,7 +1080,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        auth::{RateLimiter, RequireAuth, extractor::Role, rate_limit::RateLimit},
+        auth::{Authz, Principal, RateLimiter, rate_limit::RateLimit},
         state::AppState,
     };
 
@@ -1033,6 +1110,7 @@ mod tests {
     }
 
     async fn seed_database_row(state: &AppState, db: &ManagedDatabase) {
+        let sealed = secrets::seal_database(db).unwrap_or_else(|err| panic!("seal: {err}"));
         sqlx::query(
             "INSERT INTO databases (id, name, db_type, project_id, container_id, host_port, status, db_name, db_user, db_password, root_password, volume_path, memory_limit, custom_external_url, custom_internal_url, image_used, custom_image, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1046,12 +1124,12 @@ mod tests {
         .bind(&db.status)
         .bind(&db.db_name)
         .bind(&db.db_user)
-        .bind(&db.db_password)
-        .bind(&db.root_password)
+        .bind(&sealed.db_password)
+        .bind(&sealed.root_password)
         .bind(&db.volume_path)
         .bind(db.memory_limit)
-        .bind(&db.custom_external_url)
-        .bind(&db.custom_internal_url)
+        .bind(&sealed.custom_external_url)
+        .bind(&sealed.custom_internal_url)
         .bind(&db.image_used)
         .bind(&db.custom_image)
         .bind(&db.created_at)
@@ -1096,15 +1174,21 @@ mod tests {
 
     #[test]
     fn build_detail_prefers_custom_urls_and_computes_engine_urls_when_missing() {
+        let strings = connection_strings(&sample_db(), None);
+        assert_eq!(
+            strings.external.as_deref(),
+            Some("postgres://appuser:secret@localhost:5433/appdb"),
+            "the plaintext string (reveal) carries the password"
+        );
         let detail = build_detail(sample_db(), None);
         assert_eq!(
             detail.connection_string.as_deref(),
-            Some("postgres://appuser:secret@localhost:5433/appdb"),
+            Some("postgres://appuser:••••••••@localhost:5433/appdb"),
             "build_detail should compute an external connection string from the engine config when no override is set"
         );
         assert_eq!(
             detail.internal_connection_string.as_deref(),
-            Some("postgres://appuser:secret@postgres-main:5432/appdb"),
+            Some("postgres://appuser:••••••••@postgres-main:5432/appdb"),
             "build_detail should compute an internal project-network connection string when the database belongs to a project"
         );
 
@@ -1202,12 +1286,12 @@ mod tests {
         let detail = build_detail(db.clone(), Some("tond.example.com"));
         assert_eq!(
             detail.public_connection_string.as_deref(),
-            Some("postgres://appuser:secret@tond.example.com:5433/appdb")
+            Some("postgres://appuser:••••••••@tond.example.com:5433/appdb")
         );
         let detail = build_detail(db, None);
         assert_eq!(
             detail.public_connection_string.as_deref(),
-            Some("postgres://appuser:secret@<server-ip>:5433/appdb"),
+            Some("postgres://appuser:••••••••@<server-ip>:5433/appdb"),
             "without a dashboard domain the host is an obvious placeholder"
         );
     }
@@ -1237,8 +1321,7 @@ mod tests {
         ] {
             let err = update_database(
                 RateLimit,
-                AuthRole(Role::Member),
-                AuthActor("member@example.com".to_string()),
+                Authz::unchecked(Principal::test_user(Role::Deployer)),
                 State(state.clone()),
                 Path(db.id.clone()),
                 Json(req),
@@ -1251,8 +1334,7 @@ mod tests {
 
         let err = create_database(
             RateLimit,
-            AuthRole(Role::Member),
-            AuthActor("member@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Deployer)),
             State(state.clone()),
             Json(CreateDatabaseRequest {
                 name: "public-db".to_string(),
@@ -1340,8 +1422,7 @@ mod tests {
 
         let response = update_database(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(db.id.clone()),
             Json(UpdateDatabaseRequest {
@@ -1386,8 +1467,7 @@ mod tests {
     ) -> Result<axum::response::Response, String> {
         update_database_credentials(
             RateLimit,
-            RequireAuth,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(id.to_string()),
             Json(req),
@@ -1407,11 +1487,69 @@ mod tests {
     }
 
     async fn stored_password(state: &AppState, id: &str) -> Option<String> {
-        sqlx::query_scalar("SELECT db_password FROM databases WHERE id = ?")
-            .bind(id)
-            .fetch_one(&state.db)
-            .await
-            .unwrap_or_else(|err| panic!("failed to read stored password: {err}"))
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT db_password FROM databases WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap_or_else(|err| panic!("failed to read stored password: {err}"));
+        crate::secret_key::decrypt_opt(
+            crate::secret_key::Purpose::DatabasePassword,
+            stored.as_deref(),
+        )
+        .unwrap_or_else(|err| panic!("stored password does not decrypt: {err}"))
+    }
+
+    #[tokio::test]
+    async fn database_secrets_are_encrypted_at_rest_and_revealed_only_on_request() {
+        let state = test_state().await;
+        let mut db = standalone_db();
+        db.custom_external_url = Some("postgres://appuser:secret@db.example.com/appdb".to_string());
+        seed_database_row(&state, &db).await;
+
+        let raw: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT db_password, custom_external_url FROM databases WHERE id = ?")
+                .bind(&db.id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap_or_else(|err| panic!("read raw row: {err}"));
+        assert!(raw.0.as_deref().is_some_and(|v| v.starts_with("v1.")));
+        assert!(raw.1.as_deref().is_some_and(|v| v.starts_with("v1.")));
+
+        let shown = get_database(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Viewer)),
+            State(state.clone()),
+            Path(db.id.clone()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("get_database should succeed"))
+        .into_response();
+        let shown = response_json(shown).await.to_string();
+        assert!(!shown.contains("secret"), "detail must be masked: {shown}");
+
+        let revealed = reveal_database_credentials(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            State(state.clone()),
+            Path(db.id.clone()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("reveal should succeed"))
+        .into_response();
+        let revealed = response_json(revealed).await;
+        assert_eq!(revealed["data"]["db_password"], "secret");
+        assert_eq!(
+            revealed["data"]["connection_string"],
+            "postgres://appuser:secret@db.example.com/appdb"
+        );
+        let audits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log WHERE action = 'db_credentials_reveal'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or_else(|err| panic!("count audits: {err}"));
+        assert_eq!(audits, 1, "every reveal is audit-logged");
     }
 
     #[tokio::test]

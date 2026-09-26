@@ -10,16 +10,20 @@ const api = vi.hoisted(() => ({
 	deleteDatabase: vi.fn(),
 	updateDatabase: vi.fn(),
 	updateDatabaseCredentials: vi.fn(),
+	revealDatabaseCredentials: vi.fn(),
+	listDatabaseBackups: vi.fn(),
+	createDatabaseBackup: vi.fn(),
+	restoreDatabase: vi.fn(),
 	redeployDatabase: vi.fn(),
 	listProjects: vi.fn()
 }));
 
-vi.mock('$lib/auth.svelte', () => ({ isAdmin: () => true }));
+vi.mock('$lib/auth.svelte', () => ({ isAdmin: () => true, can: () => true }));
 
 vi.mock('$lib/api', () => ({ ...api }));
-vi.mock('$app/navigation', () => ({ goto: vi.fn() }));
-vi.mock('$app/state', () => ({
-	page: { url: new URL('http://localhost/databases/db_pg1'), params: { id: 'db_pg1' } }
+vi.mock('$app/navigation', () => ({ goto: vi.fn(), invalidateAll: vi.fn() }));
+vi.mock('$app/state', async () => ({
+	page: (await import('../mocks/page-state.svelte')).page
 }));
 vi.mock('$lib/ui-context.svelte', () => ({
 	setUiContext: vi.fn(),
@@ -29,6 +33,8 @@ vi.mock('$lib/ui-context.svelte', () => ({
 }));
 
 import DatabasePage from '../../routes/databases/[id]/+page.svelte';
+import { setPageUrl } from '../mocks/page-state.svelte';
+import { confirmDialog, renderConfirmHost } from '../confirm';
 
 const pg: ManagedDatabaseDetail = {
 	id: 'db_pg1',
@@ -39,8 +45,8 @@ const pg: ManagedDatabaseDetail = {
 	status: 'running',
 	db_name: 'app_db',
 	db_user: 'app_user',
-	db_password: 'old_password',
-	root_password: null,
+	has_password: true,
+	has_root_password: false,
 	memory_limit: null,
 	custom_external_url: null,
 	custom_internal_url: null,
@@ -56,8 +62,9 @@ const pg: ManagedDatabaseDetail = {
 
 async function openEnvironment(db: ManagedDatabaseDetail) {
 	const user = userEvent.setup();
+	// The Environment tab is deep-linked through ?tab=environment.
+	setPageUrl(`http://localhost/databases/${db.id}?tab=environment`, { id: db.id });
 	render(DatabasePage, { props: { params: { id: db.id }, data: { db, projects: [] } } });
-	await user.click(screen.getByRole('tab', { name: /environment/i }));
 	return user;
 }
 
@@ -65,6 +72,7 @@ describe('databases/[id] credentials', () => {
 	beforeEach(() => {
 		for (const fn of Object.values(api)) fn.mockReset();
 		document.body.style.pointerEvents = '';
+		api.listDatabaseBackups.mockResolvedValue([]);
 	});
 
 	it('explains that password changes apply inside the running database', async () => {
@@ -78,7 +86,7 @@ describe('databases/[id] credentials', () => {
 
 	it('changes the password and reports success', async () => {
 		api.updateDatabaseCredentials.mockResolvedValue({
-			database: { ...pg, db_password: 'new_password' },
+			database: { ...pg },
 			changed: ['db_password']
 		});
 		const user = await openEnvironment(pg);
@@ -117,10 +125,67 @@ describe('databases/[id] credentials', () => {
 		expect(screen.getByText(/start the database to change a password/i)).toBeInTheDocument();
 	});
 
+	it('keeps the password hidden until an explicit, audited reveal', async () => {
+		api.revealDatabaseCredentials.mockResolvedValue({
+			db_user: 'app_user',
+			db_password: 'plain-password-123',
+			root_password: null,
+			connection_string: 'postgres://app_user:plain-password-123@localhost:5401/app_db',
+			public_connection_string: null,
+			internal_connection_string: null
+		});
+		const user = await openEnvironment(pg);
+
+		expect(screen.queryByText('plain-password-123')).not.toBeInTheDocument();
+		expect(api.revealDatabaseCredentials).not.toHaveBeenCalled();
+		await user.click(screen.getByRole('button', { name: /reveal postgres_password/i }));
+		expect(api.revealDatabaseCredentials).toHaveBeenCalledWith('db_pg1');
+		expect(await screen.findByText('plain-password-123')).toBeInTheDocument();
+	});
+
 	it('offers no password change for Redis', async () => {
 		await openEnvironment({ ...pg, db_type: 'redis', db_name: null });
 
 		expect(screen.queryByRole('button', { name: /^change /i })).not.toBeInTheDocument();
 		expect(screen.getByText(/can't be changed in place yet/i)).toBeInTheDocument();
+	});
+});
+
+describe('databases/[id] destructive actions', () => {
+	beforeEach(() => {
+		for (const fn of Object.values(api)) fn.mockReset();
+	});
+
+	it('stops only after confirmation', async () => {
+		api.stopDatabase.mockResolvedValue(undefined);
+		api.getDatabase.mockResolvedValue({ ...pg, status: 'stopped' });
+		api.listProjects.mockResolvedValue([]);
+		const user = userEvent.setup();
+		setPageUrl('http://localhost/databases/db_pg1', { id: 'db_pg1' });
+		renderConfirmHost();
+		render(DatabasePage, { props: { params: { id: pg.id }, data: { db: pg, projects: [] } } });
+
+		await user.click(screen.getByRole('button', { name: /^stop$/i }));
+		expect(api.stopDatabase).not.toHaveBeenCalled();
+		await confirmDialog(user);
+		expect(api.stopDatabase).toHaveBeenCalledWith('db_pg1');
+	});
+
+	it('deletes from the danger zone after typing the name', async () => {
+		api.deleteDatabase.mockResolvedValue(undefined);
+		const user = userEvent.setup();
+		setPageUrl('http://localhost/databases/db_pg1?tab=settings', { id: 'db_pg1' });
+		render(DatabasePage, { props: { params: { id: pg.id }, data: { db: pg, projects: [] } } });
+
+		expect(
+			within(screen.getByRole('navigation', { name: 'Database sections' })).getByRole('link', {
+				name: 'Settings'
+			})
+		).toHaveAttribute('aria-current', 'page');
+		await user.click(screen.getByRole('button', { name: /delete database/i }));
+		const dialog = await screen.findByRole('alertdialog');
+		expect(dialog).toHaveTextContent(/every table, key and file/i);
+		await confirmDialog(user, { typed: 'app-postgres' });
+		expect(api.deleteDatabase).toHaveBeenCalledWith('db_pg1');
 	});
 });

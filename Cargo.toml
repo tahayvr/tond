@@ -26,6 +26,17 @@ lto = false
 codegen-units = 256
 incremental = true
 
+# Hashing and compression run over whole snapshot archives; keep them
+# optimised in debug/test builds so streaming tests take seconds.
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.crc32fast]
+opt-level = 3
+[profile.dev.package.adler2]
+opt-level = 3
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
@@ -47,6 +58,10 @@ toml = "1.1.6"
 
 # Database
 sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "migrate", "chrono"] }
+# Same SQLite build sqlx links; used directly only for SQLITE_FCNTL_PERSIST_WAL
+libsqlite3-sys = { version = "0.30.1", default-features = false }
+# LevelFilter for sqlx's statement logging settings
+log = "0.4"
 
 # YAML (compose file validation; already in the tree via pingora)
 serde_yaml = "0.9.34"
@@ -77,6 +92,8 @@ uuid = { version = "1.22.0", features = ["v4", "serde"] }
 # Async utils
 futures = "0.3.32"
 tokio-stream = "0.1.18"
+# CancellationToken + TaskTracker (graceful shutdown)
+tokio-util = { version = "0.7.19", features = ["rt"] }
 
 # Crypto / auth
 sha2 = "0.11.0"
@@ -92,6 +109,8 @@ base64 = "0.23.1"
 instant-acme = "0.8.5"
 # Only used to pick the process-wide crypto provider (see tond_common::install_crypto_provider)
 rustls = { version = "0.23.45", default-features = false, features = ["aws_lc_rs", "std"] }
+# Streaming AES-256-GCM for snapshot archives (already in the tree via rustls)
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys"] }
 rcgen = "0.14.7"
 openssl = "0.10.75"
 
@@ -100,6 +119,8 @@ tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 
 # System info
 sysinfo = "0.39.6"
+# statvfs for the host disk gauge (already in the tree via tempfile)
+rustix = { version = "1.1.5", features = ["fs"] }
 
 # Cron expression parsing + next-run computation
 cron = "0.17.0"
@@ -135,6 +156,10 @@ portable-pty = "0.9.0"
 bytes = "1.11.1"
 pingora = { version = "0.9.0", features = ["lb", "openssl"] }
 async-trait = "0.1.89"
+
+# Release signature verification (`tond update`); `minisign` signs in tests only
+minisign-verify = "0.3.0"
+minisign = "0.10.0"
 
 # Test helpers
 filetime = "0.2.27"

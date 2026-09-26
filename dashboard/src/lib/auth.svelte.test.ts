@@ -89,7 +89,7 @@ describe('auth state', () => {
 		auth.setAuthenticated({
 			id: 'usr_2',
 			email: 'member@example.com',
-			role: 'member',
+			role: 'viewer',
 			totp_enabled: false,
 			created_at: '2026-01-01T00:00:00.000Z'
 		});

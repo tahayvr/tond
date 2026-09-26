@@ -38,6 +38,88 @@ error() { echo -e "${RED}[update]${NC} $*" >&2; }
 fatal() { error "$@"; exit 1; }
 step()  { echo -e "\n${CYAN}▶${NC} ${BOLD}$*${NC}"; }
 
+# ── Release signatures (keep in sync: install.sh, update.sh, web/install.sh,
+# web/update.sh; crates/tond-cli/src/signature.rs has the same policy) ──
+#
+# Releases are signed with minisign (release/SIGNING.md). A signature that is
+# present must verify; a missing one is refused unless the release predates
+# signing (TOND_UNSIGNED_RELEASES) or TOND_ALLOW_UNSIGNED=1 is set. The check
+# needs only openssl (Ed25519 over the file's BLAKE2b-512 hash, which is what
+# minisign's default "ED" signatures are).
+TOND_RELEASE_PUBKEY=""
+TOND_UNSIGNED_RELEASES="v0.1.0"
+
+# verify_minisig FILE SIGFILE PUBKEY_B64 — succeeds when SIGFILE is a valid
+# prehashed minisign signature of FILE by PUBKEY_B64.
+verify_minisig() {
+    _vm_dir=$(mktemp -d) || return 1
+    _vm_rc=1
+    if printf '%s' "$3" | base64 -d > "$_vm_dir/pub.bin" 2>/dev/null \
+        && sed -n 2p "$2" | base64 -d > "$_vm_dir/sig.bin" 2>/dev/null \
+        && [ "$(wc -c < "$_vm_dir/pub.bin")" -eq 42 ] \
+        && [ "$(wc -c < "$_vm_dir/sig.bin")" -eq 74 ] \
+        && [ "$(head -c 2 "$_vm_dir/pub.bin")" = "Ed" ] \
+        && [ "$(head -c 2 "$_vm_dir/sig.bin")" = "ED" ] \
+        && [ "$(tail -c +3 "$_vm_dir/pub.bin" | head -c 8 | od -An -tx1)" = "$(tail -c +3 "$_vm_dir/sig.bin" | head -c 8 | od -An -tx1)" ]; then
+        # DER SubjectPublicKeyInfo prefix for an Ed25519 key, then the key.
+        printf '\060\052\060\005\006\003\053\145\160\003\041\000' > "$_vm_dir/pub.der"
+        tail -c 32 "$_vm_dir/pub.bin" >> "$_vm_dir/pub.der"
+        tail -c 64 "$_vm_dir/sig.bin" > "$_vm_dir/sig.raw"
+        if openssl dgst -blake2b512 -binary "$1" > "$_vm_dir/hash.bin" 2>/dev/null \
+            && openssl pkeyutl -verify -pubin -keyform DER -inkey "$_vm_dir/pub.der" \
+                -rawin -in "$_vm_dir/hash.bin" -sigfile "$_vm_dir/sig.raw" > /dev/null 2>&1; then
+            _vm_rc=0
+        fi
+    fi
+    rm -rf "$_vm_dir"
+    return $_vm_rc
+}
+
+# check_release_signature TAG TARBALL SIGFILE — apply the policy above.
+# SIGFILE may be missing or empty (the release has no signature). Prints why
+# and fails when the release must not be used.
+check_release_signature() {
+    if [ -z "$TOND_RELEASE_PUBKEY" ]; then
+        echo "Warning: this installer has no release signing key; only the checksum of $1 was verified." >&2
+        return 0
+    fi
+    if [ -s "$3" ]; then
+        if ! command -v openssl > /dev/null 2>&1; then
+            echo "openssl is needed to verify the signature of $1. Install it (apt-get install openssl) and try again." >&2
+            return 1
+        fi
+        if verify_minisig "$2" "$3" "$TOND_RELEASE_PUBKEY"; then
+            echo "Signature of $1 verified."
+            return 0
+        fi
+        echo "The signature of release $1 does not verify. The download may have been tampered with; nothing was installed." >&2
+        return 1
+    fi
+    case " $TOND_UNSIGNED_RELEASES " in
+        *" $1 "*)
+            echo "Warning: $1 was published before releases were signed; only its checksum was verified." >&2
+            return 0
+            ;;
+    esac
+    if [ "${TOND_ALLOW_UNSIGNED:-}" = "1" ]; then
+        echo "Warning: TOND_ALLOW_UNSIGNED=1 is set, so the missing signature of $1 was ignored." >&2
+        return 0
+    fi
+    echo "Release $1 has no signature (.minisig), so it can't be verified and was not installed. If you trust this download anyway, rerun with TOND_ALLOW_UNSIGNED=1." >&2
+    return 1
+}
+
+# latest_release_tag — the tag of the latest GitHub release (e.g. v0.2.0).
+latest_release_tag() {
+    _lr_api="https://api.github.com/repos/tahayvr/tond/releases/latest"
+    if command -v curl > /dev/null 2>&1; then
+        curl -fsSL "$_lr_api"
+    else
+        wget -qO- "$_lr_api"
+    fi | sed -n 's/.*"tag_name": *"\(v[^"]*\)".*/\1/p' | head -n 1
+}
+# ── end release signatures ──
+
 # Configuration
 DRY_RUN=false
 VERSION="latest"
@@ -157,19 +239,19 @@ secure_data_dir() {
     # the proxy's own state, handled below.
     find "$DATA_DIR" -mindepth 1 -maxdepth 1 \
         ! -name 'tond.db' ! -name 'tond.db-wal' ! -name 'tond.db-shm' \
-        ! -name certs ! -name acme_account.json \
+        ! -name certs ! -name acme_account.json ! -name proxy.sock \
         -exec chmod go-rwx {} +
 
     # Pre-create the database so the proxy can open it on first start; an
     # empty file is a valid new SQLite database.
     if [[ ! -e "${DATA_DIR}/tond.db" ]]; then
-        install -m 0660 -o root -g "$PROXY_USER" /dev/null "${DATA_DIR}/tond.db"
+        install -m 0640 -o root -g "$PROXY_USER" /dev/null "${DATA_DIR}/tond.db"
     fi
     local f
     for f in tond.db tond.db-wal tond.db-shm; do
         if [[ -e "${DATA_DIR}/${f}" ]]; then
             chown root:"$PROXY_USER" "${DATA_DIR}/${f}"
-            chmod 0660 "${DATA_DIR}/${f}"
+            chmod 0640 "${DATA_DIR}/${f}"
         fi
     done
 
@@ -199,9 +281,11 @@ get_current_version() {
     fi
 }
 
-# Get latest version from GitHub
+# Get latest version from GitHub (without the v prefix)
 get_latest_version() {
-    curl -fsSL https://api.github.com/repos/tahayvr/tond/releases/latest | grep '"tag_name":' | sed 's/.*"v\(.*\)".*/\1/'
+    local tag
+    tag="$(latest_release_tag)"
+    echo "${tag#v}"
 }
 
 # Download specific version
@@ -217,10 +301,10 @@ download_version() {
     arch="$(host_arch)"
     name="tond-linux-${arch}"
     if [[ "$version" == "latest" ]]; then
-        url="https://github.com/tahayvr/tond/releases/latest/download/${name}.tar.gz"
-    else
-        url="https://github.com/tahayvr/tond/releases/download/v${version}/${name}.tar.gz"
+        version="$(get_latest_version)"
+        [[ -n "$version" ]] || fatal "Could not look up the latest release"
     fi
+    url="https://github.com/tahayvr/tond/releases/download/v${version}/${name}.tar.gz"
 
     info "Downloading from GitHub..."
     if [[ "$DRY_RUN" == true ]]; then
@@ -246,6 +330,12 @@ download_version() {
         fatal "Checksum verification failed! Download may be corrupted or tampered with."
     fi
     info "✓ Checksum verified"
+
+    info "Verifying signature..."
+    curl -fsSL -o "${tmp_dir}/tond.tar.gz.minisig" "${url}.minisig" 2>/dev/null \
+        || rm -f "${tmp_dir}/tond.tar.gz.minisig"
+    check_release_signature "v${version}" "${tmp_dir}/tond.tar.gz" "${tmp_dir}/tond.tar.gz.minisig" >&2 \
+        || fatal "Refusing to install an unverified release"
 
     info "Extracting..."
     tar -xzf "${tmp_dir}/tond.tar.gz" -C "$tmp_dir" || fatal "Failed to extract archive"
@@ -411,6 +501,9 @@ perform_update() {
     info "Updating service files..."
     cp "${download_path}/tond-server.service" /etc/systemd/system/tond-server.service
     cp "${download_path}/tond-proxy.service" /etc/systemd/system/tond-proxy.service
+    if [[ -f "${download_path}/tondbuild.slice" ]]; then
+        cp "${download_path}/tondbuild.slice" /etc/systemd/system/tondbuild.slice
+    fi
     systemctl daemon-reload
 
     # The new units run tond-proxy as ${PROXY_USER}; fix ownership and modes

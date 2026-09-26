@@ -3,7 +3,7 @@
 // Projects group related apps under a single logical unit and provide
 // shared environment variables injected into every member app at deploy time.
 //
-// Routes (all require RequireAuth + RateLimit):
+// Routes (all require RateLimit + an Authz scope, see each handler):
 //   GET    /api/projects              — list all projects
 //   POST   /api/projects              — create a project
 //   GET    /api/projects/{id}         — get project details (with member apps)
@@ -21,11 +21,12 @@ use axum::{
 use tond_common::*;
 
 use crate::{
-    alerts,
-    audit_log::{AuthActor, write_audit_log},
-    auth::{RateLimit, RequireAuth},
+    audit_log::write_audit_log,
+    auth::{Authz, RateLimit, scope},
     deploy, docker,
     error::AppError,
+    handlers::{self, env_map_from_json},
+    networks, secrets,
     state::AppState,
 };
 
@@ -38,11 +39,15 @@ struct ProjectDetailResponse {
     apps: Vec<AppResponse>,
 }
 
+// Shared env values are stored encrypted and are write-only: every response
+// lists the keys with masked values (`ProjectResponse::new`), whatever the
+// caller's scopes, like app env vars.
+
 // ── List projects ──
 
 pub async fn list_projects(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::AppsRead>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     // Include a count of active (non-expired) project previews per project.
@@ -77,22 +82,19 @@ pub async fn list_projects(
     .fetch_all(&state.db)
     .await?;
 
-    let responses: Vec<ProjectResponse> = rows
-        .into_iter()
-        .map(|r| {
-            let env_vars: serde_json::Value = serde_json::from_str(&r.env_vars)
-                .unwrap_or(serde_json::Value::Object(Default::default()));
-            ProjectResponse {
-                id: r.id,
-                name: r.name,
-                description: r.description,
-                env_vars,
-                created_at: r.created_at,
-                updated_at: r.updated_at,
-                active_preview_count: r.active_preview_count,
-            }
-        })
-        .collect();
+    let mut responses: Vec<ProjectResponse> = Vec::with_capacity(rows.len());
+    for r in rows.into_iter().filter(|r| auth.can_see_project(&r.id)) {
+        let env = secrets::project_env(&r.env_vars)?;
+        let project = Project {
+            id: r.id,
+            name: r.name,
+            description: r.description,
+            env_vars: r.env_vars,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        };
+        responses.push(ProjectResponse::new(project, &env, r.active_preview_count));
+    }
 
     Ok(Json(ApiResponse::ok(responses)))
 }
@@ -101,7 +103,7 @@ pub async fn list_projects(
 
 pub async fn get_project(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsRead>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -123,8 +125,9 @@ pub async fn get_project(
 
     let app_responses: Vec<AppResponse> = apps.into_iter().map(AppResponse::from).collect();
 
+    let env = secrets::project_env(&project.env_vars)?;
     Ok(Json(ApiResponse::ok(ProjectDetailResponse {
-        project: ProjectResponse::from(project),
+        project: ProjectResponse::new(project, &env, 0),
         apps: app_responses,
     })))
 }
@@ -133,8 +136,7 @@ pub async fn get_project(
 
 pub async fn create_project(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Json(req): Json<CreateProjectRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -159,12 +161,15 @@ pub async fn create_project(
 
     let project = Project::new(name.clone(), req.description.clone());
 
-    // Use caller-supplied env_vars if provided
-    let env_vars_str = if let Some(ev) = req.env_vars {
-        serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_string())
-    } else {
-        "{}".to_string()
+    // Use caller-supplied env_vars if provided (stored encrypted)
+    let env = match req.env_vars {
+        Some(ref ev) => {
+            auth.require(Scope::EnvWrite)?;
+            env_map_from_json(ev)?
+        }
+        None => Default::default(),
     };
+    let env_vars_str = secrets::seal_project_env(&env)?;
 
     sqlx::query(
         "INSERT INTO projects (id, name, description, env_vars, created_at, updated_at)
@@ -184,7 +189,7 @@ pub async fn create_project(
         None,
         None,
         "create_project",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("name={}", name)),
     )
     .await;
@@ -193,7 +198,7 @@ pub async fn create_project(
     project.env_vars = env_vars_str;
     Ok((
         StatusCode::CREATED,
-        Json(ApiResponse::ok(ProjectResponse::from(project))),
+        Json(ApiResponse::ok(ProjectResponse::new(project, &env, 0))),
     ))
 }
 
@@ -201,8 +206,7 @@ pub async fn create_project(
 
 pub async fn update_project(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateProjectRequest>,
@@ -218,10 +222,17 @@ pub async fn update_project(
 
     let new_name = req.name.as_deref().unwrap_or(&project.name).to_string();
     let new_desc = req.description.or(project.description.clone());
-    let new_env_str = if let Some(ev) = req.env_vars {
-        serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_string())
-    } else {
-        project.env_vars.clone()
+    let (new_env_str, env) = match req.env_vars {
+        Some(ref ev) => {
+            // Shared env vars are replaced as a whole (write-only values).
+            auth.require(Scope::EnvWrite)?;
+            let env = env_map_from_json(ev)?;
+            (secrets::seal_project_env(&env)?, env)
+        }
+        None => (
+            project.env_vars.clone(),
+            secrets::project_env(&project.env_vars)?,
+        ),
     };
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -242,7 +253,7 @@ pub async fn update_project(
         None,
         None,
         "update_project",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("id={}", project.id)),
     )
     .await;
@@ -254,15 +265,45 @@ pub async fn update_project(
         updated_at: now,
         ..project
     };
-    Ok(Json(ApiResponse::ok(ProjectResponse::from(updated))))
+    Ok(Json(ApiResponse::ok(ProjectResponse::new(
+        updated, &env, 0,
+    ))))
+}
+
+/// After a project is deleted, attach its former apps and databases to their
+/// own home networks (see networks.rs).
+async fn rehome_former_members(state: &AppState, app_ids: &[String], db_ids: &[String]) {
+    for id in app_ids {
+        if let Ok(Some(app)) = sqlx::query_as::<_, App>("SELECT * FROM apps WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await
+            && let Err(e) = networks::reconcile_app(state, &app).await
+        {
+            tracing::warn!("Could not move app {} to its own network: {e}", app.name);
+        }
+    }
+    for id in db_ids {
+        if let Ok(Some(db)) =
+            sqlx::query_as::<_, ManagedDatabase>("SELECT * FROM databases WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&state.db)
+                .await
+            && let Err(e) = networks::reconcile_database(state, &db).await
+        {
+            tracing::warn!(
+                "Could not move database {} to its own network: {e}",
+                db.name
+            );
+        }
+    }
 }
 
 // ── Delete project ──
 
 pub async fn delete_project(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::AppsDelete>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -275,8 +316,26 @@ pub async fn delete_project(
     let project =
         project.ok_or_else(|| AppError(TondError::NotFound(format!("project '{}'", id))))?;
 
+    // Members that leave with the project, to move onto their own networks.
+    let member_apps: Vec<String> = sqlx::query_scalar("SELECT id FROM apps WHERE project_id = ?")
+        .bind(&project.id)
+        .fetch_all(&state.db)
+        .await?;
+    let member_dbs: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM databases WHERE project_id = ?")
+            .bind(&project.id)
+            .fetch_all(&state.db)
+            .await?;
+
     // Un-assign all member apps (do NOT delete them)
     sqlx::query("UPDATE apps SET project_id = NULL WHERE project_id = ?")
+        .bind(&project.id)
+        .execute(&state.db)
+        .await?;
+
+    // cron_jobs.project_id has no foreign key; detach them explicitly so
+    // they run on their own networks instead of recreating this one.
+    sqlx::query("UPDATE cron_jobs SET project_id = NULL WHERE project_id = ?")
         .bind(&project.id)
         .execute(&state.db)
         .await?;
@@ -286,16 +345,20 @@ pub async fn delete_project(
         .execute(&state.db)
         .await?;
 
+    // Move former members to their own networks before the project network
+    // goes away (a container left without a network loses its published
+    // port). Best-effort: the next deploy fixes anything missed.
+    rehome_former_members(&state, &member_apps, &member_dbs).await;
+
     // Remove the Docker network for this project (best-effort)
-    let network_name = format!("tond-{}", project.id);
-    docker::remove_network(&state.docker, &network_name).await;
+    docker::remove_network(&state.docker, &networks::project_network(&project.id)).await;
 
     write_audit_log(
         &state.db,
         None,
         None,
         "delete_project",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("name={}", project.name)),
     )
     .await;
@@ -312,8 +375,7 @@ pub async fn delete_project(
 
 pub async fn deploy_project(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::AppsDeploy>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -342,50 +404,37 @@ pub async fn deploy_project(
     }
 
     let queued = apps.len();
-    // Deploys are run sequentially in a background task to avoid the port
-    // allocation race: find_free_port reads live container ports, so two
-    // concurrent deploys that both need a new port will see the same snapshot
-    // and pick the same port, causing one container to fail with "port already
-    // allocated". Running them one after another ensures each deploy binds its
-    // port before the next one calls find_free_port.
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        for mut app in apps {
-            if let Err(e) = deploy::deploy(&state_clone, &mut app, "manual").await {
-                tracing::error!("Project deploy error for {}: {}", app.name, e);
-                let _ = sqlx::query(
-                    "UPDATE apps SET status = 'failed', updated_at = datetime('now') WHERE id = ?",
-                )
-                .bind(&app.id)
-                .execute(&state_clone.db)
-                .await;
-                alerts::fire_event_alerts(
-                    &state_clone,
-                    "deployment_failure",
-                    Some(app.id.as_str()),
-                    Some(app.name.as_str()),
-                    Some(&e.to_string()),
-                )
-                .await;
-            } else {
-                alerts::fire_event_alerts(
-                    &state_clone,
-                    "deployment_success",
-                    Some(app.id.as_str()),
-                    Some(app.name.as_str()),
-                    None,
-                )
-                .await;
-            }
-        }
-    });
+    // Each app gets its own queued deployment. The build queue runs one build
+    // at a time and serialises port allocation (deploy/queue.rs), so the apps
+    // no longer need to be deployed strictly one after another here.
+    let detail = Some(format!(
+        "project {} ({})",
+        project.name,
+        handlers::deploy_trigger(&auth).1.unwrap_or_default()
+    ));
+    let mut deployment_ids = Vec::with_capacity(apps.len());
+    for app in apps {
+        let name = app.name.clone();
+        let q = deploy::start(
+            &state,
+            app,
+            deploy::DeployRequest::source("manual", detail.clone()),
+        )
+        .await
+        .map_err(|e| {
+            AppError(TondError::Internal(format!(
+                "Could not queue the deploy of {name}: {e}"
+            )))
+        })?;
+        deployment_ids.push(q.deployment_id);
+    }
 
     write_audit_log(
         &state.db,
         None,
         None,
         "deploy_project",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("project={} apps={}", project.name, queued)),
     )
     .await;
@@ -394,7 +443,8 @@ pub async fn deploy_project(
         StatusCode::ACCEPTED,
         Json(ApiResponse::ok(serde_json::json!({
             "queued": queued,
-            "message": format!("deploying {} app(s)", queued)
+            "deployment_ids": deployment_ids,
+            "message": format!("Queued {} deployment(s)", queued)
         }))),
     ))
 }

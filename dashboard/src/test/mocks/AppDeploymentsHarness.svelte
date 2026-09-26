@@ -5,18 +5,22 @@
 
 	interface Props {
 		deployments: Deployment[];
-		onRollback: (deploymentId?: string) => void | Promise<void>;
+		onRollback: (deploymentId: string) => void | Promise<void>;
+		canRollback?: boolean;
 	}
 
-	let { deployments, onRollback }: Props = $props();
+	let { deployments, onRollback, canRollback = true }: Props = $props();
 </script>
 
 <Tooltip.Provider>
 	<AppDeployments
+		appId="app_1"
+		appName="web"
 		{deployments}
 		loading={false}
 		error=""
 		{onRollback}
+		{canRollback}
 		onViewGeneratedDockerfile={async () => ''}
 	/>
 </Tooltip.Provider>

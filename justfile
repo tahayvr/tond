@@ -217,6 +217,10 @@ vm-install: package
 vm-e2e: package
     scripts/dev-vm.sh e2e --arch {{ linux_arch }}
 
+# Run the resource budget test (idle RSS, CPU, wakeups, DB queries, journal; 0 and 50 apps) on a fresh install in the local VM
+vm-budget: package
+    scripts/dev-vm.sh budget --arch {{ linux_arch }}
+
 # Open a root shell in the local VM
 vm-shell:
     scripts/dev-vm.sh shell --arch {{ linux_arch }}
@@ -271,9 +275,10 @@ restart-proxy:
 restart-server:
     ssh {{ server }} "systemctl restart tond-server && echo Done"
 
-# Print the root API key (written once to a root-only file on first start)
-root-key:
-    ssh {{ server }} "cat /opt/tond/data/root-api-key"
+# Create a scoped API token on the server (printed once), e.g.
+#   just token "--name ci --preset deployer --app web --expires 30d"
+token args:
+    ssh {{ server }} "tond token create {{ args }}"
 
 # Print the one-time admin setup link (until the admin account exists)
 setup-link:

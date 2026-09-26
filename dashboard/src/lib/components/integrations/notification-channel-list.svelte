@@ -1,4 +1,8 @@
 <script lang="ts">
+	import StatusBadge from '$lib/components/feedback/status-badge.svelte';
+	import SuccessAlert from '$lib/components/feedback/success-alert.svelte';
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
+	import { confirmAction } from '$lib/confirm.svelte';
 	import {
 		listIntegrations,
 		createIntegration,
@@ -12,12 +16,10 @@
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
-	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import Trash2 from '~icons/ri/delete-bin-line';
 	import Plus from '~icons/ri/add-line';
 	import Pencil from '~icons/ri/pencil-line';
 	import FlaskConical from '~icons/ri/flask-line';
-	import Badge from '$lib/components/ui/badge/badge.svelte';
 
 	interface Props {
 		kind: IntegrationKind;
@@ -30,8 +32,12 @@
 		buildConfig: () => IntegrationConfig;
 		/** Reset channel-specific form fields to empty */
 		resetConfig: () => void;
-		/** Populate channel-specific form fields from an existing config (for editing) */
-		loadConfig: (config: IntegrationConfig) => void;
+		/**
+		 * Populate channel-specific form fields from an existing config (for
+		 * editing). Secret fields are never returned; `savedSecrets` names the
+		 * ones that have a saved value, so the form can show them as saved.
+		 */
+		loadConfig: (config: IntegrationConfig, savedSecrets: string[]) => void;
 	}
 
 	let {
@@ -123,7 +129,7 @@
 		editingId = integration.id;
 		editName = integration.name;
 		editError = '';
-		loadConfig(integration.config);
+		loadConfig(integration.config, integration.saved_secrets ?? []);
 	}
 
 	async function handleSave() {
@@ -161,17 +167,25 @@
 	}
 
 	async function handleDelete(id: string) {
-		deletingId = id;
+		const target = integrations.find((i) => i.id === id);
 		error = '';
-		try {
-			await deleteIntegration(id);
-			integrations = integrations.filter((i) => i.id !== id);
-			if (editingId === id) cancelEdit();
-		} catch (e: any) {
-			error = e.message ?? 'Failed to delete integration';
-		} finally {
-			deletingId = null;
-		}
+		await confirmAction({
+			title: `Delete ${target?.name ?? 'this channel'}?`,
+			description:
+				'Alert rules that notify this channel stop sending to it. Rules left without any channel stay saved but notify nobody until you add one.',
+			confirmLabel: 'Delete channel',
+			pendingLabel: 'Deleting…',
+			onconfirm: async () => {
+				deletingId = id;
+				try {
+					await deleteIntegration(id);
+					integrations = integrations.filter((i) => i.id !== id);
+					if (editingId === id) cancelEdit();
+				} finally {
+					deletingId = null;
+				}
+			}
+		});
 	}
 
 	async function handleToggle(integration: Integration) {
@@ -232,15 +246,9 @@
 	});
 </script>
 
-{#if error}
-	<ErrorAlert title="Integration Error" description={error} />
-{/if}
+<InlineError title="Integration Error" message={error} />
 
-{#if testMessage}
-	<div class="rounded border border-green-500 bg-green-500/10 p-3 text-xs text-green-600">
-		{testMessage}
-	</div>
-{/if}
+<SuccessAlert message={testMessage} />
 
 <div class="space-y-3">
 	<div class="flex items-center justify-between">
@@ -263,9 +271,7 @@
 			class="space-y-3 border bg-muted/30 p-4"
 		>
 			<p class="text-xs font-semibold uppercase">New {label} Channel</p>
-			{#if addError}
-				<p class="text-xs text-destructive">{addError}</p>
-			{/if}
+			<InlineError message={addError} />
 			<div class="grid gap-1.5">
 				<Label class="text-xs" for="ch-name">Display Name</Label>
 				<Input
@@ -310,16 +316,9 @@
 							<div class="flex items-center gap-2">
 								<span class="font-medium">{integration.name}</span>
 								{#if integration.enabled}
-									<Badge
-										variant="outline"
-										class="h-4 border-green-500 px-1 text-[10px] text-green-500"
-									>
-										Enabled
-									</Badge>
+									<StatusBadge status="enabled" size="sm" />
 								{:else}
-									<Badge variant="outline" class="h-4 px-1 text-[10px] text-muted-foreground">
-										Disabled
-									</Badge>
+									<StatusBadge status="disabled" size="sm" />
 								{/if}
 							</div>
 							<span class="text-muted-foreground">Added {formatDate(integration.created_at)}</span>
@@ -375,9 +374,7 @@
 							class="space-y-3 border-t bg-muted/30 px-4 py-4"
 						>
 							<p class="text-xs font-semibold uppercase">Edit {label} Channel</p>
-							{#if editError}
-								<p class="text-xs text-destructive">{editError}</p>
-							{/if}
+							<InlineError message={editError} />
 							<div class="grid gap-1.5">
 								<Label class="text-xs" for="edit-ch-name">Display Name</Label>
 								<Input id="edit-ch-name" class="h-8 text-xs" bind:value={editName} />

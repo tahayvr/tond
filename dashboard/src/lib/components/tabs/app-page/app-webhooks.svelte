@@ -1,11 +1,15 @@
 <script lang="ts">
+	import SuccessAlert from '$lib/components/feedback/success-alert.svelte';
 	import {
 		getWebhookConfig,
+		revealWebhookSecret,
 		rotateWebhookSecret,
 		setWebhookSecret,
 		type WebhookConfig,
 		type WebhookUrls
 	} from '$lib/api';
+	import { can } from '$lib/auth.svelte';
+	import RevealableSecret from '$lib/components/secrets/revealable-secret.svelte';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
@@ -36,6 +40,12 @@
 	let rotating = $state(false);
 	let customSecret = $state('');
 	let savingCustom = $state(false);
+	/** Plaintext secret, only after an explicit reveal or a rotation */
+	let revealedSecret = $state<string | null>(null);
+
+	async function handleReveal(): Promise<string> {
+		return (await revealWebhookSecret(appId)).secret;
+	}
 
 	let origin = $derived(typeof window !== 'undefined' ? window.location.origin : '');
 
@@ -80,9 +90,9 @@
 		success = '';
 		rotating = true;
 		try {
-			config = await rotateWebhookSecret(appId);
+			revealedSecret = (await rotateWebhookSecret(appId)).secret;
 			success =
-				'New secret generated. Update it in your git provider — the old one no longer works.';
+				'New secret generated and shown below. Copy it into your git provider now — the old one no longer works.';
 			confirmingRotate = false;
 		} catch (e: any) {
 			error = e.message ?? 'Failed to rotate the webhook secret';
@@ -103,6 +113,7 @@
 		try {
 			config = await setWebhookSecret(appId, secret);
 			customSecret = '';
+			revealedSecret = null;
 			success = 'Webhook secret updated.';
 		} catch (e: any) {
 			error = e.message ?? 'Failed to update the webhook secret';
@@ -147,9 +158,7 @@
 			<button type="button" class="text-xs underline" onclick={() => (error = '')}>Dismiss</button>
 		</div>
 	{/if}
-	{#if success}
-		<p class="text-sm text-success">{success}</p>
-	{/if}
+	<SuccessAlert message={success} />
 
 	{#if loading}
 		<p class="text-xs text-muted-foreground">Loading webhook settings…</p>
@@ -196,7 +205,13 @@
 				<Label for="webhook-secret-value">
 					{provider === 'gitlab' ? 'Secret token' : 'Secret'}
 				</Label>
-				<SecretInput id="webhook-secret-value" readonly value={config.secret} />
+				<RevealableSecret
+					id="webhook-secret-value"
+					reveal={handleReveal}
+					canReveal={can('env:read-values')}
+					bind:value={revealedSecret}
+					lockedHint="Your role can't reveal the secret. Rotate it to get a new one you can copy."
+				/>
 			</div>
 		</div>
 

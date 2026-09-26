@@ -1,4 +1,6 @@
 <script lang="ts">
+	import StatusBadge from '$lib/components/feedback/status-badge.svelte';
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { safeUrl } from '$lib/utils';
 	import {
 		listGitHubRepos,
@@ -9,7 +11,6 @@
 		type GitHubBranch
 	} from '$lib/api';
 	import { Button } from '$lib/components/ui/button/index.js';
-	import { Badge } from '$lib/components/ui/badge/index.js';
 	import Github from '~icons/ri/github-fill';
 	import Trash2 from '~icons/ri/delete-bin-line';
 	import ChevronDown from '~icons/ri/arrow-down-s-line';
@@ -181,9 +182,7 @@
 							<X class="h-3.5 w-3.5" />
 						</button>
 					</div>
-					{#if nameError}
-						<span class="text-[10px] text-destructive">{nameError}</span>
-					{/if}
+					<InlineError message={nameError} />
 				{:else}
 					<div class="flex items-center gap-1.5">
 						<span class="text-sm font-bold uppercase">{displayName}</span>
@@ -201,9 +200,9 @@
 		</div>
 		<div class="flex items-center gap-2">
 			{#if app.installed}
-				<Badge variant="outline" class="border-success text-xs text-success">Installed</Badge>
+				<StatusBadge status="installed" size="sm" />
 			{:else}
-				<Badge variant="outline" class="border-warn text-xs text-warn">Pending Install</Badge>
+				<StatusBadge status="pending" label="Waiting for install" size="sm" />
 			{/if}
 			<!-- View on GitHub -->
 			<Button
