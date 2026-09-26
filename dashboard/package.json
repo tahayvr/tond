@@ -42,7 +42,6 @@
 		"eslint-plugin-svelte": "^3.23.0",
 		"globals": "^17.12.0",
 		"jsdom": "^30.1.1",
-		"layerchart": "2.5.0",
 		"msw": "^2.15.0",
 		"prettier": "^3.9.9",
 		"prettier-plugin-svelte": "^4.1.1",
