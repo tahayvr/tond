@@ -233,15 +233,12 @@ async fn prune_preview_images(state: &AppState, app_id: &str, app_name: &str) {
 // ── Compose releases ──
 //
 // A compose deployment's `image_tag` is `tond-<app>:<id>` like any other,
-// but no image carries it: it names the *release*, the set of pinned service
-// images `tond-<app>/<service>:<id>`. Pruning a release removes all of them.
-
-/// `tond-<app>/<service>:<suffix>` → the release tag `tond-<app>:<suffix>`.
-pub fn compose_release_of(app_name: &str, service_tag: &str) -> Option<String> {
-    let rest = service_tag.strip_prefix(&format!("{}/", image_repo(app_name)))?;
-    let (_, suffix) = rest.rsplit_once(':')?;
-    Some(format!("{}:{suffix}", image_repo(app_name)))
-}
+// but no image carries it: it names the *release*, the set of service images
+// the deployment ran (deployment_services.image). Service images are tagged
+// by content, `tond-<app>/<service>:<image id prefix>`, so an unchanged
+// service keeps its tag across deploys (compose then leaves its container
+// alone) and several releases can share one image. Pruning a release removes
+// the images no kept release still uses.
 
 /// Every local service image tag of the app (`tond-<app>/*`).
 async fn compose_service_tags(state: &AppState, app_name: &str) -> Option<Vec<String>> {
@@ -256,47 +253,39 @@ async fn compose_service_tags(state: &AppState, app_name: &str) -> Option<Vec<St
         ))
         .await
         .ok()?;
+    let prefix = format!("{}/", image_repo(app_name));
     Some(
         found
             .into_iter()
             .flat_map(|img| img.repo_tags)
-            .filter(|t| compose_release_of(app_name, t).is_some())
+            .filter(|t| t.starts_with(&prefix))
             .collect(),
     )
 }
 
-/// Remove the service images of one release. True when none is left.
-async fn remove_compose_release(
-    state: &AppState,
-    tags: &[String],
+/// What to prune for a compose app: `(releases to mark pruned, image tags to
+/// remove)`. `uses` holds `(release, service image)` of every deployment row;
+/// `local` the app's service tags on the host.
+pub fn compose_prune_plan(
     app_name: &str,
-    release: &str,
-) -> bool {
-    let mut all_gone = true;
-    for tag in tags
+    deployments: &[DeploymentImage],
+    uses: &[(String, String)],
+    local: &[String],
+    running: Option<&str>,
+    keep: usize,
+) -> (Vec<String>, Vec<String>) {
+    let pruned = tags_to_prune(app_name, deployments, running, keep);
+    let kept: Vec<&str> = uses
         .iter()
-        .filter(|t| compose_release_of(app_name, t).as_deref() == Some(release))
-    {
-        match state
-            .docker
-            .remove_image(
-                tag,
-                Some(RemoveImageOptionsBuilder::default().build()),
-                None,
-            )
-            .await
-        {
-            Ok(_)
-            | Err(bollard::errors::Error::DockerResponseServerError {
-                status_code: 404, ..
-            }) => tracing::info!("[prune] removed old image {tag}"),
-            Err(e) => {
-                tracing::warn!("[prune] keeping image {tag}: {e}");
-                all_gone = false;
-            }
-        }
-    }
-    all_gone
+        .filter(|(release, _)| !pruned.contains(release))
+        .map(|(_, image)| image.as_str())
+        .collect();
+    let remove = local
+        .iter()
+        .filter(|t| !kept.contains(&t.as_str()))
+        .cloned()
+        .collect();
+    (pruned, remove)
 }
 
 /// Record that a compose deployment's images are gone.
@@ -329,40 +318,51 @@ async fn prune_compose_images(state: &AppState, app_id: &str, app_name: &str) {
         .ok()
         .flatten()
         .flatten();
-    let referenced: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT image_tag FROM deployments WHERE app_id = ? AND image_tag IS NOT NULL",
+    // Deployments still running own their images too (tags_to_prune keeps
+    // them): include them through their rows.
+    let uses: Vec<(String, String)> = sqlx::query_as(
+        "SELECT d.image_tag, s.image FROM deployments d
+         JOIN deployment_services s ON s.deployment_id = d.id
+         WHERE d.app_id = ? AND d.image_tag IS NOT NULL AND s.image IS NOT NULL
+           AND (d.image_pruned = 0 OR d.status = 'running')",
     )
     .bind(app_id)
     .fetch_all(&state.db)
     .await
     .unwrap_or_default();
-    let Some(tags) = compose_service_tags(state, app_name).await else {
+    let Some(local) = compose_service_tags(state, app_name).await else {
         return;
     };
-    // Service images no deployment refers to any more.
-    let mut orphans: Vec<String> = Vec::new();
-    for tag in &tags {
-        if let Some(release) = compose_release_of(app_name, tag)
-            && !referenced.contains(&release)
-            && running.as_deref() != Some(release.as_str())
-            && !orphans.contains(&release)
-        {
-            orphans.push(release);
-        }
-    }
-    for release in orphans {
-        remove_compose_release(state, &tags, app_name, &release).await;
-    }
-    for release in tags_to_prune(app_name, &deployments, running.as_deref(), KEEP_IMAGES) {
-        if remove_compose_release(state, &tags, app_name, &release).await {
-            let _ = sqlx::query(
-                "UPDATE deployments SET image_pruned = 1 WHERE app_id = ? AND image_tag = ?",
+    let (pruned, remove) = compose_prune_plan(
+        app_name,
+        &deployments,
+        &uses,
+        &local,
+        running.as_deref(),
+        KEEP_IMAGES,
+    );
+    for tag in remove {
+        match state
+            .docker
+            .remove_image(
+                &tag,
+                Some(RemoveImageOptionsBuilder::default().build()),
+                None,
             )
-            .bind(app_id)
-            .bind(&release)
-            .execute(&state.db)
-            .await;
+            .await
+        {
+            Ok(_) => tracing::info!("[prune] removed old image {tag}"),
+            Err(e) => tracing::warn!("[prune] keeping image {tag}: {e}"),
         }
+    }
+    for release in pruned {
+        let _ = sqlx::query(
+            "UPDATE deployments SET image_pruned = 1 WHERE app_id = ? AND image_tag = ?",
+        )
+        .bind(app_id)
+        .bind(&release)
+        .execute(&state.db)
+        .await;
     }
 }
 
@@ -503,14 +503,45 @@ mod tests {
     }
 
     #[test]
-    fn compose_service_images_belong_to_their_release() {
+    fn compose_pruning_keeps_images_a_kept_release_still_uses() {
+        let deployments = vec![
+            d("tond-shop:4", "succeeded"),
+            d("tond-shop:3", "succeeded"),
+            d("tond-shop:2", "succeeded"),
+            d("tond-shop:1", "succeeded"),
+        ];
+        let u = |r: &str, i: &str| (r.to_string(), i.to_string());
+        let uses = vec![
+            u("tond-shop:4", "tond-shop/web:bbb"),
+            u("tond-shop:4", "tond-shop/db:aaa"),
+            u("tond-shop:3", "tond-shop/web:bbb"),
+            u("tond-shop:3", "tond-shop/db:aaa"),
+            u("tond-shop:1", "tond-shop/web:old"),
+            u("tond-shop:1", "tond-shop/db:aaa"),
+        ];
+        let local: Vec<String> = [
+            "tond-shop/web:bbb",
+            "tond-shop/db:aaa",
+            "tond-shop/web:old",
+            "tond-shop/web:stray",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (pruned, remove) =
+            compose_prune_plan("shop", &deployments, &uses, &local, Some("tond-shop:4"), 2);
         assert_eq!(
-            compose_release_of("shop", "tond-shop/web:3f2a1b9c1234").as_deref(),
-            Some("tond-shop:3f2a1b9c1234")
+            pruned,
+            vec!["tond-shop:2".to_string(), "tond-shop:1".to_string()]
         );
-        assert_eq!(compose_release_of("shop", "tond-shopx/web:1"), None);
-        assert_eq!(compose_release_of("shop", "tond-shop:1"), None);
-        assert!(is_deployment_image("shop", "tond-shop:3f2a1b9c1234"));
+        assert_eq!(
+            remove,
+            vec![
+                "tond-shop/web:old".to_string(),
+                "tond-shop/web:stray".to_string()
+            ],
+            "db:aaa is shared with kept releases; strays nobody uses go"
+        );
     }
 
     #[test]

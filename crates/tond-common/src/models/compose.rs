@@ -59,7 +59,7 @@ pub struct ComposeServiceResponse {
     pub exit_code: Option<i64>,
     #[serde(default)]
     pub container_id: Option<String>,
-    /// Pinned local image the container runs (`tond-<app>/<service>:<id>`)
+    /// Pinned local image the container runs (`tond-<app>/<service>:<image id prefix>`)
     #[serde(default)]
     pub running_image: Option<String>,
     /// Image id of the running image (sha256:...)

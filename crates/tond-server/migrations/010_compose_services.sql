@@ -43,7 +43,7 @@ CREATE TABLE compose_services(
 ) WITHOUT ROWID;
 
 -- What a compose deployment ran, per service: the image it was built or
--- pulled as and the pinned local tag (tond-<app>/<service>:<deployment>) with
+-- pulled as and the pinned local tag (tond-<app>/<service>:<image id prefix>) with
 -- its image id, so a rollback restores exactly that set.
 CREATE TABLE deployment_services(
   deployment_id TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,

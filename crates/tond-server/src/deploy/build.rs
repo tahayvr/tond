@@ -764,7 +764,7 @@ pub(super) fn compose_build_args(
 }
 
 /// Build one compose service's image as `tag` (a pinned
-/// `tond-<app>/<service>:<id>` tag). `scratch_dir` holds inline Dockerfiles.
+/// work tag, pinned by content afterwards). `scratch_dir` holds inline Dockerfiles.
 pub(super) async fn build_compose_service(
     state: &AppState,
     app_id: &str,

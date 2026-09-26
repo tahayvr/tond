@@ -9,7 +9,7 @@
 //   build    validate + harden (compose_policy), sync compose_services, then
 //            produce every service's image: `docker build --cgroup-parent`
 //            (the build memory cap) or a registry pull, pinned as
-//            tond-<app>/<service>:<deployment>. Rollbacks reuse the target
+//            tond-<app>/<service>:<image id prefix>. Rollbacks reuse the target
 //            deployment's pinned images.
 //   start    allocate a stable loopback host port for each published service
 //            port, write the pinned file, `docker compose up -d
@@ -278,6 +278,27 @@ async fn set_services_status(
     crate::log_bus::publish_deployment(app_id, deployment_id);
 }
 
+/// Pin `source` (a built or pulled image) under its content tag
+/// (compose::content_tag) and return that tag.
+async fn pin_by_content(
+    state: &AppState,
+    app_name: &str,
+    service: &str,
+    source: &str,
+) -> Result<String> {
+    let info = state
+        .docker
+        .inspect_image(source)
+        .await
+        .with_context(|| format!("service \"{service}\": image {source} is missing"))?;
+    let id = info.id.unwrap_or_default();
+    let tag = compose::content_tag(app_name, service, &id);
+    images::tag_image(&state.docker, source, &tag)
+        .await
+        .with_context(|| format!("service \"{service}\": could not pin {source}"))?;
+    Ok(tag)
+}
+
 /// Image id of `image` plus the registry digest of a pulled image.
 async fn image_digest(state: &AppState, image: &str) -> Option<String> {
     let info = state.docker.inspect_image(image).await.ok()?;
@@ -334,7 +355,8 @@ async fn run_with_source(
     let mut pinned: HashMap<String, String> = HashMap::new();
     for spec in &specs {
         let name = spec.name.as_str();
-        let tag = compose::pinned_tag(&app_name, name, deployment_id);
+        // Built under a per-deployment work tag, then pinned by content.
+        let work_tag = compose::pinned_tag(&app_name, name, deployment_id);
         if let Some(reuse) = &source.reuse {
             let Some(prev) = reuse.get(name) else {
                 continue;
@@ -364,7 +386,7 @@ async fn run_with_source(
                 service: name.to_string(),
                 source: "build".into(),
                 source_image: Some(build.context.clone()),
-                image: Some(tag.clone()),
+                image: None,
                 digest: None,
                 status: "building".into(),
             };
@@ -374,16 +396,35 @@ async fn run_with_source(
                 &app_id,
                 "info",
                 trigger,
-                &format!("[{name}] Building image {tag}"),
+                &format!("[{name}] Building image"),
             )
             .await?;
-            if let Err(e) =
-                build_compose_service(state, &app_id, name, &tag, build, &work_dir, trigger).await
+            let built = match build_compose_service(
+                state, &app_id, name, &work_tag, build, &work_dir, trigger,
+            )
+            .await
             {
-                row.status = "failed".into();
-                let _ = record_service(state, &app_id, deployment_id, &row).await;
-                return Err(e);
-            }
+                Ok(()) => pin_by_content(state, &app_name, name, &work_tag).await,
+                Err(e) => Err(e),
+            };
+            // The work tag has served its purpose (the content tag stays).
+            let _ = state
+                .docker
+                .remove_image(
+                    &work_tag,
+                    None::<bollard::query_parameters::RemoveImageOptions>,
+                    None,
+                )
+                .await;
+            let tag = match built {
+                Ok(tag) => tag,
+                Err(e) => {
+                    row.status = "failed".into();
+                    let _ = record_service(state, &app_id, deployment_id, &row).await;
+                    return Err(e);
+                }
+            };
+            row.image = Some(tag.clone());
             row.digest = image_digest(state, &tag).await;
             row.status = "ready".into();
             record_service(state, &app_id, deployment_id, &row).await?;
@@ -393,7 +434,7 @@ async fn run_with_source(
                 service: name.to_string(),
                 source: "pull".into(),
                 source_image: Some(image.clone()),
-                image: Some(tag.clone()),
+                image: None,
                 digest: None,
                 status: "pulling".into(),
             };
@@ -411,17 +452,25 @@ async fn run_with_source(
                 .with_context(|| format!("service \"{name}\": could not pull {image}"));
             let pulled = match pulled {
                 Ok(()) => {
-                    images::tag_image(&state.docker, &super::core::with_default_tag(image), &tag)
-                        .await
-                        .with_context(|| format!("service \"{name}\": could not pin {image}"))
+                    pin_by_content(
+                        state,
+                        &app_name,
+                        name,
+                        &super::core::with_default_tag(image),
+                    )
+                    .await
                 }
                 Err(e) => Err(e),
             };
-            if let Err(e) = pulled {
-                row.status = "failed".into();
-                let _ = record_service(state, &app_id, deployment_id, &row).await;
-                return Err(e);
-            }
+            let tag = match pulled {
+                Ok(tag) => tag,
+                Err(e) => {
+                    row.status = "failed".into();
+                    let _ = record_service(state, &app_id, deployment_id, &row).await;
+                    return Err(e);
+                }
+            };
+            row.image = Some(tag.clone());
             row.digest = image_digest(state, &tag).await;
             row.status = "ready".into();
             record_service(state, &app_id, deployment_id, &row).await?;

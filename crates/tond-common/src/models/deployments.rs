@@ -114,7 +114,7 @@ pub struct Deployment {
     pub app_id: String,
     /// Image this deployment ran: `tond-<app>:<deployment-id-prefix>`. For
     /// compose apps the same tag names the deployment's *set* of service
-    /// images (`tond-<app>/<service>:<deployment-id-prefix>`, see
+    /// images (`tond-<app>/<service>:<image id prefix>`, see
     /// `deployment_services`).
     pub image_tag: Option<String>,
     /// "queued" | "running" | "succeeded" | "failed" | "superseded"

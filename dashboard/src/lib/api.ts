@@ -934,7 +934,7 @@ export interface ComposeService extends ComposeServiceSpec {
 	health: string | null;
 	exit_code: number | null;
 	container_id: string | null;
-	/** Pinned image the container runs: tond-<app>/<service>:<deployment> */
+	/** Pinned image the container runs: tond-<app>/<service>:<image id prefix> */
 	running_image: string | null;
 	image_digest: string | null;
 	/** Latest CPU use in 1/100 % of one core */

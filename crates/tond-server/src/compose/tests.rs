@@ -181,6 +181,19 @@ fn pinned_tags_are_per_service_and_per_deployment() {
 }
 
 #[test]
+fn content_tags_follow_the_image_not_the_deployment() {
+    assert_eq!(
+        content_tag("Shop", "web", "sha256:4F1C2A3B9E01D7C55A0021C1"),
+        "tond-shop/web:4f1c2a3b9e01"
+    );
+    assert_eq!(
+        content_tag("shop", "web", "sha256:4f1c2a3b9e01ffff"),
+        content_tag("shop", "web", "sha256:4f1c2a3b9e01eeee"),
+        "same prefix, same tag"
+    );
+}
+
+#[test]
 fn pin_file_swaps_builds_for_pinned_images_and_publishes_routed_ports() {
     let pinned = pin_file(
         TWO_SERVICES,

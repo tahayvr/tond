@@ -116,6 +116,26 @@ wait_for() {
     done
 }
 
+# watch_availability <domain> <file>: request https://<domain>/ every 0.2 s
+# until killed, one HTTP status per line (000 when nothing answered).
+watch_availability() {
+    while true; do
+        curl -sk -o /dev/null -w '%{http_code}\n' --max-time 5 \
+            --resolve "$1:443:${IP}" "https://$1/" >> "$2" 2> /dev/null || true
+        sleep 0.2
+    done
+}
+
+# assert_no_downtime <file> <label>: every recorded status was 2xx.
+assert_no_downtime() {
+    local total bad
+    total=$(wc -l < "$1" | tr -d ' ')
+    bad=$(grep -cv '^2' "$1" || true)
+    (( total >= 5 )) || fail "$2: only ${total} requests were made during the redeploy"
+    (( bad == 0 )) || fail "$2: ${bad} of ${total} requests during the redeploy were not 2xx: $(sort "$1" | uniq -c | tr '\n' ' ')"
+    pass "$2: ${total} requests during the redeploy, all 2xx"
+}
+
 app_field() { api /api/v1/apps | jq -r --arg n "$1" ".data[] | select(.name == \$n) | .$2"; }
 
 # Wait until an app is running; fail fast (with deploy logs) if it fails.
@@ -1526,7 +1546,21 @@ FIRST_TAG=$(deployments | jq -r '[.data[] | select(.status == "succeeded")][0].i
 [[ "$FIRST_TAG" =~ ^tond-e2e-whoami:[0-9a-f]{12}$ ]] || fail "deployments must run a per-deployment tag, got ${FIRST_TAG}"
 docker image inspect "$FIRST_TAG" > /dev/null || fail "image ${FIRST_TAG} must exist on the host"
 pass "deployment runs ${FIRST_TAG}"
+# A redeploy of a serving app keeps serving the old container until the
+# cutover: no failed request, and the app never leaves 'running'.
+AVAIL=$(mktemp)
+STATUSES=$(mktemp)
+watch_availability "$WHOAMI_DOMAIN" "$AVAIL" &
+AVAIL_PID=$!
+( while kill -0 "$AVAIL_PID" 2> /dev/null; do app_field e2e-whoami status >> "$STATUSES" 2> /dev/null || true; sleep 1; done ) &
+STATUS_PID=$!
 tond apps deploy e2e-whoami > /dev/null
+kill "$AVAIL_PID" "$STATUS_PID" 2> /dev/null || true
+wait "$AVAIL_PID" "$STATUS_PID" 2> /dev/null || true
+assert_no_downtime "$AVAIL" "redeploying e2e-whoami"
+! grep -qv '^running$' "$STATUSES" \
+    || fail "a serving app must stay 'running' while it redeploys, saw: $(sort -u "$STATUSES" | tr '\n' ' ')"
+pass "e2e-whoami stayed 'running' during the redeploy"
 wait_for 300 "a second successful e2e-whoami deployment" \
     bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/apps/e2e-whoami/deployments | jq -e '[.data[] | select(.status == \"succeeded\")] | length >= 2'"
 wait_for_app_running e2e-whoami 120
@@ -1696,6 +1730,21 @@ wait_for 60 "route for www.${STACK_DOMAIN}" bash -c "curl -sk --resolve 'www.${S
 pass "a second domain on the same service is routed at once"
 docker volume inspect e2e-stack_cache-data > /dev/null || fail "the named volume should exist"
 
+# Redeploying an unchanged file: images are pinned by content, so compose
+# keeps every container, the service port stays and nothing fails.
+STACK_WEB_BEFORE=$(stack_services | jq -r '.data[] | select(.name == "web") | .container_id')
+AVAIL=$(mktemp)
+watch_availability "$STACK_DOMAIN" "$AVAIL" &
+AVAIL_PID=$!
+tond apps deploy e2e-stack > /dev/null
+kill "$AVAIL_PID" 2> /dev/null || true
+wait "$AVAIL_PID" 2> /dev/null || true
+assert_no_downtime "$AVAIL" "redeploying e2e-stack"
+[[ "$(app_field e2e-stack status)" == running ]] || fail "the compose app should still be running"
+[[ "$(stack_services | jq -r '.data[] | select(.name == "web") | .container_id')" == "$STACK_WEB_BEFORE" ]] \
+    || fail "an unchanged service must keep its container across a redeploy"
+pass "an unchanged service keeps its container across a redeploy"
+
 # Edit the file (web reads WHOAMI_NAME from the app's environment), redeploy,
 # then roll back to the first deployment: its compose file and images come back.
 STACK_FIRST=$(api /api/v1/apps/e2e-stack/deployments | jq -r '[.data[] | select(.status == "succeeded")][0].id')
@@ -1705,8 +1754,8 @@ code=$(api_req PUT /api/v1/apps/e2e-stack/compose "$(jq -n --arg f "$STACK_FILE_
 code=$(api_req PATCH /api/v1/apps/e2e-stack/env '{"set":{"STACK_NAME":"v2"},"unset":[]}')
 [[ "$code" == 200 ]] || fail "setting an app variable should work, got ${code}: $(cat "$API_BODY")"
 tond apps deploy e2e-stack > /dev/null
-wait_for 300 "a second compose deployment" \
-    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/apps/e2e-stack/deployments | jq -e '[.data[] | select(.status == \"succeeded\")] | length >= 2'"
+wait_for 300 "a third compose deployment" \
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/apps/e2e-stack/deployments | jq -e '[.data[] | select(.status == \"succeeded\")] | length >= 3'"
 wait_for 60 "the edited web service" bash -c "curl -sk --resolve '${STACK_DOMAIN}:443:${IP}' 'https://${STACK_DOMAIN}/' | grep -q 'Name: v2'"
 pass "an edited compose file redeploys; \${STACK_NAME} came from the app's environment (Name: v2)"
 api "/api/v1/apps/e2e-stack/deployments/${STACK_FIRST}" | jq -e '.data.services | length == 2 and all(.image | test("^tond-e2e-stack/"))' > /dev/null \

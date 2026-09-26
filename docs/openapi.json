@@ -2514,7 +2514,7 @@
           },
           "running_image": {
             "default": null,
-            "description": "Pinned local image the container runs (`tond-<app>/<service>:<id>`)",
+            "description": "Pinned local image the container runs (`tond-<app>/<service>:<image id prefix>`)",
             "type": [
               "string",
               "null"

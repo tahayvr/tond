@@ -122,6 +122,8 @@
 	// request) and stops on a terminal status. See the effects at the bottom.
 	let statusPollRequested = $state(false);
 	let appStatus = $derived(app?.status);
+	/** A deployment is queued or running (or a first deploy is building). */
+	let deployInProgress = $derived(activeDeploymentId !== null || appStatus === 'building');
 	/** Tab (and Settings section) from `?tab=` / `?section=`: deep-linkable. */
 	let view = $derived(appViewFromUrl(page.url));
 	/** Leaf view: a tab, or the Settings section when Settings is open. */
@@ -265,10 +267,28 @@
 		}
 	}
 
+	/**
+	 * The app's queued or running deployment, if any. A running app keeps its
+	 * 'running' status while it redeploys (it keeps serving the old version),
+	 * so progress comes from the deployment, not from app.status.
+	 */
+	async function refreshActiveDeployment(): Promise<string | null> {
+		const id = appId;
+		try {
+			const list = await listDeployments(id);
+			if (id !== appId) return activeDeploymentId;
+			activeDeploymentId =
+				list.find((d) => d.status === 'running' || d.status === 'queued')?.id ?? null;
+		} catch {
+			// Non-critical: the header just won't link to the live view.
+		}
+		return activeDeploymentId;
+	}
+
 	async function pollStatus() {
 		try {
-			const latest = await getApp(appId);
-			if (latest.status !== 'building') {
+			const [latest, active] = await Promise.all([getApp(appId), refreshActiveDeployment()]);
+			if (latest.status !== 'building' && !active) {
 				// Terminal state: reload everything once; the polling effect stops.
 				statusPollRequested = false;
 				await loadApp();
@@ -865,9 +885,9 @@
 		setUiContext(activeTab === 'logs' ? { ...ctx, feed: { ...ctx.feed, wsUrl: null } } : ctx);
 	});
 
-	// Status polling while building (paused in hidden tabs).
+	// Status polling while a deployment runs (paused in hidden tabs).
 	$effect(() => {
-		if (appStatus !== 'building' && !statusPollRequested) return;
+		if (!deployInProgress && !statusPollRequested) return;
 		return pollWhileVisible(pollStatus, 2000, { immediate: false });
 	});
 
@@ -895,20 +915,12 @@
 		});
 	});
 
-	// While the app builds, link to the running deployment's live view.
+	// Find a deployment in progress (to link to its live view) when the app
+	// loads or its status changes.
 	$effect(() => {
-		if (appStatus !== 'building') {
-			activeDeploymentId = null;
-			return;
-		}
-		const id = appId;
-		listDeployments(id)
-			.then((list) => {
-				if (id !== appId) return;
-				activeDeploymentId =
-					list.find((d) => d.status === 'running' || d.status === 'queued')?.id ?? null;
-			})
-			.catch(() => (activeDeploymentId = null));
+		void appId;
+		void appStatus;
+		untrack(refreshActiveDeployment);
 	});
 
 	// Mount-only teardown, keyed on the app id (navigating to another app
@@ -935,6 +947,10 @@
 		<PageHeader title={current.name} section={sectionLabel}>
 			{#snippet meta()}
 				<StatusBadge status={current.status} kind="app" />
+				{#if deployInProgress && current.status !== 'building'}
+					<!-- A running app keeps serving while the new version deploys. -->
+					<StatusBadge status="deploying" label="Deploying a new version" />
+				{/if}
 				<span>Source: {current.source_type}</span>
 				{#if current.source_url}
 					<span class="max-w-full min-w-0 truncate font-mono text-xs sm:max-w-md"
@@ -972,14 +988,10 @@
 					<Button
 						size="sm"
 						onclick={() => deploy.run()}
-						disabled={deploy.pending || deploying || current.status === 'building'}
+						disabled={deploy.pending || deploying || deployInProgress}
 						aria-busy={deploy.pending}
 					>
-						{deploy.pending
-							? 'Starting deploy…'
-							: current.status === 'building'
-								? 'Deploying…'
-								: 'Deploy'}
+						{deploy.pending ? 'Starting deploy…' : deployInProgress ? 'Deploying…' : 'Deploy'}
 					</Button>
 				{/if}
 			{/snippet}

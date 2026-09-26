@@ -14,7 +14,8 @@
 //   3. Each service's image is produced by Tond, not by `docker compose`:
 //      built with `docker build --cgroup-parent` (so compose builds share the
 //      build memory cap) or pulled, then tagged
-//      `tond-<app>/<service>:<deployment-id-prefix>` (`pinned_tag`).
+//      `tond-<app>/<service>:<image id prefix>` (`content_tag`; unchanged
+//      services keep their tag, so compose leaves their containers alone).
 //   4. `pin_file` rewrites the hardened file: every resolvable service runs
 //      its pinned tag (`build:` removed, `pull_policy: never`) and a routed
 //      service gets `127.0.0.1:<host port>:<container port>` added.
@@ -520,12 +521,27 @@ pub fn service_repo(app_name: &str, service: &str) -> String {
     )
 }
 
-/// `tond-<app>/<service>:<deployment-id-prefix>`: the pinned image a
-/// deployment runs for a service.
+/// `tond-<app>/<service>:<deployment-id-prefix>`: the work tag a build of a
+/// service is built under before it is pinned by content (`content_tag`).
 pub fn pinned_tag(app_name: &str, service: &str, deployment_id: &str) -> String {
     let release = crate::deploy::images::deployment_tag(app_name, deployment_id);
     let suffix = release.rsplit_once(':').map_or("", |(_, t)| t);
     format!("{}:{suffix}", service_repo(app_name, service))
+}
+
+/// `tond-<app>/<service>:<first 12 hex of the image id>`: the tag a service
+/// image is pinned under. It depends only on the image's content, so an
+/// unchanged service keeps its tag across deploys and compose leaves its
+/// container running.
+pub fn content_tag(app_name: &str, service: &str, image_id: &str) -> String {
+    let hex: String = image_id
+        .trim_start_matches("sha256:")
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .take(12)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    format!("{}:{hex}", service_repo(app_name, service))
 }
 
 /// How one service runs in a deployment.

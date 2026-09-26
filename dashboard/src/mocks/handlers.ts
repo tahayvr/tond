@@ -1061,7 +1061,10 @@ function startMockDeploy(
 	deployments[app.id] = [deployment, ...(deployments[app.id] ?? [])];
 	deploymentLogs[id] = [];
 	const appIdx = apps.findIndex((a) => a.id === app.id);
-	if (appIdx !== -1) apps[appIdx] = { ...apps[appIdx], status: 'building' };
+	// Like the server: a serving app keeps its status (and its route) while it
+	// redeploys; only an app with nothing running shows 'building'.
+	const serving = app.status === 'running' || app.status === 'unhealthy';
+	if (appIdx !== -1 && !serving) apps[appIdx] = { ...apps[appIdx], status: 'building' };
 
 	const fail = app.name === 'worker-queue';
 	const tag = `tond-${app.name}:${release}`;
@@ -1110,7 +1113,7 @@ function startMockDeploy(
 					]
 				}
 			}));
-			if (appIdx !== -1) apps[appIdx] = { ...apps[appIdx], status: 'failed' };
+			if (appIdx !== -1 && !serving) apps[appIdx] = { ...apps[appIdx], status: 'failed' };
 			return;
 		}
 		log('info', `Deployed successfully! Container: ${id.slice(4, 16)}`);

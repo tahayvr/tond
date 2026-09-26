@@ -422,8 +422,6 @@ pub async fn run(
             .await;
             progress::finish_failed(state, &app_id, deployment_id, &failure).await;
 
-            // The previous container keeps serving when the failure happened
-            // before the cutover; only a first deploy (or compose) is "failed".
             // A compose app is touched from `docker compose up` (start) on;
             // before that its services keep running untouched.
             let compose_touched = app.source_type == "compose"
@@ -431,19 +429,56 @@ pub async fn run(
                     phase,
                     Some(DeployPhase::Start | DeployPhase::Health | DeployPhase::Release)
                 );
-            let restore = match (&old_container_id, compose_touched) {
-                (Some(_), true) | (None, _) => "failed".to_string(),
-                (Some(_), _) if matches!(previous_status.as_str(), "building" | "pending") => {
-                    "running".to_string()
-                }
-                (Some(_), _) => previous_status,
-            };
-            let _ = update_status(state, &app_id, &restore).await;
+            let restore = status_after_failure(
+                &previous_status,
+                old_container_id.is_some(),
+                compose_touched,
+            );
+            if restore != app.status {
+                let _ = update_status(state, &app_id, &restore).await;
+            }
             app.status = restore;
 
             tracing::error!("Deploy failed for {}: {}", app.name, error);
             DeployOutcome::Failed(failure)
         }
+    }
+}
+
+/// True when the app serves traffic from an existing container: a deploy
+/// leaves its status alone (it stays routed until the cutover; the active
+/// deployment row shows the progress).
+pub(super) fn is_serving(status: &str, container_id: Option<&str>) -> bool {
+    container_id.is_some() && matches!(status, "running" | "unhealthy")
+}
+
+/// Mark a deployment's start on the app: 'building' only when nothing
+/// serves yet (first deploy, stopped or failed app). A serving app keeps its
+/// status, so tond-proxy keeps routing to the old container during the build.
+pub(super) async fn mark_deploy_started(state: &AppState, app: &mut App) -> Result<()> {
+    if !is_serving(&app.status, app.container_id.as_deref()) {
+        update_status(state, &app.id, "building").await?;
+        app.status = "building".to_string();
+    }
+    Ok(())
+}
+
+/// The app's status after a failed deployment, from its status when the
+/// deployment started: a serving app keeps serving the old container (a
+/// compose app whose services were already recreated is 'unhealthy', still
+/// routed); a stopped one stays stopped; with nothing to fall back on it is
+/// 'failed'.
+pub(super) fn status_after_failure(
+    previous: &str,
+    had_container: bool,
+    compose_touched: bool,
+) -> String {
+    match (previous, had_container) {
+        ("running" | "unhealthy", true) if compose_touched => "unhealthy".to_string(),
+        ("running" | "unhealthy" | "stopped", true) => previous.to_string(),
+        // Left 'building' by an interrupted deploy: the container is there.
+        ("building" | "pending", true) if !compose_touched => "running".to_string(),
+        _ => "failed".to_string(),
     }
 }
 
@@ -477,7 +512,7 @@ async fn pipeline(
     // The image this deployment runs, whatever the source: tond-<app>:<id>.
     let deploy_tag = images::deployment_tag(&app_name, deployment_id);
 
-    update_status(state, &app_id, "building").await?;
+    mark_deploy_started(state, app).await?;
     log_deploy(
         state,
         &app_id,
@@ -1600,6 +1635,113 @@ mod tests {
             rate_limiter: RateLimiter::new(60, 10.0),
             settings: Arc::new(RwLock::new(ServerSettings::default())),
         }
+    }
+
+    #[tokio::test]
+    async fn a_serving_app_stays_routable_until_the_cutover() {
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO apps (id, name, source_type, status, container_id, host_port, created_at, updated_at)
+             VALUES ('a1', 'web', 'image', 'running', 'c-old', 8100, 'now', 'now'),
+                    ('a2', 'fresh', 'image', 'pending', NULL, NULL, 'now', 'now'),
+                    ('a3', 'parked', 'image', 'stopped', 'c-parked', 8101, 'now', 'now'),
+                    ('a4', 'stack', 'compose', 'running', 'tond-stack:abc', NULL, 'now', 'now')",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+        for sql in [
+            "INSERT INTO app_domains (domain, app_id, kind) VALUES ('web.example.com', 'a1', 'primary')",
+            "INSERT INTO compose_services (app_id, name, published_port, host_port, routed_port)
+             VALUES ('a4', 'web', 80, 8300, 80)",
+            "INSERT INTO app_domains (domain, app_id, service, port, kind)
+             VALUES ('stack.example.com', 'a4', 'web', 80, 'primary')",
+        ] {
+            sqlx::query(sql)
+                .execute(&state.db)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let version = || async {
+            sqlx::query_scalar::<_, i64>("SELECT version FROM route_state WHERE id = 1")
+                .fetch_one(&state.db)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"))
+        };
+        // What tond-proxy routes (its app-domain query).
+        let routed = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT a.host_port FROM app_domains d JOIN apps a ON a.id = d.app_id
+                 WHERE a.status = 'running' AND a.host_port IS NOT NULL
+                   AND a.readiness != 'none' AND d.service IS NULL AND d.domain = 'web.example.com'",
+            )
+            .fetch_optional(&state.db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+        };
+        let before = version().await;
+        for id in ["a1", "a2", "a3", "a4"] {
+            let mut app: App = sqlx::query_as("SELECT * FROM apps WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            mark_deploy_started(&state, &mut app)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let statuses: Vec<(String, Option<i64>)> =
+            sqlx::query_as("SELECT status, host_port FROM apps ORDER BY id")
+                .fetch_all(&state.db)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            statuses,
+            [
+                ("running".to_string(), Some(8100)),
+                ("building".to_string(), None),
+                ("building".to_string(), Some(8101)),
+                ("running".to_string(), None),
+            ],
+            "only an app with nothing serving shows 'building'"
+        );
+        assert_eq!(version().await, before, "no route change while building");
+        assert_eq!(
+            routed().await,
+            Some(8100),
+            "the old container keeps the domain"
+        );
+        // The compose service route (tond-proxy's service query) stays too.
+        let service_route: Option<i64> = sqlx::query_scalar(
+            "SELECT s.host_port FROM app_domains d JOIN apps a ON a.id = d.app_id
+             JOIN compose_services s ON s.app_id = d.app_id AND s.name = d.service
+             WHERE d.service IS NOT NULL AND d.kind != 'redirect'
+               AND a.status IN ('running', 'building', 'unhealthy') AND s.host_port IS NOT NULL
+               AND d.domain = 'stack.example.com'",
+        )
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(service_route, Some(8300));
+    }
+
+    #[test]
+    fn a_failed_deploy_leaves_a_serving_app_serving() {
+        assert!(is_serving("running", Some("c")));
+        assert!(is_serving("unhealthy", Some("c")));
+        assert!(!is_serving("running", None));
+        assert!(!is_serving("stopped", Some("c")));
+        assert_eq!(status_after_failure("running", true, false), "running");
+        assert_eq!(status_after_failure("unhealthy", true, false), "unhealthy");
+        assert_eq!(
+            status_after_failure("running", true, true),
+            "unhealthy",
+            "compose services were already recreated: still routed, flagged"
+        );
+        assert_eq!(status_after_failure("stopped", true, false), "stopped");
+        assert_eq!(status_after_failure("pending", false, false), "failed");
+        assert_eq!(status_after_failure("failed", true, true), "failed");
+        assert_eq!(status_after_failure("building", true, false), "running");
     }
 
     #[test]
