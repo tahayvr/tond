@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { can } from '$lib/auth.svelte';
 	import type { ManagedDatabase } from '$lib/api';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { setUiContext, clearUiContext, databasesContext } from '$lib/ui-context.svelte';
@@ -25,10 +26,10 @@
 		description={databases.length ? `${runningCount} of ${databases.length} running` : undefined}
 	>
 		{#snippet actions()}
-			<Button href="/databases/new">
-				<Plus class="mr-1 h-4 w-4" />
-				New database
-			</Button>
+			{#if can('db:write')}<Button href="/databases/new">
+					<Plus class="mr-1 h-4 w-4" />
+					New database
+				</Button>{/if}
 		{/snippet}
 	</PageHeader>
 

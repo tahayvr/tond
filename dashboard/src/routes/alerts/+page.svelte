@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { can } from '$lib/auth.svelte';
 	import type { AlertRule } from '$lib/api';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { setUiContext, clearUiContext, alertsContext } from '$lib/ui-context.svelte';
@@ -25,10 +26,10 @@
 		description={rules.length ? `${enabledCount} of ${rules.length} rules enabled` : undefined}
 	>
 		{#snippet actions()}
-			<Button href="/alerts/new">
-				<Plus class="mr-1 h-4 w-4" />
-				New alert rule
-			</Button>
+			{#if can('settings:write')}<Button href="/alerts/new">
+					<Plus class="mr-1 h-4 w-4" />
+					New alert rule
+				</Button>{/if}
 		{/snippet}
 	</PageHeader>
 

@@ -26,7 +26,7 @@ describe('command palette entries', () => {
 	it('hides deploy actions from users who cannot deploy', () => {
 		const member = buildPaletteEntries(
 			{ apps: [app], databases: [], cronJobs: [], projects: [] },
-			{ canDeploy: false }
+			{ can: (scope) => scope !== 'apps:deploy' }
 		);
 		expect(member.some((e) => e.id === 'deploy:a1')).toBe(false);
 	});

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { can } from '$lib/auth.svelte';
 	import type { App, Project } from '$lib/api';
 	import { setUiContext, clearUiContext, projectsContext } from '$lib/ui-context.svelte';
 	import { Button } from '$lib/components/ui/button/index.js';
@@ -28,10 +29,10 @@
 		description={apps.length ? `${runningCount} of ${apps.length} running` : undefined}
 	>
 		{#snippet actions()}
-			<Button href="/apps/new">
-				<Plus class="mr-1 h-4 w-4" />
-				New app
-			</Button>
+			{#if can('apps:write')}<Button href="/apps/new">
+					<Plus class="mr-1 h-4 w-4" />
+					New app
+				</Button>{/if}
 		{/snippet}
 	</PageHeader>
 

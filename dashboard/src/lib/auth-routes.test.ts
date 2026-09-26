@@ -105,3 +105,12 @@ describe('showsAppShell', () => {
 		expect(showsAppShell('loading', '/apps')).toBe(false);
 	});
 });
+
+describe('set-password links', () => {
+	it('stay open for signed-out and signed-in visitors, without the app shell', () => {
+		expect(authRedirect('login', url('/set-password?token=abc'))).toBeNull();
+		expect(authRedirect('authenticated', url('/set-password?token=abc'))).toBeNull();
+		expect(showsAppShell('authenticated', '/set-password')).toBe(false);
+		expect(safeNextPath('/set-password?token=abc')).toBe('/');
+	});
+});

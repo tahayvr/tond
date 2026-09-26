@@ -30,8 +30,12 @@ import type {
 	Snapshot,
 	StorageProvider,
 	SystemMetrics,
-	User
+	User,
+	AdminUser,
+	ApiToken,
+	TokenCatalog
 } from '$lib/api';
+import { ALL_SCOPES } from '$lib/access';
 
 // ── Users ──────────────────────────────────────────────────────────────────
 
@@ -40,17 +44,263 @@ export const MOCK_USER: User = {
 	email: 'admin@localhost',
 	role: 'admin',
 	totp_enabled: false,
-	created_at: '2025-01-01T00:00:00.000Z'
+	created_at: '2025-01-01T00:00:00.000Z',
+	disabled: false,
+	password_set: true,
+	last_login_at: new Date(Date.now() - 20 * 60_000).toISOString(),
+	scopes: ALL_SCOPES
 };
 
-export const MOCK_USERS: User[] = [
-	MOCK_USER,
+const DEPLOYER_SCOPES = [
+	'apps:read',
+	'apps:deploy',
+	'apps:control',
+	'apps:rollback',
+	'env:read-names',
+	'env:write',
+	'logs:read',
+	'metrics:read',
+	'events:read',
+	'cron:read',
+	'cron:trigger',
+	'previews:write',
+	'db:read',
+	'snapshots:read',
+	'snapshots:create'
+];
+const VIEWER_SCOPES = [
+	'apps:read',
+	'env:read-names',
+	'db:read',
+	'snapshots:read',
+	'logs:read',
+	'metrics:read',
+	'events:read',
+	'cron:read'
+];
+
+export const MOCK_USERS: AdminUser[] = [
+	{ ...MOCK_USER, active_sessions: 2, is_you: true },
 	{
 		id: 'usr_2',
-		email: 'member@localhost',
-		role: 'member',
+		email: 'dana@example.com',
+		role: 'deployer',
+		totp_enabled: true,
+		created_at: '2025-02-01T00:00:00.000Z',
+		disabled: false,
+		password_set: true,
+		last_login_at: new Date(Date.now() - 3 * 3600_000).toISOString(),
+		scopes: DEPLOYER_SCOPES,
+		active_sessions: 1,
+		is_you: false
+	},
+	{
+		id: 'usr_3',
+		email: 'victor@example.com',
+		role: 'viewer',
 		totp_enabled: false,
-		created_at: '2025-02-01T00:00:00.000Z'
+		created_at: '2025-03-10T00:00:00.000Z',
+		disabled: false,
+		password_set: false,
+		last_login_at: null,
+		scopes: VIEWER_SCOPES,
+		active_sessions: 0,
+		is_you: false
+	},
+	{
+		id: 'usr_4',
+		email: 'former@example.com',
+		role: 'deployer',
+		totp_enabled: false,
+		created_at: '2024-11-01T00:00:00.000Z',
+		disabled: true,
+		password_set: true,
+		last_login_at: '2025-01-20T10:00:00.000Z',
+		scopes: DEPLOYER_SCOPES,
+		active_sessions: 0,
+		is_you: false
+	}
+];
+
+// ── API tokens ─────────────────────────────────────────────────────────────
+
+export const MOCK_TOKEN_CATALOG: TokenCatalog = {
+	groups: [
+		{
+			id: 'apps',
+			label: 'Apps',
+			scopes: [
+				{
+					id: 'apps:read',
+					description: 'See apps, their settings, domains and deployment history'
+				},
+				{ id: 'apps:deploy', description: 'Deploy apps (build and release a new version)' },
+				{
+					id: 'apps:write',
+					description: 'Create apps and change their configuration, domains and volumes'
+				},
+				{ id: 'apps:control', description: 'Start, stop and restart apps' },
+				{ id: 'apps:rollback', description: 'Roll an app back to an earlier deployment' },
+				{ id: 'apps:delete', description: 'Delete apps and projects' }
+			]
+		},
+		{
+			id: 'secrets',
+			label: 'Secrets',
+			scopes: [
+				{
+					id: 'env:read-names',
+					description: 'See the names of environment variables (not their values)'
+				},
+				{ id: 'env:read-values', description: 'Reveal environment variable values' },
+				{ id: 'env:write', description: 'Add, change and remove environment variables' },
+				{
+					id: 'db:credentials',
+					description: 'Reveal and change database passwords and connection strings'
+				}
+			]
+		},
+		{
+			id: 'data',
+			label: 'Data',
+			scopes: [
+				{ id: 'db:read', description: 'See databases and their status' },
+				{ id: 'db:write', description: 'Create, start, stop and reconfigure databases' },
+				{ id: 'db:delete', description: 'Delete databases' },
+				{ id: 'snapshots:read', description: 'See snapshots and backup status' },
+				{ id: 'snapshots:create', description: 'Take snapshots' },
+				{
+					id: 'snapshots:restore',
+					description: 'Restore and delete snapshots (overwrites live data)'
+				}
+			]
+		},
+		{
+			id: 'ops',
+			label: 'Ops',
+			scopes: [
+				{ id: 'logs:read', description: 'Read build, app, database and cron logs' },
+				{ id: 'metrics:read', description: 'See CPU, memory and network metrics and alert rules' },
+				{ id: 'events:read', description: 'See the activity (audit) log' },
+				{ id: 'cron:read', description: 'See cron jobs and their runs' },
+				{ id: 'cron:write', description: 'Create, change and delete cron jobs' },
+				{ id: 'cron:trigger', description: 'Run a cron job now' },
+				{ id: 'previews:write', description: 'Create and delete preview deployments' }
+			]
+		},
+		{
+			id: 'admin',
+			label: 'Admin',
+			scopes: [
+				{
+					id: 'settings:write',
+					description: 'Change server settings, integrations, alerts and backups'
+				},
+				{ id: 'users:admin', description: 'Invite, change and remove users and their sessions' },
+				{ id: 'tokens:admin', description: "See and revoke every user's API tokens" },
+				{ id: 'terminal:host', description: 'Open terminal sessions (host shell and containers)' }
+			]
+		}
+	],
+	presets: [
+		{
+			id: 'readonly',
+			label: 'Read-only',
+			description: "Look but don't touch: apps, logs, metrics, activity. No secret values.",
+			scopes: VIEWER_SCOPES
+		},
+		{
+			id: 'deployer',
+			label: 'Deployer (CI)',
+			description: 'Deploy and read one app from CI. Pair it with an app filter.',
+			scopes: ['apps:read', 'apps:deploy', 'logs:read']
+		},
+		{
+			id: 'agent-operator',
+			label: 'Agent operator',
+			description: 'For AI agents: read, deploy, restart, roll back, previews and env var names.',
+			scopes: [
+				'apps:read',
+				'apps:deploy',
+				'apps:control',
+				'apps:rollback',
+				'previews:write',
+				'env:read-names',
+				'logs:read',
+				'metrics:read',
+				'events:read'
+			]
+		}
+	],
+	roles: [
+		{ id: 'admin', description: 'Full control', scopes: ALL_SCOPES },
+		{ id: 'deployer', description: 'Ships code', scopes: DEPLOYER_SCOPES },
+		{ id: 'viewer', description: 'Read-only', scopes: VIEWER_SCOPES }
+	],
+	grantable: ALL_SCOPES
+};
+
+export const MOCK_TOKENS: ApiToken[] = [
+	{
+		id: 'tok_ci',
+		name: 'github-actions-web',
+		prefix: 'tond_pat_3f9a2c1d',
+		kind: 'ci',
+		scopes: ['apps:read', 'apps:deploy', 'logs:read'],
+		app_ids: ['app_running'],
+		project_ids: [],
+		allowed_ips: [],
+		owner_id: 'usr_dev',
+		owner_label: 'admin@localhost',
+		expires_at: new Date(Date.now() + 60 * 86400_000).toISOString(),
+		last_used_at: new Date(Date.now() - 42 * 60_000).toISOString(),
+		last_used_ip: '140.82.112.4',
+		revoked_at: null,
+		created_at: '2025-02-10T09:00:00.000Z'
+	},
+	{
+		id: 'tok_agent',
+		name: 'claude-ops-agent',
+		prefix: 'tond_pat_b71e0d44',
+		kind: 'agent',
+		scopes: [
+			'apps:read',
+			'apps:deploy',
+			'apps:control',
+			'apps:rollback',
+			'previews:write',
+			'env:read-names',
+			'logs:read',
+			'metrics:read',
+			'events:read'
+		],
+		app_ids: [],
+		project_ids: ['proj_1'],
+		allowed_ips: ['203.0.113.0/24'],
+		owner_id: 'usr_dev',
+		owner_label: 'admin@localhost',
+		expires_at: new Date(Date.now() + 5 * 3600_000).toISOString(),
+		last_used_at: new Date(Date.now() - 3 * 60_000).toISOString(),
+		last_used_ip: '203.0.113.20',
+		revoked_at: null,
+		created_at: new Date(Date.now() - 19 * 3600_000).toISOString()
+	},
+	{
+		id: 'tok_old',
+		name: 'laptop-scripts',
+		prefix: 'tond_pat_0c55e9a1',
+		kind: 'personal',
+		scopes: ['apps:read', 'logs:read'],
+		app_ids: [],
+		project_ids: [],
+		allowed_ips: [],
+		owner_id: 'usr_dev',
+		owner_label: 'admin@localhost',
+		expires_at: null,
+		last_used_at: '2025-01-02T10:00:00.000Z',
+		last_used_ip: '192.168.1.42',
+		revoked_at: '2025-02-01T12:00:00.000Z',
+		created_at: '2024-12-01T09:00:00.000Z'
 	}
 ];
 
@@ -349,7 +599,9 @@ export const MOCK_APPS: App[] = [
 export const MOCK_SETTINGS: ServerSettings = {
 	server_name: 'Tond Server',
 	dashboard_domain: 'dash.example.com',
-	preview_domain: 'example-previews.com'
+	preview_domain: 'example-previews.com',
+	session_idle_timeout_hours: 12,
+	session_max_age_days: 30
 };
 
 // ── Certificates ───────────────────────────────────────────────────────────
@@ -769,98 +1021,173 @@ export const MOCK_ALERT_RULES: AlertRule[] = [
 
 // ── Audit Log ──────────────────────────────────────────────────────────────
 
-export const MOCK_AUDIT_LOG: AuditLogEntry[] = [
+type AuditSeed = Omit<AuditLogEntry, 'seq' | 'created_at' | 'outcome' | 'ip'> & {
+	minutesAgo: number;
+	outcome?: string;
+	ip?: string | null;
+};
+
+const user = (email: string, id: string) => ({
+	actor_kind: 'user',
+	actor_id: id,
+	actor_label: email
+});
+const ADMIN = user('admin@localhost', 'usr_dev');
+const DANA = user('dana@example.com', 'usr_2');
+const app = (id: string, name: string) => ({
+	resource_type: 'app',
+	resource_id: id,
+	resource_name: name
+});
+const none = { resource_type: null, resource_id: null, resource_name: null };
+
+const AUDIT_SEEDS: AuditSeed[] = [
 	{
-		id: 'log_10',
-		app_id: 'app_running',
-		app_name: 'api-service',
+		...ADMIN,
+		...app('app_running', 'api-service'),
 		action: 'deploy',
-		actor: 'admin@localhost',
-		detail: 'Deployed sha-abc123f',
-		created_at: '2025-03-01T09:02:00.000Z'
-	},
-	{
-		id: 'log_9',
-		app_id: 'app_running',
-		app_name: 'api-service',
-		action: 'env_update',
-		actor: 'admin@localhost',
-		detail: 'Updated environment variables',
-		created_at: '2025-02-28T16:30:00.000Z'
-	},
-	{
-		id: 'log_8',
-		app_id: 'app_stopped',
-		app_name: 'web-frontend',
-		action: 'stop',
-		actor: 'admin@localhost',
 		detail: null,
-		created_at: '2025-02-28T14:22:00.000Z'
+		minutesAgo: 2,
+		ip: '198.51.100.7'
 	},
 	{
-		id: 'log_7',
-		app_id: 'app_stopped',
-		app_name: 'web-frontend',
+		actor_kind: 'token',
+		actor_id: 'tok_agent',
+		actor_label: 'claude-ops-agent',
+		...app('app_running', 'api-service'),
+		action: 'restart',
+		detail: null,
+		minutesAgo: 9,
+		ip: '203.0.113.20'
+	},
+	{
+		actor_kind: 'anonymous',
+		actor_id: null,
+		actor_label: 'root@example.com',
+		...none,
+		action: 'login_failed',
+		detail: 'wrong email or password',
+		minutesAgo: 14,
+		outcome: 'failure',
+		ip: '185.220.101.3'
+	},
+	{
+		actor_kind: 'token',
+		actor_id: 'tok_ci',
+		actor_label: 'github-actions-web',
+		...app('app_running', 'api-service'),
 		action: 'deploy',
-		actor: 'admin@localhost',
-		detail: 'Deployed sha-frontend1',
-		created_at: '2025-02-28T14:00:00.000Z'
+		detail: null,
+		minutesAgo: 42,
+		ip: '140.82.112.4'
 	},
 	{
-		id: 'log_6',
-		app_id: 'app_failed',
-		app_name: 'worker-queue',
-		action: 'deploy',
-		actor: 'member@localhost',
-		detail: 'Deploy failed: build error',
-		created_at: '2025-03-05T11:45:00.000Z'
+		...ADMIN,
+		resource_type: 'token',
+		resource_id: 'tok_agent',
+		resource_name: 'claude-ops-agent',
+		action: 'token_create',
+		detail: 'kind=agent scopes=apps:read,apps:deploy,apps:control projects=proj_1 expires=in 24h',
+		minutesAgo: 19 * 60,
+		ip: '198.51.100.7'
 	},
 	{
-		id: 'log_5',
-		app_id: null,
-		app_name: null,
+		...DANA,
+		...app('app_running', 'api-service'),
+		action: 'env_update',
+		detail: 'set=LOG_LEVEL',
+		minutesAgo: 3 * 60,
+		ip: '192.0.2.44'
+	},
+	{
+		...ADMIN,
+		resource_type: 'user',
+		resource_id: 'usr_3',
+		resource_name: 'victor@example.com',
+		action: 'user_invite',
+		detail: 'role=viewer',
+		minutesAgo: 26 * 60,
+		ip: '198.51.100.7'
+	},
+	{
+		...ADMIN,
+		resource_type: 'user',
+		resource_id: 'usr_4',
+		resource_name: 'former@example.com',
+		action: 'user_disable',
+		detail: null,
+		minutesAgo: 30 * 60,
+		ip: '198.51.100.7'
+	},
+	{
+		...DANA,
+		resource_type: 'user',
+		resource_id: 'usr_2',
+		resource_name: 'dana@example.com',
+		action: 'login',
+		detail: 'with 2FA',
+		minutesAgo: 3 * 60 + 5,
+		ip: '192.0.2.44'
+	},
+	{
+		actor_kind: 'local_socket',
+		actor_id: null,
+		actor_label: 'local-socket',
+		resource_type: 'settings',
+		resource_id: null,
+		resource_name: null,
+		action: 'host_terminal_enabled',
+		detail: null,
+		minutesAgo: 50 * 60
+	},
+	{
+		...ADMIN,
+		...app('app_stopped', 'web-frontend'),
+		action: 'stop',
+		detail: null,
+		minutesAgo: 52 * 60,
+		ip: '198.51.100.7'
+	},
+	{
+		...ADMIN,
+		resource_type: 'settings',
+		resource_id: null,
+		resource_name: null,
 		action: 'settings_update',
-		actor: 'admin@localhost',
-		detail: 'Updated ACME email',
-		created_at: '2025-02-20T09:00:00.000Z'
+		detail: 'session_idle_timeout_hours=12',
+		minutesAgo: 70 * 60,
+		ip: '198.51.100.7'
 	},
 	{
-		id: 'log_4',
-		app_id: 'app_running',
-		app_name: 'api-service',
+		...ADMIN,
+		...app('app_running', 'api-service'),
 		action: 'rollback',
-		actor: 'admin@localhost',
-		detail: 'Rolled back to sha-7f3a9b1',
-		created_at: '2025-02-18T11:00:00.000Z'
+		detail: 'deployment=dep_2 image_tag=tond-api-service:7f3a9b1c2d4e',
+		minutesAgo: 90 * 60,
+		ip: '198.51.100.7'
 	},
 	{
-		id: 'log_3',
-		app_id: 'app_unhealthy',
-		app_name: 'postgres-proxy',
-		action: 'health_update',
-		actor: 'admin@localhost',
-		detail: 'Health check path set to /ping',
-		created_at: '2025-02-15T09:30:00.000Z'
-	},
-	{
-		id: 'log_2',
-		app_id: 'app_stopped',
-		app_name: 'web-frontend',
+		...ADMIN,
+		...app('app_stopped', 'web-frontend'),
 		action: 'create',
-		actor: 'admin@localhost',
-		detail: 'App created',
-		created_at: '2025-01-15T08:00:00.000Z'
-	},
-	{
-		id: 'log_1',
-		app_id: 'app_running',
-		app_name: 'api-service',
-		action: 'create',
-		actor: 'admin@localhost',
-		detail: 'App created',
-		created_at: '2025-01-10T12:00:00.000Z'
+		detail: null,
+		minutesAgo: 200 * 60,
+		ip: '198.51.100.7'
 	}
 ];
+
+export const MOCK_AUDIT_LOG: AuditLogEntry[] = [...AUDIT_SEEDS]
+	.sort((a, b) => a.minutesAgo - b.minutesAgo)
+	.map((seed, i) => {
+		const { minutesAgo, outcome, ip, ...rest } = seed;
+		return {
+			...rest,
+			seq: AUDIT_SEEDS.length - i + 40,
+			created_at: new Date(Date.now() - minutesAgo * 60_000).toISOString(),
+			outcome: outcome ?? 'success',
+			ip: ip ?? null
+		};
+	});
 
 // ── Managed Databases (Phase 6.3) ──────────────────────────────────────────
 

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { can } from '$lib/auth.svelte';
 	import type { CronJob } from '$lib/api';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { setUiContext, clearUiContext, projectsContext } from '$lib/ui-context.svelte';
@@ -25,10 +26,10 @@
 		description={jobs.length ? `${enabledCount} of ${jobs.length} enabled` : undefined}
 	>
 		{#snippet actions()}
-			<Button href="/cron/new">
-				<Plus class="mr-1 h-4 w-4" />
-				New cron job
-			</Button>
+			{#if can('cron:write')}<Button href="/cron/new">
+					<Plus class="mr-1 h-4 w-4" />
+					New cron job
+				</Button>{/if}
 		{/snippet}
 	</PageHeader>
 

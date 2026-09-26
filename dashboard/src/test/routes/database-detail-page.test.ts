@@ -14,7 +14,7 @@ const api = vi.hoisted(() => ({
 	listProjects: vi.fn()
 }));
 
-vi.mock('$lib/auth.svelte', () => ({ isAdmin: () => true }));
+vi.mock('$lib/auth.svelte', () => ({ isAdmin: () => true, can: () => true }));
 
 vi.mock('$lib/api', () => ({ ...api }));
 vi.mock('$app/navigation', () => ({ goto: vi.fn(), invalidateAll: vi.fn() }));

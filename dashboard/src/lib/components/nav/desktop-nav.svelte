@@ -1,12 +1,14 @@
 <script lang="ts">
 	import { page } from '$app/state';
 	import { cn } from '$lib/utils';
-	import navItems, { isActive } from './nav-items.svelte.ts';
+	import { isActive, visibleNavItems } from './nav-items.svelte.ts';
+
+	const items = $derived(visibleNavItems());
 </script>
 
 <nav class="flex w-full justify-between" aria-label="Main">
 	<ul class="flex items-center gap-4">
-		{#each navItems as item (item.href)}
+		{#each items as item (item.href)}
 			{@const active = isActive(item.href, page.url.pathname)}
 			<li>
 				<a

@@ -5,6 +5,16 @@
 export interface TabDef<T extends string = string> {
 	id: T;
 	label: string;
+	/** Scope needed to see this tab; tabs the user can't use are hidden. */
+	scope?: string;
+}
+
+/** Tabs the user may see, given a scope check such as `can` from auth.svelte. */
+export function allowedTabs<T extends string>(
+	tabs: readonly TabDef<T>[],
+	can: (scope: string) => boolean
+): TabDef<T>[] {
+	return tabs.filter((t) => !t.scope || can(t.scope));
 }
 
 /** Read `?<param>=` and fall back when it's missing or unknown. */
@@ -49,13 +59,13 @@ export type AppSettingsSection =
 export const APP_TABS: readonly TabDef<AppTab>[] = [
 	{ id: 'overview', label: 'Overview' },
 	{ id: 'deployments', label: 'Deployments' },
-	{ id: 'logs', label: 'Logs' },
-	{ id: 'metrics', label: 'Metrics' },
+	{ id: 'logs', label: 'Logs', scope: 'logs:read' },
+	{ id: 'metrics', label: 'Metrics', scope: 'metrics:read' },
 	{ id: 'settings', label: 'Settings' }
 ];
 
 export const APP_SETTINGS_SECTIONS: readonly TabDef<AppSettingsSection>[] = [
-	{ id: 'environment', label: 'Environment' },
+	{ id: 'environment', label: 'Environment', scope: 'env:read-names' },
 	{ id: 'domain', label: 'Domain' },
 	{ id: 'health', label: 'Health' },
 	{ id: 'volumes', label: 'Volumes' },
@@ -63,7 +73,7 @@ export const APP_SETTINGS_SECTIONS: readonly TabDef<AppSettingsSection>[] = [
 	{ id: 'git', label: 'Git' },
 	{ id: 'previews', label: 'Previews' },
 	{ id: 'history', label: 'History' },
-	{ id: 'danger', label: 'Danger zone' }
+	{ id: 'danger', label: 'Danger zone', scope: 'apps:delete' }
 ];
 
 /**
@@ -92,7 +102,7 @@ export type DatabaseTab = 'overview' | 'environment' | 'metrics' | 'settings';
 export const DATABASE_TABS: readonly TabDef<DatabaseTab>[] = [
 	{ id: 'overview', label: 'Overview' },
 	{ id: 'environment', label: 'Environment' },
-	{ id: 'metrics', label: 'Metrics' },
+	{ id: 'metrics', label: 'Metrics', scope: 'metrics:read' },
 	{ id: 'settings', label: 'Settings' }
 ];
 
@@ -106,12 +116,13 @@ export const CRON_TABS: readonly TabDef<CronTab>[] = [
 export type AlertTab = 'overview' | 'settings';
 export const ALERT_TABS: readonly TabDef<AlertTab>[] = [
 	{ id: 'overview', label: 'Overview' },
-	{ id: 'settings', label: 'Settings' }
+	{ id: 'settings', label: 'Settings', scope: 'settings:write' }
 ];
 
-export type ProfileTab = 'password' | '2fa' | 'sessions';
+export type ProfileTab = 'password' | '2fa' | 'sessions' | 'tokens';
 export const PROFILE_TABS: readonly TabDef<ProfileTab>[] = [
 	{ id: 'password', label: 'Password' },
 	{ id: '2fa', label: 'Two-factor' },
-	{ id: 'sessions', label: 'Sessions' }
+	{ id: 'sessions', label: 'Sessions' },
+	{ id: 'tokens', label: 'API tokens' }
 ];

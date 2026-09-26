@@ -4,7 +4,7 @@
 	import { toggleMode } from 'mode-watcher';
 	import * as Command from '$lib/components/ui/command/index.js';
 	import { deployApp, listApps, listCronJobs, listDatabases, listProjects } from '$lib/api';
-	import { isAdmin } from '$lib/auth.svelte';
+	import { can } from '$lib/auth.svelte';
 	import { confirmAction } from '$lib/confirm.svelte';
 	import { errorMessage } from '$lib/action.svelte';
 	import {
@@ -52,7 +52,7 @@
 		};
 	});
 
-	let entries = $derived(buildPaletteEntries(data, { canDeploy: isAdmin() }));
+	let entries = $derived(buildPaletteEntries(data, { can }));
 	let groups = $derived(
 		GROUP_ORDER.map((group) => ({ group, items: entries.filter((e) => e.group === group) })).filter(
 			(g) => g.items.length > 0

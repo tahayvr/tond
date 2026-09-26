@@ -14,7 +14,7 @@
 		type CronJobRun,
 		type Project
 	} from '$lib/api';
-	import { isAdmin } from '$lib/auth.svelte';
+	import { isAdmin, can } from '$lib/auth.svelte';
 	import CronVolumeFields, {
 		OWN_FOLDER,
 		cronVolumeLabel,
@@ -468,23 +468,27 @@
 				>
 			{/snippet}
 			{#snippet actions()}
-				<Button
-					variant="outline"
-					size="sm"
-					onclick={handleToggleEnabled}
-					disabled={toggleEnabled.pending}
-				>
-					{current.enabled ? 'Pause' : toggleEnabled.pending ? 'Enabling…' : 'Enable'}
-				</Button>
-				<Button size="sm" onclick={handleTrigger} disabled={triggering} aria-busy={triggering}>
-					{#if triggering}
-						<RotateCw class="mr-1 h-4 w-4 animate-spin motion-reduce:animate-none" />
-						Starting…
-					{:else}
-						<Play class="mr-1 h-4 w-4" />
-						Run now
-					{/if}
-				</Button>
+				{#if can('cron:write')}
+					<Button
+						variant="outline"
+						size="sm"
+						onclick={handleToggleEnabled}
+						disabled={toggleEnabled.pending}
+					>
+						{current.enabled ? 'Pause' : toggleEnabled.pending ? 'Enabling…' : 'Enable'}
+					</Button>
+				{/if}
+				{#if can('cron:trigger')}
+					<Button size="sm" onclick={handleTrigger} disabled={triggering} aria-busy={triggering}>
+						{#if triggering}
+							<RotateCw class="mr-1 h-4 w-4 animate-spin motion-reduce:animate-none" />
+							Starting…
+						{:else}
+							<Play class="mr-1 h-4 w-4" />
+							Run now
+						{/if}
+					</Button>
+				{/if}
 			{/snippet}
 		</PageHeader>
 
@@ -1206,7 +1210,12 @@
 									Stops scheduled runs and deletes the run history. This can't be undone.
 								</p>
 							</div>
-							<Button variant="destructive" size="sm" onclick={() => (showDeleteDialog = true)}>
+							<Button
+								variant="destructive"
+								size="sm"
+								disabled={!can('cron:write')}
+								onclick={() => (showDeleteDialog = true)}
+							>
 								Delete…
 							</Button>
 						</div>

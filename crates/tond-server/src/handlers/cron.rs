@@ -2,7 +2,7 @@
 //
 // Creates and manages scheduled jobs that run Docker containers on a cron schedule.
 //
-// Routes (all require RequireAuth + RateLimit):
+// Routes (all require RateLimit + an Authz scope, see each handler):
 //   GET    /api/cron                      — list all cron jobs
 //   POST   /api/cron                      — create a new cron job
 //   GET    /api/cron/{id}                 — get cron job details
@@ -23,8 +23,8 @@ use serde::Deserialize;
 use tond_common::*;
 
 use crate::{
-    audit_log::{AuthActor, write_audit_log},
-    auth::{RateLimit, RequireAdmin, RequireAuth},
+    audit_log::write_audit_log,
+    auth::{Authz, RateLimit, scope},
     cron,
     cron::compute_next_run,
     error::AppError,
@@ -79,7 +79,7 @@ pub struct SchedulePreviewQuery {
 /// exactly what the scheduler will do (same parser, same time zone rules).
 pub async fn preview_schedule(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::CronRead>,
     Query(query): Query<SchedulePreviewQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let count = query.count.unwrap_or(5).clamp(1, 20);
@@ -103,7 +103,7 @@ pub async fn preview_schedule(
 
 pub async fn list_cron_jobs(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::CronRead>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     let jobs: Vec<CronJob> = sqlx::query_as("SELECT * FROM cron_jobs ORDER BY created_at DESC")
@@ -117,7 +117,7 @@ pub async fn list_cron_jobs(
 
 pub async fn get_cron_job(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::CronRead>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -132,8 +132,7 @@ pub async fn get_cron_job(
 
 pub async fn create_cron_job(
     _rate: RateLimit,
-    _admin: RequireAdmin,
-    actor: AuthActor,
+    auth: Authz<scope::CronWrite>,
     State(state): State<AppState>,
     Json(mut req): Json<CreateCronJobRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -260,7 +259,7 @@ pub async fn create_cron_job(
         None,
         None,
         "cron_create",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("name={} schedule={}", job.name, job.schedule)),
     )
     .await;
@@ -275,8 +274,7 @@ pub async fn create_cron_job(
 
 pub async fn update_cron_job(
     _rate: RateLimit,
-    _admin: RequireAdmin,
-    actor: AuthActor,
+    auth: Authz<scope::CronWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateCronJobRequest>,
@@ -452,7 +450,7 @@ pub async fn update_cron_job(
         None,
         None,
         "cron_update",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("name={}", job.name)),
     )
     .await;
@@ -469,8 +467,7 @@ pub async fn update_cron_job(
 
 pub async fn delete_cron_job(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::CronWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -486,7 +483,7 @@ pub async fn delete_cron_job(
         None,
         None,
         "cron_delete",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("name={}", job.name)),
     )
     .await;
@@ -501,8 +498,7 @@ pub async fn delete_cron_job(
 
 pub async fn trigger_cron_job(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::CronTrigger>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -520,7 +516,7 @@ pub async fn trigger_cron_job(
         None,
         None,
         "cron_trigger",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("name={}", job.name)),
     )
     .await;
@@ -546,7 +542,7 @@ pub struct CronRunsQuery {
 
 pub async fn list_cron_job_runs(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::CronRead>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(query): Query<CronRunsQuery>,
@@ -588,8 +584,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        audit_log::AuthActor,
-        auth::{RateLimiter, RequireAuth, rate_limit::RateLimit},
+        auth::{Authz, Principal, RateLimiter, rate_limit::RateLimit},
         state::AppState,
     };
 
@@ -694,8 +689,7 @@ mod tests {
 
         let error = create_cron_job(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(CreateCronJobRequest {
                 name: "bad name".to_string(),
@@ -731,8 +725,7 @@ mod tests {
 
         let error = create_cron_job(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(CreateCronJobRequest {
                 name: "nightly".to_string(),
@@ -770,8 +763,7 @@ mod tests {
 
         let error = create_cron_job(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(CreateCronJobRequest {
                 name: "nightly".to_string(),
@@ -807,8 +799,7 @@ mod tests {
 
         let error = create_cron_job(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(CreateCronJobRequest {
                 name: "nightly".to_string(),
@@ -841,7 +832,7 @@ mod tests {
     async fn schedule_preview_lists_next_runs_and_rejects_bad_input() {
         let ok = preview_schedule(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             Query(SchedulePreviewQuery {
                 schedule: "0 9 * * 1-5".to_string(),
                 timezone: Some("Europe/Berlin".to_string()),
@@ -866,7 +857,7 @@ mod tests {
             assert!(
                 preview_schedule(
                     RateLimit,
-                    RequireAuth,
+                    Authz::unchecked(Principal::test_user(Role::Admin)),
                     Query(SchedulePreviewQuery {
                         schedule: schedule.to_string(),
                         timezone: timezone.map(str::to_string),
@@ -886,8 +877,7 @@ mod tests {
 
         let error = create_cron_job(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(CreateCronJobRequest {
                 name: "nightly".to_string(),
@@ -926,8 +916,7 @@ mod tests {
 
         let response = create_cron_job(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Json(CreateCronJobRequest {
                 name: "nightly".to_string(),
@@ -996,8 +985,7 @@ mod tests {
         let state = test_state().await;
         let error = create_cron_job(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Json(CreateCronJobRequest {
                 name: "escape".to_string(),
@@ -1040,8 +1028,7 @@ mod tests {
 
         let bad_name = update_cron_job(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(job.id.clone()),
             Json(UpdateCronJobRequest {
@@ -1073,8 +1060,7 @@ mod tests {
 
         let bad_schedule = update_cron_job(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(job.id.clone()),
             Json(UpdateCronJobRequest {
@@ -1106,8 +1092,7 @@ mod tests {
 
         let bad_policy = update_cron_job(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Path(job.id),
             Json(UpdateCronJobRequest {
@@ -1148,8 +1133,7 @@ mod tests {
 
         let response = update_cron_job(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(job.id.clone()),
             Json(UpdateCronJobRequest {
@@ -1259,8 +1243,7 @@ mod tests {
 
         let error = update_cron_job(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Path(job.id),
             Json(UpdateCronJobRequest {
@@ -1316,7 +1299,7 @@ mod tests {
 
         let response = list_cron_job_runs(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Path(job.id),
             Query(CronRunsQuery {

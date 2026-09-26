@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { can } from '$lib/auth.svelte';
 	import {
 		createSnapshot,
 		deleteSnapshot,
@@ -243,19 +244,21 @@
 		description="Point-in-time copies of Tond's database, app volumes and database data."
 	>
 		{#snippet actions()}
-			<Button variant="outline" size="sm" onclick={openConfig}>
-				<Settings2 class="h-3.5 w-3.5" />
-				Backup settings
-			</Button>
-			<Button
-				size="sm"
-				disabled={create.pending}
-				aria-busy={create.pending}
-				onclick={() => create.run()}
-			>
-				<Plus class="h-3.5 w-3.5" />
-				{create.pending ? 'Creating…' : 'Create snapshot'}
-			</Button>
+			{#if can('snapshots:create')}
+				<Button variant="outline" size="sm" onclick={openConfig}>
+					<Settings2 class="h-3.5 w-3.5" />
+					Backup settings
+				</Button>
+				<Button
+					size="sm"
+					disabled={create.pending}
+					aria-busy={create.pending}
+					onclick={() => create.run()}
+				>
+					<Plus class="h-3.5 w-3.5" />
+					{create.pending ? 'Creating…' : 'Create snapshot'}
+				</Button>
+			{/if}
 		{/snippet}
 	</PageHeader>
 
@@ -440,7 +443,9 @@
 											</Button>
 
 											<!-- Rollback (pre-deploy) or Restore (full) -->
-											{#if isPreDeploy(snap) && snap.trigger_app}
+											{#if !can('snapshots:restore')}
+												<!-- restore, roll back and delete need snapshots:restore -->
+											{:else if isPreDeploy(snap) && snap.trigger_app}
 												<Button
 													variant="outline"
 													size="sm"
@@ -463,15 +468,17 @@
 											{/if}
 
 											<!-- Delete -->
-											<Button
-												variant="ghost"
-												size="icon"
-												class="h-7 w-7 text-destructive hover:text-destructive"
-												aria-label={`Delete snapshot ${snap.name}`}
-												onclick={() => handleDelete(snap)}
-											>
-												<Trash2 class="h-3.5 w-3.5" />
-											</Button>
+											{#if can('snapshots:restore')}
+												<Button
+													variant="ghost"
+													size="icon"
+													class="h-7 w-7 text-destructive hover:text-destructive"
+													aria-label={`Delete snapshot ${snap.name}`}
+													onclick={() => handleDelete(snap)}
+												>
+													<Trash2 class="h-3.5 w-3.5" />
+												</Button>
+											{/if}
 										</div>
 									</div>
 								</div>

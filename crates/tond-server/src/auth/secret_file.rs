@@ -1,8 +1,9 @@
 // auth/secret_file.rs — root-only files for one-time credentials
 //
-// tond-server hands two credentials to the operator through files instead of
-// logs (journald is readable by the `adm` group): the root API key and the
-// first-run setup token. Both live in the data directory, mode 0600.
+// tond-server hands the first-run setup token to the operator through a file
+// instead of logs (journald is readable by the `adm` group). It lives in the
+// data directory, mode 0600. (There is no root API key: automation gets a
+// scoped token from `tond token create` over the root-only socket.)
 
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -10,8 +11,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-/// File holding the root API key, written once when the key is generated.
-pub const ROOT_API_KEY_FILE: &str = "root-api-key";
 /// File holding the first-run setup token until the admin account exists.
 pub const SETUP_TOKEN_FILE: &str = "setup-token";
 

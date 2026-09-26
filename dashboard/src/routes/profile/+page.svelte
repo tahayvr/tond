@@ -8,15 +8,18 @@
 		listSessions,
 		revokeSession,
 		revokeAllSessions,
+		type ApiToken,
 		type SessionInfo,
 		type TotpSetup,
 		type User
 	} from '$lib/api';
 	import { getUser, setAuthenticated } from '$lib/auth.svelte';
+	import { page } from '$app/state';
+	import { passwordProblem, ROLE_LABELS } from '$lib/access';
+	import TokenList from '$lib/components/tokens/token-list.svelte';
 	import { untrack } from 'svelte';
 	import { setUiContext, clearUiContext, projectsContext } from '$lib/ui-context.svelte';
 	import { Badge } from '$lib/components/ui/badge/index.js';
-	import { page } from '$app/state';
 	import LinkTabs from '$lib/components/nav/link-tabs.svelte';
 	import { PROFILE_TABS, tabFromUrl, tabHref, type ProfileTab } from '$lib/tabs';
 	import { confirmAction } from '$lib/confirm.svelte';
@@ -49,8 +52,9 @@
 			pwError = 'New passwords do not match';
 			return;
 		}
-		if (newPassword.length < 8) {
-			pwError = 'New password must be at least 8 characters';
+		const problem = passwordProblem(newPassword);
+		if (problem) {
+			pwError = problem;
 			return;
 		}
 		pwSaving = true;
@@ -247,7 +251,9 @@
 			<h1 class="text-2xl font-extrabold sm:text-3xl">Profile</h1>
 			<p class="truncate text-sm text-muted-foreground">{user?.email ?? ''}</p>
 		</div>
-		<Badge variant="outline" class="text-xs">{user?.role ?? ''}</Badge>
+		<Badge variant="outline" class="text-xs">
+			{user ? (ROLE_LABELS[user.role] ?? user.role) : ''}
+		</Badge>
 	</div>
 
 	<LinkTabs
@@ -306,6 +312,8 @@
 				onRevoke={handleRevokeSession}
 				onRevokeAll={handleRevokeAll}
 			/>
+		{:else if tab === 'tokens'}
+			<TokenList initialTokens={(data.tokens as ApiToken[] | undefined) ?? []} />
 		{/if}
 	</div>
 </div>

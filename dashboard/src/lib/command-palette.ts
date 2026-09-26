@@ -31,19 +31,26 @@ export interface PaletteData {
 	projects: Project[];
 }
 
+/**
+ * `can` decides what the user may see or do (pass `can` from auth.svelte); entries
+ * needing a scope the user lacks are left out.
+ */
 export function buildPaletteEntries(
 	data: PaletteData,
-	{ canDeploy = true }: { canDeploy?: boolean } = {}
+	{ can = () => true }: { can?: (scope: string) => boolean } = {}
 ): PaletteEntry[] {
+	const canDeploy = can('apps:deploy');
 	const entries: PaletteEntry[] = [
 		{ id: 'page:/', group: 'Pages', label: 'Home', keywords: ['dashboard', 'overview'], href: '/' },
-		...navItems.map((item) => ({
-			id: `page:${item.href}`,
-			group: 'Pages' as const,
-			label: item.label,
-			keywords: [item.href.slice(1)],
-			href: item.href
-		})),
+		...navItems
+			.filter((item) => !item.scope || can(item.scope))
+			.map((item) => ({
+				id: `page:${item.href}`,
+				group: 'Pages' as const,
+				label: item.label,
+				keywords: [item.href.slice(1)],
+				href: item.href
+			})),
 		{
 			id: 'page:/profile',
 			group: 'Pages',
@@ -53,7 +60,7 @@ export function buildPaletteEntries(
 		}
 	];
 
-	entries.push(
+	const creators: PaletteEntry[] = [
 		{
 			id: 'new:app',
 			group: 'Actions',
@@ -81,7 +88,17 @@ export function buildPaletteEntries(
 			label: 'New alert rule',
 			keywords: ['create', 'notify'],
 			href: '/alerts/new'
-		},
+		}
+	];
+	const creatorScopes: Record<string, string> = {
+		'new:app': 'apps:write',
+		'new:db': 'db:write',
+		'new:cron': 'cron:write',
+		'new:alert': 'settings:write'
+	};
+	entries.push(...creators.filter((e) => can(creatorScopes[e.id])));
+
+	entries.push(
 		{
 			id: 'act:theme',
 			group: 'Actions',
@@ -114,13 +131,14 @@ export function buildPaletteEntries(
 			hint: app.status,
 			href: `/apps/${app.id}`
 		});
-		entries.push({
-			id: `logs:${app.id}`,
-			group: 'Actions',
-			label: `Open logs: ${app.name}`,
-			keywords: ['logs', app.name],
-			href: appTabHref(app.id, 'logs')
-		});
+		if (can('logs:read'))
+			entries.push({
+				id: `logs:${app.id}`,
+				group: 'Actions',
+				label: `Open logs: ${app.name}`,
+				keywords: ['logs', app.name],
+				href: appTabHref(app.id, 'logs')
+			});
 		if (canDeploy) {
 			entries.push({
 				id: `deploy:${app.id}`,

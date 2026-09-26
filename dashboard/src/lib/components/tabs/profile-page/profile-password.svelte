@@ -67,8 +67,13 @@
 				bind:value={newPassword}
 				autocomplete="new-password"
 				class="border-border bg-card font-mono text-sm"
+				aria-describedby="new-pw-hint"
 				required
 			/>
+			<p id="new-pw-hint" class="text-xs text-muted-foreground">
+				At least 12 characters. No symbols required: a few random words work well. Common or
+				breached passwords are refused. Changing it signs out your other sessions.
+			</p>
 		</div>
 
 		<div class="grid gap-2">

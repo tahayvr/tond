@@ -10,7 +10,7 @@
 		type OnboardingStatus,
 		type SystemMetrics
 	} from '$lib/api';
-	import { getUser } from '$lib/auth.svelte';
+	import { getUser, can } from '$lib/auth.svelte';
 	import { setUiContext, clearUiContext, projectsContext } from '$lib/ui-context.svelte';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Skeleton } from '$lib/components/ui/skeleton/index.js';
@@ -27,6 +27,7 @@
 	import Rocket from '~icons/ri/rocket-line';
 	import Database from '~icons/ri/database-2-line';
 	import Clock from '~icons/ri/time-line';
+	import { actorLabel } from '$lib/access';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();
@@ -88,14 +89,16 @@
 <div class="space-y-6">
 	<PageHeader title="Home" docTitle="Home" description={serverName || undefined}>
 		{#snippet actions()}
-			<Button variant="outline" size="sm" href="/projects">
-				<Plus class="mr-1 h-4 w-4" />
-				New project
-			</Button>
-			<Button size="sm" href="/apps/new">
-				<Plus class="mr-1 h-4 w-4" />
-				New app
-			</Button>
+			{#if can('apps:write')}
+				<Button variant="outline" size="sm" href="/projects">
+					<Plus class="mr-1 h-4 w-4" />
+					New project
+				</Button>
+				<Button size="sm" href="/apps/new">
+					<Plus class="mr-1 h-4 w-4" />
+					New app
+				</Button>
+			{/if}
 		{/snippet}
 	</PageHeader>
 
@@ -301,13 +304,12 @@
 				<p class="mt-2 text-sm text-muted-foreground">Nothing yet.</p>
 			{:else}
 				<ul class="mt-3 space-y-2">
-					{#each recentActivity.slice(0, 5) as entry (entry.id)}
+					{#each recentActivity.slice(0, 5) as entry (entry.seq)}
 						<li class="text-sm">
 							<span class="font-medium">{actionLabel(entry.action)}</span>
 							<span class="text-muted-foreground">
-								{entry.app_name ?? entry.detail ?? 'System'} · {formatRelativePast(
-									entry.created_at
-								)}
+								{entry.resource_name ?? entry.detail ?? 'System'} · {actorLabel(entry)} ·
+								{formatRelativePast(entry.created_at)}
 							</span>
 						</li>
 					{/each}

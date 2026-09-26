@@ -30,6 +30,7 @@ vi.mock('$lib/api', () => ({
 }));
 
 vi.mock('$app/navigation', () => ({ goto: vi.fn(), invalidateAll: vi.fn() }));
+vi.mock('$lib/auth.svelte', () => ({ can: () => true }));
 
 import SnapshotsPage from '../../routes/snapshots/+page.svelte';
 import { confirmDialog, renderConfirmHost } from '../confirm';

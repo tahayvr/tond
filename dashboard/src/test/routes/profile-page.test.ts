@@ -40,6 +40,7 @@ const { setAuthenticated } = vi.hoisted(() => ({ setAuthenticated: vi.fn() }));
 
 vi.mock('$lib/auth.svelte', () => ({
 	getUser: () => ({ email: 'admin@example.com', role: 'admin', totp_enabled: false }),
+	can: () => true,
 	setAuthenticated
 }));
 
@@ -72,7 +73,7 @@ const sessions = [
 const me = {
 	id: 'usr_1',
 	email: 'admin@example.com',
-	role: 'admin',
+	role: 'admin' as const,
 	totp_enabled: false,
 	created_at: '2026-01-01T00:00:00.000Z'
 };
@@ -85,7 +86,8 @@ function renderPage(routeSessions = sessions, totpEnabled = false, tab = '') {
 			params: {},
 			data: {
 				sessions: routeSessions,
-				me: { ...me, totp_enabled: totpEnabled }
+				me: { ...me, totp_enabled: totpEnabled },
+				tokens: []
 			}
 		}
 	});
@@ -195,7 +197,7 @@ describe('profile page', () => {
 		renderPage(sessions, false, 'sessions');
 
 		expect(api.listSessions).toHaveBeenCalledOnce();
-		expect(await screen.findByText(/sign out everywhere/i)).toBeInTheDocument();
+		expect(await screen.findByText(/sign out other sessions/i)).toBeInTheDocument();
 
 		await user.click(screen.getByRole('button', { name: /^revoke$/i }));
 		expect(api.revokeSession).not.toHaveBeenCalled();
@@ -209,8 +211,8 @@ describe('profile page', () => {
 		const user = userEvent.setup();
 		renderPage(sessions, false, 'sessions');
 
-		await screen.findByText(/sign out everywhere/i);
-		await user.click(screen.getByRole('button', { name: /sign out everywhere/i }));
+		await screen.findByText(/sign out other sessions/i);
+		await user.click(screen.getByRole('button', { name: /sign out other sessions/i }));
 		await confirmDialog(user);
 
 		expect(api.revokeAllSessions).toHaveBeenCalledOnce();

@@ -51,7 +51,11 @@ const api = vi.hoisted(() => ({
 	getApp: vi.fn()
 }));
 
-vi.mock('$lib/auth.svelte', () => ({ isAdmin: () => true }));
+const authz = vi.hoisted(() => ({ deny: new Set<string>() }));
+vi.mock('$lib/auth.svelte', () => ({
+	isAdmin: () => true,
+	can: (scope: string) => !authz.deny.has(scope)
+}));
 
 vi.mock('$app/state', async () => ({
 	page: (await import('../mocks/page-state.svelte')).page
@@ -166,6 +170,7 @@ async function goToTab(query: string) {
 describe('apps/[id] page', () => {
 	beforeEach(() => {
 		setPageUrl('http://localhost/apps/app_1', { id: 'app_1' });
+		authz.deny.clear();
 		goto.mockReset();
 		setUiContext.mockReset();
 		clearUiContext.mockReset();
@@ -305,6 +310,30 @@ describe('apps/[id] page', () => {
 		expect(api.deployApp).toHaveBeenCalledTimes(1);
 		expect(screen.getByRole('button', { name: /starting deploy/i })).toBeDisabled();
 		resolve();
+	});
+
+	it('hides what a viewer can’t use and explains read-only settings', async () => {
+		for (const scope of ['apps:deploy', 'apps:control', 'apps:write', 'apps:delete', 'logs:read']) {
+			authz.deny.add(scope);
+		}
+		setPageUrl('http://localhost/apps/app_1?tab=settings&section=git', { id: 'app_1' });
+		renderPage();
+
+		expect(screen.queryByRole('button', { name: /^deploy$/i })).not.toBeInTheDocument();
+		expect(screen.queryByRole('button', { name: /^stop$/i })).not.toBeInTheDocument();
+		const tabs = screen.getByRole('navigation', { name: 'App sections' });
+		expect(within(tabs).queryByRole('link', { name: 'Logs' })).not.toBeInTheDocument();
+		const sections = screen.getByRole('navigation', { name: 'Settings sections' });
+		expect(within(sections).queryByRole('link', { name: 'Danger zone' })).not.toBeInTheDocument();
+		expect(screen.getByText(/changing them needs the/i)).toBeInTheDocument();
+		// The webhook config (apps:write) is explained instead of failing with a 403.
+		expect(api.getWebhookConfig).not.toHaveBeenCalled();
+		expect(screen.getByText(/webhook urls and secrets are shown to users/i)).toBeInTheDocument();
+
+		await goToTab('?tab=logs');
+		expect(
+			screen.getByText(/your role can’t open this section|your role can't open this section/i)
+		).toBeInTheDocument();
 	});
 
 	it('opens the tab named in the URL and groups settings sections', async () => {

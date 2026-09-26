@@ -27,7 +27,7 @@
 	import LinkTabs from '$lib/components/nav/link-tabs.svelte';
 	import ConfirmDialog from '$lib/components/dialogs/confirm-dialog.svelte';
 	import { confirmAction } from '$lib/confirm.svelte';
-	import { DATABASE_TABS, tabFromUrl, tabHref, type DatabaseTab } from '$lib/tabs';
+	import { allowedTabs, DATABASE_TABS, tabFromUrl, tabHref, type DatabaseTab } from '$lib/tabs';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
@@ -45,7 +45,7 @@
 	import GlobeIcon from '~icons/ri/global-line';
 	import LockIcon from '~icons/ri/lock-line';
 	import AlertIcon from '~icons/ri/alert-line';
-	import { isAdmin } from '$lib/auth.svelte';
+	import { isAdmin, can } from '$lib/auth.svelte';
 	import type { PageProps } from './$types';
 
 	let { data, params }: PageProps = $props();
@@ -593,29 +593,36 @@
 				{/if}
 			{/snippet}
 			{#snippet actions()}
-				{#if current.status === 'running'}
-					<Button variant="outline" size="sm" disabled={acting || redeploying} onclick={handleStop}>
-						{acting ? 'Stopping…' : 'Stop'}
-					</Button>
-				{:else if current.status === 'stopped' || current.status === 'failed'}
+				{#if can('db:write')}
+					{#if current.status === 'running'}
+						<Button
+							variant="outline"
+							size="sm"
+							disabled={acting || redeploying}
+							onclick={handleStop}
+						>
+							{acting ? 'Stopping…' : 'Stop'}
+						</Button>
+					{:else if current.status === 'stopped' || current.status === 'failed'}
+						<Button
+							variant="outline"
+							size="sm"
+							disabled={acting || redeploying}
+							aria-busy={acting}
+							onclick={handleStart}
+						>
+							{acting ? 'Starting…' : 'Start'}
+						</Button>
+					{/if}
 					<Button
 						variant="outline"
 						size="sm"
 						disabled={acting || redeploying}
-						aria-busy={acting}
-						onclick={handleStart}
+						onclick={handleRedeploy}
 					>
-						{acting ? 'Starting…' : 'Start'}
+						{redeploying ? 'Redeploying…' : 'Redeploy'}
 					</Button>
 				{/if}
-				<Button
-					variant="outline"
-					size="sm"
-					disabled={acting || redeploying}
-					onclick={handleRedeploy}
-				>
-					{redeploying ? 'Redeploying…' : 'Redeploy'}
-				</Button>
 			{/snippet}
 		</PageHeader>
 
@@ -623,7 +630,7 @@
 
 		<LinkTabs
 			label="Database sections"
-			tabs={DATABASE_TABS}
+			tabs={allowedTabs(DATABASE_TABS, can)}
 			active={tab}
 			href={(id) => tabHref(page.url.pathname, id, 'overview')}
 		/>
@@ -1184,23 +1191,25 @@
 							<SuccessAlert message={limitsSaved ? 'Memory limit saved.' : ''} class="py-1.5" />
 						</div>
 					</div>
-					<section
-						aria-labelledby="db-danger-heading"
-						class="max-w-2xl space-y-4 rounded-sm border border-destructive/40 p-4"
-					>
-						<div>
-							<h2 id="db-danger-heading" class="text-sm font-semibold text-destructive">
-								Delete this database
-							</h2>
-							<p class="mt-1 text-sm text-muted-foreground">
-								Stops the container and permanently deletes all of its data. Snapshots taken earlier
-								are kept.
-							</p>
-						</div>
-						<Button variant="destructive" size="sm" onclick={() => (showDeleteDialog = true)}>
-							Delete database…
-						</Button>
-					</section>
+					{#if can('db:delete')}
+						<section
+							aria-labelledby="db-danger-heading"
+							class="max-w-2xl space-y-4 rounded-sm border border-destructive/40 p-4"
+						>
+							<div>
+								<h2 id="db-danger-heading" class="text-sm font-semibold text-destructive">
+									Delete this database
+								</h2>
+								<p class="mt-1 text-sm text-muted-foreground">
+									Stops the container and permanently deletes all of its data. Snapshots taken
+									earlier are kept.
+								</p>
+							</div>
+							<Button variant="destructive" size="sm" onclick={() => (showDeleteDialog = true)}>
+								Delete database…
+							</Button>
+						</section>
+					{/if}
 				</div>
 			{/if}
 

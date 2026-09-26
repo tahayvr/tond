@@ -4,6 +4,7 @@
 // re-exported here so that consumers can still write `use tond_common::App`
 // (or `use tond_common::*`) without knowing which sub-module a type lives in.
 
+pub mod access;
 pub mod api;
 pub mod apps;
 pub mod auth;
@@ -22,6 +23,7 @@ pub mod settings;
 pub mod storage;
 pub mod templates;
 
+pub use access::*;
 pub use api::*;
 pub use apps::*;
 pub use auth::*;

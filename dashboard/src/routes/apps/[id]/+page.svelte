@@ -45,12 +45,13 @@
 		type GitHubBranch
 	} from '$lib/api';
 	import { goto } from '$app/navigation';
-	import { isAdmin } from '$lib/auth.svelte';
+	import { isAdmin, can } from '$lib/auth.svelte';
 	import { confirmAction } from '$lib/confirm.svelte';
 	import { useAction } from '$lib/action.svelte';
 	import {
 		APP_TABS,
 		APP_SETTINGS_SECTIONS,
+		allowedTabs,
 		appTabHref,
 		appViewFromUrl,
 		type AppSettingsSection
@@ -108,6 +109,14 @@
 	let view = $derived(appViewFromUrl(page.url));
 	/** Leaf view: a tab, or the Settings section when Settings is open. */
 	let activeTab = $derived<string>(view.tab === 'settings' ? view.section : view.tab);
+	// Only offer what the user's scopes allow (the server enforces it either way).
+	let appTabs = $derived(allowedTabs(APP_TABS, can));
+	let settingsSections = $derived(allowedTabs(APP_SETTINGS_SECTIONS, can));
+	let viewAllowed = $derived(
+		appTabs.some((t) => t.id === view.tab) &&
+			(view.tab !== 'settings' || settingsSections.some((s) => s.id === view.section))
+	);
+	let canEditApp = $derived(can('apps:write'));
 	let sectionLabel = $derived(
 		view.tab === 'settings'
 			? APP_SETTINGS_SECTIONS.find((s) => s.id === view.section)?.label
@@ -932,7 +941,9 @@
 				{/if}
 			{/snippet}
 			{#snippet actions()}
-				{#if current.status === 'running' || current.status === 'unhealthy'}
+				{#if !can('apps:control')}
+					<!-- start/stop/restart need apps:control -->
+				{:else if current.status === 'running' || current.status === 'unhealthy'}
 					<Button variant="outline" size="sm" onclick={handleRestart}>Restart</Button>
 					<Button variant="outline" size="sm" onclick={handleStop}>Stop</Button>
 				{:else if current.status === 'stopped'}
@@ -946,18 +957,20 @@
 						{start.pending ? 'Starting…' : 'Start'}
 					</Button>
 				{/if}
-				<Button
-					size="sm"
-					onclick={() => deploy.run()}
-					disabled={deploy.pending || current.status === 'building'}
-					aria-busy={deploy.pending}
-				>
-					{deploy.pending
-						? 'Starting deploy…'
-						: current.status === 'building'
-							? 'Deploying…'
-							: 'Deploy'}
-				</Button>
+				{#if can('apps:deploy')}
+					<Button
+						size="sm"
+						onclick={() => deploy.run()}
+						disabled={deploy.pending || current.status === 'building'}
+						aria-busy={deploy.pending}
+					>
+						{deploy.pending
+							? 'Starting deploy…'
+							: current.status === 'building'
+								? 'Deploying…'
+								: 'Deploy'}
+					</Button>
+				{/if}
 			{/snippet}
 		</PageHeader>
 
@@ -965,7 +978,7 @@
 
 		<LinkTabs
 			label="App sections"
-			tabs={APP_TABS}
+			tabs={appTabs}
 			active={view.tab}
 			href={(id) => appTabHref(current.id, id, id === 'settings' ? view.section : undefined)}
 		/>
@@ -979,19 +992,28 @@
 				<LinkTabs
 					label="Settings sections"
 					variant="pills"
-					tabs={APP_SETTINGS_SECTIONS}
+					tabs={settingsSections}
 					active={view.section}
 					href={(id: AppSettingsSection) => appTabHref(current.id, 'settings', id)}
 				/>
 			{/if}
 			<div class="min-w-0">
+				{#if !viewAllowed}
+					<p class="rounded-sm border border-dashed p-4 text-sm text-muted-foreground">
+						Your role can't open this section. Ask an admin if you need access.
+					</p>
+				{:else if view.tab === 'settings' && !canEditApp && view.section !== 'history'}
+					<p class="mb-4 rounded-sm border border-dashed px-3 py-2 text-sm text-muted-foreground">
+						You can view these settings. Changing them needs the <code>apps:write</code> permission.
+					</p>
+				{/if}
 				<!-- Overview tab -->
-				{#if activeTab === 'overview'}
+				{#if viewAllowed && activeTab === 'overview'}
 					<AppOverview {app} />
 				{/if}
 
 				<!-- Logs tab -->
-				{#if activeTab === 'logs'}
+				{#if viewAllowed && activeTab === 'logs'}
 					<AppLogs
 						{logLines}
 						streaming={logStreaming}
@@ -1002,7 +1024,7 @@
 				{/if}
 
 				<!-- Deployments tab -->
-				{#if activeTab === 'deployments'}
+				{#if viewAllowed && activeTab === 'deployments'}
 					<AppDeployments
 						{deployments}
 						loading={deploymentsLoading}
@@ -1013,7 +1035,7 @@
 				{/if}
 
 				<!-- Environment tab -->
-				{#if activeTab === 'environment'}
+				{#if viewAllowed && activeTab === 'environment'}
 					<AppEnvironment
 						appId={app.id}
 						sourceType={app.source_type}
@@ -1026,7 +1048,7 @@
 				{/if}
 
 				<!-- Domain tab -->
-				{#if activeTab === 'domain'}
+				{#if viewAllowed && activeTab === 'domain'}
 					<AppDomain
 						bind:domainInput
 						savedDomain={app?.domain ?? null}
@@ -1036,7 +1058,7 @@
 				{/if}
 
 				<!-- Health tab -->
-				{#if activeTab === 'health'}
+				{#if viewAllowed && activeTab === 'health'}
 					<AppHealth
 						{app}
 						bind:healthPath
@@ -1050,7 +1072,7 @@
 				{/if}
 
 				<!-- Volumes tab -->
-				{#if activeTab === 'volumes'}
+				{#if viewAllowed && activeTab === 'volumes'}
 					<AppVolumes
 						{app}
 						bind:volumeContainerPath
@@ -1062,7 +1084,7 @@
 					/>
 				{/if}
 				<!-- Resources tab -->
-				{#if activeTab === 'resources'}
+				{#if viewAllowed && activeTab === 'resources'}
 					<div class="max-w-sm space-y-6">
 						<div class="space-y-2">
 							<Label for="resource-memory">Memory limit</Label>
@@ -1121,7 +1143,7 @@
 					</div>
 				{/if}
 				<!-- Git tab -->
-				{#if activeTab === 'git'}
+				{#if viewAllowed && activeTab === 'git'}
 					<div class="space-y-6 pt-4">
 						<InlineError message={gitError} ondismiss={() => (gitError = '')} />
 						<SuccessAlert message={gitSuccess} ondismiss={() => (gitSuccess = '')} />
@@ -1487,7 +1509,13 @@
 
 						<Separator />
 
-						<AppWebhooks appId={app.id} />
+						{#if canEditApp}
+							<AppWebhooks appId={app.id} />
+						{:else}
+							<p class="text-sm text-muted-foreground">
+								Webhook URLs and secrets are shown to users who can change this app's settings.
+							</p>
+						{/if}
 
 						<Separator />
 
@@ -1588,7 +1616,7 @@
 				{/if}
 
 				<!-- Previews tab -->
-				{#if activeTab === 'previews'}
+				{#if viewAllowed && activeTab === 'previews'}
 					<div class="space-y-6 pt-4">
 						<!-- PR Preview config -->
 						<div class="grid grid-cols-1 gap-3">
@@ -1777,18 +1805,18 @@
 				{/if}
 
 				<!-- Metrics tab -->
-				{#if activeTab === 'metrics'}
+				{#if viewAllowed && activeTab === 'metrics'}
 					{#key appId}
 						<MetricsPanel owner="apps" id={appId} noun="app" />
 					{/key}
 				{/if}
 
 				<!-- History tab -->
-				{#if activeTab === 'history'}
+				{#if viewAllowed && activeTab === 'history'}
 					<AppHistory appName={app.name} />
 				{/if}
 
-				{#if activeTab === 'danger'}
+				{#if viewAllowed && activeTab === 'danger'}
 					<section
 						aria-labelledby="danger-zone-heading"
 						class="space-y-4 rounded-sm border border-destructive/40 p-4"

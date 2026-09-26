@@ -6,7 +6,7 @@ use sqlx::AssertSqlSafe;
 
 use crate::{
     AppState,
-    auth::{RateLimit, RequireAuth},
+    auth::{Authz, RateLimit, scope},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,7 +51,7 @@ pub struct OnboardingStatusResponse {
 
 pub async fn get_status(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsRead>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     let settings = state.settings.read().await.clone();
@@ -386,7 +386,7 @@ mod tests {
         .bind("curl/8.0")
         .bind("127.0.0.1")
         .bind("2026-01-01T00:00:00Z")
-        .bind("2026-01-01T00:00:00Z")
+        .bind(chrono::Utc::now().to_rfc3339())
         .bind("2099-01-01T00:00:00Z")
         .execute(&state.db)
         .await
@@ -405,7 +405,10 @@ mod tests {
             .unwrap_or_else(|err| panic!("failed to decode onboarding response JSON: {err}"))
     }
 
-    async fn require_auth_for_test(state: &AppState, session_token: &str) -> RequireAuth {
+    async fn require_auth_for_test(
+        state: &AppState,
+        session_token: &str,
+    ) -> Authz<scope::AppsRead> {
         let mut parts = axum::http::Request::builder()
             .uri("/api/onboarding/status")
             .body(())
@@ -418,9 +421,10 @@ mod tests {
                 .unwrap_or_else(|err| panic!("failed to build session cookie header: {err}")),
         );
 
-        RequireAuth::from_request_parts(&mut parts, state)
-            .await
-            .unwrap_or_else(|err| panic!("RequireAuth should accept a valid session: {err:?}"))
+        match Authz::<scope::AppsRead>::from_request_parts(&mut parts, state).await {
+            Ok(auth) => auth,
+            Err(response) => panic!("a valid session should pass: {}", response.status()),
+        }
     }
 
     #[tokio::test]

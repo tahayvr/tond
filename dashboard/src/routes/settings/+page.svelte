@@ -4,6 +4,8 @@
 	import SettingsForm from '$lib/components/forms/settings-form.svelte';
 	import PageHeader from '$lib/components/nav/page-header.svelte';
 	import InlineError from '$lib/components/feedback/inline-error.svelte';
+	import SessionSettingsForm from '$lib/components/forms/session-settings-form.svelte';
+	import { can } from '$lib/auth.svelte';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();
@@ -76,4 +78,6 @@
 		error={accessError}
 		onSubmit={handleSaveAccess}
 	/>
+
+	<SessionSettingsForm settings={data.settings} canEdit={can('settings:write')} />
 </div>

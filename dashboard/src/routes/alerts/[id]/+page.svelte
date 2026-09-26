@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { can } from '$lib/auth.svelte';
 	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { page } from '$app/state';
 	import {
@@ -21,7 +22,7 @@
 	import LinkTabs from '$lib/components/nav/link-tabs.svelte';
 	import ConfirmDialog from '$lib/components/dialogs/confirm-dialog.svelte';
 	import { useAction } from '$lib/action.svelte';
-	import { ALERT_TABS, tabFromUrl, tabHref, type AlertTab } from '$lib/tabs';
+	import { ALERT_TABS, allowedTabs, tabFromUrl, tabHref, type AlertTab } from '$lib/tabs';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Checkbox } from '$lib/components/ui/checkbox/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
@@ -221,23 +222,25 @@
 				{/if}
 			{/snippet}
 			{#snippet actions()}
-				<Button
-					variant="outline"
-					size="sm"
-					onclick={() => sendTest.run()}
-					disabled={sendTest.pending}
-					aria-busy={sendTest.pending}
-				>
-					{sendTest.pending ? 'Sending test…' : 'Send test'}
-				</Button>
-				<Button
-					variant="outline"
-					size="sm"
-					onclick={() => toggleEnabled.run()}
-					disabled={toggleEnabled.pending}
-				>
-					{toggleEnabled.pending ? 'Saving…' : current.enabled ? 'Pause' : 'Enable'}
-				</Button>
+				{#if can('settings:write')}
+					<Button
+						variant="outline"
+						size="sm"
+						onclick={() => sendTest.run()}
+						disabled={sendTest.pending}
+						aria-busy={sendTest.pending}
+					>
+						{sendTest.pending ? 'Sending test…' : 'Send test'}
+					</Button>
+					<Button
+						variant="outline"
+						size="sm"
+						onclick={() => toggleEnabled.run()}
+						disabled={toggleEnabled.pending}
+					>
+						{toggleEnabled.pending ? 'Saving…' : current.enabled ? 'Pause' : 'Enable'}
+					</Button>
+				{/if}
 			{/snippet}
 		</PageHeader>
 
@@ -264,7 +267,7 @@
 
 		<LinkTabs
 			label="Alert rule sections"
-			tabs={ALERT_TABS}
+			tabs={allowedTabs(ALERT_TABS, can)}
 			active={tab}
 			href={(id) => tabHref(page.url.pathname, id, 'overview')}
 		/>
@@ -391,7 +394,7 @@
 			{/if}
 
 			<!-- ── Settings tab ── -->
-			{#if tab === 'settings'}
+			{#if tab === 'settings' && can('settings:write')}
 				<div class="space-y-6 pt-4">
 					<InlineError message={settingsError} />
 					<SuccessAlert message={settingsSuccess} ondismiss={() => (settingsSuccess = '')} />
