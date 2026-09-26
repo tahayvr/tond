@@ -39,7 +39,8 @@
 //     - Routing: one persistent read-only SQLite connection (mode=ro; tond.db
 //       is 0640 root:tond-proxy, see tond-server's db.rs). tond-server bumps
 //       `route_state.version` (SQL triggers) and nudges the proxy over the
-//       control socket; the proxy reloads — running apps and previews with a
+//       control socket; the proxy reloads — running apps, compose service
+//       domains (app_domains -> compose_services.host_port) and previews with a
 //       stored host_port, plus dashboard_domain / preview_domain — only when
 //       the version moved, in one read transaction, and acknowledges with the
 //       version it loaded. A deploy stops the old container only after that
@@ -653,6 +654,48 @@ impl TondProxy {
                 domain.clone(),
                 Arc::new(Route {
                     upstream,
+                    stats: self.traffic.route(RouteKind::App, id),
+                    access,
+                }),
+            );
+            live.push((RouteKind::App, id.clone()));
+        }
+
+        // Compose services: domain -> (app, service) -> the loopback host port
+        // tond-server allocated for the service's published container port.
+        // Requests are counted per app (all its services share one bucket).
+        #[allow(clippy::type_complexity)]
+        let service_rows: Vec<(String, String, String, String, i64, bool, bool)> =
+            sqlx::query_as(
+                "SELECT d.domain, a.id, a.name, d.service, s.host_port, a.access_log, a.access_log_query
+                 FROM app_domains d
+                 JOIN apps a ON a.id = d.app_id
+                 JOIN compose_services s ON s.app_id = d.app_id AND s.name = d.service
+                 WHERE d.service IS NOT NULL AND a.status = 'running' AND s.host_port IS NOT NULL",
+            )
+            .fetch_all(&mut *tx)
+            .await?;
+        for (domain, id, name, service, host_port, access_log, access_query) in &service_rows {
+            if under_preview_domain(domain) {
+                tracing::warn!(
+                    "Service {}/{} uses domain {} under the preview domain — not routed",
+                    name,
+                    service,
+                    domain
+                );
+                continue;
+            }
+            if new_routes.contains_key(domain) {
+                continue; // an app's own domain wins over a stale service row
+            }
+            let access = access_log.then(|| AccessConfig {
+                app_id: Arc::from(id.as_str()),
+                include_query: *access_query,
+            });
+            new_routes.insert(
+                domain.clone(),
+                Arc::new(Route {
+                    upstream: format!("127.0.0.1:{}", host_port),
                     stats: self.traffic.route(RouteKind::App, id),
                     access,
                 }),
@@ -1301,6 +1344,16 @@ mod tests {
         .await
         .unwrap_or_else(|err| panic!("failed to create preview_deployments table: {err}"));
 
+        for stmt in [
+            "CREATE TABLE app_domains (domain TEXT PRIMARY KEY NOT NULL, app_id TEXT NOT NULL, service TEXT, port INTEGER)",
+            "CREATE TABLE compose_services (app_id TEXT NOT NULL, name TEXT NOT NULL, host_port INTEGER, PRIMARY KEY(app_id, name))",
+        ] {
+            sqlx::query(stmt)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|err| panic!("{stmt}: {err}"));
+        }
+
         pool
     }
 
@@ -1871,6 +1924,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_routes_routes_compose_service_domains_to_their_host_ports() {
+        let dir = temp_dir();
+        let db_path = temp_db_path(dir.path());
+        let pool = create_test_db(&db_path).await;
+        insert_setting_key(&pool, "preview_domain", "previews.test").await;
+        insert_app(&pool, "shop", "shop", None, "running", 80, None).await;
+        insert_app(&pool, "down", "down", None, "stopped", 80, None).await;
+        for stmt in [
+            "INSERT INTO compose_services (app_id, name, host_port) VALUES
+               ('shop', 'web', 8300), ('shop', 'admin', 8301), ('shop', 'cache', NULL),
+               ('down', 'web', 8302)",
+            "INSERT INTO app_domains (domain, app_id, service, port) VALUES
+               ('shop.example.com', 'shop', 'web', 80),
+               ('www.shop.example.com', 'shop', 'web', 80),
+               ('admin.shop.example.com', 'shop', 'admin', 8080),
+               ('cache.shop.example.com', 'shop', 'cache', 6379),
+               ('x.previews.test', 'shop', 'web', 80),
+               ('down.example.com', 'down', 'web', 80),
+               ('single.example.com', 'shop', NULL, NULL)",
+        ] {
+            sqlx::query(stmt)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|err| panic!("{stmt}: {err}"));
+        }
+        let proxy = TondProxy::new(test_route_db(&db_path), "127.0.0.1:3001".to_string());
+        proxy
+            .refresh_routes()
+            .await
+            .unwrap_or_else(|err| panic!("refresh: {err}"));
+        let routes = upstreams(&*proxy.routes.read().await);
+        let expected: HashMap<String, String> = [
+            ("shop.example.com", "127.0.0.1:8300"),
+            ("www.shop.example.com", "127.0.0.1:8300"),
+            ("admin.shop.example.com", "127.0.0.1:8301"),
+        ]
+        .into_iter()
+        .map(|(d, u)| (d.to_string(), u.to_string()))
+        .collect();
+        assert_eq!(
+            routes, expected,
+            "unpublished services, stopped apps and preview-domain hosts are not routed"
+        );
+    }
+
+    #[tokio::test]
     async fn refresh_routes_loads_running_app_and_preview_routes_and_updates_dashboard_domain() {
         let dir = temp_dir();
         let db_path = temp_db_path(dir.path());
@@ -2244,6 +2343,8 @@ mod tests {
             "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
             "CREATE TABLE apps (id TEXT PRIMARY KEY, name TEXT, domain TEXT, status TEXT, host_port INTEGER, readiness TEXT NOT NULL DEFAULT 'http', access_log INTEGER NOT NULL DEFAULT 0, access_log_query INTEGER NOT NULL DEFAULT 0)",
             "CREATE TABLE preview_deployments (id TEXT PRIMARY KEY, subdomain TEXT, host_port INTEGER, status TEXT, expires_at TEXT)",
+            "CREATE TABLE app_domains (domain TEXT PRIMARY KEY NOT NULL, app_id TEXT NOT NULL, service TEXT, port INTEGER)",
+            "CREATE TABLE compose_services (app_id TEXT NOT NULL, name TEXT NOT NULL, host_port INTEGER, PRIMARY KEY(app_id, name))",
             "INSERT INTO apps (id, name, domain, status, host_port) VALUES ('a', 'web', 'web.example.com', 'running', 4100)",
         ] {
             sqlx::query(stmt)
