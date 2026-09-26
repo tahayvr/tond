@@ -1,15 +1,22 @@
 <script lang="ts">
-	import navItems from './nav-items.svelte.ts';
+	import { page } from '$app/state';
+	import { cn } from '$lib/utils';
+	import navItems, { isActive } from './nav-items.svelte.ts';
 </script>
 
-<nav class="flex w-full justify-between">
+<nav class="flex w-full justify-between" aria-label="Main">
 	<ul class="flex items-center gap-4">
 		{#each navItems as item (item.href)}
+			{@const active = isActive(item.href, page.url.pathname)}
 			<li>
 				<a
 					href={item.href}
 					data-sveltekit-preload-data="hover"
-					class="text-xs text-muted-foreground hover:text-foreground">{item.label}</a
+					aria-current={active ? 'page' : undefined}
+					class={cn(
+						'text-xs text-muted-foreground hover:text-foreground',
+						active && 'text-foreground underline decoration-2 underline-offset-[6px]'
+					)}>{item.label}</a
 				>
 			</li>
 		{/each}
