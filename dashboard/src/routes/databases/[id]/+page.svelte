@@ -1152,9 +1152,13 @@
 								{copiedEnvVar === '__all__' ? 'Copied!' : 'Copy'}
 							</Button>
 						</div>
+						<!-- Values stay hidden here too unless revealed in the table above;
+						     Copy always copies the real values. -->
 						<pre
 							class="overflow-x-auto rounded bg-muted px-3 py-2 font-mono text-xs leading-relaxed">{envVars
-								.map((v) => `${v.envKey}=${v.value ?? ''}`)
+								.map(
+									(v) => `${v.envKey}=${revealedKeys.has(v.envKey) ? (v.value ?? '') : '••••••••'}`
+								)
 								.join('\n')}</pre>
 					</div>
 				{/if}
