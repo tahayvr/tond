@@ -127,7 +127,14 @@ pub async fn requests_for(
     now: i64,
 ) -> Result<RequestMetricsResponse, AppError> {
     let target = requests::find_target(&state.db, route).await?;
-    let (from, series, summary) = requests::query(&state.db, target.as_slice(), range, now).await?;
+    let (from, series, summary) = requests::query(
+        &state.db,
+        target.as_slice(),
+        range,
+        now,
+        requests::pending(route),
+    )
+    .await?;
 
     let (owner_kind, app_id) = match route.0 {
         RouteKind::App => (TargetKind::App, Some(route.1.as_str())),
@@ -247,6 +254,16 @@ fn app_traffic(id: String, name: String, c: &TrafficCounters, secs: i64) -> AppT
     }
 }
 
+fn route_kind(kind: &str) -> Option<RouteKind> {
+    Some(match kind {
+        "app" => RouteKind::App,
+        "preview" => RouteKind::Preview,
+        "dashboard" => RouteKind::Dashboard,
+        "unknown" => RouteKind::Unknown,
+        _ => return None,
+    })
+}
+
 /// Server-wide traffic for the window ending at `now`.
 pub async fn overview(
     state: &AppState,
@@ -255,7 +272,8 @@ pub async fn overview(
 ) -> Result<TrafficOverviewResponse, AppError> {
     let from = range.from(now);
     let secs = now - from;
-    let totals = requests::totals_by_target(&state.db, range, now).await?;
+    let mut totals = requests::totals_by_target(&state.db, range, now).await?;
+    let pending = requests::pending_all().filter(|(minute, _)| *minute >= from);
     let targets: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
         "SELECT t.id, t.kind, t.owner_id, a.name FROM metric_targets t
          LEFT JOIN apps a ON t.kind = 'app' AND a.id = t.owner_id
@@ -268,6 +286,13 @@ pub async fn overview(
     let mut unknown_requests = 0;
     let mut apps = Vec::new();
     for (target, kind, owner_id, name) in targets {
+        // Add the minute that is not stored yet.
+        if let Some((_, rows)) = &pending
+            && let Some(route_kind) = route_kind(&kind)
+            && let Some(c) = rows.get(&(route_kind, owner_id.clone()))
+        {
+            totals.entry(target).or_default().add(c);
+        }
         let Some(c) = totals.get(&target) else {
             continue;
         };

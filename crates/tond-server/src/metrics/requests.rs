@@ -61,6 +61,21 @@ struct LiveEntry {
 
 static LIVE: RwLock<Option<HashMap<RouteId, VecDeque<LiveEntry>>>> = RwLock::new(None);
 static PROXY_CONNECTED: AtomicBool = AtomicBool::new(false);
+/// The minute being accumulated (not written yet), so queries include it.
+type PendingMinute = (i64, HashMap<RouteId, TrafficCounters>);
+static PENDING: RwLock<Option<PendingMinute>> = RwLock::new(None);
+
+/// The not-yet-written minute of `route`: (minute start, counters).
+pub fn pending(route: &RouteId) -> Option<(i64, TrafficCounters)> {
+    let pending = PENDING.read().ok()?;
+    let (minute, rows) = pending.as_ref()?;
+    rows.get(route).map(|c| (*minute, c.clone()))
+}
+
+/// Every route's not-yet-written minute.
+pub fn pending_all() -> Option<PendingMinute> {
+    PENDING.read().ok()?.clone()
+}
 
 /// Whether the last scrape reached the proxy.
 pub fn proxy_connected() -> bool {
@@ -219,6 +234,9 @@ impl Tracker {
             && let Err(e) = self.write(db, minute, rows).await
         {
             tracing::warn!("metrics: cannot store request metrics: {e}");
+        }
+        if let (Some(minute), Ok(mut p)) = (self.pending_minute, PENDING.write()) {
+            *p = Some((minute, self.pending.clone()));
         }
     }
 
@@ -500,44 +518,64 @@ pub fn summarize(c: &TrafficCounters, secs: i64) -> RequestSummary {
     }
 }
 
-async fn fetch_rows(
+async fn fetch_table(
     db: &SqlitePool,
-    targets: &[i64],
-    range: Range,
+    targets: Option<&[i64]>,
+    table: &str,
     from: i64,
 ) -> sqlx::Result<Vec<Row>> {
-    if targets.is_empty() {
-        return Ok(Vec::new());
-    }
-    let placeholders = vec!["?"; targets.len()].join(", ");
-    let sql = format!(
-        "SELECT {SELECT_COLUMNS} FROM {} WHERE target IN ({placeholders}) AND ts >= ? ORDER BY ts",
-        range.table()
-    );
+    let filter = match targets {
+        Some([]) => return Ok(Vec::new()),
+        Some(t) => format!("target IN ({})", vec!["?"; t.len()].join(", ")),
+        None => "target IN (SELECT id FROM metric_targets)".to_string(),
+    };
+    let sql = format!("SELECT {SELECT_COLUMNS} FROM {table} WHERE {filter} AND ts >= ?");
     let mut q = sqlx::query_as::<_, Row>(AssertSqlSafe(sql));
-    for t in targets {
+    for t in targets.unwrap_or_default() {
         q = q.bind(*t);
     }
     q.bind(from).fetch_all(db).await
 }
 
+/// Stored rows for the window: the range's table, plus — for hourly ranges —
+/// the minutes not rolled up into an hour yet.
+async fn fetch_rows(
+    db: &SqlitePool,
+    targets: Option<&[i64]>,
+    range: Range,
+    from: i64,
+) -> sqlx::Result<Vec<Row>> {
+    let mut rows = fetch_table(db, targets, range.table(), from).await?;
+    if range.table() == "requests_1h" {
+        let rolled_until = latest_hour(db).await?.map_or(from, |h| h + 3600);
+        rows.extend(fetch_table(db, targets, "requests_1m", rolled_until.max(from)).await?);
+    }
+    Ok(rows)
+}
+
 /// Series (every bucket from the window start to `now`, zeros where
 /// nothing was served) and summary for `targets` summed.
+///
+/// `extra` adds counters that are not stored yet (the pending minute).
 pub async fn query(
     db: &SqlitePool,
     targets: &[i64],
     range: Range,
     now: i64,
+    extra: Option<(i64, TrafficCounters)>,
 ) -> sqlx::Result<(i64, RequestSeries, RequestSummary)> {
     let step = range.step();
     let from = range.from(now);
-    let rows = fetch_rows(db, targets, range, from).await?;
+    let rows = fetch_rows(db, Some(targets), range, from).await?;
     let buckets = usize::try_from((now - from) / step + 1).unwrap_or(1);
     let mut per_bucket = vec![TrafficCounters::default(); buckets];
     let mut total = TrafficCounters::default();
-    for row in &rows {
-        let c = row.counters();
-        if let Ok(i) = usize::try_from((row.ts - from) / step)
+    let all = rows
+        .iter()
+        .map(|r| (r.ts, r.counters()))
+        .chain(extra.filter(|(ts, _)| *ts >= from));
+    for (ts, c) in all {
+        if let Ok(i) = usize::try_from((ts - from) / step)
             && let Some(b) = per_bucket.get_mut(i)
         {
             b.add(&c);
@@ -570,14 +608,7 @@ pub async fn totals_by_target(
     range: Range,
     now: i64,
 ) -> sqlx::Result<HashMap<i64, TrafficCounters>> {
-    let sql = format!(
-        "SELECT {SELECT_COLUMNS} FROM {} WHERE target IN (SELECT id FROM metric_targets) AND ts >= ?",
-        range.table()
-    );
-    let rows: Vec<Row> = sqlx::query_as(AssertSqlSafe(sql.as_str()))
-        .bind(range.from(now))
-        .fetch_all(db)
-        .await?;
+    let rows = fetch_rows(db, None, range, range.from(now)).await?;
     let mut out: HashMap<i64, TrafficCounters> = HashMap::new();
     for row in &rows {
         out.entry(row.target).or_default().add(&row.counters());
@@ -759,29 +790,39 @@ mod tests {
         assert_eq!(hour, (base, 3600, 360));
 
         let now = base + 3600 + 30;
-        let (from, series, summary) = query(&db, &[a], Range::Hour, now)
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
+        let (from, series, summary) = query(
+            &db,
+            &[a],
+            Range::Hour,
+            now,
+            Some((now / 60 * 60, counters(6, 0, 7))),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(from, base);
         assert_eq!(series.t.len(), 61);
         assert_eq!(series.rps[0], 1.0);
         assert_eq!(series.rps_5xx[0], 0.1);
         assert_eq!(series.err_pct[0], Some(10.0));
         assert_eq!(series.p50[0], Some(25.0));
-        assert_eq!(series.rps[60], 0.0, "the current minute is not written yet");
-        assert_eq!(series.p95[60], None);
-        assert_eq!(summary.requests, 3600);
+        assert_eq!(series.rps[60], 0.1, "the pending minute is included");
+        assert_eq!(summary.requests, 3606);
         assert_eq!(summary.s5xx, 360);
-        assert_eq!(summary.err_pct, Some(10.0));
-        assert_eq!(summary.bytes_out, 360_000);
+        assert_eq!(summary.err_pct, Some(9.98));
+        assert_eq!(summary.bytes_out, 360_600);
         assert!(summary.upstream_p95.is_some());
 
         // 7d reads the hourly table.
-        let (_, week, summary) = query(&db, &[a], Range::Week, now)
+        let (_, week, summary) = query(&db, &[a], Range::Week, now, None)
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(summary.requests, 3600);
         assert_eq!(week.rps.iter().filter(|v| **v > 0.0).count(), 1);
+        // Minutes of the hour that is not rolled up yet count on hourly ranges.
+        let (_, _, recent) = query(&db, &[unknown], Range::Week, now, None)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(recent.requests, 5);
 
         let totals = totals_by_target(&db, Range::Day, now)
             .await
