@@ -609,6 +609,18 @@ pass "HTTP redirects to HTTPS"
 [[ "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: not-served.example.net' "http://${IP}/")" == 404 ]] \
     || fail "plain HTTP for a host Tond does not serve must be 404, not an open redirect"
 pass "HTTP for an unknown host → 404 (no open redirect)"
+if [[ -s /proc/net/if_inet6 ]]; then
+    # tond-proxy listens on IPv6 too when the host has it (IPV6_V6ONLY sockets).
+    ss -Htln | grep -q '\[::\]:443 ' || fail "tond-proxy must listen on [::]:443 on a host with IPv6: $(ss -Htln)"
+    ss -Htln | grep -q '\[::\]:80 ' || fail "tond-proxy must listen on [::]:80 on a host with IPv6: $(ss -Htln)"
+    wait_for 30 "https://${WHOAMI_DOMAIN} over IPv6" \
+        bash -c "curl -sk --resolve '${WHOAMI_DOMAIN}:443:[::1]' 'https://${WHOAMI_DOMAIN}/' | grep -q Hostname:"
+    [[ "$(curl -s -o /dev/null -w '%{http_code}' --resolve "${WHOAMI_DOMAIN}:80:[::1]" "http://${WHOAMI_DOMAIN}/")" == 301 ]] \
+        || fail "plain HTTP over IPv6 should redirect to HTTPS"
+    pass "tond-proxy serves ports 80 and 443 over IPv6 as well"
+else
+    echo "  (no IPv6 on this host: skipping the IPv6 listener check)"
+fi
 
 step "Request metrics and access logs (tond-proxy counters, opt-in access log)"
 # The proxy counts every request per route; tond-server scrapes the counters
