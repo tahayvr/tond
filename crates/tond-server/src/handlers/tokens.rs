@@ -1,11 +1,11 @@
 // handlers/tokens.rs — API tokens (see auth/tokens.rs for the model)
 //
 // Routes:
-//   GET    /api/tokens/catalog  — scope groups, presets, roles and what the caller may grant
-//   GET    /api/tokens          — the caller's tokens; `?all=true` lists everyone's (`tokens:admin`)
-//   POST   /api/tokens          — create; the secret is in the response, once
-//   DELETE /api/tokens/{id}     — revoke (own tokens, or any with `tokens:admin`)
-//   GET    /api/auth/whoami     — who the request authenticated as, with its scopes
+//   GET    /api/v1/tokens/catalog  — scope groups, presets, roles and what the caller may grant
+//   GET    /api/v1/tokens          — the caller's tokens; `?all=true` lists everyone's (`tokens:admin`)
+//   POST   /api/v1/tokens          — create; the secret is in the response, once
+//   DELETE /api/v1/tokens/{id}     — revoke (own tokens, or any with `tokens:admin`)
+//   GET    /api/v1/auth/whoami     — who the request authenticated as, with its scopes
 //
 // Any signed-in user may create tokens up to their own role; the root CLI
 // socket creates owner-less tokens (`tond token create`). API tokens can't
@@ -27,7 +27,7 @@ use crate::{
     state::AppState,
 };
 
-// ── GET /api/tokens/catalog ──
+// ── GET /api/v1/tokens/catalog ──
 
 pub async fn token_catalog(_rate: RateLimit, auth: Principal) -> impl IntoResponse {
     (
@@ -36,9 +36,10 @@ pub async fn token_catalog(_rate: RateLimit, auth: Principal) -> impl IntoRespon
     )
 }
 
-// ── GET /api/tokens ──
+// ── GET /api/v1/tokens ──
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ListTokensQuery {
     #[serde(default)]
     pub all: bool,
@@ -64,7 +65,7 @@ pub async fn list_tokens(
     Ok((StatusCode::OK, Json(ApiResponse::ok(body))))
 }
 
-// ── POST /api/tokens ──
+// ── POST /api/v1/tokens ──
 
 pub async fn create_token(
     _rate: RateLimit,
@@ -100,7 +101,7 @@ pub async fn create_token(
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(created))))
 }
 
-// ── DELETE /api/tokens/{id} ──
+// ── DELETE /api/v1/tokens/{id} ──
 
 pub async fn revoke_token(
     _rate: RateLimit,
@@ -130,9 +131,10 @@ pub async fn revoke_token(
     Ok((StatusCode::OK, Json(ApiResponse::ok(row.to_response()))))
 }
 
-// ── GET /api/auth/whoami ──
+// ── GET /api/v1/auth/whoami ──
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct WhoAmIResponse {
     /// "user" | "token" | "local_socket"
     pub kind: String,
@@ -302,7 +304,7 @@ mod tests {
         let err = result
             .err()
             .unwrap_or_else(|| panic!("viewers can't mint deploy tokens"));
-        assert_eq!(err.0.code(), Some("SCOPE_DENIED"));
+        assert_eq!(err.0.code(), "SCOPE_DENIED");
         assert!(err.0.to_string().contains("apps:deploy"));
     }
 

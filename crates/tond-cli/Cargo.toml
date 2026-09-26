@@ -13,6 +13,7 @@ tond-common = { path = "../tond-common" }
 tond-scanner = { path = "../tond-scanner" }
 tokio = { workspace = true }
 clap = { workspace = true }
+clap_complete = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

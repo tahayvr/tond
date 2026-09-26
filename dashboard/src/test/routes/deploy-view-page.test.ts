@@ -10,7 +10,7 @@ const { goto, setUiContext, clearUiContext, appContext } = vi.hoisted(() => ({
 	appContext: vi.fn((app) => ({
 		type: 'app',
 		app,
-		feed: { title: app.name, wsUrl: '/api/apps/x/logs/stream' }
+		feed: { title: app.name, wsUrl: '/api/v1/apps/x/logs/stream' }
 	}))
 }));
 

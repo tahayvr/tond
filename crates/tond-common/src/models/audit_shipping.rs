@@ -2,8 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Where audit entries go and how delivery is going (GET /api/audit-log/shipping).
+/// Where audit entries go and how delivery is going (GET /api/v1/audit-log/shipping).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AuditShippingResponse {
     pub syslog: SyslogDestination,
     pub webhook: WebhookDestination,
@@ -12,6 +13,7 @@ pub struct AuditShippingResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SyslogDestination {
     pub enabled: bool,
     pub host: String,
@@ -22,6 +24,7 @@ pub struct SyslogDestination {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WebhookDestination {
     pub enabled: bool,
     pub url: String,
@@ -32,6 +35,7 @@ pub struct WebhookDestination {
 
 /// Delivery progress of one destination.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DeliveryStatus {
     /// Last audit entry the destination accepted.
     pub shipped_seq: i64,
@@ -46,14 +50,16 @@ pub struct DeliveryStatus {
     pub dropped: i64,
 }
 
-/// PUT /api/audit-log/shipping. Omitted sections are left unchanged.
+/// PUT /api/v1/audit-log/shipping. Omitted sections are left unchanged.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateAuditShippingRequest {
     pub syslog: Option<UpdateSyslogDestination>,
     pub webhook: Option<UpdateWebhookDestination>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateSyslogDestination {
     pub enabled: bool,
     pub host: String,
@@ -62,6 +68,7 @@ pub struct UpdateSyslogDestination {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateWebhookDestination {
     pub enabled: bool,
     pub url: String,
@@ -70,8 +77,9 @@ pub struct UpdateWebhookDestination {
     pub secret: Option<String>,
 }
 
-/// POST /api/audit-log/shipping/test body.
+/// POST /api/v1/audit-log/shipping/test body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AuditShippingTestRequest {
     /// "syslog" | "webhook"
     pub destination: String,
@@ -79,6 +87,7 @@ pub struct AuditShippingTestRequest {
 
 /// Result of sending a test entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AuditShippingTestResult {
     pub ok: bool,
     pub message: String,

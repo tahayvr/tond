@@ -13,16 +13,17 @@
 
 import { http, HttpResponse, delay } from 'msw';
 import type { TondRelease, UpdateOverview, UpdateRollbackOption, UpdateRun } from '$lib/api';
+import { errorBody, okBody } from './envelope';
 
 const LATENCY = 150;
 const SCENARIO_KEY = 'tond:mock-update';
 
 function ok<T>(data: T) {
-	return HttpResponse.json({ success: true, data, error: null });
+	return HttpResponse.json(okBody(data));
 }
 
 function err(message: string, status = 400) {
-	return HttpResponse.json({ success: false, data: null, error: message }, { status });
+	return HttpResponse.json(errorBody(message, status), { status });
 }
 
 function scenario(): string | null {
@@ -338,7 +339,7 @@ function startRun(kind: 'update' | 'rollback', to: string): UpdateRun {
 const running = () => state.run?.effective_state === 'running';
 
 export const updateHandlers = [
-	http.get('/api/system/update', async () => {
+	http.get('/api/v1/system/update', async () => {
 		await delay(LATENCY);
 		const down = tick();
 		saveState();
@@ -351,14 +352,14 @@ export const updateHandlers = [
 		return ok(overview());
 	}),
 
-	http.post('/api/system/update/check', async () => {
+	http.post('/api/v1/system/update/check', async () => {
 		await delay(900);
 		state.checkedAt = now();
 		saveState();
 		return ok(overview());
 	}),
 
-	http.put('/api/system/update/settings', async ({ request }) => {
+	http.put('/api/v1/system/update/settings', async ({ request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as { check_enabled?: boolean };
 		state.checkEnabled = body.check_enabled !== false;
@@ -366,7 +367,7 @@ export const updateHandlers = [
 		return ok(overview());
 	}),
 
-	http.post('/api/system/update', async ({ request }) => {
+	http.post('/api/v1/system/update', async ({ request }) => {
 		await delay(LATENCY);
 		if (running())
 			return err('An update or rollback is already running. Wait for it to finish.', 409);
@@ -375,10 +376,10 @@ export const updateHandlers = [
 		if (cmp(target, state.current) <= 0) return err(`Tond ${state.current} is already running.`);
 		const started = startRun('update', target);
 		saveState();
-		return HttpResponse.json({ success: true, data: started, error: null }, { status: 202 });
+		return HttpResponse.json(okBody(started), { status: 202 });
 	}),
 
-	http.post('/api/system/update/rollback', async () => {
+	http.post('/api/v1/system/update/rollback', async () => {
 		await delay(LATENCY);
 		if (running())
 			return err('An update or rollback is already running. Wait for it to finish.', 409);
@@ -390,6 +391,6 @@ export const updateHandlers = [
 		state.rollback = null;
 		const started = startRun('rollback', to);
 		saveState();
-		return HttpResponse.json({ success: true, data: started, error: null }, { status: 202 });
+		return HttpResponse.json(okBody(started), { status: 202 });
 	})
 ];

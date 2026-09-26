@@ -2,6 +2,9 @@ use std::path::Path;
 
 use anyhow::Result;
 use clap::{Args, Subcommand};
+use serde_json::json;
+
+use crate::output::{Output, outln};
 
 #[derive(Subcommand)]
 pub enum ScannerAction {
@@ -23,13 +26,13 @@ pub struct ExplainOptions {
     pub base_dir: Option<String>,
 }
 
-pub async fn handle(action: ScannerAction) -> Result<()> {
+pub async fn handle(out: &Output, action: ScannerAction) -> Result<()> {
     match action {
-        ScannerAction::Explain(options) => explain(options),
+        ScannerAction::Explain(options) => explain(out, options),
     }
 }
 
-fn explain(options: ExplainOptions) -> Result<()> {
+fn explain(out: &Output, options: ExplainOptions) -> Result<()> {
     let repo_root = Path::new(&options.path);
     let build_root = options
         .base_dir
@@ -38,48 +41,75 @@ fn explain(options: ExplainOptions) -> Result<()> {
         .unwrap_or_else(|| repo_root.to_path_buf());
     let output = tond_scanner::explain_in_dir(repo_root, &build_root, options.static_build)?;
 
-    println!("Repo root: {}", output.repo_root);
-    println!("Build root: {}", output.build_root);
-    println!("Static build: {}", output.static_build);
+    out.json(&json!({
+        "repo_root": output.repo_root,
+        "build_root": output.build_root,
+        "static_build": output.static_build,
+        "matches": output.matches.iter().map(|m| json!({
+            "profile_name": m.profile_name,
+            "stack": m.stack,
+            "confidence": m.confidence,
+            "reasons": m.reasons,
+        })).collect::<Vec<_>>(),
+        "build_plan": output.build_plan.as_ref().map(|plan| json!({
+            "profile_name": plan.profile_name,
+            "stack": plan.stack,
+            "confidence": plan.confidence,
+            "detection_reasons": plan.detection_reasons,
+            "builder_image": plan.builder_image,
+            "runtime_image": plan.runtime_image,
+            "run_command": plan.run_command,
+            "static_output_dir": plan.static_output_dir,
+            "dockerfile": plan.dockerfile,
+        })),
+        "failure_reason": output.failure_reason,
+    }))?;
+
+    outln!(out, "Repo root: {}", output.repo_root);
+    outln!(out, "Build root: {}", output.build_root);
+    outln!(out, "Static build: {}", output.static_build);
 
     if output.matches.is_empty() {
-        println!("Detected stack: none");
+        outln!(out, "Detected stack: none");
     } else {
-        println!("Candidates:");
+        outln!(out, "Candidates:");
         for candidate in &output.matches {
-            println!(
+            outln!(
+                out,
                 "- {} (stack={}, confidence={})",
-                candidate.profile_name, candidate.stack, candidate.confidence
+                candidate.profile_name,
+                candidate.stack,
+                candidate.confidence
             );
             for reason in &candidate.reasons {
-                println!("  reason: {}", reason);
+                outln!(out, "  reason: {}", reason);
             }
         }
     }
 
     if let Some(plan) = output.build_plan {
-        println!("Selected stack: {}", plan.stack);
-        println!("Confidence: {}", plan.confidence);
+        outln!(out, "Selected stack: {}", plan.stack);
+        outln!(out, "Confidence: {}", plan.confidence);
         if let Some(builder_image) = plan.builder_image {
-            println!("Builder image: {}", builder_image);
+            outln!(out, "Builder image: {}", builder_image);
         }
         if let Some(runtime_image) = plan.runtime_image {
-            println!("Runtime image: {}", runtime_image);
+            outln!(out, "Runtime image: {}", runtime_image);
         }
         if let Some(run_command) = plan.run_command {
-            println!("Run command: {}", run_command);
+            outln!(out, "Run command: {}", run_command);
         }
         if let Some(static_output_dir) = plan.static_output_dir {
-            println!("Static output dir: {}", static_output_dir);
+            outln!(out, "Static output dir: {}", static_output_dir);
         }
-        println!("Detection reasons:");
+        outln!(out, "Detection reasons:");
         for reason in &plan.detection_reasons {
-            println!("- {}", reason);
+            outln!(out, "- {}", reason);
         }
     }
 
     if let Some(failure_reason) = output.failure_reason {
-        println!("Failure: {}", failure_reason);
+        outln!(out, "Failure: {}", failure_reason);
     }
 
     Ok(())

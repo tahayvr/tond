@@ -93,7 +93,7 @@ case " ${UNHEALTHY:-} " in *" $v "*) exit 22 ;; esac
 for a in "$@"; do
     case "$a" in
         */health) echo '{"status":"ok"}'; exit 0 ;;
-        */api/system/update)
+        */api/v1/system/update)
             schema="$(sed -n 's/^migrated to //p' "$TOND_INSTALL_DIR/data/tond.db" | tail -n 1 | grep . || echo 60)"
             printf '{"success":true,"data":{"current_version":"%s","schema_version":%s,"latest":null}}' "$v" "$schema"
             exit 0 ;;

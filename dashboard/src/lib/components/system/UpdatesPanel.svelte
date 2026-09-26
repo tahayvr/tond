@@ -4,7 +4,7 @@
   failure), the progress of a run across the server's restart, and "Roll back"
   for 7 days after an update.
 
-  While a run is going the panel polls GET /api/system/update every 2 s: the
+  While a run is going the panel polls GET /api/v1/system/update every 2 s: the
   server restarts in the middle, so failed requests are expected and shown as
   "restarting". Once an update succeeds the page reloads to pick up the new
   dashboard.

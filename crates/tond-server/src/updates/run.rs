@@ -20,7 +20,7 @@
 // server for the snapshot step and by update.sh for the rest; the run's
 // output goes to <data>/update/update.log. Both are files, not rows, because
 // a failed update may restore an older copy of the database. The dashboard
-// polls GET /api/system/update, which keeps answering across the restart.
+// polls GET /api/v1/system/update, which keeps answering across the restart.
 //
 // A rollback to the previous version is offered for ROLLBACK_WINDOW_SECS after
 // an update: the backup directory update.sh left behind holds the previous
@@ -48,6 +48,7 @@ pub const LOG_TAIL_LINES: usize = 60;
 static STARTING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum RunKind {
     Update,
@@ -55,6 +56,7 @@ pub enum RunKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum RunState {
     Running,
@@ -76,6 +78,7 @@ impl RunState {
 
 /// <data>/update/status.json. update.sh writes the same fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct RunStatus {
     pub id: String,
     pub kind: RunKind,
@@ -311,6 +314,7 @@ pub fn list_backups(backups_dir: &Path) -> Vec<BackupInfo> {
 
 /// What "Roll back" would do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct RollbackOption {
     /// The version it goes back to.
     pub to_version: String,

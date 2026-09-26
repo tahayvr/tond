@@ -63,7 +63,7 @@ mod tests {
 
     fn request_parts() -> Parts {
         axum::http::Request::builder()
-            .uri("/api/apps")
+            .uri("/api/v1/apps")
             .body(())
             .unwrap_or_else(|err| panic!("failed to build test request: {err}"))
             .into_parts()

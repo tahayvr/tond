@@ -1,27 +1,26 @@
 // handlers/host.rs — the System page: host history, disk, Docker, heartbeat
 //
-//   GET  /api/system/host               (metrics:read) current host numbers,
+//   GET  /api/v1/system/host               (metrics:read) current host numbers,
 //                                       filesystems, disk-full forecast, the
 //                                       cached disk breakdown, Docker health
-//   GET  /api/system/host/history       (metrics:read) ?range=1h|24h|7d|30d
-//   GET  /api/system/host/forecast      (metrics:read) disk-full forecast
-//   POST /api/system/disk/refresh       (metrics:read) measure the disk
+//   GET  /api/v1/system/host/history       (metrics:read) ?range=1h|24h|7d|30d
+//   GET  /api/v1/system/host/forecast      (metrics:read) disk-full forecast
+//   POST /api/v1/system/disk/refresh       (metrics:read) measure the disk
 //                                       breakdown again (throttled)
-//   GET  /api/system/disk/cleanup       (settings:write) what "Free up space"
+//   GET  /api/v1/system/disk/cleanup       (settings:write) what "Free up space"
 //                                       would remove
-//   POST /api/system/disk/cleanup       (settings:write) remove it (audited)
-//   GET  /api/system/heartbeat          (metrics:read) settings (the URL is
+//   POST /api/v1/system/disk/cleanup       (settings:write) remove it (audited)
+//   GET  /api/v1/system/heartbeat          (metrics:read) settings (the URL is
 //                                       write-only: only its host is shown)
 //                                       and the last outcome
-//   PUT  /api/system/heartbeat          (settings:write)
-//   POST /api/system/heartbeat/test     (settings:write) send one ping now
+//   PUT  /api/v1/system/heartbeat          (settings:write)
+//   POST /api/v1/system/heartbeat/test     (settings:write) send one ping now
 
 use axum::{
-    Json, Router,
+    Json,
     extract::{Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use tond_common::{ApiResponse, TondError};
@@ -40,23 +39,6 @@ use crate::{
     uptime::{self, heartbeat},
 };
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/api/system/host", get(get_host))
-        .route("/api/system/host/history", get(get_history))
-        .route("/api/system/host/forecast", get(get_forecast))
-        .route("/api/system/disk/refresh", post(refresh_disk))
-        .route(
-            "/api/system/disk/cleanup",
-            get(cleanup_preview).post(cleanup),
-        )
-        .route(
-            "/api/system/heartbeat",
-            get(get_heartbeat).put(update_heartbeat),
-        )
-        .route("/api/system/heartbeat/test", post(test_heartbeat))
-}
-
 fn ok<T: Serialize>(body: T) -> impl IntoResponse {
     (StatusCode::OK, Json(ApiResponse::ok(body)))
 }
@@ -68,6 +50,7 @@ fn now() -> i64 {
 // ── Host ──
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct FilesystemResponse {
     pub mount: String,
     pub used: u64,
@@ -77,6 +60,7 @@ pub struct FilesystemResponse {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct HostCurrentResponse {
     pub cpu_percent: f64,
     pub load1: f64,
@@ -95,6 +79,7 @@ pub struct HostCurrentResponse {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct HostResponse {
     /// None until the collector's first sample.
     pub current: Option<HostCurrentResponse>,
@@ -149,6 +134,7 @@ pub async fn get_host(
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct HistoryQuery {
     #[serde(default = "default_range")]
     pub range: String,
@@ -159,6 +145,7 @@ fn default_range() -> String {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct HistoryResponse {
     pub range: &'static str,
     pub step: i64,
@@ -275,6 +262,7 @@ pub async fn cleanup(
 // ── Heartbeat ──
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct HeartbeatResponse {
     pub configured: bool,
     /// The URL's host (the URL itself is never returned).
@@ -325,6 +313,7 @@ pub async fn get_heartbeat(
 
 /// PUT body. `url`: absent keeps the stored URL, "" removes it.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct UpdateHeartbeatRequest {
     pub url: Option<String>,
     pub method: Option<String>,
@@ -396,6 +385,7 @@ pub async fn update_heartbeat(
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct HeartbeatTestResponse {
     #[serde(flatten)]
     pub outcome: heartbeat::Outcome,

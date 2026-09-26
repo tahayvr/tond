@@ -67,7 +67,7 @@ diagnostics() {
             grep -v "handshake error" | sort | uniq -c | sort -rn | head -20 || true
     done
     echo "--- containers"; docker ps -a || true
-    echo "--- apps"; api /api/apps | jq . || true
+    echo "--- apps"; api /api/v1/apps | jq . || true
 }
 trap diagnostics EXIT
 
@@ -110,7 +110,7 @@ wait_for() {
     done
 }
 
-app_field() { api /api/apps | jq -r --arg n "$1" ".data[] | select(.name == \$n) | .$2"; }
+app_field() { api /api/v1/apps | jq -r --arg n "$1" ".data[] | select(.name == \$n) | .$2"; }
 
 # Wait until an app is running; fail fast (with deploy logs) if it fails.
 wait_for_app_running() {
@@ -274,21 +274,21 @@ fi
 pass "tond-proxy cannot write tond.db"
 # The link reconnects with backoff after install starts the proxy; give it a moment.
 wait_for 30 "tond-server holding a control connection to tond-proxy" \
-    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/system/self | jq -e '.data.proxy.connected == true'"
-self=$(api /api/system/self)
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/system/self | jq -e '.data.proxy.connected == true'"
+self=$(api /api/v1/system/self)
 echo "$self" | jq -e '.data.proxy.stats.route_version >= 0 and .data.proxy.stats.pid > 0' > /dev/null \
     || fail "tond-proxy must report its stats over the control socket"
 pass "tond-server ↔ tond-proxy control link is up (proxy pid $(echo "$self" | jq -r .data.proxy.stats.pid))"
 
-step "Tond measuring itself (/api/system/self, /metrics)"
+step "Tond measuring itself (/api/v1/system/self, /metrics)"
 echo "$self" | jq -e '.data.server.rss_bytes > 0 and .data.server.tokio_alive_tasks > 0 and .data.server.open_fds > 0' > /dev/null \
-    || fail "/api/system/self must report RSS, tasks and fds: $(echo "$self" | jq -c .data.server)"
+    || fail "/api/v1/system/self must report RSS, tasks and fds: $(echo "$self" | jq -c .data.server)"
 echo "$self" | jq -e '[.data.loops[].name] | index("health") and index("cron") and index("proxy-link")' > /dev/null \
-    || fail "/api/system/self must list the background loops: $(echo "$self" | jq -c '[.data.loops[].name]')"
+    || fail "/api/v1/system/self must list the background loops: $(echo "$self" | jq -c '[.data.loops[].name]')"
 echo "$self" | jq -e '.data.db.size_bytes > 0 and .data.db.queries_total > 0' > /dev/null \
-    || fail "/api/system/self must report DB size and statement counts"
-echo "$self" | jq -e '.data.http | length > 0' > /dev/null || fail "/api/system/self must report HTTP latency per route"
-pass "/api/system/self: RSS $(( $(echo "$self" | jq .data.server.rss_bytes) / 1024 )) KiB, $(echo "$self" | jq .data.server.tokio_alive_tasks) tasks, $(echo "$self" | jq '.data.loops | length') loops, DB $(echo "$self" | jq .data.db.size_bytes) bytes"
+    || fail "/api/v1/system/self must report DB size and statement counts"
+echo "$self" | jq -e '.data.http | length > 0' > /dev/null || fail "/api/v1/system/self must report HTTP latency per route"
+pass "/api/v1/system/self: RSS $(( $(echo "$self" | jq .data.server.rss_bytes) / 1024 )) KiB, $(echo "$self" | jq .data.server.tokio_alive_tasks) tasks, $(echo "$self" | jq '.data.loops | length') loops, DB $(echo "$self" | jq .data.db.size_bytes) bytes"
 metrics=$(curl -sf --unix-socket "$SOCK" http://localhost/metrics)
 for m in tond_process_resident_memory_bytes tond_loop_wakeups_total tond_db_queries_total tond_http_request_duration_seconds_bucket; do
     grep -q "^${m}" <<<"$metrics" || fail "/metrics must expose ${m}"
@@ -306,13 +306,13 @@ done
 pass "host terminal user 'tond' exists and is unprivileged"
 
 step "Authentication boundaries"
-[[ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3001/api/apps)" == 401 ]] \
+[[ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3001/api/v1/apps)" == 401 ]] \
     || fail "loopback TCP without credentials must get 401"
 pass "loopback TCP without credentials → 401"
 wait_for 30 "proxy serving the dashboard domain" \
     bash -c "[[ \$(curl -sk -o /dev/null -w '%{http_code}' --resolve '${DASH}:443:${IP}' 'https://${DASH}/') == 200 ]]"
 pass "dashboard served through the proxy at ${DASH}"
-[[ "$(proxied_status "$DASH" /api/apps)" == 401 ]] \
+[[ "$(proxied_status "$DASH" /api/v1/apps)" == 401 ]] \
     || fail "unauthenticated API request through the proxy must get 401"
 pass "unauthenticated API request through the proxy → 401"
 [[ "$(stat -c '%a %U' "$SOCK")" == "600 root" ]] || fail "socket must be 0600 root, got: $(stat -c '%a %U' "$SOCK")"
@@ -324,7 +324,7 @@ pass "non-root user is refused by the CLI socket"
 
 # Automation gets scoped tokens from the root CLI socket; the secret is printed once.
 for name in e2e-readonly e2e-admin e2e-ci e2e-env e2e-revoked e2e-expired e2e-ip-ok e2e-ip-other; do
-    tond token revoke "$name" > /dev/null 2>&1 || true # re-runs on a long-lived VM
+    tond token revoke "$name" -y > /dev/null 2>&1 || true # re-runs on a long-lived VM
 done
 RO_TOKEN=$(tond token create --name e2e-readonly --preset readonly --expires 1d 2> /dev/null)
 [[ "$RO_TOKEN" =~ ^tond_pat_[0-9a-f]{64}$ ]] || fail "tond token create must print a tond_pat_ token, got: ${RO_TOKEN}"
@@ -356,10 +356,10 @@ dash_code() {
 }
 json_post() { printf '{"token":"%s","email":"%s","password":"%s"}' "$1" "$2" "$3"; }
 
-if dash "https://${DASH}/api/auth/status" | jq -e '.data | has("needs_setup")' > /dev/null; then
-    fail "/api/auth/status must not tell anonymous callers whether setup is open"
+if dash "https://${DASH}/api/v1/auth/status" | jq -e '.data | has("needs_setup")' > /dev/null; then
+    fail "/api/v1/auth/status must not tell anonymous callers whether setup is open"
 fi
-pass "/api/auth/status does not reveal whether setup is open"
+pass "/api/v1/auth/status does not reveal whether setup is open"
 
 SETUP_TOKEN_FILE="${DATA_DIR}/setup-token"
 signed_in=false
@@ -378,14 +378,14 @@ if [[ -f "$SETUP_TOKEN_FILE" ]]; then
     pass "tond setup-link prints the setup link"
 
     for token in "" "$(printf '0%.0s' {1..64})"; do
-        code=$(dash_code POST /api/auth/setup -H "Origin: ${DASH_ORIGIN}" -H 'Content-Type: application/json' \
+        code=$(dash_code POST /api/v1/auth/setup -H "Origin: ${DASH_ORIGIN}" -H 'Content-Type: application/json' \
             -d "$(json_post "$token" "$ADMIN_EMAIL" "$ADMIN_PASSWORD")")
         [[ "$code" == 403 ]] || fail "setup without the right token must get 403, got ${code}"
     done
     pass "setup without the setup token → 403"
 
     headers="$(mktemp)"
-    code=$(dash -D "$headers" -o /dev/null -w '%{http_code}' -X POST "https://${DASH}/api/auth/setup" \
+    code=$(dash -D "$headers" -o /dev/null -w '%{http_code}' -X POST "https://${DASH}/api/v1/auth/setup" \
         -H "Origin: ${DASH_ORIGIN}" -H 'Content-Type: application/json' \
         -d "$(json_post "$SETUP_TOKEN" "$ADMIN_EMAIL" "$ADMIN_PASSWORD")")
     [[ "$code" == 201 ]] || fail "setup with the token must create the admin (got ${code})"
@@ -395,16 +395,16 @@ if [[ -f "$SETUP_TOKEN_FILE" ]]; then
     pass "setup with the token creates the admin and sets a __Host- Secure SameSite=Strict cookie"
     [[ ! -e "$SETUP_TOKEN_FILE" ]] || fail "the setup token file must be deleted after setup"
     # (with the CSRF header: the session cookie from setup is in the jar now)
-    code=$(dash_code POST /api/auth/setup -H "Origin: ${DASH_ORIGIN}" -H 'X-Tond-CSRF: 1' \
+    code=$(dash_code POST /api/v1/auth/setup -H "Origin: ${DASH_ORIGIN}" -H 'X-Tond-CSRF: 1' \
         -H 'Content-Type: application/json' \
         -d "$(json_post "$SETUP_TOKEN" "second@tond.test" "$ADMIN_PASSWORD")")
     [[ "$code" == 403 ]] || fail "a used setup token must get 403, got ${code}"
     pass "setup token is single-use and its file is removed"
     signed_in=true
 else
-    code=$(dash_code POST /api/auth/login -H "Origin: ${DASH_ORIGIN}" -H 'Content-Type: application/json' \
+    code=$(dash_code POST /api/v1/auth/login -H "Origin: ${DASH_ORIGIN}" -H 'Content-Type: application/json' \
         -d "$(printf '{"email":"%s","password":"%s"}' "$ADMIN_EMAIL" "$ADMIN_PASSWORD")")
-    if [[ "$code" == 200 ]] && dash "https://${DASH}/api/auth/me" | jq -e '.success' > /dev/null; then
+    if [[ "$code" == 200 ]] && dash "https://${DASH}/api/v1/auth/me" | jq -e '.success' > /dev/null; then
         signed_in=true
         pass "signed in as ${ADMIN_EMAIL} (setup was completed by an earlier run)"
     else
@@ -427,51 +427,51 @@ pass "no HSTS on plain loopback HTTP"
 code=$(curl -sk --resolve "${DASH}:443:${IP}" --http1.1 -o /dev/null -w '%{http_code}' \
     -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' \
     -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H "Origin: https://evil.${DASH}" \
-    "https://${DASH}/api/system/logs/stream")
+    "https://${DASH}/api/v1/system/logs/stream")
 [[ "$code" == 403 ]] || fail "a WebSocket upgrade from a foreign origin must get 403, got ${code}"
 pass "cross-origin WebSocket upgrade → 403"
 
 if [[ "$signed_in" == true ]]; then
-    code=$(dash_code PUT /api/settings -H "Origin: ${DASH_ORIGIN}" -H 'Content-Type: application/json' -d '{}')
+    code=$(dash_code PUT /api/v1/settings -H "Origin: ${DASH_ORIGIN}" -H 'Content-Type: application/json' -d '{}')
     [[ "$code" == 403 ]] || fail "a cookie-authenticated mutation without X-Tond-CSRF must get 403, got ${code}"
-    code=$(dash_code PUT /api/settings -H "Origin: https://evil.${DASH}" -H 'X-Tond-CSRF: 1' \
+    code=$(dash_code PUT /api/v1/settings -H "Origin: https://evil.${DASH}" -H 'X-Tond-CSRF: 1' \
         -H 'Content-Type: application/json' -d '{}')
     [[ "$code" == 403 ]] || fail "a mutation from a foreign origin must get 403, got ${code}"
-    code=$(dash_code PUT /api/settings -H "Origin: ${DASH_ORIGIN}" -H 'X-Tond-CSRF: 1' \
+    code=$(dash_code PUT /api/v1/settings -H "Origin: ${DASH_ORIGIN}" -H 'X-Tond-CSRF: 1' \
         -H 'Content-Type: application/json' -d '{}')
     [[ "$code" == 200 ]] || fail "a same-origin mutation with X-Tond-CSRF must succeed, got ${code}"
     pass "cookie mutations need X-Tond-CSRF and the dashboard origin"
 
     csrf=(-H "Origin: ${DASH_ORIGIN}" -H 'X-Tond-CSRF: 1' -H 'Content-Type: application/json')
-    code=$(dash_code POST /api/auth/2fa/setup "${csrf[@]}" -d '{"password":"not-my-password"}')
+    code=$(dash_code POST /api/v1/auth/2fa/setup "${csrf[@]}" -d '{"password":"not-my-password"}')
     [[ "$code" == 401 ]] || fail "2FA setup with a wrong password must get 401, got ${code}"
     pass "2FA setup requires the current password"
 
     tond settings host-terminal off > /dev/null
     ticket_body='{"target_kind":"server","target_id":"server","password":"'"${ADMIN_PASSWORD}"'"}'
-    resp=$(dash -w '\n%{http_code}' -X POST "https://${DASH}/api/terminal/tickets" "${csrf[@]}" -d "$ticket_body")
+    resp=$(dash -w '\n%{http_code}' -X POST "https://${DASH}/api/v1/terminal/tickets" "${csrf[@]}" -d "$ticket_body")
     [[ "$(tail -1 <<< "$resp")" == 403 ]] || fail "host terminal tickets must be refused while it is off"
     grep -qF 'tond settings host-terminal on' <<< "$resp" || fail "the refusal must name the enable command"
     pass "host terminal is off by default and says how to enable it"
-    code=$(dash_code PUT /api/settings/host-terminal "${csrf[@]}" -d '{"enabled":true}')
+    code=$(dash_code PUT /api/v1/settings/host-terminal "${csrf[@]}" -d '{"enabled":true}')
     [[ "$code" == 403 ]] || fail "the dashboard must not be able to enable the host terminal, got ${code}"
     code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "Authorization: Bearer ${ADMIN_TOKEN}" \
-        -H 'Content-Type: application/json' -d '{"enabled":true}' http://127.0.0.1:3001/api/settings/host-terminal)
+        -H 'Content-Type: application/json' -d '{"enabled":true}' http://127.0.0.1:3001/api/v1/settings/host-terminal)
     [[ "$code" == 403 ]] || fail "an API token must not be able to enable the host terminal, got ${code}"
     pass "only the root CLI socket can switch the host terminal"
 
     tond settings host-terminal on > /dev/null
-    code=$(dash_code POST /api/terminal/tickets "${csrf[@]}" \
+    code=$(dash_code POST /api/v1/terminal/tickets "${csrf[@]}" \
         -d '{"target_kind":"server","target_id":"server","password":"wrong-password"}')
     [[ "$code" == 401 ]] || fail "host terminal tickets must require the password (step-up), got ${code}"
-    resp=$(dash -X POST "https://${DASH}/api/terminal/tickets" "${csrf[@]}" -d "$ticket_body")
+    resp=$(dash -X POST "https://${DASH}/api/v1/terminal/tickets" "${csrf[@]}" -d "$ticket_body")
     ticket=$(jq -r '.data.ticket // empty' <<< "$resp")
     [[ -n "$ticket" ]] || fail "host terminal ticket with the right password must be issued: ${resp}"
     ws_code() {
         curl -sk --resolve "${DASH}:443:${IP}" --http1.1 -o /dev/null -w '%{http_code}' --max-time 5 \
             -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' \
             -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H "Origin: $1" \
-            "https://${DASH}/api/terminal/ws?ticket=$2" || true
+            "https://${DASH}/api/v1/terminal/ws?ticket=$2" || true
     }
     # curl can't speak WebSocket here; after a 101 it just waits until --max-time.
     code=$(ws_code "$DASH_ORIGIN" "$ticket")
@@ -480,11 +480,11 @@ if [[ "$signed_in" == true ]]; then
     [[ "$code" == 401 ]] || fail "a terminal ticket must be single-use, got ${code}"
     pass "host terminal: step-up password, single-use ticket"
     code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer ${ADMIN_TOKEN}" \
-        -H 'Content-Type: application/json' -d "$ticket_body" http://127.0.0.1:3001/api/terminal/tickets)
+        -H 'Content-Type: application/json' -d "$ticket_body" http://127.0.0.1:3001/api/v1/terminal/tickets)
     [[ "$code" == 403 ]] || fail "API tokens must not get terminal tickets, even with terminal:host, got ${code}"
     pass "API tokens are refused terminal tickets"
     tond settings host-terminal off > /dev/null
-    audit="$(api '/api/audit-log?limit=20')"
+    audit="$(api '/api/v1/audit-log?limit=20')"
     grep -q 'terminal_opened' <<< "$audit" || fail "terminal sessions must be audited"
     pass "terminal sessions are written to the audit log"
 fi
@@ -495,7 +495,7 @@ fi
 # burst.
 limited=false
 codes=$(seq 1 200 | xargs -P 25 -I{} curl -sk --resolve "${DASH}:443:${IP}" -o /dev/null \
-    -w '%{http_code}\n' -H "X-Forwarded-For: 198.51.100.{}" "https://${DASH}/api/auth/status")
+    -w '%{http_code}\n' -H "X-Forwarded-For: 198.51.100.{}" "https://${DASH}/api/v1/auth/status")
 [[ "$codes" == *429* ]] && limited=true
 [[ "$limited" == true ]] || fail "a spoofed X-Forwarded-For must not bypass the rate limiter"
 pass "spoofed X-Forwarded-For does not bypass the rate limiter"
@@ -507,7 +507,7 @@ for i in $(seq 1 6); do
     codes+="$(curl -sk --resolve "${DASH}:443:${IP}" -o /dev/null -w '%{http_code} ' \
         -X POST -H "Origin: ${DASH_ORIGIN}" -H 'Content-Type: application/json' \
         -H "X-Forwarded-For: 203.0.113.${i}" \
-        -d "{\"email\":\"nobody${i}@tond.test\",\"password\":\"wrong\"}" "https://${DASH}/api/auth/login")"
+        -d "{\"email\":\"nobody${i}@tond.test\",\"password\":\"wrong\"}" "https://${DASH}/api/v1/auth/login")"
 done
 [[ "$codes" == *429* ]] || fail "repeated failed logins must be throttled (got: ${codes})"
 pass "failed logins back off (got: ${codes% })"
@@ -517,9 +517,9 @@ step "Users, roles and the password policy"
 # Invite over the root socket (users:admin), set the password through the
 # one-time link, act as a viewer, then disable and delete the account.
 VIEWER_EMAIL="e2e-viewer@tond.test"
-old_id=$(api /api/users | jq -r --arg e "$VIEWER_EMAIL" '.data[] | select(.email == $e) | .id')
-[[ -z "$old_id" ]] || api_req DELETE "/api/users/${old_id}" '{}' > /dev/null
-code=$(api_req POST /api/users "{\"email\":\"${VIEWER_EMAIL}\",\"role\":\"viewer\"}")
+old_id=$(api /api/v1/users | jq -r --arg e "$VIEWER_EMAIL" '.data[] | select(.email == $e) | .id')
+[[ -z "$old_id" ]] || api_req DELETE "/api/v1/users/${old_id}" '{}' > /dev/null
+code=$(api_req POST /api/v1/users "{\"email\":\"${VIEWER_EMAIL}\",\"role\":\"viewer\"}")
 [[ "$code" == 201 ]] || fail "inviting a user must succeed, got ${code}: $(cat "$API_BODY")"
 VIEWER_ID=$(jq -r '.data.user.id' "$API_BODY")
 LINK_TOKEN=$(jq -r '.data.token' "$API_BODY")
@@ -529,7 +529,7 @@ VIEWER_COOKIES="$(mktemp)"
 link_complete() {
     curl -sk --resolve "${DASH}:443:${IP}" -b "$VIEWER_COOKIES" -c "$VIEWER_COOKIES" -o "$API_BODY" -w '%{http_code}' \
         -X POST -H "Origin: https://${DASH}" -H 'X-Tond-CSRF: 1' -H 'Content-Type: application/json' \
-        -d "{\"token\":\"${LINK_TOKEN}\",\"password\":\"$1\"}" "https://${DASH}/api/auth/password-link/complete"
+        -d "{\"token\":\"${LINK_TOKEN}\",\"password\":\"$1\"}" "https://${DASH}/api/v1/auth/password-link/complete"
 }
 code=$(link_complete 'Password1234!')
 [[ "$code" == 400 ]] && grep -q breached "$API_BODY" || fail "a breached password must be refused with a clear message, got ${code}: $(cat "$API_BODY")"
@@ -545,17 +545,17 @@ viewer_code() {
         -X "$1" -H "Origin: https://${DASH}" -H 'X-Tond-CSRF: 1' -H 'Content-Type: application/json' \
         ${3:+-d "$3"} "https://${DASH}$2"
 }
-[[ "$(viewer_code GET /api/apps)" == 200 ]] || fail "viewers can read apps"
-code=$(viewer_code PUT /api/settings '{"server_name":"viewer-was-here"}')
-[[ "$code" == 403 && "$(jq -r '.code' "$API_BODY")" == SCOPE_DENIED ]] || fail "viewers must get 403 SCOPE_DENIED for settings, got ${code}"
-[[ "$(viewer_code GET /api/users)" == 403 ]] || fail "viewers can't list users"
+[[ "$(viewer_code GET /api/v1/apps)" == 200 ]] || fail "viewers can read apps"
+code=$(viewer_code PUT /api/v1/settings '{"server_name":"viewer-was-here"}')
+[[ "$code" == 403 && "$(jq -r '.error.code' "$API_BODY")" == SCOPE_DENIED ]] || fail "viewers must get 403 SCOPE_DENIED for settings, got ${code}"
+[[ "$(viewer_code GET /api/v1/users)" == 403 ]] || fail "viewers can't list users"
 pass "a viewer can read but gets 403 SCOPE_DENIED for writes"
-code=$(api_req PATCH "/api/users/${VIEWER_ID}" '{"disabled":true}')
+code=$(api_req PATCH "/api/v1/users/${VIEWER_ID}" '{"disabled":true}')
 [[ "$code" == 200 ]] || fail "disabling a user must succeed, got ${code}"
-[[ "$(viewer_code GET /api/apps)" == 401 ]] || fail "disabling a user must end their sessions"
+[[ "$(viewer_code GET /api/v1/apps)" == 401 ]] || fail "disabling a user must end their sessions"
 pass "disabling a user signs them out everywhere"
-[[ "$(api_req DELETE "/api/users/${VIEWER_ID}" '{}')" == 200 ]] || fail "deleting a user must succeed"
-api "/api/audit-log?resource_type=user&resource_id=${VIEWER_ID}" \
+[[ "$(api_req DELETE "/api/v1/users/${VIEWER_ID}" '{}')" == 200 ]] || fail "deleting a user must succeed"
+api "/api/v1/audit-log?resource_type=user&resource_id=${VIEWER_ID}" \
     | jq -e '[.data.entries[].action] | (index("user_invite") and index("user_disable") and index("user_delete") and index("invite_accepted"))' > /dev/null \
     || fail "user lifecycle events must be audited"
 pass "invite, password set, disable and delete are audited"
@@ -590,27 +590,27 @@ curl -sk -o /dev/null -X POST -d 200 --resolve "${WHOAMI_DOMAIN}:443:${IP}" "htt
 [[ "$code" == 404 ]] || fail "whoami's /health should answer 404 after POSTing 404, got ${code}"
 [[ "$(proxied_status "nothing-here.${BASE}" /)" == 502 ]] || fail "an unknown host must get the 502 page"
 wait_for 90 "request metrics for e2e-whoami" bash -c "curl -sf --unix-socket '$SOCK' \
-    'http://localhost/api/apps/e2e-whoami/requests?range=1h' \
+    'http://localhost/api/v1/apps/e2e-whoami/requests?range=1h' \
     | jq -e '.data.summary.requests >= ${REQ_N} and .data.summary.s2xx >= ${REQ_N} and .data.summary.s4xx >= 1'"
 pass "after ${REQ_N} requests the API reports ≥ ${REQ_N} requests, their 2xx and the 4xx"
-REQ=$(api "/api/apps/e2e-whoami/requests?range=1h")
+REQ=$(api "/api/v1/apps/e2e-whoami/requests?range=1h")
 jq -e '.data.series.t | length > 0 and length <= 481' <<< "$REQ" > /dev/null \
     || fail "the request series must be server-sized, got: $(jq -c '.data.series.t | length' <<< "$REQ")"
 jq -e '.data.summary.p95 != null and .data.proxy_connected == true' <<< "$REQ" > /dev/null \
     || fail "latency percentiles and the proxy link must be reported, got: $(jq -c '.data.summary' <<< "$REQ")"
 pass "series ≤ 481 buckets, p95 latency reported, proxy connected"
 wait_for 60 "server-wide traffic" bash -c "curl -sf --unix-socket '$SOCK' \
-    'http://localhost/api/system/requests?range=24h' \
+    'http://localhost/api/v1/system/requests?range=24h' \
     | jq -e '(.data.busiest | map(.name) | index(\"e2e-whoami\")) != null and .data.unknown_requests >= 1'"
 pass "the traffic overview lists e2e-whoami and counts unknown hosts"
 
-[[ "$(api_req PUT /api/apps/e2e-whoami/access-log '{"enabled":true}')" == 200 ]] \
+[[ "$(api_req PUT /api/v1/apps/e2e-whoami/access-log '{"enabled":true}')" == 200 ]] \
     || fail "enabling the access log failed: $(cat "$API_BODY")"
 # The route_state trigger makes the proxy reload; then it writes the lines.
 wait_for 30 "an access log line" bash -c "curl -sk -o /dev/null --resolve '${WHOAMI_DOMAIN}:443:${IP}' \
     'https://${WHOAMI_DOMAIN}/e2e-access?token=secret' && curl -sf --unix-socket '$SOCK' \
-    'http://localhost/api/apps/e2e-whoami/access-log?q=e2e-access' | jq -e '.data.lines | length >= 1'"
-LINE=$(api "/api/apps/e2e-whoami/access-log?q=e2e-access" | jq -r '.data.lines[-1]')
+    'http://localhost/api/v1/apps/e2e-whoami/access-log?q=e2e-access' | jq -e '.data.lines | length >= 1'"
+LINE=$(api "/api/v1/apps/e2e-whoami/access-log?q=e2e-access" | jq -r '.data.lines[-1]')
 [[ "$LINE" == *" GET /e2e-access 200 "* && "$LINE" != *secret* ]] \
     || fail "access lines must hold method, path and status without the query string, got: ${LINE}"
 pass "access log line recorded without the query string: ${LINE}"
@@ -620,12 +620,12 @@ WHOAMI_APP_ID=$(app_field e2e-whoami id)
 [[ "$(stat -c '%a %U' "${DATA_DIR}/access/${WHOAMI_APP_ID}.log")" == "600 tond-proxy" ]] \
     || fail "the access log file must be 600 tond-proxy"
 pass "access logs live in a proxy-owned 0700 directory, files 0600"
-curl -sf --unix-socket "$SOCK" "http://localhost/api/apps/e2e-whoami/access-log/download" | grep -q "/e2e-access" \
+curl -sf --unix-socket "$SOCK" "http://localhost/api/v1/apps/e2e-whoami/access-log/download" | grep -q "/e2e-access" \
     || fail "the access log download must contain the recorded line"
 pass "the full access log downloads"
-[[ "$(api_req PUT /api/apps/e2e-whoami/access-log '{"enabled":false}')" == 200 ]] \
+[[ "$(api_req PUT /api/v1/apps/e2e-whoami/access-log '{"enabled":false}')" == 200 ]] \
     || fail "disabling the access log failed"
-[[ "$(api_req DELETE /api/apps/e2e-whoami/access-log '')" == 200 ]] || fail "deleting the access log failed"
+[[ "$(api_req DELETE /api/v1/apps/e2e-whoami/access-log '')" == 200 ]] || fail "deleting the access log failed"
 [[ ! -e "${DATA_DIR}/access/${WHOAMI_APP_ID}.log" ]] || fail "the access log file must be gone after delete"
 pass "access log turned off and deleted"
 
@@ -635,38 +635,38 @@ API_TCP="http://127.0.0.1:3001"
 status_of() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
 WHOAMI_ID=$(app_field e2e-whoami id)
 [[ "$WHOAMI_ID" =~ ^[0-9a-f-]{36}$ ]] || fail "could not read the e2e-whoami app id (got: ${WHOAMI_ID})"
-WEBHOOK_JSON=$(api "/api/apps/${WHOAMI_ID}/webhook")
+WEBHOOK_JSON=$(api "/api/v1/apps/${WHOAMI_ID}/webhook")
 [[ "$(jq -r '.data.has_secret' <<< "$WEBHOOK_JSON")" == true && "$(jq -r '.data.secret // empty' <<< "$WEBHOOK_JSON")" == "" ]] \
     || fail "the webhook config must say a secret is set without returning it"
-WEBHOOK_SECRET=$(api "/api/apps/${WHOAMI_ID}/webhook-secret" | jq -r '.data.secret // empty')
+WEBHOOK_SECRET=$(api "/api/v1/apps/${WHOAMI_ID}/webhook-secret" | jq -r '.data.secret // empty')
 [[ ${#WEBHOOK_SECRET} -ge 32 ]] || fail "every app must get a generated webhook secret"
 pass "app has a generated webhook secret (write-only; revealed on request)"
-[[ "$(jq -r '.data.paths.github' <<< "$WEBHOOK_JSON")" == "/api/webhooks/github/${WHOAMI_ID}" ]] \
+[[ "$(jq -r '.data.paths.github' <<< "$WEBHOOK_JSON")" == "/api/v1/webhooks/github/${WHOAMI_ID}" ]] \
     || fail "webhook URLs must be addressed by app UUID"
 pass "webhook URLs are addressed by app UUID"
 
 PUSH_BODY='{"ref":"refs/heads/main","after":"e2e"}'
 [[ "$(status_of -X POST -H 'X-GitHub-Event: push' -H 'Content-Type: application/json' \
-    -d "$PUSH_BODY" "${API_TCP}/api/webhooks/github/${WHOAMI_ID}")" == 401 ]] \
+    -d "$PUSH_BODY" "${API_TCP}/api/v1/webhooks/github/${WHOAMI_ID}")" == 401 ]] \
     || fail "an unsigned GitHub webhook must be rejected"
 pass "unsigned GitHub webhook → 401"
 [[ "$(status_of -X POST -H 'X-GitHub-Event: push' -H 'X-Hub-Signature-256: sha256=deadbeef' \
-    -d "$PUSH_BODY" "${API_TCP}/api/webhooks/github/${WHOAMI_ID}")" == 401 ]] \
+    -d "$PUSH_BODY" "${API_TCP}/api/v1/webhooks/github/${WHOAMI_ID}")" == 401 ]] \
     || fail "a wrongly signed GitHub webhook must be rejected"
 pass "wrongly signed GitHub webhook → 401"
 [[ "$(status_of -X POST -H 'X-Gitlab-Event: Push Hook' -H 'X-Gitlab-Token: wrong' \
-    -d "$PUSH_BODY" "${API_TCP}/api/webhooks/gitlab/${WHOAMI_ID}")" == 401 ]] \
+    -d "$PUSH_BODY" "${API_TCP}/api/v1/webhooks/gitlab/${WHOAMI_ID}")" == 401 ]] \
     || fail "a GitLab webhook with a wrong token must be rejected"
 pass "GitLab webhook with a wrong token → 401"
 [[ "$(status_of -X POST -H 'X-Gitea-Event: push' \
-    -d "$PUSH_BODY" "${API_TCP}/api/webhooks/gitea/${WHOAMI_ID}")" == 401 ]] \
+    -d "$PUSH_BODY" "${API_TCP}/api/v1/webhooks/gitea/${WHOAMI_ID}")" == 401 ]] \
     || fail "an unsigned Gitea webhook must be rejected"
 pass "unsigned Gitea webhook → 401"
-[[ "$(status_of -X POST "${API_TCP}/api/webhooks/generic/${WHOAMI_ID}")" == 401 ]] \
+[[ "$(status_of -X POST "${API_TCP}/api/v1/webhooks/generic/${WHOAMI_ID}")" == 401 ]] \
     || fail "an unauthenticated generic webhook must be rejected"
 pass "unauthenticated generic webhook → 401"
 [[ "$(status_of -X POST -H 'X-GitHub-Event: push' -d "$PUSH_BODY" \
-    "${API_TCP}/api/webhooks/github/e2e-whoami")" == 404 ]] \
+    "${API_TCP}/api/v1/webhooks/github/e2e-whoami")" == 404 ]] \
     || fail "webhooks must not resolve apps by name"
 pass "webhook by app name → 404"
 
@@ -675,7 +675,7 @@ pass "webhook by app name → 404"
 DELIVERY="e2e-$(date +%s)-$$"
 generic_signed() {
     status_of -X POST -H "Authorization: Bearer ${WEBHOOK_SECRET}" -H "X-Tond-Delivery: ${DELIVERY}" \
-        "${API_TCP}/api/webhooks/generic/${WHOAMI_ID}"
+        "${API_TCP}/api/v1/webhooks/generic/${WHOAMI_ID}"
 }
 [[ "$(generic_signed)" == 200 ]] || fail "a generic webhook with the app secret must be accepted"
 pass "generic webhook with the app secret → 200"
@@ -687,7 +687,7 @@ if command -v openssl > /dev/null; then
     SIG=$(printf '%s' "$PING_BODY" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | awk '{print $NF}')
     [[ "$(status_of -X POST -H 'X-GitHub-Event: ping' -H "X-GitHub-Delivery: ${DELIVERY}-gh" \
         -H "X-Hub-Signature-256: sha256=${SIG}" -d "$PING_BODY" \
-        "${API_TCP}/api/webhooks/github/${WHOAMI_ID}")" == 200 ]] \
+        "${API_TCP}/api/v1/webhooks/github/${WHOAMI_ID}")" == 200 ]] \
         || fail "a correctly signed GitHub webhook must be accepted"
     pass "correctly signed GitHub webhook → 200"
 else
@@ -696,33 +696,33 @@ fi
 
 [[ "$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$SOCK" -X PUT \
     -H 'Content-Type: application/json' -d '{"secret":null}' \
-    "http://localhost/api/apps/${WHOAMI_ID}/webhook-secret")" != 200 ]] \
+    "http://localhost/api/v1/apps/${WHOAMI_ID}/webhook-secret")" != 200 ]] \
     || fail "the webhook secret must not be clearable"
 pass "webhook secret cannot be cleared"
 ROTATED=$(curl -sf --unix-socket "$SOCK" -X POST \
-    "http://localhost/api/apps/${WHOAMI_ID}/webhook-secret/rotate" | jq -r '.data.secret // empty')
+    "http://localhost/api/v1/apps/${WHOAMI_ID}/webhook-secret/rotate" | jq -r '.data.secret // empty')
 [[ ${#ROTATED} -ge 32 && "$ROTATED" != "$WEBHOOK_SECRET" ]] || fail "rotating the webhook secret must return a new one"
 [[ "$(status_of -X POST -H "Authorization: Bearer ${WEBHOOK_SECRET}" \
-    "${API_TCP}/api/webhooks/generic/${WHOAMI_ID}")" == 401 ]] \
+    "${API_TCP}/api/v1/webhooks/generic/${WHOAMI_ID}")" == 401 ]] \
     || fail "the old webhook secret must stop working after rotation"
 pass "rotated secret replaces the old one"
 
-GH_APPS_BEFORE=$(api /api/github-apps | jq '.data | length')
+GH_APPS_BEFORE=$(api /api/v1/github-apps | jq '.data | length')
 # GitHub's redirect only hands off to the dashboard; completing needs the
 # admin's session (same-origin POST) and their pending, single-use state.
 callback=$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' \
-    "${API_TCP}/api/github-apps/callback?code=e2eattackercode&state=forged")
+    "${API_TCP}/api/v1/github-apps/callback?code=e2eattackercode&state=forged")
 [[ "$callback" == "303 "*"/integrations/github/complete?kind=manifest"* ]] \
     || fail "the GitHub App callback must hand off to the dashboard (got: ${callback})"
 completion=$(curl -s -X POST -H 'Content-Type: application/json' \
-    -d '{"kind":"manifest","code":"e2eattackercode"}' "${API_TCP}/api/github-apps/complete")
-[[ "$(jq -r .error <<< "$completion")" == missing_state ]] \
+    -d '{"kind":"manifest","code":"e2eattackercode"}' "${API_TCP}/api/v1/github-apps/complete")
+[[ "$(jq -r .error.message <<< "$completion")" == missing_state ]] \
     || fail "completing a GitHub App flow without state must be refused (got: ${completion})"
 completion=$(curl -s -X POST -H 'Content-Type: application/json' \
-    -d '{"kind":"manifest","code":"e2eattackercode","state":"forged"}' "${API_TCP}/api/github-apps/complete")
-[[ "$(jq -r .error <<< "$completion")" == not_logged_in ]] \
+    -d '{"kind":"manifest","code":"e2eattackercode","state":"forged"}' "${API_TCP}/api/v1/github-apps/complete")
+[[ "$(jq -r .error.message <<< "$completion")" == not_logged_in ]] \
     || fail "completing a GitHub App flow without an admin session must be refused (got: ${completion})"
-[[ "$(api /api/github-apps | jq '.data | length')" == "$GH_APPS_BEFORE" ]] \
+[[ "$(api /api/v1/github-apps | jq '.data | length')" == "$GH_APPS_BEFORE" ]] \
     || fail "a refused GitHub App callback must not store an App"
 pass "GitHub App callback without the admin's pending state is refused"
 [[ "$(status_of -X POST -H 'X-GitHub-Event: push' -d "$PUSH_BODY" \
@@ -743,31 +743,97 @@ api_as() {
     curl -s -o "$API_BODY" -w '%{http_code}' -X "$2" -H "Authorization: Bearer $1" \
         -H 'Content-Type: application/json' ${4:+-d "$4"} "http://127.0.0.1:3001$3"
 }
-body_code() { jq -r '.code // empty' "$API_BODY"; }
+body_code() { jq -r '.error.code // empty' "$API_BODY"; }
 CI_TOKEN=$(tond token create --name e2e-ci --kind ci --preset deployer --app e2e-whoami --expires 1d 2> /dev/null)
-[[ "$(api_as "$CI_TOKEN" GET /api/apps/e2e-whoami)" == 200 ]] || fail "the CI token must read its own app"
-api_as "$CI_TOKEN" GET /api/apps > /dev/null
+[[ "$(api_as "$CI_TOKEN" GET /api/v1/apps/e2e-whoami)" == 200 ]] || fail "the CI token must read its own app"
+api_as "$CI_TOKEN" GET /api/v1/apps > /dev/null
 [[ "$(jq -r '.data | map(.name) | join(",")' "$API_BODY")" == e2e-whoami ]] \
     || fail "a token limited to e2e-whoami must only list e2e-whoami, got: $(cat "$API_BODY")"
 pass "a resource-limited token sees only its app"
-code=$(api_as "$CI_TOKEN" GET /api/apps/e2e-static)
+code=$(api_as "$CI_TOKEN" GET /api/v1/apps/e2e-static)
 [[ "$code" == 403 && "$(body_code)" == RESOURCE_DENIED ]] \
     || fail "the CI token must be refused other apps with 403 RESOURCE_DENIED, got ${code} $(cat "$API_BODY")"
 pass "resource filter blocks other apps (403 RESOURCE_DENIED)"
-code=$(api_as "$RO_TOKEN" PUT /api/settings '{"server_name":"hijacked"}')
+code=$(api_as "$RO_TOKEN" PUT /api/v1/settings '{"server_name":"hijacked"}')
 [[ "$code" == 403 && "$(body_code)" == SCOPE_DENIED ]] \
     || fail "a read-only token must get 403 SCOPE_DENIED for settings, got ${code} $(cat "$API_BODY")"
-code=$(api_as "$CI_TOKEN" DELETE /api/apps/e2e-whoami)
+code=$(api_as "$CI_TOKEN" DELETE /api/v1/apps/e2e-whoami)
 [[ "$code" == 403 && "$(body_code)" == SCOPE_DENIED ]] \
     || fail "a deployer token must get 403 SCOPE_DENIED for apps:delete, got ${code}"
 pass "missing scopes → 403 with the stable code SCOPE_DENIED"
 
 REVOKED=$(tond token create --name e2e-revoked --preset readonly --expires 1d 2> /dev/null)
-[[ "$(api_as "$REVOKED" GET /api/apps)" == 200 ]] || fail "a fresh token must work"
-tond token revoke e2e-revoked > /dev/null
-code=$(api_as "$REVOKED" GET /api/apps)
+[[ "$(api_as "$REVOKED" GET /api/v1/apps)" == 200 ]] || fail "a fresh token must work"
+tond token revoke e2e-revoked -y > /dev/null
+code=$(api_as "$REVOKED" GET /api/v1/apps)
 [[ "$code" == 401 && "$(body_code)" == TOKEN_REVOKED ]] || fail "a revoked token must get 401 TOKEN_REVOKED, got ${code}"
 pass "revoked token → 401 TOKEN_REVOKED"
+
+step "Stable API: /api/v1, OpenAPI, structured errors, idempotency, CLI contract"
+spec=$(curl -sf "${API_TCP}/api/v1/openapi.json") || fail "GET /api/v1/openapi.json must be public"
+jq -e '.openapi == "3.1.0"
+    and .paths["/api/v1/apps/{id}/deploy"].post["x-tond-scopes"] == ["apps:deploy"]
+    and (.components.securitySchemes | has("bearerAuth"))
+    and ([.components.schemas.ErrorCode.enum[]] | index("DEPLOY_IN_PROGRESS") != null)' <<< "$spec" > /dev/null \
+    || fail "the OpenAPI document must describe the v1 routes, their scopes and the error codes"
+pass "OpenAPI 3.1 served at /api/v1/openapi.json ($(jq '[.paths[] | keys[]] | length' <<< "$spec") operations)"
+
+code=$(curl -s -o "$API_BODY" -w '%{http_code}' --unix-socket "$SOCK" http://localhost/api/apps)
+[[ "$code" == 404 && "$(jq -r .error.code "$API_BODY")" == ROUTE_NOT_FOUND ]] \
+    || fail "unversioned /api paths must answer 404 ROUTE_NOT_FOUND, got ${code} $(cat "$API_BODY")"
+jq -e '.error.hint | contains("/api/v1/apps")' "$API_BODY" > /dev/null \
+    || fail "the ROUTE_NOT_FOUND hint must point at /api/v1: $(cat "$API_BODY")"
+code=$(curl -s -o "$API_BODY" -w '%{http_code}' --unix-socket "$SOCK" http://localhost/api/v1/apps/e2e-no-such-app)
+[[ "$code" == 404 && "$(jq -r .error.code "$API_BODY")" == APP_NOT_FOUND ]] \
+    && jq -e '.success == false and (.error.message | length > 0) and (.error.hint | length > 0)' "$API_BODY" > /dev/null \
+    || fail "an unknown app must answer 404 {code: APP_NOT_FOUND, message, hint}, got ${code} $(cat "$API_BODY")"
+code=$(api_req POST /api/v1/apps '{"name":"e2e-bad","source_type":"image","container_port":"eighty"}')
+[[ "$code" =~ ^4 && "$(jq -r .error.code "$API_BODY")" == INVALID_JSON && "$(jq -r .error.field "$API_BODY")" == container_port ]] \
+    || fail "a mistyped field must answer INVALID_JSON naming the field, got ${code} $(cat "$API_BODY")"
+code=$(api_req POST /api/v1/apps '{"name":"bad name!","source_type":"image","source_url":"traefik/whoami:v1.10"}')
+[[ "$code" == 400 && "$(jq -r .error.code "$API_BODY")" == INVALID_INPUT && "$(jq -r .error.field "$API_BODY")" == name ]] \
+    || fail "an invalid app name must answer 400 INVALID_INPUT with field=name, got ${code} $(cat "$API_BODY")"
+pass "errors are {success:false, error:{code, message, hint, field}} with stable codes"
+
+# Idempotency-Key: the repeat replays the first response, a different body is refused.
+IDEM_KEY="e2e-$(date +%s)-$RANDOM"
+idem_post() {
+    curl -s -D "$1" -o "$API_BODY" -w '%{http_code}' --unix-socket "$SOCK" -X POST \
+        -H 'Content-Type: application/json' -H "Idempotency-Key: ${IDEM_KEY}" -d "$2" \
+        http://localhost/api/v1/projects
+}
+IDEM_HDRS=$(mktemp)
+[[ "$(idem_post "$IDEM_HDRS" '{"name":"e2e-idem"}')" == 201 ]] || fail "creating a project with an Idempotency-Key must work: $(cat "$API_BODY")"
+first_id=$(jq -r .data.id "$API_BODY")
+[[ "$(idem_post "$IDEM_HDRS" '{"name":"e2e-idem"}')" == 201 ]] || fail "the repeat must replay 201: $(cat "$API_BODY")"
+[[ "$(jq -r .data.id "$API_BODY")" == "$first_id" ]] || fail "the repeat must return the same project, not create another"
+grep -qi '^idempotent-replayed: true' "$IDEM_HDRS" || fail "a replay must carry Idempotent-Replayed: true"
+[[ "$(api /api/v1/projects | jq '[.data[] | select(.name == "e2e-idem")] | length')" == 1 ]] \
+    || fail "a replayed create must not create a second project"
+code=$(idem_post "$IDEM_HDRS" '{"name":"e2e-idem-2"}')
+[[ "$code" == 422 && "$(jq -r .error.code "$API_BODY")" == IDEMPOTENCY_KEY_REUSED ]] \
+    || fail "the same key with another body must answer 422 IDEMPOTENCY_KEY_REUSED, got ${code}"
+curl -s -o /dev/null --unix-socket "$SOCK" -X DELETE "http://localhost/api/v1/projects/${first_id}"
+rm -f "$IDEM_HDRS"
+pass "Idempotency-Key replays the first response and refuses a different body (422)"
+
+# CLI: JSON output, documented exit codes, --yes.
+tond --json apps list | jq -e 'type == "array" and any(.[]; .name == "e2e-whoami")' > /dev/null \
+    || fail "tond --json apps list must print a JSON array"
+set +e
+cli_err=$(tond --json apps info e2e-no-such-app 2>&1 > /dev/null); cli_rc=$?
+set -e
+[[ "$cli_rc" == 3 && "$(jq -r .error.code <<< "$cli_err")" == APP_NOT_FOUND ]] \
+    || fail "tond --json apps info <missing> must exit 3 with APP_NOT_FOUND on stderr, got ${cli_rc}: ${cli_err}"
+set +e
+tond apps delete e2e-whoami < /dev/null > /dev/null 2>&1; cli_rc=$?
+set -e
+[[ "$cli_rc" == 2 ]] || fail "a destructive command without --yes and without a terminal must exit 2, got ${cli_rc}"
+[[ "$(app_field e2e-whoami name)" == e2e-whoami ]] || fail "a refused delete must not delete the app"
+tond help exit-codes --json | jq -e '.exit_codes | map(.exit_code) | contains([0,1,2,3,4,5,6,7,8])' > /dev/null \
+    || fail "tond help exit-codes --json must list exit codes 0-8"
+[[ "$(tond completions bash)" == *_tond* ]] || fail "tond completions bash must print a completion script"
+pass "CLI: --json output, exit codes (3 not found, 2 refused without --yes), completions"
 EXPIRED=$(tond token create --name e2e-expired --preset readonly --expires 1h 2> /dev/null)
 expire_sql="UPDATE api_tokens SET expires_at = '2000-01-01T00:00:00Z' WHERE name = 'e2e-expired'"
 if command -v sqlite3 > /dev/null; then
@@ -779,7 +845,7 @@ else
     expire_sql=""
 fi
 if [[ -n "$expire_sql" ]]; then
-    code=$(api_as "$EXPIRED" GET /api/apps)
+    code=$(api_as "$EXPIRED" GET /api/v1/apps)
     [[ "$code" == 401 && "$(body_code)" == TOKEN_EXPIRED ]] || fail "an expired token must get 401 TOKEN_EXPIRED, got ${code}"
     pass "expired token → 401 TOKEN_EXPIRED"
 else
@@ -797,22 +863,22 @@ pass "agent tokens must expire and can't hold admin scopes"
 # is replaced with the real peer, so it can't be spoofed to pass an allow-list.
 IP_OK=$(tond token create --name e2e-ip-ok --preset readonly --allow-ip 127.0.0.1 --expires 1d 2> /dev/null)
 IP_OTHER=$(tond token create --name e2e-ip-other --preset readonly --allow-ip 10.255.255.1 --expires 1d 2> /dev/null)
-[[ "$(api_as "$IP_OK" GET /api/apps)" == 200 ]] || fail "a token allowed from 127.0.0.1 must work over loopback"
-code=$(api_as "$IP_OTHER" GET /api/apps)
+[[ "$(api_as "$IP_OK" GET /api/v1/apps)" == 200 ]] || fail "a token allowed from 127.0.0.1 must work over loopback"
+code=$(api_as "$IP_OTHER" GET /api/v1/apps)
 [[ "$code" == 403 && "$(body_code)" == IP_NOT_ALLOWED ]] || fail "a token pinned to another IP must get 403 IP_NOT_ALLOWED, got ${code}"
 code=$(curl -sk -o /dev/null -w '%{http_code}' --resolve "${DASH}:443:${IP}" -H "Authorization: Bearer ${IP_OTHER}" \
-    -H 'X-Forwarded-For: 10.255.255.1' "https://${DASH}/api/apps")
+    -H 'X-Forwarded-For: 10.255.255.1' "https://${DASH}/api/v1/apps")
 [[ "$code" == 403 ]] || fail "a spoofed X-Forwarded-For through the proxy must not satisfy the allow-list, got ${code}"
 pass "allowed-IP filter works and can't be spoofed through the proxy"
 
 ENV_TOKEN=$(tond token create --name e2e-env --scope env:write --app e2e-whoami --expires 1d 2> /dev/null)
-[[ "$(api_as "$ENV_TOKEN" PATCH /api/apps/e2e-whoami/env '{"set":{"E2E_TOKEN_AUDIT":"1"},"unset":[]}')" == 200 ]] \
+[[ "$(api_as "$ENV_TOKEN" PATCH /api/v1/apps/e2e-whoami/env '{"set":{"E2E_TOKEN_AUDIT":"1"},"unset":[]}')" == 200 ]] \
     || fail "an env:write token must patch env vars: $(cat "$API_BODY")"
-entry=$(api '/api/audit-log?actor=e2e-env&action=env_update&limit=1' | jq -c '.data.entries[0]')
+entry=$(api '/api/v1/audit-log?actor=e2e-env&action=env_update&limit=1' | jq -c '.data.entries[0]')
 [[ "$(jq -r '.actor_kind' <<< "$entry")" == token && "$(jq -r '.actor_id' <<< "$entry")" != null ]] \
     || fail "token calls must be audited with the token's id and name as actor, got: ${entry}"
-api_as "$ENV_TOKEN" PATCH /api/apps/e2e-whoami/env '{"set":{},"unset":["E2E_TOKEN_AUDIT"]}' > /dev/null
-[[ "$(api '/api/audit-log?action=token_create&actor=local-socket&limit=1' | jq -r '.data.entries[0].actor_kind')" == local_socket ]] \
+api_as "$ENV_TOKEN" PATCH /api/v1/apps/e2e-whoami/env '{"set":{},"unset":["E2E_TOKEN_AUDIT"]}' > /dev/null
+[[ "$(api '/api/v1/audit-log?action=token_create&actor=local-socket&limit=1' | jq -r '.data.entries[0].actor_kind')" == local_socket ]] \
     || fail "tokens created on the host must be audited as local-socket"
 pass "token calls are audited as the token (id + name); CLI actions as local-socket"
 tond audit verify > /dev/null || fail "the audit log hash chain must verify"
@@ -824,7 +890,7 @@ if [[ -n "$CA_FILE" ]]; then
         curl -sf --cacert "$CA_FILE" --resolve "${WHOAMI_DOMAIN}:443:${IP}" "https://${WHOAMI_DOMAIN}/"
     pass "${WHOAMI_DOMAIN} serves a certificate that verifies against the ACME CA"
     wait_for 30 "certificate state for ${WHOAMI_DOMAIN} recorded as active" \
-        bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/certs | jq -e '.data[] | select(.domain == \"${WHOAMI_DOMAIN}\" and .status == \"active\" and .failure_count == 0 and .next_retry_at == null and .last_error == null)'"
+        bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/certs | jq -e '.data[] | select(.domain == \"${WHOAMI_DOMAIN}\" and .status == \"active\" and .failure_count == 0 and .next_retry_at == null and .last_error == null)'"
     pass "certificate state (status, retry, last error) recorded for the dashboard"
 else
     echo "  - E2E_CA_FILE not set; skipping certificate verification"
@@ -847,24 +913,24 @@ if [[ -n "$PREVIEW" ]]; then
         || fail "install.sh must set the preview domain to ${PREVIEW}"
     pass "preview domain ${PREVIEW} configured by install.sh"
 
-    read -r code body < <(api_send PUT /api/settings "{\"preview_domain\": \"previews.${BASE}\"}")
+    read -r code body < <(api_send PUT /api/v1/settings "{\"preview_domain\": \"previews.${BASE}\"}")
     [[ "$code" == 400 ]] || fail "a preview domain on the dashboard's site must be rejected (got ${code}: ${body})"
     pass "a preview domain on the dashboard's site (previews.${BASE}) is rejected"
 
-    read -r code body < <(api_send POST /api/apps/e2e-whoami/preview '{"ttl_hours": 1}')
+    read -r code body < <(api_send POST /api/v1/apps/e2e-whoami/preview '{"ttl_hours": 1}')
     [[ "$code" == 202 ]] || fail "creating a preview must succeed (got ${code}: ${body})"
     PREVIEW_ID=$(jq -r .data.id <<< "$body")
     PREVIEW_HOST=$(jq -r .data.subdomain <<< "$body")
     [[ "$PREVIEW_HOST" == *"-e2e-whoami.${PREVIEW}" ]] || fail "preview host must be under ${PREVIEW}, got: ${PREVIEW_HOST}"
     wait_for 180 "preview ${PREVIEW_HOST} running" \
-        bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/apps/e2e-whoami/previews | jq -e '.data[] | select(.id == \"${PREVIEW_ID}\" and .status == \"running\")'"
+        bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/apps/e2e-whoami/previews | jq -e '.data[] | select(.id == \"${PREVIEW_ID}\" and .status == \"running\")'"
     wait_for 60 "route for ${PREVIEW_HOST}" \
         bash -c "curl -sk --resolve '${PREVIEW_HOST}:443:${IP}' 'https://${PREVIEW_HOST}/' | grep -q Hostname:"
     pass "preview served at https://${PREVIEW_HOST}"
 
     for host in "$PREVIEW" "dash.${PREVIEW}" "unknown.${PREVIEW}"; do
-        status=$(proxied_status "$host" /api/apps)
-        [[ "$status" == 404 ]] || fail "https://${host}/api/apps must be 404 (dashboard/API never on the preview domain), got ${status}"
+        status=$(proxied_status "$host" /api/v1/apps)
+        [[ "$status" == 404 ]] || fail "https://${host}/api/v1/apps must be 404 (dashboard/API never on the preview domain), got ${status}"
     done
     pass "the dashboard/API is never served on the preview domain (404)"
     PREVIEW_ON_DASH="${PREVIEW_HOST%%."${PREVIEW}"}.${DASH}"
@@ -879,16 +945,16 @@ if [[ -n "$PREVIEW" ]]; then
         pass "${PREVIEW_HOST} serves a certificate that verifies against the ACME CA"
     fi
 
-    read -r code body < <(api_send PUT /api/settings '{"preview_domain": ""}')
+    read -r code body < <(api_send PUT /api/v1/settings '{"preview_domain": ""}')
     [[ "$code" == 200 ]] || fail "clearing the preview domain must succeed (got ${code}: ${body})"
-    read -r code body < <(api_send POST /api/apps/e2e-whoami/preview '{}')
+    read -r code body < <(api_send POST /api/v1/apps/e2e-whoami/preview '{}')
     [[ "$code" == 400 && "$body" == *"preview domain"* ]] \
         || fail "previews must be refused without a preview domain (got ${code}: ${body})"
-    read -r code body < <(api_send PUT /api/settings "{\"preview_domain\": \"${PREVIEW}\"}")
+    read -r code body < <(api_send PUT /api/v1/settings "{\"preview_domain\": \"${PREVIEW}\"}")
     [[ "$code" == 200 ]] || fail "restoring the preview domain must succeed (got ${code}: ${body})"
     pass "previews are refused with an explanation when no preview domain is set"
 
-    curl -sf --unix-socket "$SOCK" -X DELETE "http://localhost/api/apps/e2e-whoami/previews/${PREVIEW_ID}" > /dev/null \
+    curl -sf --unix-socket "$SOCK" -X DELETE "http://localhost/api/v1/apps/e2e-whoami/previews/${PREVIEW_ID}" > /dev/null \
         || fail "deleting the preview must succeed"
     pass "preview deleted"
 else
@@ -898,10 +964,10 @@ fi
 step "Managed database"
 tond db create e2e-redis --db-type redis > /dev/null
 wait_for 240 "e2e-redis running" \
-    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/databases | jq -e '.data[] | select(.name == \"e2e-redis\" and .status == \"running\")'"
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/databases | jq -e '.data[] | select(.name == \"e2e-redis\" and .status == \"running\")'"
 pass "e2e-redis is running"
-REDIS_DETAIL=$(api /api/databases/e2e-redis)
-REDIS_CREDS=$(api /api/databases/e2e-redis/credentials)
+REDIS_DETAIL=$(api /api/v1/databases/e2e-redis)
+REDIS_CREDS=$(api /api/v1/databases/e2e-redis/credentials)
 REDIS_USER=$(jq -r '.data.db_user' <<<"$REDIS_CREDS")
 REDIS_PASS=$(jq -r '.data.db_password' <<<"$REDIS_CREDS")
 [[ ${#REDIS_PASS} -ge 16 ]] || fail "the credentials reveal must return the Redis password"
@@ -928,11 +994,11 @@ pass "database detail: has_password, masked connection string, no password"
 # An env var value is stored encrypted: neither the database file (nor its
 # WAL) nor the env listing contains it; an explicit reveal returns it.
 CANARY="e2e-canary-$(date +%s)-${RANDOM}${RANDOM}"
-[[ "$(api_req PATCH "/api/apps/${WHOAMI_ID}/env" "{\"set\":{\"E2E_CANARY\":\"${CANARY}\"}}")" == 200 ]] \
+[[ "$(api_req PATCH "/api/v1/apps/${WHOAMI_ID}/env" "{\"set\":{\"E2E_CANARY\":\"${CANARY}\"}}")" == 200 ]] \
     || fail "setting an env var must succeed: $(cat "$API_BODY")"
 grep -qF "$CANARY" "$API_BODY" && fail "the env patch response must not echo the value"
-api "/api/apps/${WHOAMI_ID}/env" | grep -qF "$CANARY" && fail "the env listing must mask values"
-[[ "$(api "/api/apps/${WHOAMI_ID}/env/E2E_CANARY" | jq -r '.data.value')" == "$CANARY" ]] \
+api "/api/v1/apps/${WHOAMI_ID}/env" | grep -qF "$CANARY" && fail "the env listing must mask values"
+[[ "$(api "/api/v1/apps/${WHOAMI_ID}/env/E2E_CANARY" | jq -r '.data.value')" == "$CANARY" ]] \
     || fail "revealing an env var must return its value"
 for f in "${DATA_DIR}"/tond.db*; do
     grep -qaF "$CANARY" "$f" && fail "env var value found in plaintext in ${f}"
@@ -942,26 +1008,26 @@ done
 pass "env values, database passwords and webhook secrets are not stored in plaintext"
 
 for action in env_reveal webhook_secret_reveal db_credentials_reveal; do
-    api "/api/audit-log?action=${action}&limit=1" | jq -e '.data.entries | length > 0' > /dev/null \
+    api "/api/v1/audit-log?action=${action}&limit=1" | jq -e '.data.entries | length > 0' > /dev/null \
         || fail "a ${action} must be audit-logged"
 done
 pass "every secret reveal is audit-logged"
 
 step "Per-database backup"
-[[ "$(api_req POST /api/databases/e2e-redis/backups '{}')" == 201 ]] \
+[[ "$(api_req POST /api/v1/databases/e2e-redis/backups '{}')" == 201 ]] \
     || fail "backing up a database must succeed: $(cat "$API_BODY")"
 [[ "$(jq -r '.data.status + " " + .data.scope' "$API_BODY")" == "completed database:e2e-redis" ]] \
     || fail "a database backup must complete with the database scope: $(cat "$API_BODY")"
 DB_BACKUP_ID=$(jq -r '.data.id' "$API_BODY")
-api /api/databases/e2e-redis/backups | jq -e --arg id "$DB_BACKUP_ID" '.data[] | select(.id == $id)' > /dev/null \
+api /api/v1/databases/e2e-redis/backups | jq -e --arg id "$DB_BACKUP_ID" '.data[] | select(.id == $id)' > /dev/null \
     || fail "the database backup must be listed for the database"
 [[ -d "${DATA_DIR}/backups/snapshots/${DB_BACKUP_ID}/databases/e2e-redis" ]] \
     || fail "the database backup must hold the database's data"
 pass "database backed up and listed"
-[[ "$(api_req POST "/api/snapshots/${DB_BACKUP_ID}/restore-database" '{"db_name":"e2e-redis"}')" == 200 ]] \
+[[ "$(api_req POST "/api/v1/snapshots/${DB_BACKUP_ID}/restore-database" '{"db_name":"e2e-redis"}')" == 200 ]] \
     || fail "restoring the database must succeed: $(cat "$API_BODY")"
 SAFETY_ID=$(jq -r '.data.pre_restore_snapshot_id // empty' "$API_BODY")
-api /api/snapshots | jq -e --arg id "$SAFETY_ID" '.data[] | select(.id == $id and .scope == "database:e2e-redis" and .trigger == "pre_restore")' > /dev/null \
+api /api/v1/snapshots | jq -e --arg id "$SAFETY_ID" '.data[] | select(.id == $id and .scope == "database:e2e-redis" and .trigger == "pre_restore")' > /dev/null \
     || fail "a database restore must back up the current data first"
 wait_for 60 "e2e-redis answering after the restore" \
     bash -c "docker exec -e REDISCLI_AUTH='${REDIS_PASS}' tond-db-e2e-redis redis-cli --no-auth-warning --user '${REDIS_USER}' PING | grep -qx PONG"
@@ -969,46 +1035,46 @@ pass "database restored from its backup (safety-net backup taken first)"
 
 step "Cron job"
 tond cron create e2e-cron --schedule "0 0 1 1 *" --image alpine:3 --command "echo tond-e2e-cron-ok" > /dev/null
-CRON_ID=$(api /api/cron | jq -r '.data[] | select(.name == "e2e-cron") | .id')
+CRON_ID=$(api /api/v1/cron | jq -r '.data[] | select(.name == "e2e-cron") | .id')
 tond cron trigger e2e-cron > /dev/null
 wait_for 180 "a successful e2e-cron run" \
-    bash -c "curl -sf --unix-socket '$SOCK' 'http://localhost/api/cron/${CRON_ID}/runs' | jq -e '.data[] | select(.status == \"success\" and (.output // \"\" | contains(\"tond-e2e-cron-ok\")))'"
+    bash -c "curl -sf --unix-socket '$SOCK' 'http://localhost/api/v1/cron/${CRON_ID}/runs' | jq -e '.data[] | select(.status == \"success\" and (.output // \"\" | contains(\"tond-e2e-cron-ok\")))'"
 pass "manual cron run succeeded with the expected output"
 
 step "Cron schedules, alert channels and first-run checklist (dashboard UX)"
 # Next runs come from the scheduler's own parser: standard day-of-week numbering
 # (1-5 = Monday-Friday) evaluated in the job's time zone.
-PREVIEW=$(api '/api/cron/schedule-preview?schedule=0%209%20*%20*%201-5&timezone=Europe/Berlin&count=5')
+PREVIEW=$(api '/api/v1/cron/schedule-preview?schedule=0%209%20*%20*%201-5&timezone=Europe/Berlin&count=5')
 [[ "$(jq -r '.data.next_runs | length' <<<"$PREVIEW")" == 5 ]] || fail "schedule preview should list 5 runs: $PREVIEW"
 for run in $(jq -r '.data.next_runs[]' <<<"$PREVIEW"); do
     [[ "$(TZ=Europe/Berlin date -d "$run" +%u)" -le 5 ]] || fail "1-5 must mean Monday-Friday, got $run"
     [[ "$(TZ=Europe/Berlin date -d "$run" +%H:%M)" == "09:00" ]] || fail "runs should be 09:00 Berlin time, got $run"
 done
-[[ "$(api_req GET '/api/cron/schedule-preview?schedule=0%209%20*%20*%20*&timezone=Mars/Olympus' '')" == 400 ]] \
+[[ "$(api_req GET '/api/v1/cron/schedule-preview?schedule=0%209%20*%20*%20*&timezone=Mars/Olympus' '')" == 400 ]] \
     || fail "an unknown time zone must be rejected"
-TZ_CODE=$(api_req POST /api/cron '{"name":"e2e-bad-tz","schedule":"0 3 * * *","image":"alpine:3","timezone":"Mars/Olympus"}')
+TZ_CODE=$(api_req POST /api/v1/cron '{"name":"e2e-bad-tz","schedule":"0 3 * * *","image":"alpine:3","timezone":"Mars/Olympus"}')
 [[ "$TZ_CODE" == 400 ]] || fail "creating a cron job with an unknown time zone should be 400, got $TZ_CODE"
 pass "schedule preview uses Mon-Fri for 1-5 in the job's time zone; unknown zones are rejected"
 
-NO_CHANNEL=$(api_req POST /api/alerts '{"name":"e2e-nobody","kind":"deploy_failed"}')
+NO_CHANNEL=$(api_req POST /api/v1/alerts '{"name":"e2e-nobody","kind":"deploy_failed"}')
 [[ "$NO_CHANNEL" == 400 ]] || fail "an alert rule that notifies nobody should be 400, got $NO_CHANNEL"
-CH_CODE=$(api_req POST /api/integrations '{"name":"e2e-unreachable","kind":"webhook","config":{"webhook_url":"http://127.0.0.1:9/unreachable"}}')
+CH_CODE=$(api_req POST /api/v1/integrations '{"name":"e2e-unreachable","kind":"webhook","config":{"webhook_url":"http://127.0.0.1:9/unreachable"}}')
 [[ "$CH_CODE" == 201 ]] || fail "a webhook channel should be created, got $CH_CODE: $(cat "$API_BODY")"
 UNREACHABLE_ID=$(jq -r '.data.id' "$API_BODY")
-RULE_CODE=$(api_req POST /api/alerts "{\"name\":\"e2e-deploys\",\"kind\":\"deploy_failed\",\"integration_ids\":[\"${UNREACHABLE_ID}\"]}")
+RULE_CODE=$(api_req POST /api/v1/alerts "{\"name\":\"e2e-deploys\",\"kind\":\"deploy_failed\",\"integration_ids\":[\"${UNREACHABLE_ID}\"]}")
 [[ "$RULE_CODE" == 201 ]] || fail "a deploy-failed rule with a channel should be created, got $RULE_CODE: $(cat "$API_BODY")"
 RULE_ID=$(jq -r '.data.id' "$API_BODY")
-TEST_CODE=$(api_req POST "/api/alerts/${RULE_ID}/test" '')
+TEST_CODE=$(api_req POST "/api/v1/alerts/${RULE_ID}/test" '')
 [[ "$TEST_CODE" == 200 ]] || fail "send-test should answer 200, got $TEST_CODE"
 jq -e '.data | length == 1 and .[0].kind == "webhook" and .[0].ok == false and (.[0].error | length > 0)' "$API_BODY" > /dev/null \
     || fail "send-test should report the unreachable webhook: $(cat "$API_BODY")"
-api /api/integrations | jq -e --arg id "$UNREACHABLE_ID" '.data[] | select(.id == $id and (.last_error | length > 0))' > /dev/null \
+api /api/v1/integrations | jq -e --arg id "$UNREACHABLE_ID" '.data[] | select(.id == $id and (.last_error | length > 0))' > /dev/null \
     || fail "a failed send must be visible on the channel"
-api_req DELETE "/api/alerts/${RULE_ID}" '' > /dev/null
-api_req DELETE "/api/integrations/${UNREACHABLE_ID}" '' > /dev/null
+api_req DELETE "/api/v1/alerts/${RULE_ID}" '' > /dev/null
+api_req DELETE "/api/v1/integrations/${UNREACHABLE_ID}" '' > /dev/null
 pass "alert rules need a channel; send-test reports each channel; failures show on the channel"
 
-ONBOARDING=$(api /api/onboarding/status)
+ONBOARDING=$(api /api/v1/onboarding/status)
 jq -e '.data.has_successful_deploy == true and .data.last_deployment.app_name != null and (.data | has("has_source_integration") and has("has_notification_channel"))' \
     <<<"$ONBOARDING" > /dev/null || fail "onboarding status should report the checklist and last deploy: $ONBOARDING"
 pass "onboarding status reports the first-run checklist and the latest deployment"
@@ -1037,12 +1103,12 @@ http.server.HTTPServer(("127.0.0.1", 18099), H).serve_forever()
     HOOK_PID=$!
     wait_for 10 "the local webhook receiver" bash -c "curl -s -o /dev/null -X POST -d '{}' http://127.0.0.1:18099/probe"
     rm -f "$HOOK_DIR"/*
-    [[ "$(api_req POST /api/integrations '{"name":"e2e-signed-hook","kind":"webhook","config":{"webhook_url":"http://127.0.0.1:18099/hook","signing_secret":"e2e-signing-secret"}}')" == 201 ]] \
+    [[ "$(api_req POST /api/v1/integrations '{"name":"e2e-signed-hook","kind":"webhook","config":{"webhook_url":"http://127.0.0.1:18099/hook","signing_secret":"e2e-signing-secret"}}')" == 201 ]] \
         || fail "the signed webhook channel should be created: $(cat "$API_BODY")"
     HOOK_ID=$(jq -r '.data.id' "$API_BODY")
     jq -e '.data.saved_secrets | index("signing_secret") and index("webhook_url")' "$API_BODY" > /dev/null \
         || fail "the channel's secrets must be write-only: $(cat "$API_BODY")"
-    [[ "$(api_req POST /api/alerts "{\"name\":\"e2e-memory\",\"kind\":\"memory\",\"app_id\":\"${WHOAMI_ID}\",\"threshold\":0.001,\"for_secs\":0,\"severity\":\"critical\",\"integration_ids\":[\"${HOOK_ID}\"]}")" == 201 ]] \
+    [[ "$(api_req POST /api/v1/alerts "{\"name\":\"e2e-memory\",\"kind\":\"memory\",\"app_id\":\"${WHOAMI_ID}\",\"threshold\":0.001,\"for_secs\":0,\"severity\":\"critical\",\"integration_ids\":[\"${HOOK_ID}\"]}")" == 201 ]] \
         || fail "the memory rule should be created: $(cat "$API_BODY")"
     MEM_RULE=$(jq -r '.data.id' "$API_BODY")
     wait_for 120 "the firing notification" bash -c "grep -l '\"event\":\"firing\"' '$HOOK_DIR'/*.json"
@@ -1053,18 +1119,18 @@ http.server.HTTPServer(("127.0.0.1", 18099), H).serve_forever()
         EXPECTED="sha256=$(openssl dgst -sha256 -hmac e2e-signing-secret -hex < "$FIRED" | awk '{print $NF}')"
         [[ "$(cat "${FIRED%.json}.sig")" == "$EXPECTED" ]] || fail "the webhook signature must be HMAC-SHA256 of the body"
     fi
-    api /api/alerts/active | jq -e --arg rule "$MEM_RULE" '.data[] | select(.rule_id == $rule and .state == "firing" and .target == "app:'"${WHOAMI_ID}"'")' > /dev/null \
+    api /api/v1/alerts/active | jq -e --arg rule "$MEM_RULE" '.data[] | select(.rule_id == $rule and .state == "firing" and .target == "app:'"${WHOAMI_ID}"'")' > /dev/null \
         || fail "the alert must be listed as firing"
     pass "memory alert fired and a signed notification arrived"
 
-    [[ "$(api_req PATCH "/api/alerts/${MEM_RULE}" '{"threshold":100}')" == 200 ]] || fail "raising the threshold should work: $(cat "$API_BODY")"
+    [[ "$(api_req PATCH "/api/v1/alerts/${MEM_RULE}" '{"threshold":100}')" == 200 ]] || fail "raising the threshold should work: $(cat "$API_BODY")"
     wait_for 120 "the resolved notification" bash -c "grep -l '\"event\":\"resolved\"' '$HOOK_DIR'/*.json"
-    api "/api/alerts/history?rule_id=${MEM_RULE}" | jq -e '.data.total == 1 and .data.episodes[0].state == "resolved" and .data.episodes[0].notifications_sent >= 2' > /dev/null \
-        || fail "history must show the resolved episode with its notifications: $(api "/api/alerts/history?rule_id=${MEM_RULE}")"
-    [[ "$(api /api/alerts/active | jq --arg rule "$MEM_RULE" '[.data[] | select(.rule_id == $rule)] | length')" == 0 ]] \
+    api "/api/v1/alerts/history?rule_id=${MEM_RULE}" | jq -e '.data.total == 1 and .data.episodes[0].state == "resolved" and .data.episodes[0].notifications_sent >= 2' > /dev/null \
+        || fail "history must show the resolved episode with its notifications: $(api "/api/v1/alerts/history?rule_id=${MEM_RULE}")"
+    [[ "$(api /api/v1/alerts/active | jq --arg rule "$MEM_RULE" '[.data[] | select(.rule_id == $rule)] | length')" == 0 ]] \
         || fail "a resolved alert must leave the active list"
-    api_req DELETE "/api/alerts/${MEM_RULE}" '' > /dev/null
-    api_req DELETE "/api/integrations/${HOOK_ID}" '' > /dev/null
+    api_req DELETE "/api/v1/alerts/${MEM_RULE}" '' > /dev/null
+    api_req DELETE "/api/v1/integrations/${HOOK_ID}" '' > /dev/null
     kill "$HOOK_PID" 2> /dev/null || true
     rm -rf "$HOOK_DIR"
     pass "the alert resolved, sent a resolve notification and is in the history"
@@ -1095,7 +1161,7 @@ assert_hardened tond-e2e-whoami "app e2e-whoami"
 assert_hardened "tond-db-e2e-redis" "database e2e-redis"
 
 WHOAMI_PORT=$(app_field e2e-whoami host_port)
-REDIS_PORT=$(api /api/databases | jq -r '.data[] | select(.name == "e2e-redis") | .host_port')
+REDIS_PORT=$(api /api/v1/databases | jq -r '.data[] | select(.name == "e2e-redis") | .host_port')
 for port in "$WHOAMI_PORT" "$REDIS_PORT"; do
     if ss -Hltn "sport = :${port}" | awk '{print $4}' | grep -vqE '^127\.0\.0\.1:'; then
         ss -ltn "sport = :${port}" >&2
@@ -1103,7 +1169,7 @@ for port in "$WHOAMI_PORT" "$REDIS_PORT"; do
     fi
 done
 pass "published ports ${WHOAMI_PORT} and ${REDIS_PORT} only listen on 127.0.0.1"
-[[ "$(api /api/databases | jq -r '.data[] | select(.name == "e2e-redis") | .public_access')" == false ]] \
+[[ "$(api /api/v1/databases | jq -r '.data[] | select(.name == "e2e-redis") | .public_access')" == false ]] \
     || fail "managed databases must be private by default"
 pass "managed databases are private by default"
 
@@ -1111,15 +1177,15 @@ jq -e '.["log-opts"]["max-size"] and .["log-opts"]["max-file"]' /etc/docker/daem
     || fail "install.sh must set default log rotation in /etc/docker/daemon.json"
 pass "daemon.json sets default container log rotation"
 
-code=$(api_req POST /api/apps '{"name":"e2e-rooted","source_type":"image","source_url":"alpine:3","container_port":80,"volumes":[{"container_path":"/host","host_path":"/"}]}')
+code=$(api_req POST /api/v1/apps '{"name":"e2e-rooted","source_type":"image","source_url":"alpine:3","container_port":80,"volumes":[{"container_path":"/host","host_path":"/"}]}')
 [[ "$code" == 400 ]] && grep -q "is not allowed" "$API_BODY" \
     || fail "a host_path of / must be rejected with 400, got ${code}: $(cat "$API_BODY")"
 [[ -z "$(app_field e2e-rooted id)" ]] || fail "no app may be created for a rejected volume"
-pass "POST /api/apps with host_path \"/\" → 400, nothing created"
-code=$(api_req POST /api/apps/e2e-whoami/volumes '{"container_path":"/sock","host_path":"/var/run/docker.sock"}')
+pass "POST /api/v1/apps with host_path \"/\" → 400, nothing created"
+code=$(api_req POST /api/v1/apps/e2e-whoami/volumes '{"container_path":"/sock","host_path":"/var/run/docker.sock"}')
 [[ "$code" == 400 ]] || fail "binding docker.sock into an app must be rejected, got ${code}: $(cat "$API_BODY")"
-pass "POST /api/apps/{id}/volumes with docker.sock → 400"
-code=$(api_req POST /api/apps '{"name":"e2e-compose","source_type":"compose","container_port":80,"compose_content":"services:\n  web:\n    image: nginx:alpine\n    privileged: true\n    network_mode: host\n"}')
+pass "POST /api/v1/apps/{id}/volumes with docker.sock → 400"
+code=$(api_req POST /api/v1/apps '{"name":"e2e-compose","source_type":"compose","container_port":80,"compose_content":"services:\n  web:\n    image: nginx:alpine\n    privileged: true\n    network_mode: host\n"}')
 [[ "$code" == 400 ]] && grep -q "privileged" "$API_BODY" && grep -q "network_mode: host" "$API_BODY" \
     || fail "a privileged compose file must be rejected with every problem listed, got ${code}: $(cat "$API_BODY")"
 pass "compose with privileged + network_mode: host → 400 listing both problems"
@@ -1169,28 +1235,28 @@ pass "another app's network cannot reach e2e-whoami's container IP"
 ! redis_reachable "$WHOAMI_NET" "$REDIS_IP" || fail "an unlinked app must not reach e2e-redis (${REDIS_IP})"
 pass "an unlinked app cannot reach a database outside its project"
 
-read -r code body < <(api_send PUT /api/databases/e2e-redis/links/e2e-whoami '{}')
+read -r code body < <(api_send PUT /api/v1/databases/e2e-redis/links/e2e-whoami '{}')
 [[ "$code" == 200 ]] && jq -e '.data.linked_apps | any(.name == "e2e-whoami")' <<<"$body" > /dev/null \
     || fail "linking e2e-whoami to e2e-redis must succeed (got ${code}: ${body})"
 wait_for 20 "e2e-redis reachable by name from e2e-whoami's network" redis_reachable "$WHOAMI_NET" e2e-redis
 pass "after linking, e2e-whoami reaches e2e-redis by name"
-api /api/apps/e2e-whoami/databases | jq -e '.data | any(.name == "e2e-redis" and .via == "link")' > /dev/null \
-    || fail "GET /api/apps/e2e-whoami/databases must list the linked database"
-read -r code body < <(api_send PUT /api/databases/e2e-redis/links/e2e-static '{}')
+api /api/v1/apps/e2e-whoami/databases | jq -e '.data | any(.name == "e2e-redis" and .via == "link")' > /dev/null \
+    || fail "GET /api/v1/apps/e2e-whoami/databases must list the linked database"
+read -r code body < <(api_send PUT /api/v1/databases/e2e-redis/links/e2e-static '{}')
 [[ "$code" == 200 ]] || fail "linking e2e-static must succeed (got ${code}: ${body})"
 ! http_ok "$STATIC_NET" "$WHOAMI_IP" \
     || fail "two apps linked to the same database must still not reach each other"
 pass "apps linked to the same database still cannot reach each other"
-read -r code body < <(api_send DELETE /api/databases/e2e-redis/links/e2e-static '{}')
+read -r code body < <(api_send DELETE /api/v1/databases/e2e-redis/links/e2e-static '{}')
 [[ "$code" == 200 ]] || fail "unlinking e2e-static must succeed (got ${code}: ${body})"
-read -r code body < <(api_send DELETE /api/databases/e2e-redis/links/e2e-whoami '{}')
+read -r code body < <(api_send DELETE /api/v1/databases/e2e-redis/links/e2e-whoami '{}')
 [[ "$code" == 200 ]] || fail "unlinking e2e-whoami must succeed (got ${code}: ${body})"
 wait_for 30 "e2e-redis unreachable from e2e-whoami after unlinking" \
     redis_unreachable "$WHOAMI_NET" "$REDIS_IP"
 [[ "$(networks_of tond-db-e2e-redis)" == "${REDIS_NET} " ]] \
     || fail "unlinking must detach e2e-redis from the apps' networks (on: $(networks_of tond-db-e2e-redis))"
 pass "unlinking detaches the database again"
-code=$(api_req POST /api/apps '{"name":"e2e-compose","source_type":"compose","container_port":80,"compose_content":"services:\n  web:\n    image: nginx:alpine\nnetworks:\n  shared:\n    external: true\n    name: tond-net-db-e2e-redis\n"}')
+code=$(api_req POST /api/v1/apps '{"name":"e2e-compose","source_type":"compose","container_port":80,"compose_content":"services:\n  web:\n    image: nginx:alpine\nnetworks:\n  shared:\n    external: true\n    name: tond-net-db-e2e-redis\n"}')
 [[ "$code" == 400 ]] && grep -q "external" "$API_BODY" \
     || fail "a compose file joining another network must be rejected, got ${code}: $(cat "$API_BODY")"
 pass "compose files cannot join another app's or database's network"
@@ -1200,17 +1266,17 @@ UPLOAD_TMP=$(mktemp -d)
 ln -s /etc/shadow "${UPLOAD_TMP}/shadow"
 tar -czf "${UPLOAD_TMP}/evil.tar.gz" -C "$UPLOAD_TMP" shadow
 code=$(curl -s -o "$API_BODY" -w '%{http_code}' --unix-socket "$SOCK" \
-    -F "file=@${UPLOAD_TMP}/evil.tar.gz" http://localhost/api/apps/e2e-static/upload)
+    -F "file=@${UPLOAD_TMP}/evil.tar.gz" http://localhost/api/v1/apps/e2e-static/upload)
 [[ "$code" == 400 ]] && grep -q "outside the project" "$API_BODY" \
     || fail "an archive with a symlink to /etc/shadow must be refused with 400, got ${code}: $(cat "$API_BODY")"
 pass "an archive linking outside the project is refused (400, says why)"
-read -r code body < <(api_send PUT /api/settings '{"upload_max_bytes": 1048576}')
+read -r code body < <(api_send PUT /api/v1/settings '{"upload_max_bytes": 1048576}')
 [[ "$code" == 200 ]] || fail "setting a 1 MiB upload limit must succeed (got ${code}: ${body})"
 head -c 3145728 /dev/zero > "${UPLOAD_TMP}/zeros.bin"
 tar -czf "${UPLOAD_TMP}/bomb.tar.gz" -C "$UPLOAD_TMP" zeros.bin
 code=$(curl -s -o "$API_BODY" -w '%{http_code}' --unix-socket "$SOCK" \
-    -F "file=@${UPLOAD_TMP}/bomb.tar.gz" http://localhost/api/apps/e2e-static/upload)
-read -r restore_code _ < <(api_send PUT /api/settings '{"upload_max_bytes": 1073741824}')
+    -F "file=@${UPLOAD_TMP}/bomb.tar.gz" http://localhost/api/v1/apps/e2e-static/upload)
+read -r restore_code _ < <(api_send PUT /api/v1/settings '{"upload_max_bytes": 1073741824}')
 [[ "$restore_code" == 200 ]] || fail "restoring the upload limit must succeed"
 [[ "$code" == 413 ]] && grep -q "tondignore" "$API_BODY" \
     || fail "an archive that unpacks past the limit must be refused with 413, got ${code}: $(cat "$API_BODY")"
@@ -1221,10 +1287,10 @@ rm -rf "$UPLOAD_TMP"
 [[ "$(app_field e2e-static status)" == running ]] || fail "refused uploads must not touch the running app"
 
 step "Apps domain (automatic hostnames never on the dashboard's site)"
-api /api/apps/e2e-whoami | jq -e '.data.domain_warning | strings | contains("same site as your dashboard")' > /dev/null \
+api /api/v1/apps/e2e-whoami | jq -e '.data.domain_warning | strings | contains("same site as your dashboard")' > /dev/null \
     || fail "a custom domain on the dashboard's site (${WHOAMI_DOMAIN}) must carry a warning"
 pass "custom domain ${WHOAMI_DOMAIN} (same site as ${DASH}) is allowed with a warning"
-read -r code body < <(api_send PUT /api/settings "{\"apps_domain\": \"apps.${BASE}\"}")
+read -r code body < <(api_send PUT /api/v1/settings "{\"apps_domain\": \"apps.${BASE}\"}")
 [[ "$code" == 400 ]] || fail "an apps domain on the dashboard's site must be rejected (got ${code}: ${body})"
 pass "an apps domain on the dashboard's site (apps.${BASE}) is rejected"
 if [[ -n "$APPS_DOMAIN" ]]; then
@@ -1249,7 +1315,7 @@ else
 fi
 
 step "Per-deployment images and rollback"
-deployments() { api /api/apps/e2e-whoami/deployments; }
+deployments() { api /api/v1/apps/e2e-whoami/deployments; }
 FIRST_ID=$(deployments | jq -r '[.data[] | select(.status == "succeeded")][0].id')
 FIRST_TAG=$(deployments | jq -r '[.data[] | select(.status == "succeeded")][0].image_tag')
 [[ "$FIRST_TAG" =~ ^tond-e2e-whoami:[0-9a-f]{12}$ ]] || fail "deployments must run a per-deployment tag, got ${FIRST_TAG}"
@@ -1257,17 +1323,17 @@ docker image inspect "$FIRST_TAG" > /dev/null || fail "image ${FIRST_TAG} must e
 pass "deployment runs ${FIRST_TAG}"
 tond apps deploy e2e-whoami > /dev/null
 wait_for 300 "a second successful e2e-whoami deployment" \
-    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/apps/e2e-whoami/deployments | jq -e '[.data[] | select(.status == \"succeeded\")] | length >= 2'"
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/apps/e2e-whoami/deployments | jq -e '[.data[] | select(.status == \"succeeded\")] | length >= 2'"
 wait_for_app_running e2e-whoami 120
 SECOND_TAG=$(deployments | jq -r '[.data[] | select(.status == "succeeded")][0].image_tag')
 [[ "$SECOND_TAG" != "$FIRST_TAG" ]] || fail "each deployment must get its own tag"
 deployments | jq -e --arg id "$FIRST_ID" '.data[] | select(.id == $id) | .rollback_available' > /dev/null \
     || fail "the previous deployment must be offered for rollback"
 pass "redeploy ran ${SECOND_TAG}; ${FIRST_TAG} is offered for rollback"
-code=$(api_req POST /api/apps/e2e-whoami/rollback "{\"deployment_id\":\"${FIRST_ID}\"}")
+code=$(api_req POST /api/v1/apps/e2e-whoami/rollback "{\"deployment_id\":\"${FIRST_ID}\"}")
 [[ "$code" == 202 ]] || fail "rollback should be accepted, got ${code}: $(cat "$API_BODY")"
 wait_for 300 "rollback to ${FIRST_TAG}" \
-    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/apps/e2e-whoami/deployments | jq -e --arg t '${FIRST_TAG}' '.data[0] | select(.trigger_source == \"rollback\" and .status == \"succeeded\" and .image_tag == \$t)'"
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/apps/e2e-whoami/deployments | jq -e --arg t '${FIRST_TAG}' '.data[0] | select(.trigger_source == \"rollback\" and .status == \"succeeded\" and .image_tag == \$t)'"
 wait_for_app_running e2e-whoami 120
 running_image=$(docker inspect tond-e2e-whoami | jq -r '.[0].Config.Image')
 [[ "$running_image" == "$FIRST_TAG" ]] || fail "rollback must run exactly ${FIRST_TAG}, got ${running_image}"
@@ -1283,13 +1349,13 @@ jq -e '[.phases[] | select(.status != "skipped")] | length > 0 and all(.status =
 jq -e '.duration_secs >= 0' <<< "$ROLLBACK_ROW" > /dev/null || fail "deployments must record a duration"
 pass "rollback recorded its target, steps and duration"
 
-code=$(api_req POST /api/apps/e2e-whoami/deploy '{}')
+code=$(api_req POST /api/v1/apps/e2e-whoami/deploy '{}')
 [[ "$code" == 202 ]] || fail "deploy should be accepted, got ${code}: $(cat "$API_BODY")"
 DEP_ID=$(jq -r '.data.deployment_id' "$API_BODY")
 [[ "$DEP_ID" =~ ^[0-9a-f-]{36}$ ]] || fail "deploy must return the new deployment's id, got: $(cat "$API_BODY")"
 wait_for 300 "deployment ${DEP_ID} to succeed" \
-    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/apps/e2e-whoami/deployments/${DEP_ID} | jq -e '.data.status == \"succeeded\"'"
-DETAIL=$(api "/api/apps/e2e-whoami/deployments/${DEP_ID}")
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/apps/e2e-whoami/deployments/${DEP_ID} | jq -e '.data.status == \"succeeded\"'"
+DETAIL=$(api "/api/v1/apps/e2e-whoami/deployments/${DEP_ID}")
 jq -e '.data.trigger_source == "cli"' <<< "$DETAIL" > /dev/null \
     || fail "a deploy over the local socket is triggered by the CLI: $(jq -c '.data | {trigger_source, trigger_detail}' <<< "$DETAIL")"
 jq -e '[.data.phases[] | .phase] == ["clone","build","start","health","release"]' <<< "$DETAIL" > /dev/null \
@@ -1302,12 +1368,12 @@ wait_for_app_running e2e-whoami 120
 # whoami listens on 80; telling Tond 8081 must fail the first deploy with
 # a clear cause instead of 'running' with nothing behind the route.
 tond apps create e2e-badport --source-type image --source traefik/whoami:v1.10 --port 8081 > /dev/null
-code=$(api_req POST /api/apps/e2e-badport/deploy '{}')
+code=$(api_req POST /api/v1/apps/e2e-badport/deploy '{}')
 [[ "$code" == 202 ]] || fail "deploy should be accepted, got ${code}: $(cat "$API_BODY")"
 BAD_ID=$(jq -r '.data.deployment_id' "$API_BODY")
 wait_for 240 "deployment ${BAD_ID} to fail" \
-    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/apps/e2e-badport/deployments/${BAD_ID} | jq -e '.data.status == \"failed\"'"
-BAD=$(api "/api/apps/e2e-badport/deployments/${BAD_ID}")
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/apps/e2e-badport/deployments/${BAD_ID} | jq -e '.data.status == \"failed\"'"
+BAD=$(api "/api/v1/apps/e2e-badport/deployments/${BAD_ID}")
 [[ "$(jq -r '.data.failure.code' <<< "$BAD")" == port_not_listening ]] \
     || fail "a wrong port must be classified as port_not_listening: $(jq -c '.data.failure' <<< "$BAD")"
 jq -e '.data.failure.title | test("8081")' <<< "$BAD" > /dev/null || fail "the cause must name the expected port"
@@ -1317,14 +1383,14 @@ jq -e '.data.phases[] | select(.phase == "health") | .status == "failed"' <<< "$
 [[ -z "$(docker ps -aq --filter name='^tond-e2e-badport$')" ]] || fail "the container of a failed deploy must be removed"
 pass "wrong port → failed with 'port_not_listening' naming port 8081"
 
-code=$(api_req GET "/api/domains/check?domain=${WHOAMI_DOMAIN}" '')
+code=$(api_req GET "/api/v1/domains/check?domain=${WHOAMI_DOMAIN}" '')
 [[ "$code" == 200 ]] || fail "domain check should answer 200, got ${code}: $(cat "$API_BODY")"
 jq -e '.data.dns.status | IN("ok","mismatch","missing","inconclusive")' "$API_BODY" > /dev/null \
     || fail "domain check must report a DNS status: $(cat "$API_BODY")"
 jq -e --arg d "$WHOAMI_DOMAIN" '.data.domain == $d and (.data.records | all(.type == "A" or .type == "AAAA"))' "$API_BODY" > /dev/null \
     || fail "domain check must list A/AAAA records to create: $(cat "$API_BODY")"
 DNS_STATUS=$(jq -r '.data.dns.status' "$API_BODY")
-code=$(api_req GET "/api/domains/check?domain=not_a_domain" '')
+code=$(api_req GET "/api/v1/domains/check?domain=not_a_domain" '')
 [[ "$code" == 400 ]] || fail "an invalid domain must be rejected with 400, got ${code}"
 pass "domain check reports DNS '${DNS_STATUS}' for ${WHOAMI_DOMAIN}; invalid domains → 400"
 
@@ -1332,9 +1398,9 @@ step "Build queue: coalescing, 202 + queue position, acknowledged cutover"
 wait_for_app_running e2e-whoami 120
 # Three deploys back to back: the first runs, the second waits, the third
 # supersedes the second (one deploy in flight per app, newest wins).
-q1=$(api_req POST /api/apps/e2e-whoami/deploy '{}'); b1=$(cat "$API_BODY")
-q2=$(api_req POST /api/apps/e2e-whoami/deploy '{}'); b2=$(cat "$API_BODY")
-q3=$(api_req POST /api/apps/e2e-whoami/deploy '{}'); b3=$(cat "$API_BODY")
+q1=$(api_req POST /api/v1/apps/e2e-whoami/deploy '{}'); b1=$(cat "$API_BODY")
+q2=$(api_req POST /api/v1/apps/e2e-whoami/deploy '{}'); b2=$(cat "$API_BODY")
+q3=$(api_req POST /api/v1/apps/e2e-whoami/deploy '{}'); b3=$(cat "$API_BODY")
 [[ "$q1 $q2 $q3" == "202 202 202" ]] || fail "deploys must be accepted with 202, got ${q1} ${q2} ${q3}"
 for b in "$b1" "$b2" "$b3"; do
     echo "$b" | jq -e '.data.deployment_id and .data.status == "queued" and .data.queue_position >= 1' > /dev/null \
@@ -1344,8 +1410,8 @@ D2=$(echo "$b2" | jq -r .data.deployment_id)
 D3=$(echo "$b3" | jq -r .data.deployment_id)
 [[ "$(echo "$b3" | jq -r .data.superseded)" == "$D2" ]] || fail "the third deploy must supersede the second: ${b3}"
 wait_for 300 "the newest deploy to succeed" \
-    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/apps/e2e-whoami/deployments | jq -e --arg id '${D3}' '.data[] | select(.id == \$id and .status == \"succeeded\")'"
-api /api/apps/e2e-whoami/deployments | jq -e --arg id "$D2" --arg by "$D3" \
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/apps/e2e-whoami/deployments | jq -e --arg id '${D3}' '.data[] | select(.id == \$id and .status == \"succeeded\")'"
+api /api/v1/apps/e2e-whoami/deployments | jq -e --arg id "$D2" --arg by "$D3" \
     '.data[] | select(.id == $id and .status == "superseded" and .superseded_by == $by)' > /dev/null \
     || fail "the waiting deploy must be marked superseded by the newest one"
 pass "3 deploys → first ran, second superseded by the third, third succeeded"
@@ -1358,15 +1424,15 @@ wait_for 30 "route after queued deploys" bash -c "curl -sk --resolve '${WHOAMI_D
 
 step "Background worker (readiness: none — no port, no domain, never routed)"
 # A worker that serves nothing must deploy (the HTTP release check would fail it).
-code=$(api_req POST /api/apps '{"name":"e2e-worker","source_type":"dockerfile","dockerfile_content":"FROM alpine:3\nCMD [\"sh\", \"-c\", \"while true; do echo tick; sleep 5; done\"]","readiness":"none","ready_after_secs":5}')
+code=$(api_req POST /api/v1/apps '{"name":"e2e-worker","source_type":"dockerfile","dockerfile_content":"FROM alpine:3\nCMD [\"sh\", \"-c\", \"while true; do echo tick; sleep 5; done\"]","readiness":"none","ready_after_secs":5}')
 [[ "$code" == 201 ]] || fail "creating a background worker should succeed, got ${code}: $(cat "$API_BODY")"
-code=$(api_req POST /api/apps '{"name":"e2e-worker-domain","source_type":"image","source_url":"alpine:3","readiness":"none","domain":"worker.example.test"}')
+code=$(api_req POST /api/v1/apps '{"name":"e2e-worker-domain","source_type":"image","source_url":"alpine:3","readiness":"none","domain":"worker.example.test"}')
 [[ "$code" == 400 ]] || fail "a background worker with a domain must be rejected, got ${code}"
-code=$(api_req POST /api/apps/e2e-worker/deploy '{}')
+code=$(api_req POST /api/v1/apps/e2e-worker/deploy '{}')
 [[ "$code" == 202 ]] || fail "worker deploy should be accepted, got ${code}: $(cat "$API_BODY")"
 WORKER_DEP=$(jq -r '.data.deployment_id' "$API_BODY")
 wait_for_app_running e2e-worker 300
-WORKER=$(api "/api/apps/e2e-worker/deployments/${WORKER_DEP}")
+WORKER=$(api "/api/v1/apps/e2e-worker/deployments/${WORKER_DEP}")
 jq -e '.data.status == "succeeded"' <<< "$WORKER" > /dev/null \
     || fail "the worker deployment must succeed: $(jq -c '.data | {status, failure}' <<< "$WORKER")"
 jq -e '.data.phases[] | select(.phase == "health") | .label == "Stay up for 5s" and .status == "succeeded"' <<< "$WORKER" > /dev/null \
@@ -1380,17 +1446,17 @@ pass "a background worker deploys to running with no domain (readiness step: sta
 step "Resource metrics (cgroup sampling, restarts, cached host stats)"
 # The collector samples every 30 s; the first reading only primes the rates.
 wait_for 150 "e2e-whoami metrics samples" \
-    bash -c "curl -sf --unix-socket '$SOCK' 'http://localhost/api/apps/e2e-whoami/metrics?range=1h' | jq -e '(.data.series.t | length) >= 1 and .data.current != null'"
-WHOAMI_METRICS=$(api "/api/apps/e2e-whoami/metrics?range=1h")
+    bash -c "curl -sf --unix-socket '$SOCK' 'http://localhost/api/v1/apps/e2e-whoami/metrics?range=1h' | jq -e '(.data.series.t | length) >= 1 and .data.current != null'"
+WHOAMI_METRICS=$(api "/api/v1/apps/e2e-whoami/metrics?range=1h")
 jq -e '.data.step == 30 and .data.series.mem[-1] > 0 and .data.series.pids[-1] > 0 and .data.mem_limit > 0 and (.data.series.cpu | length) == (.data.series.t | length)' \
     <<<"$WHOAMI_METRICS" > /dev/null || fail "app metrics should carry memory, pids, a limit and aligned series: ${WHOAMI_METRICS}"
 pass "app samples come from cgroups (memory, pids, limit; rates computed server-side)"
 wait_for 120 "e2e-redis metrics samples" \
-    bash -c "curl -sf --unix-socket '$SOCK' 'http://localhost/api/databases/e2e-redis/metrics?range=24h' | jq -e '(.data.series.t | length) >= 1'"
+    bash -c "curl -sf --unix-socket '$SOCK' 'http://localhost/api/v1/databases/e2e-redis/metrics?range=24h' | jq -e '(.data.series.t | length) >= 1'"
 pass "managed databases are measured too"
-jq -e '.data.step == 7200 and (.data.series.t | length) <= 480' <<<"$(api "/api/apps/e2e-whoami/metrics?range=30d")" > /dev/null \
+jq -e '.data.step == 7200 and (.data.series.t | length) <= 480' <<<"$(api "/api/v1/apps/e2e-whoami/metrics?range=30d")" > /dev/null \
     || fail "30d metrics should be downsampled to 2 h buckets"
-[[ "$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$SOCK" 'http://localhost/api/apps/e2e-whoami/metrics?range=1y')" == 400 ]] \
+[[ "$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$SOCK" 'http://localhost/api/v1/apps/e2e-whoami/metrics?range=1y')" == 400 ]] \
     || fail "an unknown metrics range must be rejected"
 pass "series are downsampled per range (30d → 2 h buckets); unknown ranges → 400"
 
@@ -1399,14 +1465,14 @@ pass "series are downsampled per range (30d → 2 h buckets); unknown ranges →
 WHOAMI_PID=$(docker inspect -f '{{.State.Pid}}' tond-e2e-whoami)
 kill -9 "$WHOAMI_PID"
 wait_for 90 "restart event for e2e-whoami" \
-    bash -c "curl -sf --unix-socket '$SOCK' 'http://localhost/api/apps/e2e-whoami/metrics?range=1h' | jq -e '.data.events | any(.kind == \"restart\" and (.detail | contains(\"exit code 137\")))'"
+    bash -c "curl -sf --unix-socket '$SOCK' 'http://localhost/api/v1/apps/e2e-whoami/metrics?range=1h' | jq -e '.data.events | any(.kind == \"restart\" and (.detail | contains(\"exit code 137\")))'"
 wait_for 60 "e2e-whoami running again" bash -c "docker inspect -f '{{.State.Running}}' tond-e2e-whoami | grep -qx true"
 pass "a crash-restart is recorded as a restart event (exit code 137)"
 
-SYS_TIME=$(curl -sf -o /dev/null -w '%{time_total}' --unix-socket "$SOCK" http://localhost/api/system/metrics)
-awk -v t="$SYS_TIME" 'BEGIN { exit !(t < 0.15) }' || fail "/api/system/metrics took ${SYS_TIME}s (it must read a cache, not sample)"
+SYS_TIME=$(curl -sf -o /dev/null -w '%{time_total}' --unix-socket "$SOCK" http://localhost/api/v1/system/metrics)
+awk -v t="$SYS_TIME" 'BEGIN { exit !(t < 0.15) }' || fail "/api/v1/system/metrics took ${SYS_TIME}s (it must read a cache, not sample)"
 jq -e '.data.disk_total > 0 and (.data.disk_mount | length) > 0 and .data.containers_running >= 2' \
-    <<<"$(api /api/system/metrics)" > /dev/null || fail "system metrics should report the data directory's filesystem and Tond's containers"
+    <<<"$(api /api/v1/system/metrics)" > /dev/null || fail "system metrics should report the data directory's filesystem and Tond's containers"
 pass "system metrics answer from the cache in ${SYS_TIME}s with the data directory's disk"
 
 step "Uptime checks, heartbeat and host history"
@@ -1414,11 +1480,11 @@ step "Uptime checks, heartbeat and host history"
 # domains have no public DNS and the ACME CA isn't publicly trusted, so run.sh
 # gives tond-server TOND_UPTIME_RESOLVE / TOND_UPTIME_CA_FILE (tests only).
 if systemctl show tond-server -p Environment | grep -q TOND_UPTIME_RESOLVE; then
-    api /api/system/self | jq -e '.data.loops | any(.name == "uptime")' > /dev/null \
-        || fail "the uptime loop should be registered in /api/system/self"
-    api "/api/apps/e2e-whoami/uptime" | jq -e '.data.check.interval_secs == 60 and .data.url == "https://'"${WHOAMI_DOMAIN}"'/"' > /dev/null \
-        || fail "e2e-whoami should get an uptime check automatically: $(api /api/apps/e2e-whoami/uptime)"
-    UPTIME_CODE=$(api_req POST /api/apps/e2e-whoami/uptime/check '{}')
+    api /api/v1/system/self | jq -e '.data.loops | any(.name == "uptime")' > /dev/null \
+        || fail "the uptime loop should be registered in /api/v1/system/self"
+    api "/api/v1/apps/e2e-whoami/uptime" | jq -e '.data.check.interval_secs == 60 and .data.url == "https://'"${WHOAMI_DOMAIN}"'/"' > /dev/null \
+        || fail "e2e-whoami should get an uptime check automatically: $(api /api/v1/apps/e2e-whoami/uptime)"
+    UPTIME_CODE=$(api_req POST /api/v1/apps/e2e-whoami/uptime/check '{}')
     [[ "$UPTIME_CODE" == 200 ]] || fail "check now answered ${UPTIME_CODE}: $(cat "$API_BODY")"
     if [[ -n "$CA_FILE" ]]; then
         jq -e '.data.status == "up" and .data.last.status == 200 and .data.last.cert_days_left > 0 and .data.last.dns == "overridden"' "$API_BODY" > /dev/null \
@@ -1430,27 +1496,27 @@ if systemctl show tond-server -p Environment | grep -q TOND_UPTIME_RESOLVE; then
     fi
     # Stop the container behind Tond's back: the proxy answers 502 → down (http_5xx).
     docker stop tond-e2e-whoami > /dev/null
-    [[ "$(api_req POST /api/apps/e2e-whoami/uptime/check '{}')" == 200 ]] || fail "check now failed: $(cat "$API_BODY")"
+    [[ "$(api_req POST /api/v1/apps/e2e-whoami/uptime/check '{}')" == 200 ]] || fail "check now failed: $(cat "$API_BODY")"
     jq -e '.data.status == "down" and .data.incidents[0].cause == "http_5xx" and .data.incidents[0].ended_at == null' "$API_BODY" > /dev/null \
         || fail "a stopped container should open an http_5xx incident: $(jq -c '.data | {status, last, incidents}' "$API_BODY")"
     pass "a dead app is reported down with the cause (HTTP 502 from the proxy) and an open incident"
     docker start tond-e2e-whoami > /dev/null
     wait_for 60 "e2e-whoami back behind the proxy" bash -c "curl -sk --resolve '${WHOAMI_DOMAIN}:443:${IP}' 'https://${WHOAMI_DOMAIN}/' | grep -q Hostname:"
     if [[ -n "$CA_FILE" ]]; then
-        [[ "$(api_req POST /api/apps/e2e-whoami/uptime/check '{}')" == 200 ]] || fail "check now failed: $(cat "$API_BODY")"
+        [[ "$(api_req POST /api/v1/apps/e2e-whoami/uptime/check '{}')" == 200 ]] || fail "check now failed: $(cat "$API_BODY")"
         jq -e '.data.status == "up" and .data.incidents[0].ended_at != null' "$API_BODY" > /dev/null \
             || fail "recovery should close the incident: $(jq -c '.data | {status, incidents}' "$API_BODY")"
         pass "recovery closes the incident"
     fi
-    UPTIME_RUNS=$(api /api/system/self | jq '.data.loops[] | select(.name == "uptime") | .runs')
+    UPTIME_RUNS=$(api /api/v1/system/self | jq '.data.loops[] | select(.name == "uptime") | .runs')
     wait_for 150 "a scheduled uptime round" \
-        bash -c "(( \$(curl -sf --unix-socket '$SOCK' http://localhost/api/system/self | jq '.data.loops[] | select(.name == \"uptime\") | .runs') > ${UPTIME_RUNS} ))"
-    api /api/uptime | jq -e '.data[] | select(.name == "e2e-whoami") | .uptime.day_probes >= 2 and .uptime.day != null' > /dev/null \
-        || fail "GET /api/uptime should report e2e-whoami's probes: $(api /api/uptime)"
-    pass "the uptime loop probes on its own on the minute grid (GET /api/uptime)"
-    api /api/system/uptime | jq -e '.data.check.path == "/health"' > /dev/null || fail "the dashboard should have its own check"
+        bash -c "(( \$(curl -sf --unix-socket '$SOCK' http://localhost/api/v1/system/self | jq '.data.loops[] | select(.name == \"uptime\") | .runs') > ${UPTIME_RUNS} ))"
+    api /api/v1/uptime | jq -e '.data[] | select(.name == "e2e-whoami") | .uptime.day_probes >= 2 and .uptime.day != null' > /dev/null \
+        || fail "GET /api/v1/uptime should report e2e-whoami's probes: $(api /api/v1/uptime)"
+    pass "the uptime loop probes on its own on the minute grid (GET /api/v1/uptime)"
+    api /api/v1/system/uptime | jq -e '.data.check.path == "/health"' > /dev/null || fail "the dashboard should have its own check"
     pass "the dashboard has its own uptime check (/health)"
-    [[ "$(api_req PUT /api/apps/e2e-whoami/uptime '{"enabled":true,"path":"nope","interval_secs":60,"expected_status":null,"timeout_secs":10}')" == 400 ]] \
+    [[ "$(api_req PUT /api/v1/apps/e2e-whoami/uptime '{"enabled":true,"path":"nope","interval_secs":60,"expected_status":null,"timeout_secs":10}')" == 400 ]] \
         || fail "an invalid check path must be rejected"
     pass "check settings are validated"
 else
@@ -1478,46 +1544,46 @@ http.server.HTTPServer(("127.0.0.1", port), Hit).serve_forever()
 PY
 HB_PID=$!
 wait_for 10 "the heartbeat listener" bash -c "curl -sf http://127.0.0.1:${HB_PORT}/ready"
-[[ "$(api_req PUT /api/system/heartbeat '{"url":"http://127.0.0.1:'"${HB_PORT}"'/ping/e2e-hb-secret","method":"POST","interval_secs":60,"enabled":true}')" == 200 ]] \
+[[ "$(api_req PUT /api/v1/system/heartbeat '{"url":"http://127.0.0.1:'"${HB_PORT}"'/ping/e2e-hb-secret","method":"POST","interval_secs":60,"enabled":true}')" == 200 ]] \
     || fail "saving the heartbeat failed: $(cat "$API_BODY")"
 jq -e '.data.configured and .data.url_host == "127.0.0.1"' "$API_BODY" > /dev/null || fail "heartbeat settings not saved: $(cat "$API_BODY")"
-if grep -q e2e-hb-secret "$API_BODY" || api /api/system/heartbeat | grep -q e2e-hb-secret; then
+if grep -q e2e-hb-secret "$API_BODY" || api /api/v1/system/heartbeat | grep -q e2e-hb-secret; then
     fail "the heartbeat URL must be write-only"
 fi
-[[ "$(api_req POST /api/system/heartbeat/test '{}')" == 200 ]] || fail "test ping failed: $(cat "$API_BODY")"
+[[ "$(api_req POST /api/v1/system/heartbeat/test '{}')" == 200 ]] || fail "test ping failed: $(cat "$API_BODY")"
 jq -e '.data.outcome == "sent"' "$API_BODY" > /dev/null || fail "the test ping should be sent: $(cat "$API_BODY")"
 grep -q "POST /ping/e2e-hb-secret" "$HB_LOG" || fail "the listener didn't receive the test ping"
 pass "heartbeat URL is write-only; a test ping reaches the monitor"
 wait_for 150 "a scheduled heartbeat" bash -c "[[ \$(grep -c 'POST /ping/e2e-hb-secret' '$HB_LOG') -ge 2 ]]"
-api /api/system/heartbeat | jq -e '.data.last_ok_at != null and .data.healthy' > /dev/null \
-    || fail "the heartbeat should be healthy with a recent success: $(api /api/system/heartbeat)"
+api /api/v1/system/heartbeat | jq -e '.data.last_ok_at != null and .data.healthy' > /dev/null \
+    || fail "the heartbeat should be healthy with a recent success: $(api /api/v1/system/heartbeat)"
 pass "the scheduled heartbeat is sent while Tond is healthy (Docker, proxy, loops)"
-[[ "$(api_req PUT /api/system/heartbeat '{"url":""}')" == 200 ]] || fail "removing the heartbeat URL failed"
+[[ "$(api_req PUT /api/v1/system/heartbeat '{"url":""}')" == 200 ]] || fail "removing the heartbeat URL failed"
 kill "$HB_PID" 2> /dev/null || true
 grep -q "e2e-hb-secret" /opt/tond/data/tond.db && fail "the heartbeat URL must be encrypted at rest"
 pass "the heartbeat URL is encrypted at rest and can be removed"
 
 # Host history: one row a minute from the metrics tick.
 wait_for 150 "host history samples" \
-    bash -c "curl -sf --unix-socket '$SOCK' 'http://localhost/api/system/host/history?range=1h' | jq -e '(.data.series.t | length) >= 1'"
+    bash -c "curl -sf --unix-socket '$SOCK' 'http://localhost/api/v1/system/host/history?range=1h' | jq -e '(.data.series.t | length) >= 1'"
 jq -e '.data.step == 60 and .data.series.disk_total[-1] > 0 and .data.series.inodes_total[-1] >= .data.series.inodes_used[-1] and .data.series.mem_total[-1] > 0 and (.data.series.load1 | length) == (.data.series.t | length)' \
-    <<<"$(api '/api/system/host/history?range=1h')" > /dev/null || fail "host history should carry disk, inodes, memory and load: $(api '/api/system/host/history?range=1h' | head -c 600)"
+    <<<"$(api '/api/v1/system/host/history?range=1h')" > /dev/null || fail "host history should carry disk, inodes, memory and load: $(api '/api/v1/system/host/history?range=1h' | head -c 600)"
 # (btrfs reports no inode counts: inodes_total is 0 there.)
 pass "host history is recorded every minute (CPU, load, memory, swap, disk, inodes)"
-api /api/system/host/forecast | jq -e '.data.day.status | IN("filling", "stable", "insufficient_data")' > /dev/null \
-    || fail "the disk forecast should answer: $(api /api/system/host/forecast)"
-HOST=$(api /api/system/host)
+api /api/v1/system/host/forecast | jq -e '.data.day.status | IN("filling", "stable", "insufficient_data")' > /dev/null \
+    || fail "the disk forecast should answer: $(api /api/v1/system/host/forecast)"
+HOST=$(api /api/v1/system/host)
 jq -e '.data.docker.reachable and (.data.docker.version | length) > 0 and (.data.docker.storage_driver | length) > 0 and .data.current.data_fs.total > 0' \
     <<<"$HOST" > /dev/null || fail "host overview should report Docker's health and the filesystems: ${HOST}"
 pass "disk forecast answers; Docker is reachable ($(jq -r '.data.docker.version + ", " + .data.docker.storage_driver' <<<"$HOST"))"
-DISK=$(curl -sf --unix-socket "$SOCK" -X POST http://localhost/api/system/disk/refresh)
+DISK=$(curl -sf --unix-socket "$SOCK" -X POST http://localhost/api/v1/system/disk/refresh)
 jq -e '.data.error == null and .data.images.count >= 1 and .data.images.bytes > 0 and .data.tond_data > 0' <<<"$DISK" > /dev/null \
     || fail "the disk breakdown should list Docker images and the data directory: ${DISK}"
-PREVIEW_CLEANUP=$(api /api/system/disk/cleanup)
+PREVIEW_CLEANUP=$(api /api/v1/system/disk/cleanup)
 jq -e '(.data.total_bytes | type) == "number" and (.data.dangling_images | type) == "array"' <<<"$PREVIEW_CLEANUP" > /dev/null \
     || fail "the cleanup preview should list what would be removed: ${PREVIEW_CLEANUP}"
-[[ "$(api_req POST /api/system/disk/cleanup '{}')" == 200 ]] || fail "free up space failed: $(cat "$API_BODY")"
-api "/api/audit-log?action=disk_cleanup&limit=1" | jq -e '.data.entries | length > 0' > /dev/null \
+[[ "$(api_req POST /api/v1/system/disk/cleanup '{}')" == 200 ]] || fail "free up space failed: $(cat "$API_BODY")"
+api "/api/v1/audit-log?action=disk_cleanup&limit=1" | jq -e '.data.entries | length > 0' > /dev/null \
     || fail "free up space must be audited"
 proxied_body "$WHOAMI_DOMAIN" / | grep -q Hostname: || fail "free up space must not touch running apps"
 pass "disk breakdown (images, build cache, data dir); free up space removes only build cache and dangling images, audited"
@@ -1537,10 +1603,10 @@ grep -qi '^content-encoding: br' <<<"$ASSET_HEADERS" || fail "hashed assets shou
 pass "index.html br + no-cache; hashed assets br + immutable; missing chunks 404; no TTF fonts"
 
 step "Operations: certificates, retention, app events, deploy trend, /metrics token, audit shipping, deploy --follow"
-certs=$(api /api/certs)
+certs=$(api /api/v1/certs)
 jq -e --arg d "$WHOAMI_DOMAIN" '.data[] | select(.domain == $d)
     | .serves.kind == "app" and .serves.app_name == "e2e-whoami" and (.issuer_kind | type == "string")' \
-    <<<"$certs" > /dev/null || fail "GET /api/certs must say what each certificate serves: $(jq -c . <<<"$certs")"
+    <<<"$certs" > /dev/null || fail "GET /api/v1/certs must say what each certificate serves: $(jq -c . <<<"$certs")"
 pass "the certificate list names what each domain serves"
 if [[ -n "$CA_FILE" ]]; then
     jq -e --arg d "$WHOAMI_DOMAIN" '.data[] | select(.domain == $d)
@@ -1549,11 +1615,11 @@ if [[ -n "$CA_FILE" ]]; then
     pass "issued certificates record issuer and last renewal"
 fi
 
-retention=$(api /api/settings/retention)
+retention=$(api /api/v1/settings/retention)
 jq -e '([.data.fields[] | select(.key == "retention_audit_log_days")][0].default == 180)
     and .data.database.file_bytes > 0 and (.data.database.tables | map(.name) | index("audit_log"))' \
     <<<"$retention" > /dev/null || fail "retention settings must carry defaults and the database size per table"
-read -r code _ < <(api_send PUT /api/settings/retention '{"retention_audit_log_days": 5}')
+read -r code _ < <(api_send PUT /api/v1/settings/retention '{"retention_audit_log_days": 5}')
 [[ "$code" == 400 ]] || fail "retention values outside their bounds must be rejected (got ${code})"
 pass "retention settings: roadmap defaults, bounds enforced, database size per table"
 if [[ -f /etc/systemd/journald.conf.d/tond.conf ]]; then
@@ -1565,21 +1631,21 @@ else
     pass "an existing journal cap was kept"
 fi
 
-events=$(api "/api/apps/e2e-whoami/events?limit=200")
+events=$(api "/api/v1/apps/e2e-whoami/events?limit=200")
 jq -e '[.data.events[].kind] | index("deploy_succeeded") and index("restart")' <<<"$events" > /dev/null \
     || fail "the app event feed must show deploys and the restart: $(jq -c '[.data.events[].kind]' <<<"$events")"
 pass "app events merge deploys and restarts ($(jq '.data.events | length' <<<"$events") events)"
-stats=$(api /api/apps/e2e-whoami/deployments/stats)
+stats=$(api /api/v1/apps/e2e-whoami/deployments/stats)
 jq -e '.data.window >= 2 and .data.success_rate != null and .data.median_duration_secs != null' <<<"$stats" > /dev/null \
     || fail "deploy stats must report a success rate and median duration: $(jq -c .data <<<"$stats")"
 pass "deploy trend: $(jq '.data.success_rate * 100 | floor' <<<"$stats")% of the last $(jq .data.window <<<"$stats") deploys succeeded"
 
-tond token revoke e2e-prometheus > /dev/null 2>&1 || true
+tond token revoke e2e-prometheus -y > /dev/null 2>&1 || true
 PROM_TOKEN=$(tond token create --name e2e-prometheus --scope metrics:read --expires 1d 2> /dev/null)
 prom=$(curl -sf -H "Authorization: Bearer ${PROM_TOKEN}" http://127.0.0.1:3001/metrics) \
     || fail "/metrics over TCP must accept a metrics:read token"
 grep -q '^tond_process_resident_memory_bytes' <<<"$prom" || fail "/metrics over TCP must expose Prometheus metrics"
-[[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${RO_TOKEN}" http://127.0.0.1:3001/api/settings/retention)" == 200 ]] \
+[[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${RO_TOKEN}" http://127.0.0.1:3001/api/v1/settings/retention)" == 200 ]] \
     || fail "any signed-in caller may read retention settings"
 pass "Prometheus can scrape /metrics over TCP with a metrics:read token"
 
@@ -1599,14 +1665,14 @@ while True:
     c.close()' "$SYSLOG_OUT" &
     SYSLOG_PID=$!
     sleep 1
-    read -r code body < <(api_send PUT /api/audit-log/shipping '{"syslog": {"enabled": true, "host": "127.0.0.1", "port": 16514, "tls": false}}')
+    read -r code body < <(api_send PUT /api/v1/audit-log/shipping '{"syslog": {"enabled": true, "host": "127.0.0.1", "port": 16514, "tls": false}}')
     [[ "$code" == 200 ]] || fail "enabling syslog shipping should succeed (got ${code}: ${body})"
     wait_for 60 "audit entries shipped to the syslog receiver" bash -c "grep -q 'audit_shipping_update' '$SYSLOG_OUT'"
     wait_for 60 "syslog shipping caught up" \
-        bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/audit-log/shipping | jq -e '.data.syslog.status.pending == 0 and .data.syslog.status.last_error == null'"
+        bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/audit-log/shipping | jq -e '.data.syslog.status.pending == 0 and .data.syslog.status.last_error == null'"
     grep -qE '^[0-9]+ <1(08|09)>1 ' "$SYSLOG_OUT" || fail "shipped entries must be octet-counted RFC 5424 messages"
     grep -q '"hash":"' "$SYSLOG_OUT" || fail "shipped entries must carry their chain hash"
-    read -r code _ < <(api_send PUT /api/audit-log/shipping '{"syslog": {"enabled": false, "host": "127.0.0.1", "port": 16514, "tls": false}}')
+    read -r code _ < <(api_send PUT /api/v1/audit-log/shipping '{"syslog": {"enabled": false, "host": "127.0.0.1", "port": 16514, "tls": false}}')
     kill "$SYSLOG_PID" 2> /dev/null || true
     rm -f "$SYSLOG_OUT"
     pass "audit entries (with hashes) are shipped to syslog as RFC 5424 and delivery is tracked"
@@ -1620,14 +1686,14 @@ grep -q "✓ " <<<"$follow_out" || fail "tond apps deploy must print phase progr
 queued_out=$(tond apps deploy e2e-whoami --no-follow 2>&1) || fail "tond apps deploy --no-follow failed: ${queued_out}"
 grep -q "queued" <<<"$queued_out" || fail "--no-follow must return once the deploy is queued: ${queued_out}"
 wait_for 300 "the --no-follow deploy to finish" \
-    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/apps/e2e-whoami/deployments | jq -e '[.data[] | select(.status == \"running\" or .status == \"queued\")] | length == 0'"
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/apps/e2e-whoami/deployments | jq -e '[.data[] | select(.status == \"running\" or .status == \"queued\")] | length == 0'"
 wait_for_app_running e2e-whoami 120
 pass "tond apps deploy follows phases to the end; --no-follow returns at once"
 
 step "Snapshot"
 tond snapshot create --name e2e-smoke > /dev/null
 wait_for 120 "e2e-smoke snapshot completed" \
-    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/snapshots | jq -e '.data[] | select(.name == \"e2e-smoke\" and .status == \"completed\")'"
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/snapshots | jq -e '.data[] | select(.name == \"e2e-smoke\" and .status == \"completed\")'"
 pass "full snapshot completed"
 
 step "Restart survival"
@@ -1641,34 +1707,34 @@ journalctl -u tond-server --since "-2min" --no-pager -o cat | grep -q "SIGTERM r
 pass "tond-server shut down gracefully on SIGTERM"
 # A restart in the middle of a deploy: the deployment is marked interrupted,
 # never left 'running'.
-api_req POST /api/apps/e2e-whoami/deploy '{}' > /dev/null
+api_req POST /api/v1/apps/e2e-whoami/deploy '{}' > /dev/null
 INTERRUPTED=$(jq -r .data.deployment_id "$API_BODY")
 systemctl kill -s SIGKILL tond-server
 wait_for 60 "API health after a crash" curl -sf http://127.0.0.1:3001/health
-status=$(api /api/apps/e2e-whoami/deployments | jq -r --arg id "$INTERRUPTED" '.data[] | select(.id == $id) | .status')
+status=$(api /api/v1/apps/e2e-whoami/deployments | jq -r --arg id "$INTERRUPTED" '.data[] | select(.id == $id) | .status')
 case "$status" in
     failed)
-        api /api/apps/e2e-whoami/deployments | jq -e --arg id "$INTERRUPTED" '.data[] | select(.id == $id) | .failure.code == "interrupted"' > /dev/null \
+        api /api/v1/apps/e2e-whoami/deployments | jq -e --arg id "$INTERRUPTED" '.data[] | select(.id == $id) | .failure.code == "interrupted"' > /dev/null \
             || fail "an interrupted deploy must say so"
         pass "a deploy cut off by a crash is marked failed (interrupted) at startup" ;;
     queued|running|succeeded)
         # It had not started yet (resumed from the queue) or finished first.
         wait_for 300 "the resumed deploy to finish" \
-            bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/apps/e2e-whoami/deployments | jq -e --arg id '${INTERRUPTED}' '.data[] | select(.id == \$id and (.status == \"succeeded\" or .status == \"failed\"))'"
+            bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/apps/e2e-whoami/deployments | jq -e --arg id '${INTERRUPTED}' '.data[] | select(.id == \$id and (.status == \"succeeded\" or .status == \"failed\"))'"
         pass "a deploy caught by the crash was resumed or had finished (status was ${status})" ;;
     *) fail "unexpected status for the interrupted deploy: '${status}'" ;;
 esac
-unfinished=$(api /api/apps/e2e-whoami/deployments | jq '[.data[] | select(.status == "running")] | length')
+unfinished=$(api /api/v1/apps/e2e-whoami/deployments | jq '[.data[] | select(.status == "running")] | length')
 wait_for 300 "no deployment left in flight" \
-    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/apps/e2e-whoami/deployments | jq -e '[.data[] | select(.status == \"running\" or .status == \"queued\")] | length == 0'"
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/apps/e2e-whoami/deployments | jq -e '[.data[] | select(.status == \"running\" or .status == \"queued\")] | length == 0'"
 wait_for_app_running e2e-whoami 120
 pass "startup reconciliation left nothing in flight (had ${unfinished} right after the crash)"
 
 step "Stability"
-running_runs=$(api "/api/cron/${CRON_ID}/runs" | jq '[.data[] | select(.status == "running")] | length')
+running_runs=$(api "/api/v1/cron/${CRON_ID}/runs" | jq '[.data[] | select(.status == "running")] | length')
 [[ "$running_runs" == 0 ]] || fail "no cron run may stay 'running' after a restart (found ${running_runs})"
 pass "no cron run left 'running' after the restart"
-[[ "$(api "/api/cron/${CRON_ID}" | jq -r '.data.status')" != running ]] \
+[[ "$(api "/api/v1/cron/${CRON_ID}" | jq -r '.data.status')" != running ]] \
     || fail "the cron job must not stay 'running' after its run finished"
 pass "cron job status settled after its run"
 

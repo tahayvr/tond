@@ -479,6 +479,9 @@ pub async fn run_once(db: &SqlitePool, policy: &RetentionPolicy) -> Result<Janit
     })
     .await?;
 
+    // ── idempotency keys past their 24 h window, and the row cap ──
+    crate::idempotency::prune(db, now.timestamp()).await?;
+
     // ── finished preview rows (their containers are already gone) ──
     let preview_cutoff = (now - chrono::Duration::days(7)).to_rfc3339();
     sqlx::query(

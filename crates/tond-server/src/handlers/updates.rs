@@ -1,28 +1,22 @@
 // handlers/updates.rs — System → Updates: Tond updating itself
 //
-//   GET  /api/system/update           (metrics:read) running version, latest
+//   GET  /api/v1/system/update           (metrics:read) running version, latest
 //                                     release, changelog, the current or last
 //                                     run (progress + log tail), rollback offer
-//   POST /api/system/update           (settings:write) {version?, skip_snapshot?, force?}
+//   POST /api/v1/system/update           (settings:write) {version?, skip_snapshot?, force?}
 //                                     snapshot, then update in tond-update.service
-//   POST /api/system/update/rollback  (settings:write) {skip_snapshot?} back to
+//   POST /api/v1/system/update/rollback  (settings:write) {skip_snapshot?} back to
 //                                     the previous version (within 7 days)
-//   POST /api/system/update/check     (settings:write) look for releases now
+//   POST /api/v1/system/update/check     (settings:write) look for releases now
 //                                     (throttled to once a minute)
-//   PUT  /api/system/update/settings  (settings:write) {check_enabled}
+//   PUT  /api/v1/system/update/settings  (settings:write) {check_enabled}
 //
 // Starting a run is audited here; its outcome is audited once it finishes
 // (updates::audit_finished_run). The dashboard polls GET while a run is going:
 // the server restarts in the middle, so there is no stream to keep open.
 // `tond update` uses the same endpoints over the root-only socket.
 
-use axum::{
-    Json, Router,
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    routing::{get, post, put},
-};
+use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
 use tond_common::{ApiResponse, TondError};
 
@@ -40,19 +34,12 @@ use crate::{
     },
 };
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/api/system/update", get(get_update).post(start_update))
-        .route("/api/system/update/rollback", post(start_rollback))
-        .route("/api/system/update/check", post(check_now))
-        .route("/api/system/update/settings", put(update_settings))
-}
-
 fn ok<T: Serialize>(status: StatusCode, body: T) -> impl IntoResponse {
     (status, Json(ApiResponse::ok(body)))
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ReleaseResponse {
     pub version: String,
     pub tag: String,
@@ -77,6 +64,7 @@ impl From<&releases::Release> for ReleaseResponse {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct CheckResponse {
     pub enabled: bool,
     pub checked_at: Option<i64>,
@@ -84,6 +72,7 @@ pub struct CheckResponse {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct RunResponse {
     #[serde(flatten)]
     pub status: RunStatus,
@@ -94,6 +83,7 @@ pub struct RunResponse {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct UpdateOverview {
     pub current_version: String,
     pub schema_version: Option<i64>,
@@ -173,6 +163,7 @@ pub async fn get_update(
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct StartUpdateRequest {
     /// The version to install (default: the latest release).
@@ -289,6 +280,7 @@ pub async fn start_update(
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct StartRollbackRequest {
     #[serde(default)]
@@ -373,6 +365,7 @@ pub async fn check_now(
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct UpdateSettingsRequest {
     pub check_enabled: bool,

@@ -1,9 +1,9 @@
 // commands/update.rs — `tond update`: update Tond, or roll it back
 //
 // The normal path is the same as the dashboard's (System → Updates): ask
-// tond-server (POST /api/system/update, or …/rollback) to take a full snapshot
+// tond-server (POST /api/v1/system/update, or …/rollback) to take a full snapshot
 // and start the update in a transient systemd unit, then follow its progress
-// (GET /api/system/update) across the server's restart and exit with the
+// (GET /api/v1/system/update) across the server's restart and exit with the
 // outcome. `--check` only reports whether a newer release exists.
 //
 // `--direct` does the update itself, without the server: download the release
@@ -24,6 +24,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use crate::client::TondClient;
+use crate::output::{Output, note, outln};
 use crate::signature::{self, Verdict};
 
 const FALLBACK_SCRIPT: &str = "/opt/tond/bin/update.sh";
@@ -52,6 +53,7 @@ pub struct UpdateArgs {
 pub async fn handle(
     connect: impl FnOnce() -> Result<TondClient>,
     remote: bool,
+    out: &Output,
     mut args: UpdateArgs,
 ) -> Result<()> {
     args.version = args
@@ -64,24 +66,26 @@ pub async fn handle(
                 "--direct and --dry-run run on the server itself; drop --server and run them there as root."
             );
         }
-        return direct(&args);
+        return direct(out, &args);
     }
 
     let client = match connect() {
         Ok(c) => c,
         Err(e) if !remote && !args.check => {
-            eprintln!(
+            note!(
+                out,
                 "Warning: tond-server isn't answering ({e:#}).\n\
                  Updating directly instead, without taking a snapshot first."
             );
-            return direct(&args);
+            return direct(out, &args);
         }
         Err(e) => return Err(e),
     };
 
     if args.check {
         let overview = client.check_updates().await?;
-        print_overview(&overview);
+        out.json(&overview)?;
+        print_overview(out, &overview);
         return Ok(());
     }
 
@@ -93,7 +97,8 @@ pub async fn handle(
             .await?
     };
     let run_id = status["id"].as_str().unwrap_or_default().to_string();
-    println!(
+    outln!(
+        out,
         "{} Tond {} → {}{}",
         if args.rollback {
             "Rolling back"
@@ -108,19 +113,20 @@ pub async fn handle(
             " (taking a full snapshot first)"
         }
     );
-    follow(&client, &run_id).await
+    follow(&client, out, &run_id).await
 }
 
 /// Print the version check.
-fn print_overview(o: &Value) {
+fn print_overview(out: &Output, o: &Value) {
     let current = o["current_version"].as_str().unwrap_or("?");
-    println!("Running: Tond {current}");
+    outln!(out, "Running: Tond {current}");
     match o["latest"]["version"].as_str() {
         Some(latest) if o["update_available"].as_bool() == Some(true) => {
-            println!("Available: Tond {latest}");
+            outln!(out, "Available: Tond {latest}");
             if let Some(changelog) = o["changelog"].as_array() {
                 for release in changelog {
-                    println!(
+                    outln!(
+                        out,
                         "\n── {} ({})",
                         release["name"].as_str().unwrap_or_default(),
                         release["published_at"]
@@ -134,20 +140,21 @@ fn print_overview(o: &Value) {
                         .lines()
                         .take(40)
                     {
-                        println!("  {line}");
+                        outln!(out, "  {line}");
                     }
                 }
             }
-            println!("\nUpdate with: sudo tond update");
+            outln!(out, "\nUpdate with: sudo tond update");
         }
-        Some(latest) => println!("Up to date (latest release: {latest})."),
-        None => println!("No release information yet."),
+        Some(latest) => outln!(out, "Up to date (latest release: {latest})."),
+        None => outln!(out, "No release information yet."),
     }
     if let Some(err) = o["check"]["error"].as_str() {
-        println!("The last check failed: {err}");
+        outln!(out, "The last check failed: {err}");
     }
     if let Some(rb) = o["rollback"].as_object() {
-        println!(
+        outln!(
+            out,
             "Rollback to {} is available (sudo tond update --rollback).",
             rb.get("to_version").and_then(Value::as_str).unwrap_or("?")
         );
@@ -199,7 +206,7 @@ pub fn run_outcome(run: &Value, run_id: &str) -> RunOutcome {
 
 /// Follow a run until it finishes, printing its log. The server restarts in
 /// the middle: failed requests are expected and retried.
-async fn follow(client: &TondClient, run_id: &str) -> Result<()> {
+async fn follow(client: &TondClient, out: &Output, run_id: &str) -> Result<()> {
     let started = Instant::now();
     let mut seen: Vec<String> = Vec::new();
     let mut offline_since: Option<Instant> = None;
@@ -207,7 +214,8 @@ async fn follow(client: &TondClient, run_id: &str) -> Result<()> {
         match client.get_update().await {
             Ok(overview) => {
                 if let Some(since) = offline_since.take() {
-                    println!(
+                    outln!(
+                        out,
                         "  (tond-server is back after {} s)",
                         since.elapsed().as_secs()
                     );
@@ -223,14 +231,15 @@ async fn follow(client: &TondClient, run_id: &str) -> Result<()> {
                     .unwrap_or_default();
                 if run["id"].as_str() == Some(run_id) || run_id.is_empty() {
                     for line in new_log_lines(&seen, &log) {
-                        println!("  {line}");
+                        outln!(out, "  {line}");
                     }
                     seen = log;
                 }
                 match run_outcome(run, run_id) {
                     RunOutcome::Running => {}
                     RunOutcome::Succeeded(msg) => {
-                        println!("{msg}");
+                        out.json(run)?;
+                        outln!(out, "{msg}");
                         return Ok(());
                     }
                     RunOutcome::Failed(msg) => bail!("{msg}"),
@@ -238,7 +247,7 @@ async fn follow(client: &TondClient, run_id: &str) -> Result<()> {
             }
             Err(_) => {
                 if offline_since.is_none() {
-                    println!("  (tond-server is restarting; waiting for it…)");
+                    outln!(out, "  (tond-server is restarting; waiting for it…)");
                     offline_since = Some(Instant::now());
                 }
             }
@@ -357,7 +366,7 @@ pub fn script_args(args: &UpdateArgs) -> Vec<String> {
 }
 
 /// Update (or roll back) without tond-server.
-fn direct(args: &UpdateArgs) -> Result<()> {
+fn direct(out: &Output, args: &UpdateArgs) -> Result<()> {
     let is_root = is_running_as_root();
     if !is_root && !sudo_available() {
         bail!(
@@ -369,24 +378,25 @@ fn direct(args: &UpdateArgs) -> Result<()> {
     if args.rollback {
         let mut cmd_args = vec!["--rollback".to_string()];
         cmd_args.extend(script_args_without_force(args));
-        return run_and_report(Path::new(FALLBACK_SCRIPT), &cmd_args, is_root);
+        return run_and_report(out, Path::new(FALLBACK_SCRIPT), &cmd_args, is_root);
     }
 
     let tmp_dir = create_temp_dir().context("Failed to create temporary directory")?;
-    let result = match download_bundle(&tmp_dir, args.version.as_deref()) {
+    let result = match download_bundle(out, &tmp_dir, args.version.as_deref()) {
         Ok(bundle) => {
             let mut cmd_args = vec![
                 "--bundle".to_string(),
                 bundle.to_string_lossy().into_owned(),
             ];
             cmd_args.extend(script_args(args));
-            run_and_report(&bundle.join("update.sh"), &cmd_args, is_root)
+            run_and_report(out, &bundle.join("update.sh"), &cmd_args, is_root)
         }
         Err(DownloadError::Untrusted(e)) => Err(e),
         Err(DownloadError::Unavailable(e)) => {
             let fallback = Path::new(FALLBACK_SCRIPT);
             if fallback.exists() {
-                eprintln!(
+                note!(
+                    out,
                     "Warning: could not download the release ({e:#}).\n\
                      Falling back to the installed {FALLBACK_SCRIPT} (it downloads the release itself)."
                 );
@@ -396,7 +406,7 @@ fn direct(args: &UpdateArgs) -> Result<()> {
                     cmd_args.push(v.clone());
                 }
                 cmd_args.extend(script_args(args));
-                run_and_report(fallback, &cmd_args, is_root)
+                run_and_report(out, fallback, &cmd_args, is_root)
             } else {
                 Err(anyhow::anyhow!(
                     "Could not download the release ({e:#}), and {FALLBACK_SCRIPT} doesn't exist. \
@@ -416,17 +426,25 @@ fn script_args_without_force(args: &UpdateArgs) -> Vec<String> {
         .collect()
 }
 
-fn run_and_report(script: &Path, args: &[String], is_root: bool) -> Result<()> {
-    let status = if is_root {
-        process::Command::new(script).args(args).status()
+fn run_and_report(out: &Output, script: &Path, args: &[String], is_root: bool) -> Result<()> {
+    let mut cmd = if is_root {
+        process::Command::new(script)
     } else {
-        process::Command::new("sudo")
-            .arg(script)
-            .args(args)
-            .status()
+        let mut sudo = process::Command::new("sudo");
+        sudo.arg(script);
+        sudo
+    };
+    cmd.args(args);
+    // With --json the script's progress goes to stderr: stdout holds only
+    // the JSON result.
+    if out.is_json() {
+        cmd.stdout(process::Stdio::from(std::io::stderr()));
     }
-    .with_context(|| format!("Failed to run {}", script.display()))?;
+    let status = cmd
+        .status()
+        .with_context(|| format!("Failed to run {}", script.display()))?;
     if status.success() {
+        out.json(&serde_json::json!({ "ok": true, "script": script.display().to_string() }))?;
         return Ok(());
     }
     match status.code() {
@@ -441,7 +459,11 @@ fn run_and_report(script: &Path, args: &[String], is_root: bool) -> Result<()> {
 }
 
 /// Download, verify and extract the release bundle into `dir`.
-fn download_bundle(dir: &Path, version: Option<&str>) -> Result<PathBuf, DownloadError> {
+fn download_bundle(
+    out: &Output,
+    dir: &Path,
+    version: Option<&str>,
+) -> Result<PathBuf, DownloadError> {
     let tag = resolve_tag(version)?;
     let url = tarball_url(&tag);
     let bundle = bundle_name();
@@ -449,7 +471,7 @@ fn download_bundle(dir: &Path, version: Option<&str>) -> Result<PathBuf, Downloa
     let tarball_path = dir.join("tond.tar.gz");
     let checksum_path = dir.join("tond.tar.gz.sha256");
 
-    println!("Downloading {url}");
+    note!(out, "Downloading {url}");
     let status = process::Command::new("curl")
         .args(["-fsSL", "-o"])
         .arg(&tarball_path)
@@ -484,7 +506,7 @@ fn download_bundle(dir: &Path, version: Option<&str>) -> Result<PathBuf, Downloa
             "checksum mismatch for {url} (download corrupted or tampered with)"
         )));
     }
-    println!("Checksum verified.");
+    note!(out, "Checksum verified.");
 
     let signature_path = dir.join("tond.tar.gz.minisig");
     let signature = if download_optional(&format!("{url}.minisig"), &signature_path)? {
@@ -500,8 +522,8 @@ fn download_bundle(dir: &Path, version: Option<&str>) -> Result<PathBuf, Downloa
         signature::release_public_key(),
         signature::allow_unsigned_from_env(),
     ) {
-        Ok(Verdict::Verified) => println!("Signature of {tag} verified."),
-        Ok(Verdict::Unverified(why)) => eprintln!("Warning: {why}."),
+        Ok(Verdict::Verified) => note!(out, "Signature of {tag} verified."),
+        Ok(Verdict::Unverified(why)) => note!(out, "Warning: {why}."),
         Err(e) => return Err(DownloadError::Untrusted(e)),
     }
 

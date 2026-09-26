@@ -38,7 +38,7 @@ set -euo pipefail
 # (changes made since are lost — the dashboard and `tond update --rollback`
 # take a snapshot first). A failed rollback puts the current version back.
 #
-# Progress goes to <data>/update/status.json (read by GET /api/system/update)
+# Progress goes to <data>/update/status.json (read by GET /api/v1/system/update)
 # and to stdout (appended to <data>/update/update.log by the unit).
 #
 # Exit codes: 0 updated / rolled back / nothing to do, 1 failed (nothing
@@ -428,11 +428,11 @@ installed_version() {
     echo "${v:-unknown}"
 }
 
-# api_field NAME — a numeric or string field of GET /api/system/update from
+# api_field NAME — a numeric or string field of GET /api/v1/system/update from
 # the running tond-server, over the root-only socket (empty when unavailable).
 api_field() {
     local body
-    body="$(curl -sf --max-time 5 --unix-socket "$SOCKET_PATH" http://tond/api/system/update 2>/dev/null || true)"
+    body="$(curl -sf --max-time 5 --unix-socket "$SOCKET_PATH" http://tond/api/v1/system/update 2>/dev/null || true)"
     printf '%s' "$body" | sed -n "s/.*\"$1\":\"\{0,1\}\([^\",}]*\)\"\{0,1\}[,}].*/\1/p" | head -n 1
 }
 

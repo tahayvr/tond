@@ -2,35 +2,35 @@
 //
 // Endpoints for managing per-app git integration settings:
 //
-//   PUT  /api/apps/{id}/auto-deploy
+//   PUT  /api/v1/apps/{id}/auto-deploy
 //     Enable or disable auto-deploy on webhook push. Also sets the branch
 //     filter. Returns the updated app.
 //
-//   GET  /api/apps/{id}/webhook
+//   GET  /api/v1/apps/{id}/webhook
 //     Webhook URLs (per provider) and whether a secret is set, for setting up
 //     GitHub/GitLab/Gitea/generic webhooks. The secret itself is write-only.
 //
-//   GET  /api/apps/{id}/webhook-secret
+//   GET  /api/v1/apps/{id}/webhook-secret
 //     Reveal the webhook secret (admin only, audit-logged).
 //
-//   PUT  /api/apps/{id}/webhook-secret
+//   PUT  /api/v1/apps/{id}/webhook-secret
 //     Replace the webhook secret with a caller-chosen value ({ "secret": "..." },
 //     at least MIN_WEBHOOK_SECRET_LEN characters). Verification cannot be
 //     disabled: every webhook must be signed.
 //
-//   POST /api/apps/{id}/webhook-secret/rotate
+//   POST /api/v1/apps/{id}/webhook-secret/rotate
 //     Replace the webhook secret with a fresh random one; returns the new
 //     secret once (audit-logged).
 //
-//   POST /api/apps/{id}/deploy-key
+//   POST /api/v1/apps/{id}/deploy-key
 //     Generate (or regenerate) an Ed25519 SSH deploy key for the app.
 //     Stores the private key on disk at $TOND_DATA_DIR/keys/<app_id>/id_ed25519
 //     and the public key in the `deploy_key_pub` column. Returns the public key.
 //
-//   GET  /api/apps/{id}/deploy-key
+//   GET  /api/v1/apps/{id}/deploy-key
 //     Returns the current public deploy key (or 404 if none generated yet).
 //
-//   POST /api/git/branches
+//   POST /api/v1/git/branches
 //     List a repository's branches and default branch (`git ls-remote`) for
 //     the new-app wizard's branch picker.
 
@@ -77,7 +77,7 @@ async fn fetch_app(db: &sqlx::SqlitePool, id_or_name: &str) -> Result<tond_commo
 
 // ── Auto-deploy toggle ──────────────────────────────────────────────────────
 
-/// PUT /api/apps/{id}/auto-deploy
+/// PUT /api/v1/apps/{id}/auto-deploy
 ///
 /// Body: { "auto_deploy": true, "watch_branch": "main" }
 /// Enables or disables automatic deploys when a webhook fires.
@@ -147,7 +147,7 @@ async fn webhook_config(
     })
 }
 
-/// GET /api/apps/{id}/webhook
+/// GET /api/v1/apps/{id}/webhook
 ///
 /// Returns the webhook URLs for every provider and whether a secret is set.
 pub async fn get_webhook_config(
@@ -161,7 +161,7 @@ pub async fn get_webhook_config(
     Ok((StatusCode::OK, Json(ApiResponse::ok(config))))
 }
 
-/// GET /api/apps/{id}/webhook-secret
+/// GET /api/v1/apps/{id}/webhook-secret
 ///
 /// Reveals the current secret, for pasting into a provider's webhook form.
 /// Needs env:read-values (a stored secret, like env values); every reveal is
@@ -191,7 +191,7 @@ pub async fn reveal_webhook_secret(
     ))
 }
 
-/// PUT /api/apps/{id}/webhook-secret
+/// PUT /api/v1/apps/{id}/webhook-secret
 ///
 /// Body: { "secret": "my-long-secret" }
 /// Replaces the secret used to verify GitHub/Gitea/generic signatures and the
@@ -242,7 +242,7 @@ fn validate_webhook_secret(secret: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-/// POST /api/apps/{id}/webhook-secret/rotate
+/// POST /api/v1/apps/{id}/webhook-secret/rotate
 ///
 /// Generates a new random secret. The old one stops working immediately, so
 /// the provider's webhook settings must be updated with the returned value,
@@ -278,7 +278,7 @@ pub async fn rotate_webhook_secret(
 
 // ── Deploy keys ─────────────────────────────────────────────────────────────
 
-/// POST /api/apps/{id}/deploy-key
+/// POST /api/v1/apps/{id}/deploy-key
 ///
 /// Generate (or regenerate) an Ed25519 SSH deploy key for this app.
 /// Private key stored at $TOND_DATA_DIR/keys/<app_id>/id_ed25519 (mode 0600).
@@ -339,7 +339,7 @@ pub async fn generate_deploy_key(
     ))
 }
 
-/// GET /api/apps/{id}/deploy-key
+/// GET /api/v1/apps/{id}/deploy-key
 ///
 /// Returns the current public deploy key. 404 if no key has been generated yet.
 pub async fn get_deploy_key(
@@ -387,7 +387,7 @@ fn generate_ed25519_keypair(comment: &str) -> anyhow::Result<(String, String)> {
 
 // ── Source update ───────────────────────────────────────────────────────────
 
-/// PUT /api/apps/{id}/source
+/// PUT /api/v1/apps/{id}/source
 ///
 /// Body: { "source_type": "git"|"image"|"tarball", "source_url": "..." }
 /// Updates the deployment source type and URL for the app.
@@ -448,8 +448,9 @@ pub async fn update_source(
 
 // ── Remote branches (new-app wizard) ────────────────────────────────────────
 
-/// POST /api/git/branches request body.
+/// POST /api/v1/git/branches request body.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct RemoteBranchesRequest {
     /// Repository URL (http/https; credentials in the URL are used, not echoed)
     pub url: String,
@@ -459,8 +460,9 @@ pub struct RemoteBranchesRequest {
     pub gitlab_token_id: Option<String>,
 }
 
-/// POST /api/git/branches response.
+/// POST /api/v1/git/branches response.
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct RemoteBranchesResponse {
     /// The repository's default branch (its HEAD), when the server says
     pub default_branch: Option<String>,
@@ -475,7 +477,7 @@ const MAX_BRANCHES: usize = 200;
 /// `git ls-remote` gives up after this long.
 const LS_REMOTE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// POST /api/git/branches
+/// POST /api/v1/git/branches
 ///
 /// Body: { "url": "https://github.com/o/r.git", "github_app_id"?: "...", "gitlab_token_id"?: "..." }
 /// Lists a repository's branches and its default branch with

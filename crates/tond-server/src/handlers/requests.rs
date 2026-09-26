@@ -1,18 +1,18 @@
 // handlers/requests.rs — request metric endpoints (tond-proxy traffic)
 //
 // Routes (scope metrics:read):
-//   GET /api/apps/{id}/requests?range=1h|6h|24h|7d|30d|90d
-//   GET /api/previews/{id}/requests?range=…
+//   GET /api/v1/apps/{id}/requests?range=1h|6h|24h|7d|30d|90d
+//   GET /api/v1/previews/{id}/requests?range=…
 //     Series (≤ ~480 buckets: RPS by status class, 5xx %, p50/p95/p99,
 //     bandwidth), a summary over the window, the last minute from memory,
 //     and chart markers (deploys, rollbacks, restarts, crashes, OOM kills).
 //     `{id}` may be the app's id or name.
 //
-//   GET /api/system/requests?range=…
+//   GET /api/v1/system/requests?range=…
 //     Server-wide totals plus the busiest apps and the apps with the most
 //     5xx responses (home page tile).
 //
-//   GET /api/previews/{id}/metrics?range=1h|24h|7d|30d
+//   GET /api/v1/previews/{id}/metrics?range=1h|24h|7d|30d
 //     A preview's container metrics (same shape as the app endpoint).
 
 use axum::{
