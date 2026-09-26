@@ -538,7 +538,9 @@ async fn post_webhook_checked(
         .json(&payload)
         .timeout(std::time::Duration::from_secs(10))
         .send()
-        .await?;
+        .await
+        // The URL may carry a secret (Slack-style webhook paths).
+        .map_err(reqwest::Error::without_url)?;
     if !response.status().is_success() {
         anyhow::bail!("Webhook answered HTTP {}", response.status().as_u16());
     }

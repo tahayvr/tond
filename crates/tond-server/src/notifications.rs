@@ -114,7 +114,10 @@ async fn send_telegram(
         .json(&body)
         .timeout(std::time::Duration::from_secs(10))
         .send()
-        .await?;
+        .await
+        // reqwest errors print the URL, which carries the bot token or
+        // webhook secret: never let it reach logs or the dashboard.
+        .map_err(reqwest::Error::without_url)?;
 
     if !resp.status().is_success() {
         let text = resp.text().await.unwrap_or_default();
@@ -138,7 +141,10 @@ async fn send_discord(
         .json(&body)
         .timeout(std::time::Duration::from_secs(10))
         .send()
-        .await?;
+        .await
+        // reqwest errors print the URL, which carries the bot token or
+        // webhook secret: never let it reach logs or the dashboard.
+        .map_err(reqwest::Error::without_url)?;
 
     if !resp.status().is_success() {
         let text = resp.text().await.unwrap_or_default();
@@ -159,7 +165,10 @@ async fn send_slack(cfg: &tond_common::SlackConfig, payload: &NotificationPayloa
         .json(&body)
         .timeout(std::time::Duration::from_secs(10))
         .send()
-        .await?;
+        .await
+        // reqwest errors print the URL, which carries the bot token or
+        // webhook secret: never let it reach logs or the dashboard.
+        .map_err(reqwest::Error::without_url)?;
 
     if !resp.status().is_success() {
         let text = resp.text().await.unwrap_or_default();
@@ -209,6 +218,21 @@ async fn send_email(cfg: &EmailConfig, payload: &NotificationPayload) -> Result<
 mod tests {
     use super::*;
     use tond_common::{DiscordConfig, EmailConfig, SlackConfig, TelegramConfig};
+
+    #[tokio::test]
+    async fn delivery_errors_never_contain_the_webhook_url() {
+        // Nothing listens on port 9: the request fails before any response.
+        let cfg = DiscordConfig {
+            webhook_url: "http://127.0.0.1:9/api/webhooks/123/SUPERSECRET".to_string(),
+        };
+        let err = send_discord(&cfg, &sample_payload())
+            .await
+            .err()
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_default();
+        assert!(!err.is_empty(), "the request must fail");
+        assert!(!err.contains("SUPERSECRET"), "leaked the URL: {err}");
+    }
 
     fn sample_payload() -> NotificationPayload {
         NotificationPayload {
