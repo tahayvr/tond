@@ -93,6 +93,9 @@ pub enum CertOutcome {
     Issued {
         issued_at: String,
         expires_at: String,
+        /// The issuing CA as named in the certificate (O and CN).
+        #[serde(default)]
+        issuer: Option<String>,
     },
     /// The attempt failed or was skipped (DNS pre-check). `status` is what
     /// the dashboard shows: 'active' while an older certificate still serves,

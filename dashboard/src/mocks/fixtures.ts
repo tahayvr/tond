@@ -14,6 +14,9 @@ import type {
 	AuditLogEntry,
 	BackupConfig,
 	Certificate,
+	RetentionSettings,
+	AuditShipping,
+	AppEvent,
 	CronJob,
 	CronJobRun,
 	Deployment,
@@ -627,9 +630,202 @@ export const MOCK_DATABASE_LINKS: { database_id: string; app_id: string }[] = [
 	{ database_id: 'db_redis1', app_id: 'app_pending' }
 ];
 
+// ── Retention ──────────────────────────────────────────────────────────────
+
+const MB = 1024 * 1024;
+
+export const MOCK_RETENTION: RetentionSettings = {
+	fields: [
+		{
+			key: 'retention_deploy_logs_deployments',
+			value: 30,
+			default: 30,
+			min: 1,
+			max: 500,
+			unit: 'deploys'
+		},
+		{ key: 'retention_deploy_logs_days', value: 90, default: 90, min: 1, max: 365, unit: 'days' },
+		{
+			key: 'retention_deployments_per_app',
+			value: 50,
+			default: 50,
+			min: 30,
+			max: 1000,
+			unit: 'deploys'
+		},
+		{
+			key: 'retention_cron_runs_per_job',
+			value: 100,
+			default: 100,
+			min: 10,
+			max: 1000,
+			unit: 'runs'
+		},
+		{ key: 'retention_cron_runs_days', value: 30, default: 30, min: 1, max: 365, unit: 'days' },
+		{ key: 'retention_audit_log_days', value: 180, default: 180, min: 30, max: 3650, unit: 'days' },
+		{ key: 'retention_app_events_days', value: 90, default: 90, min: 7, max: 365, unit: 'days' },
+		{
+			key: 'retention_alert_history_days',
+			value: 90,
+			default: 90,
+			min: 7,
+			max: 365,
+			unit: 'days'
+		}
+	],
+	database: {
+		file_bytes: 38.4 * MB,
+		wal_bytes: 4.1 * MB,
+		free_bytes: 1.2 * MB,
+		tables: [
+			{ name: 'deploy_logs', bytes: 14.2 * MB },
+			{ name: 'metrics_1h', bytes: 7.9 * MB },
+			{ name: 'metrics_5m', bytes: 5.1 * MB },
+			{ name: 'audit_log', bytes: 3.6 * MB },
+			{ name: 'metrics_raw', bytes: 2.8 * MB },
+			{ name: 'cron_job_runs', bytes: 1.9 * MB },
+			{ name: 'deployments', bytes: 0.9 * MB },
+			{ name: 'metric_events', bytes: 0.3 * MB },
+			{ name: 'apps', bytes: 0.1 * MB },
+			{ name: 'sessions', bytes: 0.05 * MB }
+		],
+		measured_at: new Date().toISOString()
+	}
+};
+
+// ── Audit log shipping ─────────────────────────────────────────────────────
+
+export const MOCK_AUDIT_SHIPPING: AuditShipping = {
+	syslog: {
+		enabled: true,
+		host: 'logs.example.net',
+		port: 6514,
+		tls: true,
+		status: {
+			shipped_seq: 1284,
+			pending: 0,
+			failures: 0,
+			last_attempt_at: new Date(Date.now() - 4 * 60_000).toISOString(),
+			last_success_at: new Date(Date.now() - 4 * 60_000).toISOString(),
+			last_error: null,
+			next_attempt_at: null,
+			dropped: 0
+		}
+	},
+	webhook: {
+		enabled: false,
+		url: '',
+		has_secret: false,
+		status: {
+			shipped_seq: 0,
+			pending: 1284,
+			failures: 0,
+			last_attempt_at: null,
+			last_success_at: null,
+			last_error: null,
+			next_attempt_at: null,
+			dropped: 0
+		}
+	},
+	latest_seq: 1284
+};
+
+// ── App events ─────────────────────────────────────────────────────────────
+
+const hoursAgo = (h: number) => new Date(Date.now() - h * 3_600_000).toISOString();
+
+export function makeMockAppEvents(appId: string): AppEvent[] {
+	const events: AppEvent[] = [
+		{
+			at: hoursAgo(0.3),
+			kind: 'deploy_succeeded',
+			severity: 'success',
+			title: 'Deploy succeeded in 1 min 12 s',
+			detail: 'a1b2c3d Fix login redirect',
+			actor: 'dev@example.com',
+			deployment_id: 'dep_001'
+		},
+		{
+			at: hoursAgo(2),
+			kind: 'resources_changed',
+			severity: 'info',
+			title: 'Resource limits changed',
+			detail: 'memory=512MiB cpu=1',
+			actor: 'dev@example.com',
+			deployment_id: null
+		},
+		{
+			at: hoursAgo(5),
+			kind: 'oom',
+			severity: 'danger',
+			title: 'Killed: out of memory',
+			detail: 'exit code 137 (killed by the kernel: out of memory)',
+			actor: null,
+			deployment_id: null
+		},
+		{
+			at: hoursAgo(4.9),
+			kind: 'alert_fired',
+			severity: 'danger',
+			title: 'Alert fired: Out of memory',
+			detail: 'severity critical',
+			actor: null,
+			deployment_id: null
+		},
+		{
+			at: hoursAgo(5.1),
+			kind: 'restart',
+			severity: 'warning',
+			title: 'Container restarted',
+			detail: 'exit code 137',
+			actor: null,
+			deployment_id: null
+		},
+		{
+			at: hoursAgo(26),
+			kind: 'deploy_failed',
+			severity: 'danger',
+			title: 'Deploy failed',
+			detail: 'build failed: npm ERR! missing script: build',
+			actor: 'github push',
+			deployment_id: 'dep_002'
+		},
+		{
+			at: hoursAgo(49),
+			kind: 'cert_issued',
+			severity: 'success',
+			title: 'HTTPS certificate issued for api.example.com',
+			detail: null,
+			actor: null,
+			deployment_id: null
+		},
+		{
+			at: hoursAgo(50),
+			kind: 'domain_changed',
+			severity: 'info',
+			title: 'Domain changed',
+			detail: 'domain=api.example.com',
+			actor: 'dev@example.com',
+			deployment_id: null
+		},
+		{
+			at: hoursAgo(72),
+			kind: 'control',
+			severity: 'info',
+			title: 'Restarted',
+			detail: null,
+			actor: 'ops-token',
+			deployment_id: null
+		}
+	];
+	return appId === 'app_running' ? events : events.slice(4);
+}
+
 // ── Certificates ───────────────────────────────────────────────────────────
 
 const minutesFromNow = (m: number) => new Date(Date.now() + m * 60_000).toISOString();
+
+const daysFromNow = (d: number) => new Date(Date.now() + d * 86_400_000).toISOString();
 
 export const MOCK_CERTIFICATES: Certificate[] = [
 	{
@@ -637,12 +833,16 @@ export const MOCK_CERTIFICATES: Certificate[] = [
 		domain: 'api.example.com',
 		cert_type: 'acme',
 		status: 'active',
-		issued_at: '2026-08-01T00:00:00Z',
-		expires_at: '2026-10-30T00:00:00Z',
+		issued_at: daysFromNow(-24),
+		expires_at: daysFromNow(66),
 		last_error: null,
-		last_attempt_at: '2026-08-01T00:00:00Z',
+		last_attempt_at: daysFromNow(-24),
 		next_retry_at: null,
-		failure_count: 0
+		failure_count: 0,
+		issuer: "Let's Encrypt R11",
+		issuer_kind: 'letsencrypt',
+		last_renewed_at: daysFromNow(-24),
+		serves: { kind: 'app', app_id: 'app_running', app_name: 'api-service' }
 	},
 	{
 		id: 'cert-002',
@@ -655,7 +855,11 @@ export const MOCK_CERTIFICATES: Certificate[] = [
 			"DNS for app.example.com points to 1.2.3.4, expected 5.6.7.8. Update the domain's A/AAAA record to this server.",
 		last_attempt_at: minutesFromNow(-4),
 		next_retry_at: minutesFromNow(12),
-		failure_count: 4
+		failure_count: 4,
+		issuer: null,
+		issuer_kind: 'unknown',
+		last_renewed_at: null,
+		serves: { kind: 'app', app_id: 'app_stopped', app_name: 'web-frontend' }
 	},
 	{
 		id: 'cert-003',
@@ -668,7 +872,66 @@ export const MOCK_CERTIFICATES: Certificate[] = [
 			'polling order ready: order failed: 403 urn:ietf:params:acme:error:unauthorized: Invalid response from http://dash.example.com/.well-known/acme-challenge/abc: 404',
 		last_attempt_at: minutesFromNow(-1),
 		next_retry_at: minutesFromNow(1),
-		failure_count: 1
+		failure_count: 1,
+		issuer: null,
+		issuer_kind: 'unknown',
+		last_renewed_at: null,
+		serves: { kind: 'dashboard' }
+	},
+	{
+		id: 'cert-004',
+		domain: 'shop.example.com',
+		cert_type: 'acme',
+		status: 'active',
+		issued_at: daysFromNow(-80),
+		expires_at: daysFromNow(10),
+		last_error:
+			'polling order ready: order failed: urn:ietf:params:acme:error:connection: Timeout during connect (likely firewall problem)',
+		last_attempt_at: minutesFromNow(-90),
+		next_retry_at: minutesFromNow(150),
+		failure_count: 6,
+		issuer: "Let's Encrypt R10",
+		issuer_kind: 'letsencrypt',
+		last_renewed_at: daysFromNow(-80),
+		serves: { kind: 'app', app_id: 'app_running', app_name: 'api-service' }
+	},
+	{
+		id: 'cert-005',
+		domain: 'a1b2c3-api-service.example-previews.com',
+		cert_type: 'acme',
+		status: 'active',
+		issued_at: daysFromNow(-2),
+		expires_at: daysFromNow(88),
+		last_error: null,
+		last_attempt_at: daysFromNow(-2),
+		next_retry_at: null,
+		failure_count: 0,
+		issuer: "(STAGING) Let's Encrypt (STAGING) Riddling Rhubarb R12",
+		issuer_kind: 'letsencrypt_staging',
+		last_renewed_at: daysFromNow(-2),
+		serves: {
+			kind: 'preview',
+			app_id: 'app_running',
+			app_name: 'api-service',
+			preview_id: 'prev_1',
+			pr_number: 42
+		}
+	},
+	{
+		id: 'cert-006',
+		domain: 'old.example.com',
+		cert_type: 'acme',
+		status: 'active',
+		issued_at: daysFromNow(-50),
+		expires_at: daysFromNow(40),
+		last_error: null,
+		last_attempt_at: daysFromNow(-50),
+		next_retry_at: null,
+		failure_count: 0,
+		issuer: "Let's Encrypt R11",
+		issuer_kind: 'letsencrypt',
+		last_renewed_at: daysFromNow(-50),
+		serves: { kind: 'unused' }
 	}
 ];
 

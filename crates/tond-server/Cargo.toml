@@ -54,6 +54,9 @@ bytes = { workspace = true }
 tar = { workspace = true }
 walkdir = { workspace = true }
 portable-pty = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-platform-verifier = { workspace = true }
 
 [dev-dependencies]
 filetime = { workspace = true }

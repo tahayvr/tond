@@ -18,6 +18,8 @@ hex = { workspace = true }
 anyhow = { workspace = true }
 serde_with = { workspace = true }
 rustls = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

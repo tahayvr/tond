@@ -73,6 +73,8 @@ pub enum Purpose {
     /// SMTP passwords, ntfy topics/tokens, Pushover/Gotify tokens, webhook
     /// signing secrets; see INTEGRATION_SECRET_FIELDS)
     IntegrationSecret,
+    /// audit_shipping.webhook_secret (HMAC key for shipped audit entries)
+    AuditWebhookSecret,
 }
 
 impl Purpose {
@@ -95,6 +97,7 @@ impl Purpose {
             Purpose::GithubWebhookSecret => b"tond:github_apps.webhook_secret",
             Purpose::GithubPrivateKey => b"tond:github_apps.private_key",
             Purpose::IntegrationSecret => b"tond:integrations.config",
+            Purpose::AuditWebhookSecret => b"tond:audit_shipping.webhook_secret",
         }
     }
 }
@@ -484,6 +487,11 @@ pub const SCALAR_SECRET_COLUMNS: &[(&str, &str, Purpose)] = &[
         Purpose::GithubWebhookSecret,
     ),
     ("github_apps", "private_key", Purpose::GithubPrivateKey),
+    (
+        "audit_shipping",
+        "webhook_secret",
+        Purpose::AuditWebhookSecret,
+    ),
 ];
 
 /// Secrets stored as string fields inside a `config` JSON column.

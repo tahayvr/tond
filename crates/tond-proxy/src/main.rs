@@ -945,12 +945,14 @@ impl ProxyHttp for TondProxy {
 
 fn main() {
     tond_common::install_crypto_provider();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(tond_common::logging::fmt_layer(
+                tond_common::logging::LogFormat::from_env(),
+            ))
+            .init();
+    }
 
     tracing::info!("Starting Tond Proxy (Pingora) with TLS support...");
 

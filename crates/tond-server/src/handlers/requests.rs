@@ -496,7 +496,7 @@ mod tests {
         assert_eq!(o.errors[0].err_pct, Some(1.0));
 
         // Dashboard and unknown targets survive the orphan prune.
-        store::prune(&state.db, now)
+        store::prune(&state.db, now, 90 * 86_400)
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         let o = overview(&state, requests::Range::Day, now)

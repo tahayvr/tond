@@ -63,6 +63,11 @@ Environment=TOND_SERVER_ADDR=127.0.0.1:3001
 # Logging level: trace, debug, info, warn, error
 Environment=RUST_LOG=info
 
+# Log format: text (default, readable in journalctl) or json (one JSON object
+# per line with level, target, message and span fields, for log shippers).
+# Set it with: systemctl edit tond-proxy
+# Environment=TOND_LOG_FORMAT=json
+
 # ── Privileges ──
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE

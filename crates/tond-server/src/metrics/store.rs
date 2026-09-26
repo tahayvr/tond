@@ -5,7 +5,7 @@
 //   metrics_raw     30 s samples                 kept RAW_KEEP_SECS  (25 h)
 //   metrics_5m      5-minute rollups             kept M5_KEEP_SECS   (8 days)
 //   metrics_1h      1-hour rollups               kept H1_KEEP_SECS   (90 days)
-//   metric_events   restarts / crashes / OOMs    kept EVENT_KEEP_SECS (90 days)
+//   metric_events   restarts / crashes / OOMs    kept retention_app_events_days (90)
 //   requests_1m/1h  request metrics (requests.rs) kept 48 h / 90 days
 //
 // Each tick writes all samples in one transaction. Rollups are computed when a
@@ -30,7 +30,6 @@ pub const MAX_POINTS: i64 = 480;
 pub const RAW_KEEP_SECS: i64 = 25 * 3600;
 pub const M5_KEEP_SECS: i64 = 8 * 86_400;
 pub const H1_KEEP_SECS: i64 = 90 * 86_400;
-pub const EVENT_KEEP_SECS: i64 = 90 * 86_400;
 const BATCH: i64 = 2_000;
 const BATCH_PAUSE: Duration = Duration::from_millis(25);
 
@@ -251,7 +250,9 @@ impl RollupTable {
 
 /// Drop samples, rollups and events past their retention, plus targets whose
 /// owner no longer exists. Returns the number of rows deleted.
-pub async fn prune(db: &SqlitePool, now: i64) -> anyhow::Result<u64> {
+/// Delete expired rows. `event_keep_secs` is how long restart / crash / OOM
+/// events are kept (`retention_app_events_days`, default 90 days).
+pub async fn prune(db: &SqlitePool, now: i64, event_keep_secs: i64) -> anyhow::Result<u64> {
     let mut deleted = 0;
 
     // Targets whose app / database / cron job / preview is gone, with all rows.
@@ -291,7 +292,7 @@ pub async fn prune(db: &SqlitePool, now: i64) -> anyhow::Result<u64> {
         ("metrics_raw", RAW_KEEP_SECS, "target, ts"),
         ("metrics_5m", M5_KEEP_SECS, "target, ts"),
         ("metrics_1h", H1_KEEP_SECS, "target, ts"),
-        ("metric_events", EVENT_KEEP_SECS, "target, ts, kind"),
+        ("metric_events", event_keep_secs, "target, ts, kind"),
         ("requests_1m", super::requests::M1_KEEP_SECS, "target, ts"),
         ("requests_1h", super::requests::H1_KEEP_SECS, "target, ts"),
     ] {
@@ -684,7 +685,7 @@ mod tests {
             .await
             .unwrap_or_else(|e| panic!("{e}"));
 
-        let deleted = prune(&db, now)
+        let deleted = prune(&db, now, 90 * 86_400)
             .await
             .unwrap_or_else(|e| panic!("prune: {e}"));
         assert_eq!(deleted, 5, "old raw + old hourly + orphan raw/event/target");
