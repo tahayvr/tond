@@ -1463,6 +1463,9 @@ wait_for_app_running e2e-stack 300
 stack_services | jq -e '[.data[] | .status] == ["running", "running"] and (.data[] | select(.name == "cache") | .health) == "healthy"' \
     > /dev/null || fail "both services should run and redis be healthy: $(stack_services)"
 pass "both services running, the redis healthcheck passed"
+tond --json apps services e2e-stack | jq -e '[.[].name] == ["web", "cache"]' > /dev/null \
+    || fail "tond apps services should list both services: $(tond --json apps services e2e-stack)"
+pass "tond apps services lists them"
 wait_for 60 "route for ${STACK_DOMAIN}" bash -c "curl -sk --resolve '${STACK_DOMAIN}:443:${IP}' 'https://${STACK_DOMAIN}/' | grep -q Hostname:"
 pass "https://${STACK_DOMAIN} is routed to the web service"
 STACK_WEB=$(stack_services | jq -r '.data[] | select(.name == "web") | .container_id')
