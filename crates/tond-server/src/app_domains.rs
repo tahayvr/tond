@@ -1,7 +1,7 @@
 // app_domains.rs — the domains an app answers on (model and rules)
 //
 // `app_domains` is the source of truth; `apps.domain` is a read-only mirror
-// of the primary domain kept by SQL triggers (030_domains.sql), so code that
+// of the primary domain kept by SQL triggers (001_baseline.sql), so code that
 // only needs "the app's address" keeps reading `apps.domain`. Never write
 // `apps.domain` directly: go through the functions here.
 //

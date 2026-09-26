@@ -173,7 +173,11 @@ mod tests {
     #[tokio::test]
     async fn schema_version_is_the_newest_migration() {
         let state = crate::state::AppState::for_tests().await;
-        let v = schema_version(&state.db).await.unwrap_or_default();
-        assert!(v >= 60, "schema version {v}");
+        let v = schema_version(&state.db).await;
+        let newest = sqlx::migrate!("./migrations")
+            .iter()
+            .map(|m| m.version)
+            .max();
+        assert_eq!(v, newest);
     }
 }

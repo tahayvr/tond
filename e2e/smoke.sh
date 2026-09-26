@@ -2194,7 +2194,7 @@ UPDATE_STATUS="${DATA_DIR}/update/status.json"
 overview=$(api /api/v1/system/update)
 CURRENT_VERSION=$(jq -r .data.current_version <<<"$overview")
 [[ -n "$CURRENT_VERSION" && "$CURRENT_VERSION" != null ]] || fail "GET /system/update must report the running version"
-jq -e '.data.schema_version >= 60' <<<"$overview" > /dev/null || fail "GET /system/update must report the schema version"
+jq -e '.data.schema_version >= 1' <<<"$overview" > /dev/null || fail "GET /system/update must report the schema version"
 jq -e '.data.unsupported_reason == null' <<<"$overview" > /dev/null \
     || fail "updates must be possible from the dashboard here: $(jq -r .data.unsupported_reason <<<"$overview")"
 pass "GET /system/update reports Tond ${CURRENT_VERSION} and that it can update itself"
