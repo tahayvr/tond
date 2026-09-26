@@ -71,10 +71,11 @@ use tond_common::*;
 use crate::{
     alerts::fire_event_alerts,
     audit_log::{AuthActor, write_audit_log},
-    auth::{RateLimit, RequireAuth},
+    auth::{AuthRole, RateLimit, RequireAdmin, RequireAuth},
     deploy, docker,
     error::AppError,
     state::AppState,
+    volumes,
 };
 
 // ── Health ──
@@ -148,11 +149,19 @@ pub async fn get_app(
 
 pub async fn create_app(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: AuthRole,
     actor: AuthActor,
     State(state): State<AppState>,
     Json(req): Json<CreateAppRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    // Volumes and compose files reach the host, so only admins may set them.
+    if req.volumes.as_ref().is_some_and(|v| !v.is_empty()) {
+        auth.ensure_admin("configure volumes")?;
+    }
+    if req.source_type == "compose" {
+        auth.ensure_admin("deploy Docker Compose apps")?;
+    }
+
     // Validate name (alphanumeric + hyphens)
     if !req.name.chars().all(|c| c.is_alphanumeric() || c == '-') {
         return Err(AppError(TondError::InvalidInput(
@@ -295,10 +304,13 @@ pub async fn create_app(
     if let Some(registry_credential_id) = req.registry_credential_id {
         app.registry_credential_id = Some(registry_credential_id);
     }
-    if let Some(vols) = req.volumes
-        && !vols.is_empty()
+    if let Some(reqs) = req.volumes
+        && !reqs.is_empty()
     {
-        app.volumes = serde_json::to_string(&vols).unwrap_or_else(|_| "[]".to_string());
+        let vols = volumes::app_volumes(&volumes::data_dir(), &app.name, &reqs)
+            .map_err(|msg| AppError(TondError::InvalidInput(msg)))?;
+        app.volumes = serde_json::to_string(&vols)
+            .map_err(|e| AppError(TondError::Internal(e.to_string())))?;
     }
     if let Some(content) = req.dockerfile_content {
         app.dockerfile_content = Some(content);
@@ -793,43 +805,21 @@ pub async fn update_health(
 
 pub async fn add_volume(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
+    actor: AuthActor,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<VolumeRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let app = fetch_app(&state.db, &id).await?;
 
-    // Validate container_path
-    if req.container_path.is_empty() || !req.container_path.starts_with('/') {
-        return Err(AppError(TondError::InvalidInput(
-            "container_path must be an absolute path (e.g. /data)".to_string(),
-        )));
-    }
-
     let mut volumes: Vec<Volume> = serde_json::from_str(&app.volumes).unwrap_or_default();
 
-    // Reject duplicate container paths
-    if volumes
-        .iter()
-        .any(|v| v.container_path == req.container_path)
-    {
-        return Err(AppError(TondError::InvalidInput(format!(
-            "Volume at {} already exists",
-            req.container_path
-        ))));
-    }
-
-    // Build host path: /opt/tond/data/volumes/<app-name>/<sanitised-mount>
-    // e.g. /data -> /opt/tond/data/volumes/myapp/data
-    let sanitised = req.container_path.trim_start_matches('/').replace('/', "_");
-    let data_dir = std::env::var("TOND_DATA_DIR").unwrap_or_else(|_| "/opt/tond/data".to_string());
-    let host_path = format!("{}/volumes/{}/{}", data_dir, app.name, sanitised);
-
-    volumes.push(Volume {
-        host_path,
-        container_path: req.container_path,
-    });
+    // Map the request into <data>/volumes/<app>/<name>; arbitrary host paths are refused.
+    let volume = volumes::add_app_volume(&volumes::data_dir(), &app.name, &volumes, &req)
+        .map_err(|msg| AppError(TondError::InvalidInput(msg)))?;
+    let detail = format!("{} -> {}", volume.host_path, volume.container_path);
+    volumes.push(volume);
 
     let volumes_json = serde_json::to_string(&volumes)
         .map_err(|e| AppError(TondError::Internal(e.to_string())))?;
@@ -839,6 +829,16 @@ pub async fn add_volume(
         .bind(&app.id)
         .execute(&state.db)
         .await?;
+
+    write_audit_log(
+        &state.db,
+        Some(&app.id),
+        Some(&app.name),
+        "volume_add",
+        &actor.0,
+        Some(&detail),
+    )
+    .await;
 
     Ok((
         StatusCode::OK,
@@ -852,7 +852,7 @@ pub async fn add_volume(
 
 pub async fn remove_volume(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<VolumeRequest>,
@@ -1179,7 +1179,7 @@ mod tests {
     use super::*;
     use crate::{
         audit_log::AuthActor,
-        auth::{RateLimiter, RequireAuth, rate_limit::RateLimit},
+        auth::{RateLimiter, RequireAdmin, RequireAuth, Role, rate_limit::RateLimit},
         state::AppState,
     };
 
@@ -1277,7 +1277,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            RequireAuth,
+            AuthRole(Role::Admin),
             AuthActor("admin@example.com".to_string()),
             State(state),
             Json(CreateAppRequest {
@@ -1324,7 +1324,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            RequireAuth,
+            AuthRole(Role::Admin),
             AuthActor("admin@example.com".to_string()),
             State(state),
             Json(CreateAppRequest {
@@ -1371,7 +1371,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            RequireAuth,
+            AuthRole(Role::Admin),
             AuthActor("admin@example.com".to_string()),
             State(state),
             Json(CreateAppRequest {
@@ -1418,7 +1418,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            RequireAuth,
+            AuthRole(Role::Admin),
             AuthActor("admin@example.com".to_string()),
             State(state),
             Json(CreateAppRequest {
@@ -1465,7 +1465,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            RequireAuth,
+            AuthRole(Role::Admin),
             AuthActor("admin@example.com".to_string()),
             State(state),
             Json(CreateAppRequest {
@@ -1512,7 +1512,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            RequireAuth,
+            AuthRole(Role::Admin),
             AuthActor("admin@example.com".to_string()),
             State(state),
             Json(CreateAppRequest {
@@ -1559,7 +1559,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            RequireAuth,
+            AuthRole(Role::Admin),
             AuthActor("admin@example.com".to_string()),
             State(state),
             Json(CreateAppRequest {
@@ -1606,7 +1606,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            RequireAuth,
+            AuthRole(Role::Admin),
             AuthActor("admin@example.com".to_string()),
             State(state),
             Json(CreateAppRequest {
@@ -1652,7 +1652,7 @@ mod tests {
         let state = test_state().await;
         let response = create_app(
             RateLimit,
-            RequireAuth,
+            AuthRole(Role::Admin),
             AuthActor("admin@example.com".to_string()),
             State(state),
             Json(CreateAppRequest {
@@ -1701,7 +1701,7 @@ mod tests {
         let state = test_state().await;
         let response = create_app(
             RateLimit,
-            RequireAuth,
+            AuthRole(Role::Admin),
             AuthActor("admin@example.com".to_string()),
             State(state),
             Json(CreateAppRequest {
@@ -1749,7 +1749,7 @@ mod tests {
         let state = test_state().await;
         let response = create_app(
             RateLimit,
-            RequireAuth,
+            AuthRole(Role::Admin),
             AuthActor("admin@example.com".to_string()),
             State(state.clone()),
             Json(CreateAppRequest {
@@ -1770,9 +1770,10 @@ mod tests {
                 project_id: None,
                 github_app_id: None,
                 registry_credential_id: None,
-                volumes: Some(vec![Volume {
-                    host_path: "/opt/tond/data/demo".to_string(),
+                volumes: Some(vec![VolumeRequest {
                     container_path: "/data".to_string(),
+                    name: None,
+                    host_path: None,
                 }]),
                 drain_timeout: Some(45),
                 build_method: Some("tbuild".to_string()),
@@ -2002,11 +2003,14 @@ mod tests {
 
         let error = add_volume(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
+            AuthActor("admin@example.com".to_string()),
             State(state),
             Path(app.id),
             Json(VolumeRequest {
                 container_path: "data".to_string(),
+                name: None,
+                host_path: None,
             }),
         )
         .await
@@ -2015,7 +2019,7 @@ mod tests {
 
         assert_eq!(
             error.0.to_string(),
-            "Invalid input: container_path must be an absolute path (e.g. /data)",
+            "Invalid input: Container path 'data' must be an absolute path inside the container, e.g. /data",
             "add_volume should require absolute container paths"
         );
     }
@@ -2027,11 +2031,14 @@ mod tests {
 
         let add_response = add_volume(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
+            AuthActor("admin@example.com".to_string()),
             State(state.clone()),
             Path(app.id.clone()),
             Json(VolumeRequest {
                 container_path: "/data/cache".to_string(),
+                name: None,
+                host_path: None,
             }),
         )
         .await
@@ -2059,11 +2066,14 @@ mod tests {
 
         let error = add_volume(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
+            AuthActor("admin@example.com".to_string()),
             State(state.clone()),
             Path(app.id.clone()),
             Json(VolumeRequest {
                 container_path: "/data/cache".to_string(),
+                name: None,
+                host_path: None,
             }),
         )
         .await
@@ -2071,17 +2081,19 @@ mod tests {
         .unwrap_or_else(|| panic!("expected add_volume to reject duplicate mounts"));
         assert_eq!(
             error.0.to_string(),
-            "Invalid input: Volume at /data/cache already exists",
+            "Invalid input: A volume is already mounted at /data/cache",
             "add_volume should reject duplicate container paths"
         );
 
         let remove_response = remove_volume(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
             State(state.clone()),
             Path(app.id.clone()),
             Json(VolumeRequest {
                 container_path: "/data/cache".to_string(),
+                name: None,
+                host_path: None,
             }),
         )
         .await
@@ -2103,6 +2115,139 @@ mod tests {
             volumes_after_remove, "[]",
             "remove_volume should persist an empty volume list after deleting the only mount"
         );
+    }
+
+    #[tokio::test]
+    async fn add_volume_rejects_host_paths_outside_the_app_directory() {
+        let state = test_state().await;
+        let app = seed_app(&state, "demo").await;
+
+        for host_path in ["/", "/etc", "/var/run/docker.sock", "/opt/tond/data"] {
+            let error = add_volume(
+                RateLimit,
+                RequireAdmin,
+                AuthActor("admin@example.com".to_string()),
+                State(state.clone()),
+                Path(app.id.clone()),
+                Json(VolumeRequest {
+                    container_path: "/host".to_string(),
+                    name: None,
+                    host_path: Some(host_path.to_string()),
+                }),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("host_path {host_path} must be rejected"));
+            assert_eq!(error.0.status_code(), 400);
+            assert!(
+                error.0.to_string().contains("is not allowed"),
+                "error should explain why: {}",
+                error.0
+            );
+        }
+
+        let stored: String = sqlx::query_scalar("SELECT volumes FROM apps WHERE id = ?")
+            .bind(&app.id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_else(|err| panic!("failed to read volumes: {err}"));
+        assert_eq!(stored, "[]", "rejected volumes must not be persisted");
+    }
+
+    #[tokio::test]
+    async fn create_app_confines_volumes_and_rejects_host_root() {
+        let state = test_state().await;
+        let mut request = CreateAppRequest {
+            name: "rooted".to_string(),
+            source_type: "image".to_string(),
+            source_url: Some("alpine:3".to_string()),
+            branch: None,
+            container_port: 3000,
+            env_vars: None,
+            domain: None,
+            project_id: None,
+            memory_limit: None,
+            cpu_limit: None,
+            health_check_path: None,
+            health_check_interval: None,
+            health_failure_threshold: None,
+            drain_timeout: None,
+            build_method: None,
+            auto_deploy: false,
+            watch_branch: None,
+            volumes: Some(vec![VolumeRequest {
+                container_path: "/host".to_string(),
+                name: None,
+                host_path: Some("/".to_string()),
+            }]),
+            registry_credential_id: None,
+            github_app_id: None,
+            dockerfile_content: None,
+            compose_content: None,
+            base_dir: None,
+            static_build: false,
+        };
+
+        let error = create_app(
+            RateLimit,
+            AuthRole(Role::Admin),
+            AuthActor("admin@example.com".to_string()),
+            State(state.clone()),
+            Json(request),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("host_path '/' must be rejected"));
+        assert_eq!(error.0.status_code(), 400);
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM apps WHERE name = 'rooted'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_else(|err| panic!("count failed: {err}"));
+        assert_eq!(count, 0, "no app row may be created for a rejected request");
+
+        // Members may not set volumes at all.
+        request = CreateAppRequest {
+            name: "member-app".to_string(),
+            source_type: "image".to_string(),
+            source_url: Some("alpine:3".to_string()),
+            branch: None,
+            container_port: 3000,
+            env_vars: None,
+            domain: None,
+            project_id: None,
+            memory_limit: None,
+            cpu_limit: None,
+            health_check_path: None,
+            health_check_interval: None,
+            health_failure_threshold: None,
+            drain_timeout: None,
+            build_method: None,
+            auto_deploy: false,
+            watch_branch: None,
+            volumes: Some(vec![VolumeRequest {
+                container_path: "/data".to_string(),
+                name: None,
+                host_path: None,
+            }]),
+            registry_credential_id: None,
+            github_app_id: None,
+            dockerfile_content: None,
+            compose_content: None,
+            base_dir: None,
+            static_build: false,
+        };
+        let error = create_app(
+            RateLimit,
+            AuthRole(Role::Member),
+            AuthActor("member@example.com".to_string()),
+            State(state.clone()),
+            Json(request),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("members must not configure volumes"));
+        assert_eq!(error.0.status_code(), 403);
     }
 
     #[tokio::test]

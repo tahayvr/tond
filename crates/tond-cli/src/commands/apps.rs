@@ -1128,7 +1128,9 @@ required = true
                         custom_image: None,
                         created_at: "2026-01-01T00:00:00Z".to_string(),
                         updated_at: "2026-01-01T00:00:00Z".to_string(),
+                        public_access: false,
                     },
+                    public_connection_string: None,
                     connection_string: Some(
                         "postgres://tond_analytics:secret@localhost:5432/tond_analytics"
                             .to_string(),

@@ -15,6 +15,11 @@
 //   POST   /api/databases/{id}/start              — start container (existing container)
 //   POST   /api/databases/{id}/redeploy           — recreate container (picks up custom_image)
 //   PATCH  /api/databases/{id}/credentials        — update stored credentials (takes effect on redeploy)
+//
+// Network exposure (H6): database ports are published on 127.0.0.1 unless an
+// admin turns on `public_access`, which publishes on 0.0.0.0. Docker's iptables
+// rules bypass UFW, so a 0.0.0.0 port is reachable from the internet even with
+// the firewall "closed" — hence off by default and admin-only.
 
 use axum::{
     Json,
@@ -26,7 +31,7 @@ use tond_common::*;
 
 use crate::{
     audit_log::{AuthActor, write_audit_log},
-    auth::{RateLimit, RequireAuth},
+    auth::{AuthRole, RateLimit, RequireAuth},
     docker,
     error::AppError,
     state::AppState,
@@ -69,15 +74,53 @@ pub async fn get_database(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let db = fetch_db(&state.db, &id).await?;
-    let detail = build_detail(db);
+    let detail = build_detail(db, public_host(&state).await.as_deref());
     Ok((StatusCode::OK, Json(ApiResponse::ok(detail))))
+}
+
+/// Placeholder host shown in public connection strings when the server has no
+/// dashboard domain configured yet.
+const SERVER_ADDRESS_PLACEHOLDER: &str = "<server-ip>";
+
+/// The address clients on the internet use to reach this server: the
+/// dashboard domain when configured.
+async fn public_host(state: &AppState) -> Option<String> {
+    let domain = state.settings.read().await.dashboard_domain.clone();
+    let domain = domain.trim();
+    (!domain.is_empty()).then(|| domain.to_string())
+}
+
+/// Which interface the database port is published on.
+fn exposure_for(db: &ManagedDatabase) -> docker::Exposure {
+    if db.public_access {
+        docker::Exposure::Public
+    } else {
+        docker::Exposure::Loopback
+    }
 }
 
 /// Build a `ManagedDatabaseDetail` from a `ManagedDatabase` row,
 /// computing both external and internal connection strings.
 /// If the database row has custom URL overrides set, those take precedence
-/// over the auto-computed strings.
-fn build_detail(db: ManagedDatabase) -> ManagedDatabaseDetail {
+/// over the auto-computed strings. `public_host` is the server's public
+/// address, used for the public connection string when public access is on.
+fn build_detail(db: ManagedDatabase, public_host: Option<&str>) -> ManagedDatabaseDetail {
+    let public_connection_string = if db.public_access {
+        db.host_port.and_then(|port| {
+            engine_for(&db.db_type).map(|eng| {
+                eng.connection_string_on(
+                    public_host.unwrap_or(SERVER_ADDRESS_PLACEHOLDER),
+                    port,
+                    db.db_name.as_deref(),
+                    db.db_user.as_deref(),
+                    db.db_password.as_deref(),
+                )
+            })
+        })
+    } else {
+        None
+    };
+
     // Use the user-supplied override if present; otherwise compute from credentials.
     let connection_string = if let Some(ref custom) = db.custom_external_url {
         Some(custom.clone())
@@ -113,6 +156,7 @@ fn build_detail(db: ManagedDatabase) -> ManagedDatabaseDetail {
     ManagedDatabaseDetail {
         database: ManagedDatabaseResponse::from(db),
         connection_string,
+        public_connection_string,
         internal_connection_string,
     }
 }
@@ -158,11 +202,15 @@ fn next_credential(current: Option<String>, requested: Option<String>) -> Option
 
 pub async fn create_database(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: AuthRole,
     actor: AuthActor,
     State(state): State<AppState>,
     Json(req): Json<CreateDatabaseRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    if req.public_access {
+        auth.ensure_admin("expose a database to the internet")?;
+    }
+
     // Validate name (alphanumeric + hyphens)
     if !req.name.chars().all(|c| c.is_alphanumeric() || c == '-') {
         return Err(AppError(TondError::InvalidInput(
@@ -204,6 +252,8 @@ pub async fn create_database(
     if let Some(mem) = req.memory_limit {
         db.memory_limit = Some(mem);
     }
+    db.public_access = req.public_access;
+    let exposure = exposure_for(&db);
 
     // Set up volume path
     let data_dir = std::env::var("TOND_DATA_DIR").unwrap_or_else(|_| "/opt/tond/data".to_string());
@@ -251,6 +301,7 @@ pub async fn create_database(
         &container_name,
         container_port,
         host_port,
+        exposure,
         env_vars,
         db.memory_limit,
         None, // no cpu limit for databases
@@ -271,8 +322,8 @@ pub async fn create_database(
         "INSERT INTO databases
             (id, name, db_type, project_id, container_id, host_port, status,
              db_name, db_user, db_password, root_password, volume_path, memory_limit,
-             image_used, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             image_used, created_at, updated_at, public_access)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&db.id)
     .bind(&db.name)
@@ -290,6 +341,7 @@ pub async fn create_database(
     .bind(&db.image_used)
     .bind(&db.created_at)
     .bind(&db.updated_at)
+    .bind(db.public_access)
     .execute(&state.db)
     .await
     .map_err(|e| {
@@ -307,13 +359,13 @@ pub async fn create_database(
         "db_create",
         &actor.0,
         Some(&format!(
-            "name={} type={} image={}",
-            db.name, db.db_type, image
+            "name={} type={} image={} public_access={}",
+            db.name, db.db_type, image, db.public_access
         )),
     )
     .await;
 
-    let detail = build_detail(db);
+    let detail = build_detail(db, public_host(&state).await.as_deref());
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(detail))))
 }
 
@@ -455,13 +507,24 @@ pub async fn start_database(
 
 pub async fn update_database(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: AuthRole,
     actor: AuthActor,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateDatabaseRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let db = fetch_db(&state.db, &id).await?;
+
+    // A custom image runs arbitrary code with the database volume mounted, and
+    // public access opens the port to the internet: both are admin decisions.
+    if req.custom_image.is_some() {
+        auth.ensure_admin("change a database's Docker image")?;
+    }
+    let exposure_changed = req.public_access.is_some_and(|p| p != db.public_access);
+    if exposure_changed {
+        auth.ensure_admin("change a database's public access")?;
+    }
+    let public_access = req.public_access.unwrap_or(db.public_access);
 
     // Normalise: treat an empty string as "clear the override".
     let new_external = normalized_optional_override(req.custom_external_url);
@@ -491,6 +554,7 @@ pub async fn update_database(
              custom_internal_url  = ?,
              custom_image         = ?,
              memory_limit         = ?,
+             public_access        = ?,
              updated_at           = datetime('now')
          WHERE id = ?",
     )
@@ -498,6 +562,7 @@ pub async fn update_database(
     .bind(&int_url)
     .bind(&cust_image)
     .bind(mem_limit)
+    .bind(public_access)
     .bind(&db.id)
     .execute(&state.db)
     .await?;
@@ -508,13 +573,19 @@ pub async fn update_database(
         None,
         "db_update",
         &actor.0,
-        Some(&format!("name={}", db.name)),
+        Some(&format!("name={} public_access={}", db.name, public_access)),
     )
     .await;
 
-    // Re-fetch and return the updated detail.
-    let updated_db = fetch_db(&state.db, &db.id).await?;
-    let detail = build_detail(updated_db);
+    let mut updated_db = fetch_db(&state.db, &db.id).await?;
+
+    // A port binding can only change by recreating the container. Do it now
+    // (same image, volume and port) so the toggle takes effect immediately.
+    if exposure_changed && updated_db.container_id.is_some() {
+        updated_db = recreate_container(&state, updated_db).await?;
+    }
+
+    let detail = build_detail(updated_db, public_host(&state).await.as_deref());
     Ok((StatusCode::OK, Json(ApiResponse::ok(detail))))
 }
 
@@ -540,7 +611,18 @@ pub async fn redeploy_database(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let db = fetch_db(&state.db, &id).await?;
+    let updated_db = recreate_container(&state, db).await?;
+    let detail = build_detail(updated_db, public_host(&state).await.as_deref());
+    Ok((StatusCode::OK, Json(ApiResponse::ok(detail))))
+}
 
+/// Stop, remove and recreate a database container (steps 1–5 above) and
+/// return the refreshed row.
+async fn recreate_container(
+    state: &AppState,
+    db: ManagedDatabase,
+) -> Result<ManagedDatabase, AppError> {
+    let exposure = exposure_for(&db);
     let engine = engine_for(&db.db_type).ok_or_else(|| {
         AppError(TondError::InvalidInput(format!(
             "Unknown db_type '{}'",
@@ -604,6 +686,7 @@ pub async fn redeploy_database(
         &container_name,
         engine.container_port,
         host_port,
+        exposure,
         env_vars,
         db.memory_limit,
         None,
@@ -631,9 +714,7 @@ pub async fn redeploy_database(
     .execute(&state.db)
     .await?;
 
-    let updated_db = fetch_db(&state.db, &db.id).await?;
-    let detail = build_detail(updated_db);
-    Ok((StatusCode::OK, Json(ApiResponse::ok(detail))))
+    fetch_db(&state.db, &db.id).await
 }
 
 // ── Update credentials ──
@@ -686,7 +767,7 @@ pub async fn update_database_credentials(
     .await;
 
     let updated_db = fetch_db(&state.db, &db.id).await?;
-    let detail = build_detail(updated_db);
+    let detail = build_detail(updated_db, public_host(&state).await.as_deref());
     // Credentials only take effect after a redeploy — signal this explicitly so
     // the dashboard can surface a "redeploy required" banner.
     Ok((
@@ -715,7 +796,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        auth::{RateLimiter, RequireAuth, rate_limit::RateLimit},
+        auth::{RateLimiter, RequireAuth, Role, rate_limit::RateLimit},
         state::AppState,
     };
 
@@ -794,12 +875,13 @@ mod tests {
             custom_image: None,
             created_at: "2026-04-08T12:00:00Z".to_string(),
             updated_at: "2026-04-08T12:00:00Z".to_string(),
+            public_access: false,
         }
     }
 
     #[test]
     fn build_detail_prefers_custom_urls_and_computes_engine_urls_when_missing() {
-        let detail = build_detail(sample_db());
+        let detail = build_detail(sample_db(), None);
         assert_eq!(
             detail.connection_string.as_deref(),
             Some("postgres://appuser:secret@localhost:5433/appdb"),
@@ -814,7 +896,7 @@ mod tests {
         let mut db = sample_db();
         db.custom_external_url = Some("postgres://external.example.com/db".to_string());
         db.custom_internal_url = Some("postgres://internal.example.com/db".to_string());
-        let detail = build_detail(db);
+        let detail = build_detail(db, None);
         assert_eq!(
             detail.connection_string.as_deref(),
             Some("postgres://external.example.com/db"),
@@ -825,6 +907,84 @@ mod tests {
             Some("postgres://internal.example.com/db"),
             "build_detail should prefer a custom internal URL override over the computed project-network connection string"
         );
+    }
+
+    #[test]
+    fn public_connection_string_only_exists_when_public_access_is_on() {
+        let detail = build_detail(sample_db(), Some("tond.example.com"));
+        assert_eq!(detail.public_connection_string, None);
+        assert_eq!(exposure_for(&sample_db()), docker::Exposure::Loopback);
+
+        let mut db = sample_db();
+        db.public_access = true;
+        assert_eq!(exposure_for(&db), docker::Exposure::Public);
+        let detail = build_detail(db.clone(), Some("tond.example.com"));
+        assert_eq!(
+            detail.public_connection_string.as_deref(),
+            Some("postgres://appuser:secret@tond.example.com:5433/appdb")
+        );
+        let detail = build_detail(db, None);
+        assert_eq!(
+            detail.public_connection_string.as_deref(),
+            Some("postgres://appuser:secret@<server-ip>:5433/appdb"),
+            "without a dashboard domain the host is an obvious placeholder"
+        );
+    }
+
+    #[tokio::test]
+    async fn members_cannot_enable_public_access_or_change_the_image() {
+        let state = test_state().await;
+        let mut db = sample_db();
+        db.project_id = None;
+        seed_database_row(&state, &db).await;
+
+        for req in [
+            UpdateDatabaseRequest {
+                custom_external_url: None,
+                custom_internal_url: None,
+                custom_image: None,
+                memory_limit: None,
+                public_access: Some(true),
+            },
+            UpdateDatabaseRequest {
+                custom_external_url: None,
+                custom_internal_url: None,
+                custom_image: Some("evil/image".to_string()),
+                memory_limit: None,
+                public_access: None,
+            },
+        ] {
+            let err = update_database(
+                RateLimit,
+                AuthRole(Role::Member),
+                AuthActor("member@example.com".to_string()),
+                State(state.clone()),
+                Path(db.id.clone()),
+                Json(req),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("members must be refused"));
+            assert_eq!(err.0.status_code(), 403);
+        }
+
+        let err = create_database(
+            RateLimit,
+            AuthRole(Role::Member),
+            AuthActor("member@example.com".to_string()),
+            State(state.clone()),
+            Json(CreateDatabaseRequest {
+                name: "public-db".to_string(),
+                db_type: "postgres".to_string(),
+                project_id: None,
+                memory_limit: None,
+                public_access: true,
+            }),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("members must not create public databases"));
+        assert_eq!(err.0.status_code(), 403);
     }
 
     #[test]
@@ -899,7 +1059,7 @@ mod tests {
 
         let response = update_database(
             RateLimit,
-            RequireAuth,
+            AuthRole(Role::Admin),
             AuthActor("admin@example.com".to_string()),
             State(state.clone()),
             Path(db.id.clone()),
@@ -908,6 +1068,7 @@ mod tests {
                 custom_internal_url: Some("   ".to_string()),
                 custom_image: Some("postgres:17-alpine".to_string()),
                 memory_limit: Some(0),
+                public_access: None,
             }),
         )
         .await

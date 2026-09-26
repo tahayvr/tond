@@ -8,11 +8,16 @@ use uuid::Uuid;
 
 /// A bind-mount volume for a deployed app.
 ///
-/// `host_path` is the absolute path on the VPS host
-/// (e.g. `/opt/tond/data/volumes/<app-name>/data`).
+/// Users never pick the host side: the server maps `name` to
+/// `<TOND_DATA_DIR>/volumes/<app-name>/<name>` and reports that as `host_path`
+/// (informational — deploys re-derive the path from `name`).
 /// `container_path` is the mount point inside the container (e.g. `/data`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Volume {
+    /// Directory name under the app's volume directory (e.g. `data`)
+    #[serde(default)]
+    pub name: String,
+    /// Absolute host path, computed by the server (read-only)
     pub host_path: String,
     pub container_path: String,
 }
@@ -191,8 +196,8 @@ pub struct CreateAppRequest {
     pub auto_deploy: bool,
     /// Branch to watch for webhook-triggered deploys (None = any branch)
     pub watch_branch: Option<String>,
-    /// Volume mounts: list of {host_path, container_path}
-    pub volumes: Option<Vec<Volume>>,
+    /// Volume mounts: list of {container_path, name?}. Host paths are chosen by the server.
+    pub volumes: Option<Vec<VolumeRequest>>,
     /// Registry credential to use for pulling private images
     pub registry_credential_id: Option<String>,
     /// GitHub App ID to use for private repo cloning
@@ -339,10 +344,17 @@ pub struct UpdateHealthRequest {
     pub health_failure_threshold: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolumeRequest {
     /// Mount point inside the container (e.g. "/data")
     pub container_path: String,
+    /// Volume directory name under `volumes/<app>/` (default: derived from `container_path`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Only accepted when it already points at `<data>/volumes/<app>/<name>`;
+    /// anything else is rejected. Prefer `name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -518,7 +530,8 @@ mod tests {
         app.preview_enabled = 1;
         app.static_build = 1;
         app.volumes = serde_json::to_string(&vec![Volume {
-            host_path: "/opt/tond/data/demo".to_string(),
+            name: "data".to_string(),
+            host_path: "/opt/tond/data/volumes/demo/data".to_string(),
             container_path: "/data".to_string(),
         }])
         .unwrap_or_else(|err| panic!("failed to serialize volumes fixture: {err}"));

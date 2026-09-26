@@ -55,6 +55,7 @@ mod notifications;
 mod secret_key;
 mod state;
 mod storage;
+mod volumes;
 
 use std::future::IntoFuture;
 use std::path::{Path, PathBuf};

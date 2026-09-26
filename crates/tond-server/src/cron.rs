@@ -18,7 +18,10 @@
 //   • Timezone-aware next-run computation via chrono-tz.
 //   • Concurrency policy: 'skip' (default) skips if already running; 'allow' starts anyway.
 //   • Resource limits: memory_mb and cpu_shares wired into Docker HostConfig.
-//   • Volume mounts: volumes JSON array wired into Docker HostConfig.binds.
+//   • Volume mounts: volumes JSON array wired into Docker HostConfig.binds, every
+//     host path re-derived and confined by `volumes::cron_binds`.
+//   • Hardening: the same no-new-privileges / capability / pids / memory / log
+//     rotation policy as app containers (`docker::harden_host_config`).
 //   • Retry logic: on non-zero exit, re-queues the job up to max_retries times with
 //     retry_delay_seconds delay. Attempt number is tracked on the run row.
 //   • last_run_status: updated on the cron_jobs row at the end of each run (final attempt).
@@ -27,10 +30,10 @@ use anyhow::Result;
 use chrono::Utc;
 use cron::Schedule;
 use std::str::FromStr;
-use tond_common::CronJob;
+use tond_common::{CronJob, CronVolume};
 use uuid::Uuid;
 
-use crate::{alerts, docker, state::AppState};
+use crate::{alerts, docker, state::AppState, volumes};
 
 fn should_run_due_job(job: &CronJob) -> bool {
     !(job.status == "running" && job.concurrency_policy == "skip")
@@ -43,14 +46,22 @@ fn cron_env_vec(env_json: Option<&str>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn cron_binds(volumes_json: Option<&str>) -> Option<Vec<String>> {
-    volumes_json
-        .and_then(|s| serde_json::from_str::<Vec<VolumeMount>>(s).ok())
-        .map(|vols| {
-            vols.into_iter()
-                .map(|v| format!("{}:{}", v.host_path, v.container_path))
-                .collect()
-        })
+/// Parse the stored volumes JSON and turn it into confined Docker bind strings.
+/// Unparseable JSON fails the run rather than silently running without mounts.
+fn cron_binds(
+    data_dir: &std::path::Path,
+    job_id: &str,
+    volumes_json: Option<&str>,
+) -> Result<Option<Vec<String>>> {
+    let Some(json) = volumes_json.filter(|s| !s.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let vols: Vec<CronVolume> = serde_json::from_str(json)
+        .map_err(|e| anyhow::anyhow!("invalid volume configuration: {e}"))?;
+    if vols.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(volumes::cron_binds(data_dir, job_id, &vols)?))
 }
 
 fn cron_memory_limit_bytes(memory_mb: Option<i64>) -> Option<i64> {
@@ -307,13 +318,6 @@ pub async fn run_cron_job(state: &AppState, job: &CronJob, _initial_attempt: i64
 
 // ── Docker execution helper ───────────────────────────────────────────────────
 
-/// Volume mount descriptor (matches the JSON stored in cron_jobs.volumes).
-#[derive(serde::Deserialize)]
-struct VolumeMount {
-    host_path: String,
-    container_path: String,
-}
-
 /// Start the cron job container, wait for it to finish, collect output.
 /// Returns `(exit_code, output_string)` on success.
 async fn run_cron_container(
@@ -338,20 +342,21 @@ async fn run_cron_container(
 
     let cmd_vec: Option<Vec<&str>> = cmd.map(|c| c.iter().map(|s| s.as_str()).collect());
 
-    // Parse volume mounts
-    let binds = cron_binds(job.volumes.as_deref());
+    // Parse volume mounts (confined to <data>/volumes, see volumes.rs)
+    let binds = cron_binds(&volumes::data_dir(), &job.id, job.volumes.as_deref())?;
 
     // Resource limits
     let memory = cron_memory_limit_bytes(job.memory_mb);
     let cpu_shares: Option<i64> = job.cpu_shares;
 
-    let host_config = HostConfig {
+    let mut host_config = HostConfig {
         auto_remove: Some(false), // we remove manually after collecting logs
         memory,
         cpu_shares,
         binds,
         ..Default::default()
     };
+    docker::harden_host_config(&mut host_config, docker::default_memory_limit());
 
     let container_config = ContainerCreateBody {
         image: Some(job.image.clone()),
@@ -492,7 +497,10 @@ mod tests {
             Some("UTC".to_string()),
             2,
             5,
-            Some(r#"[{"host_path":"/data/input","container_path":"/mnt/input"}]"#.to_string()),
+            Some(
+                r#"[{"name":"input","host_path":"/ignored","container_path":"/mnt/input"}]"#
+                    .to_string(),
+            ),
         )
     }
 
@@ -562,16 +570,28 @@ mod tests {
             "cron_env_vec should fall back to an empty environment on invalid JSON"
         );
 
-        assert_eq!(
-            cron_binds(job.volumes.as_deref()),
-            Some(vec!["/data/input:/mnt/input".to_string()]),
-            "cron_binds should convert stored volume mount JSON into Docker bind strings"
+        let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let binds = cron_binds(tmp.path(), &job.id, job.volumes.as_deref())
+            .unwrap_or_else(|e| panic!("cron_binds failed: {e}"))
+            .unwrap_or_default();
+        assert_eq!(binds.len(), 1);
+        assert!(
+            binds[0].ends_with(&format!("volumes/_cron/{}/input:/mnt/input", job.id)),
+            "cron_binds should map stored volumes into the job's confined directory: {}",
+            binds[0]
         );
-        assert_eq!(
-            cron_binds(Some("not-json")),
-            None,
-            "cron_binds should ignore invalid volume JSON instead of panicking"
+        assert!(
+            cron_binds(tmp.path(), &job.id, Some("not-json")).is_err(),
+            "cron_binds should fail loudly on invalid volume JSON"
         );
+        assert!(cron_binds(tmp.path(), &job.id, None).is_ok_and(|b| b.is_none()));
+
+        // A tampered row pointing at the host root is re-derived from the name.
+        let tampered = r#"[{"name":"etc","host_path":"/","container_path":"/host"}]"#;
+        let binds = cron_binds(tmp.path(), &job.id, Some(tampered))
+            .unwrap_or_else(|e| panic!("cron_binds failed: {e}"))
+            .unwrap_or_default();
+        assert!(!binds[0].starts_with("/:"), "{}", binds[0]);
     }
 
     #[test]

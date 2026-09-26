@@ -33,6 +33,7 @@ use crate::docker;
 use crate::handlers::{github_apps, gitlab_tokens};
 use crate::secret_key::{self, Purpose};
 use crate::state::AppState;
+use crate::volumes;
 
 use super::build::{
     BuildOptions, build_from_git, build_from_inline_dockerfile, run_inline_compose,
@@ -433,12 +434,10 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
         .and_then(|e| serde_json::from_str(e).ok())
         .unwrap_or_default();
 
+    // Host paths are re-derived from volume names and verified to stay inside
+    // <data>/volumes/<app> (no symlink escapes) right before the mount.
     let volumes: Vec<Volume> = serde_json::from_str(&app.volumes).unwrap_or_default();
-    let mut binds: Vec<String> = Vec::new();
-    for vol in &volumes {
-        tokio::fs::create_dir_all(&vol.host_path).await?;
-        binds.push(format!("{}:{}", vol.host_path, vol.container_path));
-    }
+    let binds = volumes::app_binds(&volumes::data_dir(), &app_name, &volumes)?;
 
     log_deploy(
         state,
@@ -483,6 +482,7 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
             &staging_name,
             container_port,
             new_host_port,
+            docker::Exposure::Loopback,
             env_vars,
             app.memory_limit,
             app.cpu_limit,
@@ -502,6 +502,7 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
             &app_name,
             container_port,
             new_host_port,
+            docker::Exposure::Loopback,
             env_vars,
             app.memory_limit,
             app.cpu_limit,
@@ -751,12 +752,10 @@ pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> R
         .and_then(|e| serde_json::from_str(e).ok())
         .unwrap_or_default();
 
+    // Host paths are re-derived from volume names and verified to stay inside
+    // <data>/volumes/<app> (no symlink escapes) right before the mount.
     let volumes: Vec<Volume> = serde_json::from_str(&app.volumes).unwrap_or_default();
-    let mut binds: Vec<String> = Vec::new();
-    for vol in &volumes {
-        tokio::fs::create_dir_all(&vol.host_path).await?;
-        binds.push(format!("{}:{}", vol.host_path, vol.container_path));
-    }
+    let binds = volumes::app_binds(&volumes::data_dir(), &app_name, &volumes)?;
 
     log_deploy(
         state,
@@ -794,6 +793,7 @@ pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> R
             &staging_name_rb,
             container_port,
             new_host_port,
+            docker::Exposure::Loopback,
             env_vars,
             app.memory_limit,
             app.cpu_limit,
@@ -813,6 +813,7 @@ pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> R
             &app_name,
             container_port,
             new_host_port,
+            docker::Exposure::Loopback,
             env_vars,
             app.memory_limit,
             app.cpu_limit,
@@ -1112,12 +1113,10 @@ pub async fn deploy_preview(
         app.preview_env_vars.as_str(),
     );
 
+    // Host paths are re-derived from volume names and verified to stay inside
+    // <data>/volumes/<app> (no symlink escapes) right before the mount.
     let volumes: Vec<Volume> = serde_json::from_str(&app.volumes).unwrap_or_default();
-    let mut binds: Vec<String> = Vec::new();
-    for vol in &volumes {
-        tokio::fs::create_dir_all(&vol.host_path).await?;
-        binds.push(format!("{}:{}", vol.host_path, vol.container_path));
-    }
+    let binds = volumes::app_binds(&volumes::data_dir(), &app_name, &volumes)?;
 
     let container_name = format!("tond-preview-{}", slug);
 
@@ -1145,6 +1144,7 @@ pub async fn deploy_preview(
         &container_name,
         container_port,
         host_port,
+        docker::Exposure::Loopback,
         env_vars,
         app.memory_limit,
         app.cpu_limit,

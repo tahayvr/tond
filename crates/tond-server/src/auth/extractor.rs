@@ -415,8 +415,16 @@ mod tests {
             .err()
             .unwrap_or_else(|| panic!("members must be refused"));
         assert_eq!(err.0.status_code(), 403);
-        assert!(err.0.to_string().contains("Only admins can configure volumes"));
-        assert!(AuthRole(Role::Admin).ensure_admin("configure volumes").is_ok());
+        assert!(
+            err.0
+                .to_string()
+                .contains("Only admins can configure volumes")
+        );
+        assert!(
+            AuthRole(Role::Admin)
+                .ensure_admin("configure volumes")
+                .is_ok()
+        );
     }
 
     #[tokio::test]
