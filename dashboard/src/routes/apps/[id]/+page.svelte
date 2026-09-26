@@ -7,7 +7,6 @@
 		startApp,
 		restartApp,
 		deleteApp,
-		updateDomain,
 		updateHealth,
 		updateDrainTimeout,
 		updateAppResources,
@@ -138,7 +137,6 @@
 	);
 
 	// Domain form
-	let certRefreshKey = $state(0);
 
 	// Health form
 	let healthPath = $state('');
@@ -380,11 +378,9 @@
 		await startDeploy();
 	}
 
-	/** Domain card save; errors are shown in the card, so this rethrows. */
-	async function handleUpdateDomain(domain: string) {
-		await updateDomain(appId, domain);
+	/** The domain card changed the domains; the primary (app.domain) may have moved. */
+	async function handleDomainsChanged() {
 		await loadApp();
-		certRefreshKey += 1;
 	}
 
 	async function handleUpdateHealth() {
@@ -1074,12 +1070,7 @@
 
 				<!-- Domain tab -->
 				{#if viewAllowed && activeTab === 'domain'}
-					<AppDomain
-						{app}
-						{certRefreshKey}
-						onUpdate={handleUpdateDomain}
-						canEdit={can('apps:write')}
-					/>
+					<AppDomain {app} onChanged={handleDomainsChanged} canEdit={can('apps:write')} />
 				{/if}
 
 				<!-- Databases: what this app can reach (project + links) -->

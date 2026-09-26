@@ -71,6 +71,7 @@
 mod access_logs;
 mod alerts;
 mod api_errors;
+mod app_domains;
 mod audit_log;
 mod audit_ship;
 mod auth;
@@ -85,6 +86,7 @@ mod db_docker_tests;
 mod db_exec;
 mod db_upgrade;
 mod deploy;
+mod dns_providers;
 mod docker;
 mod domains;
 mod error;

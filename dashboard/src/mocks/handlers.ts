@@ -52,6 +52,8 @@ import {
 	MOCK_APP_ENV_VARS,
 	MOCK_PREVIEW_ENV_VARS,
 	MOCK_CERTIFICATES,
+	MOCK_APP_DOMAINS,
+	MOCK_DNS_PROVIDERS,
 	MOCK_DATABASE_LINKS,
 	makeMockSystemMetrics,
 	makeMockSystemSelf,
@@ -74,8 +76,10 @@ import type {
 	BackupConfig,
 	CronJob,
 	CronJobRun,
+	AppDomain,
 	Deployment,
 	DeploymentLogLine,
+	DnsProvider,
 	DeployPhase,
 	PhaseRecord,
 	GitHubApp,
@@ -122,6 +126,11 @@ function ok<T>(data: T) {
 
 function err(message: string, status = 400, code?: string) {
 	return HttpResponse.json(errorBody(message, status, code), { status });
+}
+
+/** INVALID_INPUT about one request field. */
+function fieldErr(message: string, field: string) {
+	return HttpResponse.json(errorBody(message, 400, 'INVALID_INPUT', { field }), { status: 400 });
 }
 
 /** The mock password policy: 12–256 characters, no common passwords. */
@@ -396,8 +405,79 @@ function queueMockCertificate(domain: string) {
 		issuer: null,
 		issuer_kind: 'unknown',
 		last_renewed_at: null,
+		challenge: null,
 		serves: { kind: 'unused' }
 	});
+}
+
+const appDomains: Record<string, AppDomain[]> = structuredClone(MOCK_APP_DOMAINS);
+let dnsProviders: DnsProvider[] = structuredClone(MOCK_DNS_PROVIDERS);
+
+/** Server order: primary, aliases, redirects. */
+function sortedDomains(appId: string): AppDomain[] {
+	const rank = { primary: 0, alias: 1, redirect: 2 } as const;
+	return [...(appDomains[appId] ?? [])].sort(
+		(a, b) => rank[a.kind] - rank[b.kind] || a.created_at.localeCompare(b.created_at)
+	);
+}
+
+/** Keep `App.domain` equal to the primary domain (the server's triggers). */
+function syncPrimary(appId: string) {
+	const idx = apps.findIndex((a) => a.id === appId);
+	if (idx === -1) return;
+	const primary = (appDomains[appId] ?? []).find((d) => d.kind === 'primary')?.domain ?? null;
+	apps[idx] = { ...apps[idx], domain: primary };
+}
+
+/** Oldest alias becomes primary when the app has none. */
+function promoteIfNeeded(appId: string) {
+	const list = appDomains[appId] ?? [];
+	if (list.some((d) => d.kind === 'primary')) return;
+	const alias = [...list]
+		.filter((d) => d.kind === 'alias')
+		.sort((a, b) => a.created_at.localeCompare(b.created_at))[0];
+	if (alias) alias.kind = 'primary';
+}
+
+/** The server's domain rules (app_domains.rs), or an error message. */
+function checkMockDomain(appId: string, raw: string): string | null {
+	const domain = normalizeDomain(raw);
+	if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(domain)) {
+		return `'${domain}' is not a valid domain name (expected something like app.example.com)`;
+	}
+	if (domain === MOCK_SETTINGS.dashboard_domain) {
+		return `${domain} is the dashboard domain; choose another hostname for the app`;
+	}
+	const preview = MOCK_SETTINGS.preview_domain;
+	if (preview && (domain === preview || domain.endsWith(`.${preview}`))) {
+		return `${domain} is under the preview domain (${preview}), which only serves previews; choose a hostname outside it`;
+	}
+	for (const [otherId, list] of Object.entries(appDomains)) {
+		if (otherId !== appId && list.some((d) => d.domain === domain)) {
+			const other = apps.find((a) => a.id === otherId)?.name ?? otherId;
+			return `${domain} is already used by the app '${other}'. Remove it there first.`;
+		}
+	}
+	return null;
+}
+
+function mockDomainRow(
+	domain: string,
+	kind: AppDomain['kind'],
+	redirectTo: string | null = null,
+	code = 308
+): AppDomain {
+	return {
+		domain,
+		kind,
+		redirect_to: redirectTo,
+		redirect_code: code,
+		service: null,
+		port: null,
+		created_at: new Date().toISOString(),
+		automatic: !!MOCK_SETTINGS.apps_domain && domain.endsWith(`.${MOCK_SETTINGS.apps_domain}`),
+		warning: mockDomainWarning(domain)
+	};
 }
 
 // In-memory mutable state (mutations survive page navigation within the session)
@@ -1209,8 +1289,17 @@ function mockDomainCheck(domain: string) {
 		status = 'mismatch';
 		message = `DNS for ${domain} points to ${ips.join(', ')}, expected ${serverIp}. Update the domain's A/AAAA record to this server.`;
 	}
-	const cert = certificates.find((c) => c.domain === domain) ?? null;
+	const parent = domain.split('.').slice(1).join('.');
+	const wildcard = parent.includes('.')
+		? (certificates.find((c) => c.domain === `*.${parent}` && c.status === 'active') ?? null)
+		: null;
+	const own = certificates.find((c) => c.domain === domain) ?? null;
+	const cert = own ?? wildcard;
+	const provider =
+		dnsProviders.find((p) => p.zones.some((z) => domain === z || domain.endsWith(`.${z}`))) ?? null;
 	return {
+		covered_by: own ? null : (wildcard?.domain ?? null),
+		dns_provider: provider?.name ?? null,
 		domain,
 		zone,
 		apps_domain: appsDomain,
@@ -1222,6 +1311,10 @@ function mockDomainCheck(domain: string) {
 		dns: { status, resolved: ips, expected: [serverIp], stray, message },
 		certificate: cert
 			? {
+					domain: cert.domain,
+					cert_type: cert.cert_type,
+					challenge: cert.challenge,
+					issuer: cert.issuer,
 					status: cert.status,
 					issued_at: cert.issued_at,
 					expires_at: cert.expires_at,
@@ -2187,7 +2280,12 @@ export const handlers = [
 				`${domain} is under the preview domain (${preview}), which only serves previews; choose a hostname outside it`
 			);
 		}
-		apps[idx] = { ...apps[idx], domain, updated_at: new Date().toISOString() };
+		const list = (appDomains[apps[idx].id] ??= []);
+		for (const d of list) if (d.kind === 'primary') d.kind = 'alias';
+		const existing = list.find((d) => d.domain === domain);
+		if (existing) Object.assign(existing, { kind: 'primary', redirect_to: null });
+		else list.push(mockDomainRow(domain, 'primary'));
+		syncPrimary(apps[idx].id);
 		queueMockCertificate(domain);
 		return ok({
 			message: 'Domain updated, certificate provisioning queued',
@@ -2196,7 +2294,304 @@ export const handlers = [
 		});
 	}),
 
+	// ── App domains ───────────────────────────────────────────────────────────
+
+	http.get('/api/v1/apps/:id/domains', async ({ params }) => {
+		await delay(LATENCY);
+		if (!apps.some((a) => a.id === params.id)) return err('App not found', 404);
+		return ok(sortedDomains(params.id as string));
+	}),
+
+	http.post('/api/v1/apps/:id/domains/www-pair', async ({ params, request }) => {
+		await delay(LATENCY);
+		const id = params.id as string;
+		if (!apps.some((a) => a.id === id)) return err('App not found', 404);
+		const body = (await request.json()) as {
+			domain: string;
+			canonical: 'apex' | 'www';
+			primary?: boolean;
+		};
+		const input = normalizeDomain(body.domain);
+		const apex = input.startsWith('www.') ? input.slice(4) : input;
+		const www = `www.${apex}`;
+		const [canonical, other] = body.canonical === 'apex' ? [apex, www] : [www, apex];
+		const problem = checkMockDomain(id, canonical) ?? checkMockDomain(id, other);
+		if (problem) return err(problem, problem.includes('already used') ? 409 : 400);
+		const list = (appDomains[id] ??= []);
+		const makePrimary = body.primary ?? true;
+		if (makePrimary) for (const d of list) if (d.kind === 'primary') d.kind = 'alias';
+		const upsert = (row: AppDomain) => {
+			const i = list.findIndex((d) => d.domain === row.domain);
+			if (i === -1) {
+				list.push(row);
+				queueMockCertificate(row.domain);
+			} else list[i] = { ...list[i], ...row, created_at: list[i].created_at };
+		};
+		upsert(mockDomainRow(canonical, makePrimary ? 'primary' : 'alias'));
+		for (const d of list) if (d.redirect_to === other) d.redirect_to = canonical;
+		upsert(mockDomainRow(other, 'redirect', canonical));
+		promoteIfNeeded(id);
+		syncPrimary(id);
+		return ok(sortedDomains(id));
+	}),
+
+	http.post('/api/v1/apps/:id/domains', async ({ params, request }) => {
+		await delay(LATENCY);
+		const id = params.id as string;
+		if (!apps.some((a) => a.id === id)) return err('App not found', 404);
+		const body = (await request.json()) as {
+			domain: string;
+			kind?: AppDomain['kind'];
+			redirect_to?: string;
+			redirect_code?: number;
+		};
+		const domain = normalizeDomain(body.domain);
+		const problem = checkMockDomain(id, domain);
+		if (problem) return err(problem, problem.includes('already used') ? 409 : 400);
+		const list = (appDomains[id] ??= []);
+		if (list.some((d) => d.domain === domain)) {
+			return err(`${domain} is already a domain of this app`, 409);
+		}
+		const kind = body.kind ?? (list.some((d) => d.kind === 'primary') ? 'alias' : 'primary');
+		if (kind === 'redirect') {
+			const target = list.find((d) => d.domain === body.redirect_to);
+			if (!target || target.kind === 'redirect') {
+				return err(
+					`${body.redirect_to ?? '(none)'} isn't a serving domain of this app. Redirects can only point at the app's own domains.`
+				);
+			}
+		}
+		if (kind === 'primary') for (const d of list) if (d.kind === 'primary') d.kind = 'alias';
+		list.push(
+			mockDomainRow(
+				domain,
+				kind,
+				kind === 'redirect' ? (body.redirect_to ?? null) : null,
+				body.redirect_code ?? 308
+			)
+		);
+		promoteIfNeeded(id);
+		syncPrimary(id);
+		queueMockCertificate(domain);
+		return ok(sortedDomains(id));
+	}),
+
+	http.patch('/api/v1/apps/:id/domains/:domain', async ({ params, request }) => {
+		await delay(LATENCY);
+		const id = params.id as string;
+		const list = appDomains[id] ?? [];
+		const row = list.find((d) => d.domain === params.domain);
+		if (!row) return err(`${params.domain} is not a domain of this app`, 404);
+		const body = (await request.json()) as {
+			kind?: AppDomain['kind'];
+			redirect_to?: string;
+			redirect_code?: number;
+		};
+		const kind = body.kind ?? row.kind;
+		if (row.kind === 'primary' && kind !== 'primary') {
+			return err(`${row.domain} is the primary domain. Make another domain primary first.`, 409);
+		}
+		if (kind === 'redirect') {
+			const pointing = list.filter((d) => d.redirect_to === row.domain).map((d) => d.domain);
+			if (pointing.length) {
+				return err(
+					`${pointing.join(', ')} redirect${pointing.length === 1 ? 's' : ''} to ${row.domain}; point ${pointing.length === 1 ? 'it' : 'them'} at another domain first`,
+					409
+				);
+			}
+			const target = list.find((d) => d.domain === (body.redirect_to ?? row.redirect_to));
+			if (!target || target.kind === 'redirect' || target.domain === row.domain) {
+				return err(`choose a serving domain of this app to redirect to`);
+			}
+			row.redirect_to = target.domain;
+			row.redirect_code = body.redirect_code ?? row.redirect_code;
+		} else {
+			row.redirect_to = null;
+			row.redirect_code = 308;
+		}
+		if (kind === 'primary') for (const d of list) if (d.kind === 'primary') d.kind = 'alias';
+		row.kind = kind;
+		promoteIfNeeded(id);
+		syncPrimary(id);
+		return ok(sortedDomains(id));
+	}),
+
+	http.delete('/api/v1/apps/:id/domains/:domain', async ({ params }) => {
+		await delay(LATENCY);
+		const id = params.id as string;
+		const list = appDomains[id] ?? [];
+		const row = list.find((d) => d.domain === params.domain);
+		if (!row) return err(`${params.domain} is not a domain of this app`, 404);
+		const pointing = list.filter((d) => d.redirect_to === row.domain).map((d) => d.domain);
+		if (pointing.length) {
+			return err(
+				`${pointing.join(', ')} redirect${pointing.length === 1 ? 's' : ''} to ${row.domain}. Remove ${pointing.length === 1 ? 'it' : 'them'} or point ${pointing.length === 1 ? 'it' : 'them'} at another domain first.`,
+				409
+			);
+		}
+		appDomains[id] = list.filter((d) => d !== row);
+		promoteIfNeeded(id);
+		syncPrimary(id);
+		return ok(sortedDomains(id));
+	}),
+
+	// ── DNS providers ─────────────────────────────────────────────────────────
+
+	http.get('/api/v1/dns-providers', async () => {
+		await delay(LATENCY);
+		return ok(dnsProviders);
+	}),
+
+	http.post('/api/v1/dns-providers', async ({ request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as {
+			name: string;
+			kind: DnsProvider['kind'];
+			zones: string[];
+			token: string;
+			config?: DnsProvider['config'];
+		};
+		if (!body.name?.trim()) return err('Give the provider a name');
+		if (!body.token?.trim()) return err('Paste the API token');
+		const zones = [...new Set(body.zones.map(normalizeDomain).filter(Boolean))];
+		if (zones.length === 0) {
+			return err('List at least one zone (the domain the provider hosts, e.g. example.com)');
+		}
+		if (body.kind === 'route53' && !body.config?.access_key_id?.trim()) {
+			return err(
+				'Route 53 needs the access key id (the secret access key goes in the token field)'
+			);
+		}
+		const taken = dnsProviders.find((p) => p.zones.some((z) => zones.includes(z)));
+		if (taken) {
+			const zone = zones.find((z) => taken.zones.includes(z));
+			return err(`${zone} is already handled by the DNS provider '${taken.name}'`, 409);
+		}
+		const now = new Date().toISOString();
+		const provider: DnsProvider = {
+			id: `dns_${Date.now()}`,
+			name: body.name.trim(),
+			kind: body.kind,
+			zones,
+			config: body.config ?? {},
+			token_set: true,
+			created_at: now,
+			updated_at: now,
+			last_used_at: null,
+			last_error: null
+		};
+		dnsProviders = [...dnsProviders, provider];
+		return ok(provider);
+	}),
+
+	http.patch('/api/v1/dns-providers/:id', async ({ params, request }) => {
+		await delay(LATENCY);
+		const idx = dnsProviders.findIndex((p) => p.id === params.id);
+		if (idx === -1) return err(`DNS provider ${params.id}`, 404);
+		const body = (await request.json()) as {
+			name?: string;
+			zones?: string[];
+			token?: string;
+			config?: DnsProvider['config'];
+		};
+		const current = dnsProviders[idx];
+		dnsProviders[idx] = {
+			...current,
+			name: body.name?.trim() || current.name,
+			zones: body.zones ? body.zones.map(normalizeDomain).filter(Boolean) : current.zones,
+			config: body.config ?? current.config,
+			updated_at: new Date().toISOString(),
+			last_error: null
+		};
+		return ok(dnsProviders[idx]);
+	}),
+
+	http.delete('/api/v1/dns-providers/:id', async ({ params }) => {
+		await delay(LATENCY);
+		dnsProviders = dnsProviders.filter((p) => p.id !== params.id);
+		return ok({ deleted: params.id });
+	}),
+
+	http.post('/api/v1/dns-providers/:id/test', async ({ params }) => {
+		await delay(LATENCY * 3);
+		const provider = dnsProviders.find((p) => p.id === params.id);
+		if (!provider) return err(`DNS provider ${params.id}`, 404);
+		const labels: Record<DnsProvider['kind'], string> = {
+			cloudflare: 'Cloudflare',
+			hetzner: 'Hetzner DNS',
+			digitalocean: 'DigitalOcean',
+			route53: 'Amazon Route 53',
+			challtestsrv: 'challtestsrv (test)'
+		};
+		const zones = provider.zones.map((zone) =>
+			zone.endsWith('.invalid')
+				? {
+						zone,
+						ok: false,
+						message: `${labels[provider.kind]} answered 403: Unauthorized — check the token and its permissions`
+					}
+				: { zone, ok: true, message: `${labels[provider.kind]} can manage ${zone}` }
+		);
+		return ok({ ok: zones.every((z) => z.ok), zones });
+	}),
+
 	// ── Certificates ──────────────────────────────────────────────────────────
+
+	http.post('/api/v1/certs/custom', async ({ request }) => {
+		await delay(LATENCY * 2);
+		const body = (await request.json()) as { domain: string; cert_pem: string; key_pem: string };
+		const domain = normalizeDomain(body.domain);
+		if (!body.cert_pem.includes('-----BEGIN CERTIFICATE-----')) {
+			return fieldErr(
+				'The certificate must be PEM (-----BEGIN CERTIFICATE-----), leaf first, then the intermediates',
+				'cert_pem'
+			);
+		}
+		if (!body.key_pem.includes('PRIVATE KEY-----')) {
+			return fieldErr(
+				'The private key must be PEM (-----BEGIN PRIVATE KEY----- or an RSA/EC key)',
+				'key_pem'
+			);
+		}
+		if (body.key_pem.includes('WRONG')) {
+			return fieldErr(
+				`The private key doesn't belong to the certificate for ${domain}. Upload the key that was generated with this certificate's request.`,
+				'key_pem'
+			);
+		}
+		const now = new Date().toISOString();
+		const row = {
+			id: `cert-${Date.now()}`,
+			domain,
+			cert_type: 'custom',
+			status: 'active',
+			issued_at: now,
+			expires_at: new Date(Date.now() + 365 * 86_400_000).toISOString(),
+			last_error: null,
+			last_attempt_at: now,
+			next_retry_at: null,
+			failure_count: 0,
+			issuer: 'Example Corp Issuing CA',
+			issuer_kind: 'uploaded' as const,
+			last_renewed_at: now,
+			challenge: null,
+			serves: domain.startsWith('*.')
+				? { kind: 'wildcard' as const, purpose: 'custom' as const, hosts: 0 }
+				: { kind: 'unused' as const }
+		};
+		const i = certificates.findIndex((c) => c.domain === domain);
+		if (i === -1) certificates.push(row);
+		else certificates[i] = { ...row, serves: certificates[i].serves };
+		return ok(certificates.find((c) => c.domain === domain) ?? null);
+	}),
+
+	http.delete('/api/v1/certs/custom/:domain', async ({ params }) => {
+		await delay(LATENCY);
+		const i = certificates.findIndex((c) => c.domain === params.domain && c.cert_type === 'custom');
+		if (i === -1) return err(`No uploaded certificate for ${params.domain}`, 404);
+		certificates.splice(i, 1);
+		return ok({ deleted: params.domain });
+	}),
 
 	http.get('/api/v1/certs', async () => {
 		await delay(LATENCY);

@@ -69,6 +69,20 @@ describe('integrations page', () => {
 							created_at: '2026-01-01T00:00:00.000Z',
 							updated_at: '2026-01-01T00:00:00.000Z'
 						}
+					],
+					dnsProviders: [
+						{
+							id: 'dns_1',
+							name: 'Cloudflare',
+							kind: 'cloudflare' as const,
+							zones: ['example-apps.com'],
+							config: {},
+							token_set: true,
+							created_at: '2026-01-01T00:00:00.000Z',
+							updated_at: '2026-01-01T00:00:00.000Z',
+							last_used_at: null,
+							last_error: null
+						}
 					]
 				}
 			}
@@ -76,5 +90,7 @@ describe('integrations page', () => {
 
 		expect(screen.getByText(/integrations/i)).toBeInTheDocument();
 		expect(screen.getByText(/telegram/i)).toBeInTheDocument();
+		expect(screen.getByText(/dns providers \(wildcard certificates\)/i)).toBeInTheDocument();
+		expect(screen.getByText('example-apps.com')).toBeInTheDocument();
 	});
 });

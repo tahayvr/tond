@@ -1,5 +1,16 @@
 <script lang="ts">
-	import { listCertificates, retryCertificate, type Certificate } from '$lib/api';
+	import {
+		deleteUploadedCertificate,
+		listCertificates,
+		retryCertificate,
+		type Certificate,
+		type DnsProvider
+	} from '$lib/api';
+	import { confirmAction } from '$lib/confirm.svelte';
+	import { Button } from '$lib/components/ui/button/index.js';
+	import UploadCertificateDialog from '$lib/components/certificates/upload-certificate-dialog.svelte';
+	import UploadIcon from '~icons/ri/upload-2-line';
+	import InfoIcon from '~icons/ri/information-line';
 	import { can } from '$lib/auth.svelte';
 	import { certificateProblem, sortCertificates } from '$lib/certificates';
 	import { useAction } from '$lib/action.svelte';
@@ -31,6 +42,39 @@
 	});
 
 	let problemsOnly = $derived(data.problemsOnly as boolean);
+	let dnsProviders = $derived((data.dnsProviders ?? []) as DnsProvider[]);
+	let hasWildcard = $derived(certificates.some((c) => c.serves.kind === 'wildcard'));
+	let canManageUploads = $derived(can('settings:write'));
+
+	let uploadOpen = $state(false);
+	let uploadDomain = $state('');
+	let uploadSuccess = $state('');
+
+	function openUpload(domain = '') {
+		uploadDomain = domain;
+		uploadOpen = true;
+	}
+
+	async function handleUploaded(_cert: Certificate | null, domain: string) {
+		await refresh();
+		uploadSuccess = `Tond now serves your certificate for ${domain}. It won't renew it: upload the renewed one before it expires.`;
+	}
+
+	async function handleRemoveUpload(domain: string) {
+		await confirmAction({
+			title: `Remove the uploaded certificate for ${domain}?`,
+			description:
+				"Tond stops serving it and requests a certificate from Let's Encrypt for the domain on its next pass (if Tond still serves the domain).",
+			confirmLabel: 'Remove certificate',
+			pendingLabel: 'Removing…',
+			destructive: true,
+			onconfirm: async () => {
+				await deleteUploadedCertificate(domain);
+				await refresh();
+				uploadSuccess = `The uploaded certificate for ${domain} was removed.`;
+			}
+		});
+	}
 	let sorted = $derived(sortCertificates(certificates, now));
 	let problemCount = $derived(sorted.filter((c) => certificateProblem(c, now) !== null).length);
 	let shown = $derived(
@@ -85,11 +129,33 @@
 	<PageHeader
 		title="Certificates"
 		description="HTTPS certificates for the dashboard, apps and previews. Tond requests and renews them automatically."
-	/>
+	>
+		{#snippet actions()}
+			{#if canManageUploads}
+				<Button variant="outline" size="sm" onclick={() => openUpload()}>
+					<UploadIcon /> Upload certificate
+				</Button>
+			{/if}
+		{/snippet}
+	</PageHeader>
 
+	<SuccessAlert message={uploadSuccess} ondismiss={() => (uploadSuccess = '')} />
 	<SuccessAlert message={retry.success} ondismiss={retry.clear} />
 	<InlineError message={retry.error} ondismiss={retry.clear} />
 	<InlineError message={loadError} ondismiss={() => (loadError = '')} />
+
+	{#if !hasWildcard && dnsProviders.length === 0 && certificates.length > 0}
+		<div class="flex items-start gap-2 rounded-md border bg-muted/30 p-3 text-sm" role="note">
+			<InfoIcon class="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+			<p class="text-muted-foreground">
+				Every app and preview gets a certificate of its own. Connect your DNS provider and one
+				wildcard certificate covers them all (fewer Let's Encrypt requests, instant HTTPS for new
+				apps). <a href="/integrations/dns" class="text-foreground underline underline-offset-2"
+					>Set up a DNS provider</a
+				>
+			</p>
+		</div>
+	{/if}
 
 	{#if certificates.length > 0}
 		<nav aria-label="Filter certificates" class="flex flex-wrap items-center gap-2">
@@ -151,6 +217,9 @@
 					canWrite={can('apps:write')}
 					retrying={retry.isPending(cert.domain)}
 					onRetry={(domain) => retry.run(domain)}
+					{canManageUploads}
+					onReplace={(domain) => openUpload(domain)}
+					onRemoveUpload={handleRemoveUpload}
 				/>
 			{/each}
 		</ul>
@@ -160,3 +229,5 @@
 		</p>
 	{/if}
 </div>
+
+<UploadCertificateDialog bind:open={uploadOpen} domain={uploadDomain} onUploaded={handleUploaded} />

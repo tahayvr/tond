@@ -79,6 +79,8 @@ pub enum Purpose {
     HeartbeatUrl,
     /// audit_shipping.webhook_secret (HMAC key for shipped audit entries)
     AuditWebhookSecret,
+    /// dns_providers.token_enc (DNS API token / Route 53 secret key)
+    DnsProviderToken,
     /// idempotency_keys.response (a stored response can hold a new token or
     /// database password). A cache: key rotation drops it instead.
     IdempotentResponse,
@@ -107,6 +109,7 @@ impl Purpose {
             Purpose::IntegrationSecret => b"tond:integrations.config",
             Purpose::HeartbeatUrl => b"tond:heartbeat_config.url_enc",
             Purpose::AuditWebhookSecret => b"tond:audit_shipping.webhook_secret",
+            Purpose::DnsProviderToken => b"tond:dns_providers.token_enc",
             Purpose::IdempotentResponse => b"tond:idempotency_keys.response",
         }
     }
@@ -479,6 +482,7 @@ pub const SCALAR_SECRET_COLUMNS: &[(&str, &str, Purpose)] = &[
         Purpose::RegistryPassword,
     ),
     ("gitlab_tokens", "token_enc", Purpose::GitlabToken),
+    ("dns_providers", "token_enc", Purpose::DnsProviderToken),
     ("gitea_tokens", "token_enc", Purpose::GiteaToken),
     ("users", "totp_secret_enc", Purpose::TotpSecret),
     ("apps", "env_vars", Purpose::AppEnv),
