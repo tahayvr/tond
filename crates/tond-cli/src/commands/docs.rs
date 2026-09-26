@@ -54,7 +54,7 @@ pub fn cli_markdown(root: &Command) -> String {
 
 fn visible_subcommands(cmd: &Command) -> Vec<&Command> {
     cmd.get_subcommands()
-        .filter(|c| !c.is_hide_set() && c.get_name() != "help")
+        .filter(|c| !c.is_hide_set())
         .collect()
 }
 

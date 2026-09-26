@@ -22,6 +22,7 @@ Tond has three layers of configuration: environment variables read by the proces
 | `TOND_DASHBOARD_DOMAIN` | unset | Seeds the `dashboard_domain` setting at startup while that setting is empty. After that the setting wins. The installer writes it to a drop-in (`tond-server.service.d/dashboard-domain.conf`). |
 | `TOND_TERMINAL_USER` | `tond` | Unprivileged Linux user the host terminal runs as. |
 | `TOND_BUILD_CONCURRENCY` | `1` | Number of image builds that may run at the same time. |
+| `TOND_UPDATE_RELEASES_URL` | GitHub's releases API for `tahayvr/tond` | Where the daily update check lists releases. A `file://` path works too. See [The update check](#the-update-check). |
 | `TOND_BUILD_CGROUP_PARENT` | `tondbuild.slice` | Cgroup parent passed to `docker build`, which puts every build under the memory cap of `tondbuild.slice`. An empty value disables it. |
 | `TOND_SHUTDOWN_GRACE_SECS` | `45` | How long in-flight deploys, cron runs and snapshots may run after SIGTERM before they are marked interrupted. |
 | `TOND_LOG_FORMAT` | `text` | `json` writes one JSON object per log line. Anything else is text. |
@@ -62,7 +63,8 @@ The proxy reads the dashboard domain and preview domain from the database, not f
 | `TOND_SERVER` | `--server` | unset | Server URL to use over HTTP(S) instead of the local socket. Needs a token. |
 | `TOND_TOKEN` | `--token` | unset | API token (`tond_pat_…`) for `--server` connections. |
 | `TOND_SOCKET_PATH` | `--socket` | `/opt/tond/data/tond.sock` | Local socket used when no server URL is set. |
-| `TOND_ALLOW_UNSIGNED` | none | unset | `1` lets `tond update` install a release that has no signature. A signature that fails to verify is always refused. |
+| `TOND_IDEMPOTENCY_KEY` | `--idempotency-key` | a new UUID per request | Idempotency key sent with mutating requests: a repeated command with the same key returns the first result instead of acting twice. See [Error codes](/reference/error-codes#retries-and-idempotency). |
+| `TOND_ALLOW_UNSIGNED` | none | unset | `1` lets `tond update --direct` install a release that has no signature. A signature that fails to verify is always refused. |
 
 See [CLI](/reference/cli) for every command and flag.
 

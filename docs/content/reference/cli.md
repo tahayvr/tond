@@ -1412,3 +1412,15 @@ tond completions <SHELL>
 | Argument | Description |
 | --- | --- |
 | `<SHELL>` | Shell to generate completions for. One of `bash`, `elvish`, `fish`, `powershell`, `zsh`. |
+
+## tond help
+
+Print help for a command (`tond help apps deploy`) or the exit-code table (`tond help exit-codes`)
+
+```text
+tond help [TOPIC...]
+```
+
+| Argument | Description |
+| --- | --- |
+| `[TOPIC]` | Command path, or `exit-codes`. |
