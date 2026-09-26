@@ -1155,7 +1155,8 @@ jq -e '.data.allowlist_enforced == true and .data.access_warning == null' "$API_
 iptables -S DOCKER-USER | grep -q -- "-j TOND-DB" || fail "DOCKER-USER must jump to TOND-DB"
 iptables -S TOND-DB | grep -- "--ctorigdstport ${PGC_PORT} " | grep -- "-s 192.0.2.10/32" | grep -q -- "-j RETURN" \
     || fail "the allowlist must accept 192.0.2.10 on port ${PGC_PORT}: $(iptables -S TOND-DB)"
-iptables -S TOND-DB | grep -q -- "--ctorigdstport ${PGC_PORT} -j DROP" || fail "other sources must be dropped"
+iptables -S TOND-DB | grep -- "--ctorigdstport ${PGC_PORT} " | grep -v -- " -s " | grep -q -- "-j DROP" \
+    || fail "other sources must be dropped: $(iptables -S TOND-DB)"
 [[ "$(api_req PATCH /api/v1/databases/e2e-pg-copy '{"public_access":false,"allowlist":[]}')" == 200 ]] \
     || fail "making the database private again must succeed: $(cat "$API_BODY")"
 ! iptables -S TOND-DB | grep -q -- "--ctorigdstport ${PGC_PORT} " || fail "a private database must leave no allowlist rules"
