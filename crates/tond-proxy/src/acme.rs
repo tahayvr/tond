@@ -295,7 +295,7 @@ async fn provision_cert_inner(
 
     // Store cert in the cert store (memory + disk)
     p.cert_store
-        .store(domain, cert_pem.as_bytes(), private_key_pem.as_bytes())
+        .store_acme(domain, cert_pem.as_bytes(), private_key_pem.as_bytes())
         .await
         .context("storing certificate")?;
 

@@ -516,6 +516,7 @@ impl IssuanceLoop {
         let hosts = self.desired_domains().await;
         let cfg = self.config.read().await.clone();
         let custom = self.custom_domains().await?;
+        self.cert_store.add_uploads(custom.clone());
         let mut states = load_retry_states(&self.db).await?;
         states.extend(self.outbox.overlay());
         let failures: HashMap<String, u32> = states
@@ -666,6 +667,11 @@ impl IssuanceLoop {
                 {
                     tracing::warn!("[cert] issued {} but could not record it: {}", domain, e);
                 }
+                None
+            }
+            // An upload arrived while the order ran: nothing to record.
+            Err(e) if self.cert_store.is_upload(domain) => {
+                tracing::info!("[cert] {domain}: {e:#}");
                 None
             }
             Err(e) => {

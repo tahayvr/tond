@@ -38,7 +38,7 @@ use anyhow::{Context, Result};
 use openssl::asn1::Asn1Time;
 use openssl::pkey::{PKey, Private};
 use openssl::x509::X509;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -222,6 +222,12 @@ pub struct CertStore {
     certs_dir: PathBuf,
     /// Fallback self-signed cert for unknown domains
     fallback: Arc<CertPair>,
+    /// Domains served by an uploaded certificate: an ACME result for one of
+    /// them (an order that was already running when the upload arrived) is
+    /// dropped instead of replacing the upload.
+    uploads: Arc<std::sync::RwLock<HashSet<String>>>,
+    /// Serialises "is it an upload?" + write between ACME and uploads.
+    writes: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl CertStore {
@@ -239,6 +245,8 @@ impl CertStore {
             cache: Arc::new(RwLock::new(HashMap::new())),
             certs_dir: certs_dir.to_path_buf(),
             fallback: Arc::new(fallback),
+            uploads: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            writes: Arc::new(tokio::sync::Mutex::new(())),
         };
 
         // Load any existing certs from disk
@@ -269,6 +277,11 @@ impl CertStore {
 
     /// Forget a certificate and delete its files.
     pub async fn remove(&self, domain: &str) -> Result<()> {
+        let _write = self.writes.lock().await;
+        self.uploads
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(domain);
         self.cache.write().await.remove(domain);
         let dir = self.certs_dir.join(dir_name(domain));
         match tokio::fs::remove_dir_all(&dir).await {
@@ -288,8 +301,43 @@ impl CertStore {
         key_pem: &[u8],
     ) -> Result<UploadDetails> {
         let details = validate_upload(domain, cert_pem, key_pem)?;
+        let _write = self.writes.lock().await;
         self.store(domain, cert_pem, key_pem).await?;
+        self.uploads
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(domain.to_string());
         Ok(details)
+    }
+
+    /// Record uploads known from the `certificates` table (every certificate
+    /// pass, so the set survives restarts). Only remove() forgets one: a row
+    /// tond-server hasn't written yet must not make a fresh upload look free.
+    pub fn add_uploads(&self, domains: HashSet<String>) {
+        self.uploads
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(domains);
+    }
+
+    /// `domain` is served by an uploaded certificate.
+    pub fn is_upload(&self, domain: &str) -> bool {
+        self.uploads
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(domain)
+    }
+
+    /// Store an ACME result, unless an upload took the domain over while the
+    /// order ran (the result is dropped: the upload wins).
+    pub async fn store_acme(&self, domain: &str, cert_pem: &[u8], key_pem: &[u8]) -> Result<()> {
+        let _write = self.writes.lock().await;
+        if self.is_upload(domain) {
+            anyhow::bail!(
+                "{domain} got an uploaded certificate while the order ran; the ACME certificate was dropped"
+            );
+        }
+        self.store(domain, cert_pem, key_pem).await
     }
 
     /// Check if we have a cert (non-fallback) for this domain.
@@ -849,6 +897,55 @@ mod tests {
             )
             .is_err(),
             "a single-name certificate doesn't serve a wildcard"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upload_wins_over_an_acme_result_that_was_already_running() {
+        let dir = temp_dir();
+        let store = CertStore::new(&dir.path().join("certs"))
+            .await
+            .unwrap_or_else(|err| panic!("store: {err}"));
+        let upload = chain(&["shop.example.com"], false);
+        store
+            .install_upload(
+                "shop.example.com",
+                upload.leaf.as_bytes(),
+                upload.key.as_bytes(),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("upload: {err:#}"));
+        let (_, acme_pem, acme_key) = generate_self_signed_for_domain("shop.example.com")
+            .unwrap_or_else(|err| panic!("fixture: {err}"));
+        assert!(
+            store
+                .store_acme("shop.example.com", &acme_pem, &acme_key)
+                .await
+                .is_err(),
+            "the in-flight ACME result is dropped"
+        );
+        let served = store
+            .get("shop.example.com")
+            .await
+            .cert
+            .to_der()
+            .unwrap_or_default();
+        let uploaded = X509::from_pem(upload.leaf.as_bytes())
+            .and_then(|c| c.to_der())
+            .unwrap_or_default();
+        assert_eq!(served, uploaded, "the upload keeps serving");
+
+        store
+            .remove("shop.example.com")
+            .await
+            .unwrap_or_else(|err| panic!("remove: {err}"));
+        assert!(!store.is_upload("shop.example.com"));
+        assert!(
+            store
+                .store_acme("shop.example.com", &acme_pem, &acme_key)
+                .await
+                .is_ok(),
+            "once the upload is removed, ACME takes over again"
         );
     }
 
