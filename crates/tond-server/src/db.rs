@@ -51,6 +51,18 @@ use sqlx::{ConnectOptions, SqlitePool};
 use crate::runtime::changes::HookState;
 use crate::runtime::dbstats;
 
+/// Begin a transaction that writes: `BEGIN IMMEDIATE` takes the write lock up
+/// front, so a busy database waits out `busy_timeout`. A plain (deferred)
+/// transaction that reads first and writes later can't wait: when another
+/// connection commits in between, SQLite refuses the upgrade at once with
+/// SQLITE_BUSY_SNAPSHOT (517, "database is locked"). Every tond-server
+/// transaction writes, so use this instead of `pool.begin()`.
+pub async fn begin_write(
+    pool: &SqlitePool,
+) -> sqlx::Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
+    pool.begin_with("BEGIN IMMEDIATE").await
+}
+
 /// Maximum pooled connections for tond-server.
 const MAX_CONNECTIONS: u32 = 4;
 
@@ -157,6 +169,76 @@ mod tests {
             "tond.db must be 0640: the proxy group reads, nobody else"
         );
         share_with_proxy(&dir.path().join("missing.db"));
+    }
+
+    #[tokio::test]
+    async fn begin_write_waits_for_a_concurrent_writer_instead_of_failing() {
+        let dir = tempfile::TempDir::new().unwrap_or_else(|err| panic!("temp dir: {err}"));
+        let pool = open_pool(&dir.path().join("tond.db").to_string_lossy())
+            .await
+            .unwrap_or_else(|err| panic!("open_pool: {err}"));
+        sqlx::query("CREATE TABLE t (n INTEGER NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|err| panic!("create: {err}"));
+        sqlx::query("INSERT INTO t (n) VALUES (0)")
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|err| panic!("insert: {err}"));
+        let bump = "UPDATE t SET n = n + 1";
+
+        // A deferred transaction that reads, then sees another connection
+        // commit, can't upgrade to a writer: SQLITE_BUSY_SNAPSHOT, at once.
+        let mut deferred = pool
+            .begin()
+            .await
+            .unwrap_or_else(|err| panic!("begin: {err}"));
+        let _: i64 = sqlx::query_scalar("SELECT n FROM t")
+            .fetch_one(&mut *deferred)
+            .await
+            .unwrap_or_else(|err| panic!("read: {err}"));
+        sqlx::query(bump)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|err| panic!("other writer: {err}"));
+        let err = sqlx::query(bump)
+            .execute(&mut *deferred)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("a stale deferred transaction must not write"));
+        assert!(err.to_string().contains("517"), "{err}");
+        drop(deferred);
+
+        // begin_write holds the write lock from the start: the other writer
+        // waits (busy_timeout) and both writes land.
+        let mut tx = begin_write(&pool)
+            .await
+            .unwrap_or_else(|err| panic!("begin_write: {err}"));
+        let _: i64 = sqlx::query_scalar("SELECT n FROM t")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap_or_else(|err| panic!("read: {err}"));
+        let other = {
+            let pool = pool.clone();
+            tokio::spawn(async move { sqlx::query(bump).execute(&pool).await.map(|_| ()) })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        sqlx::query(bump)
+            .execute(&mut *tx)
+            .await
+            .unwrap_or_else(|err| panic!("write inside begin_write: {err}"));
+        tx.commit()
+            .await
+            .unwrap_or_else(|err| panic!("commit: {err}"));
+        other
+            .await
+            .unwrap_or_else(|err| panic!("join: {err}"))
+            .unwrap_or_else(|err| panic!("the other writer must wait, not fail: {err}"));
+        let n: i64 = sqlx::query_scalar("SELECT n FROM t")
+            .fetch_one(&pool)
+            .await
+            .unwrap_or_else(|err| panic!("read: {err}"));
+        assert_eq!(n, 3);
     }
 
     #[tokio::test]

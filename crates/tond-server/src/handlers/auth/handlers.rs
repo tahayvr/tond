@@ -290,7 +290,7 @@ pub async fn setup(
     let now = Utc::now().to_rfc3339();
     let user_id = Uuid::new_v4().to_string();
 
-    let mut tx = match state.db.begin().await {
+    let mut tx = match crate::db::begin_write(&state.db).await {
         Ok(tx) => tx,
         Err(e) => return internal_error(e),
     };
@@ -1221,7 +1221,7 @@ pub async fn password_link_complete(
         Err(e) => return password_error_response(e),
     };
 
-    let mut tx = match state.db.begin().await {
+    let mut tx = match crate::db::begin_write(&state.db).await {
         Ok(tx) => tx,
         Err(e) => return internal_error(e),
     };

@@ -50,7 +50,7 @@ pub async fn create(
     let token = generate_raw_key();
     let now = Utc::now();
     let expires_at = (now + Duration::hours(LINK_TTL_HOURS)).to_rfc3339();
-    let mut tx = db.begin().await?;
+    let mut tx = crate::db::begin_write(db).await?;
     sqlx::query("DELETE FROM password_links WHERE user_id = ?")
         .bind(user_id)
         .execute(&mut *tx)
@@ -158,7 +158,9 @@ mod tests {
         assert_eq!(info.email, "new@example.com");
         assert_eq!(info.purpose, "reset");
 
-        let mut tx = db.begin().await.unwrap_or_else(|e| panic!("{e}"));
+        let mut tx = crate::db::begin_write(&db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
         assert!(
             consume(&mut tx, &token)
                 .await
@@ -166,7 +168,9 @@ mod tests {
                 .is_some()
         );
         tx.commit().await.unwrap_or_else(|e| panic!("{e}"));
-        let mut tx = db.begin().await.unwrap_or_else(|e| panic!("{e}"));
+        let mut tx = crate::db::begin_write(&db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
         assert!(
             consume(&mut tx, &token)
                 .await

@@ -692,7 +692,7 @@ async fn begin<'t>(
     tx: &'t mut Option<Transaction<'static, Sqlite>>,
 ) -> Result<&'t mut Transaction<'static, Sqlite>> {
     if tx.is_none() {
-        *tx = Some(db.begin().await?);
+        *tx = Some(crate::db::begin_write(db).await?);
     }
     Ok(tx.as_mut().unwrap_or_else(|| unreachable!("just set")))
 }
@@ -791,7 +791,7 @@ async fn enqueue(
 /// notifications, and forget its states.
 pub async fn close_rule(db: &SqlitePool, rule_id: &str, now: i64) -> Result<()> {
     let _guard = EVAL_LOCK.lock().await;
-    let mut tx = db.begin().await?;
+    let mut tx = crate::db::begin_write(db).await?;
     sqlx::query(
         "UPDATE alert_history SET resolved_at = ?
          WHERE resolved_at IS NULL AND id IN (SELECT episode_id FROM alert_states WHERE rule_id = ?)",

@@ -259,6 +259,9 @@ One system for all of these — never hand-roll a pill, banner or `confirm()`:
   (`runtime::changes::Watch`), never on a short fixed tick; register them in
   `runtime::loops` so `/api/v1/system/self` shows their health. `e2e/budget.sh` checks RSS,
   wakeups, DB queries and journal lines at idle.
+- Open write transactions with `crate::db::begin_write(&pool)` (`BEGIN IMMEDIATE`), never `pool.begin()`:
+  a deferred transaction that reads and then writes fails at once with SQLITE_BUSY_SNAPSHOT (517,
+  "database is locked") when another connection commits in between; `busy_timeout` can't help it.
 - Spawn child processes with `crate::process::command(..)`, not `tokio::process::Command::new`:
   tond-server runs with `OOMScoreAdjust=-900`, and the helper resets children (git, docker CLI,
   tar) to a neutral OOM score so they can't hide behind Tond's protection.

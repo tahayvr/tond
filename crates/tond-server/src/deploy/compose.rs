@@ -575,7 +575,7 @@ async fn run_with_source(
     // ── Release ──
     progress::start(state, &app_id, DeployPhase::Release).await;
     let release = images::deployment_tag(&app_name, deployment_id);
-    let mut tx = state.db.begin().await?;
+    let mut tx = crate::db::begin_write(&state.db).await?;
     for spec in &specs {
         let digest: Option<String> = sqlx::query_scalar(
             "SELECT digest FROM deployment_services WHERE deployment_id = ? AND service = ?",

@@ -166,7 +166,7 @@ pub async fn update_retention(
     let pairs = validate_changes(&changes).map_err(TondError::InvalidInput)?;
     let before = RetentionPolicy::load(&state.db).await;
     let now = chrono::Utc::now().to_rfc3339();
-    let mut tx = state.db.begin().await?;
+    let mut tx = crate::db::begin_write(&state.db).await?;
     for (key, value) in &pairs {
         sqlx::query(
             "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)

@@ -392,7 +392,7 @@ pub async fn reencrypt_stored_secrets(
     if current == previous {
         return Ok(report);
     }
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::begin_write(pool).await?;
 
     for (table, column, purpose) in SCALAR_SECRET_COLUMNS {
         // `table` and `column` come from the literal list: injection-safe.

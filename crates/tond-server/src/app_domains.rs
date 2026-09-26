@@ -311,7 +311,7 @@ pub async fn add(
     app_id: &str,
     req: &AddAppDomainRequest,
 ) -> Result<AppDomain, TondError> {
-    let mut tx = db.begin().await?;
+    let mut tx = crate::db::begin_write(db).await?;
     let (domain, existing) = check_new_domain(&mut tx, ctx, app_id, &req.domain).await?;
     if existing.is_some() {
         return Err(TondError::Conflict(format!(
@@ -368,7 +368,7 @@ pub async fn update(
     req: &UpdateAppDomainRequest,
 ) -> Result<AppDomain, TondError> {
     let domain = normalize_domain(domain);
-    let mut tx = db.begin().await?;
+    let mut tx = crate::db::begin_write(db).await?;
     let current = get_in(&mut tx, &domain)
         .await?
         .filter(|d| d.app_id == app_id)
@@ -421,7 +421,7 @@ pub async fn update(
 /// Remove a domain. The oldest alias becomes primary when the primary goes.
 pub async fn remove(db: &SqlitePool, app_id: &str, domain: &str) -> Result<AppDomain, TondError> {
     let domain = normalize_domain(domain);
-    let mut tx = db.begin().await?;
+    let mut tx = crate::db::begin_write(db).await?;
     let current = get_in(&mut tx, &domain)
         .await?
         .filter(|d| d.app_id == app_id)
@@ -459,7 +459,7 @@ pub async fn www_pair(
         CanonicalHost::Apex => (apex, www),
         CanonicalHost::Www => (www, apex),
     };
-    let mut tx = db.begin().await?;
+    let mut tx = crate::db::begin_write(db).await?;
     let (canonical, canonical_row) = check_new_domain(&mut tx, ctx, app_id, &canonical).await?;
     let (other, other_row) = check_new_domain(&mut tx, ctx, app_id, &other).await?;
 
@@ -530,7 +530,7 @@ pub async fn set_primary(
     app_id: &str,
     raw: &str,
 ) -> Result<AppDomain, TondError> {
-    let mut tx = db.begin().await?;
+    let mut tx = crate::db::begin_write(db).await?;
     // A redirect made primary serves again (nothing can point at a redirect).
     let (domain, existing) = check_new_domain(&mut tx, ctx, app_id, raw).await?;
     upsert(
@@ -558,7 +558,7 @@ pub async fn assign_automatic(
     app_id: &str,
     domain: &str,
 ) -> Result<bool, sqlx::Error> {
-    let mut tx = db.begin().await?;
+    let mut tx = crate::db::begin_write(db).await?;
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app_domains WHERE app_id = ?")
         .bind(app_id)
         .fetch_one(&mut *tx)
@@ -617,7 +617,7 @@ pub async fn set_service_domains(
     port: Option<i64>,
     domains: &[String],
 ) -> Result<Vec<String>, TondError> {
-    let mut tx = db.begin().await?;
+    let mut tx = crate::db::begin_write(db).await?;
     let mut wanted: Vec<String> = Vec::new();
     let mut added: Vec<String> = Vec::new();
     for raw in domains {
@@ -853,7 +853,9 @@ mod tests {
         .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(port, Some(3000));
         // A service leaving the file takes its domains (and redirects to them).
-        let mut tx = db.begin().await.unwrap_or_else(|e| panic!("{e}"));
+        let mut tx = crate::db::begin_write(&db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
         remove_service(&mut tx, "a1", "admin")
             .await
             .unwrap_or_else(|e| panic!("{e}"));

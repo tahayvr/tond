@@ -748,7 +748,7 @@ pub async fn sync_specs(
     app_id: &str,
     specs: &[ComposeServiceSpec],
 ) -> sqlx::Result<()> {
-    let mut tx = db.begin().await?;
+    let mut tx = crate::db::begin_write(db).await?;
     let existing: Vec<String> =
         sqlx::query_scalar("SELECT name FROM compose_services WHERE app_id = ?")
             .bind(app_id)
@@ -799,7 +799,7 @@ pub async fn store_states(
             .bind(app_id)
             .fetch_all(db)
             .await?;
-    let mut tx = db.begin().await?;
+    let mut tx = crate::db::begin_write(db).await?;
     for name in names {
         let st = states.iter().find(|s| s.service == name);
         sqlx::query(

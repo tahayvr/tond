@@ -355,7 +355,7 @@ pub async fn create_alert(
     let channels = check_channels(&state.db, &req.integration_ids).await?;
 
     let id = Uuid::new_v4().to_string();
-    let mut tx = state.db.begin().await?;
+    let mut tx = crate::db::begin_write(&state.db).await?;
     sqlx::query(
         "INSERT INTO alert_rules (id, name, kind, app_id, threshold, window_secs, for_secs,
             severity, repeat_secs)
@@ -437,7 +437,7 @@ pub async fn update_alert(
         None => None,
     };
 
-    let mut tx = state.db.begin().await?;
+    let mut tx = crate::db::begin_write(&state.db).await?;
     sqlx::query(
         "UPDATE alert_rules
          SET name = ?, threshold = ?, window_secs = ?, for_secs = ?, severity = ?,
