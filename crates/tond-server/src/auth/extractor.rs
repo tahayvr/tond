@@ -23,7 +23,7 @@
 //      it and checks the api_keys table.
 //
 //   3. Session cookie (dashboard browser)
-//      Reads the Cookie header for a `tond_session` value and calls
+//      Reads the Cookie header for a `__Host-tond_session` value and calls
 //      handlers::auth::validate_session() which joins sessions + users
 //      and checks expiry.
 //
@@ -63,7 +63,7 @@ impl<S: Send + Sync> FromRequestParts<S> for LocalPeer {
 /// Extractor that validates authentication via:
 /// 1. The local Unix socket (`LocalSocket` extension) — CLI on the same machine, no credentials needed
 /// 2. `Authorization: Bearer <api-key>` header
-/// 3. `tond_session` cookie (dashboard browser sessions)
+/// 3. `__Host-tond_session` cookie (dashboard browser sessions)
 ///
 /// Usage in handlers:
 /// ```rust

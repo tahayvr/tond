@@ -24,7 +24,8 @@
 //     {"type":"container","app_id":"...","app_name":"...","line":"..."}
 //
 // Authentication (both endpoints): the local Unix socket (CLI on the host),
-// `?token=<api-key>` query param, or `tond_session` cookie. Close code 4001 on failure.
+// `?token=<api-key>` query param, or `__Host-tond_session` cookie (browser
+// upgrades must come from the dashboard origin, see auth/csrf.rs). Close code 4001 on failure.
 
 use axum::{
     extract::{
@@ -852,7 +853,7 @@ async fn authenticate(
 // Incremental frames — emitted each time a new run row appears:
 //   {"type":"run","run":{...}}
 //
-// Authentication: ?token= query param or tond_session cookie.
+// Authentication: ?token= query param or __Host-tond_session cookie.
 
 /// Axum handler — upgrades to WebSocket and streams cron run output.
 pub async fn stream_cron_runs(
