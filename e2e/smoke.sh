@@ -1500,7 +1500,7 @@ tond apps deploy e2e-stack > /dev/null
 wait_for 300 "a second compose deployment" \
     bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/apps/e2e-stack/deployments | jq -e '[.data[] | select(.status == \"succeeded\")] | length >= 2'"
 wait_for 60 "the edited web service" bash -c "curl -sk --resolve '${STACK_DOMAIN}:443:${IP}' 'https://${STACK_DOMAIN}/' | grep -q 'Name: v2'"
-pass "an edited compose file redeploys; ${STACK_NAME} came from the app's environment (Name: v2)"
+pass "an edited compose file redeploys; \${STACK_NAME} came from the app's environment (Name: v2)"
 api "/api/v1/apps/e2e-stack/deployments/${STACK_FIRST}" | jq -e '.data.services | length == 2 and all(.image | test("^tond-e2e-stack/"))' > /dev/null \
     || fail "a compose deployment should list its pinned service images"
 code=$(api_req POST /api/v1/apps/e2e-stack/rollback "{\"deployment_id\":\"${STACK_FIRST}\"}")
