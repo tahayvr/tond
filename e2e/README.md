@@ -9,7 +9,8 @@ What the smoke test covers:
 
 - services up, API health
 - auth boundaries: loopback TCP and proxied requests without credentials get 401,
-  the CLI socket is `0600 root` and refuses non-root users, API keys over TCP
+  the CLI socket is `0600 root` and refuses non-root users, scoped API tokens
+  (`tond token create`) over TCP, no root API key file
 - data directory permissions: `tond.db` shared only with the `tond-proxy` group, TLS/ACME
   keys owner-only, nothing world-readable
 - service sandboxing: tond-proxy runs as `tond-proxy` with only `CAP_NET_BIND_SERVICE`,
@@ -17,13 +18,20 @@ What the smoke test covers:
 - previews (with `--preview-domain`): served only under the preview domain, the dashboard
   and API are 404 there, same-site preview domains are rejected, previews are refused
   without a preview domain
-- auth hardening: root API key and setup token only in `0600 root` files (never in
+- auth hardening: setup token only in a `0600 root` file, tokens never in
   the journal), token-gated single-use setup, `__Host-` Secure/SameSite=Strict session
   cookie, CSRF header + Origin checks, cross-origin WebSocket refusal, security
   headers/HSTS, 2FA re-auth, host terminal off by default (socket-only switch,
   step-up, single-use tickets, audit log), rate limiter not bypassable with a
   spoofed `X-Forwarded-For`, failed-login backoff. It creates the admin account
   `E2E_ADMIN_EMAIL` / `E2E_ADMIN_PASSWORD` through the setup token.
+- users and roles: invite → one-time set-password link, password policy (12+ chars,
+  breached passwords refused), a viewer gets 403 `SCOPE_DENIED` for writes, disabling
+  signs the user out, lifecycle events audited
+- API tokens: `SCOPE_DENIED` for missing scopes, `RESOURCE_DENIED` outside the app
+  filter, 401 `TOKEN_REVOKED` / `TOKEN_EXPIRED`, allowed-IP filter (not spoofable through
+  the proxy), agent tokens must expire, token calls audited as the token, and
+  `tond audit verify` checks the hash chain
 - an image app (pull, run, route through the proxy, HTTP→HTTPS redirect)
 - a pushed app (`tond apps push` → TBuild → `docker build` → run → route)
 - a real certificate issued over ACME HTTP-01 and verified against the CA

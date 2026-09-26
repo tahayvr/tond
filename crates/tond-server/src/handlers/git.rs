@@ -33,13 +33,14 @@ use axum::{
     response::IntoResponse,
 };
 use tond_common::{
-    ApiResponse, AppResponse, DeployKeyResponse, MIN_WEBHOOK_SECRET_LEN, TondError,
+    ApiResponse, AppResponse, DeployKeyResponse, MIN_WEBHOOK_SECRET_LEN, Scope, TondError,
     UpdateAutoDeployRequest, UpdateSourceRequest, UpdateWebhookSecretRequest,
     WebhookConfigResponse, WebhookUrls, generate_raw_key,
 };
 
+use crate::audit_log::{AuditEntry, record};
 use crate::{
-    auth::{AuthRole, RateLimit, RequireAuth},
+    auth::{Authz, RateLimit, scope},
     error::AppError,
     state::AppState,
 };
@@ -65,7 +66,7 @@ async fn fetch_app(db: &sqlx::SqlitePool, id_or_name: &str) -> Result<tond_commo
 /// Enables or disables automatic deploys when a webhook fires.
 pub async fn update_auto_deploy(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Path(app_id): Path<String>,
     Json(payload): Json<UpdateAutoDeployRequest>,
@@ -85,6 +86,14 @@ pub async fn update_auto_deploy(
     .await?;
 
     let updated = fetch_app(&state.db, &app.id).await?;
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("auto_deploy_update")
+            .resource("app", &updated.id, &updated.name)
+            .detail(format!("auto_deploy={}", payload.auto_deploy)),
+    )
+    .await;
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(AppResponse::from(updated))),
@@ -131,7 +140,7 @@ async fn webhook_config(
 /// Returns the webhook URLs for every provider and the current secret.
 pub async fn get_webhook_config(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Path(app_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -147,7 +156,7 @@ pub async fn get_webhook_config(
 /// GitLab token. There is no way to clear it.
 pub async fn update_webhook_secret(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Path(app_id): Path<String>,
     Json(payload): Json<UpdateWebhookSecretRequest>,
@@ -165,6 +174,12 @@ pub async fn update_webhook_secret(
 
     let updated = fetch_app(&state.db, &app.id).await?;
     let config = webhook_config(&state, updated).await?;
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("webhook_secret_update").resource("app", &app.id, &app.name),
+    )
+    .await;
     Ok((StatusCode::OK, Json(ApiResponse::ok(config))))
 }
 
@@ -191,7 +206,7 @@ fn validate_webhook_secret(secret: &str) -> Result<(), AppError> {
 /// the provider's webhook settings must be updated with the returned value.
 pub async fn rotate_webhook_secret(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Path(app_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -207,6 +222,12 @@ pub async fn rotate_webhook_secret(
 
     let updated = fetch_app(&state.db, &app.id).await?;
     let config = webhook_config(&state, updated).await?;
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("webhook_secret_rotate").resource("app", &app.id, &app.name),
+    )
+    .await;
     Ok((StatusCode::OK, Json(ApiResponse::ok(config))))
 }
 
@@ -219,7 +240,7 @@ pub async fn rotate_webhook_secret(
 /// Public key stored in the apps.deploy_key_pub column.
 pub async fn generate_deploy_key(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Path(app_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -258,6 +279,12 @@ pub async fn generate_deploy_key(
 
     tracing::info!("Generated deploy key for app {}", app.name);
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("deploy_key_generate").resource("app", &app.id, &app.name),
+    )
+    .await;
     Ok((
         StatusCode::CREATED,
         Json(ApiResponse::ok(DeployKeyResponse {
@@ -272,7 +299,7 @@ pub async fn generate_deploy_key(
 /// Returns the current public deploy key. 404 if no key has been generated yet.
 pub async fn get_deploy_key(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsRead>,
     State(state): State<AppState>,
     Path(app_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -321,7 +348,7 @@ fn generate_ed25519_keypair(comment: &str) -> anyhow::Result<(String, String)> {
 /// Updates the deployment source type and URL for the app.
 pub async fn update_source(
     _rate: RateLimit,
-    auth: AuthRole,
+    auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Path(app_id): Path<String>,
     Json(payload): Json<UpdateSourceRequest>,
@@ -341,7 +368,7 @@ pub async fn update_source(
 
     // Compose files are full container specs; switching to or from one is an admin action.
     if payload.source_type == "compose" || app.source_type == "compose" {
-        auth.ensure_admin("change a Docker Compose app's source")?;
+        auth.require_to(Scope::SettingsWrite, "change a Docker Compose app's source")?;
     }
 
     sqlx::query(
@@ -360,6 +387,14 @@ pub async fn update_source(
         payload.source_type,
         payload.source_url
     );
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("source_update")
+            .resource("app", &app.id, &app.name)
+            .detail(format!("source_type={}", payload.source_type)),
+    )
+    .await;
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(AppResponse::from(updated))),

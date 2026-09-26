@@ -25,8 +25,8 @@ use tond_common::*;
 
 use super::fetch_app;
 use crate::{
-    audit_log::{AuthActor, write_audit_log},
-    auth::{RateLimit, RequireAdmin, RequireAuth},
+    audit_log::write_audit_log,
+    auth::{Authz, RateLimit, scope},
     error::AppError,
     state::AppState,
 };
@@ -154,7 +154,7 @@ async fn fetch_app_in_tx(tx: &mut sqlx::SqliteConnection, app_id: &str) -> Resul
 
 pub async fn get_env(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::EnvReadNames>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -164,8 +164,7 @@ pub async fn get_env(
 
 pub async fn reveal_env_var(
     _rate: RateLimit,
-    _admin: RequireAdmin,
-    actor: AuthActor,
+    auth: Authz<scope::EnvReadValues>,
     State(state): State<AppState>,
     Path((id, key)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -181,7 +180,7 @@ pub async fn reveal_env_var(
         Some(&app.id),
         Some(&app.name),
         "env_reveal",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("key={key}")),
     )
     .await;
@@ -194,8 +193,7 @@ pub async fn reveal_env_var(
 
 pub async fn patch_env(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::EnvWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<PatchEnvRequest>,
@@ -233,7 +231,7 @@ pub async fn patch_env(
         Some(&updated.id),
         Some(&updated.name),
         "env_update",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&detail),
     )
     .await;
@@ -246,8 +244,7 @@ pub async fn patch_env(
 
 pub async fn reveal_preview_env_var(
     _rate: RateLimit,
-    _admin: RequireAdmin,
-    actor: AuthActor,
+    auth: Authz<scope::EnvReadValues>,
     State(state): State<AppState>,
     Path((id, key)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -263,7 +260,7 @@ pub async fn reveal_preview_env_var(
         Some(&app.id),
         Some(&app.name),
         "preview_env_reveal",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("key={key}")),
     )
     .await;
@@ -276,8 +273,7 @@ pub async fn reveal_preview_env_var(
 
 pub async fn patch_preview_env(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::EnvWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<PatchPreviewEnvRequest>,
@@ -330,7 +326,7 @@ pub async fn patch_preview_env(
         Some(&updated.id),
         Some(&updated.name),
         "preview_env_update",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&detail),
     )
     .await;
@@ -353,6 +349,7 @@ mod tests {
     use axum::{extract::FromRequestParts, http::header};
 
     use super::*;
+    use crate::auth::Principal;
     use crate::auth::{LocalSocket, RateLimiter};
     use crate::handlers::auth::SESSION_COOKIE;
 
@@ -411,10 +408,6 @@ mod tests {
             .unwrap_or_else(|err| panic!("failed to decode JSON response body: {err}"))
     }
 
-    fn actor() -> AuthActor {
-        AuthActor("admin@example.com".to_string())
-    }
-
     /// Seed a user with `role` and a live session; returns the raw session token.
     async fn seed_session_for(state: &AppState, role: &str) -> String {
         let user_id = format!("user-{role}");
@@ -444,7 +437,8 @@ mod tests {
         token
     }
 
-    async fn admin_gate(state: &AppState, headers: &[(header::HeaderName, String)]) -> bool {
+    /// HTTP status the reveal route's `Authz<scope::EnvReadValues>` gives these headers (200 = passes).
+    async fn reveal_gate(state: &AppState, headers: &[(header::HeaderName, String)]) -> u16 {
         let mut builder = axum::http::Request::builder().uri("/api/apps/x/env/K");
         for (name, value) in headers {
             builder = builder.header(name, value);
@@ -453,49 +447,51 @@ mod tests {
             .body(())
             .unwrap_or_else(|err| panic!("failed to build request: {err}"))
             .into_parts();
-        RequireAdmin::from_request_parts(&mut parts, state)
-            .await
-            .is_ok()
+        match Authz::<scope::EnvReadValues>::from_request_parts(&mut parts, state).await {
+            Ok(_) => 200,
+            Err(response) => response.status().as_u16(),
+        }
+    }
+
+    async fn token_with(state: &AppState, scopes: &[&str]) -> String {
+        crate::auth::tokens::create_token(
+            &state.db,
+            &Principal::local_socket(),
+            &CreateTokenRequest {
+                name: "e2e".into(),
+                scopes: scopes.iter().map(|s| s.to_string()).collect(),
+                ..CreateTokenRequest::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|err| panic!("failed to create token: {err}"))
+        .secret
     }
 
     #[tokio::test]
-    async fn only_admins_pass_the_reveal_gate() {
+    async fn only_callers_with_env_read_values_pass_the_reveal_gate() {
         let state = test_state().await;
         let admin = seed_session_for(&state, "admin").await;
-        let member = seed_session_for(&state, "member").await;
+        let deployer = seed_session_for(&state, "deployer").await;
         let cookie = |t: &str| (header::COOKIE, format!("{SESSION_COOKIE}={t}"));
+        let bearer = |t: &str| (header::AUTHORIZATION, format!("Bearer {t}"));
 
-        assert!(admin_gate(&state, &[cookie(&admin)]).await, "admin session");
-        assert!(
-            !admin_gate(&state, &[cookie(&member)]).await,
-            "member session must be refused"
+        assert_eq!(
+            reveal_gate(&state, &[cookie(&admin)]).await,
+            200,
+            "admin session"
         );
-        let (api_key, raw_key) = ApiKey::generate("e2e");
-        sqlx::query("INSERT INTO api_keys (id, name, key_hash, created_at) VALUES (?, ?, ?, ?)")
-            .bind(&api_key.id)
-            .bind(&api_key.name)
-            .bind(&api_key.key_hash)
-            .bind(&api_key.created_at)
-            .execute(&state.db)
-            .await
-            .unwrap_or_else(|err| panic!("failed to seed API key: {err}"));
-        assert!(
-            admin_gate(
-                &state,
-                &[(header::AUTHORIZATION, format!("Bearer {raw_key}"))]
-            )
-            .await,
-            "API keys count as admin"
+        assert_eq!(
+            reveal_gate(&state, &[cookie(&deployer)]).await,
+            403,
+            "deployers can write env vars but not read values"
         );
-        assert!(
-            !admin_gate(
-                &state,
-                &[(header::AUTHORIZATION, "Bearer bogus".to_string())]
-            )
-            .await,
-            "an invalid API key is refused"
-        );
-        assert!(!admin_gate(&state, &[]).await, "no credential");
+        let reader = token_with(&state, &["env:read-values"]).await;
+        assert_eq!(reveal_gate(&state, &[bearer(&reader)]).await, 200);
+        let names_only = token_with(&state, &["env:read-names"]).await;
+        assert_eq!(reveal_gate(&state, &[bearer(&names_only)]).await, 403);
+        assert_eq!(reveal_gate(&state, &[bearer("bogus")]).await, 401);
+        assert_eq!(reveal_gate(&state, &[]).await, 401, "no credential");
 
         let (mut parts, _) = axum::http::Request::builder()
             .extension(LocalSocket)
@@ -503,10 +499,10 @@ mod tests {
             .unwrap_or_else(|err| panic!("failed to build request: {err}"))
             .into_parts();
         assert!(
-            RequireAdmin::from_request_parts(&mut parts, &state)
+            Authz::<scope::EnvReadValues>::from_request_parts(&mut parts, &state)
                 .await
                 .is_ok(),
-            "the root-only Unix socket counts as admin"
+            "the root-only Unix socket holds every scope"
         );
     }
 
@@ -580,10 +576,15 @@ mod tests {
         )
         .await;
 
-        let response = get_env(RateLimit, RequireAuth, State(state.clone()), Path(app.id))
-            .await
-            .unwrap_or_else(|err| panic!("get_env should succeed: {}", err.0))
-            .into_response();
+        let response = get_env(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            State(state.clone()),
+            Path(app.id),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("get_env should succeed: {}", err.0))
+        .into_response();
         assert_eq!(response.status(), StatusCode::OK);
         let json = body_json(response).await;
         let text = json.to_string();
@@ -606,8 +607,7 @@ mod tests {
 
         let response = patch_env(
             RateLimit,
-            RequireAuth,
-            actor(),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.name.clone()),
             Json(PatchEnvRequest {
@@ -630,7 +630,7 @@ mod tests {
         );
 
         let audit: String = sqlx::query_scalar(
-            "SELECT detail FROM audit_log WHERE action = 'env_update' AND app_id = ?",
+            "SELECT detail FROM audit_log WHERE action = 'env_update' AND resource_id = ?",
         )
         .bind(&app.id)
         .fetch_one(&state.db)
@@ -649,8 +649,7 @@ mod tests {
 
         let result = patch_env(
             RateLimit,
-            RequireAuth,
-            actor(),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.id.clone()),
             Json(PatchEnvRequest::default()),
@@ -671,8 +670,7 @@ mod tests {
 
         let response = reveal_env_var(
             RateLimit,
-            RequireAdmin,
-            actor(),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path((app.id.clone(), "TOKEN".to_string())),
         )
@@ -684,7 +682,7 @@ mod tests {
         assert!(!json.to_string().contains("zzz"));
 
         let reveals: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM audit_log WHERE action = 'env_reveal' AND app_id = ?",
+            "SELECT COUNT(*) FROM audit_log WHERE action = 'env_reveal' AND resource_id = ?",
         )
         .bind(&app.id)
         .fetch_one(&state.db)
@@ -694,8 +692,7 @@ mod tests {
 
         let missing = reveal_env_var(
             RateLimit,
-            RequireAdmin,
-            actor(),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path((app.id.clone(), "NOPE".to_string())),
         )
@@ -716,8 +713,7 @@ mod tests {
 
         let response = patch_preview_env(
             RateLimit,
-            RequireAuth,
-            actor(),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.id.clone()),
             Json(PatchPreviewEnvRequest {

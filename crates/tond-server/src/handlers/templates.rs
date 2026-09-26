@@ -2,13 +2,13 @@ use axum::{Json, http::StatusCode, response::IntoResponse};
 use tond_common::{ApiResponse, TemplateCatalogEntry, TondError, load_template_manifests};
 
 use crate::{
-    auth::{RateLimit, RequireAuth},
+    auth::{Authz, RateLimit, scope},
     error::AppError,
 };
 
 pub async fn list_templates(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsRead>,
 ) -> Result<impl IntoResponse, AppError> {
     let template_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -32,6 +32,8 @@ mod tests {
     use axum::{body::to_bytes, response::IntoResponse};
 
     use super::*;
+    use crate::auth::Principal;
+    use tond_common::Role;
 
     async fn response_json(response: axum::response::Response) -> serde_json::Value {
         let bytes = to_bytes(response.into_body(), usize::MAX)
@@ -43,10 +45,13 @@ mod tests {
 
     #[tokio::test]
     async fn list_templates_returns_manifest_catalog_entries() {
-        let response = list_templates(RateLimit, RequireAuth)
-            .await
-            .unwrap_or_else(|_| panic!("expected list_templates to succeed"))
-            .into_response();
+        let response = list_templates(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("expected list_templates to succeed"))
+        .into_response();
         let body = response_json(response).await;
         let templates = body["data"]
             .as_array()

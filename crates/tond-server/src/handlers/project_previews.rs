@@ -8,7 +8,7 @@
 // The preview domain is required (see domains.rs); without it creating a
 // project preview is refused with a 400.
 //
-// Routes (all require RequireAuth + RateLimit):
+// Routes (all require RateLimit + an Authz scope, see each handler):
 //   POST   /api/projects/{id}/previews
 //     Create a project preview: insert one project_previews row, then for
 //     every member app insert a preview_deployments row linked via
@@ -34,8 +34,9 @@ use tond_common::{
     ProjectPreview, ProjectPreviewResponse, TondError, aggregate_preview_status,
 };
 
+use crate::audit_log::{AuditEntry, record};
 use crate::{
-    auth::{RateLimit, RequireAuth},
+    auth::{Authz, RateLimit, scope},
     deploy, docker,
     domains::{preview_host, require_preview_domain},
     error::AppError,
@@ -107,7 +108,7 @@ fn random_slug() -> String {
 /// Returns 202 immediately.
 pub async fn create_project_preview(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::PreviewsWrite>,
     State(state): State<AppState>,
     Path(project_id): Path<String>,
     body: Option<Json<CreateProjectPreviewRequest>>,
@@ -243,7 +244,7 @@ pub async fn create_project_preview(
             Ok(r) => r,
             Err(_) => ProjectPreview {
                 id: pp_id,
-                project_id: project.id,
+                project_id: project.id.clone(),
                 slug,
                 ttl_seconds,
                 expires_at,
@@ -251,6 +252,14 @@ pub async fn create_project_preview(
             },
         };
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("project_preview_create")
+            .resource("project", &project.id, &project.name)
+            .detail(format!("slug={}", pp.slug)),
+    )
+    .await;
     let resp = build_project_preview_response(&state.db, pp).await;
     (StatusCode::ACCEPTED, Json(ApiResponse::ok(resp))).into_response()
 }
@@ -261,7 +270,7 @@ pub async fn create_project_preview(
 /// aggregated status) for a project.
 pub async fn list_project_previews(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsRead>,
     State(state): State<AppState>,
     Path(project_id): Path<String>,
 ) -> Response {
@@ -308,7 +317,7 @@ pub async fn list_project_previews(
 /// and delete the project_previews row.
 pub async fn delete_project_preview(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::PreviewsWrite>,
     State(state): State<AppState>,
     Path((project_id, pp_id)): Path<(String, String)>,
 ) -> Response {
@@ -375,6 +384,14 @@ pub async fn delete_project_preview(
         .execute(&state.db)
         .await;
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("project_preview_delete")
+            .resource("project", &project.id, &project.name)
+            .detail(format!("slug={}", pp.slug)),
+    )
+    .await;
     tracing::info!(
         "Project preview {} (slug {}) deleted for project {}",
         pp.id,
@@ -409,9 +426,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        auth::{RateLimiter, RequireAuth, rate_limit::RateLimit},
+        auth::{Authz, Principal, RateLimiter, rate_limit::RateLimit},
         state::AppState,
     };
+    use tond_common::Role;
 
     async fn test_state() -> AppState {
         let db = SqlitePool::connect("sqlite::memory:")
@@ -425,6 +443,7 @@ mod tests {
             server_name: "tond".to_string(),
             dashboard_domain: "dash.example.com".to_string(),
             preview_domain: "example-previews.com".to_string(),
+            ..ServerSettings::default()
         };
 
         AppState {
@@ -529,7 +548,7 @@ mod tests {
 
         let response = create_project_preview(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Path("project-1".to_string()),
             None,
@@ -558,7 +577,7 @@ mod tests {
 
         let response = create_project_preview(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path("project-1".to_string()),
             Some(Json(CreateProjectPreviewRequest { ttl_hours: Some(2) })),
@@ -609,7 +628,7 @@ mod tests {
 
         let list_response = list_project_previews(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path("project-1".to_string()),
         )
@@ -636,7 +655,7 @@ mod tests {
 
         let delete_response = delete_project_preview(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(("project-1".to_string(), project_preview_id.clone())),
         )

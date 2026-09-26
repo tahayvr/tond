@@ -16,7 +16,9 @@ const auth = vi.hoisted(() => ({ role: 'admin' }));
 
 vi.mock('$lib/auth.svelte', () => ({
 	getUser: () => ({ id: 'usr_1', email: 'a@b.c', role: auth.role, totp_enabled: false }),
-	isAdmin: () => auth.role === 'admin'
+	isAdmin: () => auth.role === 'admin',
+	// Deployers may write env vars but only admins read values (env:read-values).
+	can: (scope: string) => auth.role === 'admin' || scope !== 'env:read-values'
 }));
 
 vi.mock('$lib/api', async () => {
@@ -59,8 +61,8 @@ describe('AppEnvironment', () => {
 		auth.role = 'admin';
 	});
 
-	it('does not offer reveal or copy to non-admins, but still allows editing', async () => {
-		auth.role = 'member';
+	it('does not offer reveal or copy without env:read-values, but still allows editing', async () => {
+		auth.role = 'deployer';
 		api.getAppEnv.mockResolvedValue(envWith(['API_KEY']));
 
 		renderTab();

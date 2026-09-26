@@ -1,7 +1,10 @@
 // api.rs — generic API response envelope
 //
 // `ApiResponse<T>` is the single JSON wrapper used for every API response:
-//   { success: bool, data: T | null, error: string | null }
+//   { success: bool, data: T | null, error: string | null, code?: string }
+//
+// `code` is a stable, machine-readable error code on some failures (e.g.
+// `SCOPE_DENIED`, `TOKEN_EXPIRED`); clients switch on it instead of the message.
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -11,6 +14,9 @@ pub struct ApiResponse<T: Serialize> {
     pub success: bool,
     pub data: Option<T>,
     pub error: Option<String>,
+    /// Stable error code (see module docs). Omitted when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
 }
 
 impl<T: Serialize> ApiResponse<T> {
@@ -19,6 +25,7 @@ impl<T: Serialize> ApiResponse<T> {
             success: true,
             data: Some(data),
             error: None,
+            code: None,
         }
     }
 
@@ -27,6 +34,17 @@ impl<T: Serialize> ApiResponse<T> {
             success: false,
             data: None,
             error: Some(msg.into()),
+            code: None,
+        }
+    }
+
+    /// Failure with a stable error code.
+    pub fn err_code(code: &str, msg: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            data: None,
+            error: Some(msg.into()),
+            code: Some(code.to_string()),
         }
     }
 
@@ -38,6 +56,7 @@ impl<T: Serialize> ApiResponse<T> {
             success: true,
             data: None,
             error: Some(msg.into()),
+            code: None,
         }
     }
 }

@@ -1,4 +1,11 @@
-import { getAuthStatus, setUnauthorizedHandler, type AuthStatus, type User } from './api';
+import { ALL_SCOPES, hasScope } from './access';
+import {
+	getAuthStatus,
+	setUnauthorizedHandler,
+	type AuthStatus,
+	type Scope,
+	type User
+} from './api';
 
 // Auth state -- module-level singletons using Svelte 5 runes via $state
 // These are reactive and can be imported by any component.
@@ -19,12 +26,17 @@ export function getUser() {
 }
 
 /**
- * Whether the signed-in user is an admin. Admin-only actions (volumes, compose
- * files, cron jobs, database exposure, credentials, settings) are refused by
- * the API for members; the UI disables them up front.
+ * Whether the signed-in user is an admin. Actions that reach the host
+ * (volumes, compose files, cron jobs, database exposure, credentials,
+ * settings) are refused by the API for other roles; the UI disables them up front.
  */
 export function isAdmin() {
 	return _user?.role === 'admin';
+}
+
+/** Whether the signed-in user's role grants `scope` (e.g. `env:read-values`). */
+export function can(scope: Scope) {
+	return hasScope(_user, scope);
 }
 
 /** True when the user was signed out because their session expired (shown on /login). */
@@ -64,7 +76,8 @@ export async function checkAuth(): Promise<void> {
 			email: 'dev@localhost',
 			role: 'admin',
 			totp_enabled: false,
-			created_at: '1970-01-01T00:00:00.000Z'
+			created_at: '1970-01-01T00:00:00.000Z',
+			scopes: ALL_SCOPES
 		};
 		return;
 	}
