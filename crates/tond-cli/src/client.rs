@@ -72,6 +72,14 @@ struct HostTerminalSetting {
     enabled: bool,
 }
 
+/// Inline content of a new app: a Dockerfile (source type `dockerfile`) or
+/// a compose file (source type `compose` without a git URL).
+#[derive(Debug, Default)]
+pub struct InlineSource {
+    pub dockerfile: Option<String>,
+    pub compose: Option<String>,
+}
+
 pub struct TondClient {
     base_url: String,
     client: reqwest::Client,
@@ -397,6 +405,7 @@ impl TondClient {
     #[allow(clippy::too_many_arguments)]
     pub async fn create_app(
         &self,
+        inline: InlineSource,
         name: &str,
         source_type: &str,
         source_url: Option<String>,
@@ -434,8 +443,8 @@ impl TondClient {
             volumes: None,
             registry_credential_id: None,
             github_app_id: None,
-            dockerfile_content: None,
-            compose_content: None,
+            dockerfile_content: inline.dockerfile,
+            compose_content: inline.compose,
             compose_path: None,
             compose_service: None,
             base_dir: None,
@@ -1707,6 +1716,7 @@ pub(crate) mod tests {
 
         let response = client
             .create_app(
+                InlineSource::default(),
                 "demo",
                 "git",
                 Some("https://example.com/repo.git".to_string()),
@@ -1802,6 +1812,7 @@ pub(crate) mod tests {
 
         client
             .create_app(
+                InlineSource::default(),
                 "analytics",
                 "image",
                 Some("ghcr.io/plausible/community-edition".to_string()),

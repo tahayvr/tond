@@ -707,6 +707,54 @@ mod tests {
     }
 
     #[test]
+    fn source_and_db_types_accept_every_server_value_and_nothing_else() {
+        for source_type in tond_common::APP_SOURCE_TYPES {
+            Cli::try_parse_from(["tond", "apps", "create", "x", "-t", source_type])
+                .unwrap_or_else(|err| panic!("--source-type {source_type}: {err}"));
+        }
+        assert!(Cli::try_parse_from(["tond", "apps", "create", "x", "-t", "svn"]).is_err());
+        for engine in tond_common::ALL_ENGINES {
+            Cli::try_parse_from(["tond", "db", "create", "x", "-t", engine.db_type])
+                .unwrap_or_else(|err| panic!("--db-type {}: {err}", engine.db_type));
+        }
+        let err = Cli::try_parse_from(["tond", "db", "create", "x", "-t", "oracle"])
+            .err()
+            .unwrap_or_else(|| panic!("an unknown engine must be refused"));
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn create_help_lists_the_real_values_and_no_stale_defaults() {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let apps = cmd
+            .find_subcommand_mut("apps")
+            .and_then(|c| c.find_subcommand_mut("create"))
+            .unwrap_or_else(|| panic!("apps create"))
+            .render_long_help()
+            .to_string();
+        for value in tond_common::APP_SOURCE_TYPES {
+            assert!(apps.contains(value), "apps create help lacks {value}");
+        }
+        assert!(!apps.contains("default: 256"), "{apps}");
+        assert!(!apps.contains("default: 0.5"), "{apps}");
+        let db = cmd
+            .find_subcommand_mut("db")
+            .and_then(|c| c.find_subcommand_mut("create"))
+            .unwrap_or_else(|| panic!("db create"))
+            .render_long_help()
+            .to_string();
+        for engine in tond_common::ALL_ENGINES {
+            assert!(
+                db.contains(engine.db_type),
+                "db create help lacks {}",
+                engine.db_type
+            );
+        }
+        assert!(!db.contains("default: 256"), "{db}");
+    }
+
+    #[test]
     fn cli_parses_apps_create_defaults() {
         let cli = Cli::try_parse_from(["tond", "apps", "create", "demo"])
             .unwrap_or_else(|err| panic!("failed to parse apps create command: {err}"));

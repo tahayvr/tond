@@ -16,7 +16,7 @@ use tond_common::{
     TemplateResponse, UpdateAppDomainRequest, WwwPairRequest,
 };
 
-use crate::client::TondClient;
+use crate::client::{InlineSource, TondClient};
 use crate::deploy_follow;
 use crate::error::{self, CliError};
 use crate::output::{Output, out, outln};
@@ -36,11 +36,15 @@ pub struct CreateAppOptions {
     #[arg(long, requires = "template")]
     pub allow_low_memory: bool,
 
-    /// Source type: git, image
-    #[arg(short = 't', long, default_value = "git")]
+    /// Source type: git (build a repository), image (run a registry image),
+    /// tarball (deploy later with `tond apps push`), dockerfile (build the
+    /// Dockerfile given with --source), compose (a compose file: a git URL or
+    /// a local file given with --source)
+    #[arg(short = 't', long, default_value = "git", value_parser = source_type_parser())]
     pub source_type: String,
 
-    /// Git URL or Docker image
+    /// Git URL (git, compose), Docker image (image), or path to a local
+    /// Dockerfile (dockerfile) or compose file (compose)
     #[arg(short, long)]
     pub source: Option<String>,
 
@@ -60,11 +64,12 @@ pub struct CreateAppOptions {
     #[arg(long = "env")]
     pub env: Vec<String>,
 
-    /// Memory limit in megabytes (default: 256)
+    /// Memory limit in megabytes (default: none set; every container is capped
+    /// at 75% of the server's RAM)
     #[arg(long)]
     pub memory_mb: Option<i64>,
 
-    /// CPU limit as a float (e.g. 0.5 = half a core, 1.0 = one core; default: 0.5)
+    /// CPU limit as a float (e.g. 0.5 = half a core, 1.0 = one core; default: no limit)
     #[arg(long)]
     pub cpus: Option<f64>,
 
@@ -94,6 +99,54 @@ pub struct CreateAppOptions {
     /// Skip interactive prompts and fail if required template inputs are missing.
     #[arg(short = 'y', long)]
     pub yes: bool,
+}
+
+/// `--source-type`'s possible values: the server's list of source types.
+fn source_type_parser() -> clap::builder::PossibleValuesParser {
+    clap::builder::PossibleValuesParser::new(tond_common::APP_SOURCE_TYPES.iter().copied())
+}
+
+/// Whether `--source` of a compose app names a git repository (the compose
+/// file is read from it) rather than a local file.
+fn is_git_url(source: &str) -> bool {
+    ["https://", "http://", "ssh://", "git://", "git@"]
+        .iter()
+        .any(|prefix| source.starts_with(prefix))
+}
+
+/// The inline content `--source` provides for dockerfile and compose apps
+/// (a local file), and the `source_url` the server gets instead.
+fn inline_source(
+    source_type: &str,
+    source: Option<String>,
+) -> Result<(InlineSource, Option<String>), CliError> {
+    let read = |path: &str| {
+        std::fs::read_to_string(path)
+            .map_err(|e| CliError::usage(format!("cannot read {path}: {e}")))
+    };
+    match (source_type, source) {
+        ("dockerfile", Some(path)) => Ok((
+            InlineSource {
+                dockerfile: Some(read(&path)?),
+                compose: None,
+            },
+            None,
+        )),
+        ("dockerfile", None) => Err(CliError::usage(
+            "--source-type dockerfile needs --source <path to a Dockerfile>",
+        )),
+        ("compose", Some(source)) if !is_git_url(&source) => Ok((
+            InlineSource {
+                dockerfile: None,
+                compose: Some(read(&source)?),
+            },
+            None,
+        )),
+        ("compose", None) => Err(CliError::usage(
+            "--source-type compose needs --source <git URL or path to a compose file>",
+        )),
+        (_, source) => Ok((InlineSource::default(), source)),
+    }
 }
 
 /// `--wait` / `--no-wait` of commands that start a deployment.
@@ -577,6 +630,7 @@ pub async fn handle(client: &TondClient, out: &Output, action: AppsAction) -> Re
                 )
                 .await;
             }
+            let (inline, source) = inline_source(&source_type, source)?;
             let memory_limit = memory_mb.map(|m| m * 1_048_576);
             let cpu_limit = cpus.map(|c| (c * 1_000_000_000.0) as i64);
             let env = if env.is_empty() {
@@ -591,6 +645,7 @@ pub async fn handle(client: &TondClient, out: &Output, action: AppsAction) -> Re
             };
             let app = client
                 .create_app(
+                    inline,
                     &name,
                     &source_type,
                     source,
@@ -1479,6 +1534,45 @@ mod tests {
     use tokio::{net::TcpListener, sync::Mutex};
 
     use super::*;
+
+    #[test]
+    fn inline_source_reads_dockerfiles_and_local_compose_files() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let dockerfile = dir.path().join("Dockerfile");
+        std::fs::write(&dockerfile, "FROM alpine:3\n").unwrap_or_else(|e| panic!("{e}"));
+        let path = dockerfile.to_string_lossy().to_string();
+
+        let (inline, url) =
+            inline_source("dockerfile", Some(path.clone())).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(inline.dockerfile.as_deref(), Some("FROM alpine:3\n"));
+        assert_eq!(url, None);
+
+        let (inline, url) = inline_source("compose", Some(path)).unwrap_or_else(|e| panic!("{e}"));
+        assert!(inline.compose.is_some());
+        assert_eq!(url, None);
+
+        let git = "https://example.com/stack.git".to_string();
+        let (inline, url) =
+            inline_source("compose", Some(git.clone())).unwrap_or_else(|e| panic!("{e}"));
+        assert!(inline.compose.is_none() && inline.dockerfile.is_none());
+        assert_eq!(url, Some(git));
+
+        for (kind, source) in [
+            ("dockerfile", None),
+            ("compose", None),
+            ("dockerfile", Some("/no/such/file".to_string())),
+        ] {
+            let err = inline_source(kind, source)
+                .err()
+                .unwrap_or_else(|| panic!("{kind} without a readable source must fail"));
+            assert_eq!(err.exit, 2);
+        }
+
+        let (inline, url) =
+            inline_source("image", Some("nginx".into())).unwrap_or_else(|e| panic!("{e}"));
+        assert!(inline.dockerfile.is_none() && inline.compose.is_none());
+        assert_eq!(url.as_deref(), Some("nginx"));
+    }
     use crate::client::TondClient;
 
     #[derive(Clone, Default)]

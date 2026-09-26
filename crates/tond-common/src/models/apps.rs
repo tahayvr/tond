@@ -25,6 +25,10 @@ pub struct Volume {
 
 // ── App (a deployed service) ──
 
+/// Every `source_type` an app can have (the server validates against this
+/// list and the CLI derives `--source-type`'s possible values from it).
+pub const APP_SOURCE_TYPES: &[&str] = &["git", "image", "tarball", "dockerfile", "compose"];
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct App {

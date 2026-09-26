@@ -271,13 +271,13 @@ pub(crate) async fn insert_app(
     }
 
     // Validate source_type
-    if !matches!(
-        req.source_type.as_str(),
-        "git" | "image" | "tarball" | "dockerfile" | "compose"
-    ) {
+    if !APP_SOURCE_TYPES.contains(&req.source_type.as_str()) {
         return Err(AppError(TondError::invalid_field(
             "source_type",
-            "source_type must be one of: git, image, tarball, dockerfile, compose",
+            format!(
+                "source_type must be one of: {}",
+                APP_SOURCE_TYPES.join(", ")
+            ),
         )));
     }
 
