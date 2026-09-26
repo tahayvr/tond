@@ -87,6 +87,12 @@ INSTALL_ARGS=(--non-interactive --dashboard-domain "dash.${BASE_DOMAIN}")
 [[ -n "$PREVIEW_DOMAIN" ]] && INSTALL_ARGS+=(--preview-domain "$PREVIEW_DOMAIN")
 "${BUNDLE}/install.sh" "${INSTALL_ARGS[@]}"
 
+# install.sh may have restarted Docker (log rotation in daemon.json), which
+# restarts Pebble with a new issuing root: fetch the current one.
+if [[ "$ACME" == pebble ]]; then
+    "${HERE}/pebble/pebble.sh" --refresh-root "$CA_FILE"
+fi
+
 E2E_BASE_DOMAIN="$BASE_DOMAIN" \
 E2E_PREVIEW_DOMAIN="$PREVIEW_DOMAIN" \
 E2E_TARGET_IP="$IP" \
