@@ -262,7 +262,8 @@
 		{
 			id: 'compose',
 			label: 'Docker Compose',
-			description: 'You can deploy complex applications easily with Docker Compose, without Git.',
+			description:
+				'Run several services together from a compose file: paste it or read it from a Git repository.',
 			icon: Layers
 		},
 		{

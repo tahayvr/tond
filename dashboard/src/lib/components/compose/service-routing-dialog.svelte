@@ -96,7 +96,7 @@
 	<Dialog.Content class="sm:max-w-lg">
 		<Dialog.Header>
 			<Dialog.Title
-				>Domains &amp; port · <span class="font-mono">{service?.name}</span></Dialog.Title
+				>Domains &amp; port · <span class="font-mono normal-case">{service?.name}</span></Dialog.Title
 			>
 			<Dialog.Description>
 				Tond publishes one container port of this service on 127.0.0.1 and routes these domains to

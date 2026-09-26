@@ -3913,7 +3913,52 @@ export const handlers = [
 	// On connect: sends a snapshot of 5 seed lines.
 	// Every 2 s: sends one incremental container_log line.
 
-	appLogStream.addEventListener('connection', ({ client }) => {
+	appLogStream.addEventListener('connection', ({ client, params }) => {
+		// Compose apps: every service's output, tagged with the service.
+		const services = composeServices[params.id as string];
+		if (services) {
+			const names = services.filter((s) => s.status === 'running').map((s) => s.name);
+			const lineFor = (service: string, n: number) =>
+				service === 'cache'
+					? `1:M * ${n} changes in 60 seconds. Saving...`
+					: service === 'db'
+						? `LOG:  checkpoint starting: time (${n})`
+						: `GET /products?page=${n % 5} 200 ${8 + (n % 9)}ms`;
+			client.send(
+				JSON.stringify({
+					type: 'snapshot',
+					deploy_logs: [
+						{
+							level: 'info',
+							message: 'Deployed successfully! 5 service(s) running',
+							ts: new Date().toISOString()
+						}
+					],
+					container_logs: names.flatMap((service, i) => [
+						{
+							ts: new Date(Date.now() - (10 - i) * 1000).toISOString(),
+							service,
+							line: lineFor(service, i)
+						}
+					])
+				})
+			);
+			let counter = 0;
+			const timer = setInterval(() => {
+				counter += 1;
+				const service = names[counter % names.length];
+				client.send(
+					JSON.stringify({
+						type: 'container',
+						ts: new Date().toISOString(),
+						service,
+						line: lineFor(service, counter)
+					})
+				);
+			}, 1500);
+			client.addEventListener('close', () => clearInterval(timer));
+			return;
+		}
 		// Send initial snapshot
 		client.send(
 			JSON.stringify({

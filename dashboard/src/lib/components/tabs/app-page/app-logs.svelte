@@ -74,7 +74,7 @@
 				<Button
 					size="sm"
 					variant={serviceFilter === name ? 'default' : 'outline'}
-					class="font-mono"
+					class="font-mono normal-case"
 					aria-pressed={serviceFilter === name}
 					onclick={() => (serviceFilter = name)}>{name}</Button
 				>
