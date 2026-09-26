@@ -2,7 +2,11 @@ import { render, screen } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Certificate } from '$lib/api';
-import CertificateStatus, { certificateView, formatRetryIn } from './certificate-status.svelte';
+import CertificateStatus, {
+	certificateView,
+	explainCertError,
+	formatRetryIn
+} from './certificate-status.svelte';
 
 const api = vi.hoisted(() => ({
 	listCertificates: vi.fn(),
@@ -98,5 +102,45 @@ describe('CertificateStatus', () => {
 		const { container } = render(CertificateStatus, { domain: '' });
 		expect(container.querySelector('[data-testid="certificate-status"]')).toBeNull();
 		expect(api.listCertificates).not.toHaveBeenCalled();
+	});
+});
+
+describe('explainCertError', () => {
+	const d = 'app.example.com';
+
+	it('keeps messages that are already readable', () => {
+		expect(
+			explainCertError('DNS for app.example.com points to 1.2.3.4, expected 5.6.7.8', d)
+		).toBeNull();
+		expect(explainCertError('something unexpected', d)).toBeNull();
+	});
+
+	it('explains the common Let’s Encrypt failures', () => {
+		const cases: [string, string][] = [
+			[
+				'order failed: 403 urn:ietf:params:acme:error:unauthorized: Invalid response from http://app.example.com/.well-known/acme-challenge/abc: 404',
+				"wasn't this one"
+			],
+			[
+				'urn:ietf:params:acme:error:connection: Timeout during connect (likely firewall problem)',
+				'port 80'
+			],
+			[
+				'urn:ietf:params:acme:error:dns: DNS problem: NXDOMAIN looking up A for app.example.com',
+				"doesn't resolve"
+			],
+			[
+				'urn:ietf:params:acme:error:rateLimited: too many failed authorizations recently',
+				'rate limit'
+			],
+			[
+				'urn:ietf:params:acme:error:caa: CAA record for example.com prevents issuance',
+				'CAA record'
+			],
+			['urn:ietf:params:acme:error:rejectedIdentifier: Error creating new order', "won't issue"]
+		];
+		for (const [raw, expected] of cases) {
+			expect(explainCertError(raw, d)).toContain(expected);
+		}
 	});
 });

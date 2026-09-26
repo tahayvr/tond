@@ -111,7 +111,9 @@
 				class="border-border bg-card font-mono text-sm"
 			/>
 			<p class="font-mono text-[10px] text-muted-foreground/60">
-				Leave blank for direct IP access. If you set a domain, point its A record at this server.
+				The HTTPS address of this dashboard. Point the domain's A (and AAAA) record at this server;
+				Tond gets the certificate automatically. Without a domain, reach the dashboard through an
+				SSH tunnel: ssh -L 3001:127.0.0.1:3001 root@&lt;server&gt;, then open http://localhost:3001.
 			</p>
 			<CertificateStatus domain={savedDashboardDomain} refreshKey={certRefreshKey} />
 		</div>

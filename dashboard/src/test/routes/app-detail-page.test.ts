@@ -202,6 +202,16 @@ describe('apps/[id] page', () => {
 		);
 	});
 
+	it('fills the settings forms with the saved values on first load', async () => {
+		const user = userEvent.setup();
+		renderPage({ ...app, source_url: 'https://github.com/o/r' });
+
+		await user.click(screen.getByRole('tab', { name: 'Git' }));
+		expect(screen.getByLabelText('Git URL')).toHaveValue('https://github.com/o/r');
+
+		expect(api.getApp).not.toHaveBeenCalled();
+	});
+
 	it('re-deploys the app and refreshes its data', async () => {
 		api.deployApp.mockResolvedValue(undefined);
 		api.getApp.mockResolvedValue({ ...app, status: 'building' });

@@ -19,6 +19,9 @@
 //   metrics        — drop samples older than N days (was a full-table scan
 //                    every 30 s in metrics.rs; now indexed and hourly).
 //   sessions / mfa_pending — drop expired rows.
+//   terminal_tickets / github_app_flows — drop expired rows.
+//   webhook_deliveries — drop replay IDs older than the 72 h replay window.
+//   preview_deployments — drop expired/failed rows a week after they expired.
 //
 // Every delete runs in batches of BATCH_SIZE rows with a short pause between
 // batches, so a single statement never holds SQLite's write lock for long
@@ -331,6 +334,37 @@ pub async fn run_once(db: &SqlitePool, policy: &RetentionPolicy) -> Result<Janit
         .execute(db)
         .await?;
 
+    // ── expired one-time tokens and flows ──
+    for sql in [
+        "DELETE FROM terminal_tickets WHERE expires_at < ?",
+        "DELETE FROM github_app_flows WHERE expires_at < ?",
+    ] {
+        sqlx::query(sql).bind(&now_str).execute(db).await?;
+    }
+
+    // ── webhook replay IDs past the replay window (webhooks.rs keeps 72 h) ──
+    let replay_cutoff = (now - chrono::Duration::hours(72)).to_rfc3339();
+    delete_in_batches(|| {
+        sqlx::query(
+            "DELETE FROM webhook_deliveries WHERE rowid IN (
+                SELECT rowid FROM webhook_deliveries WHERE received_at < ? LIMIT ?)",
+        )
+        .bind(&replay_cutoff)
+        .bind(BATCH_SIZE)
+        .execute(db)
+    })
+    .await?;
+
+    // ── finished preview rows (their containers are already gone) ──
+    let preview_cutoff = (now - chrono::Duration::days(7)).to_rfc3339();
+    sqlx::query(
+        "DELETE FROM preview_deployments
+         WHERE status IN ('expired', 'failed') AND expires_at < ?",
+    )
+    .bind(&preview_cutoff)
+    .execute(db)
+    .await?;
+
     Ok(report)
 }
 
@@ -642,6 +676,77 @@ mod tests {
         assert_eq!(ids(&db, "SELECT id FROM sessions").await, vec!["s-live"]);
         assert_eq!(report.cron_job_runs, 2);
         assert_eq!(report.sessions, 1);
+    }
+
+    #[tokio::test]
+    async fn expired_tokens_old_replay_ids_and_finished_previews_are_pruned() {
+        let db = test_db().await;
+        seed_app(&db, "a1").await;
+        let past = (Utc::now() - chrono::Duration::days(10)).to_rfc3339();
+        let future = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        sqlx::query(
+            "INSERT INTO users (id, email, password_hash, role, created_at, updated_at)
+             VALUES ('u1', 'a@b.c', 'x', 'admin', 'now', 'now')",
+        )
+        .execute(&db)
+        .await
+        .unwrap_or_else(|err| panic!("seed user: {err}"));
+
+        for (state, expires) in [("flow-old", &past), ("flow-live", &future)] {
+            sqlx::query(
+                "INSERT INTO github_app_flows (state, kind, user_id, expires_at, created_at)
+                 VALUES (?, 'manifest', 'u1', ?, ?)",
+            )
+            .bind(state)
+            .bind(expires)
+            .bind(&past)
+            .execute(&db)
+            .await
+            .unwrap_or_else(|err| panic!("seed flow: {err}"));
+        }
+        for (key, at) in [("old", &past), ("recent", &future)] {
+            sqlx::query("INSERT INTO webhook_deliveries (key, received_at) VALUES (?, ?)")
+                .bind(key)
+                .bind(at)
+                .execute(&db)
+                .await
+                .unwrap_or_else(|err| panic!("seed delivery: {err}"));
+        }
+        for (id, status, expires) in [
+            ("p-expired", "expired", &past),
+            ("p-running", "running", &past),
+            ("p-recent", "expired", &future),
+        ] {
+            sqlx::query(
+                "INSERT INTO preview_deployments (id, app_id, slug, status, expires_at)
+                 VALUES (?, 'a1', ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(id)
+            .bind(status)
+            .bind(expires)
+            .execute(&db)
+            .await
+            .unwrap_or_else(|err| panic!("seed preview: {err}"));
+        }
+
+        run_once(&db, &RetentionPolicy::default())
+            .await
+            .unwrap_or_else(|err| panic!("janitor pass: {err}"));
+
+        assert_eq!(
+            ids(&db, "SELECT state FROM github_app_flows").await,
+            vec!["flow-live"]
+        );
+        assert_eq!(
+            ids(&db, "SELECT key FROM webhook_deliveries").await,
+            vec!["recent"]
+        );
+        assert_eq!(
+            ids(&db, "SELECT id FROM preview_deployments ORDER BY id").await,
+            vec!["p-recent", "p-running"],
+            "running previews and recently expired rows stay"
+        );
     }
 
     #[tokio::test]
