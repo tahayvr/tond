@@ -372,15 +372,20 @@ v = sorted(float(x) * 1000 for x in sys.stdin if x.strip())
 print(f"{v[len(v) // 2]:.3f}/{v[min(len(v) - 1, int(len(v) * 0.99))]:.3f}" if v else "n/a")' || echo "n/a"
 }
 
-# generate <host-prefix> <n>: ~5 requests per second, a new TLS connection
-# each (like separate visitors), round robin over <prefix>-0 … <prefix>-(n-1).
+# generate <host-prefix> <n>: ~5 requests per second, round robin over
+# <prefix>-0 … <prefix>-(n-1). Like a browser, each visit reuses its TLS
+# connection for a few requests (5 per connection), so the proxy's CPU is
+# not all TLS handshakes.
 generate() {
     local prefix=$1 n=$2 i=0 host
     while true; do
         host="${prefix}-$((i % n)).budget.test"
-        curl -sk -o /dev/null --max-time 5 --resolve "${host}:443:127.0.0.1" "https://${host}/" || true
+        curl -sk --max-time 5 --resolve "${host}:443:127.0.0.1" \
+            -o /dev/null "https://${host}/" -o /dev/null "https://${host}/a" \
+            -o /dev/null "https://${host}/b" -o /dev/null "https://${host}/c" \
+            -o /dev/null "https://${host}/d" || true
         i=$((i + 1))
-        sleep 0.2
+        sleep 1
     done
 }
 
@@ -447,6 +452,7 @@ traffic_phase() {
     check "traffic: CPU both processes" \
         "$(calc "(($(jq .scpu "$b") - $(jq .scpu "$a")) + ($(jq .pcpu "$b") - $(jq .pcpu "$a"))) / ($minutes * 60) * 100")" \
         "<=" 0.5 "% of a core"
+    info "CPU split: server $(calc "($(jq .scpu "$b") - $(jq .scpu "$a")) / ($minutes * 60) * 100") %, proxy $(calc "($(jq .pcpu "$b") - $(jq .pcpu "$a")) / ($minutes * 60) * 100") %"
     # A minute is written 60–90 s after it starts: the minutes flushed during
     # the window started in [t0 - 90, t1 - 60).
     written=$(request_minutes_between "$((t0 - 90))" "$((t1 - 60))")
