@@ -97,6 +97,40 @@ describe('root layout shell', () => {
 		expect(screen.queryByText(/checking server status/i)).not.toBeInTheDocument();
 	});
 
+	it('renders /login/2fa bare, without redirecting a signed-out user back to /login', async () => {
+		const { goto } = await import('$app/navigation');
+		state.page.url = new URL('http://localhost/login/2fa');
+		state.status = 'login';
+
+		render(RootLayout, {
+			props: {
+				children: createRawSnippet(() => ({
+					render: () => '<div>two factor page</div>'
+				}))
+			}
+		});
+
+		expect(screen.getByText('two factor page')).toBeInTheDocument();
+		expect(goto).not.toHaveBeenCalled();
+	});
+
+	it('does not render the dashboard for a signed-out user and redirects with next', async () => {
+		const { goto } = await import('$app/navigation');
+		state.page.url = new URL('http://localhost/apps/app_1');
+		state.status = 'login';
+
+		render(RootLayout, {
+			props: {
+				children: createRawSnippet(() => ({
+					render: () => '<div>dashboard child content</div>'
+				}))
+			}
+		});
+
+		expect(screen.queryByText('dashboard child content')).not.toBeInTheDocument();
+		expect(goto).toHaveBeenCalledWith('/login?next=%2Fapps%2Fapp_1', { replaceState: true });
+	});
+
 	it('shows the boot shell while auth status is still loading', async () => {
 		state.navigating.type = null;
 		state.status = 'loading';

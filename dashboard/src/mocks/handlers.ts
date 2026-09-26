@@ -163,20 +163,90 @@ let alertIntegrationLinks: Record<string, AlertIntegrationLink[]> = {
 	]
 };
 
+// ── Mock scenarios ──────────────────────────────────────────────────────────
+// Reproduce failure states in the browser. Set one in the devtools console,
+// then reload:  localStorage.setItem('tond:mock-scenario', 'session-expired')
+//
+//   server-down      every /api request gets a proxy-style 502 HTML page
+//   session-expired  the next data request gets a 401 (one-shot), then normal
+//   rate-limited     POST /api/auth/login gets 429 with Retry-After: 30
+//   logged-out       start signed out (run with VITE_DEV_AUTH_BYPASS=false)
+//   mfa              like logged-out, and sign-in asks for a 2FA code (123456)
+//   2fa-enabled      the current user starts with 2FA enabled
+//
+// Clear with localStorage.removeItem('tond:mock-scenario').
+const SCENARIO_KEY = 'tond:mock-scenario';
+
+function mockScenario(): string | null {
+	try {
+		return globalThis.localStorage?.getItem(SCENARIO_KEY) ?? null;
+	} catch {
+		return null;
+	}
+}
+
+function clearMockScenario() {
+	try {
+		globalThis.localStorage?.removeItem(SCENARIO_KEY);
+	} catch {
+		// ignore
+	}
+}
+
+let mockSignedIn = false;
+let mockTotpEnabled = mockScenario() === '2fa-enabled';
+
+function currentMockUser() {
+	return { ...MOCK_USER, totp_enabled: mockTotpEnabled };
+}
+
+const CREDENTIAL_PATHS = ['/api/auth/'];
+
 export const handlers = [
+	// Scenario gate: runs first and falls through (returns undefined) when idle.
+	http.all('/api/*', ({ request }) => {
+		const scenario = mockScenario();
+		if (!scenario) return;
+		const path = new URL(request.url).pathname;
+		if (scenario === 'server-down') {
+			return new HttpResponse('<html><body><h1>502 Bad Gateway</h1></body></html>', {
+				status: 502,
+				headers: { 'Content-Type': 'text/html' }
+			});
+		}
+		if (scenario === 'session-expired' && !CREDENTIAL_PATHS.some((p) => path.startsWith(p))) {
+			clearMockScenario();
+			return err('Unauthorized', 401);
+		}
+		if (scenario === 'rate-limited' && path === '/api/auth/login') {
+			return HttpResponse.json(
+				{ success: false, data: null, error: 'Rate limit exceeded. Try again later.' },
+				{ status: 429, headers: { 'Retry-After': '30' } }
+			);
+		}
+	}),
+
 	// ── Auth ────────────────────────────────────────────────────────────────
 
 	http.get('/api/auth/status', async () => {
 		await delay(LATENCY);
-		if (needsSetup) {
+		const scenario = mockScenario();
+		if ((scenario === 'logged-out' || scenario === 'mfa') && !mockSignedIn) {
+			return ok({ needs_setup: false, authenticated: false, user: null });
+		}
+		if (needsSetup && scenario !== 'logged-out' && scenario !== 'mfa') {
 			return ok({ needs_setup: true, authenticated: false, user: null });
 		}
-		return ok({ needs_setup: false, authenticated: true, user: MOCK_USER });
+		return ok({ needs_setup: false, authenticated: true, user: currentMockUser() });
 	}),
 
 	http.post('/api/auth/login', async () => {
 		await delay(LATENCY);
-		return ok({ user: MOCK_USER });
+		if (mockScenario() === 'mfa') {
+			return ok({ mfa_required: true });
+		}
+		mockSignedIn = true;
+		return ok({ user: currentMockUser() });
 	}),
 
 	http.post('/api/auth/logout', async () => {
@@ -186,7 +256,7 @@ export const handlers = [
 
 	http.get('/api/auth/me', async () => {
 		await delay(LATENCY);
-		return ok(MOCK_USER);
+		return ok(currentMockUser());
 	}),
 
 	http.post('/api/auth/setup', async () => {
@@ -311,6 +381,7 @@ export const handlers = [
 		if (body.code !== '123456') {
 			return err('Invalid TOTP code', 401);
 		}
+		mockTotpEnabled = true;
 		return ok({
 			message: '2FA enabled successfully',
 			backup_codes: Array.from({ length: 10 }, () =>
@@ -328,6 +399,7 @@ export const handlers = [
 		if (body.code !== '123456') {
 			return err('Invalid TOTP or backup code', 401);
 		}
+		mockTotpEnabled = false;
 		return ok({ message: '2FA disabled' });
 	}),
 
@@ -337,7 +409,8 @@ export const handlers = [
 		if (body.code !== '123456') {
 			return err('Invalid TOTP or backup code', 401);
 		}
-		return ok({ user: MOCK_USER });
+		mockSignedIn = true;
+		return ok({ user: currentMockUser() });
 	}),
 
 	// ── Projects ──────────────────────────────────────────────────────────────

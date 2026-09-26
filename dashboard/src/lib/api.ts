@@ -133,17 +133,101 @@ interface ApiResponse<T> {
 
 const BASE = '/api';
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
-	const res = await fetch(`${BASE}${path}`, {
-		headers: { 'Content-Type': 'application/json' },
-		credentials: 'same-origin',
-		...options
-	});
-	const json: ApiResponse<T> = await res.json();
-	if (!json.success) {
-		throw new Error(json.error || 'Unknown error');
+export const SERVER_UNAVAILABLE_MESSAGE =
+	'Server unavailable. Tond may be restarting — try again in a moment.';
+export const SESSION_EXPIRED_MESSAGE = 'Your session has expired. Sign in again to continue.';
+
+/** An API failure, carrying the HTTP status (0 = the request never got a response). */
+export class ApiError extends Error {
+	readonly status: number;
+	/** Seconds to wait before retrying, from a 429's Retry-After header. */
+	readonly retryAfter: number | null;
+
+	constructor(message: string, status: number, retryAfter: number | null = null) {
+		super(message);
+		this.name = 'ApiError';
+		this.status = status;
+		this.retryAfter = retryAfter;
+	}
+}
+
+// Endpoints that answer 401 for a wrong password or code. A 401 from these is
+// an input error, not an expired session, so it must not sign the user out.
+const CREDENTIAL_ENDPOINTS = [
+	'/auth/status',
+	'/auth/login',
+	'/auth/logout',
+	'/auth/setup',
+	'/auth/2fa/verify',
+	'/auth/2fa/confirm',
+	'/auth/2fa/disable',
+	'/auth/change-password'
+];
+
+let unauthorizedHandler: (() => void) | null = null;
+
+/** Register what happens when the session expires (auth.svelte.ts signs the user out). */
+export function setUnauthorizedHandler(handler: (() => void) | null) {
+	unauthorizedHandler = handler;
+}
+
+/** Parse a Retry-After header (delta-seconds or HTTP date) into whole seconds. */
+export function parseRetryAfter(header: string | null, now: number = Date.now()): number | null {
+	if (!header) return null;
+	const trimmed = header.trim();
+	if (/^\d+$/.test(trimmed)) return Number(trimmed);
+	const date = Date.parse(trimmed);
+	if (Number.isNaN(date)) return null;
+	return Math.max(0, Math.ceil((date - now) / 1000));
+}
+
+/** Turn a fetch Response into data or a descriptive ApiError. */
+async function parseResponse<T>(path: string, res: Response): Promise<T> {
+	const endpoint = path.split('?')[0];
+
+	if (res.status === 401 && !CREDENTIAL_ENDPOINTS.includes(endpoint)) {
+		unauthorizedHandler?.();
+		throw new ApiError(SESSION_EXPIRED_MESSAGE, 401);
+	}
+
+	if (res.status === 429) {
+		const retryAfter = parseRetryAfter(res.headers.get('Retry-After'));
+		const message =
+			retryAfter !== null
+				? `Too many attempts, try again in ${retryAfter} s.`
+				: 'Too many attempts, try again in a moment.';
+		throw new ApiError(message, 429, retryAfter);
+	}
+
+	// A proxy error page (502/504 HTML) or an empty body is not our API talking.
+	let json: ApiResponse<T>;
+	try {
+		json = await res.json();
+	} catch {
+		throw new ApiError(SERVER_UNAVAILABLE_MESSAGE, res.status);
+	}
+	if (!json || typeof json !== 'object' || !('success' in json)) {
+		throw new ApiError(SERVER_UNAVAILABLE_MESSAGE, res.status);
+	}
+	if (!res.ok || !json.success) {
+		throw new ApiError(json.error || `Request failed (HTTP ${res.status})`, res.status);
 	}
 	return json.data as T;
+}
+
+async function request<T>(path: string, options?: RequestInit): Promise<T> {
+	let res: Response;
+	try {
+		res = await fetch(`${BASE}${path}`, {
+			headers: { 'Content-Type': 'application/json' },
+			credentials: 'same-origin',
+			...options
+		});
+	} catch {
+		// Network failure: server down, connection reset, offline.
+		throw new ApiError(SERVER_UNAVAILABLE_MESSAGE, 0);
+	}
+	return parseResponse<T>(path, res);
 }
 
 export async function listApps(): Promise<App[]> {
