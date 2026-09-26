@@ -4,7 +4,9 @@
 // with defaults, possible values and environment variables) and prints
 // docs/content/reference/cli.md, so the published reference is generated
 // from the code and can't drift: `just docs-gen` rewrites the file and a test
-// fails when the committed copy is stale.
+// fails when the committed copy is stale. The exit-code table the docs show
+// (docs/src/data/exit-codes.json, from `tond help exit-codes --json`) is
+// checked the same way.
 
 use std::fmt::Write;
 
@@ -20,7 +22,16 @@ const INTRO: &str = r#"# CLI
 
 **From anywhere else** (your laptop, CI), pass the server's URL and an [API token](/concepts/access): `--server https://tond.example.com --token tond_pat_…`, or set `TOND_SERVER` and `TOND_TOKEN`. What the token may do depends on its scopes.
 
-Every command prints `--help`. Exit codes are described in [Exit codes](/reference/exit-codes)."#;
+**For scripts and agents:**
+
+- `--json` works on every command: stdout holds one JSON document (the result), and a failure prints one JSON error line on stderr.
+- Exit codes tell failures apart (not found, denied, conflict, deploy failed, server unavailable…): see [Exit codes](/reference/exit-codes) or run `tond help exit-codes`.
+- Destructive commands ask for confirmation in a terminal and refuse without one; pass `--yes` in CI.
+- `tond apps deploy` and `tond apps push` wait for the deploy to finish and exit non-zero if it fails; `--no-wait` returns as soon as it is queued.
+- Mutating requests carry an idempotency key, so a retried command never acts twice; `--idempotency-key` (or `TOND_IDEMPOTENCY_KEY`) sets it.
+- `tond completions bash|zsh|fish` prints a shell completion script, e.g. `tond completions bash > /etc/bash_completion.d/tond`.
+
+Every command prints `--help`, and `tond help <command>` does the same."#;
 
 /// The whole reference page.
 pub fn cli_markdown(root: &Command) -> String {
@@ -304,6 +315,21 @@ mod tests {
         assert!(md.contains("Create an app \\| with a pipe"), "{md}");
         assert!(!md.contains("secret"), "{md}");
         assert!(!md.contains("internal"), "{md}");
+    }
+
+    /// docs/src/data/exit-codes.json (the docs' exit-code table) must be what
+    /// `tond help exit-codes --json` prints.
+    #[test]
+    fn the_published_exit_codes_are_up_to_date() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/src/data/exit-codes.json");
+        let committed: serde_json::Value = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        assert!(
+            committed == crate::exit_codes_json(),
+            "docs/src/data/exit-codes.json is out of date with the CLI. Regenerate it: just docs-gen"
+        );
     }
 
     /// docs/content/reference/cli.md must be what the CLI generates.
