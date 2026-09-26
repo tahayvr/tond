@@ -55,6 +55,7 @@ pub mod projects;
 pub mod registry_credentials;
 pub mod settings;
 pub mod storage_providers;
+pub mod system_self;
 pub mod templates;
 pub mod terminal;
 pub mod webhooks;
@@ -70,11 +71,11 @@ use serde_json::json;
 use tond_common::*;
 
 use crate::{
-    alerts::fire_event_alerts,
     audit_log::{AuthActor, write_audit_log},
     auth::{AuthRole, RateLimit, RequireAdmin, RequireAuth},
     compose_policy, deploy, docker,
     error::AppError,
+    proxy_link,
     state::AppState,
     volumes,
 };
@@ -485,58 +486,47 @@ pub async fn deploy_app(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
-    let mut app = fetch_app(&state.db, &id).await?;
-    let app_id = app.id.clone();
+    let app = fetch_app(&state.db, &id).await?;
 
-    // Deploy in background
-    let state_clone = state.clone();
-    let app_name_clone = app.name.clone();
-    let actor_str = actor.0.clone();
-    tokio::spawn(async move {
-        if let Err(e) = deploy::deploy(&state_clone, &mut app, "manual").await {
-            tracing::error!("Deploy failed for {}: {}", app.name, e);
-            let _ = sqlx::query(
-                "UPDATE apps SET status = 'failed', updated_at = datetime('now') WHERE id = ?",
-            )
-            .bind(&app.id)
-            .execute(&state_clone.db)
-            .await;
-            fire_event_alerts(
-                &state_clone,
-                "deployment_failure",
-                Some(app.id.as_str()),
-                Some(app.name.as_str()),
-                Some(&e.to_string()),
-            )
-            .await;
-        } else {
-            fire_event_alerts(
-                &state_clone,
-                "deployment_success",
-                Some(app.id.as_str()),
-                Some(app.name.as_str()),
-                None,
-            )
-            .await;
-        }
-    });
+    // Queued behind the app's running deploy / the build slots (deploy/queue.rs).
+    let queued = deploy::queue::enqueue(&state, &app, deploy::queue::JobKind::Deploy, "manual")
+        .await
+        .map_err(|e| {
+            AppError(TondError::Internal(format!(
+                "Could not queue the deploy: {e}"
+            )))
+        })?;
 
     write_audit_log(
         &state.db,
-        Some(&app_id),
-        Some(&app_name_clone),
+        Some(&app.id),
+        Some(&app.name),
         "deploy",
-        &actor_str,
-        None,
+        &actor.0,
+        Some(&format!("deployment={}", queued.deployment_id)),
     )
     .await;
 
     Ok((
         StatusCode::ACCEPTED,
-        Json(ApiResponse::ok(
-            json!({ "message": "Deployment started", "app_id": app_id }),
-        )),
+        Json(ApiResponse::ok(queued_response(&app.id, &queued))),
     ))
+}
+
+/// Body of a 202 answer to a queued deploy.
+pub(crate) fn queued_response(app_id: &str, queued: &deploy::queue::Enqueued) -> serde_json::Value {
+    json!({
+        "message": if queued.queue_position > 1 {
+            format!("Deployment queued (position {})", queued.queue_position)
+        } else {
+            "Deployment queued".to_string()
+        },
+        "app_id": app_id,
+        "deployment_id": queued.deployment_id,
+        "status": queued.status,
+        "queue_position": queued.queue_position,
+        "superseded": queued.superseded,
+    })
 }
 
 // ── Stop App ──
@@ -814,6 +804,9 @@ pub async fn retry_cert(
         return Err(TondError::NotFound(format!("No certificate for {domain}")).into());
     }
 
+    // Ask tond-proxy to try right away instead of at its next scheduled pass.
+    tokio::spawn(proxy_link::request_certs(Some(domain.clone())));
+
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(
@@ -1023,9 +1016,9 @@ pub async fn upload_deploy(
 ) -> Result<impl IntoResponse, AppError> {
     let mut app = fetch_app(&state.db, &id).await?;
 
-    // Extract tarball from multipart upload
-    let extract_dir = format!("/tmp/tond-uploads/{}", app.name);
-    let _ = tokio::fs::remove_dir_all(&extract_dir).await;
+    // Extract into a directory of its own: an earlier upload of the same app
+    // may still be waiting in the build queue or building.
+    let extract_dir = format!("/tmp/tond-uploads/{}", uuid::Uuid::new_v4());
     tokio::fs::create_dir_all(&extract_dir).await.map_err(|e| {
         AppError(TondError::Internal(format!(
             "Failed to create upload dir: {}",
@@ -1058,6 +1051,7 @@ pub async fn upload_deploy(
                 .map_err(|e| AppError(TondError::Internal(format!("Failed to run tar: {}", e))))?;
 
             if !output.status.success() {
+                let _ = tokio::fs::remove_dir_all(&extract_dir).await;
                 return Err(AppError(TondError::InvalidInput(
                     "Failed to extract tarball".to_string(),
                 )));
@@ -1077,82 +1071,38 @@ pub async fn upload_deploy(
     .await?;
     app.source_type = "tarball".to_string();
 
-    let app_id = app.id.clone();
-    let app_name_clone = app.name.clone();
-    let actor_str = actor.0.clone();
-
-    // Build and deploy in background
-    let state_clone = state.clone();
-    let extract_dir_clone = extract_dir.clone();
-    tokio::spawn(async move {
-        // Build with the configured method.
-        match deploy::build_from_dir(&state_clone, &app, &extract_dir_clone).await {
-            Ok(_image_tag) => {
-                if let Err(e) = deploy::deploy(&state_clone, &mut app, "upload").await {
-                    tracing::error!("Deploy failed for {}: {}", app.name, e);
-                    let _ = sqlx::query(
-						"UPDATE apps SET status = 'failed', updated_at = datetime('now') WHERE id = ?",
-					)
-					.bind(&app.id)
-					.execute(&state_clone.db)
-					.await;
-                    fire_event_alerts(
-                        &state_clone,
-                        "deployment_failure",
-                        Some(app.id.as_str()),
-                        Some(app.name.as_str()),
-                        Some(&e.to_string()),
-                    )
-                    .await;
-                } else {
-                    fire_event_alerts(
-                        &state_clone,
-                        "deployment_success",
-                        Some(app.id.as_str()),
-                        Some(app.name.as_str()),
-                        None,
-                    )
-                    .await;
-                }
-            }
-            Err(e) => {
-                tracing::error!("Build failed for {}: {}", app.name, e);
-                let _ = sqlx::query(
-                    "UPDATE apps SET status = 'failed', updated_at = datetime('now') WHERE id = ?",
-                )
-                .bind(&app.id)
-                .execute(&state_clone.db)
-                .await;
-                fire_event_alerts(
-                    &state_clone,
-                    "deployment_failure",
-                    Some(app.id.as_str()),
-                    Some(app.name.as_str()),
-                    Some(&e.to_string()),
-                )
-                .await;
-            }
-        }
-
-        // Clean up
-        let _ = tokio::fs::remove_dir_all(&extract_dir_clone).await;
-    });
+    // Build + deploy through the queue; the job removes extract_dir when done.
+    let queued = deploy::queue::enqueue(
+        &state,
+        &app,
+        deploy::queue::JobKind::Upload {
+            dir: extract_dir.clone(),
+        },
+        "upload",
+    )
+    .await
+    .map_err(|e| {
+        AppError(TondError::Internal(format!(
+            "Could not queue the deploy: {e}"
+        )))
+    })?;
 
     write_audit_log(
         &state.db,
-        Some(&app_id),
-        Some(&app_name_clone),
+        Some(&app.id),
+        Some(&app.name),
         "deploy",
-        &actor_str,
-        Some("source=upload"),
+        &actor.0,
+        Some(&format!(
+            "source=upload deployment={}",
+            queued.deployment_id
+        )),
     )
     .await;
 
     Ok((
         StatusCode::ACCEPTED,
-        Json(ApiResponse::ok(
-            json!({ "message": "Upload received, building & deploying...", "app_id": app_id }),
-        )),
+        Json(ApiResponse::ok(queued_response(&app.id, &queued))),
     ))
 }
 

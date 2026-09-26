@@ -26,7 +26,6 @@ use serde_json::json;
 use tond_common::*;
 
 use crate::{
-    alerts,
     audit_log::{AuthActor, write_audit_log},
     auth::{RateLimit, RequireAuth},
     deploy::{self, images},
@@ -128,6 +127,7 @@ fn pick_rollback_target<'a>(
 
 /// Deployment rows plus rollback metadata for the API.
 fn deployment_responses(app: &App, deployments: Vec<Deployment>) -> Vec<DeploymentResponse> {
+    let positions = deploy::queue::global().positions();
     let current = current_image_tag(&deployments).map(str::to_string);
     let mut seen_current = false;
     deployments
@@ -146,6 +146,9 @@ fn deployment_responses(app: &App, deployments: Vec<Deployment>) -> Vec<Deployme
             resp.is_current = is_current;
             resp.rollback_available = blocker.is_none();
             resp.rollback_unavailable_reason = blocker;
+            if resp.status == "queued" {
+                resp.queue_position = positions.get(&resp.id).map(|p| *p as u32);
+            }
             resp
         })
         .collect()
@@ -184,7 +187,7 @@ pub async fn rollback_app(
     Path(id): Path<String>,
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
-    let mut app = fetch_app(&state.db, &id).await?;
+    let app = fetch_app(&state.db, &id).await?;
     let req = parse_rollback_request(&body)?;
 
     let deployments = sqlx::query_as::<_, Deployment>(
@@ -212,60 +215,39 @@ pub async fn rollback_app(
         ))));
     }
 
-    let app_name = app.name.clone();
-    let app_name_for_spawn = app_name.clone();
-    let app_id_clone = app.id.clone();
-    let image_tag_for_spawn = image_tag.clone();
-    let actor_str = actor.0.clone();
-    let state_clone = state.clone();
-
-    tokio::spawn(async move {
-        if let Err(e) = deploy::deploy_image(&state_clone, &mut app, &image_tag_for_spawn).await {
-            tracing::error!("Rollback failed for {}: {}", app_name_for_spawn, e);
-            let _ = sqlx::query(
-                "UPDATE apps SET status = 'failed', updated_at = datetime('now') WHERE id = ?",
-            )
-            .bind(&app.id)
-            .execute(&state_clone.db)
-            .await;
-            alerts::fire_event_alerts(
-                &state_clone,
-                "deployment_failure",
-                Some(app.id.as_str()),
-                Some(app_name_for_spawn.as_str()),
-                Some(&e.to_string()),
-            )
-            .await;
-        } else {
-            alerts::fire_event_alerts(
-                &state_clone,
-                "deployment_success",
-                Some(app.id.as_str()),
-                Some(app_name_for_spawn.as_str()),
-                None,
-            )
-            .await;
-        }
-    });
+    let queued = deploy::queue::enqueue(
+        &state,
+        &app,
+        deploy::queue::JobKind::Rollback {
+            image_tag: image_tag.clone(),
+        },
+        "rollback",
+    )
+    .await
+    .map_err(|e| {
+        AppError(TondError::Internal(format!(
+            "Could not queue the rollback: {e}"
+        )))
+    })?;
 
     write_audit_log(
         &state.db,
-        Some(&app_id_clone),
-        Some(&app_name),
+        Some(&app.id),
+        Some(&app.name),
         "rollback",
-        &actor_str,
-        Some(&format!("deployment={} image_tag={}", target_id, image_tag)),
+        &actor.0,
+        Some(&format!(
+            "deployment={} target={} image_tag={}",
+            queued.deployment_id, target_id, image_tag
+        )),
     )
     .await;
 
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(ApiResponse::ok(json!({
-            "message": "Rollback started",
-            "image_tag": image_tag,
-            "deployment_id": target_id,
-        }))),
-    ))
+    let mut body = crate::handlers::queued_response(&app.id, &queued);
+    body["message"] = json!("Rollback queued");
+    body["image_tag"] = json!(image_tag);
+    body["target_deployment_id"] = json!(target_id);
+    Ok((StatusCode::ACCEPTED, Json(ApiResponse::ok(body))))
 }
 
 pub async fn get_generated_dockerfile(
@@ -372,6 +354,9 @@ mod tests {
             finished_at: Some("2026-04-08T12:01:00Z".to_string()),
             created_at: "2026-04-08T12:00:00Z".to_string(),
             image_pruned: false,
+            kind: "deploy".to_string(),
+            error: None,
+            superseded_by: None,
         }
     }
 

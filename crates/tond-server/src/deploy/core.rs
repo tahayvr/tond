@@ -39,6 +39,7 @@ use crate::backup::{self, SnapshotTrigger};
 use crate::docker;
 use crate::handlers::{github_apps, gitlab_tokens};
 use crate::log_bus::{self, DeployLogEvent};
+use crate::proxy_link;
 use crate::secret_key::{self, Purpose};
 use crate::state::AppState;
 use crate::volumes;
@@ -48,6 +49,7 @@ use super::build::{
 };
 use super::git::{GitHttpAuth, redact_url_credentials, split_url_credentials};
 use super::images;
+use super::queue::{self, DeployCtx};
 
 /// Work out the clone URL and HTTPS credentials for a git app.
 ///
@@ -174,30 +176,26 @@ fn preview_env_vars(
 ///   "manual"   — via the dashboard or API
 ///   "webhook"  — via a GitHub/GitLab/generic webhook
 ///   "upload"   — via a tarball upload
-pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Result<()> {
+pub async fn deploy(
+    state: &AppState,
+    app: &mut App,
+    trigger_source: &str,
+    ctx: &DeployCtx,
+) -> Result<()> {
     let app_id = app.id.clone();
     let app_name = app.name.clone();
 
     // Remember the old container so we can stop it after a successful swap.
     let old_container_id = app.container_id.clone();
 
-    // ── Create a deployment history row ──
-    let deployment_id = Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query(
-        "INSERT INTO deployments (id, app_id, image_tag, status, trigger_source, started_at, created_at)
-         VALUES (?, ?, NULL, 'running', ?, ?, ?)",
-    )
-    .bind(&deployment_id)
-    .bind(&app_id)
-    .bind(trigger_source)
-    .bind(&now)
-    .bind(&now)
-    .execute(&state.db)
-    .await?;
+    // The deployment row was created (status 'queued') by the build queue.
+    let deployment_id = ctx.deployment_id.clone();
 
     // The image this deployment runs, whatever the source: tond-<app>:<id>.
     let deploy_tag = images::deployment_tag(&app_name, &deployment_id);
+
+    // Wait for a build slot (status 'building').
+    ctx.begin_build(state).await?;
 
     // Update status to building
     update_status(state, &app_id, "building").await?;
@@ -220,7 +218,7 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
             let snap_state = state.clone();
             let snap_app_name = app_name.clone();
             let snap_deploy_id = deployment_id.clone();
-            tokio::spawn(async move {
+            crate::runtime::shutdown::spawn_tracked(async move {
                 let _ = backup::create_snapshot(
                     &snap_state,
                     SnapshotTrigger::PreDeploy {
@@ -370,6 +368,9 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
         }
     };
 
+    // The image exists: give the build slot back (status 'deploying').
+    ctx.begin_deploy(state).await?;
+
     // Record the image tag on the deployment row now that we know it.
     let _ = sqlx::query("UPDATE deployments SET image_tag = ? WHERE id = ?")
         .bind(&image_name)
@@ -441,14 +442,7 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
         )
         .await?;
 
-        let finished = chrono::Utc::now().to_rfc3339();
-        let _ = sqlx::query(
-            "UPDATE deployments SET status = 'succeeded', finished_at = ? WHERE id = ?",
-        )
-        .bind(&finished)
-        .bind(&deployment_id)
-        .execute(&state.db)
-        .await;
+        let _ = queue::finish(state, &deployment_id, "succeeded", None).await;
 
         return Ok(());
     }
@@ -458,6 +452,8 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
     // (zero-downtime staging swap), so we cannot reuse the existing port here.
     // On the very first deploy there is no old container and no reserved port,
     // so this also handles that case correctly.
+    // Held until the new container owns its port (see queue::port_allocation).
+    let port_guard = queue::port_allocation().await;
     let new_host_port = docker::find_free_port(&state.docker, 8100).await?;
     let container_port = app.container_port as u16;
 
@@ -550,6 +546,7 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
             e
         })?
     };
+    drop(port_guard);
 
     // ── Graceful health-check drain ──
     //
@@ -604,13 +601,14 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
             update_status(state, &app_id, restore_status).await?;
 
             // Mark deployment as failed
-            let finished = chrono::Utc::now().to_rfc3339();
-            let _ = sqlx::query(
-                "UPDATE deployments SET status = 'failed', finished_at = ? WHERE id = ?",
+            let _ = queue::finish(
+                state,
+                &deployment_id,
+                "failed",
+                Some(&format!(
+                    "The new container did not become healthy within {drain_timeout}s"
+                )),
             )
-            .bind(&finished)
-            .bind(&deployment_id)
-            .execute(&state.db)
             .await;
 
             // Return Ok — the old container is still serving so the app is
@@ -630,8 +628,9 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
 
     // ── Atomic traffic cutover ──
     //
-    // Update the DB in a single statement. tond-proxy reads host_port every
-    // 5 s; after this write the old port stops receiving new requests.
+    // Update the DB in a single statement (the route_state trigger bumps the
+    // route version), then have tond-proxy reload and acknowledge it before
+    // the old container is stopped.
     sqlx::query(
         "UPDATE apps SET container_id = ?, host_port = ?, status = 'running', updated_at = datetime('now') WHERE id = ?",
     )
@@ -645,30 +644,17 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
     app.host_port = Some(new_host_port as i64);
     app.status = "running".to_string();
 
-    // ── Zero-downtime cutover: wait → SIGTERM old → rename staging ──
+    // ── Zero-downtime cutover: proxy ack → SIGTERM old → rename staging ──
     //
-    // After writing the new port to the DB the proxy needs up to PROXY_POLL_SECS
-    // to pick up the change and start routing to the new container. Only then
-    // can we safely SIGTERM the old one.
+    // tond-proxy must be routing to the new port before the old container is
+    // stopped: wait for its acknowledgement (tens of milliseconds).
     //
     // On the first deploy there is no old container and the new one already has
     // the canonical name, so skip this block entirely.
-    const PROXY_POLL_SECS: u64 = 3; // must be > the proxy's 2 s poll interval
     if let Some(ref old_id) = old_container_id
         && old_id != &new_container_id
     {
-        log_deploy(
-            state,
-            &app_id,
-            "info",
-            trigger_source,
-            &format!(
-                "Waiting {}s for proxy to pick up new port before stopping old container",
-                PROXY_POLL_SECS
-            ),
-        )
-        .await?;
-        tokio::time::sleep(std::time::Duration::from_secs(PROXY_POLL_SECS)).await;
+        wait_for_proxy_cutover(state, &app_id, trigger_source).await?;
 
         log_deploy(
             state,
@@ -723,22 +709,36 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
     .await?;
 
     // Mark deployment as succeeded
-    let finished = chrono::Utc::now().to_rfc3339();
-    let _ =
-        sqlx::query("UPDATE deployments SET status = 'succeeded', finished_at = ? WHERE id = ?")
-            .bind(&finished)
-            .bind(&deployment_id)
-            .execute(&state.db)
-            .await;
+    let _ = queue::finish(state, &deployment_id, "succeeded", None).await;
 
     images::prune_app_images(state, &app_id, &app_name).await;
 
     Ok(())
 }
 
+/// Wait until tond-proxy routes the app's new port (see proxy_link.rs), and
+/// say in the deploy log how the cutover was confirmed.
+async fn wait_for_proxy_cutover(
+    state: &AppState,
+    app_id: &str,
+    trigger_source: &str,
+) -> Result<()> {
+    let outcome = proxy_link::sync_routes(state).await;
+    log_deploy(state, app_id, "info", trigger_source, &outcome.describe()).await?;
+    if let Some(wait) = outcome.fallback_wait() {
+        tokio::time::sleep(wait).await;
+    }
+    Ok(())
+}
+
 /// Deploy from a specific Docker image tag (used for rollbacks).
 /// Skips the build step and re-runs the given image directly.
-pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> Result<()> {
+pub async fn deploy_image(
+    state: &AppState,
+    app: &mut App,
+    image_tag: &str,
+    ctx: &DeployCtx,
+) -> Result<()> {
     // Rollback is not supported for compose apps: there is no single image to
     // re-run. Re-deploy with the desired compose content instead.
     if app.source_type == "compose" {
@@ -767,20 +767,10 @@ pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> R
         );
     }
 
-    // Deployment row
-    let deployment_id = Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query(
-        "INSERT INTO deployments (id, app_id, image_tag, status, trigger_source, started_at, created_at)
-         VALUES (?, ?, ?, 'running', 'rollback', ?, ?)",
-    )
-    .bind(&deployment_id)
-    .bind(&app_id)
-    .bind(image_tag)
-    .bind(&now)
-    .bind(&now)
-    .execute(&state.db)
-    .await?;
+    // The deployment row (kind 'rollback', image_tag set) comes from the
+    // build queue. Nothing to build: go straight to 'deploying'.
+    let deployment_id = ctx.deployment_id.clone();
+    ctx.begin_deploy(state).await?;
 
     update_status(state, &app_id, "building").await?;
     log_deploy(
@@ -795,6 +785,7 @@ pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> R
     // Always allocate a fresh host port (same reasoning as in deploy()).
     // For rollbacks the old container is still running on the existing port
     // while we start the rollback container on a new port.
+    let port_guard = queue::port_allocation().await;
     let new_host_port = docker::find_free_port(&state.docker, 8100).await?;
     let container_port = app.container_port as u16;
 
@@ -879,6 +870,7 @@ pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> R
             e
         })?
     };
+    drop(port_guard);
 
     // Graceful drain (same logic as regular deploy)
     if let Some(ref path) = app.health_check_path.clone() {
@@ -918,15 +910,6 @@ pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> R
             };
             update_status(state, &app_id, restore_status).await?;
 
-            let finished = chrono::Utc::now().to_rfc3339();
-            let _ = sqlx::query(
-                "UPDATE deployments SET status = 'failed', finished_at = ? WHERE id = ?",
-            )
-            .bind(&finished)
-            .bind(&deployment_id)
-            .execute(&state.db)
-            .await;
-
             anyhow::bail!(
                 "Rollback failed: container did not pass health checks within {}s",
                 drain_timeout
@@ -959,19 +942,7 @@ pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> R
     if let Some(ref old_id) = old_container_id
         && old_id != &new_container_id
     {
-        const PROXY_POLL_SECS: u64 = 3;
-        log_deploy(
-            state,
-            &app_id,
-            "info",
-            "rollback",
-            &format!(
-                "Waiting {}s for proxy to pick up new port before stopping old container",
-                PROXY_POLL_SECS
-            ),
-        )
-        .await?;
-        tokio::time::sleep(std::time::Duration::from_secs(PROXY_POLL_SECS)).await;
+        wait_for_proxy_cutover(state, &app_id, "rollback").await?;
 
         log_deploy(
             state,
@@ -1006,13 +977,7 @@ pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> R
     )
     .await?;
 
-    let finished = chrono::Utc::now().to_rfc3339();
-    let _ =
-        sqlx::query("UPDATE deployments SET status = 'succeeded', finished_at = ? WHERE id = ?")
-            .bind(&finished)
-            .bind(&deployment_id)
-            .execute(&state.db)
-            .await;
+    let _ = queue::finish(state, &deployment_id, "succeeded", None).await;
 
     images::prune_app_images(state, &app_id, &app_name).await;
 
@@ -1040,6 +1005,12 @@ pub async fn deploy_preview(
 
     tracing::info!("Starting preview deploy for {} (slug: {})", app_name, slug);
 
+    // Previews build outside the per-app queue but share the global build
+    // slots, and use their own build directory so they never race the app's
+    // production build.
+    let build_slot = queue::build_slot().await;
+    let work_name = format!("{app_name}-preview-{slug}");
+
     let image_name = match app.source_type.as_str() {
         "git" => {
             let source_url = app
@@ -1065,7 +1036,7 @@ pub async fn deploy_preview(
             build_from_git(
                 state,
                 &app_id,
-                &app_name,
+                &work_name,
                 &clone_url,
                 git_auth.as_ref(),
                 branch,
@@ -1103,7 +1074,7 @@ pub async fn deploy_preview(
             build_from_inline_dockerfile(
                 state,
                 &app_id,
-                &app_name,
+                &work_name,
                 content,
                 &images::preview_tag(&app_name, &slug),
                 "preview",
@@ -1121,6 +1092,7 @@ pub async fn deploy_preview(
         }
     };
 
+    drop(build_slot);
     preview.image_tag = Some(image_name.clone());
 
     // Update image_tag in DB now that we know it
@@ -1131,6 +1103,7 @@ pub async fn deploy_preview(
         .await;
 
     // Pick a free port in the preview range (8200+)
+    let port_guard = queue::port_allocation().await;
     let host_port = docker::find_free_port(&state.docker, 8200).await?;
     let container_port = app.container_port as u16;
 
@@ -1181,6 +1154,7 @@ pub async fn deploy_preview(
         None,
     )
     .await?;
+    drop(port_guard);
 
     // Update the preview row with runtime details
     sqlx::query(

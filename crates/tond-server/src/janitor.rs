@@ -8,8 +8,8 @@
 //                    deployment" means rows written at or after its start).
 //                    Older logs are also dropped after M days, except the logs
 //                    of the app's most recent deployment, which are always kept.
-//   deployments    — per app, keep the last N rows. Rows still running or
-//                    pending and the last few succeeded deployments with an
+//   deployments    — per app, keep the last N rows. Unfinished rows (queued,
+//                    building, deploying) and the last few succeeded deployments with an
 //                    image (the rollback candidates) are never deleted. Rows
 //                    whose app no longer exists are deleted.
 //   cron_job_runs  — per job, keep the last N runs and drop runs older than M
@@ -39,6 +39,7 @@ use anyhow::Result;
 use chrono::Utc;
 use sqlx::SqlitePool;
 
+use crate::runtime::loops;
 use crate::state::AppState;
 
 /// Rows deleted per statement.
@@ -144,19 +145,28 @@ impl JanitorReport {
 }
 
 pub async fn run_janitor(state: AppState) {
-    tokio::time::sleep(STARTUP_DELAY).await;
+    let lp = loops::register("janitor");
+    lp.sleep(STARTUP_DELAY).await;
     loop {
+        let run = lp.run();
         let policy = RetentionPolicy::load(&state.db).await;
         match run_once(&state.db, &policy).await {
             Ok(report) if report.total() > 0 => {
                 tracing::info!("Janitor: deleted {:?}", report);
+                drop(run);
             }
-            Ok(_) => tracing::debug!("Janitor: nothing to delete"),
-            Err(e) => tracing::warn!("Janitor pass failed: {}", e),
+            Ok(_) => {
+                tracing::debug!("Janitor: nothing to delete");
+                drop(run);
+            }
+            Err(e) => {
+                tracing::warn!("Janitor pass failed: {}", e);
+                run.fail(&e);
+            }
         }
         // Refresh planner statistics for tables whose shape changed.
         let _ = sqlx::query("PRAGMA optimize").execute(&state.db).await;
-        tokio::time::sleep(INTERVAL).await;
+        lp.sleep(INTERVAL).await;
     }
 }
 
@@ -211,7 +221,7 @@ pub async fn run_once(db: &SqlitePool, policy: &RetentionPolicy) -> Result<Janit
             "DELETE FROM deployments WHERE rowid IN (
                 SELECT rowid FROM deployments
                 WHERE app_id NOT IN (SELECT id FROM apps)
-                  AND status NOT IN ('running', 'pending')
+                  AND status NOT IN ('queued', 'building', 'deploying')
                 LIMIT ?)",
         )
         .bind(BATCH_SIZE)
@@ -225,7 +235,7 @@ pub async fn run_once(db: &SqlitePool, policy: &RetentionPolicy) -> Result<Janit
                     "DELETE FROM deployments WHERE rowid IN (
                         SELECT rowid FROM deployments
                         WHERE app_id = ?1
-                          AND status NOT IN ('running', 'pending')
+                          AND status NOT IN ('queued', 'building', 'deploying')
                           AND id NOT IN (
                               SELECT id FROM deployments WHERE app_id = ?1
                               ORDER BY created_at DESC LIMIT ?2)
@@ -587,7 +597,7 @@ mod tests {
         // three recent failures.
         seed_deployment(&db, "old-ok", "a1", "succeeded", Some("img:1"), &ts(10, 0)).await;
         seed_deployment(&db, "old-fail", "a1", "failed", None, &ts(9, 0)).await;
-        seed_deployment(&db, "stuck", "a1", "running", None, &ts(8, 0)).await;
+        seed_deployment(&db, "stuck", "a1", "building", None, &ts(8, 0)).await;
         for i in 0..3 {
             seed_deployment(&db, &format!("new-{i}"), "a1", "failed", None, &ts(1, i)).await;
         }

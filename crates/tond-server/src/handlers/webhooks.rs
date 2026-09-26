@@ -48,7 +48,6 @@ use sha2::{Digest, Sha256};
 use tond_common::{ApiResponse, App, GitHubApp, GitLabToken, PreviewDeployment, TondError};
 
 use crate::{
-    alerts,
     auth::RateLimiter,
     deploy, docker,
     domains::preview_host,
@@ -293,11 +292,11 @@ pub fn sanitize_provider_url(raw: Option<&str>) -> Option<String> {
 
 // ── Shared deploy trigger ──────────────────────────────────────────────────
 
-/// Check auto_deploy, the branch filter and the per-app rate limit, then spawn
-/// a background deploy.
+/// Check auto_deploy, the branch filter and the per-app rate limit, then queue
+/// a deploy (deploy/queue.rs).
 async fn trigger_webhook_deploy(
     state: &AppState,
-    mut app: App,
+    app: App,
     provider: &str,
     branch: Option<&str>,
 ) -> Response {
@@ -340,37 +339,24 @@ async fn trigger_webhook_deploy(
         branch
     );
 
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = deploy::deploy(&state_clone, &mut app, "webhook").await {
-            tracing::error!("[webhook] deploy failed for {}: {}", app.id, e);
-            let _ = sqlx::query(
-                "UPDATE apps SET status = 'failed', updated_at = datetime('now') WHERE id = ?",
+    // A burst of pushes coalesces in the queue: the newest supersedes a
+    // deploy that has not started yet.
+    match deploy::queue::enqueue(state, &app, deploy::queue::JobKind::Deploy, "webhook").await {
+        Ok(queued) => (
+            StatusCode::ACCEPTED,
+            Json(ApiResponse::ok(crate::handlers::queued_response(
+                &app.id, &queued,
+            ))),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("[webhook] could not queue deploy for {}: {}", app.id, e);
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not queue the deploy",
             )
-            .bind(&app.id)
-            .execute(&state_clone.db)
-            .await;
-            alerts::fire_event_alerts(
-                &state_clone,
-                "deployment_failure",
-                Some(app.id.as_str()),
-                Some(app.name.as_str()),
-                Some(&e.to_string()),
-            )
-            .await;
-        } else {
-            alerts::fire_event_alerts(
-                &state_clone,
-                "deployment_success",
-                Some(app.id.as_str()),
-                Some(app.name.as_str()),
-                None,
-            )
-            .await;
         }
-    });
-
-    (StatusCode::ACCEPTED, Json(ApiResponse::<()>::ok(()))).into_response()
+    }
 }
 
 /// Fetch an app by UUID for webhook use. Names are not accepted: webhook URLs
