@@ -34,7 +34,12 @@ export function collapseCarriageReturns(text: string): string {
 export function prepareLine(line: LogLine, index: number, showPrefix = true): PreparedLine {
 	const text = collapseCarriageReturns(line.text ?? '');
 	const plain = stripAnsi(text);
-	const prefix = showPrefix && line.appName ? line.appName : undefined;
+	// Multi-app streams tag lines with the app, compose apps with the service.
+	const source =
+		line.appName && line.service
+			? `${line.appName}/${line.service}`
+			: (line.appName ?? line.service);
+	const prefix = showPrefix && source ? source : undefined;
 	return {
 		index,
 		segments: parseAnsi(text),

@@ -321,6 +321,9 @@ pub struct AppResponse {
     pub domain_warning: Option<String>,
     pub source_type: String,
     pub source_url: Option<String>,
+    /// Branch deployed from `source_url` (git and git-sourced compose apps)
+    #[serde(default)]
+    pub branch: Option<String>,
     pub status: String,
     pub container_port: i64,
     pub host_port: Option<i64>,
@@ -396,6 +399,7 @@ impl From<App> for AppResponse {
             domain: app.domain,
             source_type: app.source_type,
             source_url: app.source_url,
+            branch: app.branch,
             status: app.status,
             container_port: app.container_port,
             host_port: app.host_port,

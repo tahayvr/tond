@@ -12,6 +12,8 @@
 	interface Props {
 		appId: string;
 		appName: string;
+		/** Compose app: offer a per-service filter (services seen in the output). */
+		compose?: boolean;
 		logLines: LogLine[];
 		streaming: boolean;
 		onConnect: () => void;
@@ -19,9 +21,28 @@
 		onClear: () => void;
 	}
 
-	let { appId, appName, logLines, streaming, onConnect, onStop, onClear }: Props = $props();
+	let {
+		appId,
+		appName,
+		compose = false,
+		logLines,
+		streaming,
+		onConnect,
+		onStop,
+		onClear
+	}: Props = $props();
 
 	let view = $derived(appLogViewFromUrl(page.url));
+	let services = $derived(
+		compose
+			? [...new Set(logLines.map((l) => l.service).filter((s): s is string => !!s))].sort()
+			: []
+	);
+	/** Compose apps: show one service's output ('' = every service and deploy lines). */
+	let serviceFilter = $state('');
+	let shownLines = $derived(
+		serviceFilter ? logLines.filter((l) => l.service === serviceFilter) : logLines
+	);
 </script>
 
 <div class="space-y-4 pt-4">
@@ -40,16 +61,37 @@
 		</ButtonGroup.Root>
 	</nav>
 
+	{#if view !== 'access' && services.length > 0}
+		<div class="flex flex-wrap items-center gap-2" role="group" aria-label="Service">
+			<span class="text-xs text-muted-foreground">Service:</span>
+			<Button
+				size="sm"
+				variant={serviceFilter === '' ? 'default' : 'outline'}
+				aria-pressed={serviceFilter === ''}
+				onclick={() => (serviceFilter = '')}>All</Button
+			>
+			{#each services as name (name)}
+				<Button
+					size="sm"
+					variant={serviceFilter === name ? 'default' : 'outline'}
+					class="font-mono"
+					aria-pressed={serviceFilter === name}
+					onclick={() => (serviceFilter = name)}>{name}</Button
+				>
+			{/each}
+		</div>
+	{/if}
+
 	{#if view === 'access'}
 		<AppAccessLog {appId} {appName} />
 	{:else}
 		<LogViewer
-			lines={logLines}
+			lines={shownLines}
 			live={streaming}
-			downloadName="{appName}-logs"
+			downloadName={serviceFilter ? `${appName}-${serviceFilter}-logs` : `${appName}-logs`}
 			emptyText={streaming ? 'Waiting for output…' : 'Not connected. Connect to stream logs.'}
 			heightClass="h-[26rem] sm:h-[34rem]"
-			showPrefix={false}
+			showPrefix={services.length > 0 && !serviceFilter}
 			label="{appName} logs"
 		>
 			{#snippet actions()}

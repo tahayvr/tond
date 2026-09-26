@@ -47,7 +47,7 @@
 		appReadiness,
 		openLogStream
 	} from '$lib/api';
-	import { goto } from '$app/navigation';
+	import { goto, invalidateAll } from '$app/navigation';
 	import { isAdmin, can } from '$lib/auth.svelte';
 	import { confirmAction } from '$lib/confirm.svelte';
 	import { useAction } from '$lib/action.svelte';
@@ -55,7 +55,9 @@
 		APP_TABS,
 		APP_SETTINGS_SECTIONS,
 		allowedTabs,
+		appSectionsFor,
 		appTabHref,
+		appTabsFor,
 		appViewFromUrl,
 		type AppSettingsSection
 	} from '$lib/tabs';
@@ -92,6 +94,8 @@
 	import RequestMetricsPanel from '$lib/components/metrics/request-metrics-panel.svelte';
 	import AppHistory from '$lib/components/tabs/app-page/app-history.svelte';
 	import AppWebhooks from '$lib/components/tabs/app-page/app-webhooks.svelte';
+	import ComposeServices from '$lib/components/compose/compose-services.svelte';
+	import ComposeFileSettings from '$lib/components/compose/compose-file-settings.svelte';
 	import { safeUrl } from '$lib/utils';
 	import { SecretInput } from '$lib/components/ui/secret-input/index.js';
 	import Github from '~icons/ri/github-fill';
@@ -123,8 +127,13 @@
 	/** Leaf view: a tab, or the Settings section when Settings is open. */
 	let activeTab = $derived<string>(view.tab === 'settings' ? view.section : view.tab);
 	// Only offer what the user's scopes allow (the server enforces it either way).
-	let appTabs = $derived(allowedTabs(APP_TABS, can));
-	let settingsSections = $derived(allowedTabs(APP_SETTINGS_SECTIONS, can));
+	// Compose apps get Services and a Compose file section instead of the
+	// single-container ones (domains are per service).
+	let isCompose = $derived(app?.source_type === 'compose');
+	let appTabs = $derived(appTabsFor(allowedTabs(APP_TABS, can), app?.source_type ?? ''));
+	let settingsSections = $derived(
+		appSectionsFor(allowedTabs(APP_SETTINGS_SECTIONS, can), app?.source_type ?? '')
+	);
 	let viewAllowed = $derived(
 		appTabs.some((t) => t.id === view.tab) &&
 			(view.tab !== 'settings' || settingsSections.some((s) => s.id === view.section))
@@ -1017,9 +1026,26 @@
 					<div class="pt-4">
 						<AppEventsStrip appId={app.id} />
 					</div>
+					{#if isCompose}
+						<div class="pt-4">
+							<ComposeServices {app} compact />
+						</div>
+					{/if}
 					<AppOverview
 						{app}
 						uptimeHref={can('metrics:read') ? appTabHref(appId, 'uptime') : null}
+					/>
+				{/if}
+
+				<!-- Services tab (compose apps) -->
+				{#if viewAllowed && activeTab === 'services' && isCompose}
+					<ComposeServices
+						{app}
+						canControl={can('apps:control')}
+						canEdit={canEditApp}
+						canReadLogs={can('logs:read')}
+						canDeploy={can('apps:deploy')}
+						onDeploy={() => deploy.run()}
 					/>
 				{/if}
 
@@ -1035,6 +1061,7 @@
 					<AppLogs
 						appId={app.id}
 						appName={app.name}
+						compose={isCompose}
 						{logLines}
 						streaming={logStreaming}
 						onConnect={startLogStream}
@@ -1068,6 +1095,17 @@
 						onRegistryCredentialChange={handleEnvRegistryCredential}
 						previewEnabled={app.preview_enabled}
 						onRedeploy={handleEnvRedeploy}
+					/>
+				{/if}
+
+				<!-- Compose file (compose apps) -->
+				{#if viewAllowed && activeTab === 'compose' && isCompose}
+					<ComposeFileSettings
+						{app}
+						canEdit={can('settings:write')}
+						canDeploy={can('apps:deploy')}
+						onSaved={() => invalidateAll()}
+						onDeploy={() => deploy.run()}
 					/>
 				{/if}
 

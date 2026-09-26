@@ -13,11 +13,12 @@
 	import Layers from '~icons/ri/stack-line';
 	import Box from '~icons/ri/box-3-line';
 	import { Button } from '$lib/components/ui/button/index.js';
+	import ComposeEditor from '$lib/components/compose/compose-editor.svelte';
+	import * as ButtonGroup from '$lib/components/ui/button-group/index.js';
 	import {
 		listGitHubApps,
 		listGitHubRepos,
 		listGitHubBranches,
-		validateCompose,
 		type GitHubApp,
 		type GitHubRepo,
 		type TemplateCatalogEntry
@@ -36,6 +37,16 @@
 		branch: string;
 		dockerfileContent: string;
 		composeContent: string;
+		/** Compose: a pasted file or one read from a git repository. */
+		composeMode?: 'inline' | 'git';
+		/** Compose from a repository: path of the file in it. */
+		composePath?: string;
+		/** Compose: the service that gets the app's port and domain ('' = Tond picks). */
+		composeService?: string;
+		/** Compose: problems the policy check found in the pasted file. */
+		composeErrors?: string[];
+		/** The app's port (to suggest the compose web service). */
+		containerPort?: number;
 		selectedTemplateId: string;
 		templates: TemplateCatalogEntry[];
 		envVars: Record<string, string>;
@@ -51,6 +62,11 @@
 		branch = $bindable(''),
 		dockerfileContent = $bindable(''),
 		composeContent = $bindable(''),
+		composeMode = $bindable('inline'),
+		composePath = $bindable('docker-compose.yml'),
+		composeService = $bindable(''),
+		composeErrors = $bindable([]),
+		containerPort = 80,
 		selectedTemplateId = $bindable(''),
 		templates,
 		envVars = $bindable({}),
@@ -77,32 +93,6 @@
 				)
 			: []
 	);
-
-	// Compose policy check: ask the server (debounced) so problems show up under
-	// the editor instead of at the end of the wizard.
-	let composeErrors = $state<string[]>([]);
-	$effect(() => {
-		const content = composeContent;
-		const appName = name;
-		if (sourceSubType !== 'compose' || !content.trim()) {
-			composeErrors = [];
-			return;
-		}
-		let cancelled = false;
-		const timer = setTimeout(async () => {
-			try {
-				const result = await validateCompose(content, appName);
-				if (!cancelled) composeErrors = result.errors;
-			} catch {
-				// Validation is advisory; the create request re-checks and reports errors.
-				if (!cancelled) composeErrors = [];
-			}
-		}, 500);
-		return () => {
-			cancelled = true;
-			clearTimeout(timer);
-		};
-	});
 
 	// GitHub App picker state
 	let githubApps = $state<GitHubApp[]>([]);
@@ -600,43 +590,74 @@ CMD [&quot;node&quot;, &quot;dist/index.js&quot;]"
 		</div>
 	{/if}
 
-	<!-- Docker Compose inline editor -->
+	<!-- Docker Compose: a pasted file or one from a git repository -->
 	{#if sourceSubType === 'compose'}
-		<div class="space-y-2">
-			<Label for="compose-content">docker-compose.yml *</Label>
-			<Textarea
-				id="compose-content"
-				bind:value={composeContent}
-				placeholder="services:
-  web:
-    image: nginx:alpine
-    ports:
-      - &quot;80:80&quot;
-    volumes:
-      - ./html:/usr/share/nginx/html"
-				class="min-h-64 font-mono text-xs"
-				spellcheck={false}
-			/>
-			<p class="text-xs text-muted-foreground">
-				Paste your docker-compose.yml content. The application will be started with
-				<code class="rounded bg-muted px-1 font-mono">docker compose up --build -d</code>.
-			</p>
-			<p class="text-xs text-muted-foreground">
-				For safety Tond refuses privileged mode, host namespaces (<code class="font-mono"
-					>network_mode: host</code
-				>, <code class="font-mono">pid: host</code>…), extra capabilities, devices and bind mounts
-				outside the app's folder. Use relative binds like
-				<code class="font-mono">./data:/data</code> — they are stored in the app's volume folder. Published
-				ports are bound to 127.0.0.1 and reached through Tond's proxy.
-			</p>
-			{#if composeErrors.length > 0}
-				<div class="rounded-md bg-destructive/10 p-3 text-xs text-destructive" role="alert">
-					<p class="font-medium">This compose file will be rejected:</p>
-					<ul class="mt-1 list-disc space-y-0.5 pl-4">
-						{#each composeErrors as problem (problem)}
-							<li>{problem}</li>
-						{/each}
-					</ul>
+		<div class="space-y-4">
+			<nav aria-label="Where the compose file comes from">
+				<ButtonGroup.Root>
+					<Button
+						type="button"
+						size="sm"
+						variant={composeMode === 'inline' ? 'default' : 'outline'}
+						aria-pressed={composeMode === 'inline'}
+						onclick={() => (composeMode = 'inline')}>Paste a file</Button
+					>
+					<Button
+						type="button"
+						size="sm"
+						variant={composeMode === 'git' ? 'default' : 'outline'}
+						aria-pressed={composeMode === 'git'}
+						onclick={() => (composeMode = 'git')}>From a Git repository</Button
+					>
+				</ButtonGroup.Root>
+			</nav>
+			{#if composeMode === 'inline'}
+				<ComposeEditor
+					bind:content={composeContent}
+					bind:webService={composeService}
+					appName={name}
+					pickWebService
+					{containerPort}
+					onChecked={(errors) => (composeErrors = errors)}
+				/>
+			{:else}
+				<div class="grid gap-4 sm:grid-cols-2">
+					<div class="space-y-1.5 sm:col-span-2">
+						<Label for="compose-repo">Repository URL *</Label>
+						<Input
+							id="compose-repo"
+							class="font-mono"
+							placeholder="https://github.com/acme/shop.git"
+							bind:value={sourceUrl}
+						/>
+					</div>
+					<div class="space-y-1.5">
+						<Label for="compose-branch">Branch</Label>
+						<Input id="compose-branch" class="font-mono" placeholder="main" bind:value={branch} />
+					</div>
+					<div class="space-y-1.5">
+						<Label for="compose-path">Compose file path</Label>
+						<Input
+							id="compose-path"
+							class="font-mono"
+							placeholder="docker-compose.yml"
+							bind:value={composePath}
+						/>
+					</div>
+					<div class="space-y-1.5 sm:col-span-2">
+						<Label for="compose-service">Web service (optional)</Label>
+						<Input
+							id="compose-service"
+							class="w-full font-mono sm:w-72"
+							placeholder="web"
+							bind:value={composeService}
+						/>
+						<p class="text-xs text-muted-foreground">
+							Tond clones the branch on every deploy and reads the compose file from it. The service
+							named here gets the app's port and domain; leave it empty and Tond picks the service
+							that declares the port.
+						</p>
+					</div>
 				</div>
 			{/if}
 		</div>
