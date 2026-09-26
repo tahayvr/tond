@@ -46,17 +46,21 @@ pub async fn create_snapshot(
 ) -> Result<impl IntoResponse, AppError> {
     let trigger = SnapshotTrigger::Manual { name: req.name };
 
-    // Spawn in background; return the snapshot ID immediately
+    // Tracked work: a graceful shutdown lets the snapshot finish even if this
+    // request's connection is closed first.
     let state_clone = state.clone();
     let (tx, _rx) = mpsc::channel(32);
-    let id = backup::create_snapshot(&state_clone, trigger.clone(), Some(tx))
-        .await
-        .map_err(|e| {
-            AppError(TondError::Internal(format!(
-                "Failed to start snapshot: {}",
-                e
-            )))
-        })?;
+    let id = crate::runtime::shutdown::spawn_tracked(async move {
+        backup::create_snapshot(&state_clone, trigger, Some(tx)).await
+    })
+    .await
+    .map_err(|e| AppError(TondError::Internal(format!("Snapshot task failed: {e}"))))?
+    .map_err(|e| {
+        AppError(TondError::Internal(format!(
+            "Failed to start snapshot: {}",
+            e
+        )))
+    })?;
 
     Ok((
         StatusCode::ACCEPTED,

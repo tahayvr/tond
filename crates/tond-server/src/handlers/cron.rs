@@ -465,7 +465,7 @@ pub async fn trigger_cron_job(
     // Spawn the run in the background (same as the scheduler does)
     let state_clone = state.clone();
     let job_clone = job.clone();
-    tokio::spawn(async move {
+    crate::runtime::shutdown::spawn_tracked(async move {
         cron::run_cron_job(&state_clone, &job_clone, 1).await;
     });
 

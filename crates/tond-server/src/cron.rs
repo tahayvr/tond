@@ -3,8 +3,9 @@
 // Exports:
 //   run_cron_scheduler(state)        — long-running Tokio task. On start it closes out
 //                                      runs a previous process left 'running' (see
-//                                      reconcile_interrupted_runs). Then it wakes every
-//                                      30 s, finds enabled jobs whose next_run_at <= now,
+//                                      reconcile_interrupted_runs). Then it sleeps until
+//                                      the earliest next_run_at (or until cron_jobs
+//                                      changes), finds enabled jobs whose next_run_at <= now,
 //                                      advances next_run_at to the next slot (a
 //                                      compare-and-set, *before* the run starts, so a
 //                                      long 'allow' run is never re-started every tick)
@@ -40,7 +41,12 @@ use std::str::FromStr;
 use tond_common::{CronJob, CronVolume};
 use uuid::Uuid;
 
+use crate::runtime::changes::{Table, Watch};
+use crate::runtime::{loops, shutdown};
 use crate::{alerts, docker, state::AppState, volumes};
+
+/// Longest sleep when no job is scheduled soon (a cron_jobs change wakes us).
+const MAX_SLEEP: std::time::Duration = std::time::Duration::from_secs(3600);
 
 fn should_run_due_job(job: &CronJob) -> bool {
     !(job.status == "running" && job.concurrency_policy == "skip")
@@ -141,10 +147,37 @@ pub async fn run_cron_scheduler(state: AppState) {
     }
     remove_orphaned_cron_containers(&state.docker).await;
 
+    let lp = loops::register("cron");
+    let mut watch = Watch::new(&[Table::CronJobs]);
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        let sleep = next_due_in(&state.db).await;
+        lp.wait(Some(sleep), &mut watch).await;
+        if shutdown::is_shutting_down() {
+            return;
+        }
+        let _run = lp.run();
         schedule_due_jobs(&state).await;
     }
+}
+
+/// Time until the earliest enabled job is due (zero if one is overdue),
+/// capped at MAX_SLEEP.
+async fn next_due_in(db: &sqlx::SqlitePool) -> std::time::Duration {
+    let next: Option<String> = sqlx::query_scalar(
+        "SELECT MIN(next_run_at) FROM cron_jobs WHERE enabled = 1 AND next_run_at IS NOT NULL",
+    )
+    .fetch_one(db)
+    .await
+    .ok()
+    .flatten();
+    next.as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|at| {
+            (at.with_timezone(&Utc) - Utc::now())
+                .to_std()
+                .unwrap_or(std::time::Duration::ZERO)
+        })
+        .map_or(MAX_SLEEP, |d| d.min(MAX_SLEEP))
 }
 
 /// One scheduler tick: claim every due job (advancing `next_run_at` *before*
@@ -153,7 +186,8 @@ pub async fn run_cron_scheduler(state: AppState) {
 async fn schedule_due_jobs(state: &AppState) {
     for job in claim_due_jobs(&state.db).await {
         let state_clone = state.clone();
-        tokio::spawn(async move {
+        // Tracked: a graceful shutdown waits for the run to finish.
+        shutdown::spawn_tracked(async move {
             run_cron_job(&state_clone, &job, 1).await;
         });
     }

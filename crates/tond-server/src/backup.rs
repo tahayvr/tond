@@ -719,23 +719,32 @@ pub async fn restore_database(state: &AppState, snapshot_id: &str, db_name: &str
 
 // ── Backup scheduler ──────────────────────────────────────────────────────────
 
+/// Sleeps until the next scheduled snapshot; a change to backup_config wakes
+/// it to re-plan. Disabled or invalid schedules wait for a config change.
 #[allow(dead_code)]
 pub async fn backup_scheduler(state: AppState) {
+    use crate::runtime::changes::{Table, Watch};
+    use crate::runtime::loops::{self, Wake};
     use cron::Schedule;
     use std::str::FromStr;
+
+    const IDLE: std::time::Duration = std::time::Duration::from_secs(3600);
+    let lp = loops::register("backup-scheduler");
+    let mut watch = Watch::new(&[Table::BackupConfig]);
 
     loop {
         let cfg = match get_backup_config(&state).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!("backup_scheduler: failed to read config: {}", e);
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                lp.wait(Some(std::time::Duration::from_secs(60)), &mut watch)
+                    .await;
                 continue;
             }
         };
 
         if cfg.enabled == 0 {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            lp.wait(Some(IDLE), &mut watch).await;
             continue;
         }
 
@@ -747,7 +756,7 @@ pub async fn backup_scheduler(state: AppState) {
                     cfg.full_schedule_cron,
                     e
                 );
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                lp.wait(Some(IDLE), &mut watch).await;
                 continue;
             }
         };
@@ -757,15 +766,21 @@ pub async fn backup_scheduler(state: AppState) {
             let wait = (next - now)
                 .to_std()
                 .unwrap_or(std::time::Duration::from_secs(60));
-            tracing::info!("backup_scheduler: next run in {:?}", wait);
-            tokio::time::sleep(wait).await;
+            tracing::debug!("backup_scheduler: next run in {:?}", wait);
+            if lp.wait(Some(wait), &mut watch).await == Wake::Event {
+                continue; // config changed: re-plan
+            }
+            if crate::runtime::shutdown::is_shutting_down() {
+                return;
+            }
+            drop(lp.run());
 
             let state_clone = state.clone();
-            tokio::spawn(async move {
+            crate::runtime::shutdown::spawn_tracked(async move {
                 let _ = create_snapshot(&state_clone, SnapshotTrigger::Scheduled, None).await;
             });
         } else {
-            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            lp.wait(Some(IDLE), &mut watch).await;
         }
     }
 }
