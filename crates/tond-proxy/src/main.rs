@@ -35,17 +35,24 @@
 //     HTTP_REQUEST_TIMEOUT, at most HTTP_MAX_CONNECTIONS are served at once,
 //     and accept() errors never stop the listener (renewals depend on it).
 //
-//   Background thread (native OS thread + Tokio runtime):
-//     - Route refresh loop: every 2 s opens a read-only SQLite connection,
-//       queries running apps and previews with a stored host_port, and
-//       atomically replaces the RouteMap. Also reads dashboard_domain and
-//       preview_domain from the settings table so changes made via the
-//       dashboard or CLI are picked up without a proxy restart. The proxy
-//       never talks to Docker (it runs unprivileged, see tond-proxy.service).
-//     - Certificate loop (issuance.rs): every 30 s, issues or renews certs
-//       for routed domains and the dashboard domain, with per-domain
-//       exponential backoff and a DNS pre-check; results (including the last
-//       error and next retry time) are written to the certificates table.
+//   Background thread (native OS thread + current-thread Tokio runtime):
+//     - Routing: one persistent read-only SQLite connection (mode=ro; tond.db
+//       is 0640 root:tond-proxy, see tond-server's db.rs). tond-server bumps
+//       `route_state.version` (SQL triggers) and nudges the proxy over the
+//       control socket; the proxy reloads — running apps and previews with a
+//       stored host_port, plus dashboard_domain / preview_domain — only when
+//       the version moved, in one read transaction, and acknowledges with the
+//       version it loaded. A deploy stops the old container only after that
+//       acknowledgement. A fallback check every FALLBACK_POLL_SECS (60 s)
+//       catches a missed nudge. The proxy never talks to Docker (it runs
+//       unprivileged, see tond-proxy.service).
+//     - Control socket (control.rs): <data dir>/proxy.sock, owner-only,
+//       root/own-uid peers only.
+//     - Certificate loop (issuance.rs): event-driven (route changes, "Retry
+//       now", the earliest due retry), issues or renews certs for routed
+//       domains and the dashboard domain with per-domain exponential backoff
+//       and a DNS pre-check. Results go to tond-server over the control
+//       socket; tond-proxy never writes the database.
 //
 // Logging: nothing is logged per request at info (routing decisions are at
 // debug), and the route refresh only logs when a route is added, removed or
@@ -55,16 +62,17 @@
 //   TOND_DB_PATH          — SQLite database path
 //   TOND_DATA_DIR         — base dir for certs and ACME account creds
 //   TOND_SERVER_ADDR      — tond-server address (default: 127.0.0.1:3001)
-//   TOND_DASHBOARD_DOMAIN — (optional) seed value written to the DB on first
-//                           startup when the DB value is empty. After that
-//                           the DB value takes precedence and this env var
-//                           is ignored. Use `tond settings set dashboard-domain`
-//                           or the dashboard settings page to change it.
+//   TOND_PROXY_SOCKET     — control socket (default: <TOND_DATA_DIR>/proxy.sock)
 //   TOND_ACME_STAGING     — "1" or "true" to use Let's Encrypt staging
+//
+// (TOND_DASHBOARD_DOMAIN moved to tond-server, which seeds the setting; the
+// proxy reads the dashboard domain from the database like everything else.)
 
 mod acme;
 mod certs;
+mod control;
 mod issuance;
+mod meters;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -76,15 +84,19 @@ use pingora::tls::ext::{ssl_add_chain_cert, ssl_use_certificate, ssl_use_private
 use pingora::tls::ssl::NameType;
 use pingora::upstreams::peer::HttpPeer;
 use sqlx::SqlitePool;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Notify, RwLock, Semaphore};
+use tond_common::proxy_control::FALLBACK_POLL_SECS;
 
 use crate::acme::ChallengeMap;
 use crate::certs::CertStore;
-use crate::issuance::IssuanceLoop;
+use crate::issuance::{IssuanceLoop, Outbox};
 
 /// Route map: domain -> upstream (host:port)
 type RouteMap = Arc<RwLock<HashMap<String, String>>>;
@@ -129,12 +141,55 @@ impl TlsAccept for TondTlsAccept {
     }
 }
 
+// ── Route database ──
+
+/// The proxy's single, persistent, read-only connection to tond.db and the
+/// route_state.version its routing table corresponds to.
+pub struct RouteDb {
+    pool: SqlitePool,
+    loaded_version: AtomicI64,
+    reloads: AtomicU64,
+    /// Serialises reloads (control socket and fallback poll).
+    lock: tokio::sync::Mutex<()>,
+}
+
+impl RouteDb {
+    /// Open lazily: the file may not exist until tond-server first starts.
+    fn open(db_path: &str) -> Result<Self> {
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{db_path}"))?
+            .read_only(true)
+            .create_if_missing(false)
+            .busy_timeout(Duration::from_secs(5));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .min_connections(0)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .connect_lazy_with(options);
+        Ok(Self {
+            pool,
+            loaded_version: AtomicI64::new(-1),
+            reloads: AtomicU64::new(0),
+            lock: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    fn loaded_version(&self) -> i64 {
+        self.loaded_version.load(Ordering::Relaxed)
+    }
+
+    fn reloads(&self) -> u64 {
+        self.reloads.load(Ordering::Relaxed)
+    }
+}
+
 // ── Proxy ──
 
+#[derive(Clone)]
 struct TondProxy {
     routes: RouteMap,
-    db_path: String,
-    /// Live dashboard domain — reads from the DB on every 2 s poll.
+    db: Arc<RouteDb>,
+    /// Live dashboard domain, reloaded with the routes.
     /// None means no dashboard domain is configured.
     dashboard_domain: DashboardDomain,
     /// Live preview domain — previews are served only under it, and nothing
@@ -142,6 +197,8 @@ struct TondProxy {
     preview_domain: PreviewDomain,
     /// Address of the tond-server instance (default: 127.0.0.1:3001).
     server_addr: String,
+    /// Poked when the set of served domains changes (certificate loop).
+    domains_changed: Arc<Notify>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -355,14 +412,43 @@ fn route_changes(old: &HashMap<String, String>, new: &HashMap<String, String>) -
 }
 
 impl TondProxy {
-    fn new(db_path: &str, initial_dashboard_domain: Option<String>, server_addr: String) -> Self {
+    fn new(db: Arc<RouteDb>, server_addr: String) -> Self {
         Self {
             routes: Arc::new(RwLock::new(HashMap::new())),
-            db_path: db_path.to_string(),
-            dashboard_domain: Arc::new(RwLock::new(initial_dashboard_domain)),
+            db,
+            dashboard_domain: Arc::new(RwLock::new(None)),
             preview_domain: Arc::new(RwLock::new(None)),
             server_addr,
+            domains_changed: Arc::new(Notify::new()),
         }
+    }
+
+    fn route_db(&self) -> &RouteDb {
+        &self.db
+    }
+
+    async fn route_count(&self) -> usize {
+        self.routes.read().await.len()
+    }
+
+    /// Reload the routing table if route_state.version moved. Returns the
+    /// loaded version and the number of routes.
+    async fn sync(&self) -> Result<(i64, u64)> {
+        let meter = meters::register("route-sync");
+        let started = Instant::now();
+        let result = async {
+            let _guard = self.db.lock.lock().await;
+            let version: i64 = sqlx::query_scalar("SELECT version FROM route_state WHERE id = 1")
+                .fetch_one(&self.db.pool)
+                .await?;
+            if version != self.db.loaded_version() {
+                self.reload_locked().await?;
+            }
+            anyhow::Ok((self.db.loaded_version(), self.route_count().await as u64))
+        }
+        .await;
+        meter.ran(started, result.as_ref().err().map(|e| format!("{e:#}")));
+        result
     }
 
     async fn resolve(&self, host: &str) -> RouteTarget {
@@ -372,23 +458,33 @@ impl TondProxy {
         resolve_route(host, dd.as_deref(), pd.as_deref(), &routes)
     }
 
-    /// Refresh routes and settings from SQLite.
+    /// Reload routes and settings from SQLite unconditionally.
+    async fn refresh_routes(&self) -> Result<()> {
+        let _guard = self.db.lock.lock().await;
+        self.reload_locked().await
+    }
+
+    /// Reload (caller holds `db.lock`). Everything is read in one read
+    /// transaction, so the table matches exactly one route_state.version.
     ///
     /// Reads the host_port stored in the DB (written by tond-server on every
     /// deploy), which makes routing deterministic across proxy restarts and
     /// keeps the proxy away from the Docker socket. Rows without a host_port
-    /// (a deploy in progress) are skipped until the next refresh.
+    /// (a deploy in progress) are skipped.
     ///
     /// Also reads `dashboard_domain` and `preview_domain` from the settings
     /// table so that changes made via the dashboard UI or `tond settings`
     /// CLI commands are picked up without restarting the proxy.
-    async fn refresh_routes(&self) -> Result<()> {
-        let pool = SqlitePool::connect(&format!("sqlite:{}?mode=ro", self.db_path)).await?;
+    async fn reload_locked(&self) -> Result<()> {
+        let mut tx = self.db.pool.begin().await?;
+        let version: i64 = sqlx::query_scalar("SELECT version FROM route_state WHERE id = 1")
+            .fetch_one(&mut *tx)
+            .await?;
 
         let settings: Vec<(String, String)> = sqlx::query_as(
             "SELECT key, value FROM settings WHERE key IN ('dashboard_domain', 'preview_domain')",
         )
-        .fetch_all(&pool)
+        .fetch_all(&mut *tx)
         .await?;
         let setting = |key: &str| {
             settings
@@ -398,12 +494,14 @@ impl TondProxy {
                 .filter(|v| !v.is_empty())
         };
         let new_preview_domain = setting("preview_domain");
+        let mut domains_changed = false;
         {
             let new_domain = setting("dashboard_domain");
             let mut dd = self.dashboard_domain.write().await;
             if *dd != new_domain {
                 tracing::info!("Dashboard domain updated: {:?} -> {:?}", *dd, new_domain);
                 *dd = new_domain;
+                domains_changed = true;
             }
         }
         {
@@ -427,7 +525,7 @@ impl TondProxy {
             "SELECT name, domain, host_port FROM apps
              WHERE status = 'running' AND domain IS NOT NULL AND host_port IS NOT NULL",
         )
-        .fetch_all(&pool)
+        .fetch_all(&mut *tx)
         .await?;
 
         let mut new_routes = HashMap::new();
@@ -455,9 +553,9 @@ impl TondProxy {
                AND host_port IS NOT NULL
                AND expires_at > datetime('now')",
         )
-        .fetch_all(&pool)
-        .await
-        .unwrap_or_default();
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
 
         for (subdomain, host_port) in preview_rows {
             if let Some(sub) = subdomain {
@@ -477,9 +575,17 @@ impl TondProxy {
             }
             tracing::info!("Routing table now has {} route(s)", new_routes.len());
         }
+        let domain_set_changed =
+            routes.len() != new_routes.len() || new_routes.keys().any(|d| !routes.contains_key(d));
         *routes = new_routes;
+        drop(routes);
 
-        pool.close().await;
+        let first_load = self.db.loaded_version() < 0;
+        self.db.loaded_version.store(version, Ordering::Relaxed);
+        self.db.reloads.fetch_add(1, Ordering::Relaxed);
+        if first_load || domains_changed || domain_set_changed {
+            self.domains_changed.notify_one();
+        }
         Ok(())
     }
 }
@@ -653,148 +759,50 @@ fn main() {
     let data_dir = std::env::var("TOND_DATA_DIR").unwrap_or_else(|_| "/opt/tond/data".to_string());
     let server_addr =
         std::env::var("TOND_SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:3001".to_string());
-    // TOND_DASHBOARD_DOMAIN is a one-time seed: if the DB has no dashboard_domain
-    // and this env var is set, it is written to the DB on startup. After that the
-    // DB value is the source of truth and this variable is ignored.
-    let env_dashboard_domain = std::env::var("TOND_DASHBOARD_DOMAIN")
-        .ok()
-        .filter(|s| !s.is_empty());
     let certs_dir_path = PathBuf::from(&data_dir).join("certs");
     let acme_staging = std::env::var("TOND_ACME_STAGING")
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
 
-    // Build the cert store, challenge map, and seed the DB in a temporary
-    // Tokio runtime (Pingora's Server::run_forever owns the main event loop).
-    let (cert_store, challenges, initial_dashboard_domain) = {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let cert_store = CertStore::new(&certs_dir_path)
-                .await
-                .expect("Failed to initialize cert store");
-            let challenges = acme::new_challenge_map();
-
-            // Seed dashboard_domain from env var if the DB value is empty.
-            let db_url = format!("sqlite:{}", db_path);
-            let initial = match SqlitePool::connect(&db_url).await {
-                Ok(pool) => {
-                    let row: Option<(String,)> =
-                        sqlx::query_as("SELECT value FROM settings WHERE key = 'dashboard_domain'")
-                            .fetch_optional(&pool)
-                            .await
-                            .unwrap_or(None);
-                    let db_value = row.map(|(v,)| v).filter(|v| !v.is_empty());
-
-                    let resolved = if db_value.is_none() {
-                        // DB is empty — write the env var value if present.
-                        if let Some(ref env_val) = env_dashboard_domain {
-                            tracing::info!(
-                                "Seeding dashboard_domain from TOND_DASHBOARD_DOMAIN env var: {}",
-                                env_val
-                            );
-                            let _ = sqlx::query(
-                                "INSERT INTO settings (key, value, updated_at)
-                                 VALUES ('dashboard_domain', ?, datetime('now'))
-                                 ON CONFLICT(key) DO UPDATE
-                                   SET value = excluded.value,
-                                       updated_at = excluded.updated_at",
-                            )
-                            .bind(env_val)
-                            .execute(&pool)
-                            .await;
-                            Some(env_val.clone())
-                        } else {
-                            None
-                        }
-                    } else {
-                        db_value
-                    };
-
-                    pool.close().await;
-                    resolved
-                }
-                Err(e) => {
-                    // DB not yet created (first run before tond-server initialises).
-                    tracing::warn!("Could not open DB to read dashboard_domain: {}", e);
-                    env_dashboard_domain.clone()
-                }
-            };
-
-            (cert_store, challenges, initial)
-        })
-    };
-
-    if let Some(ref domain) = initial_dashboard_domain {
-        tracing::info!("Dashboard domain: {} -> {}", domain, server_addr);
-    }
+    // Build the cert store in a temporary runtime (Pingora's
+    // Server::run_forever owns the main event loop).
+    let cert_store = current_thread_runtime().block_on(async {
+        CertStore::new(&certs_dir_path)
+            .await
+            .expect("Failed to initialize cert store")
+    });
+    let challenges = acme::new_challenge_map();
 
     let mut server = Server::new(None).unwrap();
     server.bootstrap();
 
-    let proxy = TondProxy::new(&db_path, initial_dashboard_domain, server_addr);
+    let route_db = Arc::new(
+        RouteDb::open(&db_path)
+            .unwrap_or_else(|err| panic!("invalid database path {db_path}: {err}")),
+    );
+    let proxy = TondProxy::new(route_db, server_addr);
 
-    // ── Background tasks ──
+    // ── Background tasks: one OS thread, one current-thread runtime ──
 
-    let routes = proxy.routes.clone();
-    let dashboard_domain_shared = proxy.dashboard_domain.clone();
-    let preview_domain_shared = proxy.preview_domain.clone();
-    let db_path_bg = db_path.clone();
+    let proxy_bg = proxy.clone();
     let cert_store_bg = cert_store.clone();
     let challenges_bg = challenges.clone();
     let data_dir_bg = PathBuf::from(&data_dir);
+    let started = Instant::now();
 
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let proxy_for_refresh = TondProxy {
-                routes: routes.clone(),
-                db_path: db_path_bg,
-                dashboard_domain: dashboard_domain_shared.clone(),
-                preview_domain: preview_domain_shared.clone(),
-                server_addr: String::new(),
-            };
-            let db_url = format!("sqlite:{}", proxy_for_refresh.db_path);
-            let db_pool = SqlitePool::connect(&db_url).await.unwrap_or_else(|err| {
-                panic!("failed to open SQLite database for the certificate loop: {err}")
-            });
-
-            // Spawn the HTTP server for port 80 (ACME challenges + redirect)
-            let http_ctx = HttpContext {
-                challenges: challenges_bg.clone(),
-                routes: routes.clone(),
-                dashboard_domain: dashboard_domain_shared.clone(),
-                preview_domain: preview_domain_shared.clone(),
-            };
-            tokio::spawn(async move {
-                if let Err(e) = run_http_server(http_ctx).await {
-                    tracing::error!("HTTP server (port 80) failed to start: {}", e);
-                }
-            });
-
-            // Certificate issuance/renewal loop (per-domain backoff, DNS
-            // pre-check, state persisted for the dashboard).
-            tokio::spawn(
-                IssuanceLoop {
-                    routes: routes.clone(),
-                    dashboard_domain: dashboard_domain_shared.clone(),
-                    cert_store: cert_store_bg,
-                    challenges: challenges_bg,
-                    data_dir: data_dir_bg,
-                    db: db_pool,
-                    staging: acme_staging,
-                }
-                .run(),
-            );
-
-            // Route refresh loop — also refreshes dashboard_domain and preview_domain from DB
-            loop {
-                if let Err(e) = proxy_for_refresh.refresh_routes().await {
-                    tracing::warn!("Failed to refresh routes: {}", e);
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-        });
-    });
+    std::thread::Builder::new()
+        .name("tond-proxy-bg".to_string())
+        .spawn(move || {
+            current_thread_runtime().block_on(background(
+                proxy_bg,
+                cert_store_bg,
+                challenges_bg,
+                data_dir_bg,
+                acme_staging,
+                started,
+            ));
+        })
+        .expect("failed to start the background thread");
 
     // ── TLS Proxy on port 443 ──
     let tls_accept = TondTlsAccept {
@@ -812,6 +820,103 @@ fn main() {
 
     tracing::info!("Tond Proxy listening on :443 (TLS) and :80 (HTTP redirect + ACME)");
     server.run_forever();
+}
+
+/// A single-threaded Tokio runtime: the proxy's background work (routing,
+/// certificates, port 80, control socket) is light and mostly idle.
+fn current_thread_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build the background Tokio runtime")
+}
+
+/// Everything besides the TLS proxy itself.
+async fn background(
+    proxy: TondProxy,
+    cert_store: CertStore,
+    challenges: ChallengeMap,
+    data_dir: PathBuf,
+    staging: bool,
+    started: Instant,
+) {
+    if let Err(e) = proxy.refresh_routes().await {
+        tracing::warn!("Initial route load failed (retrying on the next nudge or check): {e:#}");
+    }
+
+    // Port 80: ACME challenges + redirect to HTTPS.
+    let http_ctx = HttpContext {
+        challenges: challenges.clone(),
+        routes: proxy.routes.clone(),
+        dashboard_domain: proxy.dashboard_domain.clone(),
+        preview_domain: proxy.preview_domain.clone(),
+    };
+    tokio::spawn(async move {
+        if let Err(e) = run_http_server(http_ctx).await {
+            tracing::error!("HTTP server (port 80) failed to start: {}", e);
+        }
+    });
+
+    // Certificate loop: results go to tond-server through the outbox.
+    let outbox = Arc::new(Outbox::default());
+    tokio::spawn(
+        IssuanceLoop {
+            routes: proxy.routes.clone(),
+            dashboard_domain: proxy.dashboard_domain.clone(),
+            cert_store,
+            challenges,
+            data_dir: data_dir.clone(),
+            db: proxy.db.pool.clone(),
+            outbox: outbox.clone(),
+            wake: proxy.domains_changed.clone(),
+            staging,
+        }
+        .run(),
+    );
+
+    // Control socket for tond-server.
+    let socket = control::socket_path(&data_dir);
+    match control::bind(&socket) {
+        Ok(listener) => {
+            use std::os::unix::fs::MetadataExt;
+            // We created the socket, so its owner is our effective uid.
+            let own_uid = std::fs::metadata(&socket).map(|m| m.uid()).unwrap_or(0);
+            tracing::info!("Control socket listening on {}", socket.display());
+            let ctl = Arc::new(control::Control {
+                proxy: proxy.clone(),
+                outbox,
+                cert_wake: proxy.domains_changed.clone(),
+                started,
+            });
+            tokio::spawn(control::serve(listener, own_uid, ctl));
+        }
+        Err(e) => tracing::error!(
+            "Control socket unavailable ({e:#}); routes follow the database only through the {FALLBACK_POLL_SECS}s fallback check"
+        ),
+    }
+
+    // Safety net for a missed nudge: cheap version check once a minute.
+    let meter = meters::register("route-poll");
+    let interval = Duration::from_secs(FALLBACK_POLL_SECS);
+    loop {
+        meter.planned(Some(interval));
+        let slept = Instant::now();
+        tokio::time::sleep(interval).await;
+        meter.woke(Some((slept, interval)));
+        let run = Instant::now();
+        let before = proxy.db.loaded_version();
+        let result = proxy.sync().await;
+        match &result {
+            Ok((version, _)) if *version != before && before >= 0 => {
+                tracing::warn!(
+                    "Fallback check found route version {version} (had {before}): a nudge from tond-server was missed"
+                );
+            }
+            Err(e) => tracing::warn!("Route check failed: {e:#}"),
+            _ => {}
+        }
+        meter.ran(run, result.err().map(|e| format!("{e:#}")));
+    }
 }
 
 /// Most port-80 connections served at once; extra connections are closed.
@@ -910,6 +1015,13 @@ mod tests {
         dir.join("proxy-routes.db")
     }
 
+    fn test_route_db(db_path: &Path) -> Arc<RouteDb> {
+        Arc::new(
+            RouteDb::open(&db_path.to_string_lossy())
+                .unwrap_or_else(|err| panic!("route db: {err}")),
+        )
+    }
+
     async fn create_test_db(db_path: &Path) -> SqlitePool {
         let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
         let pool = SqlitePool::connect(&db_url).await.unwrap_or_else(|err| {
@@ -918,6 +1030,17 @@ mod tests {
                 db_path.display()
             )
         });
+
+        sqlx::query(
+            "CREATE TABLE route_state (id INTEGER PRIMARY KEY, version INTEGER NOT NULL DEFAULT 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|err| panic!("failed to create route_state table: {err}"));
+        sqlx::query("INSERT INTO route_state (id, version) VALUES (1, 0)")
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|err| panic!("failed to seed route_state: {err}"));
 
         sqlx::query(
             "CREATE TABLE settings (
@@ -1373,10 +1496,10 @@ mod tests {
     async fn dashboard_target_uses_server_addr_and_invalid_ports_fall_back_to_documented_defaults()
     {
         let proxy = TondProxy::new(
-            "/tmp/unused.db",
-            Some("dashboard.example.com".to_string()),
+            test_route_db(Path::new("/tmp/unused.db")),
             "127.0.0.1:not-a-port".to_string(),
         );
+        *proxy.dashboard_domain.write().await = Some("dashboard.example.com".to_string());
         proxy.routes.write().await.insert(
             "app.example.com".to_string(),
             "127.0.0.1:not-a-port".to_string(),
@@ -1553,11 +1676,7 @@ mod tests {
 
         pool.close().await;
 
-        let proxy = TondProxy::new(
-            &db_path.to_string_lossy(),
-            Some("stale.example.com".to_string()),
-            "127.0.0.1:3001".to_string(),
-        );
+        let proxy = TondProxy::new(test_route_db(&db_path), "127.0.0.1:3001".to_string());
 
         proxy
             .refresh_routes()
@@ -1621,11 +1740,7 @@ mod tests {
         )
         .await;
 
-        let proxy = TondProxy::new(
-            &db_path.to_string_lossy(),
-            Some("seed.example.com".to_string()),
-            "127.0.0.1:3001".to_string(),
-        );
+        let proxy = TondProxy::new(test_route_db(&db_path), "127.0.0.1:3001".to_string());
 
         proxy
             .refresh_routes()
@@ -1744,11 +1859,7 @@ mod tests {
         .await;
         pool.close().await;
 
-        let proxy = TondProxy::new(
-            &db_path.to_string_lossy(),
-            None,
-            "127.0.0.1:3001".to_string(),
-        );
+        let proxy = TondProxy::new(test_route_db(&db_path), "127.0.0.1:3001".to_string());
         proxy
             .refresh_routes()
             .await
@@ -1769,6 +1880,135 @@ mod tests {
         assert_eq!(
             proxy.resolve("squatter.previews.test").await,
             RouteTarget::NotFound
+        );
+    }
+
+    async fn bump_version(pool: &SqlitePool) {
+        sqlx::query("UPDATE route_state SET version = version + 1")
+            .execute(pool)
+            .await
+            .unwrap_or_else(|err| panic!("bump: {err}"));
+    }
+
+    #[tokio::test]
+    async fn sync_reloads_only_when_the_route_version_moves() {
+        let dir = temp_dir();
+        let db_path = temp_db_path(dir.path());
+        let pool = create_test_db(&db_path).await;
+        insert_app(
+            &pool,
+            "a1",
+            "web",
+            Some("web.example.com"),
+            "running",
+            3000,
+            Some(4100),
+        )
+        .await;
+        bump_version(&pool).await;
+
+        let proxy = TondProxy::new(test_route_db(&db_path), "127.0.0.1:3001".to_string());
+        let (version, routes) = proxy
+            .sync()
+            .await
+            .unwrap_or_else(|err| panic!("first sync: {err}"));
+        assert_eq!((version, routes), (1, 1));
+        assert_eq!(proxy.route_db().reloads(), 1);
+
+        // A write that did not bump the version is not picked up...
+        insert_app(
+            &pool,
+            "a2",
+            "api",
+            Some("api.example.com"),
+            "running",
+            3000,
+            Some(4200),
+        )
+        .await;
+        let (version, routes) = proxy
+            .sync()
+            .await
+            .unwrap_or_else(|err| panic!("second sync: {err}"));
+        assert_eq!((version, routes), (1, 1), "same version: no reload");
+        assert_eq!(proxy.route_db().reloads(), 1);
+
+        // ...until the version moves (tond-server's triggers do this).
+        bump_version(&pool).await;
+        let (version, routes) = proxy
+            .sync()
+            .await
+            .unwrap_or_else(|err| panic!("third sync: {err}"));
+        assert_eq!((version, routes), (2, 2));
+        assert_eq!(proxy.route_db().reloads(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_route_connection_is_read_only_and_follows_a_wal_writer() {
+        // Server-like writer: WAL mode, files 0440 for us (read-only access,
+        // like the tond-proxy group on 0640 files).
+        let dir = temp_dir();
+        let db_path = temp_db_path(dir.path());
+        let writer_opts = SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path.display()))
+            .unwrap_or_else(|err| panic!("opts: {err}"))
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+        let writer = SqlitePool::connect_with(writer_opts)
+            .await
+            .unwrap_or_else(|err| panic!("writer: {err}"));
+        for stmt in [
+            "CREATE TABLE route_state (id INTEGER PRIMARY KEY, version INTEGER NOT NULL)",
+            "INSERT INTO route_state VALUES (1, 1)",
+            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            "CREATE TABLE apps (id TEXT PRIMARY KEY, name TEXT, domain TEXT, status TEXT, host_port INTEGER)",
+            "CREATE TABLE preview_deployments (id TEXT PRIMARY KEY, subdomain TEXT, host_port INTEGER, status TEXT, expires_at TEXT)",
+            "INSERT INTO apps VALUES ('a', 'web', 'web.example.com', 'running', 4100)",
+        ] {
+            sqlx::query(stmt)
+                .execute(&writer)
+                .await
+                .unwrap_or_else(|err| panic!("{stmt}: {err}"));
+        }
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for suffix in ["", "-wal", "-shm"] {
+                let f = PathBuf::from(format!("{}{suffix}", db_path.display()));
+                std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o440))
+                    .unwrap_or_else(|err| panic!("chmod {}: {err}", f.display()));
+            }
+        }
+
+        let proxy = TondProxy::new(test_route_db(&db_path), "127.0.0.1:3001".to_string());
+        assert_eq!(
+            proxy
+                .sync()
+                .await
+                .unwrap_or_else(|err| panic!("sync: {err}")),
+            (1, 1)
+        );
+        let write = sqlx::query("UPDATE route_state SET version = 99")
+            .execute(&proxy.db.pool)
+            .await;
+        assert!(
+            write.is_err(),
+            "the proxy's connection must not be able to write"
+        );
+
+        sqlx::query("INSERT INTO apps VALUES ('b', 'api', 'api.example.com', 'running', 4200)")
+            .execute(&writer)
+            .await
+            .unwrap_or_else(|err| panic!("insert: {err}"));
+        sqlx::query("UPDATE route_state SET version = 2")
+            .execute(&writer)
+            .await
+            .unwrap_or_else(|err| panic!("bump: {err}"));
+        assert_eq!(
+            proxy
+                .sync()
+                .await
+                .unwrap_or_else(|err| panic!("sync: {err}")),
+            (2, 2),
+            "a persistent read-only connection sees the writer's new commits"
         );
     }
 }

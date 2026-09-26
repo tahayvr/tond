@@ -572,4 +572,100 @@ mod tests {
             std::os::unix::net::UnixListener::bind(&path).unwrap_or_else(|e| panic!("bind: {e}"));
         assert!(!proxy_absent(&path));
     }
+
+    /// End to end over a real socket, against a fake proxy: the link
+    /// connects, stores and acks a cert event, and a cutover sync is acked.
+    #[tokio::test]
+    async fn link_round_trip_with_a_fake_proxy() {
+        use bollard::{API_DEFAULT_VERSION, Docker};
+        use std::sync::Arc;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::sync::RwLock;
+
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let path = dir.path().join("proxy.sock");
+        // SAFETY: only this test reads TOND_PROXY_SOCKET (nextest runs each
+        // test in its own process).
+        unsafe { std::env::set_var("TOND_PROXY_SOCKET", &path) };
+        let listener =
+            tokio::net::UnixListener::bind(&path).unwrap_or_else(|e| panic!("bind: {e}"));
+
+        let state = AppState {
+            db: db().await,
+            docker: Docker::connect_with_http("http://127.0.0.1:2375", 1, API_DEFAULT_VERSION)
+                .unwrap_or_else(|e| panic!("docker: {e}")),
+            rate_limiter: crate::auth::RateLimiter::new(60, 10.0),
+            settings: Arc::new(RwLock::new(tond_common::ServerSettings::default())),
+        };
+        tokio::spawn(run(state.clone()));
+
+        let (acked_tx, acked_rx) = tokio::sync::oneshot::channel::<u64>();
+        tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .unwrap_or_else(|e| panic!("accept: {e}"));
+            let (read, mut write) = stream.into_split();
+            let send = |msg: ProxyMessage| encode_line(&msg).unwrap_or_default();
+            let _ = write
+                .write_all(&send(ProxyMessage::Hello {
+                    pid: 7,
+                    route_version: 0,
+                }))
+                .await;
+            let _ = write
+                .write_all(&send(ProxyMessage::CertEvent {
+                    seq: 41,
+                    report: report(CertOutcome::Failed {
+                        status: "failed".into(),
+                        error: "dns".into(),
+                        failure_count: 1,
+                        next_retry_at: "2999-01-01T00:00:00+00:00".into(),
+                    }),
+                }))
+                .await;
+            let mut acked_tx = Some(acked_tx);
+            let mut lines = BufReader::new(read).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                match serde_json::from_str::<ProxyRequest>(&line) {
+                    Ok(ProxyRequest::Sync { id, min_version }) => {
+                        let _ = write
+                            .write_all(&send(ProxyMessage::Reply {
+                                id,
+                                body: ReplyBody::Synced {
+                                    route_version: min_version,
+                                    routes: 3,
+                                },
+                            }))
+                            .await;
+                    }
+                    Ok(ProxyRequest::Ack { seq }) => {
+                        if let Some(tx) = acked_tx.take() {
+                            let _ = tx.send(seq);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let acked = tokio::time::timeout(Duration::from_secs(5), acked_rx)
+            .await
+            .unwrap_or_else(|_| panic!("the cert event was never acked"))
+            .unwrap_or_default();
+        assert_eq!(acked, 41);
+        let failures: i64 = sqlx::query_scalar(
+            "SELECT failure_count FROM certificates WHERE domain = 'app.example.com'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or_else(|e| panic!("stored report: {e}"));
+        assert_eq!(failures, 1, "the report was stored before the ack");
+
+        assert!(is_connected());
+        match sync_routes(&state).await {
+            SyncOutcome::Acked { route_version, .. } => assert_eq!(route_version, 0),
+            other => panic!("expected an ack, got {other:?}"),
+        }
+    }
 }
