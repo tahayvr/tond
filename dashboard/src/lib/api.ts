@@ -1198,14 +1198,18 @@ export async function redeployDatabase(id: string): Promise<ManagedDatabaseDetai
 
 export interface UpdateDatabaseCredentialsResponse {
 	database: ManagedDatabaseDetail;
-	requires_redeploy: boolean;
+	/** Fields changed inside the running database and saved, e.g. ["db_password"] */
+	changed: ('db_password' | 'root_password')[];
 }
 
+/**
+ * Change a password inside the running database (the server runs ALTER USER /
+ * ALTER ROLE in the container), then save it. Refused when the database is
+ * stopped, for Redis/KeyDB, and for database or user renames.
+ */
 export async function updateDatabaseCredentials(
 	id: string,
 	data: {
-		db_name?: string | null;
-		db_user?: string | null;
 		db_password?: string | null;
 		root_password?: string | null;
 	}

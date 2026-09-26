@@ -1378,11 +1378,40 @@ export const handlers = [
 			db_password?: string | null;
 			root_password?: string | null;
 		};
-		const updated = { ...databases[idx] };
-		if (body.db_name !== undefined) updated.db_name = body.db_name ?? null;
-		if (body.db_user !== undefined) updated.db_user = body.db_user ?? null;
-		if (body.db_password !== undefined) updated.db_password = body.db_password ?? null;
-		if (body.root_password !== undefined) updated.root_password = body.root_password ?? null;
+		// Mirrors the server: passwords change inside the running engine; renames,
+		// Redis/KeyDB and stopped databases are refused and nothing is saved.
+		const current = databases[idx];
+		const renamed = (next: string | null | undefined, now: string | null) =>
+			!!next?.trim() && next.trim() !== now;
+		if (renamed(body.db_name, current.db_name) || renamed(body.db_user, current.db_user)) {
+			return err(
+				"Invalid input: The username of an existing database can't be changed; only passwords can."
+			);
+		}
+		const changed: string[] = [];
+		const updated = { ...current };
+		const nextPw = body.db_password?.trim();
+		if (nextPw && nextPw !== current.db_password) {
+			updated.db_password = nextPw;
+			changed.push('db_password');
+		}
+		const nextRoot = body.root_password?.trim();
+		if (nextRoot && nextRoot !== current.root_password) {
+			updated.root_password = nextRoot;
+			changed.push('root_password');
+		}
+		if (changed.length === 0) return err('Invalid input: Nothing to change: enter a new password.');
+		if (current.db_type === 'redis' || current.db_type === 'keydb') {
+			return err(
+				"Invalid input: Redis and KeyDB passwords can't be changed in place yet. The stored password was not changed."
+			);
+		}
+		if (current.status !== 'running') {
+			return err(
+				`Invalid input: Start '${current.name}' first: the password is changed inside the running database. Nothing was changed.`
+			);
+		}
+		await delay(LATENCY * 3); // simulate the docker exec
 		updated.updated_at = new Date().toISOString();
 		databases[idx] = updated;
 		const db = databases[idx];
@@ -1406,7 +1435,7 @@ export const handlers = [
 				connection_string: db.custom_external_url ?? computedExternalC,
 				internal_connection_string: db.custom_internal_url ?? computedInternalC
 			},
-			requires_redeploy: true
+			changed
 		});
 	}),
 
