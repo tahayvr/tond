@@ -916,7 +916,7 @@ impl TondClient {
             db_type: db_type.to_string(),
             project_id: project_id.map(|s| s.to_string()),
             memory_limit,
-            public_access: false,
+            ..Default::default()
         };
         let req = self
             .client

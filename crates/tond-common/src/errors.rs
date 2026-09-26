@@ -46,6 +46,10 @@ pub enum TondError {
     /// The request body (e.g. an uploaded archive) exceeds a configured limit.
     #[error("Too large: {0}")]
     PayloadTooLarge(String),
+
+    /// The request conflicts with work in progress (HTTP 409)
+    #[error("{0}")]
+    Conflict(String),
 }
 
 impl TondError {
@@ -57,6 +61,7 @@ impl TondError {
             TondError::InvalidInput(_) => 400,
             TondError::Forbidden(_) => 403,
             TondError::PayloadTooLarge(_) => 413,
+            TondError::Conflict(_) => 409,
             TondError::ScopeDenied { .. } => 403,
             _ => 500,
         }

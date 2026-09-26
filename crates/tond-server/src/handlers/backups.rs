@@ -260,6 +260,15 @@ pub async fn update_backup_config(
         None => current.storage_provider_id,
     };
 
+    // A retention of zero would delete every snapshot right after taking it.
+    if full_retention_count < 1 || pre_deploy_retention_per_app < 1 {
+        return Err(AppError(TondError::InvalidInput(
+            "Keep at least one snapshot: a retention of 0 deletes each snapshot right after \
+             taking it. Turn the schedule off instead."
+                .to_string(),
+        )));
+    }
+
     // Validate with the same parser the scheduler uses (standard 5-field cron,
     // 0/7 = Sunday, @daily-style macros).
     crate::cron::parse_schedule(&full_schedule_cron).map_err(|e| {
@@ -484,6 +493,49 @@ pub async fn restore_database(
             ),
             pre_restore_snapshot_id,
         })),
+    ))
+}
+
+// ── Restore into a new database ───────────────────────────────────────────────
+
+/// POST /api/snapshots/{id}/restore-new-database — restore one database of
+/// a snapshot into a new managed database (same engine and version, fresh
+/// credentials), leaving the original untouched: for recovery drills, or to
+/// pull old rows out of a backup.
+pub async fn restore_to_new_database(
+    _rate: RateLimit,
+    auth: Authz<scope::SnapshotsRestore>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<RestoreToNewDatabaseRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    auth.require_to(Scope::DbWrite, "create a database from a backup")?;
+    let name = req.name.trim().to_string();
+    let source = req.source.trim().to_string();
+    let worker = state.clone();
+    let (snap, src, target, project) = (id.clone(), source.clone(), name.clone(), req.project_id);
+    // Tracked: a graceful shutdown lets the restore finish (or clean up).
+    let db = crate::runtime::shutdown::spawn_tracked(async move {
+        backup::restore_to_new_database(&worker, &snap, &src, &target, project).await
+    })
+    .await
+    .map_err(|e| AppError(TondError::Internal(format!("Restore task failed: {e}"))))?
+    .map_err(|e| AppError(TondError::InvalidInput(format!("{e:#}"))))?;
+
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("snapshot_restore_new_database")
+            .resource("snapshot", &id, &id)
+            .detail(format!("source={source} new={name}")),
+    )
+    .await;
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiResponse::ok(json!({
+            "message": format!("Restored {source} into the new database {name}. {source} was not changed."),
+            "database": ManagedDatabaseResponse::from(db),
+        }))),
     ))
 }
 

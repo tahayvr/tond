@@ -77,7 +77,12 @@ mod backup;
 mod compose_policy;
 mod cron;
 mod db;
+mod db_access;
 mod db_credentials;
+#[cfg(test)]
+mod db_docker_tests;
+mod db_exec;
+mod db_upgrade;
 mod deploy;
 mod docker;
 mod domains;
@@ -216,9 +221,11 @@ async fn run() -> Result<()> {
     // drift while the server is down). Once, in the background.
     {
         let state = state.clone();
-        runtime::shutdown::spawn_tracked(
-            async move { networks::reconcile_all_databases(&state).await },
-        );
+        runtime::shutdown::spawn_tracked(async move {
+            // An upgrade cut off by a restart puts the old version back first.
+            db_upgrade::recover_interrupted(&state).await;
+            networks::reconcile_all_databases(&state).await
+        });
     }
 
     // Finish what a previous process left behind (and resume queued deploys)
@@ -234,6 +241,7 @@ async fn run() -> Result<()> {
     tokio::spawn(janitor::run_janitor(state.clone()));
     tokio::spawn(audit_ship::run(state.clone()));
     tokio::spawn(backup::backup_scheduler(state.clone()));
+    tokio::spawn(db_access::run_access_loop(state.clone()));
     tokio::spawn(run_preview_cleanup_loop(state.clone()));
     tokio::spawn(uptime::run(state.clone()));
 
@@ -747,6 +755,36 @@ async fn run() -> Result<()> {
             get(handlers::logs::stream_all_database_logs),
         )
         .route(
+            "/api/databases/catalog",
+            get(handlers::database_ops::get_catalog),
+        )
+        .route(
+            "/api/databases/{id}/backup-schedule",
+            get(handlers::database_ops::get_backup_schedule)
+                .put(handlers::database_ops::update_backup_schedule),
+        )
+        .route(
+            "/api/databases/{id}/extensions",
+            get(handlers::database_ops::list_extensions)
+                .post(handlers::database_ops::create_extension),
+        )
+        .route(
+            "/api/databases/{id}/upgrade",
+            post(handlers::database_ops::start_upgrade),
+        )
+        .route(
+            "/api/databases/{id}/upgrade/confirm",
+            post(handlers::database_ops::confirm_upgrade),
+        )
+        .route(
+            "/api/databases/{id}/upgrade/rollback",
+            post(handlers::database_ops::rollback_upgrade),
+        )
+        .route(
+            "/api/databases/{id}/upgrade/dismiss",
+            post(handlers::database_ops::dismiss_upgrade),
+        )
+        .route(
             "/api/databases/{id}",
             get(handlers::databases::get_database),
         )
@@ -877,6 +915,10 @@ async fn run() -> Result<()> {
         .route(
             "/api/snapshots/{id}/restore-database",
             post(handlers::backups::restore_database),
+        )
+        .route(
+            "/api/snapshots/{id}/restore-new-database",
+            post(handlers::backups::restore_to_new_database),
         )
         // Latency histogram per route template (runtime/http_metrics.rs).
         .route_layer(axum::middleware::from_fn(http_metrics::track))

@@ -17,6 +17,7 @@
 //   DockerError      → 500 Internal Server Error
 //   Internal         → 500 Internal Server Error
 //   PayloadTooLarge  → 413 Payload Too Large
+//   Conflict         → 409 Conflict (work in progress)
 
 use axum::{Json, http::StatusCode, response::IntoResponse};
 use tond_common::{ApiResponse, TondError};
