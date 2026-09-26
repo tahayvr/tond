@@ -21,6 +21,7 @@
 	"devDependencies": {
 		"@eslint/compat": "^2.1.1",
 		"@eslint/js": "^10.0.1",
+		"@fontsource-variable/jetbrains-mono": "^5.3.0",
 		"@iconify-json/ri": "^1.2.10",
 		"@internationalized/date": "^3.12.4",
 		"@sveltejs/adapter-static": "^3.0.10",
@@ -41,7 +42,6 @@
 		"eslint-plugin-svelte": "^3.23.0",
 		"globals": "^17.12.0",
 		"jsdom": "^30.1.1",
-		"layerchart": "2.5.0",
 		"msw": "^2.15.0",
 		"prettier": "^3.9.9",
 		"prettier-plugin-svelte": "^4.1.1",
