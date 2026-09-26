@@ -114,6 +114,9 @@ pub struct ProxyStats {
     pub routes: u64,
     /// Times the routing table was reloaded from the database.
     pub reloads: u64,
+    /// Access log lines dropped because the writer fell behind, since start.
+    #[serde(default)]
+    pub access_log_dropped: u64,
     pub loops: Vec<LoopStats>,
 }
 

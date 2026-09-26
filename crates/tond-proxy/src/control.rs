@@ -7,7 +7,8 @@
 //
 // Per connection: send `hello`, then answer requests (`sync` reloads routes
 // when route_state.version moved and replies with the loaded version,
-// `certs` pokes the certificate loop, `stats` reports process/loop stats,
+// `certs` pokes the certificate loop, `stats` reports process/loop stats, `traffic` the per-route request
+// counters,
 // `ack` drops a delivered cert event) while forwarding every certificate
 // result from the Outbox until tond-server acknowledges it.
 
@@ -117,6 +118,7 @@ async fn stats(ctl: &Control) -> ProxyStats {
         route_version: db.loaded_version(),
         routes: ctl.proxy.route_count().await as u64,
         reloads: db.reloads(),
+        access_log_dropped: ctl.proxy.access.dropped(),
         loops: meters::snapshot(),
     }
 }
@@ -153,6 +155,12 @@ async fn answer(ctl: &Control, request: ProxyRequest) -> Option<(u64, ReplyBody)
             id,
             ReplyBody::Stats {
                 stats: stats(ctl).await,
+            },
+        )),
+        ProxyRequest::Traffic { id } => Some((
+            id,
+            ReplyBody::Traffic {
+                traffic: ctl.proxy.traffic.snapshot(),
             },
         )),
         ProxyRequest::Ack { seq } => {

@@ -8,6 +8,7 @@
 //   errors  — the unified TondError enum used across the workspace
 //   dns     — compare a domain's DNS with this server's addresses
 //   models  — all domain structs, DTOs, and request/response types
+//   traffic — per-route request counters (tond-proxy -> tond-server)
 //
 // `dns` is used as `tond_common::dns::…` (not re-exported flat).
 //
@@ -19,6 +20,7 @@ pub mod errors;
 pub mod models;
 pub mod procstat;
 pub mod proxy_control;
+pub mod traffic;
 
 pub use errors::*;
 pub use models::*;
