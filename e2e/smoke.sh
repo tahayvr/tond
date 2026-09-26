@@ -580,7 +580,10 @@ pass "TLS keys and the ACME account key are 0600, owned by tond-proxy"
 
 step "Preview domain isolation"
 if [[ -n "$PREVIEW" ]]; then
-    tond settings | grep -q "preview-domain *${PREVIEW}" || fail "install.sh must set the preview domain to ${PREVIEW}"
+    # Capture first: with pipefail, `tond settings | grep -q` can fail on SIGPIPE.
+    settings_out="$(tond settings)"
+    grep -qE "^preview-domain +${PREVIEW}$" <<< "$settings_out" \
+        || fail "install.sh must set the preview domain to ${PREVIEW}"
     pass "preview domain ${PREVIEW} configured by install.sh"
 
     read -r code body < <(api_send PUT /api/settings "{\"preview_domain\": \"previews.${BASE}\"}")
