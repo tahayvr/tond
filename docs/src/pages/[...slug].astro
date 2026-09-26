@@ -1,0 +1,20 @@
+---
+import { render } from 'astro:content';
+import DocLayout from '../layouts/DocLayout.astro';
+import { loadPages } from '../lib/pages';
+
+export async function getStaticPaths() {
+	const { pages, nav } = await loadPages();
+	return pages.map((page, i) => ({
+		params: { slug: page.id === 'index' ? undefined : page.id },
+		props: { page, nav, prev: pages[i - 1], next: pages[i + 1] }
+	}));
+}
+
+const { page, nav, prev, next } = Astro.props;
+const { Content, headings } = await render(page.entry);
+---
+
+<DocLayout page={page} nav={nav} headings={headings} prev={prev} next={next}>
+	<Content />
+</DocLayout>

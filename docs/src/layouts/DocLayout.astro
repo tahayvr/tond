@@ -1,0 +1,215 @@
+---
+import '@fontsource-variable/jetbrains-mono/index.css';
+import '../styles/global.css';
+import type { MarkdownHeading } from 'astro';
+import type { NavSection, Page } from '../lib/pages';
+import Icon from '../components/Icon.astro';
+import Logo from '../components/Logo.astro';
+
+interface Props {
+	page: Page;
+	nav: NavSection[];
+	headings: MarkdownHeading[];
+	prev?: Page;
+	next?: Page;
+}
+
+const { page, nav, headings, prev, next } = Astro.props;
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const href = (link: string) => (link === '/' ? `${base}/` : `${base}${link}`);
+const toc = headings.filter((h) => h.depth === 2 || h.depth === 3);
+const title = page.id === 'index' ? 'Tond docs' : `${page.title} · Tond docs`;
+const canonical = new URL(href(page.link), Astro.site).toString();
+const isActive = (p: Page) => p.id === page.id;
+---
+
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>{title}</title>
+		<meta name="description" content={page.description} />
+		<link rel="canonical" href={canonical} />
+		<link rel="icon" href={`${base}/favicon.svg`} type="image/svg+xml" />
+		<link rel="alternate" type="text/markdown" href={`${href(page.link === '/' ? '/index' : page.link)}.md`} />
+		<meta name="color-scheme" content="light dark" />
+		<meta property="og:title" content={page.title} />
+		<meta property="og:description" content={page.description} />
+		<meta property="og:type" content="article" />
+		<meta property="og:url" content={canonical} />
+		<!-- Theme before first paint: saved choice, else the system setting. -->
+		<script is:inline>
+			(() => {
+				let theme = null;
+				try {
+					theme = localStorage.getItem('tond-docs-theme');
+				} catch {}
+				const dark = theme ? theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+				document.documentElement.classList.toggle('dark', dark);
+			})();
+		</script>
+	</head>
+	<body>
+		<a class="skip-link" href="#content">Skip to content</a>
+		<header class="topbar">
+			<button
+				class="icon-button menu-button"
+				type="button"
+				aria-label="Open navigation"
+				aria-controls="sidebar"
+				aria-expanded="false"
+				data-menu-toggle
+			>
+				<Icon name="menu-line" />
+			</button>
+			<a class="brand" href={`${base}/`} aria-label="Tond docs home">
+				<Logo class="brand-logo" />
+				<span class="brand-docs">docs</span>
+			</a>
+			<div class="topbar-actions">
+				<button class="search-button" type="button" data-search-open aria-haspopup="dialog">
+					<Icon name="search-line" />
+					<span class="search-label">Search</span>
+					<kbd class="search-kbd">/</kbd>
+				</button>
+				<button class="icon-button" type="button" data-theme-toggle aria-label="Switch to dark theme">
+					<Icon name="moon-line" class="theme-icon-dark" />
+					<Icon name="sun-line" class="theme-icon-light" />
+				</button>
+				<a class="icon-button" href="https://github.com/tahayvr/tond" aria-label="Tond on GitHub">
+					<Icon name="github-line" />
+				</a>
+			</div>
+		</header>
+
+		<div class="shell">
+			<nav class="sidebar" id="sidebar" aria-label="Documentation">
+				{
+					nav.map((section) => (
+						<details class="nav-section" open>
+							<summary>{section.text}</summary>
+							<ul>
+								{section.items.map(({ page: item, children }) => (
+									<li>
+										<a
+											href={href(item.link)}
+											aria-current={isActive(item) ? 'page' : undefined}
+										>
+											{item.title}
+										</a>
+										{children.length > 0 && (isActive(item) || children.some(isActive)) && (
+											<ul class="nav-children">
+												{children.map((child) => (
+													<li>
+														<a
+															href={href(child.link)}
+															aria-current={isActive(child) ? 'page' : undefined}
+														>
+															{child.title}
+														</a>
+													</li>
+												))}
+											</ul>
+										)}
+									</li>
+								))}
+							</ul>
+						</details>
+					))
+				}
+			</nav>
+			<div class="nav-scrim" data-menu-close hidden></div>
+
+			<main id="content" class="main">
+				{
+					toc.length > 1 && (
+						<details class="toc-mobile">
+							<summary>On this page</summary>
+							<ul>
+								{toc.map((h) => (
+									<li class={`toc-depth-${h.depth}`}>
+										<a href={`#${h.slug}`}>{h.text.replace(/#$/, '')}</a>
+									</li>
+								))}
+							</ul>
+						</details>
+					)
+				}
+				<article class="prose" data-pagefind-body>
+					<p class="eyebrow" data-pagefind-ignore>{page.section}</p>
+					<slot />
+				</article>
+				<nav class="pager" aria-label="Previous and next page" data-pagefind-ignore>
+					{
+						prev ? (
+							<a class="pager-link pager-prev" href={href(prev.link)}>
+								<span class="pager-dir">
+									<Icon name="arrow-left-line" /> Previous
+								</span>
+								<span class="pager-title">{prev.title}</span>
+							</a>
+						) : (
+							<span />
+						)
+					}
+					{
+						next && (
+							<a class="pager-link pager-next" href={href(next.link)}>
+								<span class="pager-dir">
+									Next <Icon name="arrow-right-line" />
+								</span>
+								<span class="pager-title">{next.title}</span>
+							</a>
+						)
+					}
+				</nav>
+				<footer class="site-footer" data-pagefind-ignore>
+					<p>
+						Tond: apps and databases on one cheap VPS. This site sets no cookies and loads nothing
+						from other servers.
+					</p>
+					<p>
+						<a href={`${base}/llms.txt`}>llms.txt</a> ·
+						<a href={`${href(page.link === '/' ? '/index' : page.link)}.md`}>This page as Markdown</a>
+					</p>
+				</footer>
+			</main>
+
+			{
+				toc.length > 1 && (
+					<aside class="toc" aria-label="On this page">
+						<p class="toc-title">On this page</p>
+						<ul>
+							{toc.map((h) => (
+								<li class={`toc-depth-${h.depth}`}>
+									<a href={`#${h.slug}`} data-toc-link={h.slug}>
+										{h.text.replace(/#$/, '')}
+									</a>
+								</li>
+							))}
+						</ul>
+					</aside>
+				)
+			}
+		</div>
+
+		<dialog class="search-dialog" aria-label="Search the docs" data-search-dialog>
+			<div class="search-panel">
+				<div class="search-head">
+					<p class="search-title">Search the docs</p>
+					<button class="icon-button" type="button" data-search-close aria-label="Close search">
+						<Icon name="close-line" />
+					</button>
+				</div>
+				<div id="search-ui" data-base={base}></div>
+				<p class="search-fallback" hidden data-search-fallback>
+					Search is built with the site (<code>just docs-build</code>); it isn't available in the
+					dev server.
+				</p>
+			</div>
+		</dialog>
+
+		<script src="../scripts/site.ts"></script>
+	</body>
+</html>
