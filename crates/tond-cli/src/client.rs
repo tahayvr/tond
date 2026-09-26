@@ -667,6 +667,34 @@ impl TondClient {
         .await
     }
 
+    /// Services of a Docker Compose app.
+    pub async fn list_services(
+        &self,
+        id: &str,
+    ) -> Result<Vec<tond_common::ComposeServiceResponse>> {
+        self.list(&format!("/apps/{id}/services")).await
+    }
+
+    /// Restart, stop or start one compose service.
+    pub async fn service_action(&self, id: &str, service: &str, action: &str) -> Result<Value> {
+        self.value(
+            Method::POST,
+            &format!("/apps/{id}/services/{service}/{action}"),
+            None,
+        )
+        .await
+    }
+
+    /// Recent log lines of one compose service: `{service, lines}`.
+    pub async fn service_logs(&self, id: &str, service: &str) -> Result<Value> {
+        self.call(
+            Method::GET,
+            &format!("/apps/{id}/services/{service}/logs"),
+            None,
+        )
+        .await
+    }
+
     pub async fn list_deployments(&self, id: &str) -> Result<Vec<DeploymentResponse>> {
         self.list(&format!("/apps/{id}/deployments")).await
     }

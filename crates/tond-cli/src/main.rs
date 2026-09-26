@@ -467,6 +467,27 @@ mod tests {
     use crate::client::tests::{app_response_json, spawn_test_server};
 
     #[test]
+    fn compose_service_commands_parse_and_refuse_unknown_actions() {
+        let cli = Cli::try_parse_from(["tond", "apps", "service", "shop", "web", "restart"])
+            .unwrap_or_else(|err| panic!("apps service should parse: {err}"));
+        assert!(matches!(
+            cli.command,
+            Commands::Apps {
+                action: AppsAction::Service { ref app, ref service, ref action }
+            } if app == "shop" && service == "web" && action == "restart"
+        ));
+        assert!(Cli::try_parse_from(["tond", "apps", "service", "shop", "web", "nuke"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["tond", "apps", "services", "shop"])
+                .unwrap_or_else(|err| panic!("apps services should parse: {err}"))
+                .command,
+            Commands::Apps {
+                action: AppsAction::Services { .. }
+            }
+        ));
+    }
+
+    #[test]
     fn cli_uses_default_server_for_simple_command() {
         let cli = Cli::try_parse_from(["tond", "apps", "list"])
             .unwrap_or_else(|err| panic!("failed to parse apps list command: {err}"));
