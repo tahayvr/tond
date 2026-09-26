@@ -187,9 +187,12 @@ if ! check_release_signature "$TAG" "$TMPDIR/tond.tar.gz" "$TMPDIR/tond.tar.gz.m
     exit 1
 fi
 
-tar -xzf "$TMPDIR/tond.tar.gz" -C "$TMPDIR" "${BUNDLE}/update.sh"
-
+tar -xzf "$TMPDIR/tond.tar.gz" -C "$TMPDIR"
 chmod +x "$TMPDIR/${BUNDLE}/update.sh"
 
+# The verified bundle is installed as is (update.sh --bundle): no second
+# download. Prefer `sudo tond update` on a working server: it also takes a
+# full snapshot first. This is the way back for a server whose tond CLI or
+# tond-server is broken.
 info "Running update..."
-"$TMPDIR/${BUNDLE}/update.sh" "$@"
+"$TMPDIR/${BUNDLE}/update.sh" --bundle "$TMPDIR/${BUNDLE}" "$@"
