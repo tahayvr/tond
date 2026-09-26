@@ -14,7 +14,7 @@ use anyhow::Result;
 use tond_common::App;
 
 use crate::state::AppState;
-use crate::{compose_policy, volumes};
+use crate::{compose_policy, docker, volumes};
 
 use super::images;
 
@@ -542,12 +542,9 @@ pub(super) async fn run_inline_compose(
     // <data>/volumes/<app>, ports on 127.0.0.1, container hardening added.
     let data_path = std::path::Path::new(&data_dir);
     let volume_dir = volumes::app_volume_dir(data_path, app_name);
-    let hardened = compose_policy::harden(
-        compose_content,
-        &volume_dir,
-        crate::docker::default_memory_limit(),
-    )
-    .map_err(|errors| anyhow::anyhow!(compose_policy::format_errors(&errors)))?;
+    let hardened =
+        compose_policy::harden(compose_content, &volume_dir, docker::default_memory_limit())
+            .map_err(|errors| anyhow::anyhow!(compose_policy::format_errors(&errors)))?;
     for rel in &hardened.bind_sources {
         volumes::prepare_host_dir(data_path, &volume_dir, rel, true)?;
     }
