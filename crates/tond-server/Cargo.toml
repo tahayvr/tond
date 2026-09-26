@@ -41,6 +41,7 @@ cron = { workspace = true }
 chrono-tz = { workspace = true }
 jsonwebtoken = { workspace = true }
 urlencoding = { workspace = true }
+psl = { workspace = true }
 totp-rs = { workspace = true }
 lettre = { workspace = true }
 flate2 = { workspace = true }

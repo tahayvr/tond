@@ -180,6 +180,34 @@ function mockPublicUrl(db: ManagedDatabase): string | null {
 		: `${db.db_type}://${db.db_user}:${db.db_password}@tond.example.com:${db.host_port}/${db.db_name}`;
 }
 
+// Mirrors tond-server's domains.rs: previews need a preview domain on a different
+// registrable domain from the dashboard. The mock approximates the Public Suffix
+// List check by comparing the last two labels.
+const PREVIEW_DOMAIN_REQUIRED =
+	'Invalid input: Previews need a preview domain. Set one in Settings: a separate domain you own (e.g. example-previews.com, not a subdomain of the dashboard domain) with a wildcard DNS record *.<preview-domain> pointing at this server. Previews run pull-request code, so they must not share a site with the dashboard.';
+
+function mockSite(domain: string): string {
+	return domain.split('.').slice(-2).join('.');
+}
+
+function mockPreviewDomainError(preview: string, dashboard: string): string | null {
+	if (!preview) return null;
+	if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(preview)) {
+		return `'${preview}' is not a valid domain name (expected something like example-previews.com)`;
+	}
+	if (!dashboard) return null;
+	const nested =
+		preview === dashboard || preview.endsWith(`.${dashboard}`) || dashboard.endsWith(`.${preview}`);
+	if (nested || mockSite(preview) === mockSite(dashboard)) {
+		return `The preview domain must be a different registrable domain from the dashboard (${dashboard}). Previews run pull-request code; use a separate domain you own.`;
+	}
+	return null;
+}
+
+function normalizeDomain(value: string): string {
+	return value.trim().toLowerCase().replace(/\.$/, '');
+}
+
 const certificates = MOCK_CERTIFICATES.map((c) => ({ ...c }));
 
 /** Mirror the server: saving a domain queues a pending cert and resets retry state. */
@@ -1069,6 +1097,8 @@ export const handlers = [
 
 	http.post('/api/apps/:id/preview', async ({ params, request }) => {
 		await delay(LATENCY);
+		if (!MOCK_SETTINGS.preview_domain) return err(PREVIEW_DOMAIN_REQUIRED);
+		const app = apps.find((a) => a.id === params.id);
 		const body = (await request.json()) as {
 			ttl_hours?: number;
 			pr_number?: number;
@@ -1087,7 +1117,7 @@ export const handlers = [
 			app_id: params.id as string,
 			project_preview_id: null,
 			slug,
-			subdomain: `${slug}.preview.example.com`,
+			subdomain: `${slug}-${app?.name ?? 'app'}.${MOCK_SETTINGS.preview_domain}`,
 			container_id: null,
 			host_port: null,
 			image_tag: null,
@@ -1095,7 +1125,7 @@ export const handlers = [
 			status: 'building',
 			expires_at: new Date(Date.now() + ttl * 1000).toISOString(),
 			created_at: new Date().toISOString(),
-			url: `https://${slug}.preview.example.com`,
+			url: `https://${slug}-${app?.name ?? 'app'}.${MOCK_SETTINGS.preview_domain}`,
 			pr_number: body.pr_number ?? null,
 			head_sha: body.head_sha ?? null,
 			head_ref: body.head_ref ?? null,
@@ -1128,6 +1158,9 @@ export const handlers = [
 			preview_excluded_keys?: string[];
 			preview_env_vars?: Record<string, string>;
 		};
+		if (body.preview_enabled && !MOCK_SETTINGS.preview_domain) {
+			return err(PREVIEW_DOMAIN_REQUIRED);
+		}
 		apps[idx] = {
 			...apps[idx],
 			preview_enabled: body.preview_enabled,
@@ -1151,6 +1184,7 @@ export const handlers = [
 		const projectId = params.id as string;
 		const project = projects.find((p) => p.id === projectId || p.name === projectId);
 		if (!project) return err('Project not found', 404);
+		if (!MOCK_SETTINGS.preview_domain) return err(PREVIEW_DOMAIN_REQUIRED);
 		const body = (await request.json()) as { ttl_hours?: number };
 		const ttlHours = body.ttl_hours ?? 24;
 		const ttlSeconds = ttlHours * 3600;
@@ -1164,7 +1198,7 @@ export const handlers = [
 			app_id: app.id,
 			project_preview_id: `pprev_${Date.now()}`,
 			slug,
-			subdomain: `${slug}-${app.name}.dash.example.com`,
+			subdomain: `${slug}-${app.name}.${MOCK_SETTINGS.preview_domain}`,
 			container_id: null,
 			host_port: null,
 			image_tag: null,
@@ -1172,7 +1206,7 @@ export const handlers = [
 			status: 'running',
 			expires_at: expiresAt,
 			created_at: createdAt,
-			url: `https://${slug}-${app.name}.dash.example.com`,
+			url: `https://${slug}-${app.name}.${MOCK_SETTINGS.preview_domain}`,
 			pr_number: null,
 			head_sha: null,
 			head_ref: null,
@@ -1264,6 +1298,17 @@ export const handlers = [
 	http.put('/api/settings', async ({ request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as Partial<typeof MOCK_SETTINGS>;
+		if (body.dashboard_domain !== undefined) {
+			body.dashboard_domain = normalizeDomain(body.dashboard_domain);
+		}
+		if (body.preview_domain !== undefined) {
+			body.preview_domain = normalizeDomain(body.preview_domain);
+		}
+		const previewError = mockPreviewDomainError(
+			body.preview_domain ?? MOCK_SETTINGS.preview_domain,
+			body.dashboard_domain ?? MOCK_SETTINGS.dashboard_domain
+		);
+		if (previewError) return err(previewError);
 		Object.assign(MOCK_SETTINGS, body);
 		if (body.dashboard_domain) queueMockCertificate(body.dashboard_domain);
 		MOCK_ONBOARDING_STATUS.dashboard_domain = MOCK_SETTINGS.dashboard_domain;

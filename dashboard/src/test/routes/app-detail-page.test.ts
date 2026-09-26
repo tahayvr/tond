@@ -42,6 +42,7 @@ const api = vi.hoisted(() => ({
 	setAutoDeploy: vi.fn(),
 	updateSource: vi.fn(),
 	listPreviews: vi.fn(),
+	getSettings: vi.fn(),
 	createPreview: vi.fn(),
 	deletePreview: vi.fn(),
 	updatePreviewConfig: vi.fn(),
@@ -176,6 +177,11 @@ describe('apps/[id] page', () => {
 		}
 		api.listDeployments.mockResolvedValue([]);
 		api.listPreviews.mockResolvedValue([]);
+		api.getSettings.mockResolvedValue({
+			server_name: 'Tond',
+			dashboard_domain: 'dash.example.com',
+			preview_domain: 'example-previews.com'
+		});
 		api.listOpenPRs.mockResolvedValue([]);
 		api.getAppMetrics.mockResolvedValue([]);
 		api.listRegistryCredentials.mockResolvedValue([]);
@@ -423,6 +429,23 @@ describe('apps/[id] page', () => {
 
 		expect(api.updatePreviewConfig).toHaveBeenCalledWith('app_1', true);
 		expect(api.getApp).toHaveBeenCalledWith('app_1');
+	});
+
+	it('explains and blocks previews when no preview domain is configured', async () => {
+		api.getSettings.mockResolvedValue({
+			server_name: 'Tond',
+			dashboard_domain: 'dash.example.com',
+			preview_domain: ''
+		});
+
+		const user = userEvent.setup();
+		renderPage({ ...app, github_app_id: 'gh_1', preview_enabled: false });
+
+		await user.click(screen.getByRole('tab', { name: /previews/i }));
+
+		expect(await screen.findByText(/previews need a preview domain/i)).toBeInTheDocument();
+		expect(screen.getByRole('button', { name: /enable pr previews/i })).toBeDisabled();
+		expect(screen.getByRole('button', { name: /create preview/i })).toBeDisabled();
 	});
 
 	it('loads open pull requests for previews', async () => {

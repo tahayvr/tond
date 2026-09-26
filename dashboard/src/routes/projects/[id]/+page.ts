@@ -1,12 +1,19 @@
-import { getProject, listApps, listDatabases, listProjectPreviews } from '$lib/api';
+import { getProject, getSettings, listApps, listDatabases, listProjectPreviews } from '$lib/api';
 
 export async function load({ params }: { params: { id: string } }) {
-	const [project, allDatabases, allApps, projectPreviews] = await Promise.all([
+	const [project, allDatabases, allApps, projectPreviews, settings] = await Promise.all([
 		getProject(params.id),
 		listDatabases(),
 		listApps(),
-		listProjectPreviews(params.id)
+		listProjectPreviews(params.id),
+		getSettings()
 	]);
 
-	return { project, allDatabases, allApps, projectPreviews };
+	return {
+		project,
+		allDatabases,
+		allApps,
+		projectPreviews,
+		previewDomain: settings.preview_domain ?? ''
+	};
 }

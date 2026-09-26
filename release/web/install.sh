@@ -4,9 +4,6 @@
 
 set -e
 
-RELEASE_URL="https://github.com/tahayvr/tond/releases/latest/download/tond-linux-x86_64.tar.gz"
-CHECKSUM_URL="${RELEASE_URL}.sha256"
-
 # Colors (if terminal supports it)
 if [ -t 1 ]; then
     RED='\033[0;31m'
@@ -48,11 +45,18 @@ if [ "$(uname -s)" != "Linux" ]; then
     exit 1
 fi
 
-# Check architecture
-if [ "$(uname -m)" != "x86_64" ]; then
-    error "Unsupported architecture: $(uname -m). Tond requires x86_64 (amd64)."
-    exit 1
-fi
+# Check architecture (bundles: tond-linux-x86_64, tond-linux-aarch64)
+case "$(uname -m)" in
+    x86_64|amd64) ARCH="x86_64" ;;
+    aarch64|arm64) ARCH="aarch64" ;;
+    *)
+        error "Unsupported architecture: $(uname -m). Tond supports x86_64 (amd64) and aarch64 (arm64)."
+        exit 1
+        ;;
+esac
+BUNDLE="tond-linux-${ARCH}"
+RELEASE_URL="https://github.com/tahayvr/tond/releases/latest/download/${BUNDLE}.tar.gz"
+CHECKSUM_URL="${RELEASE_URL}.sha256"
 
 info "Downloading Tond..."
 
@@ -87,8 +91,8 @@ tar -xzf "$TMPDIR/tond.tar.gz" -C "$TMPDIR"
 # Find the extracted directory
 if [ -d "$TMPDIR/tond" ]; then
     EXTRACTED="$TMPDIR/tond"
-elif [ -d "$TMPDIR/tond-linux-x86_64" ]; then
-    EXTRACTED="$TMPDIR/tond-linux-x86_64"
+elif [ -d "$TMPDIR/${BUNDLE}" ]; then
+    EXTRACTED="$TMPDIR/${BUNDLE}"
 else
     error "Could not find extracted files"
     exit 1

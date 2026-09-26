@@ -21,7 +21,13 @@
 //
 // To add a new migration: create the next numbered .sql file in migrations/.
 // No changes to this file are needed.
+//
+// share_with_proxy() keeps the database file at mode 0660. tond-proxy runs as
+// the unprivileged `tond-proxy` user and reaches tond.db through its group,
+// which the file inherits from the setgid data directory (root:tond-proxy,
+// set up by install.sh). SQLite gives -wal/-shm the same mode and owner.
 
+use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -45,7 +51,17 @@ pub async fn open_pool(db_path: &str) -> Result<SqlitePool> {
         .max_connections(MAX_CONNECTIONS)
         .connect_with(options)
         .await?;
+    share_with_proxy(Path::new(db_path));
     Ok(pool)
+}
+
+/// Set the database file to 0660 (owner + group) so tond-proxy can use it.
+/// Best-effort: a missing file or a filesystem without Unix modes is ignored.
+pub fn share_with_proxy(db_path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if db_path.is_file() {
+        let _ = std::fs::set_permissions(db_path, std::fs::Permissions::from_mode(0o660));
+    }
 }
 
 pub async fn migrate(pool: &SqlitePool) -> Result<()> {
@@ -55,7 +71,31 @@ pub async fn migrate(pool: &SqlitePool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
+
+    #[test]
+    fn share_with_proxy_sets_owner_and_group_read_write() {
+        let dir = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
+        let db = dir.path().join("tond.db");
+        std::fs::write(&db, b"").unwrap_or_else(|err| panic!("write: {err}"));
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644))
+            .unwrap_or_else(|err| panic!("chmod: {err}"));
+
+        share_with_proxy(&db);
+
+        let mode = std::fs::metadata(&db)
+            .unwrap_or_else(|err| panic!("stat: {err}"))
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o660,
+            "tond.db must be 0660, not world-readable"
+        );
+        share_with_proxy(&dir.path().join("missing.db"));
+    }
 
     #[tokio::test]
     async fn open_pool_uses_wal_and_normal_synchronous() {
@@ -81,5 +121,15 @@ mod tests {
         migrate(&pool)
             .await
             .unwrap_or_else(|err| panic!("migrations should apply: {err}"));
+
+        let file_mode = std::fs::metadata(&path)
+            .unwrap_or_else(|err| panic!("stat: {err}"))
+            .permissions()
+            .mode();
+        assert_eq!(
+            file_mode & 0o777,
+            0o660,
+            "open_pool must leave tond.db shared with the proxy group only"
+        );
     }
 }

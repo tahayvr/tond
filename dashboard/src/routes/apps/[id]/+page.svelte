@@ -22,6 +22,7 @@
 		setAutoDeploy,
 		updateSource,
 		listPreviews,
+		getSettings,
 		createPreview,
 		deletePreview,
 		updatePreviewConfig,
@@ -67,6 +68,7 @@
 	import AppHealth from '$lib/components/tabs/app-page/app-health.svelte';
 	import AppVolumes from '$lib/components/tabs/app-page/app-volumes.svelte';
 	import AppPreviews from '$lib/components/tabs/app-page/app-previews.svelte';
+	import PreviewDomainRequiredAlert from '$lib/components/alerts/preview-domain-required-alert.svelte';
 	import AppMetrics from '$lib/components/tabs/app-page/app-metrics.svelte';
 	import AppHistory from '$lib/components/tabs/app-page/app-history.svelte';
 	import AppWebhooks from '$lib/components/tabs/app-page/app-webhooks.svelte';
@@ -162,6 +164,9 @@
 	let previewTtl = $state(24);
 	let previewConfigSaving = $state(false);
 	let previewConfigError = $state('');
+	// null until settings are loaded; '' when no preview domain is configured
+	let previewDomain = $state<string | null>(null);
+	let previewsBlocked = $derived(previewDomain === '');
 
 	// Open PRs state (Load open PRs feature)
 	let openPRs = $state<GithubPR[]>([]);
@@ -750,6 +755,11 @@
 			previewsError = e.message;
 		} finally {
 			previewsLoading = false;
+		}
+		try {
+			previewDomain = (await getSettings()).preview_domain ?? '';
+		} catch {
+			// Leave the state unknown; the API still refuses previews without a domain.
 		}
 	}
 
@@ -1598,6 +1608,10 @@
 							</Badge>
 						</div>
 
+						{#if previewsBlocked}
+							<PreviewDomainRequiredAlert />
+						{/if}
+
 						{#if previewConfigError}
 							<ErrorAlert title="Error" description={previewConfigError} />
 						{/if}
@@ -1606,7 +1620,7 @@
 							{#if !app.preview_enabled}
 								<Button
 									size="sm"
-									disabled={previewConfigSaving}
+									disabled={previewConfigSaving || previewsBlocked}
 									onclick={() => handleTogglePreviewEnabled(true)}
 								>
 									{previewConfigSaving ? 'Saving…' : 'Enable PR Previews'}
@@ -1630,11 +1644,15 @@
 							</p>
 						{/if}
 
-						<div class="rounded-md border border-dashed px-4 py-3 text-sm text-muted-foreground">
-							<strong class="text-foreground">Wildcard DNS required</strong> — add a
-							<code class="font-mono text-xs">*.yourdomain.com → &lt;server IP&gt;</code> A record so
-							preview subdomains resolve automatically.
-						</div>
+						{#if previewDomain}
+							<div class="rounded-md border border-dashed px-4 py-3 text-sm text-muted-foreground">
+								Previews are served at
+								<code class="font-mono text-xs">&lt;id&gt;-{app.name}.{previewDomain}</code>.
+								<strong class="text-foreground">Wildcard DNS required</strong> — add a
+								<code class="font-mono text-xs">*.{previewDomain} → &lt;server IP&gt;</code> A record
+								so preview hostnames resolve automatically.
+							</div>
+						{/if}
 					</div>
 
 					<Separator />
@@ -1751,7 +1769,9 @@
 									class="w-28"
 								/>
 							</div>
-							<Button onclick={() => handleCreatePreview()}>Create Preview</Button>
+							<Button onclick={() => handleCreatePreview()} disabled={previewsBlocked}>
+								Create Preview
+							</Button>
 						</div>
 						<p class="text-xs text-muted-foreground">
 							The preview will be automatically removed after the TTL expires.

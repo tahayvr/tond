@@ -20,6 +20,11 @@ pub struct ServerSettings {
     /// The domain at which the Tond dashboard itself is accessible.
     /// When set, tond-proxy will route this domain to the dashboard.
     pub dashboard_domain: String,
+    /// The domain previews are served under (`<slug>-<app>.<preview_domain>`).
+    /// Must be a different registrable domain from `dashboard_domain`, so
+    /// preview pages are cross-site to the dashboard. Empty = previews disabled.
+    #[serde(default)]
+    pub preview_domain: String,
 }
 
 impl Default for ServerSettings {
@@ -27,6 +32,7 @@ impl Default for ServerSettings {
         Self {
             server_name: default_server_name(),
             dashboard_domain: String::new(),
+            preview_domain: String::new(),
         }
     }
 }
@@ -44,4 +50,6 @@ pub struct SettingRow {
 pub struct UpdateSettingsRequest {
     pub server_name: Option<String>,
     pub dashboard_domain: Option<String>,
+    #[serde(default)]
+    pub preview_domain: Option<String>,
 }

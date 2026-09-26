@@ -1213,6 +1213,7 @@ mod tests {
             settings: Arc::new(RwLock::new(ServerSettings {
                 server_name: "tond".to_string(),
                 dashboard_domain: "dashboard.example.com".to_string(),
+                preview_domain: String::new(),
             })),
         }
     }

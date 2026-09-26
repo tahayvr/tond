@@ -6,7 +6,8 @@
 //
 //   db           — SQLite connection pool. Path from TOND_DB_PATH
 //                  (default: /opt/tond/data/tond.db). Created with ?mode=rwc so
-//                  the file is created on first run.
+//                  the file is created on first run, then kept at 0660 so
+//                  tond-proxy (group tond-proxy) can share it.
 //
 //   docker       — Bollard Docker client connected via the local Unix
 //                  socket. Verified at startup by calling docker.version().

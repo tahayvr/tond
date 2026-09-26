@@ -294,7 +294,15 @@ pub fn prepare_host_dir(
     allow_file: bool,
 ) -> Result<PathBuf> {
     let volumes = volumes_root(data_dir);
-    std::fs::create_dir_all(&volumes)?;
+    if !volumes.exists() {
+        // Same mode install.sh gives it: root-only at the top level; the
+        // per-volume directories below keep their own modes for containers.
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&volumes)?;
+    }
     let volumes = volumes.canonicalize()?;
 
     // Create the root below <data>/volumes one component at a time too, so a

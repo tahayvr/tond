@@ -59,6 +59,7 @@ mod cron;
 mod db;
 mod deploy;
 mod docker;
+mod domains;
 mod error;
 mod handlers;
 mod health;
@@ -123,13 +124,15 @@ async fn main() -> Result<()> {
             match row.key.as_str() {
                 "server_name" => s.server_name = row.value,
                 "dashboard_domain" => s.dashboard_domain = row.value,
+                "preview_domain" => s.preview_domain = row.value,
                 _ => {}
             }
         }
         tracing::info!(
-            "Settings loaded (server_name={:?}, dashboard_domain={:?})",
+            "Settings loaded (server_name={:?}, dashboard_domain={:?}, preview_domain={:?})",
             s.server_name,
-            s.dashboard_domain
+            s.dashboard_domain,
+            s.preview_domain
         );
     }
 
