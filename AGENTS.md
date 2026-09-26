@@ -230,7 +230,7 @@ One system for all of these — never hand-roll a pill, banner or `confirm()`:
   proxy over `proxy.sock`, and a deploy stops the old container only after the proxy
   acknowledges the new version (`proxy_link::sync_routes`). The proxy keeps one
   persistent read-only connection and a 60 s fallback check. If you add a table or
-  column the proxy routes on, extend the triggers in the `route_state` migration.
+  column the proxy routes on, extend the `route_*` triggers (baseline schema) in a new migration.
 - Every production deploy goes through the build queue (`deploy/queue.rs`: one deploy
   per app, newest supersedes a queued one, global build slots). Never spawn
   `deploy::deploy` directly. Long-running work (deploys, cron runs, snapshots) is spawned

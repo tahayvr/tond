@@ -12,7 +12,7 @@
 //   `canonical` is a JSON array of the row's fields in a fixed order and
 //   `prev_hash` is the previous row's hash. Sequence numbers are assigned by
 //   the writer (1, 2, 3, … without gaps), so deleting, reordering or editing a
-//   row breaks verification. SQLite triggers (010_authz.sql) additionally
+//   row breaks verification. SQLite triggers (001_baseline.sql) additionally
 //   refuse UPDATEs, and DELETEs unless the janitor is pruning.
 //
 //   Retention (janitor.rs → `prune_before`) removes a prefix of the chain in
@@ -37,7 +37,7 @@ use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 use tond_common::{AuditLog, AuditVerifyReport};
 
-/// Hash the chain starts from (seeded into `audit_state` by 010_authz.sql).
+/// Hash the chain starts from (seeded into `audit_state` by 001_baseline.sql).
 #[cfg(test)]
 pub const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 

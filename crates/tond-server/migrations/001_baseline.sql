@@ -1,9 +1,10 @@
 -- Tond baseline schema.
 --
--- Squashed before the first release (no installs existed): migrations
--- 001-049 from the original history, then the Phase 0 lock-down migrations
--- (auth hardening, database public access, per-deployment images, webhook
--- hardening, GitHub App flows, certificate retry state, retention indexes).
+-- Squashed before the first release (no installs existed): the original
+-- migrations 001-049, then Phase 0 (lock down) and Phase 1 (solid core):
+-- authorization and API tokens, hash-chained audit log, encrypted snapshots,
+-- build queue and route_state triggers, compact metrics, deploy phases and
+-- readiness, event-only alert rules, database links and preview sharing.
 -- Add new migrations as 002_..., 003_... from here on.
 
 CREATE TABLE apps(
@@ -42,8 +43,10 @@ CREATE TABLE apps(
   base_dir TEXT,
   static_build INTEGER NOT NULL DEFAULT 0,
   preview_enabled INTEGER NOT NULL DEFAULT 0,
-  preview_excluded_keys TEXT NOT NULL DEFAULT '[]',
-  preview_env_vars TEXT NOT NULL DEFAULT '{}'
+  preview_shared_keys TEXT NOT NULL DEFAULT '[]',
+  preview_env_vars TEXT NOT NULL DEFAULT '{}',
+  readiness TEXT NOT NULL DEFAULT 'http',
+  ready_after_secs INTEGER NOT NULL DEFAULT 10
 );
 
 CREATE TABLE deploy_logs(
@@ -53,19 +56,11 @@ CREATE TABLE deploy_logs(
   level TEXT NOT NULL DEFAULT 'info',
   created_at TEXT NOT NULL,
   trigger_source TEXT NOT NULL DEFAULT 'manual',
+  deployment_id TEXT,
   FOREIGN KEY(app_id) REFERENCES apps(id) ON DELETE CASCADE
 );
 CREATE INDEX idx_apps_name ON apps(name);
 CREATE INDEX idx_apps_domain ON apps(domain);
-
-CREATE TABLE api_keys(
-  id TEXT PRIMARY KEY NOT NULL,
-  name TEXT NOT NULL,
-  key_hash TEXT NOT NULL UNIQUE,
-  created_at TEXT NOT NULL,
-  last_used_at TEXT
-);
-CREATE INDEX idx_api_keys_key_hash ON api_keys(key_hash);
 
 CREATE TABLE users(
   id TEXT PRIMARY KEY,
@@ -76,7 +71,9 @@ CREATE TABLE users(
   updated_at TEXT NOT NULL,
   totp_secret_enc TEXT,
   totp_enabled INTEGER NOT NULL DEFAULT 0,
-  totp_last_step INTEGER
+  totp_last_step INTEGER,
+  disabled_at TEXT,
+  last_login_at TEXT
 );
 CREATE INDEX idx_users_email ON users(email);
 
@@ -130,7 +127,17 @@ CREATE TABLE deployments(
   created_at TEXT NOT NULL,
   trigger_source TEXT NOT NULL DEFAULT 'manual',
   generated_dockerfile TEXT,
-  image_pruned INTEGER NOT NULL DEFAULT 0
+  image_pruned INTEGER NOT NULL DEFAULT 0,
+  kind TEXT NOT NULL DEFAULT 'deploy',
+  error TEXT,
+  superseded_by TEXT,
+  commit_sha TEXT,
+  commit_message TEXT,
+  commit_author TEXT,
+  trigger_detail TEXT,
+  rollback_of TEXT,
+  phases TEXT NOT NULL DEFAULT '[]',
+  failure TEXT
 );
 CREATE INDEX deployments_app_id_idx ON deployments(app_id, created_at DESC);
 
@@ -159,61 +166,6 @@ CREATE TABLE preview_deployments(
   comment_id INTEGER,
   gitlab_project_id INTEGER
 );
-
-CREATE TABLE metrics(
-  id TEXT NOT NULL PRIMARY KEY,
-  app_id TEXT NOT NULL,
-  -- CPU usage as a percentage(0.0 – 100.0)
-  cpu_percent REAL NOT NULL DEFAULT 0.0,
-  -- Memory used by the container in bytes
-  mem_used INTEGER NOT NULL DEFAULT 0,
-  -- Memory limit for the container in bytes
-  mem_limit INTEGER NOT NULL DEFAULT 0,
-  -- Cumulative bytes received on all network interfaces
-  net_rx INTEGER NOT NULL DEFAULT 0,
-  -- Cumulative bytes transmitted on all network interfaces
-  net_tx INTEGER NOT NULL DEFAULT 0,
-  -- Number of container restarts recorded at this sample
-  restarts INTEGER NOT NULL DEFAULT 0,
-  collected_at TEXT NOT NULL DEFAULT(datetime('now'))
-);
-CREATE INDEX idx_metrics_app_collected
-ON metrics(app_id, collected_at DESC);
-
-CREATE TABLE alert_rules(
-  id TEXT NOT NULL PRIMARY KEY,
-  -- Optional: scope to a specific app; NULL = all apps
-  app_id TEXT REFERENCES apps(id) ON DELETE CASCADE,
-  -- Human-readable name
-  name TEXT NOT NULL,
-  -- Metric to watch: "cpu" | "memory" | "app_down"
-  metric TEXT NOT NULL,
-  -- Threshold:
-  -- cpu / memory → percentage(0–100)
-  -- app_down → minutes the app must be non-running before alerting
-  threshold REAL NOT NULL,
-  -- Webhook URL to POST to when the condition fires
-  webhook_url TEXT NOT NULL,
-  -- 1 = active, 0 = paused
-  enabled INTEGER NOT NULL DEFAULT 1,
-  -- ISO-8601 timestamp of last fire(NULL = never fired)
-  last_fired_at TEXT,
-  created_at TEXT NOT NULL DEFAULT(datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT(datetime('now')),
-  events TEXT
-);
-
-CREATE TABLE audit_log(
-  id TEXT PRIMARY KEY,
-  app_id TEXT,
-  app_name TEXT,
-  action TEXT NOT NULL,
-  actor TEXT NOT NULL,
-  detail TEXT,
-  created_at TEXT NOT NULL DEFAULT(datetime('now'))
-);
-CREATE INDEX idx_audit_log_app_id ON audit_log(app_id);
-CREATE INDEX idx_audit_log_created_at ON audit_log(created_at DESC);
 
 CREATE TABLE projects(
   id TEXT PRIMARY KEY NOT NULL,
@@ -408,7 +360,10 @@ CREATE TABLE snapshots(
   -- SHA-256 of the exported .tar.gz(if uploaded)
   checksum_sha256 TEXT,
   error_message TEXT,
-  notes TEXT
+  notes TEXT,
+  remote_status TEXT,
+  remote_error TEXT,
+  archive_bytes INTEGER
 );
 CREATE INDEX snapshots_trigger_app ON snapshots(trigger_app, created_at DESC);
 CREATE INDEX snapshots_created_at ON snapshots(created_at DESC);
@@ -478,10 +433,242 @@ CREATE INDEX idx_cron_job_runs_running ON cron_job_runs(
   status
 ) WHERE status = 'running';
 CREATE INDEX idx_sessions_expires_at ON sessions(expires_at);
-CREATE INDEX idx_metrics_collected_at ON metrics(collected_at);
+
+CREATE TABLE api_tokens(
+  id TEXT PRIMARY KEY NOT NULL,
+  name TEXT NOT NULL,
+  -- visible start of the token("tond_pat_" + 8 chars), safe to show
+  prefix TEXT NOT NULL,
+  -- sha256 of the full token; the token itself is never stored
+  token_hash TEXT NOT NULL UNIQUE,
+  -- creator; NULL = created as root on the host(tond token create)
+  owner_user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK(kind IN('personal', 'service', 'agent', 'ci')),
+  -- JSON array of scope names
+  scopes TEXT NOT NULL,
+  -- JSON arrays of app / project ids; both NULL = every resource
+  app_ids TEXT,
+  project_ids TEXT,
+  -- JSON array of IPs / CIDRs; NULL = any address
+  allowed_ips TEXT,
+  expires_at TEXT,
+  last_used_at TEXT,
+  last_used_ip TEXT,
+  revoked_at TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX idx_api_tokens_owner ON api_tokens(owner_user_id);
+
+CREATE TABLE password_links(
+  token_hash TEXT PRIMARY KEY NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  -- "invite" | "reset"
+  purpose TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX idx_password_links_user ON password_links(user_id);
+
+CREATE TABLE audit_log(
+  -- position in the chain: 1, 2, 3, … assigned by the writer, no gaps
+  seq INTEGER PRIMARY KEY NOT NULL,
+  created_at TEXT NOT NULL,
+  -- "user" | "token" | "local_socket" | "system" | "anonymous"
+  actor_kind TEXT NOT NULL,
+  actor_id TEXT,
+  actor_label TEXT NOT NULL,
+  action TEXT NOT NULL,
+  resource_type TEXT,
+  resource_id TEXT,
+  resource_name TEXT,
+  -- "success" | "failure"
+  outcome TEXT NOT NULL DEFAULT 'success',
+  ip TEXT,
+  detail TEXT,
+  prev_hash TEXT NOT NULL,
+  -- sha256(prev_hash || canonical row), see audit_log.rs
+  hash TEXT NOT NULL
+);
+CREATE INDEX idx_audit_log_created_at ON audit_log(created_at);
+CREATE INDEX idx_audit_log_resource ON audit_log(
+  resource_type,
+  resource_id,
+  seq
+);
+CREATE INDEX idx_audit_log_actor ON audit_log(actor_label, seq);
+CREATE INDEX idx_audit_log_action ON audit_log(action, seq);
+
+CREATE TABLE audit_state(
+  id INTEGER PRIMARY KEY CHECK(id = 1),
+  checkpoint_seq INTEGER NOT NULL DEFAULT 0,
+  checkpoint_hash TEXT NOT NULL,
+  pruning INTEGER NOT NULL DEFAULT 0
+);
+CREATE TRIGGER audit_log_append_only_update BEFORE UPDATE ON audit_log
+BEGIN
+  SELECT RAISE(ABORT, 'audit_log is append-only');
+END;
+CREATE TRIGGER audit_log_append_only_delete BEFORE DELETE ON audit_log
+WHEN (SELECT pruning FROM audit_state WHERE id = 1) = 0
+BEGIN
+  SELECT RAISE(ABORT, 'audit_log rows are only removed by retention');
+END;
+CREATE INDEX deployments_unfinished_idx ON deployments(
+  status,
+  created_at
+)
+WHERE status IN('queued', 'running');
+
+CREATE TABLE route_state(
+  id INTEGER PRIMARY KEY CHECK(id = 1),
+  version INTEGER NOT NULL DEFAULT 0
+);
+CREATE TRIGGER route_apps_insert AFTER INSERT ON apps
+BEGIN
+  UPDATE route_state SET version = version + 1 WHERE id = 1;
+END;
+CREATE TRIGGER route_apps_delete AFTER DELETE ON apps
+BEGIN
+  UPDATE route_state SET version = version + 1 WHERE id = 1;
+END;
+CREATE TRIGGER route_apps_update AFTER UPDATE OF name, domain, host_port, status, readiness ON apps
+WHEN OLD.name IS NOT NEW.name
+  OR OLD.domain IS NOT NEW.domain
+  OR OLD.host_port IS NOT NEW.host_port
+  OR OLD.readiness IS NOT NEW.readiness
+  OR (OLD.status = 'running') IS NOT (NEW.status = 'running')
+BEGIN
+  UPDATE route_state SET version = version + 1 WHERE id = 1;
+END;
+CREATE TRIGGER route_previews_insert AFTER INSERT ON preview_deployments
+BEGIN
+  UPDATE route_state SET version = version + 1 WHERE id = 1;
+END;
+CREATE TRIGGER route_previews_delete AFTER DELETE ON preview_deployments
+BEGIN
+  UPDATE route_state SET version = version + 1 WHERE id = 1;
+END;
+CREATE TRIGGER route_previews_update
+AFTER UPDATE OF subdomain, host_port, status, expires_at ON preview_deployments
+WHEN OLD.subdomain IS NOT NEW.subdomain
+  OR OLD.host_port IS NOT NEW.host_port
+  OR OLD.status IS NOT NEW.status
+  OR OLD.expires_at IS NOT NEW.expires_at
+BEGIN
+  UPDATE route_state SET version = version + 1 WHERE id = 1;
+END;
+CREATE TRIGGER route_settings_insert AFTER INSERT ON settings
+WHEN NEW.key IN ('dashboard_domain', 'preview_domain')
+BEGIN
+  UPDATE route_state SET version = version + 1 WHERE id = 1;
+END;
+CREATE TRIGGER route_settings_update AFTER UPDATE ON settings
+WHEN NEW.key IN ('dashboard_domain', 'preview_domain') AND OLD.value IS NOT NEW.value
+BEGIN
+  UPDATE route_state SET version = version + 1 WHERE id = 1;
+END;
+CREATE TRIGGER route_settings_delete AFTER DELETE ON settings
+WHEN OLD.key IN ('dashboard_domain', 'preview_domain')
+BEGIN
+  UPDATE route_state SET version = version + 1 WHERE id = 1;
+END;
+
+CREATE TABLE metric_targets(
+  id INTEGER PRIMARY KEY,
+  -- "app" | "database" | "cron" | "preview"
+  kind TEXT NOT NULL,
+  owner_id TEXT NOT NULL,
+  -- Latest summed memory limit of the target's containers in bytes(0 = none)
+  mem_limit INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(kind, owner_id)
+);
+
+CREATE TABLE metrics_raw(
+  target INTEGER NOT NULL,
+  ts INTEGER NOT NULL,
+  cpu INTEGER NOT NULL,
+  mem INTEGER NOT NULL,
+  rx INTEGER NOT NULL,
+  tx INTEGER NOT NULL,
+  pids INTEGER NOT NULL,
+  PRIMARY KEY(target, ts)
+) WITHOUT ROWID;
+
+CREATE TABLE metrics_5m(
+  target INTEGER NOT NULL,
+  ts INTEGER NOT NULL,
+  cpu INTEGER NOT NULL,
+  cpu_max INTEGER NOT NULL,
+  mem INTEGER NOT NULL,
+  mem_max INTEGER NOT NULL,
+  rx INTEGER NOT NULL,
+  tx INTEGER NOT NULL,
+  pids INTEGER NOT NULL,
+  PRIMARY KEY(target, ts)
+) WITHOUT ROWID;
+
+CREATE TABLE metrics_1h(
+  target INTEGER NOT NULL,
+  ts INTEGER NOT NULL,
+  cpu INTEGER NOT NULL,
+  cpu_max INTEGER NOT NULL,
+  mem INTEGER NOT NULL,
+  mem_max INTEGER NOT NULL,
+  rx INTEGER NOT NULL,
+  tx INTEGER NOT NULL,
+  pids INTEGER NOT NULL,
+  PRIMARY KEY(target, ts)
+) WITHOUT ROWID;
+
+CREATE TABLE metric_events(
+  target INTEGER NOT NULL,
+  ts INTEGER NOT NULL,
+  -- "restart" | "oom" | "crash"
+  kind TEXT NOT NULL,
+  detail TEXT,
+  PRIMARY KEY(target, ts, kind)
+) WITHOUT ROWID;
+CREATE INDEX idx_deploy_logs_deployment ON deploy_logs(
+  deployment_id,
+  created_at
+);
+
+CREATE TABLE "alert_rules"(
+  id TEXT NOT NULL PRIMARY KEY,
+  -- Optional: scope to a specific app; NULL = all apps
+  app_id TEXT REFERENCES apps(id) ON DELETE CASCADE,
+  -- Human-readable name
+  name TEXT NOT NULL,
+  -- Metric to watch: "cpu" | "memory" | "app_down" | "disk_usage"; NULL for event-only rules
+  metric TEXT,
+  -- Threshold:
+  -- cpu / memory / disk_usage → percentage(0–100)
+  -- app_down → minutes the app must be non-running before alerting
+  threshold REAL NOT NULL,
+  -- Optional webhook URL to POST to when the rule fires('' = none)
+  webhook_url TEXT NOT NULL DEFAULT '',
+  -- 1 = active, 0 = paused
+  enabled INTEGER NOT NULL DEFAULT 1,
+  -- ISO-8601 timestamp of last fire(NULL = never fired)
+  last_fired_at TEXT,
+  created_at TEXT NOT NULL DEFAULT(datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT(datetime('now')),
+  events TEXT
+);
+
+CREATE TABLE database_links(
+  database_id TEXT NOT NULL REFERENCES databases(id) ON DELETE CASCADE,
+  app_id TEXT NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL DEFAULT(datetime('now')),
+  PRIMARY KEY(database_id, app_id)
+);
+CREATE INDEX idx_database_links_app ON database_links(app_id);
 
 
 -- Seed rows
 INSERT OR IGNORE INTO settings (key, value) VALUES ('dashboard_domain', '');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('acme_email', '');
 INSERT OR IGNORE INTO backup_config (id) VALUES (1);
+INSERT INTO audit_state (id, checkpoint_seq, checkpoint_hash)
+VALUES (1, 0, '0000000000000000000000000000000000000000000000000000000000000000');
+INSERT INTO route_state (id, version) VALUES (1, 0);

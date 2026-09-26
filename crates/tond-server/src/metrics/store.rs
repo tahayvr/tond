@@ -1,6 +1,6 @@
 // metrics/store.rs — compact metric storage, rollups, retention and queries
 //
-// Tables (see migrations/040_compact_metrics.sql):
+// Tables (see migrations/001_baseline.sql):
 //   metric_targets  (id, kind, owner_id, mem_limit)
 //   metrics_raw     30 s samples                 kept RAW_KEEP_SECS  (25 h)
 //   metrics_5m      5-minute rollups             kept M5_KEEP_SECS   (8 days)
