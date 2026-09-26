@@ -523,6 +523,7 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
             binds,
             network_name.as_deref(),
             Some(&app_name),
+            None,
         )
         .await
         .map_err(|e| {
@@ -851,6 +852,7 @@ pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> R
             binds,
             network_name.as_deref(),
             Some(&app_name),
+            None,
         )
         .await
         .map_err(|e| {
@@ -1176,6 +1178,7 @@ pub async fn deploy_preview(
         binds,
         network_name.as_deref(),
         Some(&app_name),
+        None,
     )
     .await?;
 

@@ -649,6 +649,19 @@ tond db create e2e-redis --db-type redis > /dev/null
 wait_for 240 "e2e-redis running" \
     bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/databases | jq -e '.data[] | select(.name == \"e2e-redis\" and .status == \"running\")'"
 pass "e2e-redis is running"
+REDIS_DETAIL=$(api /api/databases/e2e-redis)
+REDIS_USER=$(jq -r '.data.db_user' <<<"$REDIS_DETAIL")
+REDIS_PASS=$(jq -r '.data.db_password' <<<"$REDIS_DETAIL")
+# The server may still be loading right after "running"; retry the auth check briefly.
+wait_for 30 "e2e-redis answering authenticated PING" \
+    bash -c "docker exec -e REDISCLI_AUTH='${REDIS_PASS}' tond-db-e2e-redis redis-cli --no-auth-warning --user '${REDIS_USER}' PING | grep -qx PONG"
+noauth=$(docker exec tond-db-e2e-redis redis-cli PING 2>&1 || true)
+[[ "$noauth" == *NOAUTH* ]] || fail "managed Redis must refuse unauthenticated clients, got: ${noauth}"
+wrong=$(docker exec -e REDISCLI_AUTH=wrong tond-db-e2e-redis redis-cli --no-auth-warning --user "$REDIS_USER" PING 2>&1 || true)
+[[ "$wrong" != *PONG* ]] || fail "managed Redis must refuse a wrong password"
+jq -e --arg u "$REDIS_USER" --arg p "$REDIS_PASS" '.data.connection_string | contains($u + ":" + $p + "@")' <<<"$REDIS_DETAIL" > /dev/null \
+    || fail "the Redis connection string must carry the credentials"
+pass "managed Redis requires auth (NOAUTH without, PONG with the ACL user); connection string carries credentials"
 
 step "Cron job"
 tond cron create e2e-cron --schedule "0 0 1 1 *" --image alpine:3 --command "echo tond-e2e-cron-ok" > /dev/null

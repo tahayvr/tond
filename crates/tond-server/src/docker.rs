@@ -419,6 +419,8 @@ pub async fn get_logs(
 ///
 /// `network_alias` is used as the network alias when connecting to
 /// `network_name` (typically the app name, without the `tond-preview-` prefix).
+/// `cmd` overrides the image's default command (managed Redis/KeyDB pass
+/// their generated config file this way); `None` keeps the image default.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_container_named(
     docker: &Docker,
@@ -433,6 +435,7 @@ pub async fn run_container_named(
     binds: Vec<String>,
     network_name: Option<&str>,
     network_alias: Option<&str>,
+    cmd: Option<Vec<String>>,
 ) -> anyhow::Result<String> {
     ensure_image(docker, image).await?;
     let env = env_with_port(env_vars, port);
@@ -458,6 +461,7 @@ pub async fn run_container_named(
     let config = ContainerCreateBody {
         image: Some(image.to_string()),
         env: Some(env),
+        cmd,
         exposed_ports: Some(vec![format!("{}/tcp", port)]),
         host_config: Some(host_config),
         networking_config,
