@@ -20,6 +20,44 @@
 		return rest === 0 ? `${hours} h` : `${hours} h ${rest} min`;
 	}
 
+	/**
+	 * Plain-language explanation of a certificate error, or null when the
+	 * message is already readable (e.g. Tond's own DNS pre-check).
+	 */
+	export function explainCertError(raw: string, domain: string): string | null {
+		const e = raw.toLowerCase();
+		if (e.startsWith('dns for ')) return null;
+		if (e.includes('ratelimited') || e.includes('too many')) {
+			return `Let's Encrypt's rate limit for ${domain} was reached. Nothing to fix on your side if DNS is right: Tond keeps retrying with backoff and it clears on its own.`;
+		}
+		if (e.includes(':caa') || e.includes('caa record')) {
+			return `A CAA record on ${domain} doesn't allow Let's Encrypt. Add a CAA record 0 issue "letsencrypt.org", or remove the CAA records.`;
+		}
+		if (e.includes('rejectedidentifier')) {
+			return `Let's Encrypt won't issue a certificate for ${domain}. Use a public domain name you own.`;
+		}
+		if (
+			e.includes(':dns') ||
+			e.includes('nxdomain') ||
+			e.includes('no valid a records') ||
+			e.includes('servfail')
+		) {
+			return `${domain} doesn't resolve yet. Add an A (and AAAA, if you use IPv6) record pointing at this server. DNS changes can take a few minutes to spread.`;
+		}
+		if (
+			e.includes(':connection') ||
+			e.includes('timeout during connect') ||
+			e.includes('connection refused') ||
+			e.includes('timed out')
+		) {
+			return `Let's Encrypt couldn't connect to port 80 on ${domain}. Make sure your cloud firewall allows inbound ports 80 and 443, and that the DNS record points at this server.`;
+		}
+		if (e.includes('unauthorized') || e.includes('acme-challenge')) {
+			return `Let's Encrypt reached a server for ${domain}, but it wasn't this one. Check that the domain's A/AAAA records point at this server and that no CDN proxy or other server answers on port 80.`;
+		}
+		return null;
+	}
+
 	/** Decide what to show for a domain's certificate row (or its absence). */
 	export function certificateView(cert: Certificate | undefined, now: number): CertificateView {
 		if (!cert) return { kind: 'none' };
@@ -109,6 +147,15 @@
 	});
 </script>
 
+{#snippet technical(raw: string)}
+	{#if explainCertError(raw, trimmed)}
+		<details class="text-xs text-muted-foreground">
+			<summary class="cursor-pointer select-none">Technical details</summary>
+			<p class="mt-1 font-mono break-words">{raw}</p>
+		</details>
+	{/if}
+{/snippet}
+
 {#if trimmed && loaded}
 	<div
 		class={cn(
@@ -131,8 +178,10 @@
 					</p>
 					{#if view.renewalError}
 						<p class="text-foreground">
-							The last renewal attempt failed: {view.renewalError}
+							The last renewal attempt failed. {explainCertError(view.renewalError, trimmed) ??
+								view.renewalError}
 						</p>
+						{@render technical(view.renewalError)}
 					{/if}
 				</div>
 			</div>
@@ -143,7 +192,10 @@
 					<p class="font-medium">
 						{view.failed ? 'Certificate request failed' : 'Certificate pending'} for {trimmed}
 					</p>
-					<p class="break-words text-foreground">{view.error}</p>
+					<p class="break-words text-foreground">
+						{explainCertError(view.error, trimmed) ?? view.error}
+					</p>
+					{@render technical(view.error)}
 					<p class="flex items-center gap-1 text-muted-foreground">
 						<TimeIcon class="size-3.5" />
 						{#if view.retryIn}
