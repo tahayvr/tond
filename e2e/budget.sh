@@ -528,7 +528,17 @@ if (( APPS > 0 )); then
         (( SECONDS < deadline )) || { FAILURES+=("certificates for the dummy apps did not settle in 10 min"); break; }
         sleep 5
     done
-    sleep 30
+    # The uptime loop creates checks for apps with a domain when it reloads
+    # (on its own writes, or hourly); rows written behind tond-server's back
+    # are only seen after a restart. Restart so the phase really probes every
+    # dummy app each minute (one TLS handshake per app through the proxy).
+    systemctl restart tond-server
+    for _ in $(seq 1 30); do api /api/system/self > /dev/null 2>&1 && break; sleep 1; done
+    settle
+    checks=$(api /api/uptime | jq "[.data[]? | select(.status != \"paused\")] | length")
+    info "uptime checks active: ${checks}"
+    (( checks >= APPS )) || FAILURES+=("expected ≥ ${APPS} active uptime checks, found ${checks}")
+    sleep 60
     measure "${APPS} apps" 40 25
     remove_dummy_apps
 fi
