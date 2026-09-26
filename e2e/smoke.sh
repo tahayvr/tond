@@ -1290,6 +1290,118 @@ jq -e '.data.disk_total > 0 and (.data.disk_mount | length) > 0 and .data.contai
     <<<"$(api /api/system/metrics)" > /dev/null || fail "system metrics should report the data directory's filesystem and Tond's containers"
 pass "system metrics answer from the cache in ${SYS_TIME}s with the data directory's disk"
 
+step "Uptime checks, heartbeat and host history"
+# Probes take the public path (DNS → tond-proxy on 443 → TLS → app). The test
+# domains have no public DNS and the ACME CA isn't publicly trusted, so run.sh
+# gives tond-server TOND_UPTIME_RESOLVE / TOND_UPTIME_CA_FILE (tests only).
+if systemctl show tond-server -p Environment | grep -q TOND_UPTIME_RESOLVE; then
+    api /api/system/self | jq -e '.data.loops | any(.name == "uptime")' > /dev/null \
+        || fail "the uptime loop should be registered in /api/system/self"
+    api "/api/apps/e2e-whoami/uptime" | jq -e '.data.check.interval_secs == 60 and .data.url == "https://'"${WHOAMI_DOMAIN}"'/"' > /dev/null \
+        || fail "e2e-whoami should get an uptime check automatically: $(api /api/apps/e2e-whoami/uptime)"
+    UPTIME_CODE=$(api_req POST /api/apps/e2e-whoami/uptime/check '{}')
+    [[ "$UPTIME_CODE" == 200 ]] || fail "check now answered ${UPTIME_CODE}: $(cat "$API_BODY")"
+    if [[ -n "$CA_FILE" ]]; then
+        jq -e '.data.status == "up" and .data.last.status == 200 and .data.last.cert_days_left > 0 and .data.last.dns == "overridden"' "$API_BODY" > /dev/null \
+            || fail "e2e-whoami should be up with a valid certificate (via the ACME CA): $(jq -c '.data | {status, last}' "$API_BODY")"
+        pass "e2e-whoami is up through DNS/TLS/proxy (HTTP 200, certificate valid for $(jq -r .data.last.cert_days_left "$API_BODY") more days)"
+    else
+        jq -e '.data.last != null' "$API_BODY" > /dev/null || fail "check now should record a probe"
+        pass "check now probed e2e-whoami (no ACME CA: TLS isn't verified here)"
+    fi
+    # Stop the container behind Tond's back: the proxy answers 502 → down (http_5xx).
+    docker stop tond-e2e-whoami > /dev/null
+    [[ "$(api_req POST /api/apps/e2e-whoami/uptime/check '{}')" == 200 ]] || fail "check now failed: $(cat "$API_BODY")"
+    jq -e '.data.status == "down" and .data.incidents[0].cause == "http_5xx" and .data.incidents[0].ended_at == null' "$API_BODY" > /dev/null \
+        || fail "a stopped container should open an http_5xx incident: $(jq -c '.data | {status, last, incidents}' "$API_BODY")"
+    pass "a dead app is reported down with the cause (HTTP 502 from the proxy) and an open incident"
+    docker start tond-e2e-whoami > /dev/null
+    wait_for 60 "e2e-whoami back behind the proxy" bash -c "curl -sk --resolve '${WHOAMI_DOMAIN}:443:${IP}' 'https://${WHOAMI_DOMAIN}/' | grep -q Hostname:"
+    if [[ -n "$CA_FILE" ]]; then
+        [[ "$(api_req POST /api/apps/e2e-whoami/uptime/check '{}')" == 200 ]] || fail "check now failed: $(cat "$API_BODY")"
+        jq -e '.data.status == "up" and .data.incidents[0].ended_at != null' "$API_BODY" > /dev/null \
+            || fail "recovery should close the incident: $(jq -c '.data | {status, incidents}' "$API_BODY")"
+        pass "recovery closes the incident"
+    fi
+    UPTIME_RUNS=$(api /api/system/self | jq '.data.loops[] | select(.name == "uptime") | .runs')
+    wait_for 150 "a scheduled uptime round" \
+        bash -c "(( \$(curl -sf --unix-socket '$SOCK' http://localhost/api/system/self | jq '.data.loops[] | select(.name == \"uptime\") | .runs') > ${UPTIME_RUNS} ))"
+    api /api/uptime | jq -e '.data[] | select(.name == "e2e-whoami") | .uptime.day_probes >= 2 and .uptime.day != null' > /dev/null \
+        || fail "GET /api/uptime should report e2e-whoami's probes: $(api /api/uptime)"
+    pass "the uptime loop probes on its own on the minute grid (GET /api/uptime)"
+    api /api/system/uptime | jq -e '.data.check.path == "/health"' > /dev/null || fail "the dashboard should have its own check"
+    pass "the dashboard has its own uptime check (/health)"
+    [[ "$(api_req PUT /api/apps/e2e-whoami/uptime '{"enabled":true,"path":"nope","interval_secs":60,"expected_status":null,"timeout_secs":10}')" == 400 ]] \
+        || fail "an invalid check path must be rejected"
+    pass "check settings are validated"
+else
+    echo "  - TOND_UPTIME_RESOLVE not set for tond-server (not run via e2e/run.sh); skipping probe checks"
+fi
+
+# Heartbeat: a local listener stands in for healthchecks.io.
+HB_PORT=18477
+HB_LOG=$(mktemp)
+python3 - "$HB_PORT" "$HB_LOG" <<'PY' &
+import http.server, sys
+port, log = int(sys.argv[1]), sys.argv[2]
+class Hit(http.server.BaseHTTPRequestHandler):
+    def hit(self):
+        with open(log, "a") as f:
+            f.write(f"{self.command} {self.path}\n")
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+    do_GET = hit
+    do_POST = hit
+    def log_message(self, *args):
+        pass
+http.server.HTTPServer(("127.0.0.1", port), Hit).serve_forever()
+PY
+HB_PID=$!
+wait_for 10 "the heartbeat listener" bash -c "curl -sf http://127.0.0.1:${HB_PORT}/ready"
+[[ "$(api_req PUT /api/system/heartbeat '{"url":"http://127.0.0.1:'"${HB_PORT}"'/ping/e2e-hb-secret","method":"POST","interval_secs":60,"enabled":true}')" == 200 ]] \
+    || fail "saving the heartbeat failed: $(cat "$API_BODY")"
+jq -e '.data.configured and .data.url_host == "127.0.0.1"' "$API_BODY" > /dev/null || fail "heartbeat settings not saved: $(cat "$API_BODY")"
+if grep -q e2e-hb-secret "$API_BODY" || api /api/system/heartbeat | grep -q e2e-hb-secret; then
+    fail "the heartbeat URL must be write-only"
+fi
+[[ "$(api_req POST /api/system/heartbeat/test '{}')" == 200 ]] || fail "test ping failed: $(cat "$API_BODY")"
+jq -e '.data.outcome == "sent"' "$API_BODY" > /dev/null || fail "the test ping should be sent: $(cat "$API_BODY")"
+grep -q "POST /ping/e2e-hb-secret" "$HB_LOG" || fail "the listener didn't receive the test ping"
+pass "heartbeat URL is write-only; a test ping reaches the monitor"
+wait_for 150 "a scheduled heartbeat" bash -c "[[ \$(grep -c 'POST /ping/e2e-hb-secret' '$HB_LOG') -ge 2 ]]"
+api /api/system/heartbeat | jq -e '.data.last_ok_at != null and .data.healthy' > /dev/null \
+    || fail "the heartbeat should be healthy with a recent success: $(api /api/system/heartbeat)"
+pass "the scheduled heartbeat is sent while Tond is healthy (Docker, proxy, loops)"
+[[ "$(api_req PUT /api/system/heartbeat '{"url":""}')" == 200 ]] || fail "removing the heartbeat URL failed"
+kill "$HB_PID" 2> /dev/null || true
+grep -q "e2e-hb-secret" /opt/tond/data/tond.db && fail "the heartbeat URL must be encrypted at rest"
+pass "the heartbeat URL is encrypted at rest and can be removed"
+
+# Host history: one row a minute from the metrics tick.
+wait_for 150 "host history samples" \
+    bash -c "curl -sf --unix-socket '$SOCK' 'http://localhost/api/system/host/history?range=1h' | jq -e '(.data.series.t | length) >= 1'"
+jq -e '.data.step == 60 and .data.series.disk_total[-1] > 0 and .data.series.inodes_total[-1] > 0 and .data.series.mem_total[-1] > 0 and (.data.series.load1 | length) == (.data.series.t | length)' \
+    <<<"$(api '/api/system/host/history?range=1h')" > /dev/null || fail "host history should carry disk, inodes, memory and load: $(api '/api/system/host/history?range=1h' | head -c 600)"
+pass "host history is recorded every minute (CPU, load, memory, swap, disk, inodes)"
+api /api/system/host/forecast | jq -e '.data.day.status | IN("filling", "stable", "insufficient_data")' > /dev/null \
+    || fail "the disk forecast should answer: $(api /api/system/host/forecast)"
+HOST=$(api /api/system/host)
+jq -e '.data.docker.reachable and (.data.docker.version | length) > 0 and (.data.docker.storage_driver | length) > 0 and .data.current.data_fs.total > 0' \
+    <<<"$HOST" > /dev/null || fail "host overview should report Docker's health and the filesystems: ${HOST}"
+pass "disk forecast answers; Docker is reachable ($(jq -r '.data.docker.version + ", " + .data.docker.storage_driver' <<<"$HOST"))"
+DISK=$(curl -sf --unix-socket "$SOCK" -X POST http://localhost/api/system/disk/refresh)
+jq -e '.data.error == null and .data.images.count >= 1 and .data.images.bytes > 0 and .data.tond_data > 0' <<<"$DISK" > /dev/null \
+    || fail "the disk breakdown should list Docker images and the data directory: ${DISK}"
+PREVIEW_CLEANUP=$(api /api/system/disk/cleanup)
+jq -e '(.data.total_bytes | type) == "number" and (.data.dangling_images | type) == "array"' <<<"$PREVIEW_CLEANUP" > /dev/null \
+    || fail "the cleanup preview should list what would be removed: ${PREVIEW_CLEANUP}"
+[[ "$(api_req POST /api/system/disk/cleanup '{}')" == 200 ]] || fail "free up space failed: $(cat "$API_BODY")"
+api "/api/audit-log?action=disk_cleanup&limit=1" | jq -e '.data.entries | length > 0' > /dev/null \
+    || fail "free up space must be audited"
+proxied_body "$WHOAMI_DOMAIN" / | grep -q Hostname: || fail "free up space must not touch running apps"
+pass "disk breakdown (images, build cache, data dir); free up space removes only build cache and dangling images, audited"
+
 step "Dashboard delivery (precompressed, cached)"
 INDEX_HEADERS=$(curl -sk -D - -o /dev/null -H 'Accept-Encoding: br, gzip' --resolve "${DASH}:443:${IP}" "https://${DASH}/")
 grep -qi '^content-encoding: br' <<<"$INDEX_HEADERS" || fail "index.html should be served brotli-compressed: ${INDEX_HEADERS}"
