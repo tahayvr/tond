@@ -401,8 +401,11 @@ async fn run() -> Result<()> {
             post(handlers::deployments::rollback_app),
         )
         // Certificate management
-        .route("/api/certs", get(handlers::list_certs))
-        .route("/api/certs/{domain}/retry", post(handlers::retry_cert))
+        .route("/api/certs", get(handlers::certificates::list_certs))
+        .route(
+            "/api/certs/{domain}/retry",
+            post(handlers::certificates::retry_cert),
+        )
         // Server settings
         .route("/api/settings", get(handlers::settings::get_settings))
         .route("/api/settings", put(handlers::settings::update_settings))
