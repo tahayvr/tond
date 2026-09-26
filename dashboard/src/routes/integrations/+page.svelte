@@ -2,6 +2,8 @@
 	import PageTitle from '$lib/components/nav/page-title.svelte';
 	import {
 		type GitHubApp,
+		type GitLabToken,
+		type GiteaToken,
 		type RegistryCredential,
 		type Integration,
 		type IntegrationKind
@@ -9,6 +11,8 @@
 	import IntegrationCard from '$lib/components/cards/integrations/integration-card.svelte';
 	import StorageProviderList from '$lib/components/integrations/storage-provider-list.svelte';
 	import Github from '~icons/ri/github-fill';
+	import Gitlab from '~icons/ri/gitlab-fill';
+	import GitRepo from '~icons/ri/git-repository-line';
 	import Package from '~icons/ri/archive-2-line';
 	import Send from '~icons/ri/send-plane-line';
 	import Webhook from '~icons/ri/webhook-line';
@@ -24,6 +28,17 @@
 
 	// ── GitHub ────────────────────────────────────────────────────────────────
 	let githubApps = $derived(data.githubApps as GitHubApp[]);
+
+	// ── GitLab / Gitea tokens ─────────────────────────────────────────────────
+	let gitlabTokens = $derived((data.gitlabTokens ?? []) as GitLabToken[]);
+	let giteaTokens = $derived((data.giteaTokens ?? []) as GiteaToken[]);
+
+	function tokenCard(tokens: { name: string }[]) {
+		return {
+			status: tokens.length > 0 ? ('connected' as const) : ('disconnected' as const),
+			details: tokens.length ? [{ label: 'Tokens', value: String(tokens.length) }] : []
+		};
+	}
 
 	// ── Registry ─────────────────────────────────────────────────────────────
 	let credentials = $derived(data.credentials as RegistryCredential[]);
@@ -169,6 +184,20 @@
 				status={githubStatus()}
 				details={githubDetails()}
 				href="/integrations/github"
+			/>
+			<IntegrationCard
+				name="GitLab"
+				icon={Gitlab}
+				status={tokenCard(gitlabTokens).status}
+				details={tokenCard(gitlabTokens).details}
+				href="/integrations/gitlab"
+			/>
+			<IntegrationCard
+				name="Gitea / Forgejo"
+				icon={GitRepo}
+				status={tokenCard(giteaTokens).status}
+				details={tokenCard(giteaTokens).details}
+				href="/integrations/gitea"
 			/>
 		</div>
 	</section>

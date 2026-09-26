@@ -1222,6 +1222,14 @@
             "format": "int64",
             "type": "integer"
           },
+          "gitea_token_id": {
+            "default": null,
+            "description": "Gitea/Forgejo token linked to this app",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "github_app_id": {
             "description": "GitHub App registration ID used to clone this app's repo",
             "type": [
@@ -1369,6 +1377,7 @@
           "registry_credential_id",
           "github_app_id",
           "gitlab_token_id",
+          "gitea_token_id",
           "preview_enabled",
           "preview_shared_keys",
           "dockerfile_content",
@@ -2542,6 +2551,14 @@
       "CreateDatabaseRequest": {
         "description": "POST /api/v1/databases request body",
         "properties": {
+          "backup_schedule": {
+            "default": null,
+            "description": "Cron expression for this database's own backups",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "db_type": {
             "description": "\"postgres\" | \"mysql\" | \"redis\"",
             "type": "string"
@@ -2568,11 +2585,39 @@
             "default": false,
             "description": "Publish the port on all interfaces (internet-reachable). Admin only; default false.",
             "type": "boolean"
+          },
+          "variant": {
+            "default": null,
+            "description": "Image variant (\"pgvector\", \"postgis\"); default: the engine's own image",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "version": {
+            "default": null,
+            "description": "Major version (default: the engine's default, see db_catalog)",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
           "name",
           "db_type"
+        ],
+        "type": "object"
+      },
+      "CreateExtensionRequest": {
+        "description": "POST /api/v1/databases/{id}/extensions",
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
         ],
         "type": "object"
       },
@@ -2593,6 +2638,27 @@
         "required": [
           "name",
           "token"
+        ],
+        "type": "object"
+      },
+      "CreateGiteaTokenRequest": {
+        "description": "POST /api/v1/gitea-tokens — store a new token",
+        "properties": {
+          "base_url": {
+            "description": "Instance URL (Gitea, Forgejo, Codeberg…)",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "token",
+          "base_url"
         ],
         "type": "object"
       },
@@ -2851,6 +2917,48 @@
       "CreatedDatabaseResponse": {
         "description": "POST /api/v1/databases response: the (masked) detail plus the freshly\ngenerated credentials, returned once so the creator can wire them into an\napp (templates interpolate `${db.<name>.internal_connection_string}`).\n`credentials` is null for callers without `db:credentials`.",
         "properties": {
+          "access_warning": {
+            "default": null,
+            "description": "Why public access is risky as configured (public without an\nallowlist), or why the allowlist isn't enforced",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "allowlist": {
+            "default": [],
+            "description": "Source addresses allowed to connect when public (empty = anyone)",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "allowlist_enforced": {
+            "default": false,
+            "description": "Whether the allowlist is enforced by the server firewall right now",
+            "type": "boolean"
+          },
+          "backup_retention": {
+            "default": 0,
+            "format": "int64",
+            "type": "integer"
+          },
+          "backup_schedule": {
+            "default": null,
+            "description": "Cron expression of this database's own backups",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "backup_warning": {
+            "default": null,
+            "description": "Set when nothing backs this database up automatically",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "connection_string": {
             "description": "External connection string (using host port on localhost), masked",
             "type": [
@@ -2972,7 +3080,46 @@
           "status": {
             "type": "string"
           },
+          "supports_tls": {
+            "default": false,
+            "description": "Whether TLS is available for this engine (postgres, mysql, mariadb)",
+            "type": "boolean"
+          },
+          "tls": {
+            "default": false,
+            "type": "boolean"
+          },
           "updated_at": {
+            "type": "string"
+          },
+          "upgrade": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DbUpgradeState"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Upgrade in progress or waiting for confirmation"
+          },
+          "upgrade_targets": {
+            "default": [],
+            "description": "Newer versions this database can be upgraded to",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "variant": {
+            "default": "",
+            "description": "Image variant (\"\" | \"pgvector\" | \"postgis\")",
+            "type": "string"
+          },
+          "version": {
+            "default": "",
+            "description": "Engine major version",
             "type": "string"
           }
         },
@@ -2995,9 +3142,21 @@
           "created_at",
           "updated_at",
           "public_access",
+          "version",
+          "variant",
+          "backup_schedule",
+          "backup_retention",
+          "allowlist",
+          "tls",
+          "upgrade",
           "connection_string",
           "public_connection_string",
           "internal_connection_string",
+          "upgrade_targets",
+          "access_warning",
+          "allowlist_enforced",
+          "supports_tls",
+          "backup_warning",
           "credentials"
         ],
         "type": "object"
@@ -3387,6 +3546,78 @@
         ],
         "type": "object"
       },
+      "DatabaseBackupStatus": {
+        "description": "Backup schedule and health of one database\n(GET /api/v1/databases/{id}/backup-schedule).",
+        "properties": {
+          "full_schedule": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "full_snapshots_enabled": {
+            "description": "Whether full-server snapshots (which hold every database) are scheduled",
+            "type": "boolean"
+          },
+          "last_backup_at": {
+            "description": "Latest completed backup holding this database (own or full)",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_status": {
+            "description": "Status of the latest backup attempt of this database's own backups",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_run_at": {
+            "description": "Next run of this database's own schedule (RFC 3339)",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "retention": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "schedule": {
+            "description": "Cron expression of this database's own backups (None = none)",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "warning": {
+            "description": "Set when nothing backs this database up (or it keeps no backups)",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "schedule",
+          "retention",
+          "next_run_at",
+          "full_snapshots_enabled",
+          "full_schedule",
+          "last_backup_at",
+          "last_status",
+          "last_error",
+          "warning"
+        ],
+        "type": "object"
+      },
       "DatabaseCredentialsResponse": {
         "description": "GET /api/v1/databases/{id}/credentials — the plaintext credentials and\nconnection strings (admin only, audit-logged).",
         "properties": {
@@ -3435,6 +3666,44 @@
           "connection_string",
           "public_connection_string",
           "internal_connection_string"
+        ],
+        "type": "object"
+      },
+      "DatabaseExtension": {
+        "description": "One extension of a postgres database (GET /api/v1/databases/{id}/extensions).",
+        "properties": {
+          "available": {
+            "description": "Offered by the image",
+            "type": "boolean"
+          },
+          "comment": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "default_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "installed_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "available",
+          "installed_version",
+          "default_version",
+          "comment"
         ],
         "type": "object"
       },
@@ -3492,6 +3761,62 @@
           "free_bytes",
           "tables",
           "measured_at"
+        ],
+        "type": "object"
+      },
+      "DbCatalogEntry": {
+        "description": "GET /api/v1/databases/catalog — what can be created.",
+        "properties": {
+          "available": {
+            "description": "Available on this server (false for x86_64-only images on ARM64)",
+            "type": "boolean"
+          },
+          "db_type": {
+            "type": "string"
+          },
+          "default_version": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "extensions": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "label": {
+            "type": "string"
+          },
+          "supports_tls": {
+            "type": "boolean"
+          },
+          "supports_upgrade": {
+            "type": "boolean"
+          },
+          "variant": {
+            "description": "\"\" = the engine's own image",
+            "type": "string"
+          },
+          "versions": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "db_type",
+          "variant",
+          "label",
+          "description",
+          "versions",
+          "default_version",
+          "extensions",
+          "available",
+          "supports_tls",
+          "supports_upgrade"
         ],
         "type": "object"
       },
@@ -3553,6 +3878,75 @@
           "slow_threshold_ms",
           "recent_slow",
           "top_statements"
+        ],
+        "type": "object"
+      },
+      "DbUpgradeState": {
+        "description": "A major-version upgrade (`databases.upgrade`, JSON).\n\n`running` → the guarded flow is working through its steps;\n`awaiting_confirmation` → the database runs the new version and the old\ndata directory is kept until the user confirms (or rolls back);\n`failed` → nothing was switched (or it was switched back); the old\nversion keeps running.",
+        "properties": {
+          "backup_id": {
+            "description": "The backup taken before anything changed",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finished_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "from_image": {
+            "type": "string"
+          },
+          "from_version": {
+            "type": "string"
+          },
+          "rollback_dir": {
+            "default": null,
+            "description": "The previous data directory, kept for a rollback",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "started_at": {
+            "type": "string"
+          },
+          "status": {
+            "description": "\"running\" | \"awaiting_confirmation\" | \"failed\"",
+            "type": "string"
+          },
+          "step": {
+            "description": "What the upgrade is doing (or did last)",
+            "type": "string"
+          },
+          "to_image": {
+            "type": "string"
+          },
+          "to_version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "from_version",
+          "to_version",
+          "from_image",
+          "to_image",
+          "step",
+          "backup_id",
+          "started_at",
+          "finished_at",
+          "error",
+          "rollback_dir"
         ],
         "type": "object"
       },
@@ -5263,6 +5657,34 @@
         ],
         "type": "object"
       },
+      "GiteaTokenResponse": {
+        "description": "API response for a stored Gitea token (the token itself is never returned).",
+        "properties": {
+          "base_url": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "username": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "base_url",
+          "username",
+          "created_at"
+        ],
+        "type": "object"
+      },
       "HeartbeatResponse": {
         "properties": {
           "configured": {
@@ -6199,6 +6621,48 @@
       "ManagedDatabaseDetail": {
         "description": "GET /api/v1/databases/{id} response — includes generated connection strings,\nwith the password masked (`mask_url_password`).",
         "properties": {
+          "access_warning": {
+            "default": null,
+            "description": "Why public access is risky as configured (public without an\nallowlist), or why the allowlist isn't enforced",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "allowlist": {
+            "default": [],
+            "description": "Source addresses allowed to connect when public (empty = anyone)",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "allowlist_enforced": {
+            "default": false,
+            "description": "Whether the allowlist is enforced by the server firewall right now",
+            "type": "boolean"
+          },
+          "backup_retention": {
+            "default": 0,
+            "format": "int64",
+            "type": "integer"
+          },
+          "backup_schedule": {
+            "default": null,
+            "description": "Cron expression of this database's own backups",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "backup_warning": {
+            "default": null,
+            "description": "Set when nothing backs this database up automatically",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "connection_string": {
             "description": "External connection string (using host port on localhost), masked",
             "type": [
@@ -6310,7 +6774,46 @@
           "status": {
             "type": "string"
           },
+          "supports_tls": {
+            "default": false,
+            "description": "Whether TLS is available for this engine (postgres, mysql, mariadb)",
+            "type": "boolean"
+          },
+          "tls": {
+            "default": false,
+            "type": "boolean"
+          },
           "updated_at": {
+            "type": "string"
+          },
+          "upgrade": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DbUpgradeState"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Upgrade in progress or waiting for confirmation"
+          },
+          "upgrade_targets": {
+            "default": [],
+            "description": "Newer versions this database can be upgraded to",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "variant": {
+            "default": "",
+            "description": "Image variant (\"\" | \"pgvector\" | \"postgis\")",
+            "type": "string"
+          },
+          "version": {
+            "default": "",
+            "description": "Engine major version",
             "type": "string"
           }
         },
@@ -6333,15 +6836,48 @@
           "created_at",
           "updated_at",
           "public_access",
+          "version",
+          "variant",
+          "backup_schedule",
+          "backup_retention",
+          "allowlist",
+          "tls",
+          "upgrade",
           "connection_string",
           "public_connection_string",
-          "internal_connection_string"
+          "internal_connection_string",
+          "upgrade_targets",
+          "access_warning",
+          "allowlist_enforced",
+          "supports_tls",
+          "backup_warning"
         ],
         "type": "object"
       },
       "ManagedDatabaseResponse": {
         "description": "API view of a managed database. Passwords are write-only: the response\nsays whether they are set, and connection strings are masked. Read the\nplaintext with GET /api/v1/databases/{id}/credentials (audit-logged).",
         "properties": {
+          "allowlist": {
+            "default": [],
+            "description": "Source addresses allowed to connect when public (empty = anyone)",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "backup_retention": {
+            "default": 0,
+            "format": "int64",
+            "type": "integer"
+          },
+          "backup_schedule": {
+            "default": null,
+            "description": "Cron expression of this database's own backups",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "created_at": {
             "type": "string"
           },
@@ -6432,7 +6968,33 @@
           "status": {
             "type": "string"
           },
+          "tls": {
+            "default": false,
+            "type": "boolean"
+          },
           "updated_at": {
+            "type": "string"
+          },
+          "upgrade": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DbUpgradeState"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Upgrade in progress or waiting for confirmation"
+          },
+          "variant": {
+            "default": "",
+            "description": "Image variant (\"\" | \"pgvector\" | \"postgis\")",
+            "type": "string"
+          },
+          "version": {
+            "default": "",
+            "description": "Engine major version",
             "type": "string"
           }
         },
@@ -6454,7 +7016,14 @@
           "custom_image",
           "created_at",
           "updated_at",
-          "public_access"
+          "public_access",
+          "version",
+          "variant",
+          "backup_schedule",
+          "backup_retention",
+          "allowlist",
+          "tls",
+          "upgrade"
         ],
         "type": "object"
       },
@@ -7928,6 +8497,32 @@
         ],
         "type": "object"
       },
+      "RestoreToNewDatabaseRequest": {
+        "description": "POST /api/v1/snapshots/{id}/restore-new-database",
+        "properties": {
+          "name": {
+            "description": "Name of the new database",
+            "type": "string"
+          },
+          "project_id": {
+            "default": null,
+            "description": "Project for the new database (default: the source's project)",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "description": "The database in the backup to restore",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "name"
+        ],
+        "type": "object"
+      },
       "RetentionField": {
         "description": "A retention setting with its current value (GET /api/v1/settings/retention).",
         "properties": {
@@ -8430,6 +9025,19 @@
         "properties": {
           "gitlab_token_id": {
             "description": "GitLab token ID to link. `null` = detach.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "SetGiteaTokenRequest": {
+        "description": "PUT /api/v1/apps/{id}/gitea-token — link or unlink a Gitea token",
+        "properties": {
+          "gitea_token_id": {
+            "description": "Token ID to link; `null` = detach.",
             "type": [
               "string",
               "null"
@@ -9883,6 +10491,27 @@
         },
         "type": "object"
       },
+      "UpdateDatabaseBackupSchedule": {
+        "description": "PUT /api/v1/databases/{id}/backup-schedule",
+        "properties": {
+          "retention": {
+            "description": "Scheduled backups to keep (1–365); omitted = unchanged",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "schedule": {
+            "description": "Cron expression; null or \"\" turns the schedule off",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "UpdateDatabaseCredentials": {
         "description": "PATCH /api/v1/databases/{id}/credentials request body\n\nPATCH /api/v1/databases/{id}/credentials — change passwords inside the running\ndatabase (ALTER ROLE / ALTER USER via docker exec), then persist them.\nSend `null`, omit a field or send `\"\"` to leave it unchanged. Renaming the\ndatabase or user is refused: engines ignore those once data exists.",
         "properties": {
@@ -9920,6 +10549,17 @@
       "UpdateDatabaseRequest": {
         "description": "PATCH /api/v1/databases/{id} request body\n\nOnly the fields present in the request body are updated (partial update).\nSetting a field to an empty string clears the override and reverts to the\nauto-computed value.",
         "properties": {
+          "allowlist": {
+            "default": null,
+            "description": "Source addresses (IP or CIDR) allowed to connect while public; `[]`\nallows any address. Admin only.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "custom_external_url": {
             "description": "Override for the external connection string (replaces the auto-computed one).\nSend `null` or omit to leave unchanged; send `\"\"` to clear the override.",
             "type": [
@@ -9952,6 +10592,14 @@
           "public_access": {
             "default": null,
             "description": "Turn public (internet) access on or off. Admin only. The container is\nrecreated immediately so the new port binding takes effect.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "tls": {
+            "default": null,
+            "description": "Serve TLS (postgres, mysql, mariadb). Admin only; recreates the\ncontainer.",
             "type": [
               "boolean",
               "null"
@@ -10332,6 +10980,18 @@
         },
         "required": [
           "secret"
+        ],
+        "type": "object"
+      },
+      "UpgradeDatabaseRequest": {
+        "description": "POST /api/v1/databases/{id}/upgrade",
+        "properties": {
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "version"
         ],
         "type": "object"
       },
@@ -14156,6 +14816,103 @@
         ],
         "x-tond-scopes": [
           "apps:read"
+        ]
+      }
+    },
+    "/api/v1/apps/{id}/gitea-token": {
+      "put": {
+        "operationId": "set_app_gitea_token",
+        "parameters": [
+          {
+            "description": "App id or name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetGiteaTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/AppResponse"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Link or unlink a Gitea/Forgejo token and an app",
+        "tags": [
+          "Apps"
+        ],
+        "x-tond-scopes": [
+          "apps:write"
         ]
       }
     },
@@ -19793,6 +20550,69 @@
         ]
       }
     },
+    "/api/v1/databases/catalog": {
+      "get": {
+        "operationId": "get_catalog",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "items": {
+                        "$ref": "#/components/schemas/DbCatalogEntry"
+                      },
+                      "type": "array"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Engines, versions and image variants a database can run",
+        "tags": [
+          "Databases"
+        ],
+        "x-tond-scopes": [
+          "db:read"
+        ]
+      }
+    },
     "/api/v1/databases/logs/stream": {
       "get": {
         "operationId": "stream_all_database_logs",
@@ -20170,6 +20990,179 @@
         ]
       }
     },
+    "/api/v1/databases/{id}/backup-schedule": {
+      "get": {
+        "operationId": "get_backup_schedule",
+        "parameters": [
+          {
+            "description": "Database id or name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/DatabaseBackupStatus"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "A database's backup schedule and backup health",
+        "tags": [
+          "Databases"
+        ],
+        "x-tond-scopes": [
+          "snapshots:read"
+        ]
+      },
+      "put": {
+        "description": "Scheduled backups run in the backup scheduler (UTC cron) and keep `retention` (1–365) backups; a failure fires the \"backup failed\" alert for that database.",
+        "operationId": "update_backup_schedule",
+        "parameters": [
+          {
+            "description": "Database id or name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateDatabaseBackupSchedule"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/DatabaseBackupStatus"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Set or turn off a database's backup schedule",
+        "tags": [
+          "Databases"
+        ],
+        "x-tond-scopes": [
+          "db:write"
+        ]
+      }
+    },
     "/api/v1/databases/{id}/backups": {
       "get": {
         "operationId": "list_database_backups",
@@ -20504,6 +21497,181 @@
         ],
         "x-tond-scopes": [
           "db:credentials"
+        ]
+      }
+    },
+    "/api/v1/databases/{id}/extensions": {
+      "get": {
+        "operationId": "list_extensions",
+        "parameters": [
+          {
+            "description": "Database id or name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "items": {
+                        "$ref": "#/components/schemas/DatabaseExtension"
+                      },
+                      "type": "array"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "PostgreSQL extensions offered for a database",
+        "tags": [
+          "Databases"
+        ],
+        "x-tond-scopes": [
+          "db:read"
+        ]
+      },
+      "post": {
+        "operationId": "create_extension",
+        "parameters": [
+          {
+            "description": "Database id or name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateExtensionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Message"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Enable a PostgreSQL extension",
+        "tags": [
+          "Databases"
+        ],
+        "x-tond-scopes": [
+          "db:write"
         ]
       }
     },
@@ -21100,6 +22268,365 @@
         ]
       }
     },
+    "/api/v1/databases/{id}/upgrade": {
+      "post": {
+        "description": "Admin only. Backs up, loads the data into a fresh data directory of the new version, switches, and keeps the old data until confirmed. Downgrades are refused.",
+        "operationId": "start_upgrade",
+        "parameters": [
+          {
+            "description": "Database id or name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpgradeDatabaseRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/DbUpgradeState"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Accepted: the work continues in the background."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Start a major-version upgrade",
+        "tags": [
+          "Databases"
+        ],
+        "x-tond-scopes": [
+          "db:write"
+        ]
+      }
+    },
+    "/api/v1/databases/{id}/upgrade/confirm": {
+      "post": {
+        "operationId": "confirm_upgrade",
+        "parameters": [
+          {
+            "description": "Database id or name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Message"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Keep an upgraded version (deletes the old data)",
+        "tags": [
+          "Databases"
+        ],
+        "x-tond-scopes": [
+          "db:write"
+        ]
+      }
+    },
+    "/api/v1/databases/{id}/upgrade/dismiss": {
+      "post": {
+        "operationId": "dismiss_upgrade",
+        "parameters": [
+          {
+            "description": "Database id or name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "type": "null"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Clear a failed upgrade's state",
+        "tags": [
+          "Databases"
+        ],
+        "x-tond-scopes": [
+          "db:write"
+        ]
+      }
+    },
+    "/api/v1/databases/{id}/upgrade/rollback": {
+      "post": {
+        "operationId": "rollback_upgrade",
+        "parameters": [
+          {
+            "description": "Database id or name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Message"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Roll an upgrade back to the old version and data",
+        "tags": [
+          "Databases"
+        ],
+        "x-tond-scopes": [
+          "db:write"
+        ]
+      }
+    },
     "/api/v1/domains/check": {
       "get": {
         "operationId": "check_domain",
@@ -21255,6 +22782,239 @@
         ],
         "x-tond-scopes": [
           "apps:write"
+        ]
+      }
+    },
+    "/api/v1/gitea-tokens": {
+      "get": {
+        "operationId": "list_gitea_tokens",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "items": {
+                        "$ref": "#/components/schemas/GiteaTokenResponse"
+                      },
+                      "type": "array"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "List Gitea/Forgejo access tokens",
+        "tags": [
+          "Sources"
+        ],
+        "x-tond-scopes": [
+          "apps:read"
+        ]
+      },
+      "post": {
+        "description": "The token is checked against <base_url>/api/v1/user first. Linked to an app it clones private repositories and reports commit statuses and pull request previews.",
+        "operationId": "create_gitea_token",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateGiteaTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/GiteaTokenResponse"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Created."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Add a Gitea/Forgejo access token",
+        "tags": [
+          "Sources"
+        ],
+        "x-tond-scopes": [
+          "settings:write"
+        ]
+      }
+    },
+    "/api/v1/gitea-tokens/{id}": {
+      "delete": {
+        "operationId": "delete_gitea_token",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "type": "null"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Delete a Gitea/Forgejo access token",
+        "tags": [
+          "Sources"
+        ],
+        "x-tond-scopes": [
+          "settings:write"
         ]
       }
     },
@@ -25308,6 +27068,102 @@
           }
         ],
         "summary": "Restore one database from a snapshot",
+        "tags": [
+          "Snapshots"
+        ],
+        "x-tond-scopes": [
+          "snapshots:restore"
+        ]
+      }
+    },
+    "/api/v1/snapshots/{id}/restore-new-database": {
+      "post": {
+        "operationId": "restore_to_new_database",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RestoreToNewDatabaseRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "description": "`{message, database}`; the original database is not touched."
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Created."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Restore one database of a snapshot into a new database",
         "tags": [
           "Snapshots"
         ],

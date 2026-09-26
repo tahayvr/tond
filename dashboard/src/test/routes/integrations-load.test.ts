@@ -1,15 +1,25 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { listGitHubApps, listRegistryCredentials, listIntegrations } = vi.hoisted(() => ({
+const {
+	listGitHubApps,
+	listRegistryCredentials,
+	listIntegrations,
+	listGitLabTokens,
+	listGiteaTokens
+} = vi.hoisted(() => ({
 	listGitHubApps: vi.fn(),
 	listRegistryCredentials: vi.fn(),
-	listIntegrations: vi.fn()
+	listIntegrations: vi.fn(),
+	listGitLabTokens: vi.fn(),
+	listGiteaTokens: vi.fn()
 }));
 
 vi.mock('$lib/api', () => ({
 	listGitHubApps,
 	listRegistryCredentials,
-	listIntegrations
+	listIntegrations,
+	listGitLabTokens,
+	listGiteaTokens
 }));
 
 describe('integrations page load', () => {
@@ -20,6 +30,8 @@ describe('integrations page load', () => {
 		listGitHubApps.mockResolvedValue([{ id: 'gh_1', name: 'Tond GitHub App' }]);
 		listRegistryCredentials.mockResolvedValue([{ id: 'cred_1', name: 'GHCR' }]);
 		listIntegrations.mockResolvedValue([{ id: 'int_1', kind: 'telegram', enabled: true }]);
+		listGitLabTokens.mockResolvedValue([]);
+		listGiteaTokens.mockRejectedValue(new Error('offline'));
 	});
 
 	it('loads integration summary route data before render', async () => {
@@ -28,7 +40,9 @@ describe('integrations page load', () => {
 		await expect(pageModule.load()).resolves.toEqual({
 			githubApps: [{ id: 'gh_1', name: 'Tond GitHub App' }],
 			credentials: [{ id: 'cred_1', name: 'GHCR' }],
-			integrations: [{ id: 'int_1', kind: 'telegram', enabled: true }]
+			integrations: [{ id: 'int_1', kind: 'telegram', enabled: true }],
+			gitlabTokens: [],
+			giteaTokens: []
 		});
 	});
 });

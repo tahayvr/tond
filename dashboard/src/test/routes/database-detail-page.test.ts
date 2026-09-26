@@ -57,7 +57,19 @@ const pg: ManagedDatabaseDetail = {
 	connection_string: null,
 	internal_connection_string: null,
 	public_access: false,
-	public_connection_string: null
+	public_connection_string: null,
+	version: '16',
+	variant: '',
+	backup_schedule: '0 3 * * *',
+	backup_retention: 7,
+	allowlist: [],
+	tls: false,
+	upgrade: null,
+	upgrade_targets: ['17', '18'],
+	access_warning: null,
+	allowlist_enforced: false,
+	supports_tls: true,
+	backup_warning: null
 };
 
 async function openEnvironment(db: ManagedDatabaseDetail) {

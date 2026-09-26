@@ -189,6 +189,10 @@ api_routes! {
     GET "/api/v1/gitlab-tokens/{id}/repos" => handlers::gitlab_tokens::list_gitlab_repos;
     GET "/api/v1/gitlab-tokens/{id}/repos/{project_id}/branches" => handlers::gitlab_tokens::list_gitlab_branches;
     PUT "/api/v1/apps/{id}/gitlab-token" => handlers::gitlab_tokens::set_app_gitlab_token;
+    GET "/api/v1/gitea-tokens" => handlers::gitea_tokens::list_gitea_tokens;
+    POST "/api/v1/gitea-tokens" => handlers::gitea_tokens::create_gitea_token;
+    DELETE "/api/v1/gitea-tokens/{id}" => handlers::gitea_tokens::delete_gitea_token;
+    PUT "/api/v1/apps/{id}/gitea-token" => handlers::gitea_tokens::set_app_gitea_token;
     // GitHub App callback routes — public (no auth extractor), called by GitHub
     GET "/api/v1/github-apps/callback" => handlers::github_apps::github_app_callback;
     POST "/api/v1/github-apps/complete" => handlers::github_apps::complete_github_flow;
@@ -284,6 +288,15 @@ api_routes! {
     GET "/api/v1/databases" => handlers::databases::list_databases;
     POST "/api/v1/databases" => handlers::databases::create_database;
     GET "/api/v1/databases/logs/stream" => handlers::logs::stream_all_database_logs;
+    GET "/api/v1/databases/catalog" => handlers::database_ops::get_catalog;
+    GET "/api/v1/databases/{id}/backup-schedule" => handlers::database_ops::get_backup_schedule;
+    PUT "/api/v1/databases/{id}/backup-schedule" => handlers::database_ops::update_backup_schedule;
+    GET "/api/v1/databases/{id}/extensions" => handlers::database_ops::list_extensions;
+    POST "/api/v1/databases/{id}/extensions" => handlers::database_ops::create_extension;
+    POST "/api/v1/databases/{id}/upgrade" => handlers::database_ops::start_upgrade;
+    POST "/api/v1/databases/{id}/upgrade/confirm" => handlers::database_ops::confirm_upgrade;
+    POST "/api/v1/databases/{id}/upgrade/rollback" => handlers::database_ops::rollback_upgrade;
+    POST "/api/v1/databases/{id}/upgrade/dismiss" => handlers::database_ops::dismiss_upgrade;
     GET "/api/v1/databases/{id}" => handlers::databases::get_database;
     DELETE "/api/v1/databases/{id}" => handlers::databases::delete_database;
     PATCH "/api/v1/databases/{id}" => handlers::databases::update_database;
@@ -327,4 +340,5 @@ api_routes! {
     POST "/api/v1/snapshots/{id}/restore" => handlers::backups::restore_snapshot;
     POST "/api/v1/snapshots/{id}/restore-app" => handlers::backups::restore_app;
     POST "/api/v1/snapshots/{id}/restore-database" => handlers::backups::restore_database;
+    POST "/api/v1/snapshots/{id}/restore-new-database" => handlers::backups::restore_to_new_database;
 }

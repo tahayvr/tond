@@ -1,7 +1,10 @@
-import { listProjects } from '$lib/api';
+import { getDatabaseCatalog, listProjects, type DbCatalogEntry } from '$lib/api';
 
 export async function load() {
-	return {
-		projects: await listProjects()
-	};
+	// The catalog only adds choices (version, image); the form works without it.
+	const [projects, catalog] = await Promise.all([
+		listProjects(),
+		getDatabaseCatalog().catch((): DbCatalogEntry[] => [])
+	]);
+	return { projects, catalog };
 }
