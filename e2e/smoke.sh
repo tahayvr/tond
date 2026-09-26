@@ -583,8 +583,11 @@ REQ_N=20
 for _ in $(seq 1 "$REQ_N"); do
     curl -sk -o /dev/null --resolve "${WHOAMI_DOMAIN}:443:${IP}" "https://${WHOAMI_DOMAIN}/"
 done
-code=$(proxied_status "$WHOAMI_DOMAIN" "/data?size=not-a-number")
-[[ "$code" =~ ^4 ]] || fail "whoami must answer a malformed /data request with 4xx, got ${code}"
+# whoami's /health answers with the status last POSTed to it: make it a 404.
+curl -sk -o /dev/null -X POST -d 404 --resolve "${WHOAMI_DOMAIN}:443:${IP}" "https://${WHOAMI_DOMAIN}/health"
+code=$(proxied_status "$WHOAMI_DOMAIN" /health)
+curl -sk -o /dev/null -X POST -d 200 --resolve "${WHOAMI_DOMAIN}:443:${IP}" "https://${WHOAMI_DOMAIN}/health"
+[[ "$code" == 404 ]] || fail "whoami's /health should answer 404 after POSTing 404, got ${code}"
 [[ "$(proxied_status "nothing-here.${BASE}" /)" == 502 ]] || fail "an unknown host must get the 502 page"
 wait_for 90 "request metrics for e2e-whoami" bash -c "curl -sf --unix-socket '$SOCK' \
     'http://localhost/api/apps/e2e-whoami/requests?range=1h' \
