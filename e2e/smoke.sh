@@ -474,9 +474,11 @@ status_of() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
 WHOAMI_ID=$(app_field e2e-whoami id)
 [[ "$WHOAMI_ID" =~ ^[0-9a-f-]{36}$ ]] || fail "could not read the e2e-whoami app id (got: ${WHOAMI_ID})"
 WEBHOOK_JSON=$(api "/api/apps/${WHOAMI_ID}/webhook")
-WEBHOOK_SECRET=$(jq -r '.data.secret // empty' <<< "$WEBHOOK_JSON")
+[[ "$(jq -r '.data.has_secret' <<< "$WEBHOOK_JSON")" == true && "$(jq -r '.data.secret // empty' <<< "$WEBHOOK_JSON")" == "" ]] \
+    || fail "the webhook config must say a secret is set without returning it"
+WEBHOOK_SECRET=$(api "/api/apps/${WHOAMI_ID}/webhook-secret" | jq -r '.data.secret // empty')
 [[ ${#WEBHOOK_SECRET} -ge 32 ]] || fail "every app must get a generated webhook secret"
-pass "app has a generated webhook secret"
+pass "app has a generated webhook secret (write-only; revealed on request)"
 [[ "$(jq -r '.data.paths.github' <<< "$WEBHOOK_JSON")" == "/api/webhooks/github/${WHOAMI_ID}" ]] \
     || fail "webhook URLs must be addressed by app UUID"
 pass "webhook URLs are addressed by app UUID"
@@ -656,8 +658,10 @@ wait_for 240 "e2e-redis running" \
     bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/databases | jq -e '.data[] | select(.name == \"e2e-redis\" and .status == \"running\")'"
 pass "e2e-redis is running"
 REDIS_DETAIL=$(api /api/databases/e2e-redis)
-REDIS_USER=$(jq -r '.data.db_user' <<<"$REDIS_DETAIL")
-REDIS_PASS=$(jq -r '.data.db_password' <<<"$REDIS_DETAIL")
+REDIS_CREDS=$(api /api/databases/e2e-redis/credentials)
+REDIS_USER=$(jq -r '.data.db_user' <<<"$REDIS_CREDS")
+REDIS_PASS=$(jq -r '.data.db_password' <<<"$REDIS_CREDS")
+[[ ${#REDIS_PASS} -ge 16 ]] || fail "the credentials reveal must return the Redis password"
 # The server may still be loading right after "running"; retry the auth check briefly.
 wait_for 30 "e2e-redis answering authenticated PING" \
     bash -c "docker exec -e REDISCLI_AUTH='${REDIS_PASS}' tond-db-e2e-redis redis-cli --no-auth-warning --user '${REDIS_USER}' PING | grep -qx PONG"
@@ -665,9 +669,61 @@ noauth=$(docker exec tond-db-e2e-redis redis-cli PING 2>&1 || true)
 [[ "$noauth" == *NOAUTH* ]] || fail "managed Redis must refuse unauthenticated clients, got: ${noauth}"
 wrong=$(docker exec -e REDISCLI_AUTH=wrong tond-db-e2e-redis redis-cli --no-auth-warning --user "$REDIS_USER" PING 2>&1 || true)
 [[ "$wrong" != *PONG* ]] || fail "managed Redis must refuse a wrong password"
-jq -e --arg u "$REDIS_USER" --arg p "$REDIS_PASS" '.data.connection_string | contains($u + ":" + $p + "@")' <<<"$REDIS_DETAIL" > /dev/null \
-    || fail "the Redis connection string must carry the credentials"
-pass "managed Redis requires auth (NOAUTH without, PONG with the ACL user); connection string carries credentials"
+jq -e --arg u "$REDIS_USER" --arg p "$REDIS_PASS" '.data.connection_string | contains($u + ":" + $p + "@")' <<<"$REDIS_CREDS" > /dev/null \
+    || fail "the revealed Redis connection string must carry the credentials"
+pass "managed Redis requires auth (NOAUTH without, PONG with the ACL user); revealed connection string carries credentials"
+
+step "Secrets at rest and write-only API secrets"
+# The database detail never carries the password; its connection string is masked.
+[[ "$(jq -r '.data.db_password // empty' <<<"$REDIS_DETAIL")" == "" && "$(jq -r '.data.has_password' <<<"$REDIS_DETAIL")" == true ]] \
+    || fail "the database detail must report has_password without the password"
+grep -qF "$REDIS_PASS" <<<"$REDIS_DETAIL" && fail "the database detail must not contain the password"
+jq -e '.data.connection_string | contains("••••••••")' <<<"$REDIS_DETAIL" > /dev/null \
+    || fail "the database detail's connection string must be masked"
+pass "database detail: has_password, masked connection string, no password"
+
+# An env var value is stored encrypted: neither the database file (nor its
+# WAL) nor the env listing contains it; an explicit reveal returns it.
+CANARY="e2e-canary-$(date +%s)-${RANDOM}${RANDOM}"
+[[ "$(api_req PATCH "/api/apps/${WHOAMI_ID}/env" "{\"set\":{\"E2E_CANARY\":\"${CANARY}\"}}")" == 200 ]] \
+    || fail "setting an env var must succeed: $(cat "$API_BODY")"
+grep -qF "$CANARY" "$API_BODY" && fail "the env patch response must not echo the value"
+api "/api/apps/${WHOAMI_ID}/env" | grep -qF "$CANARY" && fail "the env listing must mask values"
+[[ "$(api "/api/apps/${WHOAMI_ID}/env/E2E_CANARY" | jq -r '.data.value')" == "$CANARY" ]] \
+    || fail "revealing an env var must return its value"
+for f in "${DATA_DIR}"/tond.db*; do
+    grep -qaF "$CANARY" "$f" && fail "env var value found in plaintext in ${f}"
+    grep -qaF "$REDIS_PASS" "$f" && fail "database password found in plaintext in ${f}"
+    grep -qaF "$WEBHOOK_SECRET" "$f" && fail "webhook secret found in plaintext in ${f}"
+done
+pass "env values, database passwords and webhook secrets are not stored in plaintext"
+
+AUDIT=$(api "/api/audit-log?limit=200")
+for action in env_reveal webhook_secret_reveal db_credentials_reveal; do
+    jq -e --arg a "$action" '[.data[] | select(.action == $a)] | length > 0' <<<"$AUDIT" > /dev/null \
+        || fail "a ${action} must be audit-logged"
+done
+pass "every secret reveal is audit-logged"
+
+step "Per-database backup"
+[[ "$(api_req POST /api/databases/e2e-redis/backups '{}')" == 201 ]] \
+    || fail "backing up a database must succeed: $(cat "$API_BODY")"
+[[ "$(jq -r '.data.status + " " + .data.scope' "$API_BODY")" == "completed database:e2e-redis" ]] \
+    || fail "a database backup must complete with the database scope: $(cat "$API_BODY")"
+DB_BACKUP_ID=$(jq -r '.data.id' "$API_BODY")
+api /api/databases/e2e-redis/backups | jq -e --arg id "$DB_BACKUP_ID" '.data[] | select(.id == $id)' > /dev/null \
+    || fail "the database backup must be listed for the database"
+[[ -d "${DATA_DIR}/backups/snapshots/${DB_BACKUP_ID}/databases/e2e-redis" ]] \
+    || fail "the database backup must hold the database's data"
+pass "database backed up and listed"
+[[ "$(api_req POST "/api/snapshots/${DB_BACKUP_ID}/restore-database" '{"db_name":"e2e-redis"}')" == 200 ]] \
+    || fail "restoring the database must succeed: $(cat "$API_BODY")"
+SAFETY_ID=$(jq -r '.data.pre_restore_snapshot_id // empty' "$API_BODY")
+api /api/snapshots | jq -e --arg id "$SAFETY_ID" '.data[] | select(.id == $id and .scope == "database:e2e-redis" and .trigger == "pre_restore")' > /dev/null \
+    || fail "a database restore must back up the current data first"
+wait_for 60 "e2e-redis answering after the restore" \
+    bash -c "docker exec -e REDISCLI_AUTH='${REDIS_PASS}' tond-db-e2e-redis redis-cli --no-auth-warning --user '${REDIS_USER}' PING | grep -qx PONG"
+pass "database restored from its backup (safety-net backup taken first)"
 
 step "Cron job"
 tond cron create e2e-cron --schedule "0 0 1 1 *" --image alpine:3 --command "echo tond-e2e-cron-ok" > /dev/null

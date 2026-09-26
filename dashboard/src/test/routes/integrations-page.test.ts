@@ -57,9 +57,9 @@ describe('integrations page', () => {
 							enabled: true,
 							name: 'Telegram Alerts',
 							config: {
-								bot_token: 'bot-token',
 								chat_id: '123456'
 							},
+							saved_secrets: ['bot_token'],
 							created_at: '2026-01-01T00:00:00.000Z',
 							updated_at: '2026-01-01T00:00:00.000Z'
 						}
