@@ -7,6 +7,7 @@
 pub mod access;
 pub mod api;
 pub mod apps;
+pub mod audit_shipping;
 pub mod auth;
 pub mod backup;
 pub mod certificates;
@@ -30,6 +31,7 @@ mod secret_fields_test;
 pub use access::*;
 pub use api::*;
 pub use apps::*;
+pub use audit_shipping::*;
 pub use auth::*;
 pub use backup::*;
 pub use certificates::*;

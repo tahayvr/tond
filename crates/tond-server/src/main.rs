@@ -70,6 +70,7 @@
 
 mod alerts;
 mod audit_log;
+mod audit_ship;
 mod auth;
 mod backup;
 mod compose_policy;
@@ -229,6 +230,7 @@ async fn run() -> Result<()> {
     tokio::spawn(alerts::run_alert_checker(state.clone()));
     tokio::spawn(cron::run_cron_scheduler(state.clone()));
     tokio::spawn(janitor::run_janitor(state.clone()));
+    tokio::spawn(audit_ship::run(state.clone()));
     tokio::spawn(backup::backup_scheduler(state.clone()));
     tokio::spawn(run_preview_cleanup_loop(state.clone()));
 
@@ -648,6 +650,15 @@ async fn run() -> Result<()> {
         )
         // Audit log
         .route("/api/audit-log", get(handlers::audit_log::list_audit_log))
+        .route(
+            "/api/audit-log/shipping",
+            get(handlers::audit_shipping::get_shipping)
+                .put(handlers::audit_shipping::update_shipping),
+        )
+        .route(
+            "/api/audit-log/shipping/test",
+            post(handlers::audit_shipping::test_shipping),
+        )
         .route(
             "/api/audit-log/verify",
             get(handlers::audit_log::verify_audit_log),

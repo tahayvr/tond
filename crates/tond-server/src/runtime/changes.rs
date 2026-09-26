@@ -36,10 +36,12 @@ pub enum Table {
     RouteState,
     Deployments,
     Databases,
+    AuditLog,
+    AuditShipping,
 }
 
 impl Table {
-    const ALL: [Table; 8] = [
+    const ALL: [Table; 10] = [
         Table::Apps,
         Table::PreviewDeployments,
         Table::CronJobs,
@@ -48,6 +50,8 @@ impl Table {
         Table::RouteState,
         Table::Deployments,
         Table::Databases,
+        Table::AuditLog,
+        Table::AuditShipping,
     ];
 
     fn index(self) -> usize {
@@ -68,6 +72,8 @@ impl Table {
             "route_state" => Table::RouteState,
             "deployments" => Table::Deployments,
             "databases" => Table::Databases,
+            "audit_log" => Table::AuditLog,
+            "audit_shipping" => Table::AuditShipping,
             _ => return None,
         })
     }

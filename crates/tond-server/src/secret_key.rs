@@ -74,6 +74,8 @@ pub enum Purpose {
     IntegrationSecret,
     /// alert_rules.webhook_url (Slack/Discord-style URLs are bearer secrets)
     AlertWebhookUrl,
+    /// audit_shipping.webhook_secret (HMAC key for shipped audit entries)
+    AuditWebhookSecret,
 }
 
 impl Purpose {
@@ -97,6 +99,7 @@ impl Purpose {
             Purpose::GithubPrivateKey => b"tond:github_apps.private_key",
             Purpose::IntegrationSecret => b"tond:integrations.config",
             Purpose::AlertWebhookUrl => b"tond:alert_rules.webhook_url",
+            Purpose::AuditWebhookSecret => b"tond:audit_shipping.webhook_secret",
         }
     }
 }
@@ -487,6 +490,11 @@ pub const SCALAR_SECRET_COLUMNS: &[(&str, &str, Purpose)] = &[
     ),
     ("github_apps", "private_key", Purpose::GithubPrivateKey),
     ("alert_rules", "webhook_url", Purpose::AlertWebhookUrl),
+    (
+        "audit_shipping",
+        "webhook_secret",
+        Purpose::AuditWebhookSecret,
+    ),
 ];
 
 /// Secrets stored as string fields inside a `config` JSON column.

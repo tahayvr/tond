@@ -37,6 +37,7 @@
 
 pub mod alerts;
 pub mod audit_log;
+pub mod audit_shipping;
 pub mod auth;
 pub mod backups;
 pub mod certificates;

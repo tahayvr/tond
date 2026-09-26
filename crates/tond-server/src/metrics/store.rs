@@ -5,7 +5,7 @@
 //   metrics_raw     30 s samples                 kept RAW_KEEP_SECS  (25 h)
 //   metrics_5m      5-minute rollups             kept M5_KEEP_SECS   (8 days)
 //   metrics_1h      1-hour rollups               kept H1_KEEP_SECS   (90 days)
-//   metric_events   restarts / crashes / OOMs    kept EVENT_KEEP_SECS (90 days)
+//   metric_events   restarts / crashes / OOMs    kept retention_app_events_days (90)
 //
 // Each tick writes all samples in one transaction. Rollups are computed when a
 // bucket closes (every 5 minutes / every hour) with INSERT OR REPLACE, so a
@@ -29,7 +29,6 @@ pub const MAX_POINTS: i64 = 480;
 pub const RAW_KEEP_SECS: i64 = 25 * 3600;
 pub const M5_KEEP_SECS: i64 = 8 * 86_400;
 pub const H1_KEEP_SECS: i64 = 90 * 86_400;
-pub const EVENT_KEEP_SECS: i64 = 90 * 86_400;
 const BATCH: i64 = 2_000;
 const BATCH_PAUSE: Duration = Duration::from_millis(25);
 
@@ -251,7 +250,7 @@ impl RollupTable {
 /// Drop samples, rollups and events past their retention, plus targets whose
 /// owner no longer exists. Returns the number of rows deleted.
 /// Delete expired rows. `event_keep_secs` is how long restart / crash / OOM
-/// events are kept (`retention_app_events_days`, default EVENT_KEEP_SECS).
+/// events are kept (`retention_app_events_days`, default 90 days).
 pub async fn prune(db: &SqlitePool, now: i64, event_keep_secs: i64) -> anyhow::Result<u64> {
     let mut deleted = 0;
 
@@ -693,7 +692,7 @@ mod tests {
             .await
             .unwrap_or_else(|e| panic!("{e}"));
 
-        let deleted = prune(&db, now, EVENT_KEEP_SECS)
+        let deleted = prune(&db, now, 90 * 86_400)
             .await
             .unwrap_or_else(|e| panic!("prune: {e}"));
         assert_eq!(deleted, 5, "old raw + old hourly + orphan raw/event/target");
