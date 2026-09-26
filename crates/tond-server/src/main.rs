@@ -225,6 +225,10 @@ async fn main() -> Result<()> {
             "/api/terminal/targets",
             get(handlers::terminal::list_targets),
         )
+        .route(
+            "/api/terminal/tickets",
+            post(handlers::terminal::create_ticket),
+        )
         .route("/api/terminal/ws", get(handlers::terminal::terminal_ws))
         .route("/api/apps/{id}/env", put(handlers::update_env))
         .route("/api/apps/{id}/domain", put(handlers::update_domain))
@@ -258,6 +262,16 @@ async fn main() -> Result<()> {
         // Server settings
         .route("/api/settings", get(handlers::settings::get_settings))
         .route("/api/settings", put(handlers::settings::update_settings))
+        // Host terminal switch: readable by any authenticated caller, writable
+        // only over the root-only Unix socket (`tond settings host-terminal`)
+        .route(
+            "/api/settings/host-terminal",
+            get(handlers::terminal::get_host_terminal),
+        )
+        .route(
+            "/api/settings/host-terminal",
+            put(handlers::terminal::set_host_terminal),
+        )
         .route("/api/templates", get(handlers::templates::list_templates))
         // Git integration — auto-deploy toggle, webhook secret, deploy keys, source
         .route(

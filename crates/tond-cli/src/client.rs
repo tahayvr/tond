@@ -43,6 +43,12 @@ use tond_common::{
     StorageProviderResponse, UpdateCronJobRequest, UpdateSettingsRequest,
 };
 
+/// Body and response of `/api/settings/host-terminal`.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct HostTerminalSetting {
+    enabled: bool,
+}
+
 pub struct TondClient {
     base_url: String,
     client: reqwest::Client,
@@ -1049,6 +1055,36 @@ impl TondClient {
         let resp: ApiResponse<ServerSettings> = self.auth_header(req).send().await?.json().await?;
         if resp.success {
             resp.data.context("No data returned")
+        } else {
+            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
+        }
+    }
+
+    /// Whether the dashboard's host terminal is switched on.
+    pub async fn get_host_terminal(&self) -> Result<bool> {
+        let req = self
+            .client
+            .get(format!("{}/api/settings/host-terminal", self.base_url));
+        let resp: ApiResponse<HostTerminalSetting> =
+            self.auth_header(req).send().await?.json().await?;
+        if resp.success {
+            Ok(resp.data.context("No data returned")?.enabled)
+        } else {
+            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
+        }
+    }
+
+    /// Switch the dashboard's host terminal on or off. The server accepts this
+    /// only over the local Unix socket.
+    pub async fn set_host_terminal(&self, enabled: bool) -> Result<bool> {
+        let req = self
+            .client
+            .put(format!("{}/api/settings/host-terminal", self.base_url))
+            .json(&HostTerminalSetting { enabled });
+        let resp: ApiResponse<HostTerminalSetting> =
+            self.auth_header(req).send().await?.json().await?;
+        if resp.success {
+            Ok(resp.data.context("No data returned")?.enabled)
         } else {
             anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
         }
