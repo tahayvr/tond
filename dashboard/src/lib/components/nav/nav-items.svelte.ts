@@ -6,20 +6,22 @@ export interface NavItem {
 	icon?: string;
 	/** Only shown to users holding this scope */
 	scope?: string;
+	/** Shown directly in the desktop bar; everything else goes under "More". */
+	primary?: boolean;
 }
 
 export const navItems: NavItem[] = [
-	{ href: '/projects', label: 'Projects', icon: 'app' },
-	{ href: '/apps', label: 'Apps', icon: 'rocket' },
-	{ href: '/databases', label: 'Databases', icon: 'database' },
-	{ href: '/cron', label: 'Cron jobs', icon: 'clock' },
+	{ href: '/projects', label: 'Projects', icon: 'app', primary: true },
+	{ href: '/apps', label: 'Apps', icon: 'rocket', primary: true },
+	{ href: '/databases', label: 'Databases', icon: 'database', primary: true },
+	{ href: '/cron', label: 'Cron jobs', icon: 'clock', primary: true },
 	{ href: '/snapshots', label: 'Snapshots', icon: 'clock' },
-	{ href: '/alerts', label: 'Alerts', icon: 'bell' },
+	{ href: '/alerts', label: 'Alerts', icon: 'bell', primary: true },
 	{ href: '/certificates', label: 'Certificates', icon: 'lock' },
 	{ href: '/integrations', label: 'Integrations', icon: 'puzzle', scope: 'settings:write' },
 	{ href: '/activity', label: 'Activity', icon: 'activity' },
 	// { href: '/iam', label: 'IAM', icon: 'fingerprint-pattern' },
-	{ href: '/system', label: 'System', icon: 'app' },
+	{ href: '/system', label: 'System', icon: 'app', primary: true },
 	{ href: '/users', label: 'Users', icon: 'team', scope: 'users:admin' },
 	{ href: '/settings', label: 'Settings', icon: 'settings' }
 ];
