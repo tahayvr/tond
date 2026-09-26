@@ -429,12 +429,18 @@ fn bind_local_socket(path: &Path) -> Result<tokio::net::UnixListener> {
 // ── Preview cleanup ──
 //
 // Sleeps until the earliest preview expiry (at most PREVIEW_CLEANUP_MAX_SLEEP)
-// or until preview_deployments changes. Then finds all preview_deployments
-// whose expires_at has passed and whose status is not yet 'expired', stops
-// the container (best-effort) and marks the row as expired.
+// or until preview_deployments changes. Then stops the container (best-effort)
+// of every active preview whose expires_at has passed and marks the row as
+// expired. Deadlines are compared as parsed timestamps, never as strings:
+// expires_at is RFC 3339 (`2026-01-01T10:00:00+00:00`) and SQLite's
+// datetime('now') is `2026-01-01 10:00:00`, so a string comparison would
+// keep a preview alive until the end of its expiry day, and the loop would
+// wake every second until then.
 
 /// Longest sleep of the preview cleanup loop when nothing is about to expire.
 const PREVIEW_CLEANUP_MAX_SLEEP: Duration = Duration::from_secs(3600);
+/// Sleep after a failed cleanup pass before trying again.
+const PREVIEW_CLEANUP_RETRY: Duration = Duration::from_secs(60);
 
 async fn run_preview_cleanup_loop(state: AppState) {
     use crate::runtime::changes::{Table, Watch};
@@ -442,57 +448,76 @@ async fn run_preview_cleanup_loop(state: AppState) {
     let mut watch = Watch::new(&[Table::PreviewDeployments]);
     loop {
         let run = lp.run();
-        match run_preview_cleanup(&state).await {
-            Ok(()) => drop(run),
+        let sleep = match run_preview_cleanup(&state).await {
+            Ok(next) => {
+                drop(run);
+                next.map_or(PREVIEW_CLEANUP_MAX_SLEEP, |d| {
+                    d.min(PREVIEW_CLEANUP_MAX_SLEEP)
+                })
+            }
             Err(e) => {
                 tracing::warn!("Preview cleanup error: {}", e);
                 run.fail(&e);
+                PREVIEW_CLEANUP_RETRY
             }
-        }
-        let sleep = next_preview_expiry(&state)
-            .await
-            .map_or(PREVIEW_CLEANUP_MAX_SLEEP, |d| {
-                d.min(PREVIEW_CLEANUP_MAX_SLEEP)
-            });
+        };
         lp.wait(Some(sleep), &mut watch).await;
     }
 }
 
-/// Time until the next active preview expires (zero if one already has).
-async fn next_preview_expiry(state: &AppState) -> Option<Duration> {
-    let next: Option<String> = sqlx::query_scalar(
-        "SELECT MIN(expires_at) FROM preview_deployments WHERE status != 'expired'",
-    )
-    .fetch_one(&state.db)
-    .await
-    .ok()
-    .flatten();
-    let next = next?;
-    let at = chrono::DateTime::parse_from_rfc3339(&next)
+/// A stored timestamp: RFC 3339, or SQLite's `YYYY-MM-DD HH:MM:SS` (UTC).
+fn parse_stored_ts(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
         .map(|t| t.with_timezone(&chrono::Utc))
         .or_else(|_| {
-            chrono::NaiveDateTime::parse_from_str(&next, "%Y-%m-%d %H:%M:%S").map(|n| n.and_utc())
+            chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S").map(|n| n.and_utc())
         })
-        .ok()?;
-    // +1 s so the comparison with datetime('now') in the cleanup query holds.
-    Some((at - chrono::Utc::now()).to_std().unwrap_or(Duration::ZERO) + Duration::from_secs(1))
+        .ok()
 }
 
-async fn run_preview_cleanup(state: &AppState) -> anyhow::Result<()> {
-    let expired: Vec<(String, Option<String>)> = sqlx::query_as(
-        "SELECT id, container_id FROM preview_deployments
-         WHERE status != 'expired' AND expires_at < datetime('now')",
+/// Split active previews `(id, expires_at)` at `now`: the ids that are due
+/// (expires_at at or before now) and the time until the earliest remaining
+/// deadline. A row whose expires_at doesn't parse is neither (it is logged).
+fn preview_deadlines<'a>(
+    active: impl IntoIterator<Item = (&'a str, &'a str)>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (Vec<&'a str>, Option<Duration>) {
+    let mut due = Vec::new();
+    let mut next: Option<chrono::DateTime<chrono::Utc>> = None;
+    for (id, expires_at) in active {
+        match parse_stored_ts(expires_at) {
+            Some(at) if at <= now => due.push(id),
+            Some(at) => next = Some(next.map_or(at, |n| n.min(at))),
+            None => tracing::warn!("Preview {id} has an unreadable expiry '{expires_at}'"),
+        }
+    }
+    let wait = next.map(|at| (at - now).to_std().unwrap_or(Duration::ZERO));
+    (due, wait)
+}
+
+/// Expire the previews that are due; returns the time until the next one is.
+async fn run_preview_cleanup(state: &AppState) -> anyhow::Result<Option<Duration>> {
+    let active: Vec<(String, Option<String>, String)> = sqlx::query_as(
+        "SELECT id, container_id, expires_at FROM preview_deployments
+         WHERE status != 'expired'",
     )
     .fetch_all(&state.db)
     .await?;
+    let (due, next) = preview_deadlines(
+        active.iter().map(|(id, _, at)| (id.as_str(), at.as_str())),
+        chrono::Utc::now(),
+    );
 
-    for (preview_id, container_id) in expired {
-        if let Some(ref cid) = container_id {
+    for (preview_id, container_id, _) in active
+        .iter()
+        .filter(|(id, _, _)| due.contains(&id.as_str()))
+    {
+        if let Some(cid) = container_id {
             let _ = docker::stop_container(&state.docker, cid).await;
             let _ = docker::remove_container(&state.docker, cid).await;
         }
         sqlx::query("UPDATE preview_deployments SET status = 'expired' WHERE id = ?")
-            .bind(&preview_id)
+            .bind(preview_id)
             .execute(&state.db)
             .await?;
         tracing::info!("Preview {} expired and cleaned up", preview_id);
@@ -511,7 +536,7 @@ async fn run_preview_cleanup(state: &AppState) -> anyhow::Result<()> {
     .execute(&state.db)
     .await?;
 
-    Ok(())
+    Ok(next)
 }
 
 #[cfg(test)]
@@ -596,6 +621,37 @@ mod tests {
             rate_limiter: RateLimiter::new(60, 10.0),
             settings: Arc::new(RwLock::new(ServerSettings::default())),
         }
+    }
+
+    #[test]
+    fn preview_deadlines_compare_timestamps_not_strings() {
+        let now =
+            parse_stored_ts("2026-03-10T12:00:00+00:00").unwrap_or_else(|| panic!("parse now"));
+        let (due, next) = preview_deadlines(
+            [
+                // Earlier the same day: as a string, "2026-03-10T09..." sorts
+                // after SQLite's "2026-03-10 12:00:00", which kept it alive.
+                ("same-day", "2026-03-10T09:00:00+00:00"),
+                // Another offset, same instant as 11:00 UTC.
+                ("offset", "2026-03-10T13:00:00+02:00"),
+                ("sqlite-format", "2026-03-10 11:59:59"),
+                ("later", "2026-03-10T12:30:00.123456789+00:00"),
+                ("tomorrow", "2026-03-11T00:00:00Z"),
+                ("garbage", "soon"),
+            ],
+            now,
+        );
+        assert_eq!(due, vec!["same-day", "offset", "sqlite-format"]);
+        // Sleep until the next deadline (30 min and a bit), not one second.
+        let next = next.unwrap_or_else(|| panic!("a deadline remains"));
+        assert!(
+            next >= Duration::from_secs(30 * 60) && next < Duration::from_secs(30 * 60 + 1),
+            "{next:?}"
+        );
+
+        let (due, next) = preview_deadlines([("g", "never")], now);
+        assert!(due.is_empty());
+        assert_eq!(next, None, "no parseable deadline: sleep the maximum");
     }
 
     #[tokio::test]
@@ -694,9 +750,10 @@ mod tests {
         .await
         .unwrap_or_else(|err| panic!("failed to seed expired preview row: {err}"));
 
-        run_preview_cleanup(&state)
+        let next = run_preview_cleanup(&state)
             .await
             .unwrap_or_else(|err| panic!("expected run_preview_cleanup to succeed: {err}"));
+        assert_eq!(next, None, "nothing else is waiting to expire");
 
         let status: String =
             sqlx::query_scalar("SELECT status FROM preview_deployments WHERE id = ?")
