@@ -60,6 +60,6 @@ describe('cron page', () => {
 		});
 
 		expect(screen.queryByText(/loading_schedules/i)).not.toBeInTheDocument();
-		expect(screen.getByText(/1\/1 schedules active/i)).toBeInTheDocument();
+		expect(screen.getByText(/1 of 1 enabled/i)).toBeInTheDocument();
 	});
 });

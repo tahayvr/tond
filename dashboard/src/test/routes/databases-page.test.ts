@@ -56,6 +56,6 @@ describe('databases page', () => {
 		});
 
 		expect(screen.queryByText(/loading_datastores/i)).not.toBeInTheDocument();
-		expect(screen.getByText(/1\/1 datastores_active/i)).toBeInTheDocument();
+		expect(screen.getByText(/1 of 1 running/i)).toBeInTheDocument();
 	});
 });

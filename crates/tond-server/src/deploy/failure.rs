@@ -253,7 +253,7 @@ fn classify_inner(ctx: &FailureContext<'_>) -> DeployFailure {
                 Some(Clone),
                 "branch_not_found",
                 "The branch doesn't exist in the repository",
-                "Check the branch name in the Git tab; it must match a branch on the remote exactly.",
+                "Check the branch name under Settings → Git; it must match a branch on the remote exactly.",
             );
         }
         if contains_any(
@@ -273,7 +273,7 @@ fn classify_inner(ctx: &FailureContext<'_>) -> DeployFailure {
                 Some(Clone),
                 "repo_access_denied",
                 "Tond couldn't access the repository",
-                "The repository is private or the URL is wrong. Link a GitHub App or GitLab token in the Git tab, or add the app's deploy key to the repository, then deploy again.",
+                "The repository is private or the URL is wrong. Link a GitHub App or GitLab token under Settings → Git, or add the app's deploy key to the repository, then deploy again.",
             );
         }
         return failure(
@@ -305,9 +305,9 @@ fn classify_inner(ctx: &FailureContext<'_>) -> DeployFailure {
                 "image_pull_denied",
                 "The registry refused to hand out the image",
                 if ctx.has_registry_credential {
-                    "The attached registry credentials were rejected, or the image name is wrong. Check the image name and tag, and update the credentials in the Environment tab."
+                    "The attached registry credentials were rejected, or the image name is wrong. Check the image name and tag, and update the credentials under Settings → Environment."
                 } else {
-                    "Check the image name and tag. If the image is private, add registry credentials in the Environment tab and deploy again."
+                    "Check the image name and tag. If the image is private, add registry credentials under Settings → Environment and deploy again."
                 },
             );
         }
@@ -403,7 +403,7 @@ fn classify_inner(ctx: &FailureContext<'_>) -> DeployFailure {
                     "app_oom",
                     "The app was killed for running out of memory",
                     format!(
-                        "It hit its memory limit{limit}. Raise the memory limit in the Resources tab, or reduce the app's memory use."
+                        "It hit its memory limit{limit}. Raise the memory limit under Settings → Resources, or reduce the app's memory use."
                     ),
                 );
                 f.excerpt = tail(ctx.container_logs);
@@ -441,7 +441,7 @@ fn classify_inner(ctx: &FailureContext<'_>) -> DeployFailure {
                 "port_not_listening",
                 format!("Nothing accepted connections on port {port} within {timeout}s"),
                 format!(
-                    "Tond expected the service to listen on TCP port {port} inside the container, on 0.0.0.0. Change the app's port if it uses another one. If it doesn't listen at all (a queue consumer, a scheduler), make it a background worker in the Health tab."
+                    "Tond expected the service to listen on TCP port {port} inside the container, on 0.0.0.0. Change the app's port if it uses another one. If it doesn't listen at all (a queue consumer, a scheduler), make it a background worker under Settings → Health."
                 ),
             );
             f.excerpt = tail(ctx.container_logs);
@@ -454,7 +454,7 @@ fn classify_inner(ctx: &FailureContext<'_>) -> DeployFailure {
                     "port_not_listening",
                     format!("Nothing answered on port {port} within {timeout}s"),
                     format!(
-                        "Tond expected the app to listen on port {port} inside the container. If it uses another port (nginx listens on 80, many Node apps on 3000), change the app's port; make sure the app binds to 0.0.0.0, not localhost. If it serves no traffic at all (a queue worker), make it a background worker in the Health tab."
+                        "Tond expected the app to listen on port {port} inside the container. If it uses another port (nginx listens on 80, many Node apps on 3000), change the app's port; make sure the app binds to 0.0.0.0, not localhost. If it serves no traffic at all (a queue worker), make it a background worker under Settings → Health."
                     ),
                 );
                 f.excerpt = tail(ctx.container_logs);
@@ -467,7 +467,7 @@ fn classify_inner(ctx: &FailureContext<'_>) -> DeployFailure {
                     "health_check_failed",
                     format!("The health check at {path} returned HTTP {status}"),
                     format!(
-                        "Tond polls port {port}{path} inside the container and needs a 2xx answer. Fix the endpoint, or change or clear the health check path in the Health tab."
+                        "Tond polls port {port}{path} inside the container and needs a 2xx answer. Fix the endpoint, or change or clear the health check path under Settings → Health."
                     ),
                 );
                 f.excerpt = tail(ctx.container_logs);
@@ -480,7 +480,7 @@ fn classify_inner(ctx: &FailureContext<'_>) -> DeployFailure {
                     "health_check_timeout",
                     format!("The health check at {path} didn't answer in time"),
                     format!(
-                        "Requests to port {port}{path} timed out for {timeout}s. If the app needs longer to boot, raise the drain timeout in the Health tab."
+                        "Requests to port {port}{path} timed out for {timeout}s. If the app needs longer to boot, raise the drain timeout under Settings → Health."
                     ),
                 );
                 f.excerpt = tail(ctx.container_logs);

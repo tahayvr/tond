@@ -248,7 +248,7 @@
 					<div class="pt-1">
 						<div class="text-muted-foreground">Volumes ({volumes.length}):</div>
 						{#each volumes as vol (vol.container_path)}
-							<div class="mt-0.5 truncate font-mono text-xs text-muted-foreground/80">
+							<div class="mt-0.5 truncate font-mono text-xs text-muted-foreground">
 								↳ {vol.container_path}
 							</div>
 						{/each}

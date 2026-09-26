@@ -1,4 +1,6 @@
 <script lang="ts">
+	import PageTitle from '$lib/components/nav/page-title.svelte';
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { checkPasswordLink, completePasswordLink, type PasswordLinkInfo } from '$lib/api';
@@ -76,6 +78,8 @@
 	}
 </script>
 
+<PageTitle title="Set password" />
+
 <div class="flex min-h-[80vh] flex-col items-center justify-center px-4">
 	<div class="w-full max-w-md space-y-8">
 		<div class="flex flex-col items-center gap-3">
@@ -132,11 +136,7 @@
 						autocomplete="new-password"
 					/>
 				</div>
-				{#if error}
-					<p class="rounded-md bg-destructive/10 p-3 text-sm text-destructive" role="alert">
-						{error}
-					</p>
-				{/if}
+				<InlineError message={error} />
 				<Button type="submit" class="w-full" disabled={saving}>
 					{saving ? 'Saving…' : info?.purpose === 'reset' ? 'Set new password' : 'Create account'}
 				</Button>

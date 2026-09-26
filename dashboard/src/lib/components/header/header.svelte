@@ -1,5 +1,4 @@
 <script lang="ts">
-	import { goto } from '$app/navigation';
 	import TondLogo from '../brand/tond-logo.svelte';
 	import DesktopNav from '../nav/desktop-nav.svelte';
 	import MobileNav from '../nav/mobile-nav.svelte';
@@ -7,6 +6,8 @@
 	import { clearAuth, getUser } from '$lib/auth.svelte';
 	import { logout } from '$lib/api';
 	import { Button } from '$lib/components/ui/button/index.js';
+	import { setPaletteOpen } from '$lib/ui-context.svelte';
+	import SearchIcon from '~icons/ri/search-line';
 
 	async function handleLogout() {
 		try {
@@ -26,15 +27,29 @@
 			<MobileNav email={getUser()?.email} onLogout={handleLogout} />
 		</div>
 
-		<button onclick={() => goto('/')} class="hover:cursor-pointer" aria-label="Tond home">
+		<a href="/" class="rounded-sm" aria-label="Tond home">
 			<TondLogo class="h-5 w-auto" />
-		</button>
+		</a>
 
 		<div class="hidden items-center lg:flex">
 			<DesktopNav />
 		</div>
 	</div>
 	<div class="flex items-center gap-2">
+		<Button
+			variant="outline"
+			size="sm"
+			class="h-8 gap-2 px-2 text-xs font-normal text-muted-foreground normal-case sm:w-44 sm:justify-start"
+			onclick={() => setPaletteOpen(true)}
+			aria-label="Search and run commands"
+			aria-keyshortcuts="Meta+K Control+K"
+		>
+			<SearchIcon class="size-4" />
+			<span class="hidden sm:inline">Search…</span>
+			<kbd class="ml-auto hidden rounded-sm border bg-muted px-1 font-mono text-[11px] sm:inline"
+				>⌘K</kbd
+			>
+		</Button>
 		<Button
 			href="/profile"
 			variant="ghost"

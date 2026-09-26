@@ -1,24 +1,32 @@
 <script lang="ts">
 	import {
+		getOnboardingStatus,
+		getSystemMetrics,
 		type Project,
 		type App,
 		type ManagedDatabase,
 		type CronJob,
-		type AuditLogEntry
+		type AuditLogEntry,
+		type OnboardingStatus,
+		type SystemMetrics
 	} from '$lib/api';
+	import { getUser, can } from '$lib/auth.svelte';
 	import { setUiContext, clearUiContext, projectsContext } from '$lib/ui-context.svelte';
 	import { Button } from '$lib/components/ui/button/index.js';
-	import { Badge } from '$lib/components/ui/badge/index.js';
-	import { goto } from '$app/navigation';
+	import { Skeleton } from '$lib/components/ui/skeleton/index.js';
+	import PageHeader from '$lib/components/nav/page-header.svelte';
+	import StatusBadge from '$lib/components/feedback/status-badge.svelte';
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
+	import { errorMessage } from '$lib/action.svelte';
+	import { buildChecklist } from '$lib/onboarding';
+	import { appTabHref } from '$lib/tabs';
+	import { formatRelativePast } from '$lib/time';
 	import Plus from '~icons/ri/add-line';
+	import CheckIcon from '~icons/ri/checkbox-circle-fill';
+	import TodoIcon from '~icons/ri/checkbox-blank-circle-line';
 	import Rocket from '~icons/ri/rocket-line';
 	import Database from '~icons/ri/database-2-line';
 	import Clock from '~icons/ri/time-line';
-	import Activity from '~icons/ri/pulse-line';
-	import Zap from '~icons/ri/flashlight-line';
-	import Server from '~icons/ri/server-line';
-	import Box from '~icons/ri/box-3-line';
-	import { cn } from '$lib/utils';
 	import { actorLabel } from '$lib/access';
 	import type { PageProps } from './$types';
 
@@ -32,77 +40,44 @@
 	let serverName = $derived(data.serverName);
 
 	let runningApps = $derived(apps.filter((a) => a.status === 'running').length);
+	let troubledApps = $derived(
+		apps.filter((a) => a.status === 'failed' || a.status === 'unhealthy')
+	);
 	let runningDatabases = $derived(databases.filter((d) => d.status === 'running').length);
-	let enabledCronJobs = $derived(cronJobs.filter((c) => c.enabled).length);
-	let hasResources = $derived(
-		projects.length > 0 || apps.length > 0 || databases.length > 0 || cronJobs.length > 0
-	);
+	let failedJobs = $derived(cronJobs.filter((c) => c.enabled && c.last_run_status === 'failed'));
 
-	// Group apps by project
-	let appsByProject = $derived(
-		apps.reduce<Record<string, App[]>>((acc, app) => {
-			const pid = app.project_id ?? 'unassigned';
-			if (!acc[pid]) acc[pid] = [];
-			acc[pid].push(app);
-			return acc;
-		}, {})
-	);
+	// The checklist and health tile load in the background so the page shows at once
+	// (the onboarding check resolves DNS, which can take a few seconds).
+	let onboarding = $state<OnboardingStatus | null>(null);
+	let onboardingError = $state('');
+	let metrics = $state<SystemMetrics | null>(null);
 
-	// Group databases by project
-	let dbsByProject = $derived(
-		databases.reduce<Record<string, ManagedDatabase[]>>((acc, db) => {
-			const pid = db.project_id ?? 'unassigned';
-			if (!acc[pid]) acc[pid] = [];
-			acc[pid].push(db);
-			return acc;
-		}, {})
-	);
+	$effect(() => {
+		let cancelled = false;
+		getOnboardingStatus()
+			.then((s) => !cancelled && (onboarding = s))
+			.catch((e) => !cancelled && (onboardingError = errorMessage(e)));
+		getSystemMetrics()
+			.then((m) => !cancelled && (metrics = m))
+			.catch(() => {});
+		return () => {
+			cancelled = true;
+		};
+	});
 
-	// Group cron jobs by project
-	let jobsByProject = $derived(
-		cronJobs.reduce<Record<string, CronJob[]>>((acc, job) => {
-			const pid = job.project_id ?? 'unassigned';
-			if (!acc[pid]) acc[pid] = [];
-			acc[pid].push(job);
-			return acc;
-		}, {})
+	let checklist = $derived(
+		onboarding ? buildChecklist(onboarding, getUser()?.totp_enabled ?? false) : []
 	);
+	let doneCount = $derived(checklist.filter((i) => i.done).length);
+	let checklistComplete = $derived(checklist.length > 0 && doneCount === checklist.length);
 
-	function actionVariant(
-		action: string
-	): 'default' | 'secondary' | 'destructive' | 'outline' | undefined {
-		switch (action) {
-			case 'delete':
-				return 'destructive';
-			case 'create':
-			case 'deploy':
-				return 'default';
-			case 'stop':
-				return 'secondary';
-			default:
-				return 'outline';
-		}
+	function projectName(id: string | null): string | null {
+		if (!id) return null;
+		return projects.find((p) => p.id === id)?.name ?? null;
 	}
 
-	function appStatusColor(app: App): string {
-		switch (app.status) {
-			case 'running':
-				return 'border-success/60 bg-success/10';
-			case 'failed':
-				return 'border-destructive/60 bg-destructive/10';
-			case 'unhealthy':
-				return 'border-warn/60 bg-warn/10';
-			default:
-				return 'border-border bg-muted/50';
-		}
-	}
-
-	function dbStatusColor(db: ManagedDatabase): string {
-		return db.status === 'running' ? 'border-accent/60 bg-accent/10' : 'border-border bg-muted/20';
-	}
-
-	function jobStatusColor(job: CronJob): string {
-		return job.enabled ? 'border-secondary/60 bg-secondary/10' : 'border-border bg-muted/20';
+	function actionLabel(action: string): string {
+		return action.replace(/_/g, ' ');
 	}
 
 	$effect(() => {
@@ -112,353 +87,234 @@
 </script>
 
 <div class="space-y-6">
-	<!-- Header -->
-	<div class="flex items-center justify-between gap-4">
-		<div>
-			<h1 class="text-3xl font-extrabold uppercase">Dashboard</h1>
-		</div>
-		<div class="flex items-center gap-2">
-			<Button variant="outline" size="sm" onclick={() => goto('/projects')}>
-				<Plus class="mr-1 h-4 w-4" />
-				New Project
-			</Button>
-		</div>
-	</div>
-
-	<!-- Tactical Server Map -->
-	<div class="relative overflow-hidden rounded-lg border border-border bg-card">
-		<!-- Grid background with scanlines -->
-		<div
-			class="pointer-events-none absolute inset-0 opacity-5"
-			style="background-image: 
-					linear-gradient(to right, var(--color-border) 1px, transparent 1px),
-					linear-gradient(to bottom, var(--color-border) 1px, transparent 1px);
-				background-size: 40px 40px;"
-		></div>
-		<div
-			class="pointer-events-none absolute inset-0 opacity-5"
-			style="background: repeating-linear-gradient(0deg, transparent, transparent 2px, var(--color-foreground) 2px, var(--color-foreground) 4px);"
-		></div>
-
-		<!-- Decorative corner markers -->
-		<div
-			class="pointer-events-none absolute top-0 left-0 h-8 w-8 border-t-2 border-l-2 border-border/70"
-		></div>
-		<div
-			class="pointer-events-none absolute top-0 right-0 h-8 w-8 border-t-2 border-r-2 border-border/70"
-		></div>
-		<div
-			class="pointer-events-none absolute bottom-0 left-0 h-8 w-8 border-b-2 border-l-2 border-border/70"
-		></div>
-		<div
-			class="pointer-events-none absolute right-0 bottom-0 h-8 w-8 border-r-2 border-b-2 border-border/70"
-		></div>
-
-		<div class="relative p-6">
-			<!-- Map Header -->
-			<div class="mb-6 flex items-center justify-between border-b border-border pb-4">
-				<div class="flex items-center gap-3">
-					<Server class="h-5 w-5 text-muted-foreground" />
-					<div>
-						<p class="font-mono text-[10px] tracking-[0.3em] text-muted-foreground/70 uppercase">
-							INFRASTRUCTURE_MAP
-						</p>
-						<p class="font-mono text-sm tracking-wider text-foreground uppercase">
-							{serverName || 'TOND SERVER'}
-						</p>
-					</div>
-				</div>
-				<div class="flex items-center gap-4 text-xs text-muted-foreground">
-					<div class="flex items-center gap-2">
-						<span class="inline-block size-2 rounded-full bg-success/60"></span>
-						<span class="font-mono">{runningApps} APPS RUNNING</span>
-					</div>
-					<div class="flex items-center gap-2">
-						<span class="inline-block size-2 rounded-full bg-accent/60"></span>
-						<span class="font-mono">{runningDatabases} DBS ACTIVE</span>
-					</div>
-					<div class="flex items-center gap-2">
-						<span class="inline-block size-2 rounded-full bg-secondary/60"></span>
-						<span class="font-mono">{enabledCronJobs} CRON ENABLED</span>
-					</div>
-				</div>
-			</div>
-
-			{#if !hasResources}
-				<div class="flex flex-col items-center justify-center py-16">
-					<Box class="mb-4 h-12 w-12 text-muted-foreground/40" />
-					<p class="font-mono text-[11px] tracking-widest text-muted-foreground/60 uppercase">
-						NO_ACTIVE_NODES
-					</p>
-					<p class="mt-2 text-sm text-muted-foreground/70">
-						Server is online. Use the setup actions above to deploy your first workload.
-					</p>
-					<Button class="mt-4" onclick={() => goto('/projects')}>
-						<Plus class="mr-1 h-4 w-4" />
-						Create Project
-					</Button>
-				</div>
-			{:else}
-				<!-- Project Sectors -->
-				<div class="grid gap-6">
-					{#each projects as project (project.id)}
-						<div class="relative">
-							<!-- Project label -->
-							<div class="mb-3 flex items-center gap-2">
-								<div class="font-mono text-xs tracking-wider text-muted-foreground">
-									{project.id.slice(0, 4).toUpperCase()}
-								</div>
-								<button
-									onclick={() => goto(`/projects/${project.id}`)}
-									class="font-mono text-sm font-semibold tracking-wider text-foreground hover:text-foreground"
-								>
-									{project.name.toUpperCase()}
-								</button>
-							</div>
-
-							<!-- Nodes in this project -->
-							<div class="flex flex-wrap items-start gap-3">
-								<!-- Apps -->
-								{#each appsByProject[project.id] ?? [] as app (app.id)}
-									<button
-										onclick={() => goto(`/apps/${app.id}`)}
-										class={cn(
-											'flex items-center gap-2 rounded border bg-background px-3 py-2 hover:cursor-pointer',
-											appStatusColor(app)
-										)}
-									>
-										<Rocket class="h-4 w-4 shrink-0" />
-										<div class="text-left">
-											<div class="font-mono text-xs tracking-wider text-foreground">
-												{app.name}
-											</div>
-											<div
-												class="font-mono text-[10px] tracking-wider text-muted-foreground uppercase"
-											>
-												{app.status}
-											</div>
-										</div>
-									</button>
-								{/each}
-
-								<!-- Databases -->
-								{#each dbsByProject[project.id] ?? [] as db (db.id)}
-									<button
-										onclick={() => goto('/databases')}
-										class={cn(
-											'flex items-center gap-2 rounded border bg-background px-3 py-2 hover:cursor-pointer',
-											dbStatusColor(db)
-										)}
-									>
-										<Database class="h-4 w-4 shrink-0 text-accent" />
-										<div class="text-left">
-											<div class="font-mono text-xs tracking-wider text-foreground">
-												{db.name}
-											</div>
-											<div
-												class="font-mono text-[10px] tracking-wider text-muted-foreground uppercase"
-											>
-												{db.db_type}
-											</div>
-										</div>
-									</button>
-								{/each}
-
-								<!-- Cron Jobs -->
-								{#each jobsByProject[project.id] ?? [] as job (job.id)}
-									<button
-										onclick={() => goto('/cron')}
-										class={cn(
-											'flex items-center gap-2 rounded border bg-background px-3 py-2 hover:cursor-pointer',
-											jobStatusColor(job)
-										)}
-									>
-										<Clock class="h-4 w-4 shrink-0 text-secondary" />
-										<div class="text-left">
-											<div class="font-mono text-xs tracking-wider text-foreground">
-												{job.name}
-											</div>
-											<div class="font-mono text-[10px] tracking-wider text-muted-foreground">
-												{job.schedule}
-											</div>
-										</div>
-									</button>
-								{/each}
-							</div>
-						</div>
-					{/each}
-
-					<!-- Unassigned Resources -->
-					{#if appsByProject['unassigned']?.length || dbsByProject['unassigned']?.length || jobsByProject['unassigned']?.length}
-						<div class="relative border-t border-border pt-4">
-							<div class="mb-3 flex items-center gap-2">
-								<div class="font-mono text-sm font-semibold tracking-wider text-muted-foreground">
-									UNASSIGNED_RESOURCES
-								</div>
-							</div>
-
-							<div class="flex flex-wrap items-start gap-3">
-								{#each appsByProject['unassigned'] ?? [] as app (app.id)}
-									<button
-										onclick={() => goto(`/apps/${app.id}`)}
-										class={cn(
-											'flex items-center gap-2 rounded border px-3 py-2 hover:cursor-pointer',
-											appStatusColor(app)
-										)}
-									>
-										<Rocket class="h-4 w-4 shrink-0" />
-										<div class="text-left">
-											<div class="font-mono text-xs tracking-wider text-foreground">
-												{app.name}
-											</div>
-											<div
-												class="font-mono text-[10px] tracking-wider text-muted-foreground uppercase"
-											>
-												{app.status}
-											</div>
-										</div>
-									</button>
-								{/each}
-
-								{#each dbsByProject['unassigned'] ?? [] as db (db.id)}
-									<button
-										onclick={() => goto('/databases')}
-										class={cn(
-											'flex items-center gap-2 rounded border px-3 py-2 hover:cursor-pointer',
-											dbStatusColor(db)
-										)}
-									>
-										<Database class="h-4 w-4 shrink-0 text-accent" />
-										<div class="text-left">
-											<div class="font-mono text-xs tracking-wider text-foreground">
-												{db.name}
-											</div>
-											<div
-												class="font-mono text-[10px] tracking-wider text-muted-foreground uppercase"
-											>
-												{db.db_type}
-											</div>
-										</div>
-									</button>
-								{/each}
-
-								{#each jobsByProject['unassigned'] ?? [] as job (job.id)}
-									<button
-										onclick={() => goto('/cron')}
-										class={cn(
-											'flex items-center gap-2 rounded border px-3 py-2 hover:cursor-pointer',
-											jobStatusColor(job)
-										)}
-									>
-										<Clock class="h-4 w-4 shrink-0 text-secondary" />
-										<div class="text-left">
-											<div class="font-mono text-xs tracking-wider text-foreground">
-												{job.name}
-											</div>
-											<div class="font-mono text-[10px] tracking-wider text-muted-foreground">
-												{job.schedule}
-											</div>
-										</div>
-									</button>
-								{/each}
-							</div>
-						</div>
-					{/if}
-				</div>
+	<PageHeader title="Home" docTitle="Home" description={serverName || undefined}>
+		{#snippet actions()}
+			{#if can('apps:write')}
+				<Button variant="outline" size="sm" href="/projects">
+					<Plus class="mr-1 h-4 w-4" />
+					New project
+				</Button>
+				<Button size="sm" href="/apps/new">
+					<Plus class="mr-1 h-4 w-4" />
+					New app
+				</Button>
 			{/if}
-		</div>
-	</div>
+		{/snippet}
+	</PageHeader>
 
-	<!-- Quick Access Panel -->
-	<div class="grid gap-4 sm:grid-cols-3">
-		<!-- Activity Feed -->
-		<div class="rounded-lg border border-border bg-card p-4 sm:col-span-2">
-			<div class="mb-3 flex items-center justify-between">
-				<div class="flex items-center gap-2">
-					<Activity class="h-4 w-4 text-muted-foreground" />
-					<span class="font-mono text-xs tracking-wider text-muted-foreground uppercase"
-						>ACTIVITY_LOG</span
-					>
-				</div>
-				<button
-					onclick={() => goto('/activity')}
-					class="font-mono text-[10px] tracking-wider text-muted-foreground/70 hover:text-muted-foreground"
-				>
-					VIEW_ALL →
-				</button>
+	<!-- First-run checklist -->
+	{#if onboardingError}
+		<InlineError title="Couldn't load the setup checklist" message={onboardingError} />
+	{:else if !onboarding}
+		<Skeleton class="h-40 w-full" />
+	{:else if !checklistComplete}
+		<section
+			aria-labelledby="checklist-heading"
+			class="rounded-lg border bg-card p-4 sm:p-5"
+			data-testid="setup-checklist"
+		>
+			<div class="flex flex-wrap items-baseline justify-between gap-2">
+				<h2 id="checklist-heading" class="text-base font-semibold">Finish setting up</h2>
+				<p class="text-sm text-muted-foreground">{doneCount} of {checklist.length} done</p>
 			</div>
+			<div
+				class="mt-3 h-1.5 overflow-hidden rounded-full bg-muted"
+				role="progressbar"
+				aria-label="Setup progress"
+				aria-valuemin={0}
+				aria-valuemax={checklist.length}
+				aria-valuenow={doneCount}
+			>
+				<div class="h-full bg-success" style="width: {(doneCount / checklist.length) * 100}%"></div>
+			</div>
+			<ol class="mt-4 divide-y">
+				{#each checklist as item (item.id)}
+					<li class="flex flex-col gap-2 py-3 sm:flex-row sm:items-center sm:justify-between">
+						<div class="flex min-w-0 items-start gap-3">
+							{#if item.done}
+								<CheckIcon aria-hidden="true" class="mt-0.5 size-5 shrink-0 text-success" />
+							{:else}
+								<TodoIcon aria-hidden="true" class="mt-0.5 size-5 shrink-0 text-muted-foreground" />
+							{/if}
+							<div class="min-w-0">
+								<p class="text-sm font-medium">
+									{item.title}
+									<span class="sr-only">{item.done ? '(done)' : '(to do)'}</span>
+								</p>
+								<p class="text-sm text-muted-foreground">{item.detail}</p>
+							</div>
+						</div>
+						{#if !item.done}
+							<Button
+								variant="outline"
+								size="sm"
+								href={item.href}
+								class="shrink-0 self-start sm:self-auto"
+							>
+								{item.action}
+							</Button>
+						{/if}
+					</li>
+				{/each}
+			</ol>
+		</section>
+	{/if}
 
-			{#if recentActivity.length === 0}
-				<p class="font-mono text-[10px] tracking-wider text-muted-foreground/60 uppercase">
-					NO_RECENT_ACTIVITY
+	<!-- Health tiles -->
+	<section aria-label="Overview" class="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+		<a
+			href="/apps"
+			class="rounded-lg border bg-card p-4 transition-colors hover:border-foreground/40"
+		>
+			<p class="flex items-center gap-2 text-sm text-muted-foreground">
+				<Rocket aria-hidden="true" class="size-4" /> Apps
+			</p>
+			<p class="mt-2 text-2xl font-semibold">
+				{runningApps}<span class="text-base text-muted-foreground"> / {apps.length} running</span>
+			</p>
+			{#if troubledApps.length}
+				<p class="mt-1 text-sm text-destructive">
+					{troubledApps.length} need{troubledApps.length === 1 ? 's' : ''} attention
 				</p>
 			{:else}
-				<div class="space-y-2">
-					{#each recentActivity.slice(0, 5) as entry (entry.seq)}
-						<div class="flex items-center gap-3 text-xs">
-							<span class="font-mono text-muted-foreground/60">
-								{new Date(entry.created_at).toLocaleTimeString()}
-							</span>
-							<Badge variant={actionVariant(entry.action)} class="font-mono text-[10px]">
-								{entry.action.toUpperCase()}
-							</Badge>
-							<span class="truncate text-muted-foreground">
-								{entry.resource_name ?? entry.detail ?? 'System'}
-								<span class="text-muted-foreground/60">· {actorLabel(entry)}</span>
-							</span>
-						</div>
-					{/each}
-				</div>
+				<p class="mt-1 text-sm text-muted-foreground">No failing apps</p>
+			{/if}
+		</a>
+
+		<a
+			href="/databases"
+			class="rounded-lg border bg-card p-4 transition-colors hover:border-foreground/40"
+		>
+			<p class="flex items-center gap-2 text-sm text-muted-foreground">
+				<Database aria-hidden="true" class="size-4" /> Databases
+			</p>
+			<p class="mt-2 text-2xl font-semibold">
+				{runningDatabases}<span class="text-base text-muted-foreground">
+					/ {databases.length} running</span
+				>
+			</p>
+			<p class="mt-1 text-sm text-muted-foreground">
+				{cronJobs.length} cron job{cronJobs.length === 1 ? '' : 's'}{failedJobs.length
+					? `, ${failedJobs.length} failed last run`
+					: ''}
+			</p>
+		</a>
+
+		<div class="rounded-lg border bg-card p-4" data-testid="last-deploy-tile">
+			<p class="flex items-center gap-2 text-sm text-muted-foreground">
+				<Clock aria-hidden="true" class="size-4" /> Last deploy
+			</p>
+			{#if !onboarding}
+				<Skeleton class="mt-3 h-6 w-3/4" />
+			{:else if onboarding.last_deployment}
+				{@const dep = onboarding.last_deployment}
+				<a
+					href={appTabHref(dep.app_id, 'deployments')}
+					class="mt-2 block truncate text-lg font-semibold hover:underline">{dep.app_name}</a
+				>
+				<p class="mt-1 flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
+					<StatusBadge status={dep.status} kind="deployment" size="sm" />
+					{formatRelativePast(dep.finished_at ?? dep.created_at)}
+				</p>
+			{:else}
+				<p class="mt-2 text-sm text-muted-foreground">Nothing deployed yet.</p>
 			{/if}
 		</div>
 
-		<!-- System Status -->
-		<div class="rounded-lg border border-border bg-card p-4">
-			<div class="mb-3 flex items-center gap-2">
-				<Zap class="h-4 w-4 text-muted-foreground" />
-				<span class="font-mono text-xs tracking-wider text-muted-foreground uppercase">STATUS</span>
+		<a
+			href="/system"
+			class="rounded-lg border bg-card p-4 transition-colors hover:border-foreground/40"
+		>
+			<p class="text-sm text-muted-foreground">Server health</p>
+			{#if metrics}
+				<dl class="mt-2 grid grid-cols-3 gap-2 text-sm">
+					<div>
+						<dt class="text-muted-foreground">CPU</dt>
+						<dd class="text-lg font-semibold">{Math.round(metrics.cpu_percent)}%</dd>
+					</div>
+					<div>
+						<dt class="text-muted-foreground">Memory</dt>
+						<dd class="text-lg font-semibold">{Math.round(metrics.mem_percent)}%</dd>
+					</div>
+					<div>
+						<dt class="text-muted-foreground">Disk</dt>
+						<dd
+							class={metrics.disk_percent >= 90
+								? 'text-lg font-semibold text-destructive'
+								: 'text-lg font-semibold'}
+						>
+							{Math.round(metrics.disk_percent)}%
+						</dd>
+					</div>
+				</dl>
+			{:else}
+				<Skeleton class="mt-3 h-6 w-full" />
+			{/if}
+		</a>
+	</section>
+
+	<div class="grid gap-4 lg:grid-cols-3">
+		<!-- Apps that need attention, then everything by project -->
+		<section aria-labelledby="apps-heading" class="rounded-lg border bg-card p-4 lg:col-span-2">
+			<h2 id="apps-heading" class="text-base font-semibold">Apps</h2>
+			{#if apps.length === 0}
+				<p class="mt-2 text-sm text-muted-foreground">
+					No apps yet. <a href="/apps/new" class="underline underline-offset-2"
+						>Deploy your first app</a
+					>.
+				</p>
+			{:else}
+				<ul class="mt-3 divide-y">
+					{#each [...troubledApps, ...apps.filter((a) => !troubledApps.includes(a))].slice(0, 8) as app (app.id)}
+						<li class="flex items-center justify-between gap-3 py-2">
+							<div class="min-w-0">
+								<a
+									href={`/apps/${app.id}`}
+									class="block truncate text-sm font-medium hover:underline">{app.name}</a
+								>
+								<p class="truncate text-xs text-muted-foreground">
+									{projectName(app.project_id) ?? 'No project'}{app.domain
+										? ` · ${app.domain}`
+										: ''}
+								</p>
+							</div>
+							<StatusBadge status={app.status} kind="app" size="sm" />
+						</li>
+					{/each}
+				</ul>
+				{#if apps.length > 8}
+					<a
+						href="/apps"
+						class="mt-2 inline-block text-sm text-muted-foreground hover:text-foreground"
+					>
+						All {apps.length} apps →
+					</a>
+				{/if}
+			{/if}
+		</section>
+
+		<section aria-labelledby="activity-heading" class="rounded-lg border bg-card p-4">
+			<div class="flex items-center justify-between">
+				<h2 id="activity-heading" class="text-base font-semibold">Recent activity</h2>
+				<a href="/activity" class="text-sm text-muted-foreground hover:text-foreground"
+					>View all →</a
+				>
 			</div>
-
-			<div class="space-y-3">
-				<div class="flex items-center justify-between">
-					<span class="font-mono text-[10px] text-muted-foreground/70 uppercase">Apps</span>
-					<span class="font-mono text-sm text-foreground">
-						{runningApps}/{apps.length}
-					</span>
-				</div>
-				<div class="h-1 overflow-hidden rounded-full bg-muted">
-					<div
-						class="h-full bg-success/60 transition-all"
-						style="width: {apps.length > 0 ? (runningApps / apps.length) * 100 : 0}%"
-					></div>
-				</div>
-
-				<div class="flex items-center justify-between">
-					<span class="font-mono text-[10px] text-muted-foreground/70 uppercase">Databases</span>
-					<span class="font-mono text-sm text-foreground">
-						{runningDatabases}/{databases.length}
-					</span>
-				</div>
-				<div class="h-1 overflow-hidden rounded-full bg-muted">
-					<div
-						class="h-full bg-accent/60 transition-all"
-						style="width: {databases.length > 0 ? (runningDatabases / databases.length) * 100 : 0}%"
-					></div>
-				</div>
-
-				<div class="flex items-center justify-between">
-					<span class="font-mono text-[10px] text-muted-foreground/70 uppercase">Cron Jobs</span>
-					<span class="font-mono text-sm text-foreground">
-						{enabledCronJobs}/{cronJobs.length}
-					</span>
-				</div>
-				<div class="h-1 overflow-hidden rounded-full bg-muted">
-					<div
-						class="h-full bg-secondary/60 transition-all"
-						style="width: {cronJobs.length > 0 ? (enabledCronJobs / cronJobs.length) * 100 : 0}%"
-					></div>
-				</div>
-			</div>
-		</div>
+			{#if recentActivity.length === 0}
+				<p class="mt-2 text-sm text-muted-foreground">Nothing yet.</p>
+			{:else}
+				<ul class="mt-3 space-y-2">
+					{#each recentActivity.slice(0, 5) as entry (entry.seq)}
+						<li class="text-sm">
+							<span class="font-medium">{actionLabel(entry.action)}</span>
+							<span class="text-muted-foreground">
+								{entry.resource_name ?? entry.detail ?? 'System'} · {actorLabel(entry)} ·
+								{formatRelativePast(entry.created_at)}
+							</span>
+						</li>
+					{/each}
+				</ul>
+			{/if}
+		</section>
 	</div>
 </div>

@@ -1,47 +1,28 @@
 <script lang="ts">
-	import { goto } from '$app/navigation';
 	import { type Project } from '$lib/api';
-	import {
-		getUiContext,
-		setUiContext,
-		projectsContext,
-		projectContext
-	} from '$lib/ui-context.svelte';
 	import * as Card from '$lib/components/ui/card/index.js';
 	import { Badge } from '$lib/components/ui/badge/index.js';
 	import ProjectAppGrid from './project-app-grid.svelte';
 
 	let { project, appCount = 0 }: { project: Project; appCount?: number } = $props();
-
-	let ctx = $derived(getUiContext());
-	let selected = $derived(ctx.type === 'project' && ctx.project.id === project.id);
-
-	function handleSelect() {
-		if (selected) {
-			setUiContext(projectsContext());
-		} else {
-			setUiContext(projectContext(project));
-		}
-		goto(`/projects/${project.id}`);
-	}
 </script>
 
-<button
-	type="button"
-	class="block h-full w-full text-left hover:cursor-pointer"
-	onclick={handleSelect}
+<a
+	href={`/projects/${project.id}`}
+	class="block h-full rounded-sm"
+	data-sveltekit-preload-data="hover"
 >
 	<Card.Root
-		class="flex h-full w-full flex-col rounded-sm border-none p-6 transition-colors hover:border  {selected
-			? 'invert'
-			: ''}"
+		class="flex h-full w-full flex-col rounded-sm border p-5 transition-colors hover:border-foreground/40"
 	>
 		<Card.Header class="p-0">
-			<Card.Description class="text-xs uppercase">id: {project.id.slice(0, 8)}</Card.Description>
-			<Card.Title class="text-base uppercase">{project.name}</Card.Title>
+			<Card.Title class="truncate text-base">{project.name}</Card.Title>
+			{#if project.description}
+				<Card.Description class="line-clamp-2 text-xs">{project.description}</Card.Description>
+			{/if}
 		</Card.Header>
 		<Card.Content class="grow p-0">
-			<div class="flex h-full flex-col justify-center py-6">
+			<div class="flex h-full flex-col justify-center py-4">
 				<ProjectAppGrid {appCount} />
 			</div>
 		</Card.Content>
@@ -50,7 +31,7 @@
 				<span>Updated</span>
 				<div class="flex items-center gap-2">
 					{#if project.active_preview_count > 0}
-						<Badge variant="secondary" class="h-4 px-1.5 text-[10px]">
+						<Badge variant="secondary" class="h-5 px-1.5 text-xs">
 							{project.active_preview_count}
 							{project.active_preview_count === 1 ? 'preview' : 'previews'}
 						</Badge>
@@ -60,4 +41,4 @@
 			</div>
 		</Card.Footer>
 	</Card.Root>
-</button>
+</a>

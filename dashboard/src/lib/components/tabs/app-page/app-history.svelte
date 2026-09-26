@@ -1,7 +1,8 @@
 <script lang="ts">
+	import SuccessAlert from '$lib/components/feedback/success-alert.svelte';
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { listSnapshots, rollbackAppToSnapshot, type Snapshot } from '$lib/api';
 	import { Button } from '$lib/components/ui/button/index.js';
-	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import RefreshCw from '~icons/ri/refresh-line';
 
 	interface Props {
@@ -74,15 +75,9 @@
 		restart required.
 	</p>
 
-	{#if error}
-		<ErrorAlert title="History Error" description={error} />
-	{/if}
+	<InlineError title="History Error" message={error} />
 
-	{#if successMessage}
-		<div class="rounded border border-green-500 bg-green-500/10 p-3 text-xs text-green-600">
-			{successMessage}
-		</div>
-	{/if}
+	<SuccessAlert message={successMessage} />
 
 	{#if loading}
 		<p class="py-8 text-center text-xs text-muted-foreground">Loading history…</p>

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import PageTitle from '$lib/components/nav/page-title.svelte';
 	import {
 		changePassword,
 		setup2FA,
@@ -16,17 +17,20 @@
 	import { page } from '$app/state';
 	import { passwordProblem, ROLE_LABELS } from '$lib/access';
 	import TokenList from '$lib/components/tokens/token-list.svelte';
-	import KeyIcon from '~icons/ri/key-line';
 	import { untrack } from 'svelte';
 	import { setUiContext, clearUiContext, projectsContext } from '$lib/ui-context.svelte';
 	import { Badge } from '$lib/components/ui/badge/index.js';
-	import * as Tabs from '$lib/components/ui/tabs/index.js';
+	import LinkTabs from '$lib/components/nav/link-tabs.svelte';
+	import { PROFILE_TABS, tabFromUrl, tabHref, type ProfileTab } from '$lib/tabs';
+	import { confirmAction } from '$lib/confirm.svelte';
+	import {
+		acknowledgeBackupCodes,
+		getPendingBackupCodes,
+		setPendingBackupCodes
+	} from '$lib/backup-codes.svelte';
 	import ProfilePassword from '$lib/components/tabs/profile-page/profile-password.svelte';
 	import ProfileTwoFactor from '$lib/components/tabs/profile-page/profile-two-factor.svelte';
 	import ProfileSessions from '$lib/components/tabs/profile-page/profile-sessions.svelte';
-	import KeyRound from '~icons/ri/key-2-line';
-	import ShieldCheck from '~icons/ri/shield-check-line';
-	import Monitor from '~icons/ri/computer-line';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();
@@ -77,7 +81,10 @@
 	let totpDisableCode = $state('');
 	let totpError = $state('');
 	let totpSaving = $state(false);
-	let backupCodes = $state<string[]>([]);
+	// Freshly issued backup codes stay until the user confirms they saved them.
+	let backupCodes = $derived(getPendingBackupCodes());
+	let tab = $derived<ProfileTab>(tabFromUrl(page.url, PROFILE_TABS, 'password'));
+	let shownPhase = $derived(backupCodes.length > 0 ? 'done' : totpPhase);
 	// Seeded from the freshly loaded user so enrolled users are offered "disable".
 	let twoFaEnabled = $state(
 		untrack(() => (data.me as User | undefined)?.totp_enabled ?? getUser()?.totp_enabled ?? false)
@@ -114,7 +121,7 @@
 		totpSaving = true;
 		try {
 			const result = await confirm2FA(totpCode);
-			backupCodes = result.backup_codes;
+			setPendingBackupCodes(result.backup_codes);
 			twoFaEnabled = true;
 			syncUserTotp(true);
 			totpPhase = 'done';
@@ -136,7 +143,7 @@
 			totpPhase = 'idle';
 			totpDisablePassword = '';
 			totpDisableCode = '';
-			backupCodes = [];
+			acknowledgeBackupCodes();
 		} catch (e: any) {
 			totpError = e.message;
 		} finally {
@@ -178,30 +185,57 @@
 		}
 	}
 
-	async function handleRevokeSession(id: string) {
-		revokingId = id;
-		try {
-			await revokeSession(id);
-			sessions = sessions.filter((s) => s.id !== id);
-		} catch (e: any) {
-			sessionsError = e.message;
-		} finally {
-			revokingId = null;
-		}
+	function handleRevokeSession(id: string) {
+		sessionsError = '';
+		return confirmAction({
+			title: 'Sign out this session?',
+			description: 'That browser or device is signed out immediately and must sign in again.',
+			confirmLabel: 'Sign out session',
+			pendingLabel: 'Signing out…',
+			onconfirm: async () => {
+				revokingId = id;
+				try {
+					await revokeSession(id);
+					sessions = sessions.filter((s) => s.id !== id);
+				} finally {
+					revokingId = null;
+				}
+			}
+		});
 	}
 
-	async function handleRevokeAll() {
-		revokingAll = true;
+	function handleRevokeAll() {
 		sessionsError = '';
-		try {
-			await revokeAllSessions();
-			sessions = sessions.filter((s) => s.is_current);
-		} catch (e: any) {
-			sessionsError = e.message;
-		} finally {
-			revokingAll = false;
-		}
+		return confirmAction({
+			title: 'Sign out all other sessions?',
+			description:
+				'Every other browser and device signed in to your account is signed out. This one stays signed in.',
+			confirmLabel: 'Sign out others',
+			pendingLabel: 'Signing out…',
+			onconfirm: async () => {
+				revokingAll = true;
+				try {
+					await revokeAllSessions();
+					sessions = sessions.filter((s) => s.is_current);
+				} finally {
+					revokingAll = false;
+				}
+			}
+		});
 	}
+
+	// Load sessions fresh when the Sessions tab opens.
+	$effect(() => {
+		if (tab === 'sessions') untrack(loadSessions);
+	});
+
+	// Warn before leaving the page with unsaved backup codes.
+	$effect(() => {
+		if (backupCodes.length === 0) return;
+		const warn = (e: BeforeUnloadEvent) => e.preventDefault();
+		window.addEventListener('beforeunload', warn);
+		return () => window.removeEventListener('beforeunload', warn);
+	});
 
 	$effect(() => {
 		setUiContext(projectsContext());
@@ -209,40 +243,28 @@
 	});
 </script>
 
+<PageTitle title="Profile" />
+
 <div class="space-y-6">
-	<div class="flex h-14 items-center justify-between">
-		<div>
-			<h2 class="text-3xl font-extrabold uppercase">Profile</h2>
-			<p class="font-mono text-xs tracking-wider text-muted-foreground/70">
-				{user?.email ?? ''}
-			</p>
+	<div class="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+		<div class="min-w-0">
+			<h1 class="text-2xl font-extrabold sm:text-3xl">Profile</h1>
+			<p class="truncate text-sm text-muted-foreground">{user?.email ?? ''}</p>
 		</div>
-		<Badge variant="outline" class="font-mono text-xs uppercase">
+		<Badge variant="outline" class="text-xs">
 			{user ? (ROLE_LABELS[user.role] ?? user.role) : ''}
 		</Badge>
 	</div>
 
-	<Tabs.Root value={page.url.searchParams.get('tab') ?? 'password'}>
-		<Tabs.List class="mb-6 h-auto max-w-full flex-wrap justify-start">
-			<Tabs.Trigger value="password">
-				<KeyRound class="mr-1.5 h-3.5 w-3.5" />
-				Password
-			</Tabs.Trigger>
-			<Tabs.Trigger value="2fa">
-				<ShieldCheck class="mr-1.5 h-3.5 w-3.5" />
-				Two-Factor Auth
-			</Tabs.Trigger>
-			<Tabs.Trigger value="sessions" onclick={loadSessions}>
-				<Monitor class="mr-1.5 h-3.5 w-3.5" />
-				Sessions
-			</Tabs.Trigger>
-			<Tabs.Trigger value="tokens">
-				<KeyIcon class="mr-1.5 h-3.5 w-3.5" />
-				API tokens
-			</Tabs.Trigger>
-		</Tabs.List>
+	<LinkTabs
+		label="Profile sections"
+		tabs={PROFILE_TABS}
+		active={tab}
+		href={(id) => tabHref(page.url.pathname, id, 'password')}
+	/>
 
-		<Tabs.Content value="password">
+	<div class="pt-2">
+		{#if tab === 'password'}
 			<ProfilePassword
 				bind:currentPassword
 				bind:newPassword
@@ -252,11 +274,9 @@
 				error={pwError}
 				onSubmit={handleChangePassword}
 			/>
-		</Tabs.Content>
-
-		<Tabs.Content value="2fa">
+		{:else if tab === '2fa'}
 			<ProfileTwoFactor
-				phase={totpPhase}
+				phase={shownPhase}
 				enabled={twoFaEnabled}
 				setup={totpSetup}
 				bind:setupPassword={totpSetupPassword}
@@ -276,10 +296,13 @@
 					totpPhase = 'disable';
 					totpError = '';
 				}}
+				onAcknowledge={() => {
+					acknowledgeBackupCodes();
+					totpPhase = 'idle';
+				}}
+				account={user?.email}
 			/>
-		</Tabs.Content>
-
-		<Tabs.Content value="sessions">
+		{:else if tab === 'sessions'}
 			<ProfileSessions
 				{sessions}
 				loading={sessionsLoading}
@@ -289,10 +312,8 @@
 				onRevoke={handleRevokeSession}
 				onRevokeAll={handleRevokeAll}
 			/>
-		</Tabs.Content>
-
-		<Tabs.Content value="tokens">
+		{:else if tab === 'tokens'}
 			<TokenList initialTokens={(data.tokens as ApiToken[] | undefined) ?? []} />
-		</Tabs.Content>
-	</Tabs.Root>
+		{/if}
+	</div>
 </div>

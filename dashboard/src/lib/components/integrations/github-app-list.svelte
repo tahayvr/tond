@@ -1,4 +1,6 @@
 <script lang="ts">
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
+	import { confirmAction } from '$lib/confirm.svelte';
 	import {
 		listGitHubApps,
 		getGitHubAppManifestUrl,
@@ -8,7 +10,6 @@
 	} from '$lib/api';
 	import { safeUrl } from '$lib/utils';
 	import { Button } from '$lib/components/ui/button/index.js';
-	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import GitHubAppCard from './github-app-card.svelte';
 	import Plus from '~icons/ri/add-line';
 
@@ -68,16 +69,24 @@
 	}
 
 	async function handleDisconnect(id: string) {
-		disconnectingId = id;
+		const target = apps.find((a) => a.id === id);
 		error = '';
-		try {
-			await deleteGitHubApp(id);
-			apps = apps.filter((a) => a.id !== id);
-		} catch (e: any) {
-			error = e.message ?? 'Failed to disconnect GitHub App';
-		} finally {
-			disconnectingId = null;
-		}
+		await confirmAction({
+			title: `Disconnect ${target?.name ?? 'this GitHub App'}?`,
+			description:
+				'Apps linked to it lose access to private repositories, push-to-deploy and PR previews. The app stays registered on GitHub; delete it there too if you no longer need it.',
+			confirmLabel: 'Disconnect',
+			pendingLabel: 'Disconnecting…',
+			onconfirm: async () => {
+				disconnectingId = id;
+				try {
+					await deleteGitHubApp(id);
+					apps = apps.filter((a) => a.id !== id);
+				} finally {
+					disconnectingId = null;
+				}
+			}
+		});
 	}
 
 	async function handleInstall(app: GitHubApp) {
@@ -121,9 +130,7 @@
 	});
 </script>
 
-{#if error}
-	<ErrorAlert title="GitHub Error" description={error} />
-{/if}
+<InlineError title="GitHub Error" message={error} />
 
 {#if loading}
 	<p class="text-xs text-muted-foreground">Loading…</p>

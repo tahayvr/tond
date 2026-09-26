@@ -7,7 +7,7 @@
 	import { Input } from '$lib/components/ui/input/index.js';
 	import Search from '~icons/ri/search-line';
 	import Plus from '~icons/ri/add-line';
-	import { goto } from '$app/navigation';
+	import PageHeader from '$lib/components/nav/page-header.svelte';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();
@@ -39,35 +39,40 @@
 </script>
 
 <div class="space-y-6">
-	<div class="flex h-14 items-center justify-between gap-4">
-		<h2 class="text-3xl font-extrabold uppercase">Projects</h2>
-		<div class="flex items-center gap-2">
-			<Button variant="outline" size="sm" onclick={() => (showCreate = true)}>
+	<PageHeader title="Projects">
+		{#snippet actions()}
+			<Button variant="outline" size="sm" href="/apps/new">
 				<Plus class="mr-1 h-4 w-4" />
-				New Project
+				New app
 			</Button>
-			<Button variant="outline" size="sm" onclick={() => goto('/apps/new')}>
+			<Button size="sm" onclick={() => (showCreate = true)}>
 				<Plus class="mr-1 h-4 w-4" />
-				New App
+				New project
 			</Button>
-		</div>
-	</div>
+		{/snippet}
+	</PageHeader>
 
 	<!-- Search -->
 	{#if projects.length > 0}
 		<div class="relative">
 			<Search class="absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-			<Input type="text" placeholder="Search projects..." bind:value={searchQuery} class="pl-9" />
+			<Input
+				type="search"
+				aria-label="Search projects"
+				placeholder="Search projects…"
+				bind:value={searchQuery}
+				class="pl-9"
+			/>
 		</div>
 	{/if}
 
 	{#if projects.length === 0}
 		<div class="rounded-lg border border-dashed py-16 text-center">
 			<p class="text-lg font-medium text-muted-foreground">No projects yet</p>
-			<p class="mt-2 text-sm text-muted-foreground/60">Create your first project to get started</p>
+			<p class="mt-2 text-sm text-muted-foreground">Create your first project to get started</p>
 			<Button class="mt-4" onclick={() => (showCreate = true)}>
 				<Plus class="mr-1 h-4 w-4" />
-				Create Project
+				Create project
 			</Button>
 		</div>
 	{:else if filteredProjects.length === 0}

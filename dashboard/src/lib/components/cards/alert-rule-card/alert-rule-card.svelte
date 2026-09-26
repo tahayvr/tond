@@ -1,8 +1,8 @@
 <script lang="ts">
-	import { goto } from '$app/navigation';
-	import { cn } from '$lib/utils';
 	import { ALERT_GROUPS, type AlertRule } from '$lib/api';
 	import * as Card from '$lib/components/ui/card/index.js';
+	import StatusBadge from '$lib/components/feedback/status-badge.svelte';
+	import { formatRelativePast } from '$lib/time';
 
 	interface Props {
 		rule: AlertRule;
@@ -10,20 +10,9 @@
 
 	let { rule }: Props = $props();
 
-	/**
-	 * Status dot colour:
-	 *   disabled            → muted grey
-	 *   fired within 1 hour → amber pulse
-	 *   enabled + not recent → green
-	 */
-	function statusDotClass(rule: AlertRule): string {
-		if (!rule.enabled) return 'bg-muted-foreground/30';
-		if (rule.last_fired_at) {
-			const diff = Date.now() - new Date(rule.last_fired_at).getTime();
-			if (diff < 3_600_000) return 'bg-warn animate-pulse';
-		}
-		return 'bg-accent';
-	}
+	let firedRecently = $derived(
+		!!rule.last_fired_at && Date.now() - new Date(rule.last_fired_at).getTime() < 3_600_000
+	);
 
 	function metricLabel(metric: string | null): string {
 		if (!metric) return '';
@@ -38,18 +27,6 @@
 		return metric === 'app_down' ? 'min' : '%';
 	}
 
-	function formatRelative(dt: string | null): string {
-		if (!dt) return 'Never';
-		const diff = Date.now() - new Date(dt).getTime();
-		const minutes = Math.floor(diff / 60_000);
-		const hours = Math.floor(diff / 3_600_000);
-		const days = Math.floor(diff / 86_400_000);
-		if (minutes < 1) return 'just now';
-		if (minutes < 60) return `${minutes}m ago`;
-		if (hours < 24) return `${hours}h ago`;
-		return `${days}d ago`;
-	}
-
 	function conditionSummary(rule: AlertRule): string {
 		if (rule.metric) {
 			return `${metricLabel(rule.metric)} > ${rule.threshold}${thresholdUnit(rule.metric)}`;
@@ -61,43 +38,28 @@
 	}
 </script>
 
-<button
-	type="button"
-	class="block w-full text-left hover:cursor-pointer"
-	onclick={() => goto(`/alerts/${rule.id}`)}
->
+<a href={`/alerts/${rule.id}`} class="block h-full rounded-sm" data-sveltekit-preload-data="hover">
 	<Card.Root
-		class={cn(
-			'flex w-full flex-col rounded-sm border-none p-5 transition-colors hover:border',
-			!rule.enabled && 'opacity-60'
-		)}
+		class="flex h-full w-full flex-col gap-3 rounded-sm border p-5 transition-colors hover:border-foreground/40"
 	>
-		<Card.Header class="p-0">
+		<Card.Header class="gap-2 p-0">
 			<div class="flex items-start justify-between gap-2">
-				<Card.Description class="text-xs uppercase">id: {rule.id.slice(0, 8)}</Card.Description>
-				<span class="font-mono text-[10px] text-muted-foreground/50 uppercase">
-					{rule.enabled ? 'enabled' : 'paused'}
-				</span>
+				<Card.Title class="min-w-0 truncate text-base">{rule.name}</Card.Title>
+				{#if !rule.enabled}
+					<StatusBadge status="paused" size="sm" />
+				{:else if firedRecently}
+					<StatusBadge status="firing" tone="warning" label="Fired recently" size="sm" />
+				{:else}
+					<StatusBadge status="enabled" size="sm" />
+				{/if}
 			</div>
-			<Card.Title class="text-base uppercase">{rule.name}</Card.Title>
-			<div class="flex items-center gap-2">
-				<span class="inline-block size-2 shrink-0 rounded-full {statusDotClass(rule)}"></span>
-				<span class="font-mono text-[10px] tracking-wider text-secondary uppercase">
-					{conditionSummary(rule)}
-				</span>
-			</div>
+			<Card.Description class="text-xs">{conditionSummary(rule)}</Card.Description>
 		</Card.Header>
-		<Card.Content class="grow p-0">
-			<div class="flex flex-col justify-center gap-2 py-4">
-				<p class="text-center font-mono text-[10px] text-muted-foreground/70 uppercase">
-					{rule.app_id ? `app: ${rule.app_id.slice(0, 8)}` : 'scope: global'}
-				</p>
-			</div>
+		<Card.Content
+			class="flex grow items-end justify-between gap-2 p-0 text-xs text-muted-foreground"
+		>
+			<span>{rule.app_id ? 'One app' : 'All apps'}</span>
+			<span>Last fired: {formatRelativePast(rule.last_fired_at)}</span>
 		</Card.Content>
-		<Card.Footer class="w-full justify-between p-0">
-			<span class="font-mono text-[10px] text-muted-foreground/50">
-				FIRED: {formatRelative(rule.last_fired_at)}
-			</span>
-		</Card.Footer>
 	</Card.Root>
-</button>
+</a>

@@ -238,9 +238,15 @@ pub struct CreateAlertRuleRequest {
     /// "cpu" | "memory" | "app_down" | "disk_usage" — optional for pure event rules
     pub metric: Option<String>,
     pub threshold: Option<f64>,
+    /// Optional webhook POSTed on every firing (empty or missing = none).
+    #[serde(default)]
     pub webhook_url: String,
     /// Event slugs to subscribe to (optional)
     pub events: Option<Vec<String>>,
+    /// Notification channels (integration ids) to link on creation. A rule
+    /// needs at least one channel or a webhook URL, so it always notifies someone.
+    #[serde(default)]
+    pub integration_ids: Vec<String>,
 }
 
 /// PATCH /api/alerts/{id} request body — all optional

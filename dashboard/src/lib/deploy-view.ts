@@ -3,6 +3,7 @@
 // and the deployments tab.
 
 import type { DeployFailure, DeployPhase, Deployment, PhaseRecord } from '$lib/api';
+import type { AppSettingsSection } from '$lib/tabs';
 
 export type Tone = 'success' | 'failure' | 'running' | 'waiting' | 'neutral';
 
@@ -122,18 +123,18 @@ export function deploymentSubject(d: Deployment): string {
 /** Where the fix for a failure lives on the app page, if anywhere. */
 export function failureFix(
 	failure: Pick<DeployFailure, 'code'> | null | undefined
-): { tab: string; label: string } | null {
+): { section: AppSettingsSection; label: string } | null {
 	switch (failure?.code) {
 		case 'port_not_listening':
 		case 'health_check_failed':
 		case 'health_check_timeout':
-			return { tab: 'health', label: 'Open port and health settings' };
+			return { section: 'health', label: 'Open port and health settings' };
 		case 'app_crashed':
-			return { tab: 'env', label: 'Check environment variables' };
+			return { section: 'environment', label: 'Check environment variables' };
 		case 'app_oom':
-			return { tab: 'resources', label: 'Raise the memory limit' };
+			return { section: 'resources', label: 'Raise the memory limit' };
 		case 'image_pull_denied':
-			return { tab: 'env', label: 'Add registry credentials' };
+			return { section: 'environment', label: 'Add registry credentials' };
 		case 'image_not_found':
 		case 'repo_access_denied':
 		case 'branch_not_found':
@@ -141,7 +142,7 @@ export function failureFix(
 		case 'no_dockerfile':
 		case 'build_detection_failed':
 		case 'bad_base_dir':
-			return { tab: 'git', label: 'Open source settings' };
+			return { section: 'git', label: 'Open source settings' };
 		default:
 			return null;
 	}

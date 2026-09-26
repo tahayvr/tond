@@ -264,7 +264,10 @@
 			<InfoIcon class="mt-0.5 size-4 shrink-0 text-muted-foreground" />
 			<p class="text-muted-foreground">
 				{app.name} is a background worker: it serves no traffic, so it has no domain and Tond doesn't
-				route to it. To give it an address, make it a web app in the Health tab.
+				route to it. To give it an address, make it a web app under
+				<a href="/apps/{app.id}?tab=settings&section=health" class="underline underline-offset-2"
+					>Health</a
+				>.
 			</p>
 		</div>
 	{:else}
@@ -312,7 +315,7 @@
 				{/if}
 			{:else}
 				<div class="space-y-1">
-					<h3 class="font-medium">This app has no address yet</h3>
+					<h2 class="font-medium">This app has no address yet</h2>
 					<p class="text-sm text-muted-foreground">Choose how people reach it.</p>
 				</div>
 				<div class="grid gap-3 md:grid-cols-2">
@@ -446,7 +449,7 @@
 			</section>
 
 			<section class="space-y-2" aria-label="HTTPS certificate">
-				<h3 class="text-sm font-medium">HTTPS</h3>
+				<h2 class="text-sm font-medium">HTTPS</h2>
 				<CertificateStatus {domain} refreshKey={certRefreshKey + certKey} />
 			</section>
 		{/if}

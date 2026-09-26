@@ -551,6 +551,7 @@ async fn main() -> Result<()> {
             axum::routing::patch(handlers::alerts::update_alert),
         )
         .route("/api/alerts/{id}", delete(handlers::alerts::delete_alert))
+        .route("/api/alerts/{id}/test", post(handlers::alerts::test_alert))
         // Alert ↔ integration links
         .route(
             "/api/alerts/{id}/integrations",
@@ -673,6 +674,10 @@ async fn main() -> Result<()> {
         // Cron Jobs (Phase 6.4)
         .route("/api/cron", get(handlers::cron::list_cron_jobs))
         .route("/api/cron", post(handlers::cron::create_cron_job))
+        .route(
+            "/api/cron/schedule-preview",
+            get(handlers::cron::preview_schedule),
+        )
         .route("/api/cron/{id}", get(handlers::cron::get_cron_job))
         .route(
             "/api/cron/{id}",

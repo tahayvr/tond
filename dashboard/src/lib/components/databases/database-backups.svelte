@@ -25,6 +25,7 @@
 </script>
 
 <script lang="ts">
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	// Backups of one managed database: back up now, list the backups that hold
 	// it (its own and full-server snapshots), restore one with a typed
 	// confirmation. A restore first backs up the current data.
@@ -141,7 +142,7 @@
 <div class="space-y-4" data-testid="database-backups">
 	<div class="flex flex-wrap items-start justify-between gap-3">
 		<div class="space-y-1">
-			<h3 class="text-sm font-semibold tracking-wide text-muted-foreground uppercase">Backups</h3>
+			<h2 class="text-sm font-semibold tracking-wide text-muted-foreground uppercase">Backups</h2>
 			<p class="max-w-prose text-sm text-muted-foreground">
 				A backup holds a dump of {dbName} and a copy of its data directory. Restoring one replaces the
 				data in {dbName}; the current data is backed up first, so a restore can be undone.
@@ -262,9 +263,7 @@
 				spellcheck={false}
 				disabled={restoring}
 			/>
-			{#if restoreError}
-				<p class="rounded bg-destructive/10 px-3 py-2 text-xs text-destructive">{restoreError}</p>
-			{/if}
+			<InlineError message={restoreError} />
 		</div>
 
 		<Dialog.Footer>

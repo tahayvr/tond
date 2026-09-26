@@ -5,8 +5,12 @@
 	import { authRedirect, isAuthRoute as isAuthRoutePath, showsAppShell } from '$lib/auth-routes';
 	import {
 		getFeedOpen,
+		getPaletteOpen,
+		getShortcutsOpen,
 		getTerminalOpen,
 		setFeedOpen,
+		setPaletteOpen,
+		setShortcutsOpen,
 		setTerminalOpen
 	} from '$lib/ui-context.svelte';
 	import { ModeWatcher } from 'mode-watcher';
@@ -24,6 +28,10 @@
 	import { pollWhileVisible } from '$lib/polling';
 	import { untrack } from 'svelte';
 	import favicon from '$lib/assets/favicon.svg';
+	import NavProgress from '$lib/components/nav/nav-progress.svelte';
+	import ConfirmHost from '$lib/components/dialogs/confirm-host.svelte';
+	import CommandPalette from '$lib/components/command/command-palette.svelte';
+	import ShortcutsDialog from '$lib/components/command/shortcuts-dialog.svelte';
 
 	import './layout.css';
 
@@ -119,17 +127,23 @@
 	$effect(() => {
 		if (typeof window === 'undefined' || isAuthRoute) return;
 
-		return registerDashboardShortcuts(() => ({ terminalOpen }), { setTerminalOpen });
+		return registerDashboardShortcuts(() => ({ terminalOpen }), {
+			setTerminalOpen,
+			openPalette: () => setPaletteOpen(true),
+			openShortcuts: () => setShortcutsOpen(true),
+			navigate: (href) => goto(href)
+		});
 	});
 </script>
 
 <svelte:head>
-	<title>Tond</title>
 	<link rel="icon" href={favicon} />
 </svelte:head>
 
 <ModeWatcher />
 <Toaster richColors position="top-right" />
+<NavProgress />
+<ConfirmHost />
 {#if isAuthRoute}
 	<div class="min-h-screen bg-background text-foreground">
 		{@render children()}
@@ -139,10 +153,7 @@
 		<div class="min-h-screen bg-background text-foreground">
 			<div class="mx-auto flex min-h-screen w-full max-w-4xl items-center justify-center px-6">
 				<div class="w-full max-w-2xl rounded-lg border border-border bg-card p-8 shadow-sm">
-					<p class="font-mono text-[10px] tracking-[0.35em] text-muted-foreground/70 uppercase">
-						TOND_BOOT
-					</p>
-					<h1 class="mt-3 text-3xl font-extrabold uppercase">Checking server status</h1>
+					<h1 class="text-3xl font-extrabold">Checking server status</h1>
 					<p class="mt-3 max-w-xl text-sm text-muted-foreground">
 						Authenticating your session and loading the control plane. The first load right after
 						install can take a moment.
@@ -190,24 +201,30 @@
 	<div class="min-h-screen bg-background"></div>
 {:else}
 	<Tooltip.Provider>
-		<div class="flex h-screen flex-col bg-background">
+		<a
+			href="#main-content"
+			class="sr-only z-50 rounded-sm bg-background px-3 py-2 text-sm focus:not-sr-only focus:fixed focus:top-2 focus:left-2"
+			>Skip to content</a
+		>
+		<!-- The provider wraps the whole shell so the footer can toggle the feed (a sheet on phones). -->
+		<Sidebar.Provider
+			open={getFeedOpen()}
+			onOpenChange={setFeedOpen}
+			class="flex h-dvh flex-col bg-background"
+		>
 			<!-- header: non-flexing top bar -->
 			<div class="flex-none">
 				<Header />
 			</div>
 
-			<!-- main: takes remaining height, sidebar is contained here -->
-			<Sidebar.Provider
-				open={getFeedOpen()}
-				onOpenChange={setFeedOpen}
-				class="relative flex-1 overflow-hidden"
-			>
+			<!-- main: takes remaining height, the feed sidebar is contained here -->
+			<div class="relative flex min-h-0 flex-1 overflow-hidden">
 				{#if terminalOpen}
 					<div class="min-w-0 flex-1 overflow-hidden">
 						<TerminalPane />
 					</div>
 				{:else}
-					<main class="min-w-0 flex-1 overflow-auto p-6">
+					<main id="main-content" tabindex="-1" class="min-w-0 flex-1 overflow-auto p-4 sm:p-6">
 						{@render children()}
 					</main>
 				{/if}
@@ -215,12 +232,17 @@
 				{#if !terminalOpen}
 					<FeedPanel />
 				{/if}
-			</Sidebar.Provider>
+			</div>
 
 			<!-- footer: stays at the bottom of the window -->
 			<div class="flex-none">
 				<Footer />
 			</div>
-		</div>
+		</Sidebar.Provider>
+		<CommandPalette
+			bind:open={() => getPaletteOpen(), setPaletteOpen}
+			onShowShortcuts={() => setShortcutsOpen(true)}
+		/>
+		<ShortcutsDialog bind:open={() => getShortcutsOpen(), setShortcutsOpen} />
 	</Tooltip.Provider>
 {/if}

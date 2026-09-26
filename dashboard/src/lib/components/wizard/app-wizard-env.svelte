@@ -188,7 +188,7 @@
 								class="px-3 py-2 text-left font-mono text-xs font-medium text-muted-foreground uppercase"
 								>Value</th
 							>
-							<th class="w-28 px-3 py-2"></th>
+							<th class="w-28 px-3 py-2"><span class="sr-only">Actions</span></th>
 						</tr>
 					</thead>
 					<tbody>
@@ -229,7 +229,7 @@
 												onclick={() => handleCopy(key, value)}
 											>
 												{#if copiedKey === key}
-													<Check class="h-3.5 w-3.5 text-green-500" />
+													<Check class="h-3.5 w-3.5 text-success" />
 												{:else}
 													<Copy class="h-3.5 w-3.5" />
 												{/if}

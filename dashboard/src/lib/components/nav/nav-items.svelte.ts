@@ -12,7 +12,7 @@ export const navItems: NavItem[] = [
 	{ href: '/projects', label: 'Projects', icon: 'app' },
 	{ href: '/apps', label: 'Apps', icon: 'rocket' },
 	{ href: '/databases', label: 'Databases', icon: 'database' },
-	{ href: '/cron', label: 'Cron_Jobs', icon: 'clock' },
+	{ href: '/cron', label: 'Cron jobs', icon: 'clock' },
 	{ href: '/snapshots', label: 'Snapshots', icon: 'clock' },
 	{ href: '/alerts', label: 'Alerts', icon: 'bell' },
 	{ href: '/integrations', label: 'Integrations', icon: 'puzzle', scope: 'settings:write' },

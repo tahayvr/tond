@@ -1,4 +1,5 @@
 <script lang="ts">
+	import PageTitle from '$lib/components/nav/page-title.svelte';
 	import {
 		type GitHubApp,
 		type RegistryCredential,
@@ -68,16 +69,18 @@
 	}
 </script>
 
+<PageTitle title="Integrations" />
+
 <div class="space-y-10">
 	<div class="flex h-14 items-center justify-between">
-		<h2 class="text-3xl font-extrabold uppercase">Integrations</h2>
+		<h1 class="text-2xl font-extrabold sm:text-3xl">Integrations</h1>
 	</div>
 
 	<!-- ── Notification Channels ─────────────────────────────────────────────── -->
 	<section class="space-y-4">
-		<h3 class="text-xs font-semibold tracking-widest text-muted-foreground uppercase">
+		<h2 class="text-xs font-semibold tracking-widest text-muted-foreground uppercase">
 			Notification Channels
-		</h3>
+		</h2>
 		<div class="grid grid-cols-1 items-stretch gap-4 sm:grid-cols-2 lg:grid-cols-4">
 			<IntegrationCard
 				name="Telegram"
@@ -112,17 +115,17 @@
 
 	<!-- ── Storage Providers ──────────────────────────────────────────────────── -->
 	<section class="space-y-4">
-		<h3 class="text-xs font-semibold tracking-widest text-muted-foreground uppercase">
+		<h2 class="text-xs font-semibold tracking-widest text-muted-foreground uppercase">
 			Storage Providers
-		</h3>
+		</h2>
 		<StorageProviderList />
 	</section>
 
 	<!-- ── Git Providers ─────────────────────────────────────────────────── -->
 	<section class="space-y-4">
-		<h3 class="text-xs font-semibold tracking-widest text-muted-foreground uppercase">
+		<h2 class="text-xs font-semibold tracking-widest text-muted-foreground uppercase">
 			Git Providers
-		</h3>
+		</h2>
 		<div class="grid grid-cols-1 items-stretch gap-4 sm:grid-cols-2 lg:grid-cols-3">
 			<IntegrationCard
 				name="GitHub"
@@ -136,9 +139,9 @@
 
 	<!-- ── Container Registry ─────────────────────────────────────────────── -->
 	<section class="space-y-4">
-		<h3 class="text-xs font-semibold tracking-widest text-muted-foreground uppercase">
+		<h2 class="text-xs font-semibold tracking-widest text-muted-foreground uppercase">
 			Container Registry
-		</h3>
+		</h2>
 		<div class="grid grid-cols-1 items-stretch gap-4 sm:grid-cols-2 lg:grid-cols-3">
 			<IntegrationCard
 				name="Registry Credentials"

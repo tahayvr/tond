@@ -8,7 +8,8 @@
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
-	import * as Dialog from '$lib/components/ui/dialog/index.js';
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
+	import { confirmAction } from '$lib/confirm.svelte';
 
 	interface Props {
 		app: App;
@@ -42,7 +43,6 @@
 	let saving = $state(false);
 	let error = $state('');
 	let saved = $state(false);
-	let confirmOpen = $state(false);
 
 	$effect(() => {
 		const current = appReadiness(app);
@@ -59,20 +59,28 @@
 	/** Becoming a worker drops the domain: ask first. */
 	let losesDomain = $derived(mode === 'none' && appReadiness(app) !== 'none' && !!app.domain);
 
-	function handleSave() {
+	async function handleSave() {
+		if (saving) return;
 		if (mode === 'none' && (!Number.isInteger(secs) || secs < 1 || secs > 600)) {
 			error = 'Enter how long the worker must stay up (1-600 seconds).';
 			return;
 		}
 		if (losesDomain) {
-			confirmOpen = true;
-			return;
+			const ok = await confirmAction({
+				title: `Make ${app.name} a background worker?`,
+				description: `Workers serve no traffic. From the next deploy, it counts as ready once it stays up for ${secs}s.`,
+				details: [
+					`The domain ${app.domain} is removed and the app is no longer routed.`,
+					'The health check path is removed.'
+				],
+				confirmLabel: 'Make it a worker'
+			});
+			if (!ok) return;
 		}
-		void save();
+		await save();
 	}
 
 	async function save() {
-		confirmOpen = false;
 		saving = true;
 		error = '';
 		saved = false;
@@ -138,25 +146,5 @@
 	{#if !canEdit}
 		<p class="text-xs text-muted-foreground">Your role can't change app settings.</p>
 	{/if}
-	{#if error}
-		<p class="rounded bg-destructive/10 px-3 py-2 text-xs text-destructive" role="alert">{error}</p>
-	{/if}
+	<InlineError message={error} ondismiss={() => (error = '')} />
 </section>
-
-<Dialog.Root bind:open={confirmOpen}>
-	<Dialog.Content class="max-w-md">
-		<Dialog.Header>
-			<Dialog.Title>Make {app.name} a background worker?</Dialog.Title>
-			<Dialog.Description>
-				Workers serve no traffic, so the domain <code>{app.domain}</code> and the health check are
-				removed and the app is no longer routed. From the next deploy, it counts as ready once it
-				stays up for
-				{secs}s.
-			</Dialog.Description>
-		</Dialog.Header>
-		<Dialog.Footer>
-			<Button variant="outline" onclick={() => (confirmOpen = false)}>Cancel</Button>
-			<Button onclick={save}>Make it a worker</Button>
-		</Dialog.Footer>
-	</Dialog.Content>
-</Dialog.Root>

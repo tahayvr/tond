@@ -17,9 +17,9 @@
 			case 'running':
 				return 'border-white bg-white';
 			case 'failed':
-				return 'border-red-500/60 bg-red-500/10';
+				return 'border-destructive/60 bg-destructive/10';
 			case 'unhealthy':
-				return 'border-yellow-500/60 bg-yellow-500/10';
+				return 'border-warn/60 bg-warn/10';
 			default:
 				return 'border-white/20 bg-white/5';
 		}
@@ -30,9 +30,9 @@
 			case 'running':
 				return 'text-black';
 			case 'failed':
-				return 'text-red-400';
+				return 'text-destructive';
 			case 'unhealthy':
-				return 'text-yellow-400';
+				return 'text-warn';
 			default:
 				return 'text-white/50';
 		}
@@ -43,9 +43,9 @@
 			case 'running':
 				return 'text-white/90';
 			case 'failed':
-				return 'text-red-400/80';
+				return 'text-destructive/80';
 			case 'unhealthy':
-				return 'text-yellow-400/80';
+				return 'text-warn/80';
 			default:
 				return 'text-white/35';
 		}

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { createProject } from '$lib/api';
 	import * as Dialog from '$lib/components/ui/dialog/index.js';
 	import { Button } from '$lib/components/ui/button/index.js';
@@ -78,9 +79,7 @@
 					disabled={submitting}
 				/>
 			</div>
-			{#if error}
-				<div class="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</div>
-			{/if}
+			<InlineError message={error} />
 			<Dialog.Footer>
 				<Button type="submit" disabled={!name.trim() || submitting}>
 					{submitting ? 'Creating…' : 'Create Project'}
