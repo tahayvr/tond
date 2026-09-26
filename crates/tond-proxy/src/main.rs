@@ -781,16 +781,9 @@ impl TondProxy {
         // Requests are counted per app (all its services share one bucket).
         #[allow(clippy::type_complexity)]
         let service_rows: Vec<(String, String, String, String, i64, bool, bool)> =
-            sqlx::query_as(
-                "SELECT d.domain, a.id, a.name, d.service, s.host_port, a.access_log, a.access_log_query
-                 FROM app_domains d
-                 JOIN apps a ON a.id = d.app_id
-                 JOIN compose_services s ON s.app_id = d.app_id AND s.name = d.service
-                 WHERE d.service IS NOT NULL AND d.kind != 'redirect'
-                   AND a.status IN ('running', 'building', 'unhealthy') AND s.host_port IS NOT NULL",
-            )
-            .fetch_all(&mut *tx)
-            .await?;
+            sqlx::query_as(tond_common::route_queries::COMPOSE_SERVICE_ROUTES)
+                .fetch_all(&mut *tx)
+                .await?;
         for (domain, id, name, service, host_port, access_log, access_query) in &service_rows {
             if under_preview_domain(domain) {
                 tracing::warn!(
