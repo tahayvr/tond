@@ -83,7 +83,9 @@ pub struct Current {
 static CURRENT: RwLock<Option<HashMap<Owner, Current>>> = RwLock::new(None);
 /// Latest `(cpu, mem)` of each compose service, keyed by (app id, service).
 /// In memory only: the app's series already sums its services.
-static SERVICES: RwLock<Option<HashMap<(String, String), (i64, i64)>>> = RwLock::new(None);
+/// `(app id, service) -> (cpu, mem)`
+type ServiceSamples = HashMap<(String, String), (i64, i64)>;
+static SERVICES: RwLock<Option<ServiceSamples>> = RwLock::new(None);
 
 /// Latest CPU (1/100 % of a core) and memory (bytes) of one compose service.
 pub fn service_current(app_id: &str, service: &str) -> Option<(i64, i64)> {
@@ -302,7 +304,7 @@ pub struct Collector {
     /// When the next background `docker system df` is due.
     next_df: Instant,
     /// Per compose service `(cpu, mem)` of the last sample pass.
-    service_samples: HashMap<(String, String), (i64, i64)>,
+    service_samples: ServiceSamples,
 }
 
 /// Reload the owner tables at least this often even without a change
@@ -354,7 +356,7 @@ impl Collector {
 
     /// Per compose service `(cpu, mem)` of the last sample pass.
     #[cfg(test)]
-    pub fn service_samples(&self) -> &HashMap<(String, String), (i64, i64)> {
+    pub fn service_samples(&self) -> &ServiceSamples {
         &self.service_samples
     }
 
@@ -518,7 +520,7 @@ impl Collector {
         pid_hint: &HashMap<String, u32>,
     ) -> (HashMap<Owner, Aggregate>, Vec<Happening>) {
         let mut aggregates: HashMap<Owner, Aggregate> = HashMap::new();
-        let mut services: HashMap<(String, String), (i64, i64)> = HashMap::new();
+        let mut services: ServiceSamples = HashMap::new();
         let mut happenings = Vec::new();
         for (id, t) in self.tracked.iter_mut() {
             let Some(owner) = t.owner.clone() else {

@@ -193,7 +193,10 @@ pub async fn list_apps(
 /// The API view of an app. A compose app shows the first domain of its
 /// services (its web service's) as `domain`, for display: its domains are
 /// managed per service.
-fn app_response(app: App, compose_domains: &std::collections::HashMap<String, String>) -> AppResponse {
+fn app_response(
+    app: App,
+    compose_domains: &std::collections::HashMap<String, String>,
+) -> AppResponse {
     let domain = (app.source_type == "compose")
         .then(|| compose_domains.get(&app.id).cloned())
         .flatten();
