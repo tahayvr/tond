@@ -72,7 +72,35 @@ check() {
 
 api() { curl -sf --unix-socket "$SOCK" "http://localhost$1"; }
 pid_of() { systemctl show -p MainPID --value "$1"; }
-rss_bytes() { awk '/^VmRSS:/ { print $2 * 1024 }' "/proc/$1/status"; }
+# Resident memory in bytes, then the part that is Rosetta's. Under Rosetta
+# (x86_64 binaries in an Apple Silicon VM) the translator keeps its code cache
+# in anonymous mappings at the top of the address space inside the process;
+# those pages are not Tond's and don't exist on a real x86_64 host, so they
+# are subtracted (and reported).
+rss_bytes() {
+    python3 - "$1" <<'PY'
+import re, sys
+pid = sys.argv[1]
+total = rosetta = 0
+under_rosetta = False
+start, name = 0, ""
+for line in open(f"/proc/{pid}/smaps"):
+    m = re.match(r"^([0-9a-f]+)-[0-9a-f]+ \S+ \S+ \S+ \S+\s*(.*)$", line)
+    if m:
+        start, name = int(m.group(1), 16), m.group(2)
+        if "rosetta" in name:
+            under_rosetta = True
+        continue
+    if line.startswith("Rss:"):
+        kb = int(line.split()[1])
+        total += kb
+        if "rosetta" in name or start >= 0xE000_0000_0000:
+            rosetta += kb
+if not under_rosetta:
+    rosetta = 0
+print((total - rosetta) * 1024, rosetta * 1024)
+PY
+}
 # utime + stime in seconds (fields 14, 15 after the command name).
 cpu_seconds() { awk '{ sub(/^.*\) /, ""); print ($12 + $13) / 100 }' "/proc/$1/stat"; }
 ctx_switches() {
@@ -108,10 +136,11 @@ sample() {
     proxy=$(pid_of tond-proxy)
     api /api/system/self | jq -c \
         --argjson t "$(date +%s.%N)" \
-        --argjson srss "$(rss_bytes "$server")" --argjson prss "$(rss_bytes "$proxy")" \
+        --argjson srss "$(rss_bytes "$server" | cut -d' ' -f1)" --argjson prss "$(rss_bytes "$proxy" | cut -d' ' -f1)" \
+        --argjson srosetta "$(rss_bytes "$server" | cut -d' ' -f2)" --argjson prosetta "$(rss_bytes "$proxy" | cut -d' ' -f2)" \
         --argjson scpu "$(cpu_seconds "$server")" --argjson pcpu "$(cpu_seconds "$proxy")" \
         --argjson sctx "$(ctx_switches "$server")" --argjson pctx "$(ctx_switches "$proxy")" \
-        '{t: $t, srss: $srss, prss: $prss, scpu: $scpu, pcpu: $pcpu, sctx: $sctx, pctx: $pctx,
+        '{t: $t, srss: $srss, prss: $prss, srosetta: $srosetta, prosetta: $prosetta, scpu: $scpu, pcpu: $pcpu, sctx: $sctx, pctx: $pctx,
           swake: ([.data.loops[].wakeups] | add // 0),
           pwake: ([.data.proxy.stats.loops[]?.wakeups] | add // 0),
           queries: .data.db.queries_total,
@@ -169,6 +198,9 @@ measure() {
 
     step "Budgets (${phase})"
     info "proxy routes: $(jq .routes "$b")"
+    if (( $(jq .srosetta "$b") > 0 )); then
+        info "running under Rosetta: its translation cache is not counted ($(calc "$(jq .srosetta "$b") / $MB") MB server, $(calc "$(jq .prosetta "$b") / $MB") MB proxy)"
+    fi
     check "${phase}: RSS tond-server" "$(calc "$(jq .srss "$b") / $MB")" "<=" "$rss_s_limit" MB
     check "${phase}: RSS tond-proxy" "$(calc "$(jq .prss "$b") / $MB")" "<=" "$rss_p_limit" MB
     check "${phase}: CPU both processes" \
@@ -216,12 +248,21 @@ with con:
 PY
 }
 
+count_dummy_certs() {
+    python3 - "$DB" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+print(con.execute("SELECT COUNT(*) FROM certificates WHERE domain LIKE 'budget-%'").fetchone()[0])
+PY
+}
+
 remove_dummy_apps() {
     python3 - "$DB" <<'PY'
 import sqlite3, sys
 con = sqlite3.connect(sys.argv[1], timeout=10)
 with con:
     con.execute("DELETE FROM apps WHERE name LIKE 'budget-%'")
+    con.execute("DELETE FROM certificates WHERE domain LIKE 'budget-%'")
 PY
 }
 
@@ -295,6 +336,15 @@ if (( APPS > 0 )); then
     done
     info "tond-proxy routes ${routes}"
     (( routes >= APPS )) || FAILURES+=("the proxy did not load the ${APPS} dummy routes (has ${routes})")
+    # New routes get certificates (one ACME order each). Budgets are for the
+    # steady state, so wait until the proxy has settled every new domain.
+    info "waiting for the certificate loop to settle the ${APPS} new domains…"
+    deadline=$((SECONDS + 600))
+    until (( $(count_dummy_certs) >= APPS )); do
+        (( SECONDS < deadline )) || { FAILURES+=("certificates for the dummy apps did not settle in 10 min"); break; }
+        sleep 5
+    done
+    sleep 30
     measure "${APPS} apps" 40 25
     remove_dummy_apps
 fi
