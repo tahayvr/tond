@@ -8,9 +8,11 @@
 		revokeSession,
 		revokeAllSessions,
 		type SessionInfo,
-		type TotpSetup
+		type TotpSetup,
+		type User
 	} from '$lib/api';
-	import { getUser } from '$lib/auth.svelte';
+	import { getUser, setAuthenticated } from '$lib/auth.svelte';
+	import { untrack } from 'svelte';
 	import { setUiContext, clearUiContext, projectsContext } from '$lib/ui-context.svelte';
 	import { Badge } from '$lib/components/ui/badge/index.js';
 	import * as Tabs from '$lib/components/ui/tabs/index.js';
@@ -70,7 +72,16 @@
 	let totpError = $state('');
 	let totpSaving = $state(false);
 	let backupCodes = $state<string[]>([]);
-	let twoFaEnabled = $state(false);
+	// Seeded from the freshly loaded user so enrolled users are offered "disable".
+	let twoFaEnabled = $state(
+		untrack(() => (data.me as User | undefined)?.totp_enabled ?? getUser()?.totp_enabled ?? false)
+	);
+
+	/** Keep the shared auth user in sync so other screens see the new 2FA state. */
+	function syncUserTotp(enabled: boolean) {
+		const current = getUser();
+		if (current) setAuthenticated({ ...current, totp_enabled: enabled });
+	}
 
 	function handleStart2FA() {
 		totpError = '';
@@ -99,6 +110,7 @@
 			const result = await confirm2FA(totpCode);
 			backupCodes = result.backup_codes;
 			twoFaEnabled = true;
+			syncUserTotp(true);
 			totpPhase = 'done';
 			totpCode = '';
 		} catch (e: any) {
@@ -114,6 +126,7 @@
 		try {
 			await disable2FA(totpDisablePassword, totpDisableCode);
 			twoFaEnabled = false;
+			syncUserTotp(false);
 			totpPhase = 'idle';
 			totpDisablePassword = '';
 			totpDisableCode = '';
@@ -134,7 +147,7 @@
 	}
 
 	function cancelDisable() {
-		totpPhase = twoFaEnabled ? 'idle' : 'idle';
+		totpPhase = 'idle';
 		totpDisablePassword = '';
 		totpDisableCode = '';
 		totpError = '';

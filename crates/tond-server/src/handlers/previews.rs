@@ -329,43 +329,6 @@ pub async fn update_preview_config(
             .into_response();
     }
 
-    // Update scoped secret fields if provided
-    if let Some(ref excluded_keys) = body.preview_excluded_keys {
-        let json = serde_json::to_string(excluded_keys).unwrap_or_else(|_| "[]".to_string());
-        if let Err(e) =
-            sqlx::query("UPDATE apps SET preview_excluded_keys = ?, updated_at = ? WHERE id = ?")
-                .bind(&json)
-                .bind(&now)
-                .bind(&app.id)
-                .execute(&state.db)
-                .await
-        {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::<()>::err(format!("DB error: {}", e))),
-            )
-                .into_response();
-        }
-    }
-
-    if let Some(ref preview_env_vars) = body.preview_env_vars {
-        let json = serde_json::to_string(preview_env_vars).unwrap_or_else(|_| "{}".to_string());
-        if let Err(e) =
-            sqlx::query("UPDATE apps SET preview_env_vars = ?, updated_at = ? WHERE id = ?")
-                .bind(&json)
-                .bind(&now)
-                .bind(&app.id)
-                .execute(&state.db)
-                .await
-        {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::<()>::err(format!("DB error: {}", e))),
-            )
-                .into_response();
-        }
-    }
-
     tracing::info!(
         "Preview deployments {} for app {}",
         if body.preview_enabled {
@@ -680,9 +643,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_preview_config_persists_enable_flag_and_scoped_settings() {
+    async fn update_preview_config_persists_enable_flag_without_touching_preview_env() {
         let state = test_state().await;
         let app = seed_preview_app(&state, "frontend", "git").await;
+        sqlx::query("UPDATE apps SET preview_excluded_keys = ?, preview_env_vars = ? WHERE id = ?")
+            .bind(r#"["TOKEN"]"#)
+            .bind(r#"{"MODE":"preview"}"#)
+            .bind(&app.id)
+            .execute(&state.db)
+            .await
+            .unwrap_or_else(|err| panic!("failed to seed preview env: {err}"));
 
         let response = update_preview_config(
             RateLimit,
@@ -691,8 +661,6 @@ mod tests {
             Path(app.id.clone()),
             Json(UpdatePreviewConfigRequest {
                 preview_enabled: false,
-                preview_excluded_keys: Some(vec!["SECRET_KEY".to_string(), "TOKEN".to_string()]),
-                preview_env_vars: Some(serde_json::json!({ "MODE": "preview" })),
             }),
         )
         .await;
@@ -714,16 +682,9 @@ mod tests {
             "update_preview_config should persist preview_enabled as an integer flag"
         );
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&row.1)
-                .unwrap_or_else(|err| panic!("failed to parse preview_excluded_keys JSON: {err}")),
-            serde_json::json!(["SECRET_KEY", "TOKEN"]),
-            "update_preview_config should persist preview_excluded_keys as JSON"
-        );
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&row.2)
-                .unwrap_or_else(|err| panic!("failed to parse preview_env_vars JSON: {err}")),
-            serde_json::json!({ "MODE": "preview" }),
-            "update_preview_config should persist preview_env_vars as JSON"
+            (row.1.as_str(), row.2.as_str()),
+            (r#"["TOKEN"]"#, r#"{"MODE":"preview"}"#),
+            "toggling previews must leave preview exclusions and overrides untouched"
         );
     }
 
@@ -766,8 +727,6 @@ mod tests {
             Path(app.id.clone()),
             Json(UpdatePreviewConfigRequest {
                 preview_enabled: true,
-                preview_excluded_keys: None,
-                preview_env_vars: None,
             }),
         )
         .await;

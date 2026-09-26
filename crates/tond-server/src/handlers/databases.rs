@@ -14,7 +14,7 @@
 //   POST   /api/databases/{id}/stop               — stop container
 //   POST   /api/databases/{id}/start              — start container (existing container)
 //   POST   /api/databases/{id}/redeploy           — recreate container (picks up custom_image)
-//   PATCH  /api/databases/{id}/credentials        — update stored credentials (takes effect on redeploy)
+//   PATCH  /api/databases/{id}/credentials        — change passwords inside the running database
 //
 // Network exposure (H6): database ports are published on 127.0.0.1 unless an
 // admin turns on `public_access`, which publishes on 0.0.0.0. Docker's iptables
@@ -32,6 +32,7 @@ use tond_common::*;
 use crate::{
     audit_log::{AuthActor, write_audit_log},
     auth::{AuthRole, RateLimit, RequireAuth},
+    db_credentials::{CredentialField, container_running, password_change_step, run_step},
     docker,
     error::AppError,
     state::AppState,
@@ -825,10 +826,32 @@ async fn recreate_container(
 
 // ── Update credentials ──
 
-/// Update the stored username / password (and, for SQL engines, database name).
+/// Refuse a rename of the database or user: engines only apply those names when
+/// they initialise an empty data directory, so the stored and real names would
+/// drift apart.
+fn refuse_rename(
+    label: &str,
+    current: Option<&str>,
+    requested: Option<&str>,
+) -> Result<(), AppError> {
+    let requested = requested.map(str::trim).filter(|v| !v.is_empty());
+    match requested {
+        Some(next) if Some(next) != current => Err(AppError(TondError::InvalidInput(format!(
+            "The {label} of an existing database can't be changed; only passwords can. \
+             Create a new user or database from the database shell instead."
+        )))),
+        _ => Ok(()),
+    }
+}
+
+/// Change the application and/or root password inside the running database,
+/// then persist it.
 ///
-/// Changes are persisted immediately but only take effect in the container on
-/// the next `redeploy` — the running container is not restarted automatically.
+/// The change runs in the engine itself (ALTER ROLE / ALTER USER /
+/// changeUserPassword) through `docker exec`, authenticated with the current
+/// credentials, so the stored password always matches the real one. Each
+/// password is persisted only after the engine accepted it. Refused when the
+/// database isn't running, for renames, and for engines that can't do it.
 pub async fn update_database_credentials(
     _rate: RateLimit,
     _auth: RequireAuth,
@@ -839,35 +862,108 @@ pub async fn update_database_credentials(
 ) -> Result<impl IntoResponse, AppError> {
     let db = fetch_db(&state.db, &id).await?;
 
-    // Apply only the fields that were supplied.
-    let new_db_name = next_credential(db.db_name.clone(), req.db_name);
-    let new_db_user = next_credential(db.db_user.clone(), req.db_user);
-    let new_db_password = next_credential(db.db_password.clone(), req.db_password);
-    let new_root_password = next_credential(db.root_password.clone(), req.root_password);
-    if is_redis_like(&db.db_type) {
-        redis_config(
-            new_db_user.as_deref().unwrap_or_default(),
-            new_db_password.as_deref().unwrap_or_default(),
-        )
-        .map_err(|msg| AppError(TondError::InvalidInput(msg)))?;
+    refuse_rename(
+        "database name",
+        db.db_name.as_deref(),
+        req.db_name.as_deref(),
+    )?;
+    refuse_rename("username", db.db_user.as_deref(), req.db_user.as_deref())?;
+
+    let mut changes: Vec<(CredentialField, String)> = Vec::new();
+    if let Some(next) = next_credential(None, req.db_password)
+        && Some(&next) != db.db_password.as_ref()
+    {
+        changes.push((CredentialField::AppPassword, next));
+    }
+    if let Some(next) = next_credential(None, req.root_password)
+        && Some(&next) != db.root_password.as_ref()
+    {
+        changes.push((CredentialField::RootPassword, next));
+    }
+    if changes.is_empty() {
+        return Err(AppError(TondError::InvalidInput(
+            "Nothing to change: enter a new password.".to_string(),
+        )));
     }
 
-    sqlx::query(
-        "UPDATE databases
-         SET db_name       = ?,
-             db_user       = ?,
-             db_password   = ?,
-             root_password = ?,
-             updated_at    = datetime('now')
-         WHERE id = ?",
-    )
-    .bind(&new_db_name)
-    .bind(&new_db_user)
-    .bind(&new_db_password)
-    .bind(&new_root_password)
-    .bind(&db.id)
-    .execute(&state.db)
-    .await?;
+    // Validate every change before touching the database.
+    for (field, password) in &changes {
+        password_change_step(&db, *field, password)
+            .map_err(|reason| AppError(TondError::InvalidInput(reason)))?;
+    }
+
+    let container_id = match db.container_id.as_deref() {
+        Some(cid) if db.status == "running" && container_running(&state.docker, cid).await => {
+            cid.to_string()
+        }
+        _ => {
+            return Err(AppError(TondError::InvalidInput(format!(
+                "Start '{}' first: the password is changed inside the running database. \
+                 Nothing was changed.",
+                db.name
+            ))));
+        }
+    };
+
+    let mut applied: Vec<&'static str> = Vec::new();
+    for (field, password) in &changes {
+        // Re-read so each step authenticates with the credentials now in effect.
+        let current = fetch_db(&state.db, &db.id).await?;
+        let step = password_change_step(&current, *field, password)
+            .map_err(|reason| AppError(TondError::InvalidInput(reason)))?;
+        let secrets = [
+            password.as_str(),
+            current.db_password.as_deref().unwrap_or_default(),
+            current.root_password.as_deref().unwrap_or_default(),
+        ];
+
+        if let Err(e) = run_step(&state.docker, &container_id, &step, &secrets).await {
+            let done = if applied.is_empty() {
+                "Nothing was changed.".to_string()
+            } else {
+                "The application password was changed and saved; the root password was not."
+                    .to_string()
+            };
+            return Err(AppError(TondError::Internal(format!(
+                "Couldn't change the {} inside '{}': {e}. {done}",
+                field.label(),
+                db.name
+            ))));
+        }
+
+        match field {
+            CredentialField::AppPassword => {
+                // A MySQL/MariaDB row without a root password mirrors the app
+                // password; keep root's real (old) password explicit.
+                let root = if matches!(current.db_type.as_str(), "mysql" | "mariadb")
+                    && current.root_password.is_none()
+                {
+                    current.db_password.clone()
+                } else {
+                    current.root_password.clone()
+                };
+                sqlx::query(
+                    "UPDATE databases SET db_password = ?, root_password = ?, updated_at = datetime('now') WHERE id = ?",
+                )
+                .bind(password)
+                .bind(root)
+                .bind(&db.id)
+                .execute(&state.db)
+                .await?;
+                applied.push("db_password");
+            }
+            CredentialField::RootPassword => {
+                sqlx::query(
+                    "UPDATE databases SET root_password = ?, updated_at = datetime('now') WHERE id = ?",
+                )
+                .bind(password)
+                .bind(&db.id)
+                .execute(&state.db)
+                .await?;
+                applied.push("root_password");
+            }
+        }
+    }
 
     write_audit_log(
         &state.db,
@@ -875,19 +971,17 @@ pub async fn update_database_credentials(
         None,
         "db_credentials_update",
         &actor.0,
-        Some(&format!("name={}", db.name)),
+        Some(&format!("name={} changed={}", db.name, applied.join(","))),
     )
     .await;
 
     let updated_db = fetch_db(&state.db, &db.id).await?;
     let detail = build_detail(updated_db, public_host(&state).await.as_deref());
-    // Credentials only take effect after a redeploy — signal this explicitly so
-    // the dashboard can surface a "redeploy required" banner.
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(serde_json::json!({
             "database": detail,
-            "requires_redeploy": true,
+            "changed": applied,
         }))),
     ))
 }
@@ -965,6 +1059,14 @@ mod tests {
         .execute(&state.db)
         .await
         .unwrap_or_else(|err| panic!("failed to seed managed database row: {err}"));
+    }
+
+    /// A database without a project (so seeding needs no projects row).
+    fn standalone_db() -> ManagedDatabase {
+        ManagedDatabase {
+            project_id: None,
+            ..sample_db()
+        }
     }
 
     fn sample_db() -> ManagedDatabase {
@@ -1277,56 +1379,143 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn update_database_credentials_preserves_empty_inputs_and_flags_redeploy_required() {
-        let state = test_state().await;
-        let mut db = sample_db();
-        db.project_id = None;
-        db.root_password = Some("root-secret".to_string());
-        seed_database_row(&state, &db).await;
-
-        let response = update_database_credentials(
+    async fn call_update_credentials(
+        state: &AppState,
+        id: &str,
+        req: UpdateDatabaseCredentials,
+    ) -> Result<axum::response::Response, String> {
+        update_database_credentials(
             RateLimit,
             RequireAuth,
             AuthActor("admin@example.com".to_string()),
             State(state.clone()),
-            Path(db.id.clone()),
-            Json(UpdateDatabaseCredentials {
-                db_name: Some(" next_db ".to_string()),
-                db_user: Some("   ".to_string()),
-                db_password: Some("new-secret".to_string()),
-                root_password: Some(" ".to_string()),
-            }),
+            Path(id.to_string()),
+            Json(req),
         )
         .await
-        .unwrap_or_else(|_| panic!("update_database_credentials should succeed for a seeded row"))
-        .into_response();
+        .map(IntoResponse::into_response)
+        .map_err(|e| e.0.to_string())
+    }
 
-        let body = response_json(response).await;
-        assert_eq!(
-            body["data"]["requires_redeploy"],
-            serde_json::Value::Bool(true),
-            "update_database_credentials should explicitly flag that a redeploy is required"
+    fn password_only(password: &str) -> UpdateDatabaseCredentials {
+        UpdateDatabaseCredentials {
+            db_name: None,
+            db_user: None,
+            db_password: Some(password.to_string()),
+            root_password: None,
+        }
+    }
+
+    async fn stored_password(state: &AppState, id: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT db_password FROM databases WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_else(|err| panic!("failed to read stored password: {err}"))
+    }
+
+    #[tokio::test]
+    async fn update_database_credentials_refuses_renames() {
+        let state = test_state().await;
+        let db = standalone_db();
+        seed_database_row(&state, &db).await;
+
+        let err = call_update_credentials(
+            &state,
+            &db.id,
+            UpdateDatabaseCredentials {
+                db_name: Some("other_db".to_string()),
+                db_user: None,
+                db_password: None,
+                root_password: None,
+            },
+        )
+        .await
+        .expect_err("renaming the database should be refused");
+        assert!(
+            err.contains("only passwords can"),
+            "unexpected message: {err}"
+        );
+
+        // Sending the current values back (as the dashboard may) is not a rename.
+        let err = call_update_credentials(
+            &state,
+            &db.id,
+            UpdateDatabaseCredentials {
+                db_name: Some("appdb".to_string()),
+                db_user: Some(" appuser ".to_string()),
+                db_password: Some("   ".to_string()),
+                root_password: None,
+            },
+        )
+        .await
+        .expect_err("a request with no new password has nothing to change");
+        assert!(
+            err.contains("Nothing to change"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_database_credentials_refuses_when_the_database_is_not_running() {
+        let state = test_state().await;
+        let mut db = standalone_db();
+        db.status = "stopped".to_string();
+        seed_database_row(&state, &db).await;
+
+        let err = call_update_credentials(&state, &db.id, password_only("new-secret"))
+            .await
+            .expect_err("a stopped database can't change its password");
+
+        assert!(
+            err.contains("Start 'postgres-main' first"),
+            "unexpected message: {err}"
         );
         assert_eq!(
-            body["data"]["database"]["db_name"],
-            serde_json::Value::String("next_db".to_string()),
-            "update_database_credentials should trim and persist a supplied database name"
+            stored_password(&state, &db.id).await.as_deref(),
+            Some("secret"),
+            "the stored password must stay in sync with the real one"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_database_credentials_refuses_when_the_container_is_unreachable() {
+        // The test Docker client points at a closed port, so the container
+        // can't be confirmed running even though the row says it is.
+        let state = test_state().await;
+        let db = standalone_db();
+        seed_database_row(&state, &db).await;
+
+        let err = call_update_credentials(&state, &db.id, password_only("new-secret"))
+            .await
+            .expect_err("an unreachable container can't change its password");
+
+        assert!(
+            err.contains("Nothing was changed"),
+            "unexpected message: {err}"
         );
         assert_eq!(
-            body["data"]["database"]["db_user"],
-            serde_json::Value::String("appuser".to_string()),
-            "update_database_credentials should preserve the existing username when given an empty string"
+            stored_password(&state, &db.id).await.as_deref(),
+            Some("secret")
         );
+    }
+
+    #[tokio::test]
+    async fn update_database_credentials_refuses_engines_that_cannot_change_in_place() {
+        let state = test_state().await;
+        let mut db = standalone_db();
+        db.db_type = "redis".to_string();
+        db.db_name = None;
+        seed_database_row(&state, &db).await;
+
+        let err = call_update_credentials(&state, &db.id, password_only("new-secret"))
+            .await
+            .expect_err("redis passwords can't be changed in place");
+
+        assert!(err.contains("Redis"), "unexpected message: {err}");
         assert_eq!(
-            body["data"]["database"]["db_password"],
-            serde_json::Value::String("new-secret".to_string()),
-            "update_database_credentials should update the stored application password"
-        );
-        assert_eq!(
-            body["data"]["database"]["root_password"],
-            serde_json::Value::String("root-secret".to_string()),
-            "update_database_credentials should preserve the root password when given an empty string"
+            stored_password(&state, &db.id).await.as_deref(),
+            Some("secret")
         );
     }
 }

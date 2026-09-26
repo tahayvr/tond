@@ -40,6 +40,8 @@ import {
 	MOCK_STORAGE_PROVIDERS,
 	MOCK_SNAPSHOTS,
 	MOCK_BACKUP_CONFIG,
+	MOCK_APP_ENV_VARS,
+	MOCK_PREVIEW_ENV_VARS,
 	MOCK_CERTIFICATES,
 	makeMockSystemMetrics,
 	makeMockAppMetrics
@@ -312,6 +314,57 @@ let integrations: Integration[] = structuredClone(MOCK_INTEGRATIONS);
 let storageProviders: StorageProvider[] = structuredClone(MOCK_STORAGE_PROVIDERS);
 let snapshots: Snapshot[] = structuredClone(MOCK_SNAPSHOTS);
 let backupConfig: BackupConfig = structuredClone(MOCK_BACKUP_CONFIG);
+// app_id → env vars / preview overrides (plaintext; only masked values leave the mock)
+const appEnvVars: Record<string, Record<string, string>> = structuredClone(MOCK_APP_ENV_VARS);
+const previewEnvVars: Record<string, Record<string, string>> = structuredClone(
+	MOCK_PREVIEW_ENV_VARS
+);
+
+function envStore(appId: string) {
+	return (appEnvVars[appId] ??= {});
+}
+
+function previewStore(appId: string) {
+	return (previewEnvVars[appId] ??= {});
+}
+
+function maskedEntries(vars: Record<string, string>) {
+	return Object.keys(vars)
+		.sort()
+		.map((key) => ({ key, masked: vars[key] ? '••••••••' : '' }));
+}
+
+function appEnvResponse(app: App) {
+	return {
+		vars: maskedEntries(envStore(app.id)),
+		preview: {
+			enabled: app.preview_enabled,
+			excluded_keys: app.preview_excluded_keys,
+			overrides: maskedEntries(previewStore(app.id))
+		}
+	};
+}
+
+function validateEnvPatch(body: { set?: Record<string, string>; unset?: string[] }) {
+	const set = Object.keys(body.set ?? {});
+	const unset = body.unset ?? [];
+	if (set.length === 0 && unset.length === 0) {
+		return 'Invalid input: nothing to change: send at least one variable to set or unset';
+	}
+	const bad = [...set, ...unset].find((key) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key));
+	if (bad) return `Invalid input: '${bad}' is not a valid variable name`;
+	return null;
+}
+
+function applyEnvPatch(
+	current: Record<string, string>,
+	body: { set?: Record<string, string>; unset?: string[] }
+) {
+	const next = { ...current, ...(body.set ?? {}) };
+	for (const key of body.unset ?? []) delete next[key];
+	return next;
+}
+
 // alert_id → AlertIntegrationLink[]
 let alertIntegrationLinks: Record<string, AlertIntegrationLink[]> = {
 	alert_1: [
@@ -326,15 +379,81 @@ let alertIntegrationLinks: Record<string, AlertIntegrationLink[]> = {
 	]
 };
 
+// ── Mock scenarios ──────────────────────────────────────────────────────────
+// Reproduce failure states in the browser. Set one in the devtools console,
+// then reload:  localStorage.setItem('tond:mock-scenario', 'session-expired')
+//
+//   server-down      every /api request gets a proxy-style 502 HTML page
+//   session-expired  the next data request gets a 401 (one-shot), then normal
+//   rate-limited     POST /api/auth/login gets 429 with Retry-After: 30
+//   logged-out       start signed out (run with VITE_DEV_AUTH_BYPASS=false)
+//   mfa              like logged-out, and sign-in asks for a 2FA code (123456)
+//   2fa-enabled      the current user starts with 2FA enabled
+//
+// Clear with localStorage.removeItem('tond:mock-scenario').
+const SCENARIO_KEY = 'tond:mock-scenario';
+
+function mockScenario(): string | null {
+	try {
+		return globalThis.localStorage?.getItem(SCENARIO_KEY) ?? null;
+	} catch {
+		return null;
+	}
+}
+
+function clearMockScenario() {
+	try {
+		globalThis.localStorage?.removeItem(SCENARIO_KEY);
+	} catch {
+		// ignore
+	}
+}
+
+let mockSignedIn = false;
+let mockTotpEnabled = mockScenario() === '2fa-enabled';
+
+function currentMockUser() {
+	return { ...MOCK_USER, totp_enabled: mockTotpEnabled };
+}
+
+const CREDENTIAL_PATHS = ['/api/auth/'];
+
 export const handlers = [
+	// Scenario gate: runs first and falls through (returns undefined) when idle.
+	http.all('/api/*', ({ request }) => {
+		const scenario = mockScenario();
+		if (!scenario) return;
+		const path = new URL(request.url).pathname;
+		if (scenario === 'server-down') {
+			return new HttpResponse('<html><body><h1>502 Bad Gateway</h1></body></html>', {
+				status: 502,
+				headers: { 'Content-Type': 'text/html' }
+			});
+		}
+		if (scenario === 'session-expired' && !CREDENTIAL_PATHS.some((p) => path.startsWith(p))) {
+			clearMockScenario();
+			return err('Unauthorized', 401);
+		}
+		if (scenario === 'rate-limited' && path === '/api/auth/login') {
+			return HttpResponse.json(
+				{ success: false, data: null, error: 'Rate limit exceeded. Try again later.' },
+				{ status: 429, headers: { 'Retry-After': '30' } }
+			);
+		}
+	}),
+
 	// ── Auth ────────────────────────────────────────────────────────────────
 
 	http.get('/api/auth/status', async () => {
 		await delay(LATENCY);
+		const scenario = mockScenario();
+		if ((scenario === 'logged-out' || scenario === 'mfa') && !mockSignedIn) {
+			return ok({ authenticated: false, user: null });
+		}
 		if (needsSetup) {
 			return ok({ authenticated: false, user: null });
 		}
-		return ok({ authenticated: true, user: MOCK_USER });
+		return ok({ authenticated: true, user: currentMockUser() });
 	}),
 
 	http.post('/api/auth/setup/check', async ({ request }) => {
@@ -351,7 +470,11 @@ export const handlers = [
 
 	http.post('/api/auth/login', async () => {
 		await delay(LATENCY);
-		return ok({ user: MOCK_USER });
+		if (mockScenario() === 'mfa') {
+			return ok({ mfa_required: true });
+		}
+		mockSignedIn = true;
+		return ok({ user: currentMockUser() });
 	}),
 
 	http.post('/api/auth/logout', async () => {
@@ -361,7 +484,7 @@ export const handlers = [
 
 	http.get('/api/auth/me', async () => {
 		await delay(LATENCY);
-		return ok(MOCK_USER);
+		return ok(currentMockUser());
 	}),
 
 	http.post('/api/auth/setup', async ({ request }) => {
@@ -469,6 +592,7 @@ export const handlers = [
 			id: `usr_${Date.now()}`,
 			email: body.email,
 			role: body.role ?? 'member',
+			totp_enabled: false,
 			created_at: new Date().toISOString()
 		};
 		users = [...users, newUser];
@@ -534,6 +658,9 @@ export const handlers = [
 		if (!body.password || body.password === 'wrong') {
 			return err('Password is incorrect', 401);
 		}
+		if (mockTotpEnabled) {
+			return err('Two-factor authentication is already enabled', 409);
+		}
 		const secret = 'JBSWY3DPEHPK3PXP';
 		// Minimal 1×1 white PNG as a stand-in for the real server-generated QR code
 		const qr_code =
@@ -551,6 +678,7 @@ export const handlers = [
 		if (body.code !== '123456') {
 			return err('Invalid TOTP code', 401);
 		}
+		mockTotpEnabled = true;
 		return ok({
 			message: '2FA enabled successfully',
 			backup_codes: Array.from({ length: 10 }, () =>
@@ -568,6 +696,7 @@ export const handlers = [
 		if (body.code !== '123456') {
 			return err('Invalid TOTP or backup code', 401);
 		}
+		mockTotpEnabled = false;
 		return ok({ message: '2FA disabled' });
 	}),
 
@@ -577,7 +706,8 @@ export const handlers = [
 		if (body.code !== '123456') {
 			return err('Invalid TOTP or backup code', 401);
 		}
-		return ok({ user: MOCK_USER });
+		mockSignedIn = true;
+		return ok({ user: currentMockUser() });
 	}),
 
 	// ── Projects ──────────────────────────────────────────────────────────────
@@ -731,7 +861,6 @@ export const handlers = [
 			static_build: body.static_build ?? false,
 			preview_enabled: false,
 			preview_excluded_keys: [],
-			preview_env_vars: {},
 			created_at: new Date().toISOString(),
 			updated_at: new Date().toISOString()
 		};
@@ -789,11 +918,64 @@ export const handlers = [
 		return ok(null);
 	}),
 
-	http.put('/api/apps/:id/env', async ({ params }) => {
+	// ── App environment (masked reads, per-key patches) ──
+
+	http.get('/api/apps/:id/env', async ({ params }) => {
 		await delay(LATENCY);
 		const app = apps.find((a) => a.id === params.id);
 		if (!app) return err('App not found', 404);
-		return ok(null);
+		return ok(appEnvResponse(app));
+	}),
+
+	http.get('/api/apps/:id/env/:key', async ({ params }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id);
+		if (!app) return err('App not found', 404);
+		const value = envStore(app.id)[params.key as string];
+		if (value === undefined) return err(`Not found: variable '${params.key}'`, 404);
+		return ok({ key: params.key, value });
+	}),
+
+	http.patch('/api/apps/:id/env', async ({ params, request }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id);
+		if (!app) return err('App not found', 404);
+		const body = (await request.json()) as { set?: Record<string, string>; unset?: string[] };
+		const problem = validateEnvPatch(body);
+		if (problem) return err(problem);
+		appEnvVars[app.id] = applyEnvPatch(envStore(app.id), body);
+		return ok(appEnvResponse(app));
+	}),
+
+	http.get('/api/apps/:id/preview-env/:key', async ({ params }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id);
+		if (!app) return err('App not found', 404);
+		const value = previewStore(app.id)[params.key as string];
+		if (value === undefined) return err(`Not found: preview override '${params.key}'`, 404);
+		return ok({ key: params.key, value });
+	}),
+
+	http.patch('/api/apps/:id/preview-env', async ({ params, request }) => {
+		await delay(LATENCY);
+		const idx = apps.findIndex((a) => a.id === params.id);
+		if (idx === -1) return err('App not found', 404);
+		const body = (await request.json()) as {
+			set?: Record<string, string>;
+			unset?: string[];
+			exclude?: string[];
+			include?: string[];
+		};
+		const hasExclusions = (body.exclude?.length ?? 0) + (body.include?.length ?? 0) > 0;
+		const problem = hasExclusions && !body.set && !body.unset ? null : validateEnvPatch(body);
+		if (problem) return err(problem);
+		const app = apps[idx];
+		previewEnvVars[app.id] = applyEnvPatch(previewStore(app.id), body);
+		const excluded = new Set(app.preview_excluded_keys);
+		for (const key of body.exclude ?? []) excluded.add(key);
+		for (const key of body.include ?? []) excluded.delete(key);
+		apps[idx] = { ...app, preview_excluded_keys: [...excluded].sort() };
+		return ok(appEnvResponse(apps[idx]));
 	}),
 
 	http.put('/api/apps/:id/domain', async ({ params, request }) => {
@@ -1153,22 +1335,16 @@ export const handlers = [
 		await delay(LATENCY);
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx === -1) return err('App not found', 404);
-		const body = (await request.json()) as {
-			preview_enabled: boolean;
-			preview_excluded_keys?: string[];
-			preview_env_vars?: Record<string, string>;
-		};
+		const body = (await request.json()) as { preview_enabled: boolean };
 		if (body.preview_enabled && !MOCK_SETTINGS.preview_domain) {
 			return err(PREVIEW_DOMAIN_REQUIRED);
 		}
 		apps[idx] = {
 			...apps[idx],
 			preview_enabled: body.preview_enabled,
-			preview_excluded_keys: body.preview_excluded_keys ?? apps[idx].preview_excluded_keys,
-			preview_env_vars: body.preview_env_vars ?? apps[idx].preview_env_vars,
 			updated_at: new Date().toISOString()
 		};
-		return ok(apps[idx]);
+		return ok({ preview_enabled: body.preview_enabled });
 	}),
 
 	// ── Project Previews ──────────────────────────────────────────────────────
@@ -1629,11 +1805,40 @@ export const handlers = [
 			db_password?: string | null;
 			root_password?: string | null;
 		};
-		const updated = { ...databases[idx] };
-		if (body.db_name !== undefined) updated.db_name = body.db_name ?? null;
-		if (body.db_user !== undefined) updated.db_user = body.db_user ?? null;
-		if (body.db_password !== undefined) updated.db_password = body.db_password ?? null;
-		if (body.root_password !== undefined) updated.root_password = body.root_password ?? null;
+		// Mirrors the server: passwords change inside the running engine; renames,
+		// Redis/KeyDB and stopped databases are refused and nothing is saved.
+		const current = databases[idx];
+		const renamed = (next: string | null | undefined, now: string | null) =>
+			!!next?.trim() && next.trim() !== now;
+		if (renamed(body.db_name, current.db_name) || renamed(body.db_user, current.db_user)) {
+			return err(
+				"Invalid input: The username of an existing database can't be changed; only passwords can."
+			);
+		}
+		const changed: string[] = [];
+		const updated = { ...current };
+		const nextPw = body.db_password?.trim();
+		if (nextPw && nextPw !== current.db_password) {
+			updated.db_password = nextPw;
+			changed.push('db_password');
+		}
+		const nextRoot = body.root_password?.trim();
+		if (nextRoot && nextRoot !== current.root_password) {
+			updated.root_password = nextRoot;
+			changed.push('root_password');
+		}
+		if (changed.length === 0) return err('Invalid input: Nothing to change: enter a new password.');
+		if (current.db_type === 'redis' || current.db_type === 'keydb') {
+			return err(
+				"Invalid input: Redis and KeyDB passwords can't be changed in place yet. The stored password was not changed."
+			);
+		}
+		if (current.status !== 'running') {
+			return err(
+				`Invalid input: Start '${current.name}' first: the password is changed inside the running database. Nothing was changed.`
+			);
+		}
+		await delay(LATENCY * 3); // simulate the docker exec
 		updated.updated_at = new Date().toISOString();
 		databases[idx] = updated;
 		const db = databases[idx];
@@ -1658,7 +1863,7 @@ export const handlers = [
 				public_connection_string: mockPublicUrl(db),
 				internal_connection_string: db.custom_internal_url ?? computedInternalC
 			},
-			requires_redeploy: true
+			changed
 		});
 	}),
 

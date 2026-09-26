@@ -35,6 +35,8 @@ const {
 	projectsContext: vi.fn(() => ({ type: 'projects' }))
 }));
 
+vi.mock('$lib/auth.svelte', () => ({ isAdmin: () => true }));
+
 vi.mock('$app/navigation', () => ({
 	goto
 }));

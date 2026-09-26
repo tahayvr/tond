@@ -3,7 +3,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const getAuthStatus = vi.fn();
 
 vi.mock('./api', () => ({
-	getAuthStatus
+	getAuthStatus,
+	setUnauthorizedHandler: vi.fn()
 }));
 
 describe('auth state', () => {
@@ -19,6 +20,7 @@ describe('auth state', () => {
 				id: 'usr_1',
 				email: 'admin@example.com',
 				role: 'admin',
+				totp_enabled: false,
 				created_at: '2026-01-01T00:00:00.000Z'
 			}
 		});
@@ -55,6 +57,7 @@ describe('auth state', () => {
 			id: 'usr_1',
 			email: 'admin@example.com',
 			role: 'admin',
+			totp_enabled: false,
 			created_at: '2026-01-01T00:00:00.000Z'
 		});
 		await auth.checkAuth();
@@ -87,6 +90,7 @@ describe('auth state', () => {
 			id: 'usr_2',
 			email: 'member@example.com',
 			role: 'member',
+			totp_enabled: false,
 			created_at: '2026-01-01T00:00:00.000Z'
 		});
 
@@ -97,5 +101,26 @@ describe('auth state', () => {
 
 		expect(auth.getStatus()).toBe('login');
 		expect(auth.getUser()).toBeNull();
+	});
+
+	it('signs out and flags an expired session only when a session was active', async () => {
+		const auth = await import('./auth.svelte');
+
+		auth.clearAuth();
+		auth.handleSessionExpired();
+		expect(auth.getSessionExpired()).toBe(false);
+
+		auth.setAuthenticated({
+			id: 'usr_1',
+			email: 'admin@example.com',
+			role: 'admin',
+			totp_enabled: false,
+			created_at: '2026-01-01T00:00:00.000Z'
+		});
+		auth.handleSessionExpired();
+
+		expect(auth.getStatus()).toBe('login');
+		expect(auth.getUser()).toBeNull();
+		expect(auth.getSessionExpired()).toBe(true);
 	});
 });

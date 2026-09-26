@@ -32,8 +32,11 @@ vi.mock('$lib/components/tabs/profile-page/profile-two-factor.svelte', async () 
 	default: (await import('../mocks/ProfileTwoFactorHarness.svelte')).default
 }));
 
+const { setAuthenticated } = vi.hoisted(() => ({ setAuthenticated: vi.fn() }));
+
 vi.mock('$lib/auth.svelte', () => ({
-	getUser: () => ({ email: 'admin@example.com', role: 'admin' })
+	getUser: () => ({ email: 'admin@example.com', role: 'admin', totp_enabled: false }),
+	setAuthenticated
 }));
 
 import ProfilePage from '../../routes/profile/+page.svelte';
@@ -59,12 +62,21 @@ const sessions = [
 	}
 ];
 
-function renderPage(routeSessions = sessions) {
+const me = {
+	id: 'usr_1',
+	email: 'admin@example.com',
+	role: 'admin',
+	totp_enabled: false,
+	created_at: '2026-01-01T00:00:00.000Z'
+};
+
+function renderPage(routeSessions = sessions, totpEnabled = false) {
 	render(ProfilePage, {
 		props: {
 			params: {},
 			data: {
-				sessions: routeSessions
+				sessions: routeSessions,
+				me: { ...me, totp_enabled: totpEnabled }
 			}
 		}
 	});
@@ -141,6 +153,31 @@ describe('profile page', () => {
 		expect(api.confirm2FA).toHaveBeenCalledWith('123456');
 		expect(await screen.findByText(/save these backup codes/i)).toBeInTheDocument();
 		expect(screen.getByText(/code-1/i)).toBeInTheDocument();
+	});
+
+	it('offers to disable 2fa for an enrolled user and disables it', async () => {
+		api.disable2FA.mockResolvedValue(undefined);
+		const user = userEvent.setup();
+		renderPage(sessions, true);
+
+		await user.click(screen.getByRole('tab', { name: /two-factor auth/i }));
+		expect(
+			screen.queryByRole('button', { name: /enable two-factor auth/i })
+		).not.toBeInTheDocument();
+
+		await user.click(screen.getByRole('button', { name: /disable 2fa/i }));
+		await user.type(
+			screen.getAllByLabelText(/current password/i).at(-1) as HTMLElement,
+			'ValidPass123!'
+		);
+		await user.type(screen.getByLabelText(/authenticator code/i), '123456');
+		await user.click(screen.getByRole('button', { name: /disable 2fa/i }));
+
+		expect(api.disable2FA).toHaveBeenCalledWith('ValidPass123!', '123456');
+		expect(
+			await screen.findByRole('button', { name: /enable two-factor auth/i })
+		).toBeInTheDocument();
+		expect(setAuthenticated).toHaveBeenCalledWith(expect.objectContaining({ totp_enabled: false }));
 	});
 
 	it('loads sessions when the sessions tab is opened and revokes other sessions', async () => {

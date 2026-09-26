@@ -57,6 +57,7 @@ mod backup;
 mod compose_policy;
 mod cron;
 mod db;
+mod db_credentials;
 mod deploy;
 mod docker;
 mod domains;
@@ -240,7 +241,22 @@ async fn main() -> Result<()> {
             post(handlers::terminal::create_ticket),
         )
         .route("/api/terminal/ws", get(handlers::terminal::terminal_ws))
-        .route("/api/apps/{id}/env", put(handlers::update_env))
+        .route(
+            "/api/apps/{id}/env",
+            get(handlers::env::get_env).patch(handlers::env::patch_env),
+        )
+        .route(
+            "/api/apps/{id}/env/{key}",
+            get(handlers::env::reveal_env_var),
+        )
+        .route(
+            "/api/apps/{id}/preview-env",
+            axum::routing::patch(handlers::env::patch_preview_env),
+        )
+        .route(
+            "/api/apps/{id}/preview-env/{key}",
+            get(handlers::env::reveal_preview_env_var),
+        )
         .route("/api/apps/{id}/domain", put(handlers::update_domain))
         .route("/api/apps/{id}/health", put(handlers::update_health))
         .route("/api/compose/validate", post(handlers::validate_compose))

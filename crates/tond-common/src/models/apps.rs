@@ -263,8 +263,8 @@ pub struct AppResponse {
     pub preview_enabled: bool,
     /// Env var keys excluded from preview containers
     pub preview_excluded_keys: Vec<String>,
-    /// Key-value overrides applied only to preview containers
-    pub preview_env_vars: serde_json::Value,
+    // Preview override values are secrets: read them (masked) through
+    // GET /api/apps/{id}/env, never through the app response.
     // ── Inline source content ──
     /// Raw Dockerfile content (used when source_type = "dockerfile")
     pub dockerfile_content: Option<String>,
@@ -283,8 +283,6 @@ impl From<App> for AppResponse {
         let volumes: Vec<Volume> = serde_json::from_str(&app.volumes).unwrap_or_default();
         let preview_excluded_keys: Vec<String> =
             serde_json::from_str(&app.preview_excluded_keys).unwrap_or_default();
-        let preview_env_vars: serde_json::Value =
-            serde_json::from_str(&app.preview_env_vars).unwrap_or(serde_json::json!({}));
         let expose_build_method =
             matches!(app.source_type.as_str(), "git" | "tarball" | "dockerfile");
         Self {
@@ -314,7 +312,6 @@ impl From<App> for AppResponse {
             gitlab_token_id: app.gitlab_token_id,
             preview_enabled: app.preview_enabled != 0,
             preview_excluded_keys,
-            preview_env_vars,
             dockerfile_content: app.dockerfile_content,
             compose_content: app.compose_content,
             base_dir: app.base_dir,
@@ -325,9 +322,101 @@ impl From<App> for AppResponse {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct UpdateEnvRequest {
-    pub env_vars: serde_json::Value,
+// ── Environment variables ──
+//
+// Env var values are secrets. They are never returned in bulk: the list
+// endpoint returns keys with masked values, and a single value is only
+// returned by an explicit reveal request. Writes are patches, so editing
+// one variable never touches the others.
+
+/// Masked value shown in place of every non-empty env var value.
+pub const ENV_VALUE_MASK: &str = "••••••••";
+
+/// One env var as returned by the list endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvVarEntry {
+    pub key: String,
+    /// `ENV_VALUE_MASK` for a non-empty value, `""` for an empty one.
+    pub masked: String,
+}
+
+/// Preview-only env configuration of an app.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreviewEnvResponse {
+    /// Whether PR preview deployments are enabled for this app
+    pub enabled: bool,
+    /// App env var keys that preview containers do not receive
+    pub excluded_keys: Vec<String>,
+    /// Values that replace or add env vars in preview containers only
+    pub overrides: Vec<EnvVarEntry>,
+}
+
+/// GET /api/apps/{id}/env
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppEnvResponse {
+    pub vars: Vec<EnvVarEntry>,
+    pub preview: PreviewEnvResponse,
+}
+
+/// GET /api/apps/{id}/env/{key} and /api/apps/{id}/preview-env/{key}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvVarValueResponse {
+    pub key: String,
+    pub value: String,
+}
+
+/// PATCH /api/apps/{id}/env — set and remove individual variables.
+/// Keys that are not mentioned are left unchanged.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct PatchEnvRequest {
+    /// Variables to add or overwrite
+    #[serde(default)]
+    pub set: std::collections::BTreeMap<String, String>,
+    /// Variables to remove (unknown keys are ignored)
+    #[serde(default)]
+    pub unset: Vec<String>,
+}
+
+/// PATCH /api/apps/{id}/preview-env — edit preview overrides and exclusions.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct PatchPreviewEnvRequest {
+    /// Preview overrides to add or overwrite
+    #[serde(default)]
+    pub set: std::collections::BTreeMap<String, String>,
+    /// Preview overrides to remove
+    #[serde(default)]
+    pub unset: Vec<String>,
+    /// App env var keys to hide from preview containers
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    /// App env var keys to pass to preview containers again
+    #[serde(default)]
+    pub include: Vec<String>,
+}
+
+/// Build the masked list of an env var map, sorted by key.
+pub fn masked_env_entries(vars: &std::collections::BTreeMap<String, String>) -> Vec<EnvVarEntry> {
+    vars.iter()
+        .map(|(key, value)| EnvVarEntry {
+            key: key.clone(),
+            masked: if value.is_empty() {
+                String::new()
+            } else {
+                ENV_VALUE_MASK.to_string()
+            },
+        })
+        .collect()
+}
+
+/// Whether `key` is a valid environment variable name
+/// (a letter or underscore, then letters, digits and underscores).
+pub fn is_valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 #[derive(Debug, Deserialize)]
@@ -450,15 +539,12 @@ pub struct UpdateSourceRequest {
 
 // ── Phase 4.6: PR Preview configuration ──
 
-/// PUT /api/apps/{id}/preview-config — enable or disable PR preview deployments
+/// PUT /api/apps/{id}/preview-config — enable or disable PR preview deployments.
+/// Preview env overrides and exclusions are edited with PATCH /api/apps/{id}/preview-env.
 #[derive(Debug, Deserialize)]
 pub struct UpdatePreviewConfigRequest {
     /// true = automatically deploy on pull_request events from GitHub
     pub preview_enabled: bool,
-    /// Env var keys to exclude from preview containers (replaces existing list when Some)
-    pub preview_excluded_keys: Option<Vec<String>>,
-    /// Key-value overrides applied only to preview containers (replaces existing when Some)
-    pub preview_env_vars: Option<serde_json::Value>,
 }
 
 // ── Deploy log ──
@@ -579,7 +665,6 @@ mod tests {
             .unwrap_or_else(|err| {
                 panic!("failed to serialize preview_excluded_keys fixture: {err}")
             });
-        app.preview_env_vars = serde_json::json!({ "MODE": "preview" }).to_string();
 
         let response = AppResponse::from(app);
 
@@ -606,11 +691,6 @@ mod tests {
             "AppResponse should deserialize preview excluded keys from JSON"
         );
         assert_eq!(
-            response.preview_env_vars,
-            serde_json::json!({ "MODE": "preview" }),
-            "AppResponse should deserialize preview env vars from JSON"
-        );
-        assert_eq!(
             response.build_method.as_deref(),
             Some("tbuild"),
             "AppResponse should expose build_method for source-building apps"
@@ -622,7 +702,6 @@ mod tests {
         let mut app = App::new("demo".to_string(), "git".to_string(), None, None, 3000);
         app.volumes = "not json".to_string();
         app.preview_excluded_keys = "{ definitely not an array }".to_string();
-        app.preview_env_vars = "this is not json either".to_string();
 
         let response = AppResponse::from(app);
 
@@ -634,11 +713,6 @@ mod tests {
             response.preview_excluded_keys,
             Vec::<String>::new(),
             "invalid persisted preview_excluded_keys JSON should fall back to an empty list"
-        );
-        assert_eq!(
-            response.preview_env_vars,
-            serde_json::json!({}),
-            "invalid persisted preview_env_vars JSON should fall back to an empty object"
         );
     }
 
@@ -653,5 +727,40 @@ mod tests {
             response.build_method.is_none(),
             "AppResponse should omit build_method for sources that do not build source code"
         );
+    }
+
+    #[test]
+    fn masked_env_entries_hides_values_and_marks_empty_ones() {
+        let vars = std::collections::BTreeMap::from([
+            ("B_KEY".to_string(), "secret".to_string()),
+            ("A_KEY".to_string(), String::new()),
+        ]);
+
+        let entries = masked_env_entries(&vars);
+
+        assert_eq!(
+            entries,
+            vec![
+                EnvVarEntry {
+                    key: "A_KEY".to_string(),
+                    masked: String::new(),
+                },
+                EnvVarEntry {
+                    key: "B_KEY".to_string(),
+                    masked: ENV_VALUE_MASK.to_string(),
+                },
+            ],
+            "entries should be sorted by key, mask non-empty values and keep empty ones empty"
+        );
+    }
+
+    #[test]
+    fn is_valid_env_key_accepts_posix_names_only() {
+        for key in ["PORT", "_PRIVATE", "a1_B2"] {
+            assert!(is_valid_env_key(key), "{key} should be a valid env key");
+        }
+        for key in ["", "1ABC", "WITH-DASH", "WITH SPACE", "A=B", "ÜMLAUT"] {
+            assert!(!is_valid_env_key(key), "{key:?} should be rejected");
+        }
     }
 }
