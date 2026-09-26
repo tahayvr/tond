@@ -154,7 +154,9 @@ mod tests {
             IssuerKind::Letsencrypt
         );
         assert_eq!(
-            IssuerKind::from_issuer(Some("(STAGING) Let's Encrypt (STAGING) Riddling Rhubarb R12")),
+            IssuerKind::from_issuer(Some(
+                "(STAGING) Let's Encrypt (STAGING) Riddling Rhubarb R12"
+            )),
             IssuerKind::LetsencryptStaging
         );
         assert_eq!(

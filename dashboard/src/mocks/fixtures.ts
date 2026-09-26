@@ -9,6 +9,7 @@ import type {
 	AuditLogEntry,
 	BackupConfig,
 	Certificate,
+	RetentionSettings,
 	CronJob,
 	CronJobRun,
 	Deployment,
@@ -618,6 +619,61 @@ export const MOCK_SETTINGS: ServerSettings = {
 export const MOCK_DATABASE_LINKS: { database_id: string; app_id: string }[] = [
 	{ database_id: 'db_redis1', app_id: 'app_pending' }
 ];
+
+// ── Retention ──────────────────────────────────────────────────────────────
+
+const MB = 1024 * 1024;
+
+export const MOCK_RETENTION: RetentionSettings = {
+	fields: [
+		{
+			key: 'retention_deploy_logs_deployments',
+			value: 30,
+			default: 30,
+			min: 1,
+			max: 500,
+			unit: 'deploys'
+		},
+		{ key: 'retention_deploy_logs_days', value: 90, default: 90, min: 1, max: 365, unit: 'days' },
+		{
+			key: 'retention_deployments_per_app',
+			value: 50,
+			default: 50,
+			min: 30,
+			max: 1000,
+			unit: 'deploys'
+		},
+		{
+			key: 'retention_cron_runs_per_job',
+			value: 100,
+			default: 100,
+			min: 10,
+			max: 1000,
+			unit: 'runs'
+		},
+		{ key: 'retention_cron_runs_days', value: 30, default: 30, min: 1, max: 365, unit: 'days' },
+		{ key: 'retention_audit_log_days', value: 180, default: 180, min: 30, max: 3650, unit: 'days' },
+		{ key: 'retention_app_events_days', value: 90, default: 90, min: 7, max: 365, unit: 'days' }
+	],
+	database: {
+		file_bytes: 38.4 * MB,
+		wal_bytes: 4.1 * MB,
+		free_bytes: 1.2 * MB,
+		tables: [
+			{ name: 'deploy_logs', bytes: 14.2 * MB },
+			{ name: 'metrics_1h', bytes: 7.9 * MB },
+			{ name: 'metrics_5m', bytes: 5.1 * MB },
+			{ name: 'audit_log', bytes: 3.6 * MB },
+			{ name: 'metrics_raw', bytes: 2.8 * MB },
+			{ name: 'cron_job_runs', bytes: 1.9 * MB },
+			{ name: 'deployments', bytes: 0.9 * MB },
+			{ name: 'metric_events', bytes: 0.3 * MB },
+			{ name: 'apps', bytes: 0.1 * MB },
+			{ name: 'sessions', bytes: 0.05 * MB }
+		],
+		measured_at: new Date().toISOString()
+	}
+};
 
 // ── Certificates ───────────────────────────────────────────────────────────
 

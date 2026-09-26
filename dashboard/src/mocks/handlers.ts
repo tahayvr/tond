@@ -24,6 +24,7 @@ import {
 	MOCK_PROJECTS,
 	MOCK_TEMPLATES,
 	MOCK_SETTINGS,
+	MOCK_RETENTION,
 	MOCK_ONBOARDING_STATUS,
 	MOCK_DEPLOYMENTS,
 	MOCK_DEPLOYMENT_LOGS,
@@ -2568,6 +2569,25 @@ export const handlers = [
 			? 'pending'
 			: null;
 		return ok(MOCK_ONBOARDING_STATUS);
+	}),
+
+	http.get('/api/settings/retention', async () => {
+		await delay(LATENCY);
+		return ok(MOCK_RETENTION);
+	}),
+
+	http.put('/api/settings/retention', async ({ request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as Record<string, number>;
+		for (const [key, value] of Object.entries(body)) {
+			const field = MOCK_RETENTION.fields.find((f) => f.key === key);
+			if (!field) return err(`Unknown setting '${key}'`, 400);
+			if (!Number.isInteger(value) || value < field.min || value > field.max) {
+				return err(`${key} must be between ${field.min} and ${field.max} ${field.unit}`, 400);
+			}
+			field.value = value;
+		}
+		return ok(MOCK_RETENTION);
 	}),
 
 	http.put('/api/settings', async ({ request }) => {

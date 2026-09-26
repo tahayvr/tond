@@ -257,13 +257,19 @@ mod tests {
                 app_name: "web".into()
             }
         );
-        assert_eq!(by_domain("old.example.com").serves, CertificateTarget::Unused);
+        assert_eq!(
+            by_domain("old.example.com").serves,
+            CertificateTarget::Unused
+        );
 
         // Routed, no row yet: listed as waiting.
         let api = by_domain("api.example.com");
         assert!(api.id.is_empty());
         assert_eq!(api.status, "pending");
-        assert_eq!(by_domain("dash.example.com").serves, CertificateTarget::Dashboard);
+        assert_eq!(
+            by_domain("dash.example.com").serves,
+            CertificateTarget::Dashboard
+        );
         assert!(matches!(
             by_domain("abc-web.preview.test").serves,
             CertificateTarget::Preview {
@@ -319,5 +325,4 @@ mod tests {
         .await;
         assert!(missing.is_err(), "unknown domains are a 404");
     }
-
 }

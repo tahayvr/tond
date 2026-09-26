@@ -409,6 +409,10 @@ async fn run() -> Result<()> {
         // Server settings
         .route("/api/settings", get(handlers::settings::get_settings))
         .route("/api/settings", put(handlers::settings::update_settings))
+        .route(
+            "/api/settings/retention",
+            get(handlers::retention::get_retention).put(handlers::retention::update_retention),
+        )
         // Host terminal switch: readable by any authenticated caller, writable
         // only over the root-only Unix socket (`tond settings host-terminal`)
         .route(

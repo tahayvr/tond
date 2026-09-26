@@ -250,7 +250,9 @@ impl RollupTable {
 
 /// Drop samples, rollups and events past their retention, plus targets whose
 /// owner no longer exists. Returns the number of rows deleted.
-pub async fn prune(db: &SqlitePool, now: i64) -> anyhow::Result<u64> {
+/// Delete expired rows. `event_keep_secs` is how long restart / crash / OOM
+/// events are kept (`retention_app_events_days`, default EVENT_KEEP_SECS).
+pub async fn prune(db: &SqlitePool, now: i64, event_keep_secs: i64) -> anyhow::Result<u64> {
     let mut deleted = 0;
 
     // Targets whose app / database / cron job / preview is gone, with all rows.
@@ -283,7 +285,7 @@ pub async fn prune(db: &SqlitePool, now: i64) -> anyhow::Result<u64> {
         ("metrics_raw", RAW_KEEP_SECS, "target, ts"),
         ("metrics_5m", M5_KEEP_SECS, "target, ts"),
         ("metrics_1h", H1_KEEP_SECS, "target, ts"),
-        ("metric_events", EVENT_KEEP_SECS, "target, ts, kind"),
+        ("metric_events", event_keep_secs, "target, ts, kind"),
     ] {
         let sql = format!(
             "DELETE FROM {table} WHERE ({key}) IN (
@@ -691,7 +693,7 @@ mod tests {
             .await
             .unwrap_or_else(|e| panic!("{e}"));
 
-        let deleted = prune(&db, now)
+        let deleted = prune(&db, now, EVENT_KEEP_SECS)
             .await
             .unwrap_or_else(|e| panic!("prune: {e}"));
         assert_eq!(deleted, 5, "old raw + old hourly + orphan raw/event/target");

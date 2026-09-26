@@ -58,6 +58,7 @@ pub mod previews;
 pub mod project_previews;
 pub mod projects;
 pub mod registry_credentials;
+pub mod retention;
 pub mod settings;
 pub mod storage_providers;
 pub mod system_self;

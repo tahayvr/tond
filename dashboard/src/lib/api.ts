@@ -997,6 +997,51 @@ export async function updateSettings(data: Partial<ServerSettings>): Promise<Ser
 	});
 }
 
+// ── Retention ──
+
+/** One retention rule with its current value and accepted range. */
+export interface RetentionField {
+	/** settings key, e.g. "retention_audit_log_days" */
+	key: string;
+	value: number;
+	default: number;
+	min: number;
+	max: number;
+	/** "deploys" | "days" | "runs" */
+	unit: string;
+}
+
+export interface TableSize {
+	name: string;
+	bytes: number;
+}
+
+export interface DatabaseSize {
+	file_bytes: number;
+	wal_bytes: number;
+	free_bytes: number;
+	/** Largest first; empty when the breakdown is unavailable */
+	tables: TableSize[];
+	measured_at: string;
+}
+
+export interface RetentionSettings {
+	fields: RetentionField[];
+	database: DatabaseSize | null;
+}
+
+export async function getRetention(): Promise<RetentionSettings> {
+	return request<RetentionSettings>('/settings/retention');
+}
+
+/** Change some retention rules: `{ retention_audit_log_days: 365 }`. */
+export async function updateRetention(changes: Record<string, number>): Promise<RetentionSettings> {
+	return request<RetentionSettings>('/settings/retention', {
+		method: 'PUT',
+		body: JSON.stringify(changes)
+	});
+}
+
 // ── Deployments ──
 
 /** Steps of a deployment, in order ("release" = switch traffic, stop the old container). */
