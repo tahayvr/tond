@@ -5069,6 +5069,7 @@ dependencies = [
  "tokio",
  "tond-common",
  "tracing",
+ "tracing-log",
  "tracing-subscriber",
  "uuid",
 ]
