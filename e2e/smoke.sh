@@ -90,7 +90,7 @@ api() { curl -sf --unix-socket "$SOCK" "http://localhost$1"; }
 API_BODY=$(mktemp)
 api_req() {
     curl -s -o "$API_BODY" -w '%{http_code}' --unix-socket "$SOCK" -X "$1" \
-        -H 'Content-Type: application/json' -d "$3" "http://localhost$2"
+        -H 'Content-Type: application/json' -d "${3:-}" "http://localhost$2"
 }
 
 # api_send <method> <path> <json>: prints "<status> <body>" (does not fail on 4xx).
@@ -1786,7 +1786,7 @@ api /api/v1/apps/e2e-stack/services/cache/logs | jq -e '.data.lines | length > 0
 api /api/v1/apps/e2e-stack/logs | jq -e '.data.container_logs | any(contains("[cache]"))' > /dev/null \
     || fail "the combined log should tag each line with its service"
 pass "per-service and combined logs"
-code=$(api_req POST /api/v1/apps/e2e-stack/services/cache/restart)
+code=$(api_req POST /api/v1/apps/e2e-stack/services/cache/restart '{}')
 [[ "$code" == 200 ]] || fail "restarting one service should work, got ${code}: $(cat "$API_BODY")"
 wait_for 60 "cache running after restart" bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/apps/e2e-stack/services | jq -e '.data[] | select(.name == \"cache\") | .status == \"running\"'"
 pass "POST /services/cache/restart restarts only redis"
