@@ -12,6 +12,7 @@
 
 mod build;
 mod core;
+pub mod images;
 
 pub use build::build_from_dir;
 pub use core::{deploy, deploy_image, deploy_preview};

@@ -1,15 +1,18 @@
 // handlers/deployments.rs — deployment history and rollback
 //
 // GET  /api/apps/{id}/deployments  — list last 20 deployments for an app
-// POST /api/apps/{id}/rollback     — roll back to the previous succeeded deployment
+// POST /api/apps/{id}/rollback     — redeploy the exact image of an earlier deployment
 //
-// Rollback logic:
-//   1. Fetch the two most recent 'succeeded' deployments with a non-null image_tag.
-//   2. Use the second entry (index 1) as the rollback target — the one before the
-//      current succeeded deployment. If there is only one succeeded deployment,
-//      return 400 (nothing to roll back to).
-//   3. Spawn a background task calling deploy::deploy_image() with that image_tag.
-//   4. Return 202 Accepted immediately.
+// Every deployment runs its own image tag (`tond-<app>:<id>`, see
+// deploy/images.rs), so rollback restores precisely what ran back then — code
+// and dependencies — with the app's *current* env vars, volumes and limits.
+//
+// Rollback target:
+//   - body `{"deployment_id": "..."}` picks one explicitly;
+//   - without a body, the most recent succeeded deployment whose image differs
+//     from the one running now.
+// The target must have succeeded, carry a per-deployment image tag and not
+// have been pruned. The deploy runs in the background; the handler returns 202.
 
 use axum::{
     Json,
@@ -17,6 +20,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
+use serde::Deserialize;
 use serde_json::json;
 use tond_common::*;
 
@@ -24,25 +28,113 @@ use crate::{
     alerts,
     audit_log::{AuthActor, write_audit_log},
     auth::{RateLimit, RequireAuth},
-    deploy,
+    deploy::{self, images},
     error::AppError,
     state::AppState,
 };
 
 use super::fetch_app;
 
-fn rollback_target_image_tag(candidates: &[Deployment]) -> Result<String, AppError> {
-    if candidates.len() < 2 {
-        return Err(AppError(TondError::InvalidInput(
-            "No previous deployment to roll back to".to_string(),
-        )));
+/// POST /api/apps/{id}/rollback body (optional).
+#[derive(Debug, Default, Deserialize)]
+pub struct RollbackRequest {
+    /// Deployment whose image to restore; default: the previous distinct image.
+    pub deployment_id: Option<String>,
+}
+
+/// Why a deployment can't be rolled back to, or `None` if it can.
+fn rollback_blocker(app: &App, d: &Deployment, current_tag: Option<&str>) -> Option<String> {
+    if app.source_type == "compose" {
+        return Some("Rollback isn't available for Docker Compose apps".to_string());
+    }
+    if d.status != "succeeded" {
+        return Some("Only successful deployments can be restored".to_string());
+    }
+    let Some(tag) = d.image_tag.as_deref() else {
+        return Some("This deployment has no recorded image".to_string());
+    };
+    if !images::is_deployment_image(&app.name, tag) {
+        return Some("This deployment predates per-deployment images".to_string());
+    }
+    if d.image_pruned {
+        return Some("This deployment's image was pruned to save disk space".to_string());
+    }
+    if current_tag == Some(tag) {
+        return Some("This image is already running".to_string());
+    }
+    None
+}
+
+/// Image tag of the most recent succeeded deployment — what the app runs now.
+fn current_image_tag(deployments: &[Deployment]) -> Option<&str> {
+    deployments
+        .iter()
+        .find(|d| d.status == "succeeded")
+        .and_then(|d| d.image_tag.as_deref())
+}
+
+/// Pick the deployment to restore (see module docs). `deployments` is newest first.
+fn pick_rollback_target<'a>(
+    app: &App,
+    deployments: &'a [Deployment],
+    requested: Option<&str>,
+) -> Result<&'a Deployment, AppError> {
+    let current = current_image_tag(deployments);
+    let invalid = |msg: String| AppError(TondError::InvalidInput(msg));
+
+    if let Some(id) = requested {
+        let d = deployments
+            .iter()
+            .find(|d| d.id == id)
+            .ok_or_else(|| AppError(TondError::NotFound(format!("deployment '{id}'"))))?;
+        return match rollback_blocker(app, d, current) {
+            None => Ok(d),
+            Some(reason) => Err(invalid(format!(
+                "Can't roll back to this deployment: {reason}"
+            ))),
+        };
     }
 
-    candidates[1].image_tag.clone().ok_or_else(|| {
-        AppError(TondError::InvalidInput(
-            "Rollback target is missing an image tag".to_string(),
-        ))
-    })
+    if app.source_type == "compose" {
+        return Err(invalid(
+            "Rollback isn't available for Docker Compose apps; update the compose file and redeploy instead"
+                .to_string(),
+        ));
+    }
+    deployments
+        .iter()
+        .find(|d| rollback_blocker(app, d, current).is_none())
+        .ok_or_else(|| {
+            invalid(
+                "No previous deployment to roll back to: there is no earlier successful deployment whose image is still available"
+                    .to_string(),
+            )
+        })
+}
+
+/// Deployment rows plus rollback metadata for the API.
+fn deployment_responses(app: &App, deployments: Vec<Deployment>) -> Vec<DeploymentResponse> {
+    let current = current_image_tag(&deployments).map(str::to_string);
+    let mut seen_current = false;
+    deployments
+        .into_iter()
+        .map(|d| {
+            let blocker = rollback_blocker(app, &d, current.as_deref());
+            // Only the newest deployment running the current image is "current".
+            let is_current = !seen_current
+                && d.status == "succeeded"
+                && d.image_tag.is_some()
+                && d.image_tag == current;
+            if is_current {
+                seen_current = true;
+            }
+            let mut resp = DeploymentResponse::from(d);
+            resp.is_current = is_current;
+            resp.rollback_available = blocker.is_none();
+            resp.rollback_unavailable_reason = blocker;
+            resp
+        })
+        .collect()
 }
 
 // ── List Deployments ──
@@ -62,12 +154,10 @@ pub async fn list_deployments(
     .fetch_all(&state.db)
     .await?;
 
-    let responses: Vec<DeploymentResponse> = deployments
-        .into_iter()
-        .map(DeploymentResponse::from)
-        .collect();
-
-    Ok((StatusCode::OK, Json(ApiResponse::ok(responses))))
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(deployment_responses(&app, deployments))),
+    ))
 }
 
 // ── Rollback App ──
@@ -78,18 +168,35 @@ pub async fn rollback_app(
     actor: AuthActor,
     State(state): State<AppState>,
     Path(id): Path<String>,
+    body: Option<Json<RollbackRequest>>,
 ) -> Result<impl IntoResponse, AppError> {
     let mut app = fetch_app(&state.db, &id).await?;
+    let req = body.map(|Json(r)| r).unwrap_or_default();
 
-    // Find the two most recent succeeded deployments with a known image tag.
-    let candidates = sqlx::query_as::<_, Deployment>(
-        "SELECT * FROM deployments WHERE app_id = ? AND status = 'succeeded' AND image_tag IS NOT NULL ORDER BY created_at DESC LIMIT 2",
+    let deployments = sqlx::query_as::<_, Deployment>(
+        "SELECT * FROM deployments WHERE app_id = ? ORDER BY created_at DESC",
     )
     .bind(&app.id)
     .fetch_all(&state.db)
     .await?;
 
-    let image_tag = rollback_target_image_tag(&candidates)?;
+    let target = pick_rollback_target(&app, &deployments, req.deployment_id.as_deref())?;
+    let target_id = target.id.clone();
+    let image_tag = target.image_tag.clone().unwrap_or_default();
+
+    // The image must still exist; if it vanished, record that and say so now.
+    if state.docker.inspect_image(&image_tag).await.is_err() {
+        let _ = sqlx::query(
+            "UPDATE deployments SET image_pruned = 1 WHERE app_id = ? AND image_tag = ?",
+        )
+        .bind(&app.id)
+        .bind(&image_tag)
+        .execute(&state.db)
+        .await;
+        return Err(AppError(TondError::InvalidInput(format!(
+            "Can't roll back: image {image_tag} is no longer on this server"
+        ))));
+    }
 
     let app_name = app.name.clone();
     let app_name_for_spawn = app_name.clone();
@@ -133,15 +240,17 @@ pub async fn rollback_app(
         Some(&app_name),
         "rollback",
         &actor_str,
-        Some(&format!("image_tag={}", image_tag)),
+        Some(&format!("deployment={} image_tag={}", target_id, image_tag)),
     )
     .await;
 
     Ok((
         StatusCode::ACCEPTED,
-        Json(ApiResponse::ok(
-            json!({ "message": "Rollback started", "image_tag": image_tag }),
-        )),
+        Json(ApiResponse::ok(json!({
+            "message": "Rollback started",
+            "image_tag": image_tag,
+            "deployment_id": target_id,
+        }))),
     ))
 }
 
@@ -248,52 +357,114 @@ mod tests {
             started_at: "2026-04-08T12:00:00Z".to_string(),
             finished_at: Some("2026-04-08T12:01:00Z".to_string()),
             created_at: "2026-04-08T12:00:00Z".to_string(),
+            image_pruned: false,
         }
     }
 
-    #[test]
-    fn rollback_target_image_tag_returns_previous_succeeded_image() {
-        let candidates = vec![
-            deployment("dep-current", Some("tond-frontend:current")),
-            deployment("dep-previous", Some("tond-frontend:previous")),
-        ];
-
-        assert_eq!(
-            rollback_target_image_tag(&candidates)
-                .unwrap_or_else(|_| panic!("rollback target selection should succeed")),
-            "tond-frontend:previous",
-            "rollback_target_image_tag should choose the second-most-recent succeeded deployment image"
-        );
+    fn app(source_type: &str) -> App {
+        App::new(
+            "frontend".to_string(),
+            source_type.to_string(),
+            None,
+            None,
+            3000,
+        )
     }
 
     #[test]
-    fn rollback_target_image_tag_rejects_missing_history_or_missing_image_tag() {
-        let err = rollback_target_image_tag(&[deployment(
-            "dep-current",
-            Some("tond-frontend:current"),
-        )])
+    fn default_rollback_target_is_the_previous_distinct_image() {
+        let deployments = vec![
+            deployment("dep-3", Some("tond-frontend:ccc")),
+            deployment("dep-2", Some("tond-frontend:ccc")), // redeploy of same image
+            deployment("dep-1", Some("tond-frontend:aaa")),
+        ];
+        let target = pick_rollback_target(&app("git"), &deployments, None)
+            .unwrap_or_else(|e| panic!("target expected: {}", e.0));
+        assert_eq!(target.id, "dep-1");
+    }
+
+    #[test]
+    fn rollback_skips_failed_pruned_and_legacy_deployments() {
+        let mut failed = deployment("dep-4", Some("tond-frontend:ddd"));
+        failed.status = "failed".to_string();
+        let mut pruned = deployment("dep-2", Some("tond-frontend:bbb"));
+        pruned.image_pruned = true;
+        let deployments = vec![
+            failed,
+            deployment("dep-3", Some("tond-frontend:ccc")),
+            pruned,
+            deployment("dep-legacy", Some("tond-frontend")),
+            deployment("dep-1", Some("tond-frontend:aaa")),
+        ];
+        let target = pick_rollback_target(&app("git"), &deployments, None)
+            .unwrap_or_else(|e| panic!("target expected: {}", e.0));
+        assert_eq!(target.id, "dep-1");
+
+        let err = pick_rollback_target(&app("git"), &deployments, Some("dep-2"))
+            .err()
+            .unwrap_or_else(|| panic!("pruned deployments can't be restored"));
+        assert!(err.0.to_string().contains("pruned"), "{}", err.0);
+
+        let err = pick_rollback_target(&app("git"), &deployments, Some("dep-3"))
+            .err()
+            .unwrap_or_else(|| panic!("the running image can't be 'restored'"));
+        assert!(err.0.to_string().contains("already running"), "{}", err.0);
+
+        let err = pick_rollback_target(&app("git"), &deployments, Some("missing"))
+            .err()
+            .unwrap_or_else(|| panic!("unknown deployments are 404"));
+        assert_eq!(err.0.status_code(), 404);
+    }
+
+    #[test]
+    fn rollback_reports_when_nothing_is_available() {
+        let err = pick_rollback_target(
+            &app("git"),
+            &[deployment("dep-1", Some("tond-frontend:aaa"))],
+            None,
+        )
         .err()
-        .unwrap_or_else(|| {
-            panic!("expected rollback target selection to fail with only one succeeded deployment")
-        });
+        .unwrap_or_else(|| panic!("a single deployment has nothing to roll back to"));
         assert!(
+            err.0.to_string().contains("No previous deployment"),
+            "{}",
             err.0
-                .to_string()
-                .contains("No previous deployment to roll back to"),
-            "rollback_target_image_tag should report when there is no prior successful deployment"
         );
 
-        let err = rollback_target_image_tag(&[
-            deployment("dep-current", Some("tond-frontend:current")),
-            deployment("dep-previous", None),
-        ])
+        let err = pick_rollback_target(
+            &app("compose"),
+            &[
+                deployment("dep-2", Some("tond-compose-frontend")),
+                deployment("dep-1", Some("tond-compose-frontend")),
+            ],
+            None,
+        )
         .err()
-        .unwrap_or_else(|| panic!("expected rollback target selection to fail when the previous deployment has no image tag"));
+        .unwrap_or_else(|| panic!("compose apps can't roll back"));
+        assert!(err.0.to_string().contains("Docker Compose"), "{}", err.0);
+    }
+
+    #[test]
+    fn responses_mark_current_and_rollback_availability() {
+        let mut pruned = deployment("dep-1", Some("tond-frontend:aaa"));
+        pruned.image_pruned = true;
+        let responses = deployment_responses(
+            &app("git"),
+            vec![
+                deployment("dep-3", Some("tond-frontend:ccc")),
+                deployment("dep-2", Some("tond-frontend:bbb")),
+                pruned,
+            ],
+        );
+        assert!(responses[0].is_current && !responses[0].rollback_available);
+        assert!(!responses[1].is_current && responses[1].rollback_available);
+        assert_eq!(responses[1].rollback_unavailable_reason, None);
+        assert!(!responses[2].rollback_available && responses[2].image_pruned);
         assert!(
-            err.0
-                .to_string()
-                .contains("Rollback target is missing an image tag"),
-            "rollback_target_image_tag should report when the chosen rollback deployment lacks an image tag"
+            responses[2]
+                .rollback_unavailable_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("pruned"))
         );
     }
 

@@ -16,11 +16,9 @@ use tond_common::App;
 use crate::state::AppState;
 use crate::{compose_policy, volumes};
 
-use super::core::log_deploy;
+use super::images;
 
-fn build_image_tag(app_name: &str) -> String {
-    format!("tond-{}", app_name)
-}
+use super::core::log_deploy;
 
 fn build_work_dir(data_dir: &str, app_name: &str) -> String {
     format!("{}/builds/{}", data_dir, app_name)
@@ -195,13 +193,16 @@ pub(super) struct BuildOptions<'a> {
 /// Constructs [`BuildOptions`] from the app record and delegates to
 /// [`build_from_dir_with_method`], which contains the single canonical
 /// implementation of the build-method dispatch logic.
+///
+/// The image is tagged `tond-<app>:upload`; `deploy()` re-tags it per deployment.
 pub async fn build_from_dir(state: &AppState, app: &App, dir: &str) -> Result<String> {
     let build_opts = BuildOptions {
         method: &app.build_method,
         static_build: app.static_build != 0,
         base_dir: app.base_dir.as_deref(),
     };
-    build_from_dir_with_method(state, &app.id, &app.name, dir, &build_opts, None, "upload").await
+    let image_tag = images::upload_tag(&app.name);
+    build_from_dir_with_method(state, &app.id, &image_tag, dir, &build_opts, None, "upload").await
 }
 
 /// Clone a git repository and build a Docker image from it.
@@ -222,6 +223,7 @@ pub(super) async fn build_from_git(
     git_url: &str,
     branch: &str,
     build_opts: &BuildOptions<'_>,
+    image_tag: &str,
     deployment_id: Option<&str>,
     trigger_source: &str,
 ) -> Result<String> {
@@ -281,7 +283,7 @@ pub(super) async fn build_from_git(
     let image_tag = build_from_dir_with_method(
         state,
         app_id,
-        app_name,
+        image_tag,
         &work_dir,
         build_opts,
         deployment_id,
@@ -295,19 +297,19 @@ pub(super) async fn build_from_git(
     Ok(image_tag)
 }
 
-/// Build from a local directory using the appropriate build method.
+/// Build from a local directory using the appropriate build method and tag
+/// the result `image_tag`.
 ///
 /// `build_opts.method` controls which builder is used (same semantics as above).
 pub(super) async fn build_from_dir_with_method(
     state: &AppState,
     app_id: &str,
-    app_name: &str,
+    image_tag: &str,
     dir: &str,
     build_opts: &BuildOptions<'_>,
     deployment_id: Option<&str>,
     trigger_source: &str,
 ) -> Result<String> {
-    let image_tag = build_image_tag(app_name);
     let build_root = resolve_build_root(dir, build_opts.base_dir)?;
 
     let dockerfile_path = build_root.join("Dockerfile");
@@ -331,7 +333,7 @@ pub(super) async fn build_from_dir_with_method(
             build_with_dockerfile(
                 state,
                 app_id,
-                app_name,
+                image_tag,
                 build_root
                     .to_str()
                     .expect("build root path should be valid UTF-8"),
@@ -393,7 +395,7 @@ pub(super) async fn build_from_dir_with_method(
             build_with_dockerfile(
                 state,
                 app_id,
-                app_name,
+                image_tag,
                 build_root
                     .to_str()
                     .expect("build root path should be valid UTF-8"),
@@ -411,7 +413,7 @@ pub(super) async fn build_from_dir_with_method(
         }
     }
 
-    Ok(image_tag)
+    Ok(image_tag.to_string())
 }
 
 /// Build an image using `docker build` with the Dockerfile at the repo root.
@@ -419,17 +421,15 @@ pub(super) async fn build_from_dir_with_method(
 pub(super) async fn build_with_dockerfile(
     state: &AppState,
     app_id: &str,
-    app_name: &str,
+    image_tag: &str,
     dir: &str,
     context_dir: Option<&str>,
     trigger_source: &str,
 ) -> Result<String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
-    let image_tag = build_image_tag(app_name);
-
     let dockerfile = format!("{dir}/Dockerfile");
-    let args = docker_build_args(&image_tag, context_dir.unwrap_or(dir), Some(&dockerfile));
+    let args = docker_build_args(image_tag, context_dir.unwrap_or(dir), Some(&dockerfile));
 
     let mut child = tokio::process::Command::new("docker")
         .args(&args)
@@ -483,7 +483,7 @@ pub(super) async fn build_with_dockerfile(
     }
 
     tracing::info!("Docker build succeeded: {}", image_tag);
-    Ok(image_tag)
+    Ok(image_tag.to_string())
 }
 
 /// Build an image from an inline Dockerfile string (no git clone needed).
@@ -495,6 +495,7 @@ pub(super) async fn build_from_inline_dockerfile(
     app_id: &str,
     app_name: &str,
     dockerfile_content: &str,
+    image_tag: &str,
     trigger_source: &str,
 ) -> Result<String> {
     let data_dir = std::env::var("TOND_DATA_DIR").unwrap_or_else(|_| "/opt/tond/data".to_string());
@@ -517,7 +518,7 @@ pub(super) async fn build_from_inline_dockerfile(
     )
     .await?;
 
-    build_with_dockerfile(state, app_id, app_name, &work_dir, None, trigger_source).await
+    build_with_dockerfile(state, app_id, image_tag, &work_dir, None, trigger_source).await
 }
 
 /// Run an inline `docker-compose.yml` (no git clone needed).
@@ -688,15 +689,6 @@ mod tests {
             .unwrap_or_else(|err| panic!("expected nested build root to resolve: {err}")),
             repo.path().join("apps").join("web"),
             "resolve_build_root should append base_dir beneath the repository root"
-        );
-    }
-
-    #[test]
-    fn build_image_tag_uses_tond_prefix() {
-        assert_eq!(
-            build_image_tag("frontend"),
-            "tond-frontend",
-            "build_image_tag should consistently prefix app images with 'tond-'"
         );
     }
 

@@ -13,6 +13,12 @@
 //   deploy_image(state, app, image_tag)
 //     Skip the build step and re-run a specific image (used for rollbacks).
 //
+// Image tags: every deployment runs `tond-<app>:<deployment-id-prefix>` (see
+// images.rs) — built images are tagged that way, pulled and uploaded images
+// are re-tagged — and the tag is stored on the deployment row. Rollback
+// re-runs that exact image. After a successful deploy or rollback older
+// images are pruned (keeping the last few plus the running one).
+//
 //   deploy_preview(state, app, preview)
 //     Deploy a short-lived preview of an app.
 //
@@ -38,6 +44,7 @@ use crate::volumes;
 use super::build::{
     BuildOptions, build_from_git, build_from_inline_dockerfile, run_inline_compose,
 };
+use super::images;
 
 async fn persist_generated_dockerfile(
     state: &AppState,
@@ -106,6 +113,9 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
     .bind(&now)
     .execute(&state.db)
     .await?;
+
+    // The image this deployment runs, whatever the source: tond-<app>:<id>.
+    let deploy_tag = images::deployment_tag(&app_name, &deployment_id);
 
     // Update status to building
     update_status(state, &app_id, "building").await?;
@@ -260,6 +270,7 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
                     static_build: app.static_build != 0,
                     base_dir: app.base_dir.as_deref(),
                 },
+                &deploy_tag,
                 Some(&deployment_id),
                 trigger_source,
             )
@@ -288,19 +299,34 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
             };
 
             pull_image(&state.docker, image, credentials).await?;
-            image.clone()
-        }
-        "tarball" => {
-            let image_tag = format!("tond-{}", app_name);
+
+            // Pin the pulled bytes under this deployment's tag so a rollback
+            // runs exactly this image even after `image` moves on upstream.
+            images::tag_image(&state.docker, image, &deploy_tag).await?;
             log_deploy(
                 state,
                 &app_id,
                 "info",
                 trigger_source,
-                &format!("Using pre-built image: {}", image_tag),
+                &format!("Pinned {} as {}", image, deploy_tag),
             )
             .await?;
-            image_tag
+            deploy_tag.clone()
+        }
+        "tarball" => {
+            let upload_tag = images::upload_tag(&app_name);
+            images::tag_image(&state.docker, &upload_tag, &deploy_tag)
+                .await
+                .with_context(|| format!("no uploaded image {upload_tag} to deploy"))?;
+            log_deploy(
+                state,
+                &app_id,
+                "info",
+                trigger_source,
+                &format!("Using uploaded image: {}", deploy_tag),
+            )
+            .await?;
+            deploy_tag.clone()
         }
         "dockerfile" => {
             let content = app.dockerfile_content.as_deref().ok_or_else(|| {
@@ -317,7 +343,15 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
             )
             .await?;
 
-            build_from_inline_dockerfile(state, &app_id, &app_name, content, trigger_source).await?
+            build_from_inline_dockerfile(
+                state,
+                &app_id,
+                &app_name,
+                content,
+                &deploy_tag,
+                trigger_source,
+            )
+            .await?
         }
         "compose" => {
             let content = app.compose_content.as_deref().ok_or_else(|| {
@@ -700,6 +734,8 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
             .execute(&state.db)
             .await;
 
+    images::prune_app_images(state, &app_id, &app_name).await;
+
     Ok(())
 }
 
@@ -718,6 +754,21 @@ pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> R
     let app_id = app.id.clone();
     let app_name = app.name.clone();
     let old_container_id = app.container_id.clone();
+
+    // The exact image must still be on the host (old ones are pruned).
+    if state.docker.inspect_image(image_tag).await.is_err() {
+        let _ = sqlx::query(
+            "UPDATE deployments SET image_pruned = 1 WHERE app_id = ? AND image_tag = ?",
+        )
+        .bind(&app_id)
+        .bind(image_tag)
+        .execute(&state.db)
+        .await;
+        anyhow::bail!(
+            "Image {} is no longer on this server (old images are pruned), so this deployment can't be restored",
+            image_tag
+        );
+    }
 
     // Deployment row
     let deployment_id = Uuid::new_v4().to_string();
@@ -965,6 +1016,8 @@ pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> R
             .execute(&state.db)
             .await;
 
+    images::prune_app_images(state, &app_id, &app_name).await;
+
     Ok(())
 }
 
@@ -1058,6 +1111,7 @@ pub async fn deploy_preview(
                     static_build: app.static_build != 0,
                     base_dir: app.base_dir.as_deref(),
                 },
+                &images::preview_tag(&app_name, &slug),
                 None,
                 "preview",
             )
@@ -1078,14 +1132,20 @@ pub async fn deploy_preview(
             pull_image(&state.docker, image, credentials).await?;
             image.clone()
         }
-        "tarball" => {
-            format!("tond-{}", app_name)
-        }
+        "tarball" => images::upload_tag(&app_name),
         "dockerfile" => {
             let content = app.dockerfile_content.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("dockerfile_content required for source_type='dockerfile'")
             })?;
-            build_from_inline_dockerfile(state, &app_id, &app_name, content, "preview").await?
+            build_from_inline_dockerfile(
+                state,
+                &app_id,
+                &app_name,
+                content,
+                &images::preview_tag(&app_name, &slug),
+                "preview",
+            )
+            .await?
         }
         "compose" => {
             // Preview deployments are not supported for compose apps because
