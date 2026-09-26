@@ -422,9 +422,26 @@ version_of() {
     echo "${v#v}"
 }
 
+# binary_version PATH — the version a tond CLI binary reports (`tond 0.4.0`);
+# tond-server is built from the same version. Empty when it can't run.
+binary_version() {
+    [[ -x "$1" ]] || return 0
+    "$1" --version 2>/dev/null | awk 'NR == 1 { print $2 }' | sed 's/^v//'
+}
+
+# release_version DIR_OR_INSTALL_ROOT — what the binaries there report, else
+# their VERSION file (the release tag).
+release_version() {
+    local v
+    v="$(binary_version "$(src_path "$1" tond)")"
+    [[ -n "$v" ]] || v="$(version_of "$1/VERSION")"
+    echo "$v"
+}
+
 installed_version() {
     local v
-    v="$(version_of "${INSTALL_DIR}/VERSION")"
+    v="$(binary_version "${BIN_DIR}/tond")"
+    [[ -n "$v" ]] || v="$(version_of "${INSTALL_DIR}/VERSION")"
     echo "${v:-unknown}"
 }
 
@@ -875,8 +892,8 @@ SCHEMA_BEFORE=""
 run_update() {
     RUN_KIND="update"
     FROM_VERSION="$(installed_version)"
-    if [[ -n "$BUNDLE_DIR" && -f "${BUNDLE_DIR}/VERSION" ]]; then
-        TO_VERSION="$(version_of "${BUNDLE_DIR}/VERSION")"
+    if [[ -n "$BUNDLE_DIR" && -d "$BUNDLE_DIR" ]]; then
+        TO_VERSION="$(release_version "$BUNDLE_DIR")"
     elif [[ "$VERSION" != "latest" ]]; then
         TO_VERSION="$VERSION"
     fi
@@ -887,7 +904,7 @@ run_update() {
         [[ -d "$BUNDLE_DIR" ]] || fail_unchanged "No release bundle at ${BUNDLE_DIR}."
         BUNDLE_DIR="$(cd "$BUNDLE_DIR" && pwd)"
         check_bundle "$BUNDLE_DIR"
-        [[ -n "$TO_VERSION" ]] || fail_unchanged "The bundle has no VERSION file."
+        [[ -n "$TO_VERSION" ]] || fail_unchanged "Can't tell which version the bundle at ${BUNDLE_DIR} is (no working tond binary, no VERSION file)."
         info "Installing the bundle at ${BUNDLE_DIR} (Tond ${TO_VERSION})"
     else
         if [[ -z "$TO_VERSION" ]]; then
@@ -901,7 +918,12 @@ run_update() {
         fi
         write_status running download "Downloading Tond ${TO_VERSION}"
         download_release "$TO_VERSION"
-        [[ "$DRY_RUN" == true ]] || check_bundle "$BUNDLE_DIR"
+        if [[ "$DRY_RUN" != true ]]; then
+            check_bundle "$BUNDLE_DIR"
+            local reported
+            reported="$(release_version "$BUNDLE_DIR")"
+            [[ -z "$reported" ]] || TO_VERSION="$reported"
+        fi
     fi
     info "Current version: ${FROM_VERSION}; installing: ${TO_VERSION}"
     if [[ "$FROM_VERSION" == "$TO_VERSION" && "$FORCE" == false ]]; then

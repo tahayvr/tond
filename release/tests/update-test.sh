@@ -42,13 +42,13 @@ make_stubs() {
 #!/usr/bin/env bash
 S="$STUB_STATE"
 echo "systemctl $*" >> "$S/calls"
-installed() { sed -n 's/^version //p' "$TOND_INSTALL_DIR/bin/$1"; }
+installed() { sed -n 's/^# version //p' "$TOND_INSTALL_DIR/bin/$1"; }
 # The schema is what the database file says (so restoring the file resets it).
 schema() { sed -n 's/^migrated to //p' "$TOND_INSTALL_DIR/data/tond.db" | tail -n 1 | grep . || echo 60; }
 start_server() {
     local v; v="$(installed tond-server)"
     case " ${FAIL_START:-} " in *" $v "*) return 1 ;; esac
-    local target; target="$(sed -n 's/^schema //p' "$TOND_INSTALL_DIR/bin/tond-server")"
+    local target; target="$(sed -n 's/^# schema //p' "$TOND_INSTALL_DIR/bin/tond-server")"
     local current; current="$(schema)"
     if [[ -n "$target" && "$target" -gt "$current" ]]; then
         echo "migrated to $target" >> "$TOND_INSTALL_DIR/data/tond.db"
@@ -118,12 +118,14 @@ EOF
 }
 
 # fake_release DIR VERSION SCHEMA — a release bundle (or install) whose
-# "binaries" name their version and the schema they migrate to.
+# "binaries" name their version and the schema they migrate to, and answer
+# --version like the real ones (`tond 0.4.0`).
 fake_release() {
     local dir="$1" v="$2" schema="$3" f
     mkdir -p "$dir/dashboard"
     for f in tond-server tond-proxy tond; do
-        printf 'version %s\nschema %s\n' "$v" "$schema" > "$dir/$f"
+        printf '#!/bin/sh\n# version %s\n# schema %s\n[ "$1" = --version ] && echo "%s %s"\nexit 0\n' \
+            "$v" "$schema" "$f" "$v" > "$dir/$f"
         chmod +x "$dir/$f"
     done
     echo "<h1>$v</h1>" > "$dir/dashboard/index.html"
@@ -178,7 +180,7 @@ run_update() {
     set -e
 }
 
-installed_version() { sed -n 's/^version //p' "$T/opt/tond/bin/tond-server"; }
+installed_version() { sed -n 's/^# version //p' "$T/opt/tond/bin/tond-server"; }
 
 latest_backup() {
     find "$T/opt/tond/data/backups" -mindepth 1 -maxdepth 1 -name 'tond_backup_*' | sort -r | head -n 1
@@ -194,7 +196,7 @@ test_successful_update_with_migration() {
     assert_eq 0.4.0 "$(installed_version)" "new binaries installed"
     assert_eq 0.4.0 "$(tr -d v < "$T/opt/tond/VERSION")" "VERSION file"
     assert_eq "<h1>0.4.0</h1>" "$(cat "$T/opt/tond/dashboard/index.html")" "new dashboard"
-    assert_eq "version 0.4.0" "$(head -n 1 "$T/usr/local/bin/tond")" "CLI in PATH updated"
+    assert_eq "tond 0.4.0" "$("$T/usr/local/bin/tond" --version)" "CLI in PATH updated"
     assert_eq succeeded "$(json state)" "status state"
     assert_eq update "$(json kind)" "status kind"
     assert_eq 0.3.0 "$(json from_version)" "from_version"
@@ -206,12 +208,23 @@ test_successful_update_with_migration() {
     b="$(latest_backup)"
     assert_eq "database v1" "$(cat "$b/tond.db")" "database copied before the update"
     assert_eq "wal v1" "$(cat "$b/tond.db-wal")" "WAL copied with it"
-    assert_eq "version 0.3.0" "$(head -n 1 "$b/bin/tond-server")" "old binaries backed up"
+    assert_eq "0.3.0" "$(sed -n 's/^# version //p' "$b/bin/tond-server")" "old binaries backed up"
     assert_contains "$(cat "$b/info.env")" "MIGRATED=1" "migration recorded"
     assert_contains "$(cat "$b/info.env")" "KIND=update" "backup kind"
     assert_contains "$(cat "$b/info.env")" "FROM_VERSION=0.3.0" "backup from"
     assert_contains "$(cat "$b/info.env")" "TO_VERSION=0.4.0" "backup to"
     assert_eq 0.4.0 "$(cat "$T/state/tond-proxy")" "proxy restarted on the new version"
+    teardown
+}
+
+test_versions_come_from_the_binaries_not_the_version_file() {
+    setup
+    fake_release "$T/new" 0.4.0 61
+    echo "v0.4.0-3-gabcdef-dirty" > "$T/new/VERSION"
+    run_update --bundle "$T/new"
+    assert_eq 0 "$RC" "exit code ($OUT)"
+    assert_eq 0.4.0 "$(json to_version)" "to_version is what the binary reports"
+    assert_contains "$(cat "$(latest_backup)/info.env")" "TO_VERSION=0.4.0" "backup records the binary version"
     teardown
 }
 
