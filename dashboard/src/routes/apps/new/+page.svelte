@@ -6,7 +6,7 @@
 		createDatabase,
 		createProject,
 		deployApp,
-		type ManagedDatabaseDetail,
+		type DatabaseCredentials,
 		type Project,
 		type RegistryCredential,
 		type TemplateCatalogEntry,
@@ -343,7 +343,9 @@
 			}
 
 			if (selectedTemplate) {
-				const dependencyDetails = new SvelteMap<string, ManagedDatabaseDetail>();
+				// Creation returns the generated credentials once; the template
+				// interpolates the plaintext connection strings into the app env.
+				const dependencyDetails = new SvelteMap<string, DatabaseCredentials>();
 				for (const dependency of selectedTemplate.dependencies) {
 					if (dependency.kind !== 'database' || !dependency.name || !dependency.engine) continue;
 					const database = await createDatabase({
@@ -353,7 +355,7 @@
 							? { project_id: templateProjectId ?? effectiveProjectId }
 							: {})
 					});
-					dependencyDetails.set(dependency.name, database);
+					dependencyDetails.set(dependency.name, database.credentials);
 				}
 
 				for (const env of selectedTemplate.required_env) {
@@ -425,7 +427,7 @@
 
 	function interpolateTemplateValue(
 		value: string,
-		dependencies: Pick<SvelteMap<string, ManagedDatabaseDetail>, 'get'>
+		dependencies: Pick<SvelteMap<string, DatabaseCredentials>, 'get'>
 	): string {
 		if (!value.startsWith('${db.') || !value.endsWith('}')) {
 			return value;

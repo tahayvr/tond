@@ -78,6 +78,7 @@ use crate::{
     auth::{Authz, RateLimit, scope},
     compose_policy, deploy, docker,
     error::AppError,
+    secrets,
     state::AppState,
     volumes,
 };
@@ -86,6 +87,37 @@ use crate::{
 
 pub async fn health() -> impl IntoResponse {
     Json(json!({ "status": "ok", "service": "tond" }))
+}
+
+/// Env vars from a request's JSON object: string values are kept, other
+/// scalars are stringified, keys must be valid variable names.
+pub(crate) fn env_map_from_json(
+    value: &serde_json::Value,
+) -> Result<std::collections::BTreeMap<String, String>, AppError> {
+    if value.is_null() {
+        return Ok(Default::default());
+    }
+    let object = value.as_object().ok_or_else(|| {
+        AppError(TondError::InvalidInput(
+            "env_vars must be an object of NAME: value pairs".to_string(),
+        ))
+    })?;
+    let mut env = std::collections::BTreeMap::new();
+    for (key, value) in object {
+        if !is_valid_env_key(key) {
+            return Err(AppError(TondError::InvalidInput(format!(
+                "'{key}' is not a valid variable name: use letters, digits and underscores, \
+                 not starting with a digit"
+            ))));
+        }
+        let value = match value {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Null => String::new(),
+            other => other.to_string(),
+        };
+        env.insert(key.clone(), value);
+    }
+    Ok(env)
 }
 
 // ── Shared lookup helper ──
@@ -271,9 +303,11 @@ pub async fn create_app(
         app.domain = Some(domain);
     }
 
-    if let Some(env) = req.env_vars {
-        app.env_vars = Some(env.to_string());
-    }
+    let env = match req.env_vars {
+        Some(value) => env_map_from_json(&value)?,
+        None => Default::default(),
+    };
+    secrets::seal_new_app(&mut app, &env)?;
 
     if let Some(memory_limit) = req.memory_limit {
         app.memory_limit = Some(memory_limit);

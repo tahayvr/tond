@@ -311,7 +311,10 @@ export const MOCK_PROJECTS: Project[] = [
 		id: 'proj_1',
 		name: 'web-platform',
 		description: 'Frontend and backend for the main product',
-		env_vars: { NODE_ENV: 'production', LOG_LEVEL: 'info' },
+		env: [
+			{ key: 'LOG_LEVEL', masked: '••••••••' },
+			{ key: 'NODE_ENV', masked: '••••••••' }
+		],
 		active_preview_count: 1,
 		created_at: '2025-01-08T10:00:00.000Z',
 		updated_at: '2025-02-20T09:00:00.000Z'
@@ -320,7 +323,7 @@ export const MOCK_PROJECTS: Project[] = [
 		id: 'proj_2',
 		name: 'data-pipeline',
 		description: null,
-		env_vars: {},
+		env: [],
 		active_preview_count: 0,
 		created_at: '2025-02-15T14:00:00.000Z',
 		updated_at: '2025-02-15T14:00:00.000Z'
@@ -980,7 +983,8 @@ export const MOCK_ALERT_RULES: AlertRule[] = [
 		name: 'High CPU on api-service',
 		metric: 'cpu',
 		threshold: 80,
-		webhook_url: 'https://hooks.example.com/cpu-alert',
+		has_webhook_url: true,
+		webhook_host: 'hooks.example.com',
 		enabled: true,
 		events: [],
 		last_fired_at: '2025-03-06T04:12:00.000Z',
@@ -993,7 +997,8 @@ export const MOCK_ALERT_RULES: AlertRule[] = [
 		name: 'Global Memory Usage',
 		metric: 'memory',
 		threshold: 85,
-		webhook_url: 'https://hooks.example.com/memory-alert',
+		has_webhook_url: true,
+		webhook_host: 'hooks.example.com',
 		enabled: false,
 		events: [],
 		last_fired_at: null,
@@ -1006,7 +1011,8 @@ export const MOCK_ALERT_RULES: AlertRule[] = [
 		name: 'Deployment Notifications',
 		metric: null,
 		threshold: 0,
-		webhook_url: '',
+		has_webhook_url: false,
+		webhook_host: null,
 		enabled: true,
 		events: ['deployment_success', 'deployment_failure'],
 		last_fired_at: null,
@@ -1197,8 +1203,8 @@ export const MOCK_DATABASES: ManagedDatabase[] = [
 		status: 'running',
 		db_name: 'app_db',
 		db_user: 'app_user',
-		db_password: 'mock_password_1',
-		root_password: null,
+		has_password: true,
+		has_root_password: false,
 		memory_limit: 268435456,
 		custom_external_url: null,
 		custom_internal_url: null,
@@ -1217,8 +1223,8 @@ export const MOCK_DATABASES: ManagedDatabase[] = [
 		status: 'running',
 		db_name: null,
 		db_user: 'default',
-		db_password: 'mock_redis_password',
-		root_password: null,
+		has_password: true,
+		has_root_password: false,
 		memory_limit: null,
 		custom_external_url: null,
 		custom_internal_url: null,
@@ -1237,8 +1243,8 @@ export const MOCK_DATABASES: ManagedDatabase[] = [
 		status: 'stopped',
 		db_name: 'legacy_db',
 		db_user: 'legacy_user',
-		db_password: 'mock_password_2',
-		root_password: 'mock_root_password_mysql',
+		has_password: true,
+		has_root_password: true,
 		memory_limit: 536870912,
 		custom_external_url: null,
 		custom_internal_url: null,
@@ -1257,8 +1263,8 @@ export const MOCK_DATABASES: ManagedDatabase[] = [
 		status: 'running',
 		db_name: 'analytics_db',
 		db_user: 'analytics_user',
-		db_password: 'mock_mariadb_password',
-		root_password: 'mock_root_password_mariadb',
+		has_password: true,
+		has_root_password: true,
 		memory_limit: 268435456,
 		custom_external_url: null,
 		custom_internal_url: null,
@@ -1269,6 +1275,17 @@ export const MOCK_DATABASES: ManagedDatabase[] = [
 		public_access: true
 	}
 ];
+
+/** Stored database passwords (the API never returns them; see the reveal handler). */
+export const MOCK_DATABASE_SECRETS: Record<
+	string,
+	{ db_password: string | null; root_password: string | null }
+> = {
+	db_pg1: { db_password: 'mock_password_1', root_password: null },
+	db_redis1: { db_password: 'mock_redis_password', root_password: null },
+	db_mysql1: { db_password: 'mock_password_2', root_password: 'mock_root_password_mysql' },
+	db_mariadb1: { db_password: 'mock_mariadb_password', root_password: 'mock_root_password_mariadb' }
+};
 
 // ── Cron Jobs (Phase 6.4) ──────────────────────────────────────────────────
 
@@ -1287,7 +1304,10 @@ export const MOCK_CRON_JOBS: CronJob[] = [
 		created_at: '2025-02-01T10:00:00.000Z',
 		updated_at: new Date(Date.now() - 45 * 60_000).toISOString(),
 		timeout_seconds: 60,
-		env: { REPORT_URL: 'https://example.com/report', API_KEY: 'secret123' },
+		env: [
+			{ key: 'API_KEY', masked: '••••••••' },
+			{ key: 'REPORT_URL', masked: '••••••••' }
+		],
 		last_run_status: 'success',
 		concurrency_policy: 'skip',
 		memory_mb: 128,
@@ -1311,7 +1331,7 @@ export const MOCK_CRON_JOBS: CronJob[] = [
 		created_at: '2025-01-15T08:00:00.000Z',
 		updated_at: new Date(Date.now() - 22 * 3_600_000).toISOString(),
 		timeout_seconds: 300,
-		env: null,
+		env: [],
 		last_run_status: 'success',
 		concurrency_policy: 'skip',
 		memory_mb: 256,
@@ -1341,7 +1361,7 @@ export const MOCK_CRON_JOBS: CronJob[] = [
 		created_at: '2025-03-01T09:00:00.000Z',
 		updated_at: '2025-03-01T09:00:00.000Z',
 		timeout_seconds: null,
-		env: null,
+		env: [],
 		last_run_status: null,
 		concurrency_policy: 'skip',
 		memory_mb: null,
@@ -1508,7 +1528,8 @@ export const MOCK_INTEGRATIONS: Integration[] = [
 		id: 'int_telegram_1',
 		name: 'Ops Telegram',
 		kind: 'telegram',
-		config: { bot_token: '123456789:AABBccDDeeffGGhhIIjjKKll', chat_id: '-1001234567890' },
+		config: { chat_id: '-1001234567890' },
+		saved_secrets: ['bot_token'],
 		enabled: true,
 		created_at: '2025-03-01T10:00:00.000Z',
 		updated_at: '2025-03-01T10:00:00.000Z'
@@ -1517,7 +1538,8 @@ export const MOCK_INTEGRATIONS: Integration[] = [
 		id: 'int_discord_1',
 		name: 'Discord #alerts',
 		kind: 'discord',
-		config: { webhook_url: 'https://discord.com/api/webhooks/1234567890/mock-token' },
+		config: {},
+		saved_secrets: ['webhook_url'],
 		enabled: true,
 		created_at: '2025-03-05T12:00:00.000Z',
 		updated_at: '2025-03-05T12:00:00.000Z'
@@ -1526,7 +1548,8 @@ export const MOCK_INTEGRATIONS: Integration[] = [
 		id: 'int_slack_1',
 		name: 'Slack #incidents',
 		kind: 'slack',
-		config: { webhook_url: 'https://hooks.slack.com/services/T00/B00/mock-token' },
+		config: {},
+		saved_secrets: ['webhook_url'],
 		enabled: false,
 		created_at: '2025-03-10T08:00:00.000Z',
 		updated_at: '2025-03-10T08:00:00.000Z'
@@ -1541,10 +1564,10 @@ export const MOCK_INTEGRATIONS: Integration[] = [
 			smtp_host: 'smtp.example.com',
 			smtp_port: 587,
 			smtp_user: 'alerts@example.com',
-			smtp_password: 'smtp-mock-password',
 			smtp_encryption: 'starttls',
 			to_addrs: ['ops@example.com', 'admin@example.com']
 		},
+		saved_secrets: ['smtp_password'],
 		enabled: true,
 		created_at: '2025-03-12T09:00:00.000Z',
 		updated_at: '2025-03-12T09:00:00.000Z'
@@ -1601,11 +1624,14 @@ export const MOCK_SNAPSHOTS: Snapshot[] = [
 		delta_bytes: 2_202_009,
 		total_bytes: 98_304_000,
 		local_path: '/opt/tond/snapshots/snap_1',
-		remote_key: 'prod/snap_1.tar.gz',
+		remote_key: 'snapshots/snap_1.tondsnap',
 		storage_provider_id: 'sp_r2_1',
 		checksum_sha256: 'abc123def456',
 		error_message: null,
-		notes: null
+		notes: null,
+		remote_status: 'uploaded',
+		remote_error: null,
+		archive_bytes: 41_943_040
 	},
 	{
 		id: 'snap_2',
@@ -1625,7 +1651,10 @@ export const MOCK_SNAPSHOTS: Snapshot[] = [
 		storage_provider_id: null,
 		checksum_sha256: null,
 		error_message: null,
-		notes: null
+		notes: null,
+		remote_status: null,
+		remote_error: null,
+		archive_bytes: null
 	},
 	{
 		id: 'snap_3',
@@ -1645,7 +1674,10 @@ export const MOCK_SNAPSHOTS: Snapshot[] = [
 		storage_provider_id: null,
 		checksum_sha256: null,
 		error_message: null,
-		notes: null
+		notes: null,
+		remote_status: null,
+		remote_error: null,
+		archive_bytes: null
 	},
 	{
 		id: 'snap_4',
@@ -1661,11 +1693,14 @@ export const MOCK_SNAPSHOTS: Snapshot[] = [
 		delta_bytes: 1_887_436,
 		total_bytes: 96_102_400,
 		local_path: '/opt/tond/snapshots/snap_4',
-		remote_key: 'prod/snap_4.tar.gz',
+		remote_key: 'snapshots/snap_4.tondsnap',
 		storage_provider_id: 'sp_r2_1',
 		checksum_sha256: 'def456ghi789',
 		error_message: null,
-		notes: null
+		notes: null,
+		remote_status: 'uploaded',
+		remote_error: null,
+		archive_bytes: 41_943_040
 	},
 	{
 		id: 'snap_5',
@@ -1685,7 +1720,10 @@ export const MOCK_SNAPSHOTS: Snapshot[] = [
 		storage_provider_id: null,
 		checksum_sha256: null,
 		error_message: null,
-		notes: null
+		notes: null,
+		remote_status: null,
+		remote_error: null,
+		archive_bytes: null
 	},
 	{
 		id: 'snap_failed',
@@ -1705,7 +1743,10 @@ export const MOCK_SNAPSHOTS: Snapshot[] = [
 		storage_provider_id: null,
 		checksum_sha256: null,
 		error_message: 'Disk write error: no space left on device',
-		notes: null
+		notes: null,
+		remote_status: null,
+		remote_error: null,
+		archive_bytes: null
 	}
 ];
 

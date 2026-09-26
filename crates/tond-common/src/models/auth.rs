@@ -32,6 +32,7 @@ pub struct User {
     pub created_at: String,
     pub updated_at: String,
     /// AES-GCM encrypted TOTP secret (None until 2FA is set up)
+    #[serde(skip_serializing)]
     pub totp_secret_enc: Option<String>,
     /// Whether TOTP 2FA is currently active for this user (0/1 in SQLite)
     pub totp_enabled: bool,

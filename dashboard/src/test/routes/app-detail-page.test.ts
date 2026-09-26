@@ -38,6 +38,7 @@ const api = vi.hoisted(() => ({
 	setWebhookSecret: vi.fn(),
 	getWebhookConfig: vi.fn(),
 	rotateWebhookSecret: vi.fn(),
+	revealWebhookSecret: vi.fn(),
 	setAutoDeploy: vi.fn(),
 	updateSource: vi.fn(),
 	listPreviews: vi.fn(),
@@ -58,7 +59,7 @@ const api = vi.hoisted(() => ({
 	getApp: vi.fn()
 }));
 
-vi.mock('$lib/auth.svelte', () => ({ isAdmin: () => true }));
+vi.mock('$lib/auth.svelte', () => ({ isAdmin: () => true, can: () => true }));
 
 vi.mock('$app/state', () => ({
 	page: state.page
@@ -355,14 +356,16 @@ describe('apps/[id] page', () => {
 				gitea: 'https://dash.example.com/api/webhooks/gitea/app_1',
 				generic: 'https://dash.example.com/api/webhooks/generic/app_1'
 			},
+			has_secret: true,
 			secret,
 			auto_deploy: false,
 			watch_branch: 'main'
 		};
 	}
 
-	it('shows the webhook URL and secret with provider-specific instructions', async () => {
+	it('shows the webhook URL, and the secret only after an explicit reveal', async () => {
 		api.getWebhookConfig.mockResolvedValue(webhookConfig('generated-secret-0123456789'));
+		api.revealWebhookSecret.mockResolvedValue({ secret: 'generated-secret-0123456789' });
 
 		const user = userEvent.setup();
 		renderPage();
@@ -371,9 +374,12 @@ describe('apps/[id] page', () => {
 
 		const url = (await screen.findByLabelText(/payload url/i)) as HTMLInputElement;
 		expect(url.value).toBe('https://dash.example.com/api/webhooks/github/app_1');
-		expect((screen.getByLabelText(/^secret$/i) as HTMLInputElement).value).toBe(
-			'generated-secret-0123456789'
-		);
+		const secretField = screen.getByLabelText(/^secret$/i) as HTMLInputElement;
+		expect(secretField.value).not.toContain('generated-secret');
+		expect(api.revealWebhookSecret).not.toHaveBeenCalled();
+		await user.click(screen.getByRole('button', { name: /^reveal$/i }));
+		expect(api.revealWebhookSecret).toHaveBeenCalledWith('app_1');
+		expect(await screen.findByDisplayValue('generated-secret-0123456789')).toBeInTheDocument();
 		expect(screen.getByText(/just the push event/i)).toBeInTheDocument();
 
 		await user.click(screen.getByRole('tab', { name: /^gitlab$/i }));

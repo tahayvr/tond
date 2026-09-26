@@ -46,7 +46,9 @@ pub struct App {
     pub cpu_limit: Option<i64>,
     /// "building" | "running" | "stopped" | "failed" | "unhealthy"
     pub status: String,
-    /// Environment variables as JSON object
+    /// Environment variables: a JSON object, stored encrypted by the server
+    /// (`{}` when empty). Never serialized.
+    #[serde(skip_serializing)]
     pub env_vars: Option<String>,
     /// HTTP path polled for health checks (None = disabled)
     pub health_check_path: Option<String>,
@@ -68,7 +70,9 @@ pub struct App {
     // ── Phase 4: Git Integration & Automation ──
     /// Per-app webhook secret: the HMAC-SHA256 key for GitHub/Gitea/generic
     /// signatures and the GitLab `X-Gitlab-Token`. Generated at creation;
-    /// webhooks are rejected when it is missing.
+    /// webhooks are rejected when it is missing. Stored encrypted by the
+    /// server; never serialized.
+    #[serde(skip_serializing)]
     pub webhook_secret: Option<String>,
     /// 1 = automatically trigger a deploy when a webhook fires for the
     /// configured branch; 0 = disabled (webhook exists but does not auto-deploy).
@@ -96,7 +100,9 @@ pub struct App {
     pub preview_enabled: i64,
     /// JSON array of env var keys excluded from preview containers (e.g. `["SECRET_KEY"]`)
     pub preview_excluded_keys: String,
-    /// JSON object of key-value overrides applied only to preview containers
+    /// JSON object of key-value overrides applied only to preview containers,
+    /// stored encrypted by the server. Never serialized.
+    #[serde(skip_serializing)]
     pub preview_env_vars: String,
     // ── Inline source content ──
     /// Raw Dockerfile content supplied by the user (used when source_type = "dockerfile")
@@ -515,10 +521,18 @@ pub struct WebhookConfigResponse {
     pub paths: WebhookUrls,
     /// Absolute URLs when `dashboard_domain` is configured, else None.
     pub urls: Option<WebhookUrls>,
-    /// The current webhook secret (shown to authenticated users only).
-    pub secret: String,
+    /// Whether a webhook secret is set. The secret itself is write-only: read
+    /// it with GET /api/apps/{id}/webhook-secret (admin only, audit-logged).
+    pub has_secret: bool,
     pub auto_deploy: bool,
     pub watch_branch: Option<String>,
+}
+
+/// GET /api/apps/{id}/webhook-secret (reveal) and
+/// POST /api/apps/{id}/webhook-secret/rotate (the new secret, shown once).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookSecretResponse {
+    pub secret: String,
 }
 
 /// Response returned after generating or fetching a deploy key.

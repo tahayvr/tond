@@ -13,8 +13,16 @@
 //                 "smtp_user": "…", "smtp_password": "…",
 //                 "smtp_encryption": "tls"|"starttls"|"none",
 //                 "to_addrs": ["user@example.com"] }
+//
+// The secret fields (`INTEGRATION_SECRET_FIELDS`) are stored encrypted inside
+// the JSON and are write-only over the API: responses list which ones are
+// saved in `saved_secrets`, and an update that omits one (or sends "") keeps
+// the saved value.
 
 use serde::{Deserialize, Serialize};
+
+/// Config fields that hold secrets (bot tokens, webhook URLs, SMTP passwords).
+pub const INTEGRATION_SECRET_FIELDS: &[&str] = &["bot_token", "webhook_url", "smtp_password"];
 
 // ── Database row ──────────────────────────────────────────────────────────────
 
@@ -89,15 +97,17 @@ impl IntegrationConfig {
 
 // ── API response shape ────────────────────────────────────────────────────────
 
-/// Outbound representation of an integration — config is returned as a typed
-/// object, and `enabled` is expressed as a bool.
+/// Outbound representation of an integration — the non-secret config fields,
+/// the names of the secret fields that are saved, and `enabled` as a bool.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IntegrationResponse {
     pub id: String,
     pub name: String,
     pub kind: String,
-    /// Typed config object (with sensitive fields intact for editing).
+    /// Config object without its secret fields (see `INTEGRATION_SECRET_FIELDS`).
     pub config: serde_json::Value,
+    /// Secret fields that have a saved value (e.g. `["bot_token"]`).
+    pub saved_secrets: Vec<String>,
     pub enabled: bool,
     pub created_at: String,
     pub updated_at: String,
@@ -105,13 +115,26 @@ pub struct IntegrationResponse {
 
 impl From<Integration> for IntegrationResponse {
     fn from(i: Integration) -> Self {
-        // Return the raw config JSON as a Value; let the client display it.
-        let config = serde_json::from_str(&i.config).unwrap_or(serde_json::Value::Null);
+        let mut saved_secrets = Vec::new();
+        let config = match serde_json::from_str::<serde_json::Value>(&i.config) {
+            Ok(serde_json::Value::Object(mut object)) => {
+                for field in INTEGRATION_SECRET_FIELDS {
+                    if let Some(value) = object.remove(*field)
+                        && value.as_str().is_some_and(|s| !s.is_empty())
+                    {
+                        saved_secrets.push((*field).to_string());
+                    }
+                }
+                serde_json::Value::Object(object)
+            }
+            _ => serde_json::Value::Null,
+        };
         Self {
             id: i.id,
             name: i.name,
             kind: i.kind,
             config,
+            saved_secrets,
             enabled: i.enabled != 0,
             created_at: i.created_at,
             updated_at: i.updated_at,
@@ -252,8 +275,35 @@ mod tests {
         );
         assert_eq!(
             response.config,
-            serde_json::json!({ "webhook_url": "https://slack.example" }),
-            "IntegrationResponse should deserialize the stored config JSON"
+            serde_json::json!({}),
+            "IntegrationResponse must not return the (secret) webhook URL"
+        );
+        assert_eq!(response.saved_secrets, vec!["webhook_url".to_string()]);
+    }
+
+    #[test]
+    fn integration_response_keeps_plain_fields_and_drops_every_secret() {
+        let row = Integration {
+            id: "integration-2".to_string(),
+            name: "Mail".to_string(),
+            kind: "email".to_string(),
+            config:
+                r#"{"smtp_host":"smtp.example.com","smtp_password":"v1.cipher","bot_token":""}"#
+                    .to_string(),
+            enabled: 1,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+
+        let response = IntegrationResponse::from(row);
+        assert_eq!(
+            response.config,
+            serde_json::json!({ "smtp_host": "smtp.example.com" })
+        );
+        assert_eq!(
+            response.saved_secrets,
+            vec!["smtp_password".to_string()],
+            "an empty secret field is not reported as saved"
         );
     }
 

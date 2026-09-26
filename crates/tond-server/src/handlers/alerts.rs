@@ -23,8 +23,14 @@ use crate::audit_log::{AuditEntry, record};
 use crate::{
     auth::{Authz, RateLimit, scope},
     error::AppError,
+    secrets,
     state::AppState,
 };
+
+fn rule_response(rule: AlertRule) -> Result<AlertRuleResponse, AppError> {
+    let url = secrets::alert_webhook_url(&rule.webhook_url)?;
+    Ok(AlertRuleResponse::new(rule, &url))
+}
 
 // ── List ──
 
@@ -38,7 +44,10 @@ pub async fn list_alerts(
             .fetch_all(&state.db)
             .await?;
 
-    let resp: Vec<AlertRuleResponse> = rules.into_iter().map(AlertRuleResponse::from).collect();
+    let mut resp: Vec<AlertRuleResponse> = Vec::with_capacity(rules.len());
+    for rule in rules {
+        resp.push(rule_response(rule)?);
+    }
     Ok((StatusCode::OK, Json(ApiResponse::ok(resp))))
 }
 
@@ -56,10 +65,7 @@ pub async fn get_alert(
         .await?
         .ok_or_else(|| AppError(TondError::NotFound(format!("Alert rule {id} not found"))))?;
 
-    Ok((
-        StatusCode::OK,
-        Json(ApiResponse::ok(AlertRuleResponse::from(rule))),
-    ))
+    Ok((StatusCode::OK, Json(ApiResponse::ok(rule_response(rule)?))))
 }
 
 // ── Helpers ──
@@ -129,7 +135,7 @@ pub async fn create_alert(
     .bind(&req.name)
     .bind(&req.metric)
     .bind(threshold)
-    .bind(&req.webhook_url)
+    .bind(secrets::seal_alert_webhook_url(req.webhook_url.trim())?)
     .bind(&events_json)
     .execute(&state.db)
     .await?;
@@ -147,7 +153,7 @@ pub async fn create_alert(
     .await;
     Ok((
         StatusCode::CREATED,
-        Json(ApiResponse::ok(AlertRuleResponse::from(rule))),
+        Json(ApiResponse::ok(rule_response(rule)?)),
     ))
 }
 
@@ -176,7 +182,11 @@ pub async fn update_alert(
         None => rule.metric,
     };
     let threshold = req.threshold.unwrap_or(rule.threshold);
-    let webhook_url = req.webhook_url.unwrap_or(rule.webhook_url);
+    // Write-only: absent keeps the saved URL, "" clears it.
+    let webhook_url = match req.webhook_url {
+        Some(url) => secrets::seal_alert_webhook_url(url.trim())?,
+        None => rule.webhook_url,
+    };
     let enabled: i64 = req
         .enabled
         .map(|b| if b { 1 } else { 0 })
@@ -218,7 +228,7 @@ pub async fn update_alert(
     .await;
     Ok((
         StatusCode::OK,
-        Json(ApiResponse::ok(AlertRuleResponse::from(updated))),
+        Json(ApiResponse::ok(rule_response(updated)?)),
     ))
 }
 
