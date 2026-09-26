@@ -36,12 +36,17 @@ pub enum Table {
     RouteState,
     Deployments,
     Databases,
+    Certificates,
+    Snapshots,
+    /// Not a table: the alert engine queued deliveries to send now
+    /// (`alerts::kick`). Only published through `notify`.
+    AlertKick,
     /// uptime_checks rows; the heartbeat settings handler notifies it too.
     Uptime,
 }
 
 impl Table {
-    const ALL: [Table; 9] = [
+    const ALL: [Table; 12] = [
         Table::Apps,
         Table::PreviewDeployments,
         Table::CronJobs,
@@ -50,6 +55,9 @@ impl Table {
         Table::RouteState,
         Table::Deployments,
         Table::Databases,
+        Table::Certificates,
+        Table::Snapshots,
+        Table::AlertKick,
         Table::Uptime,
     ];
 
@@ -71,6 +79,8 @@ impl Table {
             "route_state" => Table::RouteState,
             "deployments" => Table::Deployments,
             "databases" => Table::Databases,
+            "certificates" => Table::Certificates,
+            "snapshots" => Table::Snapshots,
             "uptime_checks" => Table::Uptime,
             _ => return None,
         })

@@ -119,6 +119,8 @@ pub struct LastProbe {
 
 #[derive(Debug, Clone, Default)]
 struct Live {
+    /// The app this check belongs to (None for the dashboard).
+    app_id: Option<String>,
     last: Option<LastProbe>,
     /// Open incident: (id, started_at, cause)
     incident: Option<(i64, i64, Cause)>,
@@ -162,6 +164,15 @@ pub fn next_heartbeat() -> Option<i64> {
         0 => None,
         t => Some(t),
     }
+}
+
+/// Whether the app's uptime check is down right now (for the alert engine's
+/// "app down" rule).
+pub fn app_is_down(app_id: &str) -> bool {
+    LIVE.read().ok().is_some_and(|m| {
+        m.values()
+            .any(|l| l.incident.is_some() && l.app_id.as_deref() == Some(app_id))
+    })
 }
 
 /// Where hourly rollups end (see store::windows).
@@ -354,6 +365,7 @@ async fn record(state: &AppState, ts: i64, results: &[(Check, ProbeResult)]) -> 
         }
         if let Ok(mut m) = LIVE.write() {
             let live = m.entry(check.id).or_default();
+            live.app_id = check.app_id.clone();
             live.last = Some(LastProbe {
                 at: now,
                 result: result.clone(),
@@ -373,6 +385,8 @@ fn publish(
     incident_id: i64,
     down_secs: Option<i64>,
 ) {
+    // The alert engine re-evaluates its "app down" rules now.
+    crate::alerts::kick();
     // No receivers is fine.
     let _ = EVENTS.send(UptimeEvent {
         kind,
@@ -509,6 +523,7 @@ pub async fn run(state: AppState) {
                 m.retain(|id, _| checks.iter().any(|c| c.id == *id));
                 for c in &checks {
                     let live = m.entry(c.id).or_default();
+                    live.app_id = c.app_id.clone();
                     live.next_due = if c.active {
                         Some(
                             live.next_due
