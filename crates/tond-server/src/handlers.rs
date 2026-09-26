@@ -76,7 +76,7 @@ use crate::{
     compose_policy, deploy, docker,
     error::AppError,
     state::AppState,
-    volumes,
+    upload, volumes,
 };
 
 // ── Health ──
@@ -1013,6 +1013,104 @@ pub async fn update_drain_timeout(
     ))
 }
 
+/// Stream the multipart `file` field into `upload::extract_archive`, running
+/// on a blocking thread. Errors are user-facing (400/413 with what to do).
+async fn receive_upload(
+    multipart: &mut Multipart,
+    dest: &std::path::Path,
+    max_bytes: u64,
+) -> Result<(), AppError> {
+    let mut extracted = false;
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(e) => {
+                return Err(AppError(TondError::InvalidInput(format!(
+                    "Failed to read upload: {e}"
+                ))));
+            }
+        };
+        if field.name() != Some("file") || extracted {
+            continue;
+        }
+        extracted = true;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(8);
+        let dest_owned = dest.to_path_buf();
+        let job = tokio::task::spawn_blocking(move || {
+            upload::extract_archive(
+                upload::ArchiveReader::new(rx, max_bytes),
+                &dest_owned,
+                upload::ExtractLimits::with_max_bytes(max_bytes),
+            )
+        });
+
+        let mut field = field;
+        let mut received: u64 = 0;
+        let mut extractor_stopped = false;
+        loop {
+            match field.chunk().await {
+                Ok(Some(chunk)) => {
+                    received += chunk.len() as u64;
+                    // A send error means the extractor already stopped (it
+                    // refused the archive); its result says why. Keep reading
+                    // (and discarding) a bounded amount so the client gets
+                    // the error response instead of a reset connection.
+                    if !extractor_stopped && tx.send(Ok(chunk)).await.is_err() {
+                        extractor_stopped = true;
+                    }
+                    if extractor_stopped && received > max_bytes.saturating_mul(2) {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(std::io::Error::other(format!(
+                            "the upload was interrupted: {e}"
+                        ))))
+                        .await;
+                    break;
+                }
+            }
+        }
+        drop(tx);
+
+        let result = job.await.map_err(|e| {
+            AppError(TondError::Internal(format!(
+                "upload extraction failed: {e}"
+            )))
+        })?;
+        match result {
+            Ok(stats) => tracing::info!(
+                "Upload extracted: {} files, {} bytes",
+                stats.files,
+                stats.bytes
+            ),
+            Err(upload::UploadError::TooLarge(msg)) => {
+                return Err(AppError(TondError::PayloadTooLarge(msg)));
+            }
+            Err(upload::UploadError::Invalid(msg)) => {
+                return Err(AppError(TondError::InvalidInput(format!(
+                    "Upload refused: {msg}"
+                ))));
+            }
+            Err(upload::UploadError::Io(msg)) => {
+                return Err(AppError(TondError::Internal(format!(
+                    "Could not unpack the upload: {msg}"
+                ))));
+            }
+        }
+    }
+    if !extracted {
+        return Err(AppError(TondError::InvalidInput(
+            "The upload has no 'file' part: send the archive as multipart field 'file'".to_string(),
+        )));
+    }
+    Ok(())
+}
+
 pub async fn upload_deploy(
     _rate: RateLimit,
     _auth: RequireAuth,
@@ -1023,50 +1121,20 @@ pub async fn upload_deploy(
 ) -> Result<impl IntoResponse, AppError> {
     let mut app = fetch_app(&state.db, &id).await?;
 
-    // Extract tarball from multipart upload
-    let extract_dir = format!("/tmp/tond-uploads/{}", app.name);
-    let _ = tokio::fs::remove_dir_all(&extract_dir).await;
-    tokio::fs::create_dir_all(&extract_dir).await.map_err(|e| {
+    // Extract the archive while it streams in, into a fresh private directory
+    // (see upload.rs for everything that is refused).
+    let data_dir = volumes::data_dir();
+    let extract_path = upload::create_upload_dir(&data_dir).map_err(|e| {
         AppError(TondError::Internal(format!(
-            "Failed to create upload dir: {}",
-            e
+            "Failed to create upload dir: {e}"
         )))
     })?;
-
-    while let Ok(Some(field)) = multipart.next_field().await {
-        if field.name() == Some("file") {
-            let data = field.bytes().await.map_err(|e| {
-                AppError(TondError::InvalidInput(format!(
-                    "Failed to read upload: {}",
-                    e
-                )))
-            })?;
-
-            let tar_path = format!("{}/upload.tar.gz", extract_dir);
-            tokio::fs::write(&tar_path, &data).await.map_err(|e| {
-                AppError(TondError::Internal(format!(
-                    "Failed to write tarball: {}",
-                    e
-                )))
-            })?;
-
-            // Extract tarball
-            let output = tokio::process::Command::new("tar")
-                .args(["xzf", &tar_path, "-C", &extract_dir])
-                .output()
-                .await
-                .map_err(|e| AppError(TondError::Internal(format!("Failed to run tar: {}", e))))?;
-
-            if !output.status.success() {
-                return Err(AppError(TondError::InvalidInput(
-                    "Failed to extract tarball".to_string(),
-                )));
-            }
-
-            // Remove the tar file
-            let _ = tokio::fs::remove_file(&tar_path).await;
-        }
+    let max_bytes = state.settings.read().await.upload_max_bytes;
+    if let Err(e) = receive_upload(&mut multipart, &extract_path, max_bytes).await {
+        let _ = tokio::fs::remove_dir_all(&extract_path).await;
+        return Err(e);
     }
+    let extract_dir = extract_path.to_string_lossy().into_owned();
 
     // Update source type
     sqlx::query(
@@ -2506,5 +2574,111 @@ mod tests {
         )
         .await;
         assert!(missing.is_err(), "unknown domains are a 404");
+    }
+
+    /// Run `receive_upload` behind a real axum router so the Multipart
+    /// extractor parses a genuine multipart body.
+    async fn post_upload(body: Vec<u8>, max_bytes: u64) -> (StatusCode, String, tempfile::TempDir) {
+        use tower::ServiceExt;
+
+        let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let dest = dir.path().to_path_buf();
+        let router = axum::Router::new().route(
+            "/upload",
+            axum::routing::post(move |mut multipart: Multipart| {
+                let dest = dest.clone();
+                async move {
+                    match receive_upload(&mut multipart, &dest, max_bytes).await {
+                        Ok(()) => StatusCode::OK.into_response(),
+                        Err(e) => e.into_response(),
+                    }
+                }
+            })
+            .layer(axum::extract::DefaultBodyLimit::disable()),
+        );
+        let boundary = "tondtestboundary";
+        let mut payload = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"upload.tar.gz\"\r\nContent-Type: application/gzip\r\n\r\n"
+        )
+        .into_bytes();
+        payload.extend_from_slice(&body);
+        payload.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(axum::body::Body::from(payload))
+            .unwrap_or_else(|e| panic!("request: {e}"));
+        let response = router
+            .oneshot(request)
+            .await
+            .unwrap_or_else(|e| panic!("router: {e}"));
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        (status, String::from_utf8_lossy(&bytes).into_owned(), dir)
+    }
+
+    fn gzip_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, content) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, *content)
+                .unwrap_or_else(|e| panic!("append: {e}"));
+        }
+        let tar = builder.into_inner().unwrap_or_else(|e| panic!("tar: {e}"));
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(&tar).unwrap_or_else(|e| panic!("gz: {e}"));
+        enc.finish().unwrap_or_else(|e| panic!("gz: {e}"))
+    }
+
+    #[tokio::test]
+    async fn receive_upload_extracts_a_streamed_multipart_archive() {
+        let archive = gzip_tar(&[("Dockerfile", b"FROM scratch\n"), ("src/app.txt", b"hi")]);
+        let (status, body, dir) = post_upload(archive, 1024 * 1024).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "valid upload should extract: {body}"
+        );
+        assert!(dir.path().join("Dockerfile").is_file());
+        assert!(dir.path().join("src/app.txt").is_file());
+    }
+
+    #[tokio::test]
+    async fn receive_upload_refuses_oversized_archives_with_413() {
+        let big = vec![0u8; 3 * 1024 * 1024];
+        let archive = gzip_tar(&[("big.bin", &big)]);
+        let (status, body, _dir) = post_upload(archive, 1024 * 1024).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "body: {body}");
+        assert!(
+            body.contains(".tondignore"),
+            "the error should say how to fix it: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_upload_refuses_malicious_archives_with_400() {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        builder
+            .append_link(&mut header, "passwd", "/etc/passwd")
+            .unwrap_or_else(|e| panic!("append link: {e}"));
+        let tar = builder.into_inner().unwrap_or_else(|e| panic!("tar: {e}"));
+        let (status, body, _dir) = post_upload(tar, 1024 * 1024).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(body.contains("outside the project"), "body: {body}");
     }
 }

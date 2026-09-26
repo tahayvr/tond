@@ -12,6 +12,13 @@ fn default_server_name() -> String {
     "Tond Server".to_string()
 }
 
+/// Default cap on the unpacked size of an uploaded source archive (1 GiB).
+pub const DEFAULT_UPLOAD_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+
+fn default_upload_max_bytes() -> u64 {
+    DEFAULT_UPLOAD_MAX_BYTES
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerSettings {
     /// A human-readable name for this Tond server instance (e.g. "My VPS").
@@ -25,6 +32,10 @@ pub struct ServerSettings {
     /// preview pages are cross-site to the dashboard. Empty = previews disabled.
     #[serde(default)]
     pub preview_domain: String,
+    /// Max unpacked size in bytes of an uploaded source archive (`tond push`).
+    /// The compressed upload is capped at the same size.
+    #[serde(default = "default_upload_max_bytes")]
+    pub upload_max_bytes: u64,
 }
 
 impl Default for ServerSettings {
@@ -33,6 +44,7 @@ impl Default for ServerSettings {
             server_name: default_server_name(),
             dashboard_domain: String::new(),
             preview_domain: String::new(),
+            upload_max_bytes: DEFAULT_UPLOAD_MAX_BYTES,
         }
     }
 }
@@ -46,10 +58,12 @@ pub struct SettingRow {
 
 /// PUT /api/settings request body — all fields are optional so the caller
 /// can update only the keys they care about.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct UpdateSettingsRequest {
     pub server_name: Option<String>,
     pub dashboard_domain: Option<String>,
     #[serde(default)]
     pub preview_domain: Option<String>,
+    #[serde(default)]
+    pub upload_max_bytes: Option<u64>,
 }

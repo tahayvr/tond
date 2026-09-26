@@ -36,6 +36,10 @@ pub enum TondError {
 
     #[error("Internal error: {0}")]
     Internal(String),
+
+    /// The request body (e.g. an uploaded archive) exceeds a configured limit.
+    #[error("Too large: {0}")]
+    PayloadTooLarge(String),
 }
 
 impl TondError {
@@ -46,6 +50,7 @@ impl TondError {
             TondError::AppAlreadyExists(_) => 409,
             TondError::InvalidInput(_) => 400,
             TondError::Forbidden(_) => 403,
+            TondError::PayloadTooLarge(_) => 413,
             _ => 500,
         }
     }
@@ -91,6 +96,11 @@ mod tests {
             TondError::Internal("boom".to_string()).status_code(),
             500,
             "Internal should map to HTTP 500"
+        );
+        assert_eq!(
+            TondError::PayloadTooLarge("big".to_string()).status_code(),
+            413,
+            "PayloadTooLarge should map to HTTP 413"
         );
     }
 

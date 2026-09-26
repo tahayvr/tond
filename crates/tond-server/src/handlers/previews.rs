@@ -381,6 +381,7 @@ mod tests {
             server_name: "tond".to_string(),
             dashboard_domain: "dash.example.com".to_string(),
             preview_domain: "example-previews.com".to_string(),
+            ..ServerSettings::default()
         };
 
         AppState {

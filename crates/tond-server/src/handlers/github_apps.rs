@@ -1214,6 +1214,7 @@ mod tests {
                 server_name: "tond".to_string(),
                 dashboard_domain: "dashboard.example.com".to_string(),
                 preview_domain: String::new(),
+                ..ServerSettings::default()
             })),
         }
     }

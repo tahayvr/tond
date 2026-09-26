@@ -72,6 +72,7 @@ mod secret_key;
 mod security_headers;
 mod state;
 mod storage;
+mod upload;
 mod volumes;
 
 use std::future::IntoFuture;
@@ -114,6 +115,9 @@ async fn main() -> Result<()> {
 
     tracing::info!("Database initialized");
 
+    // Uploads interrupted by a restart leave their extraction dirs behind.
+    upload::clear_upload_dirs(&volumes::data_dir());
+
     // Load persisted settings from DB into the in-memory cache
     {
         use tond_common::SettingRow;
@@ -126,6 +130,9 @@ async fn main() -> Result<()> {
                 "server_name" => s.server_name = row.value,
                 "dashboard_domain" => s.dashboard_domain = row.value,
                 "preview_domain" => s.preview_domain = row.value,
+                "upload_max_bytes" => {
+                    s.upload_max_bytes = row.value.parse().unwrap_or(s.upload_max_bytes)
+                }
                 _ => {}
             }
         }
@@ -270,7 +277,12 @@ async fn main() -> Result<()> {
             "/api/apps/{id}/resources",
             axum::routing::patch(handlers::update_app_resources),
         )
-        .route("/api/apps/{id}/upload", post(handlers::upload_deploy))
+        // Uploads stream through upload.rs, which enforces the configurable
+        // `upload_max_bytes` cap itself, so axum's 2 MB default is lifted.
+        .route(
+            "/api/apps/{id}/upload",
+            post(handlers::upload_deploy).layer(axum::extract::DefaultBodyLimit::disable()),
+        )
         // Deployment history and rollback
         .route(
             "/api/apps/{id}/deployments",

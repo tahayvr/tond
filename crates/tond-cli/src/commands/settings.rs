@@ -98,8 +98,7 @@ pub async fn handle(client: &TondClient, action: Option<SettingsAction>) -> Resu
             let s = client
                 .update_settings(UpdateSettingsRequest {
                     server_name: Some(name.clone()),
-                    dashboard_domain: None,
-                    preview_domain: None,
+                    ..Default::default()
                 })
                 .await?;
             if name.is_empty() {
@@ -111,9 +110,8 @@ pub async fn handle(client: &TondClient, action: Option<SettingsAction>) -> Resu
         Some(SettingsAction::SetDashboardDomain { domain }) => {
             let s = client
                 .update_settings(UpdateSettingsRequest {
-                    server_name: None,
                     dashboard_domain: Some(domain.clone()),
-                    preview_domain: None,
+                    ..Default::default()
                 })
                 .await?;
             if domain.is_empty() {
@@ -126,9 +124,8 @@ pub async fn handle(client: &TondClient, action: Option<SettingsAction>) -> Resu
         Some(SettingsAction::SetPreviewDomain { domain }) => {
             let s = client
                 .update_settings(UpdateSettingsRequest {
-                    server_name: None,
-                    dashboard_domain: None,
                     preview_domain: Some(domain.clone()),
+                    ..Default::default()
                 })
                 .await?;
             if domain.is_empty() {

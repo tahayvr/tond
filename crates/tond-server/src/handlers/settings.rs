@@ -7,6 +7,9 @@
 //   get_settings()    GET  /api/settings — return a snapshot of the in-memory settings
 //   update_settings() PUT  /api/settings — patch one or more keys; write-through to DB
 //
+// upload_max_bytes caps uploaded source archives (see upload.rs); it must be
+// between 1 MiB and 64 GiB.
+//
 // dashboard_domain and preview_domain are normalized (trimmed, lowercased) and
 // validated together: the preview domain must be a different registrable
 // domain from the dashboard domain (see domains.rs), whichever of the two
@@ -21,6 +24,7 @@ use crate::{
     auth::{RateLimit, RequireAdmin, RequireAuth},
     domains::{is_valid_hostname, normalize_domain, validate_preview_domain},
     state::AppState,
+    upload::{MAX_UPLOAD_MAX_BYTES, MIN_UPLOAD_MAX_BYTES, format_size},
 };
 
 async fn queue_dashboard_certificate(
@@ -115,6 +119,17 @@ pub async fn update_settings(
         pairs.push(("preview_domain", v));
     }
 
+    if let Some(max) = req.upload_max_bytes {
+        if !(MIN_UPLOAD_MAX_BYTES..=MAX_UPLOAD_MAX_BYTES).contains(&max) {
+            return invalid(format!(
+                "The upload limit must be between {} and {}",
+                format_size(MIN_UPLOAD_MAX_BYTES),
+                format_size(MAX_UPLOAD_MAX_BYTES)
+            ));
+        }
+        pairs.push(("upload_max_bytes", max.to_string()));
+    }
+
     // Write-through: persist each changed key to the DB first so that
     // tond-proxy (separate process) picks it up on its next 5-second poll.
     for (key, value) in &pairs {
@@ -154,6 +169,9 @@ pub async fn update_settings(
                 "server_name" => s.server_name = value,
                 "dashboard_domain" => s.dashboard_domain = value,
                 "preview_domain" => s.preview_domain = value,
+                "upload_max_bytes" => {
+                    s.upload_max_bytes = value.parse().unwrap_or(s.upload_max_bytes)
+                }
                 _ => {}
             }
         }
@@ -208,9 +226,8 @@ mod tests {
             RequireAdmin,
             State(state.clone()),
             Json(UpdateSettingsRequest {
-                server_name: None,
                 dashboard_domain: Some("dash.example.com".to_string()),
-                preview_domain: None,
+                ..Default::default()
             }),
         )
         .await
@@ -255,9 +272,9 @@ mod tests {
             RequireAdmin,
             State(state.clone()),
             Json(UpdateSettingsRequest {
-                server_name: None,
                 dashboard_domain: dashboard_domain.map(str::to_string),
                 preview_domain: preview_domain.map(str::to_string),
+                ..Default::default()
             }),
         )
         .await
@@ -383,6 +400,48 @@ mod tests {
         assert!(
             row.1.contains(data_dir.path().to_string_lossy().as_ref()),
             "helper should respect the supplied data dir for key_path"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_limit_is_validated_and_cached() {
+        let (state, _data_dir) = test_state().await;
+        let set = |max: u64| {
+            let state = state.clone();
+            async move {
+                update_settings(
+                    RateLimit,
+                    RequireAdmin,
+                    State(state),
+                    Json(UpdateSettingsRequest {
+                        upload_max_bytes: Some(max),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .into_response()
+                .status()
+            }
+        };
+        assert_eq!(
+            set(1024).await,
+            StatusCode::BAD_REQUEST,
+            "below 1 MiB is refused"
+        );
+        assert_eq!(
+            state.settings.read().await.upload_max_bytes,
+            DEFAULT_UPLOAD_MAX_BYTES,
+            "a refused limit leaves the default"
+        );
+        assert_eq!(set(200 * 1024 * 1024).await, StatusCode::OK);
+        assert_eq!(
+            state.settings.read().await.upload_max_bytes,
+            200 * 1024 * 1024
+        );
+        assert_eq!(
+            stored(&state, "upload_max_bytes").await.as_deref(),
+            Some("209715200"),
+            "the limit is persisted for restarts"
         );
     }
 }
