@@ -705,7 +705,8 @@ async fn event_style_rules_follow_their_tables() {
 }
 
 #[tokio::test]
-async fn http_rules_hold_while_request_metrics_are_missing_and_work_once_present() {
+async fn http_rules_fire_from_the_proxy_request_metrics() {
+    use tond_common::traffic::{RouteKind, TrafficCounters};
     let state = test_state().await;
     let db = &state.db;
     seed_app(db, "a1", "api", "running").await;
@@ -721,15 +722,18 @@ async fn http_rules_hold_while_request_metrics_are_missing_and_work_once_present
     )
     .await;
     let none = Source::Fixed(Inputs::default());
+    // No traffic yet: nothing to judge.
     assert_eq!(eval(&state, T0, &none).await.fired, 0);
-    exec(
-        db,
-        "CREATE TABLE requests_1m(app_id TEXT, ts INTEGER, requests INTEGER, status_5xx INTEGER, p95_ms REAL)",
-    )
-    .await;
-    sqlx::query("INSERT INTO requests_1m VALUES ('a1', ?, 100, 20, 150.0)")
-        .bind(T0 - 60)
-        .execute(db)
+    let target = crate::metrics::requests::ensure_target(db, &(RouteKind::App, "a1".into()))
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let mut minute = TrafficCounters {
+        requests: 100,
+        status: [0, 80, 0, 0, 20],
+        ..Default::default()
+    };
+    minute.latency[11] = 100;
+    crate::metrics::requests::write_minute(db, T0 - 60, &[(target, minute)], None)
         .await
         .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(eval(&state, T0, &none).await.fired, 1);

@@ -101,6 +101,21 @@ export function appTabHref(appId: string, tab: AppTab, section?: AppSettingsSect
 	return tabHref(`/apps/${appId}`, tab, 'overview', extra);
 }
 
+/** The app's Logs tab shows container output or the access log (`?log=access`). */
+export type AppLogView = 'output' | 'access';
+export const APP_LOG_VIEWS: readonly TabDef<AppLogView>[] = [
+	{ id: 'output', label: 'App output' },
+	{ id: 'access', label: 'Access log' }
+];
+
+export function appLogViewFromUrl(url: URL): AppLogView {
+	return tabFromUrl(url, APP_LOG_VIEWS, 'output', 'log');
+}
+
+export function appLogViewHref(appId: string, view: AppLogView): string {
+	return tabHref(`/apps/${appId}`, 'logs', 'overview', view === 'access' ? { log: 'access' } : {});
+}
+
 // ── Database and cron pages ─────────────────────────────────────────────────
 
 export type DatabaseTab = 'overview' | 'logs' | 'environment' | 'backups' | 'metrics' | 'settings';
@@ -121,10 +136,11 @@ export const SYSTEM_TABS: readonly TabDef<SystemTab>[] = [
 	{ id: 'uptime', label: 'Uptime' }
 ];
 
-export type CronTab = 'overview' | 'runs' | 'settings';
+export type CronTab = 'overview' | 'runs' | 'metrics' | 'settings';
 export const CRON_TABS: readonly TabDef<CronTab>[] = [
 	{ id: 'overview', label: 'Overview' },
 	{ id: 'runs', label: 'Runs' },
+	{ id: 'metrics', label: 'Metrics', scope: 'metrics:read' },
 	{ id: 'settings', label: 'Settings' }
 ];
 

@@ -3,7 +3,10 @@
 	import { safeUrl } from '$lib/utils';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import StatusBadge from '$lib/components/feedback/status-badge.svelte';
+	import { can } from '$lib/auth.svelte';
 	import type { PreviewDeployment } from '$lib/api';
+	import PreviewMetricsSheet from './preview-metrics-sheet.svelte';
+	import ChartIcon from '~icons/ri/line-chart-line';
 	import Github from '~icons/ri/github-fill';
 	import GitBranch from '~icons/ri/git-branch-line';
 	import ExternalLink from '~icons/ri/external-link-line';
@@ -16,6 +19,9 @@
 	}
 
 	let { previews, loading, error, onDelete }: Props = $props();
+
+	/** Preview whose metrics are open in the side panel. */
+	let metricsFor = $state<PreviewDeployment | null>(null);
 
 	function shortSha(sha: string): string {
 		return sha.slice(0, 7);
@@ -44,7 +50,7 @@
 						<th class="px-4 py-2 text-left font-medium text-muted-foreground">URL</th>
 						<th class="px-4 py-2 text-left font-medium text-muted-foreground">Image</th>
 						<th class="px-4 py-2 text-left font-medium text-muted-foreground">Expires</th>
-						<th class="w-20 px-4 py-2"><span class="sr-only">Actions</span></th>
+						<th class="w-40 px-4 py-2"><span class="sr-only">Actions</span></th>
 					</tr>
 				</thead>
 				<tbody>
@@ -120,14 +126,29 @@
 								>{new Date(p.expires_at).toLocaleString()}</td
 							>
 							<td class="px-4 py-2">
-								<Button
-									variant="ghost"
-									size="sm"
-									class="text-destructive hover:text-destructive"
-									onclick={() => onDelete(p.id)}
-								>
-									Delete
-								</Button>
+								<div class="flex items-center justify-end gap-1">
+									{#if can('metrics:read')}
+										<Button
+											variant="ghost"
+											size="sm"
+											onclick={() => (metricsFor = p)}
+											aria-label="Metrics for preview {p.pr_number !== null
+												? `#${p.pr_number}`
+												: p.slug}"
+										>
+											<ChartIcon class="size-4" aria-hidden="true" />
+											Metrics
+										</Button>
+									{/if}
+									<Button
+										variant="ghost"
+										size="sm"
+										class="text-destructive hover:text-destructive"
+										onclick={() => onDelete(p.id)}
+									>
+										Delete
+									</Button>
+								</div>
 							</td>
 						</tr>
 					{/each}
@@ -136,3 +157,5 @@
 		</div>
 	{/if}
 </div>
+
+<PreviewMetricsSheet preview={metricsFor} onclose={() => (metricsFor = null)} />

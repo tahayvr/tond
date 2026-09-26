@@ -576,6 +576,59 @@ pass "HTTP redirects to HTTPS"
     || fail "plain HTTP for a host Tond does not serve must be 404, not an open redirect"
 pass "HTTP for an unknown host → 404 (no open redirect)"
 
+step "Request metrics and access logs (tond-proxy counters, opt-in access log)"
+# The proxy counts every request per route; tond-server scrapes the counters
+# on its 30 s metrics tick (the not-yet-written minute is included).
+REQ_N=20
+for _ in $(seq 1 "$REQ_N"); do
+    curl -sk -o /dev/null --resolve "${WHOAMI_DOMAIN}:443:${IP}" "https://${WHOAMI_DOMAIN}/"
+done
+# whoami's /health answers with the status last POSTed to it: make it a 404.
+curl -sk -o /dev/null -X POST -d 404 --resolve "${WHOAMI_DOMAIN}:443:${IP}" "https://${WHOAMI_DOMAIN}/health"
+code=$(proxied_status "$WHOAMI_DOMAIN" /health)
+curl -sk -o /dev/null -X POST -d 200 --resolve "${WHOAMI_DOMAIN}:443:${IP}" "https://${WHOAMI_DOMAIN}/health"
+[[ "$code" == 404 ]] || fail "whoami's /health should answer 404 after POSTing 404, got ${code}"
+[[ "$(proxied_status "nothing-here.${BASE}" /)" == 502 ]] || fail "an unknown host must get the 502 page"
+wait_for 90 "request metrics for e2e-whoami" bash -c "curl -sf --unix-socket '$SOCK' \
+    'http://localhost/api/apps/e2e-whoami/requests?range=1h' \
+    | jq -e '.data.summary.requests >= ${REQ_N} and .data.summary.s2xx >= ${REQ_N} and .data.summary.s4xx >= 1'"
+pass "after ${REQ_N} requests the API reports ≥ ${REQ_N} requests, their 2xx and the 4xx"
+REQ=$(api "/api/apps/e2e-whoami/requests?range=1h")
+jq -e '.data.series.t | length > 0 and length <= 481' <<< "$REQ" > /dev/null \
+    || fail "the request series must be server-sized, got: $(jq -c '.data.series.t | length' <<< "$REQ")"
+jq -e '.data.summary.p95 != null and .data.proxy_connected == true' <<< "$REQ" > /dev/null \
+    || fail "latency percentiles and the proxy link must be reported, got: $(jq -c '.data.summary' <<< "$REQ")"
+pass "series ≤ 481 buckets, p95 latency reported, proxy connected"
+wait_for 60 "server-wide traffic" bash -c "curl -sf --unix-socket '$SOCK' \
+    'http://localhost/api/system/requests?range=24h' \
+    | jq -e '(.data.busiest | map(.name) | index(\"e2e-whoami\")) != null and .data.unknown_requests >= 1'"
+pass "the traffic overview lists e2e-whoami and counts unknown hosts"
+
+[[ "$(api_req PUT /api/apps/e2e-whoami/access-log '{"enabled":true}')" == 200 ]] \
+    || fail "enabling the access log failed: $(cat "$API_BODY")"
+# The route_state trigger makes the proxy reload; then it writes the lines.
+wait_for 30 "an access log line" bash -c "curl -sk -o /dev/null --resolve '${WHOAMI_DOMAIN}:443:${IP}' \
+    'https://${WHOAMI_DOMAIN}/e2e-access?token=secret' && curl -sf --unix-socket '$SOCK' \
+    'http://localhost/api/apps/e2e-whoami/access-log?q=e2e-access' | jq -e '.data.lines | length >= 1'"
+LINE=$(api "/api/apps/e2e-whoami/access-log?q=e2e-access" | jq -r '.data.lines[-1]')
+[[ "$LINE" == *" GET /e2e-access 200 "* && "$LINE" != *secret* ]] \
+    || fail "access lines must hold method, path and status without the query string, got: ${LINE}"
+pass "access log line recorded without the query string: ${LINE}"
+[[ "$(perms "${DATA_DIR}/access")" == "700 tond-proxy tond-proxy" ]] \
+    || fail "access/ must be 700 tond-proxy, got: $(perms "${DATA_DIR}/access")"
+WHOAMI_APP_ID=$(app_field e2e-whoami id)
+[[ "$(stat -c '%a %U' "${DATA_DIR}/access/${WHOAMI_APP_ID}.log")" == "600 tond-proxy" ]] \
+    || fail "the access log file must be 600 tond-proxy"
+pass "access logs live in a proxy-owned 0700 directory, files 0600"
+curl -sf --unix-socket "$SOCK" "http://localhost/api/apps/e2e-whoami/access-log/download" | grep -q "/e2e-access" \
+    || fail "the access log download must contain the recorded line"
+pass "the full access log downloads"
+[[ "$(api_req PUT /api/apps/e2e-whoami/access-log '{"enabled":false}')" == 200 ]] \
+    || fail "disabling the access log failed"
+[[ "$(api_req DELETE /api/apps/e2e-whoami/access-log '')" == 200 ]] || fail "deleting the access log failed"
+[[ ! -e "${DATA_DIR}/access/${WHOAMI_APP_ID}.log" ]] || fail "the access log file must be gone after delete"
+pass "access log turned off and deleted"
+
 step "Webhook and integration hardening"
 API_TCP="http://127.0.0.1:3001"
 # status_of <curl args...>: HTTP status code of a request to the TCP API (no credentials).

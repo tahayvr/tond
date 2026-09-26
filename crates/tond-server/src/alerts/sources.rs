@@ -1,17 +1,12 @@
 // alerts/sources.rs — data the alert rules read that other subsystems own
 //
 // Request metrics (5xx rate, p95 latency) come from the per-app request
-// rollups the proxy's counters feed (`requests_1m`). The alert engine only
-// needs "requests, 5xx and p95 per app over the last N seconds", so that is
-// the whole interface: `request_windows`. It expects
-//
-//   requests_1m(app_id TEXT, ts INTEGER, requests INTEGER,
-//               status_5xx INTEGER, p95_ms REAL)
-//
-// and reports "not available" (rules hold their state; creating such a rule
-// is refused with a clear message) while that table or a column is missing.
-// The window's p95 is approximated by the request-weighted mean of the
-// per-minute p95 values.
+// rows the proxy's counters feed (metrics/requests.rs: `requests_1m`, keyed
+// by metric_targets of kind 'app'). The alert engine only needs "requests,
+// 5xx and p95 per app over the last N seconds", so that is the whole
+// interface: `request_windows`. The window's p95 comes from the summed
+// latency histograms; the minute the collector has not written yet is
+// included, so a rule sees traffic from the tick it runs on.
 //
 // Disk-full forecast: the host history's persisted trend
 // (`metrics::host::disk_full_eta`, least squares over 24 h and 7 d of
@@ -21,6 +16,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use sqlx::SqlitePool;
+use tond_common::traffic::{RouteKind, TrafficCounters, decode_histogram, percentile};
+
+use crate::metrics::requests;
 
 /// Requests of one app within a window.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -33,45 +31,49 @@ pub struct RequestWindow {
 /// Fewer requests than this in the window: the rate is not meaningful.
 pub const MIN_REQUESTS: i64 = 20;
 
-const REQUEST_COLUMNS: &[&str] = &["app_id", "ts", "requests", "status_5xx", "p95_ms"];
-
-/// Whether per-app request metrics exist on this server.
-pub async fn request_metrics_available(db: &SqlitePool) -> bool {
-    let cols: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('requests_1m')")
-        .fetch_all(db)
-        .await
-        .unwrap_or_default();
-    REQUEST_COLUMNS
-        .iter()
-        .all(|c| cols.iter().any(|have| have == c))
-}
-
-/// Per-app request totals since `since` (unix seconds); None while request
-/// metrics are not available.
+/// Requests, 5xx and p95 per app id since `since` (unix seconds). Always
+/// Some: request metrics are collected on every server (the Option is kept
+/// for callers that treat "no data source" separately).
 pub async fn request_windows(
     db: &SqlitePool,
     since: i64,
 ) -> anyhow::Result<Option<HashMap<String, RequestWindow>>> {
-    if !request_metrics_available(db).await {
-        return Ok(None);
-    }
-    let rows: Vec<(String, i64, i64, Option<f64>)> = sqlx::query_as(
-        "SELECT app_id, SUM(requests), SUM(status_5xx),
-                SUM(p95_ms * requests) / NULLIF(SUM(CASE WHEN p95_ms IS NOT NULL THEN requests END), 0)
-         FROM requests_1m WHERE ts >= ? GROUP BY app_id",
+    let rows: Vec<(String, i64, i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT t.owner_id, r.requests, r.s5xx, r.latency
+         FROM requests_1m r JOIN metric_targets t ON t.id = r.target
+         WHERE t.kind = 'app' AND r.ts >= ?",
     )
     .bind(since)
     .fetch_all(db)
     .await?;
+    let mut sums: HashMap<String, TrafficCounters> = HashMap::new();
+    for (app, requests, s5xx, latency) in rows {
+        let c = sums.entry(app).or_default();
+        c.requests += u64::try_from(requests).unwrap_or(0);
+        c.status[4] += u64::try_from(s5xx).unwrap_or(0);
+        let hist = decode_histogram(&latency);
+        for (sum, v) in c.latency.iter_mut().zip(hist) {
+            *sum += v;
+        }
+    }
+    if let Some((minute, pending)) = requests::pending_all()
+        && minute >= since
+    {
+        for ((kind, id), c) in pending {
+            if kind == RouteKind::App {
+                sums.entry(id).or_default().add(&c);
+            }
+        }
+    }
     Ok(Some(
-        rows.into_iter()
-            .map(|(app, requests, errors_5xx, p95_ms)| {
+        sums.into_iter()
+            .map(|(app, c)| {
                 (
                     app,
                     RequestWindow {
-                        requests,
-                        errors_5xx,
-                        p95_ms,
+                        requests: i64::try_from(c.requests).unwrap_or(i64::MAX),
+                        errors_5xx: i64::try_from(c.status[4]).unwrap_or(i64::MAX),
+                        p95_ms: percentile(&c.latency, 0.95),
                     },
                 )
             })
@@ -175,47 +177,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_windows_read_the_rollup_table_when_it_exists() {
+    async fn request_windows_sum_apps_and_merge_latency_histograms() {
         let db = SqlitePool::connect("sqlite::memory:")
             .await
             .unwrap_or_else(|err| panic!("db: {err}"));
-        assert!(!request_metrics_available(&db).await);
-        assert_eq!(
-            request_windows(&db, 0)
-                .await
-                .unwrap_or_else(|err| panic!("query: {err}")),
-            None
-        );
-        sqlx::query(
-            "CREATE TABLE requests_1m(app_id TEXT, ts INTEGER, requests INTEGER,
-                                      status_5xx INTEGER, p95_ms REAL)",
-        )
-        .execute(&db)
-        .await
-        .unwrap_or_else(|err| panic!("create: {err}"));
-        for (app, ts, req, e, p95) in [
-            ("a", 60, 100, 10, 200.0),
-            ("a", 120, 300, 0, 400.0),
-            ("a", 0, 999, 999, 9999.0), // outside the window
-            ("b", 120, 5, 5, 50.0),
+        crate::db::migrate(&db)
+            .await
+            .unwrap_or_else(|err| panic!("migrate: {err}"));
+        let target = |kind: RouteKind, id: &str| {
+            let db = db.clone();
+            let id = id.to_string();
+            async move {
+                requests::ensure_target(&db, &(kind, id))
+                    .await
+                    .unwrap_or_else(|err| panic!("target: {err}"))
+            }
+        };
+        let a = target(RouteKind::App, "a").await;
+        let b = target(RouteKind::App, "b").await;
+        let preview = target(RouteKind::Preview, "p").await;
+        let counters = |requests: u64, s5xx: u64, bucket: usize| {
+            let mut c = TrafficCounters {
+                requests,
+                status: [0, requests - s5xx, 0, 0, s5xx],
+                ..Default::default()
+            };
+            c.latency[bucket] = requests;
+            c
+        };
+        for (ts, rows) in [
+            (
+                60,
+                vec![(a, counters(100, 10, 12)), (preview, counters(50, 50, 0))],
+            ),
+            (120, vec![(a, counters(300, 0, 14)), (b, counters(5, 5, 3))]),
+            (0, vec![(a, counters(999, 999, 19))]), // outside the window
         ] {
-            sqlx::query("INSERT INTO requests_1m VALUES (?, ?, ?, ?, ?)")
-                .bind(app)
-                .bind(ts)
-                .bind(req)
-                .bind(e)
-                .bind(p95)
-                .execute(&db)
+            requests::write_minute(&db, ts, &rows, None)
                 .await
-                .unwrap_or_else(|err| panic!("insert: {err}"));
+                .unwrap_or_else(|err| panic!("write: {err}"));
         }
         let w = request_windows(&db, 60)
             .await
             .unwrap_or_else(|err| panic!("query: {err}"))
             .unwrap_or_else(|| panic!("available"));
-        let a = w.get("a").copied().unwrap_or_else(|| panic!("app a"));
-        assert_eq!((a.requests, a.errors_5xx), (400, 10));
-        assert_eq!(a.p95_ms, Some(350.0), "request-weighted");
+        let app_a = w.get("a").copied().unwrap_or_else(|| panic!("app a"));
+        assert_eq!((app_a.requests, app_a.errors_5xx), (400, 10));
+        // 300 of 400 requests in (400, 600] ms: p95 falls in that bucket.
+        assert!(
+            app_a.p95_ms.is_some_and(|p| p > 400.0 && p <= 600.0),
+            "{:?}",
+            app_a.p95_ms
+        );
         assert_eq!(w.get("b").map(|b| b.requests), Some(5));
+        assert!(!w.contains_key("p"), "previews are not apps");
+        assert!(
+            request_windows(&db, 10_000)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|w| w.is_empty())
+        );
     }
 }

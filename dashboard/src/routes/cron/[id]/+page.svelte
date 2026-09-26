@@ -46,7 +46,8 @@
 	import { confirmAction } from '$lib/confirm.svelte';
 	import { useAction } from '$lib/action.svelte';
 	import { describeCron } from '$lib/cron-schedule';
-	import { CRON_TABS, tabFromUrl, tabHref, type CronTab } from '$lib/tabs';
+	import { CRON_TABS, allowedTabs, tabFromUrl, tabHref, type CronTab } from '$lib/tabs';
+	import MetricsPanel from '$lib/components/metrics/metrics-panel.svelte';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
@@ -78,7 +79,8 @@
 	let triggerNotice = $state('');
 	/** Cancels the "wait for the manual run to finish" stream. */
 	let stopWatchingRun: (() => void) | null = null;
-	let tab = $derived<CronTab>(tabFromUrl(page.url, CRON_TABS, 'overview'));
+	let cronTabs = $derived(allowedTabs(CRON_TABS, can));
+	let tab = $derived<CronTab>(tabFromUrl(page.url, cronTabs, 'overview'));
 
 	// Runs tab
 	let runs = $state<CronJobRun[]>([]);
@@ -518,7 +520,7 @@
 
 		<LinkTabs
 			label="Cron job sections"
-			tabs={CRON_TABS}
+			tabs={cronTabs}
 			active={tab}
 			href={(id) => tabHref(page.url.pathname, id, 'overview')}
 		/>
@@ -795,6 +797,19 @@
 							</div>
 						{/if}
 					{/if}
+				</div>
+			{/if}
+
+			<!-- Metrics tab: CPU / memory / network of the job's runs -->
+			{#if tab === 'metrics'}
+				<div class="space-y-3 pt-4">
+					<p class="max-w-prose text-sm text-muted-foreground">
+						Resource use while runs are in progress, sampled every 30 seconds. Runs shorter than
+						that may not show up.
+					</p>
+					{#key job.id}
+						<MetricsPanel owner="cron" id={job.id} noun="scheduled task" />
+					{/key}
 				</div>
 			{/if}
 

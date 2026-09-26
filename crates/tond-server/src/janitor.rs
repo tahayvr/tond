@@ -94,6 +94,8 @@ pub struct RetentionPolicy {
     pub uptime_days: i64,
     /// `retention_host_history_days` — hourly host history.
     pub host_history_days: i64,
+    /// `retention_request_metrics_days` — hourly request metrics.
+    pub request_metrics_days: i64,
 }
 
 fn rule_default(key: &str) -> i64 {
@@ -113,6 +115,7 @@ impl Default for RetentionPolicy {
             alert_history_days: rule_default("retention_alert_history_days"),
             uptime_days: rule_default("retention_uptime_days"),
             host_history_days: rule_default("retention_host_history_days"),
+            request_metrics_days: rule_default("retention_request_metrics_days"),
         }
     }
 }
@@ -154,6 +157,7 @@ impl RetentionPolicy {
             "retention_alert_history_days" => &mut self.alert_history_days,
             "retention_uptime_days" => &mut self.uptime_days,
             "retention_host_history_days" => &mut self.host_history_days,
+            "retention_request_metrics_days" => &mut self.request_metrics_days,
             _ => return None,
         })
     }
@@ -216,6 +220,14 @@ pub async fn run_janitor(state: AppState) {
             Ok(n) if n > 0 => tracing::info!("Janitor: removed {n} preview volume folder(s)"),
             Ok(_) => {}
             Err(e) => tracing::warn!("Janitor: preview volume prune failed: {e}"),
+        }
+        // Access logs of deleted apps (<data>/access, written by tond-proxy).
+        match crate::access_logs::prune_orphans(&state.db, &crate::auth::secret_file::data_dir())
+            .await
+        {
+            Ok(n) if n > 0 => tracing::info!("Janitor: removed {n} access log file(s)"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("Janitor: access log prune failed: {e}"),
         }
         // Networks of finished previews and cron runs, deleted apps, …
         match docker::prune_networks(&state.docker).await {
@@ -379,6 +391,8 @@ pub async fn run_once(db: &SqlitePool, policy: &RetentionPolicy) -> Result<Janit
         metrics::host_history::prune(db, now.timestamp(), days(policy.host_history_days)).await?;
     report.metrics +=
         crate::uptime::store::prune(db, now.timestamp(), days(policy.uptime_days)).await?;
+    report.metrics +=
+        metrics::requests::prune(db, now.timestamp(), days(policy.request_metrics_days)).await?;
 
     // ── alert history (unix seconds; deliveries cascade) ──
     let _ = alerts::evaluate::close_orphans(db, now.timestamp()).await;

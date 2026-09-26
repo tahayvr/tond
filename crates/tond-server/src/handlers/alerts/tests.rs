@@ -121,14 +121,14 @@ async fn rules_need_a_channel_a_known_kind_and_sane_values() {
         .await,
     );
     assert!(msg.contains("Repeat"), "{msg}");
-    let msg = err_text(
-        create(
-            &state,
-            serde_json::json!({ "name": "x", "kind": "http_5xx_rate", "integration_ids": [hook] }),
-        )
-        .await,
-    );
-    assert!(msg.contains("Request metrics"), "{msg}");
+    // HTTP rules are accepted: request metrics come from tond-proxy.
+    let http = create(
+        &state,
+        serde_json::json!({ "name": "errors", "kind": "http_5xx_rate", "integration_ids": [hook] }),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("HTTP rules must be accepted: {}", e.0));
+    assert_eq!(http["kind"], "http_5xx_rate");
 
     // Defaults come from the kind.
     let rule = create(
@@ -162,13 +162,9 @@ async fn kinds_report_whether_their_data_exists() {
             .unwrap_or_default()
     };
     assert_eq!(find("cpu")["available"], true);
-    assert_eq!(find("http_p95_latency")["available"], false);
-    assert!(
-        find("http_p95_latency")["unavailable_reason"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("Request metrics")
-    );
+    assert_eq!(find("http_p95_latency")["available"], true);
+    assert_eq!(find("http_5xx_rate")["available"], true);
+    assert!(find("http_p95_latency")["unavailable_reason"].is_null());
     assert_eq!(find("crash_loop")["unit"], "restarts");
 }
 

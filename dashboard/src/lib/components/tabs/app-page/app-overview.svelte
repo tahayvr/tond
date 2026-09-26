@@ -1,6 +1,8 @@
 <script lang="ts">
 	import { safeUrl } from '$lib/utils';
+	import { can } from '$lib/auth.svelte';
 	import StatusBadge from '$lib/components/feedback/status-badge.svelte';
+	import AppOverviewMetrics from './app-overview-metrics.svelte';
 	import UptimeBadge from '$lib/components/uptime/UptimeBadge.svelte';
 	import type { App } from '$lib/api';
 
@@ -50,6 +52,9 @@
 <div class="space-y-4 pt-4">
 	{#if uptimeHref && app.domain}
 		<UptimeBadge appId={app.id} href={uptimeHref} />
+	{/if}
+	{#if can('metrics:read')}
+		<AppOverviewMetrics appId={app.id} />
 	{/if}
 	<div class="grid grid-cols-1 gap-4 sm:grid-cols-2 [&>*]:min-w-0">
 		<!-- Status -->

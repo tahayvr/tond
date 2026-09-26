@@ -5060,6 +5060,7 @@ dependencies = [
  "openssl",
  "pingora",
  "rcgen",
+ "rustix",
  "serde",
  "serde_json",
  "sqlx",

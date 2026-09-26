@@ -192,6 +192,14 @@ pub const RETENTION_RULES: &[RetentionRule] = &[
         max: 365,
         unit: "days",
     },
+    // Hourly request metrics per app / preview (minute rows: fixed 48 h).
+    RetentionRule {
+        key: "retention_request_metrics_days",
+        default: 90,
+        min: 7,
+        max: 365,
+        unit: "days",
+    },
     // Hourly host history (minute rows: fixed 48 h).
     RetentionRule {
         key: "retention_host_history_days",

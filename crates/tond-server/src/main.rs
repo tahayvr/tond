@@ -68,6 +68,7 @@
 //   There is no root API key: automation gets a scoped token from
 //   `tond token create` over the root-only socket.
 
+mod access_logs;
 mod alerts;
 mod audit_log;
 mod audit_ship;
@@ -607,6 +608,33 @@ async fn run() -> Result<()> {
         .route(
             "/api/system/metrics",
             get(handlers::metrics::get_system_metrics),
+        )
+        // Request metrics (tond-proxy traffic) and access logs
+        .route(
+            "/api/apps/{id}/requests",
+            get(handlers::requests::get_app_requests),
+        )
+        .route(
+            "/api/previews/{id}/requests",
+            get(handlers::requests::get_preview_requests),
+        )
+        .route(
+            "/api/previews/{id}/metrics",
+            get(handlers::requests::get_preview_metrics),
+        )
+        .route(
+            "/api/system/requests",
+            get(handlers::requests::get_system_requests),
+        )
+        .route(
+            "/api/apps/{id}/access-log",
+            get(handlers::access_log::get_access_log)
+                .put(handlers::access_log::update_access_log)
+                .delete(handlers::access_log::delete_access_log),
+        )
+        .route(
+            "/api/apps/{id}/access-log/download",
+            get(handlers::access_log::download_access_log),
         )
         .route("/api/system/self", get(handlers::system_self::get_self))
         // Host history, disk, Docker, heartbeat; uptime checks

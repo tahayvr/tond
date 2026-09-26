@@ -13,7 +13,8 @@
 //     confirms it routes the new port. This replaced a fixed 3 s sleep;
 //   - receives certificate results (cert events) and stores them — the proxy
 //     opens tond.db read-only — then acks them;
-//   - asks for the proxy's own stats for GET /api/system/self.
+//   - asks for the proxy's own stats for GET /api/system/self;
+//   - reads its per-route request counters on the metrics tick (`traffic`).
 //
 // When the proxy is not running there is nothing to wait for: it loads the
 // current routes from the database when it starts. When it runs but does not
@@ -37,6 +38,7 @@ use tond_common::proxy_control::{
     CertOutcome, CertReport, FALLBACK_POLL_SECS, MAX_LINE_BYTES, PROXY_SOCKET_NAME, ProxyMessage,
     ProxyRequest, ReplyBody, encode_line,
 };
+use tond_common::traffic::TrafficSnapshot;
 
 use crate::runtime::changes::{Table, Watch};
 use crate::runtime::{loops, shutdown};
@@ -258,6 +260,25 @@ pub async fn proxy_stats() -> Option<ProxyStats> {
     match request(|id| ProxyRequest::Stats { id }, Duration::from_secs(2)).await {
         Ok(ReplyBody::Stats { stats }) => Some(stats),
         _ => None,
+    }
+}
+
+/// The proxy's cumulative per-route request counters (metrics collector
+/// tick). None when the proxy is not connected or does not answer quickly.
+pub async fn traffic() -> Option<TrafficSnapshot> {
+    if !is_connected() {
+        return None;
+    }
+    match request(|id| ProxyRequest::Traffic { id }, Duration::from_secs(2)).await {
+        Ok(ReplyBody::Traffic { traffic }) => Some(traffic),
+        Ok(other) => {
+            tracing::debug!("unexpected answer to traffic: {other:?}");
+            None
+        }
+        Err(e) => {
+            tracing::debug!("proxy traffic request failed: {e}");
+            None
+        }
     }
 }
 

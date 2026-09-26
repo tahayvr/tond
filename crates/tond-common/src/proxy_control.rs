@@ -13,6 +13,8 @@
 //     certs { id, domain? }      run a certificate pass now; with `domain`,
 //                                forget that domain's in-memory backoff first
 //     stats { id }               report process / loop stats
+//     traffic { id }             report cumulative per-route request counters
+//                                (tond_common::traffic)
 //     ack   { seq }              a cert event was stored; the proxy drops it
 //
 //   proxy -> server   ProxyMessage
@@ -27,6 +29,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::models::runtime::ProxyStats;
+use crate::traffic::TrafficSnapshot;
 
 /// File name of the control socket inside the data directory.
 pub const PROXY_SOCKET_NAME: &str = "proxy.sock";
@@ -49,6 +52,7 @@ pub enum ProxyRequest {
     Sync { id: u64, min_version: i64 },
     Certs { id: u64, domain: Option<String> },
     Stats { id: u64 },
+    Traffic { id: u64 },
     Ack { seq: u64 },
 }
 
@@ -65,6 +69,7 @@ pub enum ProxyMessage {
 pub enum ReplyBody {
     Synced { route_version: i64, routes: u64 },
     Stats { stats: ProxyStats },
+    Traffic { traffic: TrafficSnapshot },
     Ok,
     Error { message: String },
 }

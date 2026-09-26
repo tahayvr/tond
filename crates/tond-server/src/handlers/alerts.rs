@@ -32,7 +32,7 @@ use serde::Deserialize;
 use tond_common::*;
 use uuid::Uuid;
 
-use crate::alerts::{evaluate, quiet, send_test_notifications, sources};
+use crate::alerts::{evaluate, quiet, send_test_notifications};
 use crate::audit_log::{AuditEntry, record};
 use crate::{
     auth::{Authz, RateLimit, scope},
@@ -180,25 +180,21 @@ pub async fn get_alert(
     ))
 }
 
-/// Kinds whose data this server can't provide yet, with the reason.
-async fn unavailable_reason(db: &sqlx::SqlitePool, kind: &str) -> Option<String> {
-    match kind {
-        "http_5xx_rate" | "http_p95_latency" if !sources::request_metrics_available(db).await => Some(
-            "Request metrics aren't collected on this server yet, so this rule couldn't be evaluated."
-                .to_string(),
-        ),
-        _ => None,
-    }
+/// Kinds whose data this server can't provide yet, with the reason. Every
+/// kind is available today (request metrics included); the hook stays for
+/// kinds that depend on optional data sources.
+fn unavailable_reason(_kind: &str) -> Option<String> {
+    None
 }
 
 pub async fn list_kinds(
     _rate: RateLimit,
     _auth: Authz<scope::MetricsRead>,
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     let mut kinds = Vec::with_capacity(ALERT_KINDS.len());
     for info in ALERT_KINDS {
-        let reason = unavailable_reason(&state.db, info.kind).await;
+        let reason = unavailable_reason(info.kind);
         kinds.push(AlertKindResponse {
             info: *info,
             available: reason.is_none(),
@@ -332,7 +328,7 @@ pub async fn create_alert(
                 .join(", ")
         ))
     })?;
-    if let Some(reason) = unavailable_reason(&state.db, info.kind).await {
+    if let Some(reason) = unavailable_reason(info.kind) {
         return Err(invalid(reason));
     }
     let app_id = match info.scope {

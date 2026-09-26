@@ -19,6 +19,9 @@
 //              they also become one host_1m row a minute (host_history.rs),
 //              and every 30 minutes the tick starts a `docker system df`
 //              refresh in the background (docker_host.rs).
+//   Requests   The same tick reads tond-proxy's per-route request counters
+//              over the control socket (requests.rs): deltas, in-memory
+//              rings, and one requests_1m write a minute.
 //   Rollups    When a 5-minute / 1-hour bucket closes, it is rolled up.
 //              Retention is the janitor's job (store::prune).
 //   Events     Restarts (a container that exited on its own and was started
@@ -33,6 +36,7 @@ pub mod cgroup;
 pub mod docker_host;
 pub mod host;
 pub mod host_history;
+pub mod requests;
 pub mod store;
 
 use std::collections::HashMap;
@@ -281,6 +285,8 @@ pub struct Collector {
     /// Changes to the owner tables (runtime::changes): the resolver is
     /// reloaded only when one moved, not on every tick.
     owner_changes: Vec<tokio::sync::watch::Receiver<u64>>,
+    /// Request metrics from tond-proxy (requests.rs), scraped on the same tick.
+    requests: requests::Tracker,
     host_history: host_history::HostHistory,
     /// When the next background `docker system df` is due.
     next_df: Instant,
@@ -310,6 +316,7 @@ impl Collector {
             .into_iter()
             .map(changes::subscribe)
             .collect(),
+            requests: requests::Tracker::default(),
             host_history: host_history::HostHistory::default(),
             next_df: Instant::now() + FIRST_DF_AFTER,
         }
@@ -720,6 +727,10 @@ impl Collector {
         if let Err(e) = self.roll_up(&state.db, now).await {
             tracing::warn!("metrics: rollup failed: {}", e);
         }
+
+        // Request counters from tond-proxy: one control-socket round trip;
+        // rows are written once a minute.
+        self.requests.tick(&state.db, now).await;
 
         // Alert rules are evaluated on this tick (no loop of their own).
         alerts::on_metrics_tick(state, now).await;

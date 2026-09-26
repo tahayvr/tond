@@ -16,6 +16,13 @@ set -euo pipefail
 #   journal lines per service                ≤ 10 per hour
 #   log WebSocket soak (open/close ×200)     Tokio task count back to baseline
 #
+#   20 apps with traffic (~5 req/s spread over them, generator not counted)
+#   RSS tond-server over idle                ≤ +10 MB
+#   RSS tond-proxy over a TLS-warmed idle    ≤ +2 MB (raw growth printed)
+#   CPU, both processes together             ≤ 0.5 % of one core
+#   request-metric write transactions        ≤ ~1 per minute
+#   requests reported by the API             ≥ what was sent (roughly)
+#
 # Wakeups are the background loops' own wakeups as reported by
 # GET /api/system/self (server) and the proxy's control-socket stats. The OS
 # context-switch rate is printed too, for information: it includes Tokio's
@@ -26,23 +33,26 @@ set -euo pipefail
 # holds N routes) and the server's loops see them, without running N
 # containers.
 #
-# Usage: e2e/budget.sh [--window <seconds>] [--apps <n>] [--no-assert] [--json <file>]
+# Usage: e2e/budget.sh [--window <seconds>] [--apps <n>] [--traffic-apps <n>] [--no-assert] [--json <file>]
 #   --window     measurement window per phase (default 180)
 #   --apps       dummy apps for the second phase (default 50; 0 skips it)
+#   --traffic-apps  apps with traffic for the third phase (default 20; 0 skips it)
 #   --no-assert  report only (e.g. to measure an older build)
 #   --json       also write the measurements as JSON
 
 WINDOW=180
 APPS=50
+TRAFFIC_APPS=20
 ASSERT=1
 JSON_OUT=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --window) WINDOW="$2"; shift 2 ;;
         --apps) APPS="$2"; shift 2 ;;
+        --traffic-apps) TRAFFIC_APPS="$2"; shift 2 ;;
         --no-assert) ASSERT=0; shift ;;
         --json) JSON_OUT="$2"; shift 2 ;;
-        -h|--help) sed -n '4,36p' "$0"; exit 0 ;;
+        -h|--help) sed -n '4,44p' "$0"; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -201,6 +211,10 @@ measure() {
     if (( $(jq .srosetta "$b") > 0 )); then
         info "running under Rosetta: its translation cache is not counted ($(calc "$(jq .srosetta "$b") / $MB") MB server, $(calc "$(jq .prosetta "$b") / $MB") MB proxy)"
     fi
+    if [[ "$phase" == "0 apps" ]]; then
+        IDLE_SRSS=$(jq .srss "$b")
+        IDLE_PRSS=$(jq .prss "$b")
+    fi
     check "${phase}: RSS tond-server" "$(calc "$(jq .srss "$b") / $MB")" "<=" "$rss_s_limit" MB
     check "${phase}: RSS tond-proxy" "$(calc "$(jq .prss "$b") / $MB")" "<=" "$rss_p_limit" MB
     check "${phase}: CPU both processes" \
@@ -298,6 +312,176 @@ print(f"opened and closed {n} WebSockets")
 PY
 }
 
+# ── Phase 3: 20 apps with traffic ─────────────────────────────────────────────
+#
+# TRAFFIC_APPS dummy app rows all route to one tiny local upstream
+# (python3 http.server on 127.0.0.1:TRAFFIC_PORT); a curl loop sends a few
+# requests per second spread across them. Budgets are deltas against the
+# idle phase: the proxy's per-route counters, the server's request rings and
+# the once-a-minute requests_1m write must stay small. The traffic generator
+# and the upstream are separate processes and not counted.
+
+TRAFFIC_PORT=39080
+
+seed_traffic_apps() {
+    python3 - "$DB" "$1" "$TRAFFIC_PORT" <<'PY'
+import sqlite3, sys, uuid, datetime
+db, n, port = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+con = sqlite3.connect(db, timeout=10)
+with con:
+    for i in range(n):
+        con.execute(
+            "INSERT INTO apps (id, name, domain, source_type, source_url, container_port, status, host_port, created_at, updated_at)"
+            " VALUES (?, ?, ?, 'image', 'traefik/whoami', 80, 'running', ?, ?, ?)",
+            (str(uuid.uuid4()), f"budget-traffic-{i}", f"budget-traffic-{i}.budget.test", port, now, now),
+        )
+PY
+}
+
+# Distinct minutes in requests_1m with a start in [<from>, <to>) (each minute
+# is one write transaction).
+request_minutes_between() {
+    python3 - "$DB" "$1" "$2" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+print(con.execute("SELECT COUNT(DISTINCT ts) FROM requests_1m WHERE ts >= ? AND ts < ?",
+                  (int(sys.argv[2]), int(sys.argv[3]))).fetchone()[0])
+PY
+}
+
+# Requests the API reports for the traffic apps over the last hour.
+reported_requests() {
+    local total=0 n name
+    for name in $(api /api/apps | jq -r '.data[] | select(.name | startswith("budget-traffic-")) | .name'); do
+        n=$(api "/api/apps/${name}/requests?range=1h" | jq '.data.summary.requests')
+        total=$((total + n))
+    done
+    echo "$total"
+}
+
+# p50/p99 (ms) of <n> sequential requests to <url> over one reused
+# connection; extra curl args follow. Prints "n/a" when curl fails.
+latency_ms() {
+    local n=$1 url=$2; shift 2
+    local args=()
+    for _ in $(seq 1 "$n"); do args+=(-o /dev/null "$url"); done
+    curl -sk -w '%{time_total}\n' "$@" "${args[@]}" 2> /dev/null | python3 -c '
+import sys
+v = sorted(float(x) * 1000 for x in sys.stdin if x.strip())
+print(f"{v[len(v) // 2]:.3f}/{v[min(len(v) - 1, int(len(v) * 0.99))]:.3f}" if v else "n/a")' || echo "n/a"
+}
+
+# generate <host-prefix> <n>: ~5 requests per second, round robin over
+# <prefix>-0 … <prefix>-(n-1). Like a browser, each visit reuses its TLS
+# connection for a few requests (5 per connection), so the proxy's CPU is
+# not all TLS handshakes.
+generate() {
+    local prefix=$1 n=$2 i=0 host
+    while true; do
+        host="${prefix}-$((i % n)).budget.test"
+        curl -sk --max-time 5 --resolve "${host}:443:127.0.0.1" \
+            -o /dev/null "https://${host}/" -o /dev/null "https://${host}/a" \
+            -o /dev/null "https://${host}/b" -o /dev/null "https://${host}/c" \
+            -o /dev/null "https://${host}/d" || true
+        i=$((i + 1))
+        sleep 1
+    done
+}
+
+traffic_phase() {
+    local n=$1 upstream gen a b t0 t1 minutes reported written warm_prss
+    step "Seeding ${n} apps with traffic"
+    remove_dummy_apps
+    # The earlier phase's rows were removed behind tond-server's back: wait
+    # for the proxy's fallback check to drop them.
+    for _ in $(seq 1 30); do
+        (( $(api /api/system/self | jq '.data.proxy.stats.routes // 0') == 0 )) && break
+        sleep 3
+    done
+
+    # Warm-up: the same request pattern against hosts nothing is routed for.
+    # TLS session state, Pingora's buffers and the allocator settle at a
+    # plateau that any traffic causes; the proxy budget is measured from
+    # there, so it covers what 20 routed apps (counters, upstream proxying,
+    # route table) add. The raw growth over the cold idle phase is printed.
+    generate "budget-warmup" "$n" &
+    gen=$!
+    sleep 60
+    kill "$gen" 2> /dev/null || true
+    wait "$gen" 2> /dev/null || true
+    warm_prss=$(rss_bytes "$(pid_of tond-proxy)" | cut -d' ' -f1)
+    info "tond-proxy RSS after warm-up $(calc "$warm_prss / $MB") MB (idle $(calc "$IDLE_PRSS / $MB") MB)"
+
+    mkdir -p /tmp/tond-budget-upstream
+    echo ok > /tmp/tond-budget-upstream/index.html
+    python3 -m http.server "$TRAFFIC_PORT" --bind 127.0.0.1 --directory /tmp/tond-budget-upstream \
+        > /dev/null 2>&1 &
+    upstream=$!
+    seed_traffic_apps "$n"
+    for _ in $(seq 1 30); do
+        routes=$(api /api/system/self | jq '.data.proxy.stats.routes // 0')
+        (( routes >= n )) && break
+        sleep 3
+    done
+    info "tond-proxy routes ${routes}"
+    info "waiting for the certificate loop to settle the ${n} new domains…"
+    deadline=$((SECONDS + 600))
+    until (( $(count_dummy_certs) >= n )); do
+        (( SECONDS < deadline )) || { FAILURES+=("certificates for the traffic apps did not settle in 10 min"); break; }
+        sleep 5
+    done
+
+    generate "budget-traffic" "$n" &
+    gen=$!
+    sleep 90  # rings filled, first minutes written
+
+    a=$(mktemp); b=$(mktemp)
+    sample "$a"
+    t0=$(date +%s)
+    info "measuring for ${WINDOW}s with traffic…"
+    sleep "$WINDOW"
+    t1=$(date +%s)
+    sample "$b"
+    minutes=$(calc "($(jq .t "$b") - $(jq .t "$a")) / 60")
+
+    step "Budgets (${n} apps with traffic)"
+    check "traffic: RSS tond-server over idle" "$(calc "($(jq .srss "$b") - ${IDLE_SRSS}) / $MB")" "<=" 10 MB
+    check "traffic: RSS tond-proxy over warm idle" "$(calc "($(jq .prss "$b") - ${warm_prss}) / $MB")" "<=" 2 MB
+    info "tond-proxy RSS over cold idle (includes TLS warm-up): $(calc "($(jq .prss "$b") - ${IDLE_PRSS}) / $MB") MB"
+    check "traffic: CPU both processes" \
+        "$(calc "(($(jq .scpu "$b") - $(jq .scpu "$a")) + ($(jq .pcpu "$b") - $(jq .pcpu "$a"))) / ($minutes * 60) * 100")" \
+        "<=" 0.5 "% of a core"
+    info "CPU split: server $(calc "($(jq .scpu "$b") - $(jq .scpu "$a")) / ($minutes * 60) * 100") %, proxy $(calc "($(jq .pcpu "$b") - $(jq .pcpu "$a")) / ($minutes * 60) * 100") %"
+    # A minute is written 60–90 s after it starts: the minutes flushed during
+    # the window started in [t0 - 90, t1 - 60).
+    written=$(request_minutes_between "$((t0 - 90))" "$((t1 - 60))")
+    info "request-metric minutes written during the window: ${written}"
+    check "traffic: request-metric write transactions" "$(calc "$written / $minutes")" "<=" 1.1 "/min"
+    check "traffic: wakeups tond-server loops" "$(calc "($(jq .swake "$b") - $(jq .swake "$a")) / $minutes")" "<=" 6 "/min"
+    check "traffic: wakeups tond-proxy loops" "$(calc "($(jq .pwake "$b") - $(jq .pwake "$a")) / $minutes")" "<=" 2 "/min"
+    reported=$(reported_requests)
+    info "requests reported by the API (last hour, ${n} apps): ${reported}"
+    check "traffic: requests reported" "$reported" ">=" "$(calc "$WINDOW * 3")" requests
+
+    kill "$gen" 2> /dev/null || true
+    wait "$gen" 2> /dev/null || true
+
+    # Proxy latency (information): the same upstream, direct and through
+    # tond-proxy (TLS, one reused client connection).
+    local direct proxied
+    direct=$(latency_ms 300 "http://127.0.0.1:${TRAFFIC_PORT}/")
+    proxied=$(latency_ms 300 "https://budget-traffic-0.budget.test/" \
+        --resolve "budget-traffic-0.budget.test:443:127.0.0.1")
+    info "request latency p50/p99 ms: direct ${direct}, through tond-proxy ${proxied}"
+    RESULTS=$(jq -c --arg d "$direct" --arg p "$proxied" \
+        '. + {"traffic: latency direct p50/p99 ms": $d, "traffic: latency proxied p50/p99 ms": $p}' <<<"$RESULTS")
+
+    kill "$upstream" 2> /dev/null || true
+    rm -rf /tmp/tond-budget-upstream "$a" "$b"
+    remove_dummy_apps
+}
+
 # ── Phase 1: idle, no apps ────────────────────────────────────────────────────
 
 apps=$(api /api/apps | jq '.data | length')
@@ -347,6 +531,10 @@ if (( APPS > 0 )); then
     sleep 30
     measure "${APPS} apps" 40 25
     remove_dummy_apps
+fi
+
+if (( TRAFFIC_APPS > 0 )); then
+    traffic_phase "$TRAFFIC_APPS"
 fi
 
 if [[ -n "$JSON_OUT" ]]; then

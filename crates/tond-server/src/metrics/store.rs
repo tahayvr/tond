@@ -6,6 +6,7 @@
 //   metrics_5m      5-minute rollups             kept M5_KEEP_SECS   (8 days)
 //   metrics_1h      1-hour rollups               kept H1_KEEP_SECS   (90 days)
 //   metric_events   restarts / crashes / OOMs    kept retention_app_events_days (90)
+//   requests_1m/1h  request metrics (requests.rs; pruned there, orphans here)
 //
 // Each tick writes all samples in one transaction. Rollups are computed when a
 // bucket closes (every 5 minutes / every hour) with INSERT OR REPLACE, so a
@@ -256,7 +257,7 @@ pub async fn prune(db: &SqlitePool, now: i64, event_keep_secs: i64) -> anyhow::R
 
     // Targets whose app / database / cron job / preview is gone, with all rows.
     let orphans: Vec<i64> = sqlx::query_scalar(
-        "SELECT id FROM metric_targets t WHERE NOT EXISTS (
+        "SELECT id FROM metric_targets t WHERE t.kind NOT IN ('dashboard', 'unknown') AND NOT EXISTS (
             SELECT 1 FROM apps WHERE t.kind = 'app' AND apps.id = t.owner_id
             UNION ALL SELECT 1 FROM databases WHERE t.kind = 'database' AND databases.id = t.owner_id
             UNION ALL SELECT 1 FROM cron_jobs WHERE t.kind = 'cron' AND cron_jobs.id = t.owner_id
@@ -265,7 +266,14 @@ pub async fn prune(db: &SqlitePool, now: i64, event_keep_secs: i64) -> anyhow::R
     .fetch_all(db)
     .await?;
     for id in orphans {
-        for table in ["metrics_raw", "metrics_5m", "metrics_1h", "metric_events"] {
+        for table in [
+            "metrics_raw",
+            "metrics_5m",
+            "metrics_1h",
+            "metric_events",
+            "requests_1m",
+            "requests_1h",
+        ] {
             let sql = format!("DELETE FROM {table} WHERE target = ?");
             deleted += sqlx::query(AssertSqlSafe(sql.as_str()))
                 .bind(id)

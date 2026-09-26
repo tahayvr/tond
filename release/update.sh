@@ -239,7 +239,7 @@ secure_data_dir() {
     # the proxy's own state, handled below.
     find "$DATA_DIR" -mindepth 1 -maxdepth 1 \
         ! -name 'tond.db' ! -name 'tond.db-wal' ! -name 'tond.db-shm' \
-        ! -name certs ! -name acme_account.json ! -name proxy.sock \
+        ! -name certs ! -name acme_account.json ! -name proxy.sock ! -name access \
         -exec chmod go-rwx {} +
 
     # Pre-create the database so the proxy can open it on first start; an
@@ -259,6 +259,12 @@ secure_data_dir() {
     chown -R "$PROXY_USER":"$PROXY_USER" "${DATA_DIR}/certs"
     find "${DATA_DIR}/certs" -type d -exec chmod u=rwx,go=,g-s {} +
     find "${DATA_DIR}/certs" -type f -exec chmod 0600 {} +
+    # Opt-in per-app access logs (proxy-owned; see install.sh).
+    if [[ -L "${DATA_DIR}/access" ]]; then rm -f "${DATA_DIR}/access"; fi
+    mkdir -p "${DATA_DIR}/access"
+    chown -R "$PROXY_USER":"$PROXY_USER" "${DATA_DIR}/access"
+    chmod u=rwx,go=,g-s "${DATA_DIR}/access"
+    find "${DATA_DIR}/access" -type f -exec chmod 0600 {} +
     if [[ -e "${DATA_DIR}/acme_account.json" ]]; then
         chown "$PROXY_USER":"$PROXY_USER" "${DATA_DIR}/acme_account.json"
         chmod 0600 "${DATA_DIR}/acme_account.json"

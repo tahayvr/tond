@@ -9,6 +9,7 @@
 //   dns     — compare a domain's DNS with this server's addresses
 //   logging — TOND_LOG_FORMAT (text | json) for tond-server and tond-proxy
 //   models  — all domain structs, DTOs, and request/response types
+//   traffic — per-route request counters (tond-proxy -> tond-server)
 //
 // `dns` is used as `tond_common::dns::…` (not re-exported flat).
 //
@@ -21,6 +22,7 @@ pub mod logging;
 pub mod models;
 pub mod procstat;
 pub mod proxy_control;
+pub mod traffic;
 
 pub use errors::*;
 pub use models::*;

@@ -59,6 +59,11 @@ export const RETENTION_COPY: Record<string, RetentionCopy> = {
 		help: 'Each probe is kept 48 hours; the hourly summaries behind the 7- and 30-day uptime and the 90-day bars are kept this long.',
 		group: 'events'
 	},
+	retention_request_metrics_days: {
+		label: 'Hourly request metrics for',
+		help: 'Requests, errors, latency and bandwidth per app behind the 7- to 90-day charts. Minute-level rows are kept 48 hours.',
+		group: 'events'
+	},
 	retention_host_history_days: {
 		label: 'Hourly host history for',
 		help: 'CPU, load, memory and disk on the System page. Minute-level rows are kept 48 hours.',
