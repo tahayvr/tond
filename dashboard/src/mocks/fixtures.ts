@@ -181,7 +181,7 @@ export const MOCK_APPS: App[] = [
 		volumes: [
 			{
 				name: 'uploads',
-				host_path: '/opt/tond/data/volumes/web-frontend/uploads',
+				host_path: '/opt/tond/data/volumes/api-service/uploads',
 				container_path: '/app/uploads'
 			}
 		],
@@ -461,7 +461,7 @@ export const MOCK_DEPLOYMENTS: Record<string, Deployment[]> = {
 		{
 			id: 'dep_3',
 			app_id: 'app_running',
-			image_tag: 'tond-web-frontend:3f2a1b9c1234',
+			image_tag: 'tond-api-service:3f2a1b9c1234',
 			status: 'succeeded',
 			trigger_source: 'webhook',
 			has_generated_dockerfile: true,
@@ -476,7 +476,7 @@ export const MOCK_DEPLOYMENTS: Record<string, Deployment[]> = {
 		{
 			id: 'dep_2',
 			app_id: 'app_running',
-			image_tag: 'tond-web-frontend:7f3a9b1d0e2c',
+			image_tag: 'tond-api-service:7f3a9b1d0e2c',
 			status: 'succeeded',
 			trigger_source: 'manual',
 			has_generated_dockerfile: true,
@@ -491,7 +491,7 @@ export const MOCK_DEPLOYMENTS: Record<string, Deployment[]> = {
 		{
 			id: 'dep_1b',
 			app_id: 'app_running',
-			image_tag: 'tond-web-frontend:c0ffee123456',
+			image_tag: 'tond-api-service:c0ffee123456',
 			status: 'succeeded',
 			trigger_source: 'manual',
 			has_generated_dockerfile: false,
@@ -506,7 +506,7 @@ export const MOCK_DEPLOYMENTS: Record<string, Deployment[]> = {
 		{
 			id: 'dep_1',
 			app_id: 'app_running',
-			image_tag: 'tond-web-frontend:1a2b3c4d5e6f',
+			image_tag: 'tond-api-service:1a2b3c4d5e6f',
 			status: 'failed',
 			trigger_source: 'manual',
 			has_generated_dockerfile: false,

@@ -34,3 +34,8 @@ export type WithoutChild<T> = T extends { child?: any } ? Omit<T, 'child'> : T;
 export type WithoutChildren<T> = T extends { children?: any } ? Omit<T, 'children'> : T;
 export type WithoutChildrenOrChild<T> = WithoutChildren<WithoutChild<T>>;
 export type WithElementRef<T, U extends HTMLElement = HTMLElement> = T & { ref?: U | null };
+
+/** Hide the password in a `scheme://user:password@host...` connection string. */
+export function maskUrlPassword(url: string): string {
+	return url.replace(/^([a-z][a-z0-9+.-]*:\/\/[^:/@\s]*:)([^@\s]+)(@)/i, '$1••••••••$3');
+}

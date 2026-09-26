@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { safeUrl } from './utils';
+import { maskUrlPassword, safeUrl } from './utils';
 
 describe('safeUrl', () => {
 	it('keeps https URLs', () => {
@@ -33,5 +33,21 @@ describe('safeUrl', () => {
 	it('allows http only when asked', () => {
 		expect(safeUrl('http://localhost:3000/', { allowHttp: true })).toBe('http://localhost:3000/');
 		expect(safeUrl('javascript:alert(1)', { allowHttp: true })).toBeUndefined();
+	});
+});
+
+describe('maskUrlPassword', () => {
+	it('hides only the password', () => {
+		expect(maskUrlPassword('postgres://app:s3cr%40t@localhost:5401/app_db')).toBe(
+			'postgres://app:••••••••@localhost:5401/app_db'
+		);
+		expect(maskUrlPassword('redis://default:pw@tond-db-cache:6379')).toBe(
+			'redis://default:••••••••@tond-db-cache:6379'
+		);
+	});
+
+	it('leaves strings without a password alone', () => {
+		expect(maskUrlPassword('redis://localhost:6379')).toBe('redis://localhost:6379');
+		expect(maskUrlPassword('mongodb://user@host/db')).toBe('mongodb://user@host/db');
 	});
 });

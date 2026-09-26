@@ -1,4 +1,5 @@
 <script lang="ts">
+	import ConnectionString from '$lib/components/databases/connection-string.svelte';
 	import { page } from '$app/state';
 	import {
 		getDatabase,
@@ -698,12 +699,7 @@
 								</div>
 							{:else if db.connection_string}
 								<div>
-									<code
-										class="block w-full truncate rounded bg-muted px-3 py-2 font-mono text-xs"
-										title={db.connection_string}
-									>
-										{db.connection_string}
-									</code>
+									<ConnectionString value={db.connection_string} />
 									{#if db.custom_external_url}
 										<span class="mt-1 block text-xs text-muted-foreground/60">custom override</span>
 									{/if}
@@ -766,12 +762,7 @@
 								</div>
 							{:else if db.internal_connection_string}
 								<div>
-									<code
-										class="block w-full truncate rounded bg-muted px-3 py-2 font-mono text-xs"
-										title={db.internal_connection_string}
-									>
-										{db.internal_connection_string}
-									</code>
+									<ConnectionString value={db.internal_connection_string} />
 									{#if db.custom_internal_url}
 										<span class="mt-1 block text-xs text-muted-foreground/60">custom override</span>
 									{/if}
@@ -909,10 +900,7 @@
 						{#if db.public_connection_string}
 							<div class="space-y-1">
 								<p class="text-xs font-medium text-muted-foreground">Public connection string</p>
-								<code
-									class="block w-full truncate rounded bg-muted px-3 py-2 font-mono text-xs"
-									title={db.public_connection_string}>{db.public_connection_string}</code
-								>
+								<ConnectionString value={db.public_connection_string} />
 								{#if db.public_connection_string.includes('<server-ip>')}
 									<p class="text-xs text-muted-foreground/70">
 										Replace <span class="font-mono">&lt;server-ip&gt;</span> with this server's public
