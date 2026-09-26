@@ -4,10 +4,12 @@ use anyhow::Result;
 use clap::Subcommand;
 
 use crate::client::TondClient;
+use crate::output::{Output, outln};
 
 #[derive(Subcommand)]
 pub enum CronAction {
     /// List all cron jobs
+    #[command(visible_alias = "ls")]
     List,
 
     /// Create a new cron job
@@ -33,6 +35,7 @@ pub enum CronAction {
     },
 
     /// Show details for a cron job
+    #[command(visible_aliases = ["show", "get"])]
     Info {
         /// Cron job name or ID
         name: String,
@@ -60,17 +63,19 @@ pub enum CronAction {
         enable: Option<bool>,
     },
 
-    /// Delete a cron job
+    /// Delete a cron job (asks first)
+    #[command(visible_alias = "rm")]
     Delete {
         /// Cron job name or ID
         name: String,
 
-        /// Skip confirmation
+        /// Don't ask for confirmation (required when stdin is not a terminal)
         #[arg(short = 'y', long)]
         yes: bool,
     },
 
     /// Trigger a cron job immediately (manual run)
+    #[command(visible_alias = "run")]
     Trigger {
         /// Cron job name or ID
         name: String,
@@ -83,20 +88,26 @@ pub enum CronAction {
     },
 }
 
-pub async fn handle(client: &TondClient, action: CronAction) -> Result<()> {
+pub async fn handle(client: &TondClient, out: &Output, action: CronAction) -> Result<()> {
     match action {
         CronAction::List => {
             let jobs = client.list_cron_jobs().await?;
+            out.json(&jobs)?;
             if jobs.is_empty() {
-                println!("No cron jobs found.");
+                outln!(out, "No cron jobs found.");
             } else {
-                println!(
+                outln!(
+                    out,
                     "{:<24} {:<20} {:<22} {:<8} ENABLED",
-                    "NAME", "SCHEDULE", "NEXT RUN", "STATUS"
+                    "NAME",
+                    "SCHEDULE",
+                    "NEXT RUN",
+                    "STATUS"
                 );
-                println!("{}", "-".repeat(90));
+                outln!(out, "{}", "-".repeat(90));
                 for job in &jobs {
-                    println!(
+                    outln!(
+                        out,
                         "{:<24} {:<20} {:<22} {:<8} {}",
                         job.name,
                         job.schedule,
@@ -127,25 +138,43 @@ pub async fn handle(client: &TondClient, action: CronAction) -> Result<()> {
                     project.as_deref(),
                 )
                 .await?;
-            println!("Cron job created: {} (ID: {})", job.name, job.id);
-            println!("Schedule:  {}", job.schedule);
-            println!("Image:     {}", job.image);
-            println!("Next run:  {}", job.next_run_at.as_deref().unwrap_or("-"));
+            out.json(&job)?;
+            outln!(out, "Cron job created: {} (ID: {})", job.name, job.id);
+            outln!(out, "Schedule:  {}", job.schedule);
+            outln!(out, "Image:     {}", job.image);
+            outln!(
+                out,
+                "Next run:  {}",
+                job.next_run_at.as_deref().unwrap_or("-")
+            );
         }
 
         CronAction::Info { name } => {
             let job = client.get_cron_job(&name).await?;
-            println!("Name:      {}", job.name);
-            println!("ID:        {}", job.id);
-            println!("Schedule:  {}", job.schedule);
-            println!("Image:     {}", job.image);
-            println!("Command:   {}", job.command.as_deref().unwrap_or("-"));
-            println!("Project:   {}", job.project_id.as_deref().unwrap_or("-"));
-            println!("Enabled:   {}", if job.enabled { "yes" } else { "no" });
-            println!("Status:    {}", job.status);
-            println!("Last run:  {}", job.last_run_at.as_deref().unwrap_or("-"));
-            println!("Next run:  {}", job.next_run_at.as_deref().unwrap_or("-"));
-            println!("Created:   {}", job.created_at);
+            out.json(&job)?;
+            outln!(out, "Name:      {}", job.name);
+            outln!(out, "ID:        {}", job.id);
+            outln!(out, "Schedule:  {}", job.schedule);
+            outln!(out, "Image:     {}", job.image);
+            outln!(out, "Command:   {}", job.command.as_deref().unwrap_or("-"));
+            outln!(
+                out,
+                "Project:   {}",
+                job.project_id.as_deref().unwrap_or("-")
+            );
+            outln!(out, "Enabled:   {}", if job.enabled { "yes" } else { "no" });
+            outln!(out, "Status:    {}", job.status);
+            outln!(
+                out,
+                "Last run:  {}",
+                job.last_run_at.as_deref().unwrap_or("-")
+            );
+            outln!(
+                out,
+                "Next run:  {}",
+                job.next_run_at.as_deref().unwrap_or("-")
+            );
+            outln!(out, "Created:   {}", job.created_at);
         }
 
         CronAction::Update {
@@ -167,42 +196,51 @@ pub async fn handle(client: &TondClient, action: CronAction) -> Result<()> {
                     enable,
                 )
                 .await?;
-            println!("Cron job updated: {}", job.name);
-            println!("Schedule:  {}", job.schedule);
-            println!("Enabled:   {}", if job.enabled { "yes" } else { "no" });
-            println!("Next run:  {}", job.next_run_at.as_deref().unwrap_or("-"));
+            out.json(&job)?;
+            outln!(out, "Cron job updated: {}", job.name);
+            outln!(out, "Schedule:  {}", job.schedule);
+            outln!(out, "Enabled:   {}", if job.enabled { "yes" } else { "no" });
+            outln!(
+                out,
+                "Next run:  {}",
+                job.next_run_at.as_deref().unwrap_or("-")
+            );
         }
 
         CronAction::Delete { name, yes } => {
-            if !yes {
-                print!("Are you sure you want to delete cron job {}? [y/N] ", name);
-                use std::io::{self, Write};
-                io::stdout().flush()?;
-                let mut input = String::new();
-                io::stdin().read_line(&mut input)?;
-                if input.trim().to_lowercase() != "y" {
-                    println!("Cancelled");
-                    return Ok(());
-                }
-            }
-            client.delete_cron_job(&name).await?;
-            println!("Cron job {} deleted", name);
+            out.confirm(
+                yes,
+                &format!("Delete cron job {name} and its run history?"),
+                &format!("delete cron job {name}"),
+            )?;
+            let data = client.delete_cron_job(&name).await?;
+            out.done("delete", "cron_job", &name, data)?;
+            outln!(out, "Cron job {} deleted", name);
         }
 
         CronAction::Trigger { name } => {
-            client.trigger_cron_job(&name).await?;
-            println!("Cron job {} triggered", name);
+            let data = client.trigger_cron_job(&name).await?;
+            out.done("trigger", "cron_job", &name, data)?;
+            outln!(out, "Cron job {} triggered", name);
         }
 
         CronAction::Runs { name } => {
             let runs = client.list_cron_job_runs(&name).await?;
+            out.json(&runs)?;
             if runs.is_empty() {
-                println!("No runs found for cron job '{}'.", name);
+                outln!(out, "No runs found for cron job '{}'.", name);
             } else {
-                println!("{:<36} {:<10} {:<6} STARTED AT", "RUN ID", "STATUS", "EXIT");
-                println!("{}", "-".repeat(80));
+                outln!(
+                    out,
+                    "{:<36} {:<10} {:<6} STARTED AT",
+                    "RUN ID",
+                    "STATUS",
+                    "EXIT"
+                );
+                outln!(out, "{}", "-".repeat(80));
                 for run in &runs {
-                    println!(
+                    outln!(
+                        out,
                         "{:<36} {:<10} {:<6} {}",
                         run.id,
                         run.status,
