@@ -435,49 +435,6 @@ pub fn gitlab_git_credentials(token: &GitLabToken) -> anyhow::Result<GitHttpAuth
     })
 }
 
-/// Post a commit status to GitLab (best-effort — errors are logged, not propagated).
-///
-/// `state` maps to GitLab commit status states: "pending", "running", "success", "failed",
-/// "canceled".
-/// `gitlab_project_id` is the numeric project ID (from `project.id` in webhook payloads).
-pub async fn post_gitlab_commit_status(
-    token: &GitLabToken,
-    gitlab_project_id: i64,
-    sha: &str,
-    state_str: &str,
-    description: &str,
-    target_url: Option<&str>,
-) -> anyhow::Result<()> {
-    let pat = secret_key::decrypt(Purpose::GitlabToken, &token.token_enc)?;
-    let base = token.gitlab_url.trim_end_matches('/');
-    let url = format!(
-        "{}/api/v4/projects/{}/statuses/{}",
-        base, gitlab_project_id, sha
-    );
-    let mut body = serde_json::json!({
-        "state": state_str,
-        "description": description,
-        "context": "tond/preview",
-    });
-    if let Some(u) = target_url {
-        body["target_url"] = serde_json::Value::String(u.to_string());
-    }
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
-        .header("PRIVATE-TOKEN", &pat)
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("GitLab status API {} {}: {}", url, status, text);
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

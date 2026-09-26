@@ -4,7 +4,7 @@
 //
 //   POST /api/webhooks/github/{app_id}   X-Hub-Signature-256: sha256=HMAC-SHA256(secret, body)
 //   POST /api/webhooks/gitlab/{app_id}   X-Gitlab-Token: <secret>   (constant-time compare)
-//   POST /api/webhooks/gitea/{app_id}    X-Gitea-Signature / X-Forgejo-Signature: hex HMAC
+//   POST /api/webhooks/gitea/{app_id}    X-Gitea-Signature / X-Forgejo-Signature: hex HMAC (push, pull_request)
 //   POST /api/webhooks/generic/{app_id}  X-Tond-Signature-256: sha256=<hex HMAC>
 //                                        or Authorization: Bearer <secret>
 //
@@ -45,15 +45,10 @@ use axum::{
 };
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
-use tond_common::{ApiResponse, App, GitHubApp, GitLabToken, PreviewDeployment, TondError};
+use tond_common::{ApiResponse, App, GitHubApp, PreviewDeployment, TondError};
 
 use crate::{
-    auth::RateLimiter,
-    deploy, docker,
-    domains::preview_host,
-    error::AppError,
-    handlers::{github_apps, gitlab_tokens},
-    secrets,
+    auth::RateLimiter, deploy, docker, domains::preview_host, error::AppError, secrets,
     state::AppState,
 };
 
@@ -503,7 +498,7 @@ pub async fn gitlab_webhook(
             let branch = extract_push_branch(&body);
             Ok(trigger_webhook_deploy(&state, app, "gitlab", branch.as_deref()).await)
         }
-        Some("Merge Request Hook") => handle_gitlab_merge_request(&state, &app.id, &body).await,
+        Some("Merge Request Hook") => handle_gitlab_merge_request(&state, app, &body).await,
         // All other GitLab events are accepted without action.
         _ => Ok(ok_response()),
     }
@@ -513,8 +508,8 @@ pub async fn gitlab_webhook(
 
 /// POST /api/webhooks/gitea/{app_id}
 ///
-/// Requires a valid X-Gitea-Signature (or X-Forgejo-Signature); "push" events
-/// trigger a deploy.
+/// Requires a valid X-Gitea-Signature (or X-Forgejo-Signature). "push" events
+/// trigger a deploy; "pull_request" events drive preview deployments.
 pub async fn gitea_webhook(
     State(state): State<AppState>,
     Path(app_id): Path<String>,
@@ -527,12 +522,16 @@ pub async fn gitea_webhook(
     };
 
     let event = header(&headers, "x-gitea-event").or(header(&headers, "x-forgejo-event"));
-    if event != Some("push") {
-        return Ok(ok_response());
+    match event {
+        Some("push") => {
+            let branch = extract_push_branch(&body);
+            Ok(trigger_webhook_deploy(&state, app, "gitea", branch.as_deref()).await)
+        }
+        Some("pull_request" | "pull_request_sync") => {
+            handle_gitea_pull_request(&state, app, &body).await
+        }
+        _ => Ok(ok_response()),
     }
-
-    let branch = extract_push_branch(&body);
-    Ok(trigger_webhook_deploy(&state, app, "gitea", branch.as_deref()).await)
 }
 
 // ── Generic ────────────────────────────────────────────────────────────────
@@ -559,349 +558,337 @@ pub async fn generic_webhook(
     Ok(trigger_webhook_deploy(&state, app, "generic", None).await)
 }
 
-/// Handle a Merge Request Hook event from a GitLab webhook.
-///
-/// Actions handled:
-///   "open" | "update" | "reopen"
-///     – Find apps whose `source_url` matches the MR's repo clone URL and
-///       that are linked to a GitLab token (`gitlab_token_id IS NOT NULL`).
-///     – Expire any existing preview deployments for this app+MR.
-///     – Insert a new `preview_deployments` row (status = "building") with
-///       MR metadata (`pr_number` = MR IID, `head_sha`, `head_ref`, `pr_url`).
-///     – Post a "pending" GitLab commit status (best-effort).
-///     – Spawn `deploy_preview()` in the background.
-///
-///   "close" | "merge"
-///     – Find and expire all active previews for this app+MR.
-async fn handle_gitlab_merge_request(
-    state: &AppState,
-    app_id: &str,
-    body: &Bytes,
-) -> Result<Response, AppError> {
-    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return Ok((
-            StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<()>::err("invalid JSON")),
-        )
-            .into_response());
-    };
+// ── Pull/merge request previews (GitHub App, GitLab, Gitea/Forgejo) ────────
+//
+// Every forge's event is reduced to a `PrEvent`. Opening, reopening or
+// pushing to a pull request replaces its preview (the previous one is
+// stopped; its comment id carries over so the comment is edited, not
+// duplicated) and reports a pending tond/preview status; the deploy itself
+// reports success (deploy/core.rs) or failure. Closing or merging removes
+// the previews. Statuses and comments go through forge.rs.
 
-    let action = payload["object_attributes"]["action"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
-    let mr_iid = payload["object_attributes"]["iid"].as_i64().unwrap_or(0);
-    let head_sha = payload["object_attributes"]["last_commit"]["id"]
-        .as_str()
-        .map(|s| s.to_string());
-    let head_ref = payload["object_attributes"]["source_branch"]
-        .as_str()
-        .map(|s| s.to_string());
-    let mr_url = sanitize_provider_url(payload["object_attributes"]["url"].as_str());
-    let repo_http_url = payload["project"]["http_url_to_repo"]
-        .as_str()
-        .or_else(|| payload["repository"]["homepage"].as_str())
-        .map(|s| s.to_string());
-    let gitlab_project_id = payload["project"]["id"].as_i64().unwrap_or(0);
-
-    let Some(repo_url) = repo_http_url else {
-        tracing::warn!(
-            "[webhook/gitlab-mr/{}] no project.http_url_to_repo in payload",
-            app_id
-        );
-        return Ok((StatusCode::OK, Json(ApiResponse::<()>::ok(()))).into_response());
-    };
-
-    // Find the specific app (filtered by app_id from the route) + ensure it
-    // matches the incoming repo URL.
-    let app: Option<App> = sqlx::query_as(
-        "SELECT * FROM apps WHERE id = ? AND source_url = ? AND source_type = 'git'",
-    )
-    .bind(app_id)
-    .bind(&repo_url)
-    .fetch_optional(&state.db)
-    .await
-    .unwrap_or(None);
-
-    let Some(app) = app else {
-        tracing::debug!(
-            "[webhook/gitlab-mr/{}] app not found or repo URL mismatch ({})",
-            app_id,
-            repo_url
-        );
-        return Ok((StatusCode::OK, Json(ApiResponse::<()>::ok(()))).into_response());
-    };
-
-    // Fetch the associated GitLab token (needed for commit status API calls).
-    let gl_token: Option<GitLabToken> = if let Some(ref tid) = app.gitlab_token_id {
-        sqlx::query_as("SELECT * FROM gitlab_tokens WHERE id = ? LIMIT 1")
-            .bind(tid)
-            .fetch_optional(&state.db)
-            .await
-            .unwrap_or(None)
-    } else {
-        None
-    };
-
-    // Previews are served only under the preview domain (see domains.rs).
-    let preview_domain: Option<String> = {
-        let s = state.settings.read().await;
-        Some(s.preview_domain.clone()).filter(|d| !d.is_empty())
-    };
-
-    match action.as_str() {
-        "open" | "update" | "reopen" => {
-            let Some(ref sha) = head_sha else {
-                tracing::warn!(
-                    "[webhook/gitlab-mr/{}] missing last_commit.id in payload",
-                    app_id
-                );
-                return Ok((StatusCode::OK, Json(ApiResponse::<()>::ok(()))).into_response());
-            };
-
-            if app.preview_enabled == 0 {
-                tracing::debug!(
-                    "[webhook/gitlab-mr/{}] skipping — preview_enabled=false",
-                    app_id
-                );
-                return Ok((StatusCode::OK, Json(ApiResponse::<()>::ok(()))).into_response());
-            }
-            let Some(ref preview_domain) = preview_domain else {
-                tracing::warn!(
-                    "[webhook/gitlab-mr/{}] skipping — no preview domain configured",
-                    app_id
-                );
-                return Ok((StatusCode::OK, Json(ApiResponse::<()>::ok(()))).into_response());
-            };
-
-            if let Err(reason) = preview_allowed(&state.db, &app.id).await {
-                tracing::warn!("[webhook/gitlab-mr/{}] {}", app_id, reason);
-                return Ok(error_response(StatusCode::TOO_MANY_REQUESTS, reason));
-            }
-
-            // Expire any existing previews for this app+MR (best-effort).
-            let existing: Vec<PreviewDeployment> = sqlx::query_as(
-                "SELECT * FROM preview_deployments
-                 WHERE app_id = ? AND pr_number = ? AND status != 'expired'",
-            )
-            .bind(&app.id)
-            .bind(mr_iid)
-            .fetch_all(&state.db)
-            .await
-            .unwrap_or_default();
-
-            for old in existing {
-                if let Some(ref cid) = old.container_id {
-                    let _ = docker::stop_container(&state.docker, cid).await;
-                    let _ = docker::remove_container(&state.docker, cid).await;
-                }
-                let _ =
-                    sqlx::query("UPDATE preview_deployments SET status = 'expired' WHERE id = ?")
-                        .bind(&old.id)
-                        .execute(&state.db)
-                        .await;
-            }
-
-            // Build the new preview row.
-            let slug = {
-                use tond_common::generate_raw_key;
-                generate_raw_key()[..12].to_string()
-            };
-            let ttl_seconds: i64 = 86400; // 24 h
-            let now = chrono::Utc::now();
-            let expires_at = (now + chrono::Duration::seconds(ttl_seconds)).to_rfc3339();
-            let created_at = now.to_rfc3339();
-            let subdomain = preview_host(&slug, &app.name, preview_domain);
-            let preview_id = uuid::Uuid::new_v4().to_string();
-
-            let insert = sqlx::query(
-                "INSERT INTO preview_deployments
-                 (id, app_id, slug, subdomain, ttl_seconds, status, expires_at, created_at,
-                  pr_number, head_sha, head_ref, pr_url, gitlab_project_id)
-                 VALUES (?, ?, ?, ?, ?, 'building', ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&preview_id)
-            .bind(&app.id)
-            .bind(&slug)
-            .bind(&subdomain)
-            .bind(ttl_seconds)
-            .bind(&expires_at)
-            .bind(&created_at)
-            .bind(mr_iid)
-            .bind(sha)
-            .bind(head_ref.as_deref())
-            .bind(mr_url.as_deref())
-            .bind(if gitlab_project_id > 0 {
-                Some(gitlab_project_id)
-            } else {
-                None
-            })
-            .execute(&state.db)
-            .await;
-
-            if let Err(e) = insert {
-                tracing::error!(
-                    "[webhook/gitlab-mr/{}] failed to insert preview row: {}",
-                    app_id,
-                    e
-                );
-                return Ok((StatusCode::OK, Json(ApiResponse::<()>::ok(()))).into_response());
-            }
-
-            // Post "pending" commit status (best-effort).
-            if let Some(ref token) = gl_token
-                && gitlab_project_id > 0
-            {
-                let _ = gitlab_tokens::post_gitlab_commit_status(
-                    token,
-                    gitlab_project_id,
-                    sha,
-                    "pending",
-                    "Building preview environment…",
-                    None,
-                )
-                .await
-                .map_err(|e| {
-                    tracing::warn!(
-                        "[webhook/gitlab-mr/{}] failed to post pending status: {}",
-                        app_id,
-                        e
-                    );
-                });
-            }
-
-            // Fetch the just-inserted row and spawn deploy.
-            let preview_row = sqlx::query_as::<_, PreviewDeployment>(
-                "SELECT * FROM preview_deployments WHERE id = ?",
-            )
-            .bind(&preview_id)
-            .fetch_optional(&state.db)
-            .await
-            .ok()
-            .flatten();
-
-            let mut preview = match preview_row {
-                Some(p) => p,
-                None => PreviewDeployment {
-                    id: preview_id.clone(),
-                    app_id: app.id.clone(),
-                    slug: slug.clone(),
-                    subdomain: Some(subdomain.clone()),
-                    container_id: None,
-                    host_port: None,
-                    image_tag: None,
-                    ttl_seconds,
-                    status: "building".to_string(),
-                    expires_at: expires_at.clone(),
-                    created_at: created_at.clone(),
-                    project_preview_id: None,
-                    pr_number: Some(mr_iid),
-                    head_sha: Some(sha.clone()),
-                    head_ref: head_ref.clone(),
-                    pr_url: mr_url.clone(),
-                    comment_id: None,
-                    gitlab_project_id: if gitlab_project_id > 0 {
-                        Some(gitlab_project_id)
-                    } else {
-                        None
-                    },
-                },
-            };
-
-            let state_clone = state.clone();
-            let app_clone = app.clone();
-            let gl_token_clone = gl_token.clone();
-            let sha_clone = sha.clone();
-            let app_id_clone = app_id.to_string();
-
-            tokio::spawn(async move {
-                if let Err(e) = deploy::deploy_preview(&state_clone, &app_clone, &mut preview).await
-                {
-                    tracing::error!(
-                        "[webhook/gitlab-mr/{}] preview deploy failed: {}",
-                        app_id_clone,
-                        e
-                    );
-                    let _ = sqlx::query(
-                        "UPDATE preview_deployments SET status = 'failed' WHERE id = ?",
-                    )
-                    .bind(&preview.id)
-                    .execute(&state_clone.db)
-                    .await;
-
-                    // Post "failed" commit status.
-                    if let (Some(token), true) = (&gl_token_clone, gitlab_project_id > 0) {
-                        let _ = gitlab_tokens::post_gitlab_commit_status(
-                            token,
-                            gitlab_project_id,
-                            &sha_clone,
-                            "failed",
-                            &format!("Preview deploy failed: {}", e),
-                            None,
-                        )
-                        .await
-                        .map_err(|e2| {
-                            tracing::warn!(
-                                "[webhook/gitlab-mr/{}] failed to post failure status: {}",
-                                app_id_clone,
-                                e2
-                            );
-                        });
-                    }
-                }
-                // On success, deploy_preview() itself posts the "success" commit status
-                // via the GitLab token path in core.rs.
-            });
-
-            tracing::info!(
-                "[webhook/gitlab-mr/{}] action={} MR!{} — spawned preview deploy",
-                app_id,
-                action,
-                mr_iid
-            );
-        }
-
-        "close" | "merge" => {
-            let existing: Vec<PreviewDeployment> = sqlx::query_as(
-                "SELECT * FROM preview_deployments
-                 WHERE app_id = ? AND pr_number = ? AND status != 'expired'",
-            )
-            .bind(&app.id)
-            .bind(mr_iid)
-            .fetch_all(&state.db)
-            .await
-            .unwrap_or_default();
-
-            let mut expired = 0usize;
-            for p in existing {
-                if let Some(ref cid) = p.container_id {
-                    let _ = docker::stop_container(&state.docker, cid).await;
-                    let _ = docker::remove_container(&state.docker, cid).await;
-                }
-                let _ =
-                    sqlx::query("UPDATE preview_deployments SET status = 'expired' WHERE id = ?")
-                        .bind(&p.id)
-                        .execute(&state.db)
-                        .await;
-                expired += 1;
-            }
-            tracing::info!(
-                "[webhook/gitlab-mr/{}] MR!{} {} — expired {} preview(s)",
-                app_id,
-                mr_iid,
-                action,
-                expired
-            );
-        }
-
-        other => {
-            tracing::debug!("[webhook/gitlab-mr/{}] ignoring action={}", app_id, other);
-        }
-    }
-
-    Ok((StatusCode::OK, Json(ApiResponse::<()>::ok(()))).into_response())
+/// What a pull/merge request event asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PrAction {
+    /// Opened, reopened or new commits: (re)deploy the preview
+    Deploy,
+    /// Closed or merged: remove the previews
+    Close,
+    /// Anything else (labels, edits, reviews): nothing to do
+    Ignore(String),
 }
 
+/// A pull/merge request event, whatever the forge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PrEvent {
+    pub action: PrAction,
+    /// PR number (GitLab: the MR iid)
+    pub number: i64,
+    pub head_sha: Option<String>,
+    pub head_ref: Option<String>,
+    pub url: Option<String>,
+    /// Clone URL of the repository the event is about
+    pub repo_url: Option<String>,
+    pub gitlab_project_id: Option<i64>,
+}
+
+/// A GitHub `pull_request` event.
+pub(crate) fn parse_github_pull_request(body: &[u8]) -> Option<PrEvent> {
+    let p: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let action = p["action"].as_str().unwrap_or_default();
+    Some(PrEvent {
+        action: match action {
+            "opened" | "synchronize" | "reopened" => PrAction::Deploy,
+            "closed" => PrAction::Close,
+            other => PrAction::Ignore(other.to_string()),
+        },
+        number: p["number"].as_i64()?,
+        head_sha: p["pull_request"]["head"]["sha"]
+            .as_str()
+            .map(str::to_string),
+        head_ref: p["pull_request"]["head"]["ref"]
+            .as_str()
+            .map(str::to_string),
+        url: sanitize_provider_url(p["pull_request"]["html_url"].as_str()),
+        repo_url: p["repository"]["clone_url"]
+            .as_str()
+            .or_else(|| p["repository"]["html_url"].as_str())
+            .map(str::to_string),
+        gitlab_project_id: None,
+    })
+}
+
+/// A GitLab `Merge Request Hook` event.
+pub(crate) fn parse_gitlab_merge_request(body: &[u8]) -> Option<PrEvent> {
+    let p: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let attrs = &p["object_attributes"];
+    let action = attrs["action"].as_str().unwrap_or_default();
+    Some(PrEvent {
+        action: match action {
+            "open" | "update" | "reopen" => PrAction::Deploy,
+            "close" | "merge" => PrAction::Close,
+            other => PrAction::Ignore(other.to_string()),
+        },
+        number: attrs["iid"].as_i64()?,
+        head_sha: attrs["last_commit"]["id"].as_str().map(str::to_string),
+        head_ref: attrs["source_branch"].as_str().map(str::to_string),
+        url: sanitize_provider_url(attrs["url"].as_str()),
+        repo_url: p["project"]["http_url_to_repo"]
+            .as_str()
+            .or_else(|| p["repository"]["homepage"].as_str())
+            .map(str::to_string),
+        gitlab_project_id: p["project"]["id"].as_i64().filter(|id| *id > 0),
+    })
+}
+
+/// A Gitea/Forgejo `pull_request` event.
+pub(crate) fn parse_gitea_pull_request(body: &[u8]) -> Option<PrEvent> {
+    let p: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let action = p["action"].as_str().unwrap_or_default();
+    Some(PrEvent {
+        action: match action {
+            "opened" | "reopened" | "synchronized" => PrAction::Deploy,
+            "closed" => PrAction::Close,
+            other => PrAction::Ignore(other.to_string()),
+        },
+        number: p["number"]
+            .as_i64()
+            .or_else(|| p["pull_request"]["number"].as_i64())?,
+        head_sha: p["pull_request"]["head"]["sha"]
+            .as_str()
+            .map(str::to_string),
+        head_ref: p["pull_request"]["head"]["ref"]
+            .as_str()
+            .map(str::to_string),
+        url: sanitize_provider_url(p["pull_request"]["html_url"].as_str()),
+        repo_url: p["repository"]["clone_url"]
+            .as_str()
+            .or_else(|| p["repository"]["html_url"].as_str())
+            .map(str::to_string),
+        gitlab_project_id: None,
+    })
+}
+
+/// Whether two repository URLs name the same repository (scheme, case of
+/// the host, a trailing slash and ".git" don't matter).
+pub(crate) fn same_repo(a: &str, b: &str) -> bool {
+    let norm = |u: &str| {
+        let u = u.trim().trim_end_matches('/');
+        let u = u.strip_suffix(".git").unwrap_or(u);
+        let u = u
+            .trim_start_matches("https://")
+            .trim_start_matches("http://");
+        match u.split_once('/') {
+            Some((host, path)) => format!("{}/{}", host.to_ascii_lowercase(), path),
+            None => u.to_ascii_lowercase(),
+        }
+    };
+    !a.trim().is_empty() && norm(a) == norm(b)
+}
+
+/// Stop and expire every live preview of `app_id` for PR `number`; returns
+/// the comment id of the newest one (to carry over) and how many there were.
+async fn expire_pr_previews(state: &AppState, app_id: &str, number: i64) -> (Option<i64>, usize) {
+    let existing: Vec<PreviewDeployment> = sqlx::query_as(
+        "SELECT * FROM preview_deployments
+         WHERE app_id = ? AND pr_number = ? AND status != 'expired'
+         ORDER BY created_at",
+    )
+    .bind(app_id)
+    .bind(number)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    let carried = existing.iter().filter_map(|p| p.comment_id).next_back();
+    for old in &existing {
+        if let Some(ref cid) = old.container_id {
+            let _ = docker::stop_container(&state.docker, cid).await;
+            let _ = docker::remove_container(&state.docker, cid).await;
+        }
+        let _ = sqlx::query("UPDATE preview_deployments SET status = 'expired' WHERE id = ?")
+            .bind(&old.id)
+            .execute(&state.db)
+            .await;
+    }
+    (carried, existing.len())
+}
+
+/// Replace the preview of `app` for `pr` and deploy it in the background.
+async fn start_pr_preview(state: &AppState, app: &App, pr: &PrEvent) -> Result<(), &'static str> {
+    let Some(sha) = pr.head_sha.clone() else {
+        return Err("the event has no head commit");
+    };
+    if app.preview_enabled == 0 {
+        return Err("previews are off for this app");
+    }
+    // Previews are served only under the preview domain (see domains.rs).
+    let preview_domain = state.settings.read().await.preview_domain.clone();
+    if preview_domain.is_empty() {
+        return Err("no preview domain is configured");
+    }
+    preview_allowed(&state.db, &app.id).await?;
+
+    let (carried_comment_id, _) = expire_pr_previews(state, &app.id, pr.number).await;
+
+    let slug = tond_common::generate_raw_key()[..12].to_string();
+    let ttl_seconds: i64 = 86400; // 24 h
+    let now = chrono::Utc::now();
+    let preview = PreviewDeployment {
+        id: uuid::Uuid::new_v4().to_string(),
+        app_id: app.id.clone(),
+        subdomain: Some(preview_host(&slug, &app.name, &preview_domain)),
+        slug,
+        container_id: None,
+        host_port: None,
+        image_tag: None,
+        ttl_seconds,
+        status: "building".to_string(),
+        expires_at: (now + chrono::Duration::seconds(ttl_seconds)).to_rfc3339(),
+        created_at: now.to_rfc3339(),
+        project_preview_id: None,
+        pr_number: Some(pr.number),
+        head_sha: Some(sha),
+        head_ref: pr.head_ref.clone(),
+        pr_url: pr.url.clone(),
+        comment_id: carried_comment_id,
+        gitlab_project_id: pr.gitlab_project_id,
+    };
+    sqlx::query(
+        "INSERT INTO preview_deployments
+         (id, app_id, slug, subdomain, ttl_seconds, status, expires_at, created_at,
+          pr_number, head_sha, head_ref, pr_url, comment_id, gitlab_project_id)
+         VALUES (?, ?, ?, ?, ?, 'building', ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&preview.id)
+    .bind(&preview.app_id)
+    .bind(&preview.slug)
+    .bind(&preview.subdomain)
+    .bind(preview.ttl_seconds)
+    .bind(&preview.expires_at)
+    .bind(&preview.created_at)
+    .bind(preview.pr_number)
+    .bind(&preview.head_sha)
+    .bind(&preview.head_ref)
+    .bind(&preview.pr_url)
+    .bind(preview.comment_id)
+    .bind(preview.gitlab_project_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| {
+        tracing::error!("[pr-preview/{}] couldn't store the preview: {e}", app.id);
+        "couldn't store the preview"
+    })?;
+
+    crate::forge::announce_preview_building(state, app, &preview).await;
+
+    let state = state.clone();
+    let app = app.clone();
+    let mut preview = preview;
+    tokio::spawn(async move {
+        if let Err(e) = deploy::deploy_preview(&state, &app, &mut preview).await {
+            tracing::error!("[pr-preview/{}] preview deploy failed: {e:#}", app.name);
+            let _ = sqlx::query("UPDATE preview_deployments SET status = 'failed' WHERE id = ?")
+                .bind(&preview.id)
+                .execute(&state.db)
+                .await;
+            crate::forge::announce_preview_failed(&state, &app, &preview, &format!("{e:#}")).await;
+        }
+        // On success deploy_preview() announces the preview itself.
+    });
+    Ok(())
+}
+
+/// Act on a pull/merge request event for one app.
+async fn handle_pr_event(state: &AppState, app: &App, pr: &PrEvent, source: &str) -> Response {
+    match &pr.action {
+        PrAction::Deploy => match start_pr_preview(state, app, pr).await {
+            Ok(()) => {
+                tracing::info!("[{source}/{}] PR #{}: preview deploying", app.id, pr.number);
+                (StatusCode::ACCEPTED, Json(ApiResponse::<()>::ok(()))).into_response()
+            }
+            Err(reason) if reason.contains("too many") || reason.contains("rate limit") => {
+                tracing::warn!("[{source}/{}] {reason}", app.id);
+                error_response(StatusCode::TOO_MANY_REQUESTS, reason)
+            }
+            Err(reason) => {
+                tracing::debug!("[{source}/{}] PR #{} skipped: {reason}", app.id, pr.number);
+                info_response(reason)
+            }
+        },
+        PrAction::Close => {
+            let (_, n) = expire_pr_previews(state, &app.id, pr.number).await;
+            tracing::info!(
+                "[{source}/{}] PR #{} closed: {n} preview(s) removed",
+                app.id,
+                pr.number
+            );
+            ok_response()
+        }
+        PrAction::Ignore(action) => {
+            tracing::debug!("[{source}/{}] ignoring PR action {action}", app.id);
+            ok_response()
+        }
+    }
+}
+
+/// A GitLab Merge Request Hook for the app of the route: previews for merge
+/// requests of the app's own repository (commit statuses and the MR comment
+/// need a GitLab token linked to the app).
+async fn handle_gitlab_merge_request(
+    state: &AppState,
+    app: App,
+    body: &Bytes,
+) -> Result<Response, AppError> {
+    let Some(pr) = parse_gitlab_merge_request(body) else {
+        return Ok(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid merge request payload",
+        ));
+    };
+    if app.source_type != "git"
+        || !pr
+            .repo_url
+            .as_deref()
+            .is_some_and(|u| same_repo(u, app.source_url.as_deref().unwrap_or_default()))
+    {
+        tracing::debug!(
+            "[webhook/gitlab-mr/{}] repository mismatch ({:?})",
+            app.id,
+            pr.repo_url
+        );
+        return Ok(info_response("merge request is for another repository"));
+    }
+    Ok(handle_pr_event(state, &app, &pr, "webhook/gitlab-mr").await)
+}
+
+/// A Gitea/Forgejo pull_request event for the app of the route (statuses and
+/// the PR comment need a Gitea token linked to the app).
+async fn handle_gitea_pull_request(
+    state: &AppState,
+    app: App,
+    body: &Bytes,
+) -> Result<Response, AppError> {
+    let Some(pr) = parse_gitea_pull_request(body) else {
+        return Ok(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid pull request payload",
+        ));
+    };
+    if app.source_type != "git"
+        || !pr
+            .repo_url
+            .as_deref()
+            .is_some_and(|u| same_repo(u, app.source_url.as_deref().unwrap_or_default()))
+    {
+        tracing::debug!(
+            "[webhook/gitea-pr/{}] repository mismatch ({:?})",
+            app.id,
+            pr.repo_url
+        );
+        return Ok(info_response("pull request is for another repository"));
+    }
+    Ok(handle_pr_event(state, &app, &pr, "webhook/gitea-pr").await)
+}
 // ── GitHub App Events ──────────────────────────────────────────────────────
 //
 // POST /webhooks/source/github/events
@@ -1066,58 +1053,22 @@ async fn handle_github_app_push(state: &AppState, gh_app: &GitHubApp, body: &Byt
 }
 
 // ── GitHub App PR Preview Deployments (Phase 4.6) ─────────────────────────
-
-/// Handle a pull_request event from a GitHub App webhook.
-///
-/// Actions handled:
-///   "opened" | "synchronize" | "reopened"
-///     – Find all apps whose `source_url` matches the repo's clone URL.
-///     – Expire any existing preview deployments for this app+PR.
-///     – Insert a new `preview_deployments` row (status = "building") with
-///       PR metadata (`pr_number`, `head_sha`, `head_ref`, `pr_url`).
-///     – Post a "pending" GitHub commit status.
-///     – Spawn `deploy_preview()` in the background.
-///
-///   "closed"
-///     – Find and expire (stop container + mark expired) all preview rows
-///       for this app+PR combination.
+/// Handle a pull_request event from a GitHub App webhook: previews for every
+/// app linked to this GitHub App that deploys the repository (see
+/// "Pull/merge request previews" above). The App's signature only vouches
+/// for apps that use this App.
 async fn handle_github_app_pull_request(
     state: &AppState,
     gh_app: &GitHubApp,
     body: &Bytes,
 ) -> Response {
-    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<()>::err("invalid JSON")),
-        )
-            .into_response();
+    let Some(pr) = parse_github_pull_request(body) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid pull request payload");
     };
-
-    let action = payload["action"].as_str().unwrap_or("").to_string();
-    let pr_number = payload["number"].as_i64().unwrap_or(0);
-    let head_sha = payload["pull_request"]["head"]["sha"]
-        .as_str()
-        .map(|s| s.to_string());
-    let head_ref = payload["pull_request"]["head"]["ref"]
-        .as_str()
-        .map(|s| s.to_string());
-    let pr_url = sanitize_provider_url(payload["pull_request"]["html_url"].as_str());
-    let repo_clone_url = payload["repository"]["clone_url"]
-        .as_str()
-        .or_else(|| payload["repository"]["html_url"].as_str())
-        .map(|s| s.to_string());
-    let repo_full_name = payload["repository"]["full_name"]
-        .as_str()
-        .map(|s| s.to_string());
-
-    let Some(repo_url) = repo_clone_url else {
+    let Some(repo_url) = pr.repo_url.clone() else {
         tracing::warn!("[github-app-pr] no repository.clone_url in payload");
-        return (StatusCode::OK, Json(ApiResponse::<()>::ok(()))).into_response();
+        return ok_response();
     };
-
-    // Find the apps linked to this GitHub App that deploy this repo. The App's
-    // signature only vouches for apps that use this App.
     let apps: Vec<App> = sqlx::query_as(
         "SELECT * FROM apps WHERE source_url = ? AND source_type = 'git' AND github_app_id = ?",
     )
@@ -1126,281 +1077,14 @@ async fn handle_github_app_pull_request(
     .fetch_all(&state.db)
     .await
     .unwrap_or_default();
-
     if apps.is_empty() {
         tracing::debug!("[github-app-pr] no apps matched repo {}", repo_url);
-        return (StatusCode::OK, Json(ApiResponse::<()>::ok(()))).into_response();
+        return ok_response();
     }
-
-    match action.as_str() {
-        "opened" | "synchronize" | "reopened" => {
-            let Some(ref sha) = head_sha else {
-                tracing::warn!("[github-app-pr] missing head.sha in payload");
-                return (StatusCode::OK, Json(ApiResponse::<()>::ok(()))).into_response();
-            };
-
-            // Derive owner/repo for commit status calls
-            let owner_repo = repo_full_name.as_deref().and_then(|full| {
-                let mut parts = full.splitn(2, '/');
-                let owner = parts.next()?.to_string();
-                let repo = parts.next()?.to_string();
-                Some((owner, repo))
-            });
-
-            // Previews are served only under the preview domain (see domains.rs).
-            let preview_domain: Option<String> = {
-                let s = state.settings.read().await;
-                Some(s.preview_domain.clone()).filter(|d| !d.is_empty())
-            };
-
-            let mut deployed = 0usize;
-
-            for app in apps {
-                // Skip apps that have not opted in to PR preview deployments
-                if app.preview_enabled == 0 {
-                    tracing::debug!(
-                        "[github-app-pr] skipping app {} — preview_enabled=false",
-                        app.name
-                    );
-                    continue;
-                }
-                let Some(ref preview_domain) = preview_domain else {
-                    tracing::warn!(
-                        "[github-app-pr] skipping app {} — no preview domain configured",
-                        app.name
-                    );
-                    continue;
-                };
-
-                if let Err(reason) = preview_allowed(&state.db, &app.id).await {
-                    tracing::warn!("[github-app-pr] skipping app {}: {}", app.name, reason);
-                    continue;
-                }
-
-                // Expire any existing previews for this app+PR (best-effort).
-                // Save the most recent comment_id so it can be carried over to the
-                // new row and the existing PR comment gets updated rather than duplicated.
-                let existing: Vec<PreviewDeployment> = sqlx::query_as(
-                    "SELECT * FROM preview_deployments
-                     WHERE app_id = ? AND pr_number = ? AND status != 'expired'",
-                )
-                .bind(&app.id)
-                .bind(pr_number)
-                .fetch_all(&state.db)
-                .await
-                .unwrap_or_default();
-
-                // Pick the comment_id from the most recently created old row.
-                let carried_comment_id: Option<i64> =
-                    existing.iter().filter_map(|p| p.comment_id).next_back();
-
-                for old in existing {
-                    if let Some(ref cid) = old.container_id {
-                        let _ = docker::stop_container(&state.docker, cid).await;
-                        let _ = docker::remove_container(&state.docker, cid).await;
-                    }
-                    let _ = sqlx::query(
-                        "UPDATE preview_deployments SET status = 'expired' WHERE id = ?",
-                    )
-                    .bind(&old.id)
-                    .execute(&state.db)
-                    .await;
-                }
-
-                // Build the new preview row
-                let slug = {
-                    use tond_common::generate_raw_key;
-                    generate_raw_key()[..12].to_string()
-                };
-                let ttl_seconds: i64 = 86400; // 24 h
-                let now = chrono::Utc::now();
-                let expires_at = (now + chrono::Duration::seconds(ttl_seconds)).to_rfc3339();
-                let created_at = now.to_rfc3339();
-                let subdomain = preview_host(&slug, &app.name, preview_domain);
-                let preview_id = uuid::Uuid::new_v4().to_string();
-
-                let insert = sqlx::query(
-                    "INSERT INTO preview_deployments
-                     (id, app_id, slug, subdomain, ttl_seconds, status, expires_at, created_at,
-                      pr_number, head_sha, head_ref, pr_url, comment_id)
-                     VALUES (?, ?, ?, ?, ?, 'building', ?, ?, ?, ?, ?, ?, ?)",
-                )
-                .bind(&preview_id)
-                .bind(&app.id)
-                .bind(&slug)
-                .bind(&subdomain)
-                .bind(ttl_seconds)
-                .bind(&expires_at)
-                .bind(&created_at)
-                .bind(pr_number)
-                .bind(sha)
-                .bind(head_ref.as_deref())
-                .bind(pr_url.as_deref())
-                .bind(carried_comment_id)
-                .execute(&state.db)
-                .await;
-
-                if let Err(e) = insert {
-                    tracing::error!("[github-app-pr] failed to insert preview row: {}", e);
-                    continue;
-                }
-
-                // Post "pending" commit status
-                if let Some((ref owner, ref repo)) = owner_repo {
-                    let _ = github_apps::post_commit_status(
-                        gh_app,
-                        owner,
-                        repo,
-                        sha,
-                        "pending",
-                        "Building preview environment…",
-                        None,
-                        "tond/preview",
-                    )
-                    .await
-                    .map_err(|e| {
-                        tracing::warn!("[github-app-pr] failed to post pending status: {}", e);
-                    });
-                }
-
-                // Fetch the just-inserted row and spawn deploy
-                let preview_row = sqlx::query_as::<_, PreviewDeployment>(
-                    "SELECT * FROM preview_deployments WHERE id = ?",
-                )
-                .bind(&preview_id)
-                .fetch_optional(&state.db)
-                .await
-                .ok()
-                .flatten();
-
-                let mut preview = match preview_row {
-                    Some(p) => p,
-                    None => {
-                        // Construct a synthetic fallback
-                        PreviewDeployment {
-                            id: preview_id.clone(),
-                            app_id: app.id.clone(),
-                            slug: slug.clone(),
-                            subdomain: Some(subdomain.clone()),
-                            container_id: None,
-                            host_port: None,
-                            image_tag: None,
-                            ttl_seconds,
-                            status: "building".to_string(),
-                            expires_at: expires_at.clone(),
-                            created_at: created_at.clone(),
-                            project_preview_id: None,
-                            pr_number: Some(pr_number),
-                            head_sha: Some(sha.clone()),
-                            head_ref: head_ref.clone(),
-                            pr_url: pr_url.clone(),
-                            comment_id: None,
-                            gitlab_project_id: None,
-                        }
-                    }
-                };
-
-                let state_clone = state.clone();
-                let app_clone = app.clone();
-                let gh_app_clone = gh_app.clone();
-                let owner_repo_clone = owner_repo.clone();
-                let sha_clone = sha.clone();
-
-                tokio::spawn(async move {
-                    if let Err(e) =
-                        deploy::deploy_preview(&state_clone, &app_clone, &mut preview).await
-                    {
-                        tracing::error!(
-                            "[github-app-pr] preview deploy failed for {}: {}",
-                            app_clone.name,
-                            e
-                        );
-                        let _ = sqlx::query(
-                            "UPDATE preview_deployments SET status = 'failed' WHERE id = ?",
-                        )
-                        .bind(&preview.id)
-                        .execute(&state_clone.db)
-                        .await;
-
-                        // Post "failure" commit status
-                        if let Some((ref owner, ref repo)) = owner_repo_clone {
-                            let _ = github_apps::post_commit_status(
-                                &gh_app_clone,
-                                owner,
-                                repo,
-                                &sha_clone,
-                                "failure",
-                                &format!("Preview deploy failed: {}", e),
-                                None,
-                                "tond/preview",
-                            )
-                            .await
-                            .map_err(|e2| {
-                                tracing::warn!(
-                                    "[github-app-pr] failed to post failure status: {}",
-                                    e2
-                                );
-                            });
-                        }
-                    }
-                    // On success, deploy_preview() itself posts the "success" status.
-                });
-
-                deployed += 1;
-            }
-
-            tracing::info!(
-                "[github-app-pr] action={} PR#{} — spawned {} preview deploy(s) for repo {}",
-                action,
-                pr_number,
-                deployed,
-                repo_url
-            );
-        }
-
-        "closed" => {
-            // Expire all active previews for this PR across all matching apps
-            let existing: Vec<PreviewDeployment> = sqlx::query_as(
-                "SELECT pd.* FROM preview_deployments pd
-                 JOIN apps a ON pd.app_id = a.id
-                 WHERE a.source_url = ? AND a.github_app_id = ?
-                   AND pd.pr_number = ? AND pd.status != 'expired'",
-            )
-            .bind(&repo_url)
-            .bind(&gh_app.id)
-            .bind(pr_number)
-            .fetch_all(&state.db)
-            .await
-            .unwrap_or_default();
-
-            let mut expired = 0usize;
-            for p in existing {
-                if let Some(ref cid) = p.container_id {
-                    let _ = docker::stop_container(&state.docker, cid).await;
-                    let _ = docker::remove_container(&state.docker, cid).await;
-                }
-                let _ =
-                    sqlx::query("UPDATE preview_deployments SET status = 'expired' WHERE id = ?")
-                        .bind(&p.id)
-                        .execute(&state.db)
-                        .await;
-                expired += 1;
-            }
-
-            tracing::info!(
-                "[github-app-pr] PR#{} closed — expired {} preview(s) for repo {}",
-                pr_number,
-                expired,
-                repo_url
-            );
-        }
-
-        other => {
-            tracing::debug!("[github-app-pr] ignoring action={}", other);
-        }
+    for app in &apps {
+        let _ = handle_pr_event(state, app, &pr, "github-app-pr").await;
     }
-
-    (StatusCode::OK, Json(ApiResponse::<()>::ok(()))).into_response()
+    ok_response()
 }
 
 #[cfg(test)]
@@ -1997,6 +1681,169 @@ mod tests {
             response_json(signed).await["error"],
             "auto_deploy not enabled"
         );
+    }
+
+    fn gitea_pr(action: &str, repo: &str) -> Vec<u8> {
+        serde_json::json!({
+            "action": action,
+            "number": 7,
+            "pull_request": {
+                "number": 7,
+                "html_url": "https://codeberg.org/org/repo/pulls/7",
+                "head": { "sha": "0123456789abcdef", "ref": "feature" }
+            },
+            "repository": { "clone_url": repo }
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    async fn send_gitea(
+        state: &AppState,
+        app: &App,
+        event: &str,
+        body: Vec<u8>,
+        delivery: &str,
+    ) -> Response {
+        let sig = github_signature(&secret_of(app), &body);
+        gitea_webhook(
+            State(state.clone()),
+            Path(app.id.clone()),
+            headers(&[
+                ("x-gitea-event", event),
+                ("x-gitea-delivery", delivery),
+                ("x-gitea-signature", sig.trim_start_matches("sha256=")),
+            ]),
+            Bytes::from(body),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("gitea_webhook should return a response: {}", err.0))
+    }
+
+    #[test]
+    fn pull_request_events_of_every_forge_reduce_to_the_same_shape() {
+        let gitea = parse_gitea_pull_request(&gitea_pr(
+            "synchronized",
+            "https://codeberg.org/org/repo.git",
+        ))
+        .unwrap_or_else(|| panic!("gitea event parses"));
+        assert_eq!(gitea.action, PrAction::Deploy);
+        assert_eq!(
+            (gitea.number, gitea.head_sha.as_deref()),
+            (7, Some("0123456789abcdef"))
+        );
+        assert_eq!(gitea.head_ref.as_deref(), Some("feature"));
+        assert_eq!(
+            parse_gitea_pull_request(&gitea_pr("closed", "x")).map(|p| p.action),
+            Some(PrAction::Close)
+        );
+        assert_eq!(
+            parse_gitea_pull_request(&gitea_pr("label_updated", "x")).map(|p| p.action),
+            Some(PrAction::Ignore("label_updated".to_string()))
+        );
+
+        let gitlab = parse_gitlab_merge_request(
+            br#"{"object_attributes":{"action":"merge","iid":3,"url":"https://gitlab.com/g/p/-/merge_requests/3","last_commit":{"id":"abc"},"source_branch":"f"},"project":{"id":42,"http_url_to_repo":"https://gitlab.com/g/p.git"}}"#,
+        )
+        .unwrap_or_else(|| panic!("gitlab event parses"));
+        assert_eq!(gitlab.action, PrAction::Close);
+        assert_eq!((gitlab.number, gitlab.gitlab_project_id), (3, Some(42)));
+
+        let github = parse_github_pull_request(
+            br#"{"action":"reopened","number":9,"pull_request":{"head":{"sha":"s","ref":"r"},"html_url":"https://github.com/o/r/pull/9"},"repository":{"clone_url":"https://github.com/o/r.git"}}"#,
+        )
+        .unwrap_or_else(|| panic!("github event parses"));
+        assert_eq!(github.action, PrAction::Deploy);
+        assert_eq!(github.url.as_deref(), Some("https://github.com/o/r/pull/9"));
+        assert!(parse_gitea_pull_request(b"not json").is_none());
+    }
+
+    #[test]
+    fn repositories_match_regardless_of_scheme_case_and_suffix() {
+        assert!(same_repo(
+            "https://GitHub.com/org/repo.git",
+            "http://github.com/org/repo/"
+        ));
+        assert!(!same_repo(
+            "https://github.com/org/repo",
+            "https://github.com/org/other"
+        ));
+        assert!(!same_repo(
+            "https://github.com/Org/repo",
+            "https://github.com/org/repo"
+        ));
+        assert!(!same_repo("", ""));
+    }
+
+    #[tokio::test]
+    async fn gitea_pull_requests_drive_previews_of_their_own_repository_only() {
+        let state = test_state().await;
+        let app = seed_git_app(&state, "demo").await; // source: github.com/org/repo
+
+        // Another repository: ignored.
+        let other = send_gitea(
+            &state,
+            &app,
+            "pull_request",
+            gitea_pr("opened", "https://codeberg.org/x/y.git"),
+            "g-1",
+        )
+        .await;
+        assert_eq!(other.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(other).await["error"],
+            "pull request is for another repository"
+        );
+
+        // Its repository, previews off: nothing deployed.
+        let off = send_gitea(
+            &state,
+            &app,
+            "pull_request",
+            gitea_pr("opened", "https://github.com/org/repo.git"),
+            "g-2",
+        )
+        .await;
+        assert_eq!(
+            response_json(off).await["error"],
+            "previews are off for this app"
+        );
+
+        // Closing removes the PR's live previews (and only those).
+        for (id, pr, status) in [
+            ("p1", 7, "running"),
+            ("p2", 7, "failed"),
+            ("p3", 8, "running"),
+        ] {
+            sqlx::query(
+                "INSERT INTO preview_deployments (id, app_id, slug, status, expires_at, pr_number) VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(&app.id)
+            .bind(id)
+            .bind(status)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(pr)
+            .execute(&state.db)
+            .await
+            .unwrap_or_else(|err| panic!("seed preview: {err}"));
+        }
+        let closed = send_gitea(
+            &state,
+            &app,
+            "pull_request",
+            gitea_pr("closed", "https://github.com/org/repo"),
+            "g-3",
+        )
+        .await;
+        assert_eq!(closed.status(), StatusCode::OK);
+        let live: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM preview_deployments WHERE status != 'expired' ORDER BY id",
+        )
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(live, vec!["p3"]);
     }
 
     #[tokio::test]

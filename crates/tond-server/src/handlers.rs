@@ -52,6 +52,7 @@ pub mod deployments;
 pub mod domains;
 pub mod env;
 pub mod git;
+pub mod gitea_tokens;
 pub mod github_apps;
 pub mod gitlab_tokens;
 pub mod host;

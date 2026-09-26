@@ -87,6 +87,7 @@ mod deploy;
 mod docker;
 mod domains;
 mod error;
+mod forge;
 mod handlers;
 mod health;
 mod janitor;
@@ -543,6 +544,20 @@ async fn run() -> Result<()> {
         .route(
             "/api/apps/{id}/gitlab-token",
             put(handlers::gitlab_tokens::set_app_gitlab_token),
+        )
+        // Gitea / Forgejo tokens (commit statuses, PR previews, clones)
+        .route(
+            "/api/gitea-tokens",
+            get(handlers::gitea_tokens::list_gitea_tokens)
+                .post(handlers::gitea_tokens::create_gitea_token),
+        )
+        .route(
+            "/api/gitea-tokens/{id}",
+            delete(handlers::gitea_tokens::delete_gitea_token),
+        )
+        .route(
+            "/api/apps/{id}/gitea-token",
+            put(handlers::gitea_tokens::set_app_gitea_token),
         )
         // GitHub App callback routes — public (no auth extractor), called by GitHub
         .route(
