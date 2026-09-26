@@ -26,7 +26,7 @@
 // Every delete runs in batches of BATCH_SIZE rows with a short pause between
 // batches, so a single statement never holds SQLite's write lock for long
 // (tond-proxy shares the database file). Each batch selects its victims
-// through an index (see migration 041).
+// through an index (see the retention indexes in 001_baseline.sql).
 //
 // Retention values come from the `settings` table (keys below) with built-in
 // defaults. A value <= 0 disables that rule. After each pass the janitor runs

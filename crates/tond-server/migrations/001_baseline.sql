@@ -1,7 +1,10 @@
 -- Tond baseline schema.
 --
--- Squashed from migrations 001-049 before the first release (no installs
--- existed). Add new migrations as 002_..., 003_... from here on.
+-- Squashed before the first release (no installs existed): migrations
+-- 001-049 from the original history, then the Phase 0 lock-down migrations
+-- (auth hardening, database public access, per-deployment images, webhook
+-- hardening, GitHub App flows, certificate retry state, retention indexes).
+-- Add new migrations as 002_..., 003_... from here on.
 
 CREATE TABLE apps(
   id TEXT PRIMARY KEY NOT NULL,
@@ -54,7 +57,6 @@ CREATE TABLE deploy_logs(
 );
 CREATE INDEX idx_apps_name ON apps(name);
 CREATE INDEX idx_apps_domain ON apps(domain);
-CREATE INDEX idx_deploy_logs_app_id ON deploy_logs(app_id);
 
 CREATE TABLE api_keys(
   id TEXT PRIMARY KEY NOT NULL,
@@ -103,7 +105,11 @@ CREATE TABLE certificates(
   -- "active" | "pending" | "expired" | "failed"
   status TEXT NOT NULL DEFAULT 'pending',
   created_at TEXT NOT NULL DEFAULT(datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT(datetime('now'))
+  updated_at TEXT NOT NULL DEFAULT(datetime('now')),
+  last_error TEXT,
+  last_attempt_at TEXT,
+  next_retry_at TEXT,
+  failure_count INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE settings(
@@ -123,7 +129,8 @@ CREATE TABLE deployments(
   finished_at TEXT,
   created_at TEXT NOT NULL,
   trigger_source TEXT NOT NULL DEFAULT 'manual',
-  generated_dockerfile TEXT
+  generated_dockerfile TEXT,
+  image_pruned INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX deployments_app_id_idx ON deployments(app_id, created_at DESC);
 
@@ -236,7 +243,8 @@ CREATE TABLE databases(
   custom_internal_url TEXT,
   image_used TEXT,
   custom_image TEXT,
-  root_password TEXT
+  root_password TEXT,
+  public_access INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE cron_jobs(
@@ -274,7 +282,6 @@ CREATE TABLE cron_job_runs(
   finished_at TEXT,
   attempt INTEGER NOT NULL DEFAULT 1
 );
-CREATE INDEX idx_cron_job_runs_job_id ON cron_job_runs(cron_job_id);
 CREATE INDEX idx_apps_status
 ON apps(status);
 CREATE INDEX idx_cron_jobs_next_run_at
@@ -314,8 +321,7 @@ CREATE TABLE github_apps(
   -- GitHub App slug(e.g. "tond-myserver") — used to build the install URL
   slug TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT(datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT(datetime('now')),
-  manifest_state TEXT
+  updated_at TEXT NOT NULL DEFAULT(datetime('now'))
 );
 
 CREATE TABLE gitlab_tokens(
@@ -340,7 +346,8 @@ CREATE TABLE mfa_pending(
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   expires_at TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE alert_rule_notifications(
@@ -427,6 +434,51 @@ CREATE TABLE project_previews(
   expires_at TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT(datetime('now'))
 );
+
+CREATE TABLE setup_tokens(
+  token_hash TEXT PRIMARY KEY NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE terminal_tickets(
+  ticket_hash TEXT PRIMARY KEY NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  target_kind TEXT NOT NULL,
+  target_id TEXT NOT NULL,
+  origin TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE webhook_deliveries(
+  key TEXT PRIMARY KEY NOT NULL,
+  received_at TEXT NOT NULL
+);
+CREATE INDEX idx_webhook_deliveries_received_at ON webhook_deliveries(
+  received_at
+);
+
+CREATE TABLE github_app_flows(
+  state TEXT PRIMARY KEY NOT NULL,
+  -- "manifest" | "install"
+  kind TEXT NOT NULL,
+  -- github_apps.id for "install" flows; NULL for "manifest" flows
+  github_app_id TEXT REFERENCES github_apps(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX idx_deploy_logs_created_at ON deploy_logs(created_at);
+CREATE INDEX idx_deploy_logs_app_created ON deploy_logs(app_id, created_at);
+CREATE INDEX idx_cron_job_runs_job_started ON cron_job_runs(
+  cron_job_id,
+  started_at
+);
+CREATE INDEX idx_cron_job_runs_running ON cron_job_runs(
+  status
+) WHERE status = 'running';
+CREATE INDEX idx_sessions_expires_at ON sessions(expires_at);
+CREATE INDEX idx_metrics_collected_at ON metrics(collected_at);
 
 
 -- Seed rows
