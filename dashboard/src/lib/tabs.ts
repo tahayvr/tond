@@ -98,9 +98,10 @@ export function appTabHref(appId: string, tab: AppTab, section?: AppSettingsSect
 
 // ── Database and cron pages ─────────────────────────────────────────────────
 
-export type DatabaseTab = 'overview' | 'environment' | 'backups' | 'metrics' | 'settings';
+export type DatabaseTab = 'overview' | 'logs' | 'environment' | 'backups' | 'metrics' | 'settings';
 export const DATABASE_TABS: readonly TabDef<DatabaseTab>[] = [
 	{ id: 'overview', label: 'Overview' },
+	{ id: 'logs', label: 'Logs', scope: 'logs:read' },
 	{ id: 'environment', label: 'Environment' },
 	{ id: 'backups', label: 'Backups', scope: 'snapshots:read' },
 	{ id: 'metrics', label: 'Metrics', scope: 'metrics:read' },

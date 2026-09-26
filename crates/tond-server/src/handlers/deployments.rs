@@ -1,7 +1,14 @@
 // handlers/deployments.rs — deployment history and rollback
 //
 // GET  /api/apps/{id}/deployments  — list last 20 deployments for an app
+// GET  /api/apps/{id}/deployments/{deployment_id}         — one deployment + its log
+// GET  /api/apps/{id}/deployments/{deployment_id}/stream  — live deploy view (WebSocket)
 // POST /api/apps/{id}/rollback     — redeploy the exact image of an earlier deployment
+//
+// Deployments are the source of truth for what ran: commit (git deploys),
+// trigger (manual / webhook / rollback / upload / cli / api, plus who),
+// duration, phases (clone, build, start, health, release) and, for failures,
+// the classified likely cause with a fix hint (see deploy/failure.rs).
 //
 // Every deployment runs its own image tag (`tond-<app>:<id>`, see
 // deploy/images.rs), so rollback restores precisely what ran back then — code
@@ -14,27 +21,35 @@
 // The target must have succeeded, carry a per-deployment image tag and not
 // have been pruned. The deploy runs in the background; the handler returns 202.
 
+use std::time::Duration;
+
 use axum::{
     Json,
     body::Bytes,
-    extract::{Path, State},
+    extract::{
+        Path, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
     http::StatusCode,
     response::IntoResponse,
 };
 use serde::Deserialize;
 use serde_json::json;
+use tokio::sync::broadcast;
 use tond_common::*;
 
 use crate::{
-    alerts,
     audit_log::write_audit_log,
-    auth::{Authz, RateLimit, scope},
+    auth::{Authz, MaybePrincipal, Principal, RateLimit, principal::AuthFailure, scope},
     deploy::{self, images},
     error::AppError,
+    handlers,
+    log_bus::{self, DeployEvent},
     state::AppState,
 };
 
 use super::fetch_app;
+use super::logs;
 
 /// POST /api/apps/{id}/rollback body (optional).
 #[derive(Debug, Default, Deserialize)]
@@ -183,7 +198,7 @@ pub async fn rollback_app(
     Path(id): Path<String>,
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
-    let mut app = fetch_app(&state.db, &id).await?;
+    let app = fetch_app(&state.db, &id).await?;
     let req = parse_rollback_request(&body)?;
 
     let deployments = sqlx::query_as::<_, Deployment>(
@@ -212,48 +227,33 @@ pub async fn rollback_app(
     }
 
     let app_name = app.name.clone();
-    let app_name_for_spawn = app_name.clone();
-    let app_id_clone = app.id.clone();
-    let image_tag_for_spawn = image_tag.clone();
-    let actor_str = auth.audit_actor();
-    let state_clone = state.clone();
-
-    tokio::spawn(async move {
-        if let Err(e) = deploy::deploy_image(&state_clone, &mut app, &image_tag_for_spawn).await {
-            tracing::error!("Rollback failed for {}: {}", app_name_for_spawn, e);
-            let _ = sqlx::query(
-                "UPDATE apps SET status = 'failed', updated_at = datetime('now') WHERE id = ?",
-            )
-            .bind(&app.id)
-            .execute(&state_clone.db)
-            .await;
-            alerts::fire_event_alerts(
-                &state_clone,
-                "deployment_failure",
-                Some(app.id.as_str()),
-                Some(app_name_for_spawn.as_str()),
-                Some(&e.to_string()),
-            )
-            .await;
-        } else {
-            alerts::fire_event_alerts(
-                &state_clone,
-                "deployment_success",
-                Some(app.id.as_str()),
-                Some(app_name_for_spawn.as_str()),
-                None,
-            )
-            .await;
-        }
-    });
+    let app_id = app.id.clone();
+    let detail = handlers::deploy_trigger(&auth).1;
+    let deployment_id = deploy::start(
+        &state,
+        app,
+        deploy::DeployRequest {
+            kind: deploy::DeployKind::Rollback {
+                image_tag: image_tag.clone(),
+                target_deployment_id: target_id.clone(),
+            },
+            trigger_source: "rollback".to_string(),
+            trigger_detail: detail,
+        },
+    )
+    .await
+    .map_err(|e| AppError(TondError::Internal(e.to_string())))?;
 
     write_audit_log(
         &state.db,
-        Some(&app_id_clone),
+        Some(&app_id),
         Some(&app_name),
         "rollback",
-        &actor_str,
-        Some(&format!("deployment={} image_tag={}", target_id, image_tag)),
+        &auth.audit_actor(),
+        Some(&format!(
+            "deployment={} image_tag={} rollback_deployment={}",
+            target_id, image_tag, deployment_id
+        )),
     )
     .await;
 
@@ -261,10 +261,225 @@ pub async fn rollback_app(
         StatusCode::ACCEPTED,
         Json(ApiResponse::ok(json!({
             "message": "Rollback started",
+            "app_id": app_id,
             "image_tag": image_tag,
-            "deployment_id": target_id,
+            "target_deployment_id": target_id,
+            "deployment_id": deployment_id,
+            "status": "running",
         }))),
     ))
+}
+
+// ── Deployment detail and live stream ──
+
+/// Log lines returned with a deployment (the newest ones).
+const DETAIL_LOG_LIMIT: i64 = 5_000;
+
+async fn fetch_deployment(
+    db: &sqlx::SqlitePool,
+    app_id: &str,
+    deployment_id: &str,
+) -> Result<Deployment, AppError> {
+    sqlx::query_as::<_, Deployment>("SELECT * FROM deployments WHERE id = ? AND app_id = ?")
+        .bind(deployment_id)
+        .bind(app_id)
+        .fetch_optional(db)
+        .await?
+        .ok_or_else(|| AppError(TondError::NotFound(format!("deployment '{deployment_id}'"))))
+}
+
+/// The deployment's response with rollback metadata computed against the
+/// app's history.
+async fn deployment_response(
+    db: &sqlx::SqlitePool,
+    app: &App,
+    deployment: Deployment,
+) -> Result<DeploymentResponse, AppError> {
+    let history = sqlx::query_as::<_, Deployment>(
+        "SELECT * FROM deployments WHERE app_id = ? ORDER BY created_at DESC LIMIT 20",
+    )
+    .bind(&app.id)
+    .fetch_all(db)
+    .await?;
+    let id = deployment.id.clone();
+    let mut responses = deployment_responses(app, history);
+    Ok(match responses.iter().position(|r| r.id == id) {
+        Some(pos) => responses.swap_remove(pos),
+        None => DeploymentResponse::from(deployment),
+    })
+}
+
+/// A deployment's log: `(lines oldest first, truncated?)`.
+async fn deployment_logs(
+    db: &sqlx::SqlitePool,
+    deployment_id: &str,
+) -> Result<(Vec<DeploymentLogLine>, bool), AppError> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT level, message, created_at FROM deploy_logs
+         WHERE deployment_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
+    )
+    .bind(deployment_id)
+    .bind(DETAIL_LOG_LIMIT + 1)
+    .fetch_all(db)
+    .await?;
+    let truncated = rows.len() as i64 > DETAIL_LOG_LIMIT;
+    let lines = rows
+        .into_iter()
+        .take(DETAIL_LOG_LIMIT as usize)
+        .rev()
+        .map(|(level, message, ts)| DeploymentLogLine { level, message, ts })
+        .collect();
+    Ok((lines, truncated))
+}
+
+/// GET /api/apps/{id}/deployments/{deployment_id}
+pub async fn get_deployment(
+    _rate: RateLimit,
+    _auth: Authz<(scope::AppsRead, scope::LogsRead)>,
+    State(state): State<AppState>,
+    Path((id, deployment_id)): Path<(String, String)>,
+) -> Result<impl IntoResponse, AppError> {
+    let app = fetch_app(&state.db, &id).await?;
+    let deployment = fetch_deployment(&state.db, &app.id, &deployment_id).await?;
+    let response = deployment_response(&state.db, &app, deployment).await?;
+    let (logs, logs_truncated) = deployment_logs(&state.db, &deployment_id).await?;
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(DeploymentDetailResponse {
+            deployment: response,
+            logs,
+            logs_truncated,
+            container_port: app.container_port,
+            health_check_path: app.health_check_path.clone(),
+            source_type: app.source_type.clone(),
+        })),
+    ))
+}
+
+/// GET /api/apps/{id}/deployments/{deployment_id}/stream (WebSocket)
+///
+/// On connect: `{"type":"snapshot","deployment":{…},"logs":[…],"logs_truncated":bool,
+/// "container_port":n,"health_check_path":…}` — the same shape as the GET.
+/// Then, while the deployment runs:
+///   `{"type":"log","level":"info","message":"…","ts":"…"}`
+///   `{"type":"deployment","deployment":{…}}` — the row changed (phase, commit, result)
+/// The server closes the socket (code 1000) shortly after the deployment
+/// finishes. Authentication as for the log streams (handlers/logs.rs).
+pub async fn stream_deployment(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Path((id, deployment_id)): Path<(String, String)>,
+    MaybePrincipal(auth): MaybePrincipal,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_deployment_socket(socket, state, id, deployment_id, auth))
+}
+
+fn is_finished(status: &str) -> bool {
+    matches!(status, "succeeded" | "failed" | "superseded" | "cancelled")
+}
+
+async fn handle_deployment_socket(
+    mut socket: WebSocket,
+    state: AppState,
+    id: String,
+    deployment_id: String,
+    auth: Result<Principal, AuthFailure>,
+) {
+    if let Err((code, reason)) = logs::authorize(&state, auth, Scope::LogsRead, Some(&id)).await {
+        logs::close_with(&mut socket, code, reason).await;
+        return;
+    }
+    let Ok(app) = fetch_app(&state.db, &id).await else {
+        logs::close_with(&mut socket, 4004, "App not found").await;
+        return;
+    };
+
+    // Subscribe before reading the snapshot so nothing falls in between.
+    let mut bus = log_bus::subscribe();
+
+    let Ok(deployment) = fetch_deployment(&state.db, &app.id, &deployment_id).await else {
+        logs::close_with(&mut socket, 4004, "Deployment not found").await;
+        return;
+    };
+    let Ok(response) = deployment_response(&state.db, &app, deployment).await else {
+        return;
+    };
+    let Ok((lines, truncated)) = deployment_logs(&state.db, &deployment_id).await else {
+        return;
+    };
+    let mut finished = is_finished(&response.status);
+    let last_ts = lines.last().map(|l| l.ts.clone()).unwrap_or_default();
+    let snapshot = json!({
+        "type": "snapshot",
+        "deployment": response,
+        "logs": lines,
+        "logs_truncated": truncated,
+        "container_port": app.container_port,
+        "health_check_path": app.health_check_path,
+        "source_type": app.source_type,
+    });
+    if socket
+        .send(Message::Text(snapshot.to_string().into()))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    if finished {
+        logs::close_with(&mut socket, 1000, "Deployment finished").await;
+        return;
+    }
+
+    let mut ping = tokio::time::interval(Duration::from_secs(30));
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ping.tick().await;
+    loop {
+        tokio::select! {
+            event = bus.recv() => {
+                let frame = match event {
+                    Ok(event) => match event.as_ref() {
+                        DeployEvent::Log(line) if line.deployment_id.as_deref() == Some(deployment_id.as_str()) => {
+                            // Lines already in the snapshot were written before it.
+                            if line.created_at <= last_ts {
+                                continue;
+                            }
+                            json!({"type": "log", "level": line.level, "message": line.message, "ts": line.created_at})
+                        }
+                        DeployEvent::Deployment { deployment_id: changed, .. } if changed == &deployment_id => {
+                            let Ok(d) = fetch_deployment(&state.db, &app.id, &deployment_id).await else { return };
+                            let Ok(response) = deployment_response(&state.db, &app, d).await else { return };
+                            finished = is_finished(&response.status);
+                            json!({"type": "deployment", "deployment": response})
+                        }
+                        _ => continue,
+                    },
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => json!({
+                        "type": "log",
+                        "level": "warn",
+                        "message": format!("{skipped} event(s) skipped because the connection was too slow; reload to see everything"),
+                        "ts": chrono::Utc::now().to_rfc3339(),
+                    }),
+                    Err(broadcast::error::RecvError::Closed) => return,
+                };
+                if socket.send(Message::Text(frame.to_string().into())).await.is_err() {
+                    return;
+                }
+                if finished {
+                    logs::close_with(&mut socket, 1000, "Deployment finished").await;
+                    return;
+                }
+            }
+            client_msg = socket.recv() => match client_msg {
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
+                Some(Ok(_)) => {}
+            },
+            _ = ping.tick() => {
+                if socket.send(Message::Ping(Default::default())).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 pub async fn get_generated_dockerfile(
@@ -372,6 +587,13 @@ mod tests {
             finished_at: Some("2026-04-08T12:01:00Z".to_string()),
             created_at: "2026-04-08T12:00:00Z".to_string(),
             image_pruned: false,
+            commit_sha: None,
+            commit_message: None,
+            commit_author: None,
+            trigger_detail: None,
+            rollback_of: None,
+            phases: "[]".to_string(),
+            failure: None,
         }
     }
 
@@ -492,6 +714,65 @@ mod tests {
                 .as_deref()
                 .is_some_and(|r| r.contains("pruned"))
         );
+    }
+
+    #[tokio::test]
+    async fn get_deployment_returns_the_row_its_log_and_the_failure_cause() {
+        let state = test_state().await;
+        seed_app(&state, "app-1", "frontend").await;
+        sqlx::query(
+            "INSERT INTO deployments (id, app_id, status, trigger_source, trigger_detail, commit_sha, commit_message, phases, failure, started_at, finished_at, created_at)
+             VALUES ('dep-1', 'app-1', 'failed', 'manual', 'ada@example.com', 'abcdef1234567', 'Fix login', ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:01:30Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(r#"[{"phase":"build","status":"failed"}]"#)
+        .bind(r#"{"phase":"build","code":"build_failed","title":"The build failed (exit code 1)","hint":"Fix it","excerpt":["npm ERR! x"]}"#)
+        .execute(&state.db)
+        .await
+        .unwrap_or_else(|err| panic!("seed deployment: {err}"));
+        for (i, (dep, msg)) in [
+            (Some("dep-1"), "first"),
+            (None, "unrelated"),
+            (Some("dep-1"), "second"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            sqlx::query(
+                "INSERT INTO deploy_logs (id, app_id, deployment_id, message, level, created_at) VALUES (?, 'app-1', ?, ?, 'info', ?)",
+            )
+            .bind(format!("l{i}"))
+            .bind(dep)
+            .bind(msg)
+            .bind(format!("2026-01-01T00:00:0{i}Z"))
+            .execute(&state.db)
+            .await
+            .unwrap_or_else(|err| panic!("seed log: {err}"));
+        }
+
+        let response = get_deployment(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            State(state),
+            Path(("frontend".to_string(), "dep-1".to_string())),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("get_deployment should succeed"))
+        .into_response();
+        let body = response_json(response).await;
+        let data = &body["data"];
+        assert_eq!(data["duration_secs"], 90);
+        assert_eq!(data["commit_message"], "Fix login");
+        assert_eq!(data["trigger_detail"], "ada@example.com");
+        assert_eq!(data["failure"]["code"], "build_failed");
+        assert_eq!(data["phases"][0]["status"], "failed");
+        assert_eq!(data["container_port"], 3000);
+        let messages: Vec<&str> = data["logs"]
+            .as_array()
+            .unwrap_or_else(|| panic!("logs array"))
+            .iter()
+            .filter_map(|l| l["message"].as_str())
+            .collect();
+        assert_eq!(messages, vec!["first", "second"]);
     }
 
     #[tokio::test]

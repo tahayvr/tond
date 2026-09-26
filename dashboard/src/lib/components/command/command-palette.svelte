@@ -13,7 +13,6 @@
 		type PaletteData,
 		type PaletteEntry
 	} from '$lib/command-palette';
-	import { appTabHref } from '$lib/tabs';
 	import { getTerminalOpen, setTerminalOpen } from '$lib/ui-context.svelte';
 
 	let {
@@ -77,7 +76,8 @@
 			case 'shortcuts':
 				onShowShortcuts();
 				break;
-			case 'deploy':
+			case 'deploy': {
+				let deploymentId = '';
 				confirmAction({
 					title: `Deploy ${action.appName}?`,
 					description:
@@ -85,11 +85,15 @@
 					confirmLabel: 'Deploy',
 					pendingLabel: 'Starting deploy…',
 					destructive: false,
-					onconfirm: () => deployApp(action.appId)
+					onconfirm: async () => {
+						deploymentId = (await deployApp(action.appId)).deployment_id;
+					}
 				}).then((ok) => {
-					if (ok) goto(appTabHref(action.appId, 'deployments'));
+					// Follow the deploy live, like the app page's Deploy button.
+					if (ok) goto(`/apps/${action.appId}/deployments/${deploymentId}`);
 				});
 				break;
+			}
 		}
 	}
 </script>

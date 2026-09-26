@@ -1,4 +1,5 @@
 <script lang="ts">
+	import PageTitle from '$lib/components/nav/page-title.svelte';
 	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
@@ -76,6 +77,8 @@
 		}
 	}
 </script>
+
+<PageTitle title="Set password" />
 
 <div class="flex min-h-[80vh] flex-col items-center justify-center px-4">
 	<div class="w-full max-w-md space-y-8">

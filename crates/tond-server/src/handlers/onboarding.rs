@@ -185,7 +185,7 @@ async fn certificate_status(db: &sqlx::SqlitePool, dashboard_domain: &str) -> Op
     .flatten()
 }
 
-async fn fetch_public_ip() -> Option<IpAddr> {
+pub(crate) async fn fetch_public_ip() -> Option<IpAddr> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()

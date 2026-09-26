@@ -37,6 +37,7 @@
 	import * as Dialog from '$lib/components/ui/dialog/index.js';
 	import * as Select from '$lib/components/ui/select/index.js';
 	import Breadcrumb from '$lib/components/nav/breadcrumb.svelte';
+	import StreamLogViewer from '$lib/components/logs/stream-log-viewer.svelte';
 	import MetricsPanel from '$lib/components/metrics/metrics-panel.svelte';
 	import { SvelteSet } from 'svelte/reactivity';
 	import { untrack } from 'svelte';
@@ -64,6 +65,19 @@
 			? 'settings'
 			: tabFromUrl(page.url, DATABASE_TABS, 'overview')
 	);
+
+	/** UI context for this database, with the feed paused while the Logs tab streams. */
+	function dbContext(d: ManagedDatabaseDetail) {
+		const ctx = databaseContext(d);
+		return tab === 'logs' ? { ...ctx, feed: { ...ctx.feed, wsUrl: null } } : ctx;
+	}
+
+	$effect(() => {
+		void tab;
+		untrack(() => {
+			if (db) setUiContext(dbContext(db));
+		});
+	});
 	let error = $state('');
 	let projects = $state<Project[]>([]);
 	let showDeleteDialog = $state(false);
@@ -151,7 +165,7 @@
 		try {
 			[db, projects] = await Promise.all([getDatabase(dbId), listProjects()]);
 			if (db) {
-				setUiContext(databaseContext(db));
+				setUiContext(dbContext(db));
 				initLimitsDraft();
 			}
 		} catch (e: any) {
@@ -222,7 +236,7 @@
 				openFeedPanel();
 				try {
 					db = await redeployDatabase(dbId);
-					if (db) setUiContext(databaseContext(db));
+					if (db) setUiContext(dbContext(db));
 				} finally {
 					redeploying = false;
 				}
@@ -396,7 +410,7 @@
 			db = res.database;
 			creds = null;
 			revealedKeys.clear();
-			if (db) setUiContext(databaseContext(db));
+			if (db) setUiContext(dbContext(db));
 			credSuccess = `${credLabel(field)} changed inside the database and saved. Update any app that still connects with the old password, then redeploy it.`;
 			credDialogOpen = false;
 			editingCredField = null;
@@ -470,7 +484,7 @@
 						: memoryLimitDraft * 1024 * 1024;
 			}
 			db = await updateDatabase(dbId, { memory_limit: memoryLimitBytes });
-			if (db) setUiContext(databaseContext(db));
+			if (db) setUiContext(dbContext(db));
 			limitsSaved = 'Memory limit saved.';
 		} catch (e: any) {
 			limitsError = e.message ?? 'Failed to save limits';
@@ -606,7 +620,7 @@
 			db = routeData.db;
 			projects = routeData.projects;
 			if (db) {
-				setUiContext(databaseContext(db));
+				setUiContext(dbContext(db));
 				initLimitsDraft();
 			}
 		});
@@ -685,6 +699,18 @@
 		/>
 
 		<div>
+			<!-- ── Logs tab (streams only while open) ── -->
+			{#if tab === 'logs'}
+				<div class="mt-4">
+					<StreamLogViewer
+						wsUrl="/api/databases/{db.id}/logs/stream"
+						downloadName="{db.name}-logs"
+						label="{db.name} logs"
+						showPrefix={false}
+					/>
+				</div>
+			{/if}
+
 			<!-- ── Overview tab ── -->
 			{#if tab === 'overview'}
 				<div class="mt-4 space-y-4">

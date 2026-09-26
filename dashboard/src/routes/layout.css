@@ -49,9 +49,46 @@
 	--sidebar-accent-foreground: oklch(0.205 0 0);
 	--sidebar-border: oklch(0.922 0 0);
 	--sidebar-ring: oklch(0.52 0.17 255);
+	/* Log viewer surface and the 16 ANSI colours, tuned for contrast on it */
+	--log-bg: oklch(0.985 0 0);
+	--log-fg: oklch(0.2 0 0);
+	--ansi-0: #1f2328;
+	--ansi-1: #cf222e;
+	--ansi-2: #1a7f37;
+	--ansi-3: #9a6700;
+	--ansi-4: #0969da;
+	--ansi-5: #8250df;
+	--ansi-6: #1b7c83;
+	--ansi-7: #6e7781;
+	--ansi-8: #57606a;
+	--ansi-9: #a40e26;
+	--ansi-10: #116329;
+	--ansi-11: #7d4e00;
+	--ansi-12: #0550ae;
+	--ansi-13: #6639ba;
+	--ansi-14: #1b7c83;
+	--ansi-15: #57606a;
 }
 
 .dark {
+	--log-bg: oklch(0.175 0 0);
+	--log-fg: oklch(0.93 0 0);
+	--ansi-0: #6e7681;
+	--ansi-1: #ff7b72;
+	--ansi-2: #3fb950;
+	--ansi-3: #d29922;
+	--ansi-4: #58a6ff;
+	--ansi-5: #bc8cff;
+	--ansi-6: #39c5cf;
+	--ansi-7: #b1bac4;
+	--ansi-8: #8b949e;
+	--ansi-9: #ffa198;
+	--ansi-10: #56d364;
+	--ansi-11: #e3b341;
+	--ansi-12: #79c0ff;
+	--ansi-13: #d2a8ff;
+	--ansi-14: #56d4dd;
+	--ansi-15: #f0f6fc;
 	--background: oklch(0.145 0 0);
 	--foreground: oklch(0.985 0 0);
 	--card: oklch(0.159 0 0);
@@ -131,6 +168,8 @@
 	--color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
 	--color-sidebar-border: var(--sidebar-border);
 	--color-sidebar-ring: var(--sidebar-ring);
+	--color-log-bg: var(--log-bg);
+	--color-log-fg: var(--log-fg);
 }
 
 @layer base {

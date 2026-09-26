@@ -119,6 +119,12 @@ async fn main() -> Result<()> {
 
     tracing::info!("Database initialized");
 
+    // Deployments that were running when the server stopped will never finish.
+    let interrupted = deploy::progress::fail_interrupted(&state.db).await?;
+    if interrupted > 0 {
+        tracing::warn!("Marked {interrupted} interrupted deployment(s) as failed");
+    }
+
     // Load persisted settings from DB into the in-memory cache
     {
         use tond_common::SettingRow;
@@ -303,6 +309,7 @@ async fn main() -> Result<()> {
         )
         .route("/api/apps/{id}/domain", put(handlers::update_domain))
         .route("/api/apps/{id}/health", put(handlers::update_health))
+        .route("/api/apps/{id}/port", put(handlers::update_port))
         .route("/api/compose/validate", post(handlers::validate_compose))
         .route("/api/apps/{id}/volumes", post(handlers::add_volume))
         .route("/api/apps/{id}/volumes", delete(handlers::remove_volume))
@@ -321,9 +328,24 @@ async fn main() -> Result<()> {
             get(handlers::deployments::list_deployments),
         )
         .route(
+            "/api/apps/{id}/deployments/{deployment_id}",
+            get(handlers::deployments::get_deployment),
+        )
+        .route(
+            "/api/apps/{id}/deployments/{deployment_id}/stream",
+            get(handlers::deployments::stream_deployment),
+        )
+        .route(
             "/api/apps/{id}/deployments/{deployment_id}/generated-dockerfile",
             get(handlers::deployments::get_generated_dockerfile),
         )
+        // Source inspection for the new-app wizard, DNS checks for domains
+        .route(
+            "/api/git/branches",
+            post(handlers::git::list_remote_branches),
+        )
+        .route("/api/images/inspect", post(handlers::images::inspect_image))
+        .route("/api/domains/check", get(handlers::domains::check_domain))
         .route(
             "/api/apps/{id}/rollback",
             post(handlers::deployments::rollback_app),

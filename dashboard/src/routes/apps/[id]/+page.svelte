@@ -42,7 +42,9 @@
 		type RegistryCredential,
 		type GitHubApp,
 		type GitHubRepo,
-		type GitHubBranch
+		type GitHubBranch,
+		type LogLine,
+		openLogStream
 	} from '$lib/api';
 	import { goto } from '$app/navigation';
 	import { isAdmin, can } from '$lib/auth.svelte';
@@ -76,6 +78,7 @@
 	import AppEnvironment from '$lib/components/tabs/app-page/app-environment.svelte';
 	import AppDomain from '$lib/components/tabs/app-page/app-domain.svelte';
 	import AppHealth from '$lib/components/tabs/app-page/app-health.svelte';
+	import AppPort from '$lib/components/tabs/app-page/app-port.svelte';
 	import AppVolumes from '$lib/components/tabs/app-page/app-volumes.svelte';
 	import AppPreviews from '$lib/components/tabs/app-page/app-previews.svelte';
 	import PreviewDomainRequiredAlert from '$lib/components/alerts/preview-domain-required-alert.svelte';
@@ -88,14 +91,17 @@
 	import GitBranch from '~icons/ri/git-branch-line';
 	import Unlink2 from '~icons/ri/link-unlink-m';
 	import Lock from '~icons/ri/lock-line';
+	import SpinnerIcon from '~icons/ri/loader-4-line';
 	import type { PageProps } from './$types';
-	import type { LogLine } from '$lib/components/tabs/app-page/app-logs.svelte';
+
 	import { createLogBuffer } from '$lib/log-buffer';
 	import { pollWhileVisible } from '$lib/polling';
-	import { connectWithRetry, wsUrl, type ReconnectingSocket } from '$lib/reconnecting-socket';
 	import { untrack } from 'svelte';
 
 	let { data, params }: PageProps = $props();
+
+	/** The running deployment while the app builds (for the "View deploy" link). */
+	let activeDeploymentId = $state<string | null>(null);
 
 	let app = $derived(data.app as App | null);
 	let error = $state('');
@@ -124,7 +130,6 @@
 	);
 
 	// Domain form
-	let domainInput = $state('');
 	let certRefreshKey = $state(0);
 
 	// Health form
@@ -205,14 +210,14 @@
 	// Logs state — bounded (last LOG_BUFFER_LIMIT lines) and batched per flush.
 	let logLines = $state.raw<LogLine[]>([]);
 	let logStreaming = $state(false);
-	let logSocket: ReconnectingSocket | null = null;
+	let closeLogSocket: (() => void) | null = null;
+	let deploying = $state(false);
 	const logBuffer = createLogBuffer<LogLine>((lines) => (logLines = lines));
 
 	let appId = $derived(page.params.id || params.id);
 
 	/** Reset every settings form on the page to the app's saved values. */
 	function initForms(a: App) {
-		domainInput = a.domain || '';
 		healthPath = a.health_check_path || '';
 		healthInterval = a.health_check_interval;
 		healthThreshold = a.health_failure_threshold;
@@ -262,74 +267,48 @@
 	}
 
 	function stopLogStream() {
-		logSocket?.close();
-		logSocket = null;
+		closeLogSocket?.();
+		closeLogSocket = null;
 		logBuffer.flush();
 		logStreaming = false;
-	}
-
-	function handleLogMessage(evt: MessageEvent) {
-		try {
-			const msg = JSON.parse(evt.data);
-			if (msg.type === 'snapshot') {
-				// Sent on every (re)connection: replaces what is shown.
-				const deployLogs: LogLine[] = (msg.deploy_logs ?? []).map(
-					(l: { level: string; trigger_source: string; message: string; ts: string }) => ({
-						kind: 'deploy' as const,
-						level: l.level,
-						trigger_source: l.trigger_source,
-						message: l.message,
-						ts: l.ts
-					})
-				);
-				const containerLogs: LogLine[] = (msg.container_logs ?? []).map(
-					(entry: { ts: string | null; line: string }) => ({
-						kind: 'container' as const,
-						line: entry.line,
-						ts: entry.ts ?? undefined
-					})
-				);
-				logBuffer.replace([...deployLogs, ...containerLogs]);
-			} else if (msg.type === 'deploy') {
-				logBuffer.push({
-					kind: 'deploy',
-					level: msg.level,
-					trigger_source: msg.trigger_source,
-					message: msg.message,
-					ts: msg.ts
-				});
-			} else if (msg.type === 'container') {
-				logBuffer.push({ kind: 'container', line: msg.line, ts: msg.ts ?? undefined });
-			}
-		} catch {
-			// ignore parse errors
-		}
 	}
 
 	function startLogStream() {
 		stopLogStream();
 		logBuffer.clear();
 		logStreaming = true;
-		// Reconnects with backoff if the server restarts.
-		logSocket = connectWithRetry(wsUrl(`/api/apps/${appId}/logs/stream`), {
-			onOpen: () => (logStreaming = true),
-			onMessage: handleLogMessage,
-			onDisconnect: () => {
+		const close = openLogStream(`/api/apps/${appId}/logs/stream`, {
+			onLine(line) {
+				logBuffer.push(line);
+			},
+			// Reconnects with backoff if the server restarts; a fresh snapshot follows.
+			onOpen(reconnected) {
+				logStreaming = true;
+				if (reconnected) logBuffer.clear();
+			},
+			onDisconnect() {
 				logBuffer.flush();
 				logStreaming = false;
 			}
 		});
+		closeLogSocket = close;
+	}
+
+	/** Start a deploy and open its live view. */
+	async function startDeploy() {
+		const started = await deployApp(appId);
+		await goto(`/apps/${appId}/deployments/${started.deployment_id}`);
 	}
 
 	async function handleDeploy() {
+		deploying = true;
+		error = '';
 		try {
-			openFeedPanel();
-			await deployApp(appId);
-			await loadApp();
-			// Poll to reflect the building → running transition
-			statusPollRequested = true;
+			await startDeploy();
 		} catch (e: any) {
 			error = e.message;
+		} finally {
+			deploying = false;
 		}
 	}
 
@@ -390,20 +369,14 @@
 	}
 
 	async function handleEnvRedeploy() {
-		openFeedPanel();
-		await deployApp(appId);
-		await loadApp();
-		statusPollRequested = true;
+		await startDeploy();
 	}
 
-	async function handleUpdateDomain() {
-		try {
-			await updateDomain(appId, domainInput);
-			await loadApp();
-			certRefreshKey += 1;
-		} catch (e: any) {
-			error = e.message;
-		}
+	/** Domain card save; errors are shown in the card, so this rethrows. */
+	async function handleUpdateDomain(domain: string) {
+		await updateDomain(appId, domain);
+		await loadApp();
+		certRefreshKey += 1;
 	}
 
 	async function handleUpdateHealth() {
@@ -478,12 +451,11 @@
 		}
 	}
 
-	async function handleRollback(deploymentId?: string) {
+	async function handleRollback(deploymentId: string) {
 		rollbackError = '';
 		try {
-			await rollbackApp(appId, deploymentId);
-			await loadApp();
-			await loadDeployments();
+			const started = await rollbackApp(appId, deploymentId);
+			await goto(`/apps/${appId}/deployments/${started.deployment_id}`);
 		} catch (e: any) {
 			rollbackError = e.message;
 		}
@@ -888,7 +860,7 @@
 
 	// Log stream only while the Logs tab is open; restarts for a different app.
 	$effect(() => {
-		if (activeTab !== 'logs') return;
+		if (activeTab !== 'logs' || !can('logs:read')) return;
 		void appId;
 		untrack(startLogStream);
 		return stopLogStream;
@@ -910,8 +882,25 @@
 		});
 	});
 
+	// While the app builds, link to the running deployment's live view.
+	$effect(() => {
+		if (appStatus !== 'building') {
+			activeDeploymentId = null;
+			return;
+		}
+		const id = appId;
+		listDeployments(id)
+			.then((list) => {
+				if (id !== appId) return;
+				activeDeploymentId =
+					list.find((d) => d.status === 'running' || d.status === 'queued')?.id ?? null;
+			})
+			.catch(() => (activeDeploymentId = null));
+	});
+
 	// Mount-only teardown, keyed on the app id (navigating to another app
-	// resets the page; a data reload does not).
+	// resets the page; a data reload does not). `?tab=` opens a tab directly
+	// (the live deploy view links to where a failure is fixed).
 	$effect(() => {
 		void appId;
 		untrack(() => {
@@ -957,11 +946,20 @@
 						{start.pending ? 'Starting…' : 'Start'}
 					</Button>
 				{/if}
+				{#if activeDeploymentId}
+					<Button
+						variant="outline"
+						size="sm"
+						href="/apps/{current.id}/deployments/{activeDeploymentId}"
+					>
+						<SpinnerIcon class="animate-spin motion-reduce:animate-none" /> View deploy
+					</Button>
+				{/if}
 				{#if can('apps:deploy')}
 					<Button
 						size="sm"
 						onclick={() => deploy.run()}
-						disabled={deploy.pending || current.status === 'building'}
+						disabled={deploy.pending || deploying || current.status === 'building'}
 						aria-busy={deploy.pending}
 					>
 						{deploy.pending
@@ -1015,6 +1013,7 @@
 				<!-- Logs tab -->
 				{#if viewAllowed && activeTab === 'logs'}
 					<AppLogs
+						appName={app.name}
 						{logLines}
 						streaming={logStreaming}
 						onConnect={startLogStream}
@@ -1026,10 +1025,13 @@
 				<!-- Deployments tab -->
 				{#if viewAllowed && activeTab === 'deployments'}
 					<AppDeployments
+						appId={app.id}
+						appName={app.name}
 						{deployments}
 						loading={deploymentsLoading}
 						error={rollbackError}
 						onRollback={handleRollback}
+						canRollback={can('apps:rollback')}
 						onViewGeneratedDockerfile={handleViewGeneratedDockerfile}
 					/>
 				{/if}
@@ -1050,15 +1052,23 @@
 				<!-- Domain tab -->
 				{#if viewAllowed && activeTab === 'domain'}
 					<AppDomain
-						bind:domainInput
-						savedDomain={app?.domain ?? null}
+						{app}
 						{certRefreshKey}
 						onUpdate={handleUpdateDomain}
+						canEdit={can('apps:write')}
 					/>
 				{/if}
 
-				<!-- Health tab -->
+				<!-- Health tab (port, health check, deploy timeout) -->
 				{#if viewAllowed && activeTab === 'health'}
+					<AppPort
+						{app}
+						onSaved={(updated) => (app = updated)}
+						onRedeploy={startDeploy}
+						canEdit={can('apps:write')}
+						canDeploy={can('apps:deploy')}
+					/>
+					<Separator class="my-6" />
 					<AppHealth
 						{app}
 						bind:healthPath
@@ -1093,7 +1103,7 @@
 									id="resource-memory"
 									type="number"
 									bind:value={resourceMemoryDraft}
-									placeholder="Unlimited"
+									placeholder="Default cap"
 									min={1}
 									disabled={savingResources}
 								/>
