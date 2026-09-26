@@ -89,6 +89,11 @@ test PKG="":
     cargo test {{ if PKG != "" { "-p tond-" + PKG } else { "" } }} --doc --quiet
     cargo nextest run {{ if PKG != "" { "-p tond-" + PKG } else { "" } }} --show-progress=only
 
+# Regenerate the OpenAPI spec (docs/openapi.json + the embedded copy) from routes.rs and the types
+openapi:
+    TOND_UPDATE_OPENAPI=1 cargo nextest run -p tond-server openapi::generate --no-fail-fast
+    cargo nextest run -p tond-server openapi
+
 # Run dev server for Dashboard
 [working-directory('dashboard')]
 dev:

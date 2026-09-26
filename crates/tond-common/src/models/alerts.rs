@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 /// What a rule's targets are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AlertScope {
     /// One app (`app_id`) or every app (`app_id` = None).
@@ -29,6 +30,7 @@ pub enum AlertScope {
 
 /// How a value is compared with the threshold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AlertComparison {
     /// value > threshold
@@ -63,6 +65,7 @@ impl AlertComparison {
 
 /// Static description of one rule kind.
 #[derive(Debug, Clone, Copy, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AlertKindInfo {
     pub kind: &'static str,
     pub label: &'static str,
@@ -253,6 +256,7 @@ pub const ALERT_DEFAULT_REPEAT_SECS: i64 = 4 * 3600;
 
 /// One kind plus whether its data exists on this server.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AlertKindResponse {
     #[serde(flatten)]
     pub info: AlertKindInfo,
@@ -265,6 +269,7 @@ pub struct AlertKindResponse {
 
 /// Raw row of `alert_rules`.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AlertRule {
     pub id: String,
     pub name: String,
@@ -283,6 +288,7 @@ pub struct AlertRule {
 
 /// API shape of a rule.
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AlertRuleResponse {
     pub id: String,
     pub name: String,
@@ -309,8 +315,9 @@ pub struct AlertRuleResponse {
     pub updated_at: String,
 }
 
-/// POST /api/alerts
+/// POST /api/v1/alerts
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreateAlertRuleRequest {
     pub name: String,
     pub kind: String,
@@ -333,8 +340,9 @@ pub struct CreateAlertRuleRequest {
     pub integration_ids: Vec<String>,
 }
 
-/// PATCH /api/alerts/{id} — every field optional
+/// PATCH /api/v1/alerts/{id} — every field optional
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateAlertRuleRequest {
     pub name: Option<String>,
     pub threshold: Option<f64>,
@@ -351,8 +359,9 @@ pub struct UpdateAlertRuleRequest {
 
 // ── Live alerts and history ──────────────────────────────────────────────────
 
-/// A pending or firing alert (GET /api/alerts/active).
+/// A pending or firing alert (GET /api/v1/alerts/active).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ActiveAlert {
     pub rule_id: String,
     pub rule_name: String,
@@ -382,8 +391,9 @@ pub struct ActiveAlert {
     pub failed_deliveries: i64,
 }
 
-/// One firing episode (GET /api/alerts/history).
+/// One firing episode (GET /api/v1/alerts/history).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AlertEpisode {
     pub id: String,
     pub rule_id: Option<String>,
@@ -410,14 +420,16 @@ pub struct AlertEpisode {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AlertHistoryPage {
     pub episodes: Vec<AlertEpisode>,
     /// Total matching the filter
     pub total: i64,
 }
 
-/// Query of GET /api/alerts/history
+/// Query of GET /api/v1/alerts/history
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AlertHistoryQuery {
     pub rule_id: Option<String>,
     pub app_id: Option<String>,
@@ -431,6 +443,7 @@ pub struct AlertHistoryQuery {
 
 /// One notification to one channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AlertDelivery {
     pub id: String,
     pub episode_id: String,
@@ -451,15 +464,17 @@ pub struct AlertDelivery {
     pub created_at: String,
 }
 
-/// GET /api/alerts/history/{id}
+/// GET /api/v1/alerts/history/{id}
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AlertEpisodeDetail {
     pub episode: AlertEpisode,
     pub deliveries: Vec<AlertDelivery>,
 }
 
-/// POST /api/alerts/{rule}/targets/{target}/snooze
+/// POST /api/v1/alerts/{rule}/targets/{target}/snooze
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SnoozeAlertRequest {
     /// Mute for this many minutes …
     #[serde(default)]
@@ -473,6 +488,7 @@ pub struct SnoozeAlertRequest {
 
 /// A daily window during which notifications wait (e.g. 22:00–07:00).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct QuietHours {
     #[serde(default)]
     pub enabled: bool,
@@ -505,6 +521,7 @@ impl Default for QuietHours {
 
 /// A channel's quiet hours: follow the global setting, none, or its own.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum ChannelQuietHours {
     #[default]
@@ -513,8 +530,9 @@ pub enum ChannelQuietHours {
     Custom(QuietHours),
 }
 
-/// GET/PUT /api/alerts/settings
+/// GET/PUT /api/v1/alerts/settings
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AlertSettings {
     pub quiet_hours: QuietHours,
 }

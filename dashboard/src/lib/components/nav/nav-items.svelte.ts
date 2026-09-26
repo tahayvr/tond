@@ -21,6 +21,7 @@ export const navItems: NavItem[] = [
 	{ href: '/certificates', label: 'Certificates', icon: 'lock' },
 	{ href: '/integrations', label: 'Integrations', icon: 'puzzle', scope: 'settings:write' },
 	{ href: '/activity', label: 'Activity', icon: 'activity' },
+	{ href: '/developer', label: 'API', icon: 'code' },
 	// { href: '/iam', label: 'IAM', icon: 'fingerprint-pattern' },
 	{ href: '/system', label: 'System', icon: 'app', primary: true },
 	{ href: '/users', label: 'Users', icon: 'team', scope: 'users:admin' },

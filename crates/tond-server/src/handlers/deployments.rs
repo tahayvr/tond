@@ -1,9 +1,9 @@
 // handlers/deployments.rs — deployment history and rollback
 //
-// GET  /api/apps/{id}/deployments  — list last 20 deployments for an app
-// GET  /api/apps/{id}/deployments/{deployment_id}         — one deployment + its log
-// GET  /api/apps/{id}/deployments/{deployment_id}/stream  — live deploy view (WebSocket)
-// POST /api/apps/{id}/rollback     — redeploy the exact image of an earlier deployment
+// GET  /api/v1/apps/{id}/deployments  — list last 20 deployments for an app
+// GET  /api/v1/apps/{id}/deployments/{deployment_id}         — one deployment + its log
+// GET  /api/v1/apps/{id}/deployments/{deployment_id}/stream  — live deploy view (WebSocket)
+// POST /api/v1/apps/{id}/rollback     — redeploy the exact image of an earlier deployment
 //
 // Deployments are the source of truth for what ran: commit (git deploys),
 // trigger (manual / webhook / rollback / upload / cli / api, plus who),
@@ -51,7 +51,7 @@ use crate::{
 use super::fetch_app;
 use super::logs;
 
-/// POST /api/apps/{id}/rollback body (optional).
+/// POST /api/v1/apps/{id}/rollback body (optional).
 #[derive(Debug, Default, Deserialize)]
 pub struct RollbackRequest {
     /// Deployment whose image to restore; default: the previous distinct image.
@@ -262,8 +262,8 @@ pub async fn rollback_app(
     .await;
 
     let mut body = crate::handlers::queued_response("Rollback queued", &app_id, &queued);
-    body["image_tag"] = json!(image_tag);
-    body["target_deployment_id"] = json!(target_id);
+    body.image_tag = Some(image_tag);
+    body.target_deployment_id = Some(target_id);
     Ok((StatusCode::ACCEPTED, Json(ApiResponse::ok(body))))
 }
 
@@ -329,7 +329,7 @@ async fn deployment_logs(
     Ok((lines, truncated))
 }
 
-/// GET /api/apps/{id}/deployments/{deployment_id}
+/// GET /api/v1/apps/{id}/deployments/{deployment_id}
 pub async fn get_deployment(
     _rate: RateLimit,
     _auth: Authz<(scope::AppsRead, scope::LogsRead)>,
@@ -353,7 +353,7 @@ pub async fn get_deployment(
     ))
 }
 
-/// GET /api/apps/{id}/deployments/{deployment_id}/stream (WebSocket)
+/// GET /api/v1/apps/{id}/deployments/{deployment_id}/stream (WebSocket)
 ///
 /// On connect: `{"type":"snapshot","deployment":{…},"logs":[…],"logs_truncated":bool,
 /// "container_port":n,"health_check_path":…}` — the same shape as the GET.

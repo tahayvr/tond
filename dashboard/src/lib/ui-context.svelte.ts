@@ -218,14 +218,14 @@ export function clearUiContext() {
 export function projectsContext(): UiContext {
 	return {
 		type: 'projects',
-		feed: { title: 'System_Log', wsUrl: '/api/system/logs/stream', label: '' }
+		feed: { title: 'System_Log', wsUrl: '/api/v1/system/logs/stream', label: '' }
 	};
 }
 
 export function databasesContext(): UiContext {
 	return {
 		type: 'databases',
-		feed: { title: 'DB_Log', wsUrl: '/api/databases/logs/stream', label: '' }
+		feed: { title: 'DB_Log', wsUrl: '/api/v1/databases/logs/stream', label: '' }
 	};
 }
 
@@ -243,7 +243,7 @@ export function appContext(app: App): UiContext {
 		app,
 		feed: {
 			title: app.name,
-			wsUrl: `/api/apps/${app.id}/logs/stream`,
+			wsUrl: `/api/v1/apps/${app.id}/logs/stream`,
 			label: 'live stream'
 		}
 	};
@@ -255,7 +255,7 @@ export function databaseContext(database: ManagedDatabase): UiContext {
 		database,
 		feed: {
 			title: database.name,
-			wsUrl: `/api/databases/${database.id}/logs/stream`,
+			wsUrl: `/api/v1/databases/${database.id}/logs/stream`,
 			label: 'container'
 		}
 	};
@@ -267,7 +267,7 @@ export function cronJobContext(cronJob: CronJob): UiContext {
 		cronJob,
 		feed: {
 			title: cronJob.name,
-			wsUrl: `/api/cron/${cronJob.id}/runs/stream`,
+			wsUrl: `/api/v1/cron/${cronJob.id}/runs/stream`,
 			label: 'last run'
 		}
 	};

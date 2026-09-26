@@ -132,7 +132,7 @@ describe('TemplateDeployForm', () => {
 				'Umami needs about 300 MB and this server has 120 MB free.',
 				409,
 				null,
-				'insufficient_memory'
+				'INSUFFICIENT_MEMORY'
 			)
 		);
 		const user = userEvent.setup();

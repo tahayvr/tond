@@ -1,4 +1,4 @@
-// Formatting for uptime checks (GET /api/apps/{id}/uptime, /api/uptime).
+// Formatting for uptime checks (GET /api/v1/apps/{id}/uptime, /api/v1/uptime).
 
 import type { UptimeBar, UptimeCause, UptimeStatus } from '$lib/api';
 

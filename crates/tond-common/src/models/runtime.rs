@@ -1,4 +1,4 @@
-// runtime.rs — Tond measuring itself (GET /api/system/self)
+// runtime.rs — Tond measuring itself (GET /api/v1/system/self)
 //
 // tond-server reports its own process, background loops, database and HTTP
 // latency, plus the same for tond-proxy (fetched over the proxy control
@@ -11,6 +11,7 @@ use crate::procstat::ProcessSample;
 
 /// Health of one background loop.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct LoopStats {
     pub name: String,
     /// Times the loop woke up (timer or event), since start.
@@ -34,6 +35,7 @@ pub struct LoopStats {
 
 /// One statement that exceeded the slow-statement threshold.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SlowStatement {
     pub sql: String,
     pub elapsed_ms: f64,
@@ -42,12 +44,14 @@ pub struct SlowStatement {
 
 /// How often one distinct statement ran.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct StatementCount {
     pub sql: String,
     pub count: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DbStats {
     pub size_bytes: Option<u64>,
     pub wal_bytes: Option<u64>,
@@ -64,9 +68,10 @@ pub struct DbStats {
 
 /// Latency histogram of one HTTP route.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RouteLatency {
     pub method: String,
-    /// Route template, e.g. `/api/apps/{id}`.
+    /// Route template, e.g. `/api/v1/apps/{id}`.
     pub route: String,
     pub count: u64,
     pub errors: u64,
@@ -79,6 +84,7 @@ pub struct RouteLatency {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ServerProcessStats {
     #[serde(flatten)]
     pub process: ProcessSample,
@@ -93,6 +99,7 @@ pub struct ServerProcessStats {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct BuildQueueStats {
     /// Builds allowed to run at once.
     pub build_slots: u32,
@@ -104,6 +111,7 @@ pub struct BuildQueueStats {
 
 /// What tond-proxy reports about itself over the control socket.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ProxyStats {
     pub pid: u32,
     #[serde(flatten)]
@@ -121,6 +129,7 @@ pub struct ProxyStats {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ProxySelfStats {
     /// tond-server holds a live control connection to the proxy.
     pub connected: bool,
@@ -130,8 +139,9 @@ pub struct ProxySelfStats {
     pub cpu_percent: Option<f64>,
 }
 
-/// GET /api/system/self
+/// GET /api/v1/system/self
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SystemSelfResponse {
     pub version: String,
     pub server: ServerProcessStats,

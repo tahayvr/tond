@@ -1,37 +1,49 @@
 // commands/templates.rs — `tond templates`: browse the one-click catalog
 //
 // Deploying one is `tond apps create <name> --template <id>`.
+//
+// JSON output (--json): `list` prints the catalog response ({templates,
+// memory, apps_domain}), `show` prints one template.
 
 use anyhow::Result;
 use clap::Subcommand;
 use tond_common::{TemplateCatalogResponse, TemplateResponse};
 
 use crate::client::TondClient;
+use crate::error::CliError;
+use crate::output::{Output, out};
 
 #[derive(Subcommand)]
 pub enum TemplatesAction {
     /// List the templates, with their memory needs
+    #[command(visible_alias = "ls")]
     List,
     /// Show a template's services, inputs and notes
+    #[command(visible_aliases = ["info", "get"])]
     Show {
         /// Template id (see `tond templates list`)
         id: String,
     },
 }
 
-pub async fn handle(client: &TondClient, action: TemplatesAction) -> Result<()> {
+pub async fn handle(client: &TondClient, output: &Output, action: TemplatesAction) -> Result<()> {
     let catalog = client.list_templates().await?;
     match action {
-        TemplatesAction::List => print!("{}", format_list(&catalog)),
+        TemplatesAction::List => {
+            output.json(&catalog)?;
+            out!(output, "{}", format_list(&catalog));
+        }
         TemplatesAction::Show { id } => {
             let template = catalog
                 .templates
                 .iter()
                 .find(|t| t.id == id)
                 .ok_or_else(|| {
-                    anyhow::anyhow!("Unknown template '{id}'. See `tond templates list`.")
+                    CliError::usage(format!("Unknown template '{id}'."))
+                        .with_hint("See `tond templates list`.")
                 })?;
-            print!("{}", format_details(template));
+            output.json(template)?;
+            out!(output, "{}", format_details(template));
         }
     }
     Ok(())

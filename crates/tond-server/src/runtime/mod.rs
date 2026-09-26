@@ -6,7 +6,7 @@
 //   shutdown     — SIGTERM handling and tracking of in-flight work
 //   dbstats      — SQL statement counters (tracing layer on sqlx's events)
 //   http_metrics — per-route latency histograms (axum route layer)
-//   selfstats    — GET /api/system/self and the Prometheus /metrics text
+//   selfstats    — GET /api/v1/system/self and the Prometheus /metrics text
 
 pub mod changes;
 pub mod dbstats;

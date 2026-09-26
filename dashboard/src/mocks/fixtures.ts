@@ -3042,7 +3042,7 @@ export function makeMockSystemSelf(): SystemSelf {
 		http: [
 			{
 				method: 'GET',
-				route: '/api/apps',
+				route: '/api/v1/apps',
 				count: 120,
 				errors: 0,
 				sum_ms: 240,

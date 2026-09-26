@@ -1,4 +1,4 @@
-// events.rs — the per-app event feed (GET /api/apps/{id}/events)
+// events.rs — the per-app event feed (GET /api/v1/apps/{id}/events)
 //
 // Assembled on request from the tables that already record each fact
 // (deployments, metric_events, certificates, audit_log, alert_history);
@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 /// What happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AppEventKind {
     /// A deployment is queued or running.
@@ -58,6 +59,7 @@ impl AppEventKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AppEvent {
     /// RFC 3339 (UTC).
     pub at: String,
@@ -75,6 +77,7 @@ pub struct AppEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AppEventsResponse {
     /// Newest first.
     pub events: Vec<AppEvent>,
@@ -82,10 +85,11 @@ pub struct AppEventsResponse {
     pub next_before: Option<String>,
 }
 
-// ── Deploy success-rate trend (GET /api/apps/{id}/deployments/stats) ──
+// ── Deploy success-rate trend (GET /api/v1/apps/{id}/deployments/stats) ──
 
 /// One finished deployment in the trend window.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DeployOutcome {
     pub id: String,
     /// "succeeded" | "failed" | "superseded" | "cancelled"
@@ -96,6 +100,7 @@ pub struct DeployOutcome {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DeployStatsResponse {
     /// How many of the latest finished deployments the numbers cover (at most 30).
     pub window: i64,

@@ -69,6 +69,7 @@ pub fn percentile(hist: &[u64], q: f64) -> Option<f64> {
 
 /// Cumulative counters of one route (or a difference of two readings).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TrafficCounters {
     /// Requests answered (every status, including ones without a response).
     pub requests: u64,
@@ -137,6 +138,7 @@ impl TrafficCounters {
 
 /// What a route serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum RouteKind {
     App,
@@ -148,6 +150,7 @@ pub enum RouteKind {
 
 /// One route's cumulative counters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RouteTraffic {
     pub kind: RouteKind,
     /// App or preview id; None for the dashboard and unknown buckets.
@@ -160,6 +163,7 @@ pub struct RouteTraffic {
 
 /// Reply to a `traffic` request.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TrafficSnapshot {
     /// Proxy process id: a new pid means every counter restarted.
     pub pid: u32,

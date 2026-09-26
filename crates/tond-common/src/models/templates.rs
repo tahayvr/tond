@@ -132,6 +132,7 @@ pub struct TemplateManifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct TemplatePublic {
     pub service: String,
@@ -140,6 +141,7 @@ pub struct TemplatePublic {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum TemplateInputKind {
     #[default]
@@ -183,6 +185,7 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct TemplateVolume {
     pub service: String,
@@ -215,6 +218,7 @@ pub struct Template {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TemplateService {
     pub name: String,
     pub image: String,
@@ -938,6 +942,7 @@ pub fn validate(
 // ── API shapes ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TemplateInputResponse {
     pub key: String,
     pub label: String,
@@ -954,6 +959,7 @@ pub struct TemplateInputResponse {
 
 /// GET /api/templates item.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TemplateResponse {
     pub id: String,
     pub name: String,
@@ -1025,6 +1031,7 @@ impl From<Template> for TemplateResponse {
 
 /// Host memory as the catalog shows it, from the host collector's last sample.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TemplateHostMemory {
     pub total_mb: u64,
     /// What the kernel reports as available (total minus used).
@@ -1033,6 +1040,7 @@ pub struct TemplateHostMemory {
 
 /// GET /api/templates
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TemplateCatalogResponse {
     pub templates: Vec<TemplateResponse>,
     /// None until the host collector's first sample.
@@ -1043,6 +1051,7 @@ pub struct TemplateCatalogResponse {
 
 /// POST /api/templates/{id}/deploy
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TemplateDeployRequest {
     /// App name (lowercase letters, digits, hyphens).
     pub name: String,
@@ -1056,6 +1065,7 @@ pub struct TemplateDeployRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TemplateCredential {
     pub key: String,
     pub label: String,
@@ -1063,6 +1073,7 @@ pub struct TemplateCredential {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TemplateDeployResponse {
     pub app_id: String,
     pub app_name: String,

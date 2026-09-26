@@ -10,6 +10,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct DomainStatusResponse {
     pub configured: bool,
     pub expected_target: Option<String>,
@@ -20,6 +21,7 @@ pub struct DomainStatusResponse {
 
 /// The most recent deployment of any app (home page "last deploy" tile).
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq, Eq)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct LastDeploymentResponse {
     pub id: String,
     pub app_id: String,
@@ -31,6 +33,7 @@ pub struct LastDeploymentResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct OnboardingStatusResponse {
     pub dashboard_domain: String,
     pub is_fresh_install: bool,
@@ -410,7 +413,7 @@ mod tests {
         session_token: &str,
     ) -> Authz<scope::AppsRead> {
         let mut parts = axum::http::Request::builder()
-            .uri("/api/onboarding/status")
+            .uri("/api/v1/onboarding/status")
             .body(())
             .unwrap_or_else(|err| panic!("failed to build onboarding test request: {err}"))
             .into_parts()

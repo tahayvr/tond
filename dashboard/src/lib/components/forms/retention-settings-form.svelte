@@ -1,7 +1,7 @@
 <!--
   RetentionSettingsForm — how long Tond keeps build logs, cron runs, app
   events and the activity log, next to what the database weighs and where
-  the space goes. Loads its own data (GET /api/settings/retention).
+  the space goes. Loads its own data (GET /api/v1/settings/retention).
 -->
 <script lang="ts">
 	import {

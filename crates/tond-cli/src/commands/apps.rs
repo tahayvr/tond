@@ -1,12 +1,22 @@
 // commands/apps.rs — `tond apps` subcommand definitions and handler
+//
+// JSON output (--json): list commands print arrays, `info`/`create` print the
+// app, mutations without a resource print `{"ok":true,"action":…}`
+// (Output::done), `deploy`/`push` stream NDJSON events while waiting (see
+// deploy_follow.rs) or print the queued deployment with --no-wait, and
+// `logs --follow` prints the server's log frames as NDJSON.
 
 use anyhow::Result;
 use clap::{Args, Subcommand};
-use serde_json::Value;
+use futures::StreamExt;
+use serde_json::{Value, json};
+use tokio_tungstenite::tungstenite::Message;
 use tond_common::{TemplateDeployRequest, TemplateResponse};
 
 use crate::client::TondClient;
 use crate::deploy_follow;
+use crate::error::{self, CliError};
+use crate::output::{Output, out, outln};
 
 #[derive(Args)]
 pub struct CreateAppOptions {
@@ -79,34 +89,58 @@ pub struct CreateAppOptions {
     pub build_method: Option<String>,
 
     /// Skip interactive prompts and fail if required template inputs are missing.
-    #[arg(long)]
+    #[arg(short = 'y', long)]
     pub yes: bool,
+}
+
+/// `--wait` / `--no-wait` of commands that start a deployment.
+#[derive(Args, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WaitArgs {
+    /// Stream the build and exit non-zero if it fails (the default)
+    #[arg(long, conflicts_with = "no_wait")]
+    pub wait: bool,
+
+    /// Return as soon as the deploy is queued and print the deployment id
+    #[arg(long, visible_alias = "no-follow")]
+    pub no_wait: bool,
+}
+
+impl WaitArgs {
+    pub fn should_wait(&self) -> bool {
+        !self.no_wait
+    }
 }
 
 #[derive(Subcommand)]
 pub enum AppsAction {
     /// List all deployed apps
+    #[command(visible_alias = "ls")]
     List,
 
     /// Create a new app
     Create(Box<CreateAppOptions>),
 
-    /// Deploy an app (build & start from stored source) and follow its progress
+    /// Deploy an app (build & start from stored source); waits and streams the
+    /// build unless --no-wait. Exits 6 if the build or deploy fails.
     Deploy {
         /// App name or ID
         app: String,
-        /// Return as soon as the deploy is queued instead of following it
-        #[arg(long)]
-        no_follow: bool,
+
+        #[command(flatten)]
+        wait: WaitArgs,
     },
 
-    /// Deploy current directory to an app (tar + upload)
+    /// Deploy the current directory to an app (tar + upload); waits like `deploy`
     Push {
         /// App name or ID
         app: String,
+
+        #[command(flatten)]
+        wait: WaitArgs,
     },
 
     /// Show app details
+    #[command(visible_aliases = ["show", "get"])]
     Info {
         /// App name or ID
         app: String,
@@ -140,12 +174,13 @@ pub enum AppsAction {
         app: String,
     },
 
-    /// Delete an app
+    /// Delete an app (asks first; --yes to skip)
+    #[command(visible_alias = "rm")]
     Delete {
         /// App name or ID
         app: String,
 
-        /// Skip confirmation
+        /// Don't ask for confirmation (required when stdin is not a terminal)
         #[arg(short = 'y', long)]
         yes: bool,
     },
@@ -207,10 +242,14 @@ pub enum AppsAction {
         app: String,
     },
 
-    /// Roll back an app to its previous deployment
+    /// Roll back an app to its previous deployment (asks first; --yes to skip)
     Rollback {
         /// App name or ID
         app: String,
+
+        /// Don't ask for confirmation (required when stdin is not a terminal)
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 
     /// Show or generate the SSH deploy key for an app
@@ -261,6 +300,7 @@ pub enum AppsAction {
     },
 
     /// Manage preview deployments for an app
+    #[command(visible_alias = "preview")]
     Previews {
         #[command(subcommand)]
         action: PreviewAction,
@@ -270,6 +310,7 @@ pub enum AppsAction {
 #[derive(Subcommand)]
 pub enum VolumeAction {
     /// Add a persistent volume mount to an app
+    #[command(visible_alias = "create")]
     Add {
         /// App name or ID
         app: String,
@@ -283,18 +324,24 @@ pub enum VolumeAction {
     },
 
     /// List volumes for an app
+    #[command(visible_alias = "ls")]
     List {
         /// App name or ID
         app: String,
     },
 
-    /// Remove a persistent volume mount from an app
+    /// Remove a persistent volume mount from an app (asks first; --yes to skip)
+    #[command(visible_aliases = ["delete", "rm"])]
     Remove {
         /// App name or ID
         app: String,
 
         /// Absolute container path to remove (e.g. /data)
         container_path: String,
+
+        /// Don't ask for confirmation (required when stdin is not a terminal)
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 }
 
@@ -311,36 +358,151 @@ pub enum PreviewAction {
     },
 
     /// List active preview deployments for an app
+    #[command(visible_alias = "ls")]
     List {
         /// App name or ID
         app: String,
     },
 
-    /// Delete a specific preview deployment
+    /// Delete a specific preview deployment (asks first; --yes to skip)
+    #[command(visible_alias = "rm")]
     Delete {
         /// App name or ID
         app: String,
 
         /// Preview deployment ID
         preview_id: String,
+
+        /// Don't ask for confirmation (required when stdin is not a terminal)
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 }
 
-pub async fn handle(client: &TondClient, action: AppsAction) -> Result<()> {
+/// After a deploy or upload was queued: follow it (`--wait`, the default) or
+/// report the queued deployment (`--no-wait`).
+async fn wait_or_report(
+    client: &TondClient,
+    out: &Output,
+    app: &str,
+    queued: Value,
+    wait: WaitArgs,
+) -> Result<()> {
+    let deployment_id = queued
+        .get("deployment_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    match deployment_id {
+        Some(id) if wait.should_wait() => {
+            out.event(&json!({
+                "event": "queued",
+                "app": app,
+                "deployment_id": id,
+                "status": queued.get("status").cloned().unwrap_or_else(|| json!("queued")),
+                "queue_position": queued.get("queue_position").cloned().unwrap_or(Value::Null),
+            }))?;
+            let outcome = deploy_follow::follow(client, out, app, &id).await?;
+            deploy_follow::finish(out, app, &id, outcome)
+        }
+        _ => {
+            let mut doc = match queued {
+                Value::Object(map) => map,
+                _ => serde_json::Map::new(),
+            };
+            doc.entry("app").or_insert_with(|| json!(app));
+            doc.entry("deployment_id").or_insert(Value::Null);
+            doc.entry("status").or_insert_with(|| json!("queued"));
+            out.json(&doc)?;
+            match deployment_id {
+                Some(id) => outln!(
+                    out,
+                    "Deployment {id} queued. Follow it with: tond apps deployments {app}"
+                ),
+                None => outln!(
+                    out,
+                    "Deployment queued. Follow it with: tond apps deployments {app}"
+                ),
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Render one frame of the live log stream.
+fn render_log_frame(out: &Output, text: &str) -> Result<()> {
+    let Ok(val) = serde_json::from_str::<Value>(text) else {
+        outln!(out, "{text}");
+        return out.event(&json!({"type": "raw", "line": text}));
+    };
+    out.event(&val)?;
+    let field = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    match val.get("type").and_then(Value::as_str) {
+        Some("snapshot") => {
+            if let Some(arr) = val.get("deploy_logs").and_then(Value::as_array)
+                && !arr.is_empty()
+            {
+                outln!(out, "=== Deploy Logs (snapshot) ===");
+                for log in arr {
+                    let level = log.get("level").and_then(Value::as_str).unwrap_or("info");
+                    outln!(
+                        out,
+                        "[{}] {} {}",
+                        level.to_uppercase(),
+                        field(log, "ts"),
+                        field(log, "message")
+                    );
+                }
+            }
+            if let Some(arr) = val.get("container_logs").and_then(Value::as_array)
+                && !arr.is_empty()
+            {
+                outln!(out, "=== Container Logs (snapshot) ===");
+                for line in arr.iter().filter_map(Value::as_str) {
+                    out!(out, "{line}");
+                }
+            }
+            outln!(out, "=== Live stream ===");
+        }
+        Some("deploy") => {
+            let level = val.get("level").and_then(Value::as_str).unwrap_or("info");
+            outln!(
+                out,
+                "[DEPLOY][{}] {} {}",
+                level.to_uppercase(),
+                field(&val, "ts"),
+                field(&val, "message")
+            );
+        }
+        Some("container") => out!(out, "{}", field(&val, "line")),
+        _ => outln!(out, "{text}"),
+    }
+    Ok(())
+}
+
+pub async fn handle(client: &TondClient, out: &Output, action: AppsAction) -> Result<()> {
     match action {
         AppsAction::List => {
             let apps = client.list_apps().await?;
+            out.json(&apps)?;
             if apps.is_empty() {
-                println!("No apps deployed yet. Create one with: tond apps create <name>");
+                outln!(
+                    out,
+                    "No apps deployed yet. Create one with: tond apps create <name>"
+                );
                 return Ok(());
             }
-            println!(
+            outln!(
+                out,
                 "{:<20} {:<12} {:<10} {:<30}",
-                "NAME", "STATUS", "PORT", "DOMAIN"
+                "NAME",
+                "STATUS",
+                "PORT",
+                "DOMAIN"
             );
-            println!("{}", "-".repeat(72));
+            outln!(out, "{}", "-".repeat(72));
             for app in apps {
-                println!(
+                outln!(
+                    out,
                     "{:<20} {:<12} {:<10} {:<30}",
                     app.name,
                     app.status,
@@ -373,6 +535,7 @@ pub async fn handle(client: &TondClient, action: AppsAction) -> Result<()> {
             if let Some(template) = template {
                 return create_from_template(
                     client,
+                    out,
                     &template,
                     TemplateDeployRequest {
                         name,
@@ -417,171 +580,179 @@ pub async fn handle(client: &TondClient, action: AppsAction) -> Result<()> {
                     build_method,
                 )
                 .await?;
-            println!("App created: {} (ID: {})", app.name, app.id);
-            println!("Deploy with: tond apps deploy {}", app.name);
+            out.json(&app)?;
+            outln!(out, "App created: {} (ID: {})", app.name, app.id);
+            outln!(out, "Deploy with: tond apps deploy {}", app.name);
         }
 
-        AppsAction::Deploy { app, no_follow } => {
-            println!("Deploying {}...", app);
-            let deployment_id = client.deploy_app(&app).await?;
-            match deployment_id {
-                Some(id) if !no_follow => {
-                    let outcome = deploy_follow::follow(client, &app, &id).await?;
-                    deploy_follow::finish(&app, outcome)?;
-                }
-                _ => println!(
-                    "Deployment queued. Follow it with: tond apps deployments {}",
-                    app
-                ),
-            }
+        AppsAction::Deploy { app, wait } => {
+            outln!(out, "Deploying {}...", app);
+            let queued = client.deploy_app(&app).await?;
+            wait_or_report(client, out, &app, queued, wait).await?;
         }
 
-        AppsAction::Push { app } => {
-            println!("Packaging current directory...");
-            client.push_deploy(&app, ".").await?;
-            println!("Upload complete, building & deploying...");
-            println!("Check status with: tond apps info {}", app);
+        AppsAction::Push { app, wait } => {
+            outln!(out, "Packaging current directory...");
+            let queued = client.push_deploy(&app, ".").await?;
+            outln!(out, "Upload complete, building & deploying...");
+            wait_or_report(client, out, &app, queued, wait).await?;
         }
 
         AppsAction::Info { app } => {
             let info = client.get_app(&app).await?;
-            println!("Name:    {}", info.name);
-            println!("ID:      {}", info.id);
-            println!("Status:  {}", info.status);
-            println!("Source:  {}", info.source_type);
+            out.json(&info)?;
+            outln!(out, "Name:    {}", info.name);
+            outln!(out, "ID:      {}", info.id);
+            outln!(out, "Status:  {}", info.status);
+            outln!(out, "Source:  {}", info.source_type);
             if let Some(url) = &info.source_url {
-                println!("URL:     {}", url);
+                outln!(out, "URL:     {}", url);
             }
-            println!("Port:    {}", info.container_port);
+            outln!(out, "Port:    {}", info.container_port);
             match info.host_port {
-                Some(hp) => println!("HostPort:{}", hp),
-                None => println!("HostPort:-"),
+                Some(hp) => outln!(out, "HostPort:{}", hp),
+                None => outln!(out, "HostPort:-"),
             }
-            println!(
-                "Domain:  {}",
-                info.domain.unwrap_or_else(|| "-".to_string())
-            );
+            outln!(out, "Domain:  {}", info.domain.as_deref().unwrap_or("-"));
             match info.memory_limit {
-                Some(bytes) => println!("Memory:  {} bytes ({} MiB)", bytes, bytes / 1_048_576),
-                None => println!("Memory:  default"),
+                Some(bytes) => outln!(out, "Memory:  {} bytes ({} MiB)", bytes, bytes / 1_048_576),
+                None => outln!(out, "Memory:  default"),
             }
             match info.cpu_limit {
-                Some(nano) => println!(
+                Some(nano) => outln!(
+                    out,
                     "CPU:     {} nano_cpus ({:.2} cores)",
                     nano,
                     nano as f64 / 1_000_000_000.0
                 ),
-                None => println!("CPU:     default"),
+                None => outln!(out, "CPU:     default"),
             }
             if let Some(ref path) = info.health_check_path {
-                println!(
+                outln!(
+                    out,
                     "Health:  {} (every {}s, threshold {})",
-                    path, info.health_check_interval, info.health_failure_threshold
+                    path,
+                    info.health_check_interval,
+                    info.health_failure_threshold
                 );
-                println!("Failures:{}", info.health_consecutive_failures);
+                outln!(out, "Failures:{}", info.health_consecutive_failures);
             } else {
-                println!("Health:  disabled");
+                outln!(out, "Health:  disabled");
             }
             if info.volumes.is_empty() {
-                println!("Volumes: none");
+                outln!(out, "Volumes: none");
             } else {
-                println!("Volumes:");
+                outln!(out, "Volumes:");
                 for vol in &info.volumes {
-                    println!("  {} -> {}", vol.host_path, vol.container_path);
+                    outln!(out, "  {} -> {}", vol.host_path, vol.container_path);
                 }
             }
-            println!("Drain:   {}s", info.drain_timeout);
-            println!("Created: {}", info.created_at);
+            outln!(out, "Drain:   {}s", info.drain_timeout);
+            outln!(out, "Created: {}", info.created_at);
         }
 
         AppsAction::Logs { app, follow } => {
             if follow {
-                println!("Streaming logs for {} (Ctrl-C to stop)...", app);
-                client.stream_logs(&app).await?;
+                outln!(out, "Streaming logs for {} (Ctrl-C to stop)...", app);
+                let mut stream = client.log_stream(&app).await?;
+                while let Some(msg) = stream.next().await {
+                    match msg {
+                        Ok(Message::Text(text)) => render_log_frame(out, &text)?,
+                        Ok(Message::Close(frame)) => {
+                            if let Some(err) = frame
+                                .as_ref()
+                                .and_then(|f| CliError::from_close(u16::from(f.code), &f.reason))
+                            {
+                                return Err(err.into());
+                            }
+                            break;
+                        }
+                        Ok(_) => {} // ignore binary/ping/pong
+                        Err(e) => {
+                            return Err(CliError::unreachable(format!(
+                                "The log stream broke: {e}"
+                            ))
+                            .into());
+                        }
+                    }
+                }
             } else {
                 let logs = client.get_logs(&app).await?;
+                out.json(&logs)?;
 
-                if let Some(deploy_logs) = logs.get("deploy_logs")
-                    && let Some(arr) = deploy_logs.as_array()
+                if let Some(arr) = logs.get("deploy_logs").and_then(Value::as_array)
                     && !arr.is_empty()
                 {
-                    println!("=== Deploy Logs ===");
+                    outln!(out, "=== Deploy Logs ===");
                     for log in arr {
                         let level = log.get("level").and_then(|v| v.as_str()).unwrap_or("info");
                         let msg = log.get("message").and_then(|v| v.as_str()).unwrap_or("");
                         let time = log.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
-                        println!("[{}] {} {}", level.to_uppercase(), time, msg);
+                        outln!(out, "[{}] {} {}", level.to_uppercase(), time, msg);
                     }
                 }
 
-                if let Some(container_logs) = logs.get("container_logs")
-                    && let Some(arr) = container_logs.as_array()
+                if let Some(arr) = logs.get("container_logs").and_then(Value::as_array)
                     && !arr.is_empty()
                 {
-                    println!("\n=== Container Logs ===");
-                    for log in arr {
-                        if let Some(s) = log.as_str() {
-                            print!("{}", s);
-                        }
+                    outln!(out, "\n=== Container Logs ===");
+                    for s in arr.iter().filter_map(Value::as_str) {
+                        out!(out, "{}", s);
                     }
                 }
             }
         }
 
         AppsAction::Stop { app } => {
-            client.action(&app, "stop").await?;
-            println!("App {} stopped", app);
+            let data = client.action(&app, "stop").await?;
+            out.done("stop", "app", &app, data)?;
+            outln!(out, "App {} stopped", app);
         }
 
         AppsAction::Start { app } => {
-            client.action(&app, "start").await?;
-            println!("App {} started", app);
+            let data = client.action(&app, "start").await?;
+            out.done("start", "app", &app, data)?;
+            outln!(out, "App {} started", app);
         }
 
         AppsAction::Restart { app } => {
-            client.action(&app, "restart").await?;
-            println!("App {} restarted", app);
+            let data = client.action(&app, "restart").await?;
+            out.done("restart", "app", &app, data)?;
+            outln!(out, "App {} restarted", app);
         }
 
         AppsAction::Delete { app, yes } => {
-            if !yes {
-                print!("Are you sure you want to delete {}? [y/N] ", app);
-                use std::io::{self, Write};
-                io::stdout().flush()?;
-                let mut input = String::new();
-                io::stdin().read_line(&mut input)?;
-                if input.trim().to_lowercase() != "y" {
-                    println!("Cancelled");
-                    return Ok(());
-                }
-            }
-            client.delete_app(&app).await?;
-            println!("App {} deleted", app);
+            out.confirm(
+                yes,
+                &format!("Delete app {app}? Its containers, image and volumes are removed. This cannot be undone."),
+                &format!("delete app {app}"),
+            )?;
+            let data = client.delete_app(&app).await?;
+            out.done("delete", "app", &app, data)?;
+            outln!(out, "App {} deleted", app);
         }
 
         AppsAction::Env { app, vars } => {
             let mut env = serde_json::Map::new();
             for var in &vars {
-                if let Some((key, value)) = var.split_once('=') {
-                    env.insert(
-                        key.to_string(),
-                        serde_json::Value::String(value.to_string()),
-                    );
-                } else {
-                    eprintln!("Invalid env var format: {} (expected KEY=VALUE)", var);
-                    return Ok(());
-                }
+                let Some((key, value)) = var.split_once('=') else {
+                    return Err(CliError::usage(format!(
+                        "Invalid env var format: {var} (expected KEY=VALUE)"
+                    ))
+                    .into());
+                };
+                env.insert(key.to_string(), Value::String(value.to_string()));
             }
-            client
-                .update_env(&app, serde_json::Value::Object(env))
-                .await?;
-            println!("Environment variables updated for {}", app);
-            println!("Redeploy to apply changes: tond apps deploy {}", app);
+            let data = client.update_env(&app, Value::Object(env)).await?;
+            out.done("set_env", "app", &app, data)?;
+            outln!(out, "Environment variables updated for {}", app);
+            outln!(out, "Redeploy to apply changes: tond apps deploy {}", app);
         }
 
         AppsAction::Domain { app, domain } => {
-            client.update_domain(&app, &domain).await?;
-            println!("Domain set to {} for app {}", domain, app);
+            let data = client.update_domain(&app, &domain).await?;
+            out.done("set_domain", "app", &app, data)?;
+            outln!(out, "Domain set to {} for app {}", domain, app);
         }
 
         AppsAction::Health {
@@ -592,37 +763,45 @@ pub async fn handle(client: &TondClient, action: AppsAction) -> Result<()> {
             disable,
         } => {
             let health_path = if disable { None } else { path };
-            client
+            let data = client
                 .update_health(&app, health_path.as_deref(), interval, threshold)
                 .await?;
+            out.done("set_health", "app", &app, data)?;
             if disable {
-                println!("Health checks disabled for app {}", app);
+                outln!(out, "Health checks disabled for app {}", app);
             } else {
-                println!("Health checks configured for app {}", app);
+                outln!(out, "Health checks configured for app {}", app);
             }
         }
 
         AppsAction::DrainTimeout { app, seconds } => {
-            client.update_drain_timeout(&app, seconds).await?;
+            let data = client.update_drain_timeout(&app, seconds).await?;
+            out.done("set_drain_timeout", "app", &app, data)?;
             if seconds == 0 {
-                println!("Graceful drain disabled for app {}", app);
+                outln!(out, "Graceful drain disabled for app {}", app);
             } else {
-                println!("Drain timeout set to {}s for app {}", seconds, app);
+                outln!(out, "Drain timeout set to {}s for app {}", seconds, app);
             }
         }
 
         AppsAction::Deployments { app } => {
             let deployments = client.list_deployments(&app).await?;
+            out.json(&deployments)?;
             if deployments.is_empty() {
-                println!("No deployments found for {}", app);
+                outln!(out, "No deployments found for {}", app);
             } else {
-                println!(
+                outln!(
+                    out,
                     "{:<12} {:<12} {:<30} {:<25}",
-                    "STATUS", "IMAGE", "STARTED", "FINISHED"
+                    "STATUS",
+                    "IMAGE",
+                    "STARTED",
+                    "FINISHED"
                 );
-                println!("{}", "-".repeat(79));
+                outln!(out, "{}", "-".repeat(79));
                 for d in &deployments {
-                    println!(
+                    outln!(
+                        out,
                         "{:<12} {:<12} {:<30} {:<25}",
                         d.status,
                         d.image_tag.as_deref().unwrap_or("-"),
@@ -633,38 +812,51 @@ pub async fn handle(client: &TondClient, action: AppsAction) -> Result<()> {
             }
         }
 
-        AppsAction::Rollback { app } => {
-            println!("Rolling back {}...", app);
-            client.rollback_app(&app).await?;
-            println!(
+        AppsAction::Rollback { app, yes } => {
+            out.confirm(
+                yes,
+                &format!("Roll {app} back to its previous deployment?"),
+                &format!("roll back app {app}"),
+            )?;
+            outln!(out, "Rolling back {}...", app);
+            let data = client.rollback_app(&app).await?;
+            out.done("rollback", "app", &app, data)?;
+            outln!(
+                out,
                 "Rollback started! Check status with: tond apps info {}",
                 app
             );
         }
 
         AppsAction::GitKey { app, generate } => {
-            if generate {
-                let key = client.generate_deploy_key(&app).await?;
-                println!("Deploy key generated for {}:", app);
-                println!();
-                println!("{}", key);
-                println!();
-                println!("Add this public key to your repository's deploy keys.");
+            let key = if generate {
+                client.generate_deploy_key(&app).await?
             } else {
                 match client.get_deploy_key(&app).await {
-                    Ok(key) => {
-                        println!("Deploy key for {}:", app);
-                        println!();
-                        println!("{}", key);
-                        println!();
-                        println!("Add this key to your repository's deploy keys (read-only).");
-                    }
+                    Ok(key) => key,
                     Err(e) => {
-                        eprintln!("No deploy key found for {}: {}", app, e);
-                        eprintln!("Generate one with: tond apps git-key {} --generate", app);
+                        let mut e = error::describe(&e);
+                        e.message = format!("No deploy key found for {app}: {}", e.message);
+                        e.hint = Some(format!(
+                            "Generate one with: tond apps git-key {app} --generate"
+                        ));
+                        return Err(e.into());
                     }
                 }
+            };
+            out.json(&json!({ "app": app, "public_key": key }))?;
+            if generate {
+                outln!(out, "Deploy key generated for {}:", app);
+            } else {
+                outln!(out, "Deploy key for {}:", app);
             }
+            outln!(out);
+            outln!(out, "{}", key);
+            outln!(out);
+            outln!(
+                out,
+                "Add this public key to your repository's deploy keys (read-only)."
+            );
         }
 
         AppsAction::GitWebhook {
@@ -678,12 +870,13 @@ pub async fn handle(client: &TondClient, action: AppsAction) -> Result<()> {
         } => {
             if let Some(ref s) = secret {
                 client.set_webhook_secret(&app, s).await?;
-                println!("Webhook secret set for {}", app);
+                outln!(out, "Webhook secret set for {}", app);
             }
             let mut shown_secret: Option<String> = None;
             if rotate_secret {
                 shown_secret = Some(client.rotate_webhook_secret(&app).await?.secret);
-                println!(
+                outln!(
+                    out,
                     "Webhook secret rotated for {} — update it in your git provider",
                     app
                 );
@@ -696,15 +889,17 @@ pub async fn handle(client: &TondClient, action: AppsAction) -> Result<()> {
                     .set_auto_deploy(&app, auto_deploy, branch.as_deref())
                     .await?;
                 if disable {
-                    println!("Auto-deploy disabled for {}", app);
+                    outln!(out, "Auto-deploy disabled for {}", app);
                 } else if enable {
-                    println!(
+                    outln!(
+                        out,
                         "Auto-deploy enabled for {} (branch: {})",
                         app,
                         branch.as_deref().unwrap_or("any")
                     );
                 } else {
-                    println!(
+                    outln!(
+                        out,
                         "Watch branch set to {} for {}",
                         branch.as_deref().unwrap_or("any"),
                         app
@@ -716,27 +911,37 @@ pub async fn handle(client: &TondClient, action: AppsAction) -> Result<()> {
             let info = client.get_app(&app).await?;
             let config = client.get_webhook_config(&info.id).await?;
             let urls = config.urls.clone().unwrap_or(config.paths.clone());
-            println!();
-            println!("Webhook URLs for {}:", info.name);
-            println!("  GitHub:        {}", urls.github);
-            println!("  GitLab:        {}", urls.gitlab);
-            println!("  Gitea/Forgejo: {}", urls.gitea);
-            println!("  Generic:       {}", urls.generic);
-            if config.urls.is_none() {
-                println!("  (set dashboard_domain in Settings to get absolute URLs)");
-            }
             if show_secret && shown_secret.is_none() {
                 shown_secret = Some(client.reveal_webhook_secret(&info.id).await?.secret);
             }
-            if let Some(secret) = shown_secret {
-                println!();
-                println!("Webhook secret: {secret}");
-            } else {
-                println!();
-                println!("Webhook secret: hidden (use --show-secret)");
+            out.json(&json!({
+                "app": info.name,
+                "urls": urls,
+                "absolute_urls": config.urls.is_some(),
+                "secret": shown_secret,
+                "auto_deploy": info.auto_deploy,
+                "watch_branch": info.watch_branch,
+            }))?;
+            outln!(out);
+            outln!(out, "Webhook URLs for {}:", info.name);
+            outln!(out, "  GitHub:        {}", urls.github);
+            outln!(out, "  GitLab:        {}", urls.gitlab);
+            outln!(out, "  Gitea/Forgejo: {}", urls.gitea);
+            outln!(out, "  Generic:       {}", urls.generic);
+            if config.urls.is_none() {
+                outln!(
+                    out,
+                    "  (set dashboard_domain in Settings to get absolute URLs)"
+                );
             }
-            println!();
-            println!(
+            outln!(out);
+            match shown_secret {
+                Some(secret) => outln!(out, "Webhook secret: {secret}"),
+                None => outln!(out, "Webhook secret: hidden (use --show-secret)"),
+            }
+            outln!(out);
+            outln!(
+                out,
                 "Auto-deploy: {}",
                 if info.auto_deploy {
                     "enabled"
@@ -744,7 +949,8 @@ pub async fn handle(client: &TondClient, action: AppsAction) -> Result<()> {
                     "disabled"
                 }
             );
-            println!(
+            outln!(
+                out,
                 "Watch branch: {}",
                 info.watch_branch.as_deref().unwrap_or("any")
             );
@@ -756,63 +962,86 @@ pub async fn handle(client: &TondClient, action: AppsAction) -> Result<()> {
                 container_path,
                 name,
             } => {
-                client
+                let data = client
                     .add_volume(&app, &container_path, name.as_deref())
                     .await?;
-                println!(
+                out.done("add_volume", "app", &app, data)?;
+                outln!(
+                    out,
                     "Volume {} added to {}. Redeploy to apply: tond apps deploy {}",
-                    container_path, app, app
+                    container_path,
+                    app,
+                    app
                 );
             }
             VolumeAction::List { app } => {
                 let info = client.get_app(&app).await?;
+                out.json(&info.volumes)?;
                 if info.volumes.is_empty() {
-                    println!("No volumes configured for {}", app);
+                    outln!(out, "No volumes configured for {}", app);
                 } else {
-                    println!("{:<30} HOST PATH", "CONTAINER PATH");
-                    println!("{}", "-".repeat(60));
+                    outln!(out, "{:<30} HOST PATH", "CONTAINER PATH");
+                    outln!(out, "{}", "-".repeat(60));
                     for vol in &info.volumes {
-                        println!("{:<30} {}", vol.container_path, vol.host_path);
+                        outln!(out, "{:<30} {}", vol.container_path, vol.host_path);
                     }
                 }
             }
             VolumeAction::Remove {
                 app,
                 container_path,
+                yes,
             } => {
-                client.remove_volume(&app, &container_path).await?;
-                println!(
+                out.confirm(
+                    yes,
+                    &format!(
+                        "Remove volume {container_path} from {app}? The app no longer mounts it after the next deploy."
+                    ),
+                    &format!("remove volume {container_path} from app {app}"),
+                )?;
+                let data = client.remove_volume(&app, &container_path).await?;
+                out.done("remove_volume", "app", &app, data)?;
+                outln!(
+                    out,
                     "Volume {} removed from {}. Redeploy to apply: tond apps deploy {}",
-                    container_path, app, app
+                    container_path,
+                    app,
+                    app
                 );
             }
         },
 
         AppsAction::Previews { action } => match action {
             PreviewAction::Create { app, ttl } => {
-                println!("Creating preview deployment for {}...", app);
+                outln!(out, "Creating preview deployment for {}...", app);
                 let p = client.create_preview(&app, Some(ttl)).await?;
-                println!("Preview deployment started (ID: {})", p.id);
-                println!("Status:  {}", p.status);
-                if let Some(url) = &p.url {
-                    println!("URL:     https://{}", url);
-                } else {
-                    println!("URL:     (no domain configured)");
+                out.json(&p)?;
+                outln!(out, "Preview deployment started (ID: {})", p.id);
+                outln!(out, "Status:  {}", p.status);
+                match &p.url {
+                    Some(url) => outln!(out, "URL:     https://{}", url),
+                    None => outln!(out, "URL:     (no domain configured)"),
                 }
-                println!("Expires: {}", p.expires_at);
+                outln!(out, "Expires: {}", p.expires_at);
             }
             PreviewAction::List { app } => {
                 let previews = client.list_previews(&app).await?;
+                out.json(&previews)?;
                 if previews.is_empty() {
-                    println!("No active preview deployments for {}", app);
+                    outln!(out, "No active preview deployments for {}", app);
                 } else {
-                    println!(
+                    outln!(
+                        out,
                         "{:<28} {:<12} {:<40} {:<30}",
-                        "ID", "STATUS", "URL", "EXPIRES"
+                        "ID",
+                        "STATUS",
+                        "URL",
+                        "EXPIRES"
                     );
-                    println!("{}", "-".repeat(110));
+                    outln!(out, "{}", "-".repeat(110));
                     for p in &previews {
-                        println!(
+                        outln!(
+                            out,
                             "{:<28} {:<12} {:<40} {:<30}",
                             p.id,
                             p.status,
@@ -822,9 +1051,19 @@ pub async fn handle(client: &TondClient, action: AppsAction) -> Result<()> {
                     }
                 }
             }
-            PreviewAction::Delete { app, preview_id } => {
-                client.delete_preview(&app, &preview_id).await?;
-                println!("Preview {} deleted", preview_id);
+            PreviewAction::Delete {
+                app,
+                preview_id,
+                yes,
+            } => {
+                out.confirm(
+                    yes,
+                    &format!("Delete preview {preview_id} of {app}? Its container is stopped."),
+                    &format!("delete preview {preview_id}"),
+                )?;
+                let data = client.delete_preview(&app, &preview_id).await?;
+                out.done("delete", "preview", &preview_id, data)?;
+                outln!(out, "Preview {} deleted", preview_id);
             }
         },
     }
@@ -835,8 +1074,12 @@ pub async fn handle(client: &TondClient, action: AppsAction) -> Result<()> {
 /// `tond apps create <name> --template <id>`: fill the template's inputs
 /// (from --env, prompting for required ones unless --yes), create and deploy
 /// the app on the server, print the one-time credentials and follow the deploy.
+///
+/// JSON mode prints the deploy response (credentials included) as the first
+/// NDJSON event, then the deploy's events.
 async fn create_from_template(
     client: &TondClient,
+    out: &Output,
     template_id: &str,
     mut request: TemplateDeployRequest,
     env_pairs: &[String],
@@ -849,32 +1092,38 @@ async fn create_from_template(
         .into_iter()
         .find(|t| t.id == template_id)
         .ok_or_else(|| {
-            anyhow::anyhow!("Unknown template '{template_id}'. See `tond templates list`.")
+            CliError::usage(format!("Unknown template '{template_id}'."))
+                .with_hint("See `tond templates list`.")
         })?;
-    request.inputs = template_inputs(&template, env_pairs, yes, |prompt| {
-        crate::commands::settings::read_line_prompt(prompt)
+    request.inputs = template_inputs(&template, env_pairs, yes || out.is_json(), |prompt| {
+        out.prompt_line(prompt)
     })?;
 
     let created = client.deploy_template(template_id, &request).await?;
-    println!(
+    out.event(&json!({ "event": "created", "template": template.id, "app": created }))?;
+    outln!(
+        out,
         "Created {} from the {} template (ID: {}).",
-        created.app_name, template.name, created.app_id
+        created.app_name,
+        template.name,
+        created.app_id
     );
     if let Some(domain) = &created.domain {
-        println!("Address: https://{domain}");
+        outln!(out, "Address: https://{domain}");
     }
     if !created.credentials.is_empty() {
-        println!();
-        println!("Save these now; they are shown only once:");
+        outln!(out);
+        outln!(out, "Save these now; they are shown only once:");
         for c in &created.credentials {
-            println!("  {}: {}", c.label, c.value);
+            outln!(out, "  {}: {}", c.label, c.value);
         }
-        println!();
+        outln!(out);
     }
-    let outcome = deploy_follow::follow(client, &created.app_name, &created.deployment_id).await?;
-    let result = deploy_follow::finish(&created.app_name, outcome);
+    let outcome =
+        deploy_follow::follow(client, out, &created.app_name, &created.deployment_id).await?;
+    let result = deploy_follow::finish(out, &created.app_name, &created.deployment_id, outcome);
     if let Some(notes) = &created.setup_notes {
-        println!("Next: {notes}");
+        outln!(out, "Next: {notes}");
     }
     result
 }
@@ -893,7 +1142,7 @@ fn template_inputs(
         let (key, value) = parse_env_pair(pair)?;
         if !template.inputs.iter().any(|i| i.key == key) {
             let known: Vec<&str> = template.inputs.iter().map(|i| i.key.as_str()).collect();
-            anyhow::bail!(
+            return Err(CliError::usage(format!(
                 "{} has no input {key}; its inputs are: {}",
                 template.name,
                 if known.is_empty() {
@@ -901,7 +1150,8 @@ fn template_inputs(
                 } else {
                     known.join(", ")
                 }
-            );
+            ))
+            .into());
         }
         inputs.insert(key, value);
     }
@@ -910,16 +1160,16 @@ fn template_inputs(
             continue;
         }
         if yes {
-            anyhow::bail!(
-                "{} needs {} (--env {}=…) and --yes disables prompting",
-                template.name,
-                input.label,
-                input.key
-            );
+            return Err(CliError::usage(format!(
+                "{} needs {} and --yes disables prompting",
+                template.name, input.label
+            ))
+            .with_hint(format!("Pass --env {}=…", input.key))
+            .into());
         }
         let value = prompt(&format!("{} ({}): ", input.label, input.key))?;
         if value.trim().is_empty() {
-            anyhow::bail!("{} is required", input.label);
+            return Err(CliError::usage(format!("{} is required", input.label)).into());
         }
         inputs.insert(input.key.clone(), value.trim().to_string());
     }
@@ -929,10 +1179,10 @@ fn template_inputs(
 fn parse_env_pair(pair: &str) -> Result<(String, String)> {
     let (key, value) = pair
         .split_once('=')
-        .ok_or_else(|| anyhow::anyhow!("env values must use KEY=VALUE format"))?;
+        .ok_or_else(|| CliError::usage("env values must use KEY=VALUE format"))?;
 
     if key.trim().is_empty() {
-        anyhow::bail!("env values must use a non-empty KEY=VALUE format");
+        return Err(CliError::usage("env values must use a non-empty KEY=VALUE format").into());
     }
 
     Ok((key.trim().to_string(), value.to_string()))
@@ -1008,7 +1258,7 @@ mod tests {
     fn template_inputs_reject_missing_required_values_with_yes() {
         let err = template_inputs(&sample_template(), &[], true, no_prompt)
             .expect_err("--yes should reject a missing required input");
-        assert!(err.to_string().contains("--env ADMIN_EMAIL"), "got: {err}");
+        assert!(err.to_string().contains("needs Admin email"), "got: {err}");
     }
 
     #[test]
@@ -1045,19 +1295,21 @@ mod tests {
     #[tokio::test]
     async fn create_from_template_posts_one_deploy_request() {
         let capture = TemplateFlowCaptureState::default();
+        let catalog = json!({
+            "success": true,
+            "data": {"templates": [serde_json::to_value(sample_template()).unwrap_or_default()], "memory": null, "apps_domain": ""},
+            "error": null
+        });
         let router = Router::new()
             .route(
-                "/api/templates",
-                axum::routing::get(|| async {
-                    axum::Json(json!({
-                        "success": true,
-                        "data": {"templates": [sample_template_json()], "memory": null, "apps_domain": ""},
-                        "error": null
-                    }))
+                "/api/v1/templates",
+                axum::routing::get(move || {
+                    let catalog = catalog.clone();
+                    async move { axum::Json(catalog) }
                 }),
             )
             .route(
-                "/api/templates/{id}/deploy",
+                "/api/v1/templates/{id}/deploy",
                 post(
                     |State(state): State<TemplateFlowCaptureState>, body: Bytes| async move {
                         let request: serde_json::Value = serde_json::from_slice(&body)
@@ -1069,9 +1321,11 @@ mod tests {
                             .push(("deploy".to_string(), request));
                         (
                             StatusCode::BAD_REQUEST,
-                            axum::Json(
-                                json!({"success": false, "data": null, "error": "stop here"}),
-                            ),
+                            axum::Json(json!({
+                                "success": false,
+                                "data": null,
+                                "error": {"code": "INVALID_INPUT", "message": "stop here"}
+                            })),
                         )
                     },
                 ),
@@ -1080,8 +1334,10 @@ mod tests {
         let addr = spawn_test_server(router).await;
         let client = TondClient::new(&format!("http://{}", addr), None);
 
+        let (out, _, _) = Output::capture(false, false, "");
         let err = handle(
             &client,
+            &out,
             AppsAction::Create(Box::new(CreateAppOptions {
                 name: "stats".to_string(),
                 template: Some("umami".to_string()),
@@ -1104,7 +1360,7 @@ mod tests {
         )
         .await
         .expect_err("the stub server refuses the deploy");
-        assert!(err.to_string().contains("stop here"));
+        assert!(err.to_string().contains("stop here"), "got: {err}");
 
         let requests = capture.requests.lock().await.clone();
         assert_eq!(requests.len(), 1, "a template deploy is a single request");
@@ -1113,10 +1369,5 @@ mod tests {
         assert_eq!(body["domain"], "stats.example.com");
         assert_eq!(body["allow_low_memory"], true);
         assert_eq!(body["inputs"], json!({"ADMIN_EMAIL": "me@example.com"}));
-    }
-
-    fn sample_template_json() -> serde_json::Value {
-        serde_json::to_value(sample_template())
-            .unwrap_or_else(|err| panic!("failed to encode sample template: {err}"))
     }
 }

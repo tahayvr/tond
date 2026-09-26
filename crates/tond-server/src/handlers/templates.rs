@@ -89,15 +89,12 @@ fn check_memory(
     if allow_low_memory || needed <= available {
         return Ok(());
     }
-    Err(AppError(TondError::Conflict {
-        code: "insufficient_memory",
-        message: format!(
-            "{} needs about {} MB of memory and this server has {} MB free. Stop or remove an app to make room, or deploy anyway and let it swap.",
-            template.manifest.name,
-            template.manifest.ram_mb,
-            available / MIB
-        ),
-    }))
+    Err(AppError(TondError::InsufficientMemory(format!(
+        "{} needs about {} MB of memory and this server has {} MB free.",
+        template.manifest.name,
+        template.manifest.ram_mb,
+        available / MIB
+    ))))
 }
 
 /// Refuse an app name whose volume directory already holds data: data left
@@ -188,8 +185,9 @@ async fn deploy_from_template(
         || name.starts_with('-')
         || name.ends_with('-')
     {
-        return Err(AppError(TondError::InvalidInput(
-            "App name must be 1–40 lowercase letters, digits and hyphens".into(),
+        return Err(AppError(TondError::invalid_field(
+            "name",
+            "App name must be 1–40 lowercase letters, digits and hyphens",
         )));
     }
     check_memory(&template, available_memory(), req.allow_low_memory)?;
@@ -209,8 +207,12 @@ async fn deploy_from_template(
         None => format!("{name}.localhost"),
     };
     let ctx = TemplateContext::new(&name, &host);
-    let resolved = resolve_inputs(&template.manifest, &req.inputs, &ctx)
-        .map_err(|e| AppError(TondError::InvalidInput(e.to_string())))?;
+    let resolved = resolve_inputs(&template.manifest, &req.inputs, &ctx).map_err(|e| {
+        AppError(TondError::invalid_field(
+            format!("inputs.{}", e.key),
+            e.message,
+        ))
+    })?;
 
     // An existing app of this name owns its volume directory: say so (409)
     // rather than calling its data "left over".
@@ -627,7 +629,8 @@ mod tests {
         let err = check_memory(&t, Some(need / 2), false)
             .err()
             .unwrap_or_else(|| panic!("expected insufficient_memory"));
-        assert_eq!(err.0.code(), Some("insufficient_memory"));
+        assert_eq!(err.0.code(), "INSUFFICIENT_MEMORY");
+        assert!(err.0.hint().is_some_and(|h| h.contains("allow_low_memory")));
         assert_eq!(err.0.status_code(), 409);
         assert!(check_memory(&t, Some(need / 2), true).is_ok());
     }

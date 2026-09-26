@@ -112,7 +112,7 @@ VITE_MOCK_API=true          # start MSW service worker to intercept /api request
 - All API calls go through the `request<T>()` helper in `src/lib/api.ts`.
 - Each endpoint is a named async function exported from `api.ts`; never use `fetch`
   directly in component files.
-- The base URL is `/api` (proxied to the Axum server in dev via `vite.config.ts`).
+- The base URL is `/api/v1` (`BASE` in `api.ts`; `/api` is proxied to the Axum server in dev via `vite.config.ts`). The route table is `crates/tond-server/src/routes.rs`; the OpenAPI spec (`docs/openapi.json`, served at `/api/v1/openapi.json`) is generated from it with `just openapi`.
 - Add new interfaces alongside new API functions in `api.ts` — no separate type files.
 
 ### Status, feedback and confirmations (Dashboard)
@@ -239,7 +239,7 @@ One system for all of these — never hand-roll a pill, banner or `confirm()`:
   up whatever a crash left behind at startup.
 - Idle budget: background loops sleep until their next deadline or a table change
   (`runtime::changes::Watch`), never on a short fixed tick; register them in
-  `runtime::loops` so `/api/system/self` shows their health. `e2e/budget.sh` checks RSS,
+  `runtime::loops` so `/api/v1/system/self` shows their health. `e2e/budget.sh` checks RSS,
   wakeups, DB queries and journal lines at idle.
 - Spawn child processes with `crate::process::command(..)`, not `tokio::process::Command::new`:
   tond-server runs with `OOMScoreAdjust=-900`, and the helper resets children (git, docker CLI,

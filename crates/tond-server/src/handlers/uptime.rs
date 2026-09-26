@@ -1,17 +1,17 @@
 // handlers/uptime.rs — uptime checks
 //
-//   GET  /api/uptime                     (metrics:read) every check: status and
+//   GET  /api/v1/uptime                     (metrics:read) every check: status and
 //                                        uptime % over 24 h / 7 d / 30 d
-//   GET  /api/apps/{id}/uptime           (metrics:read) one app's check: status,
+//   GET  /api/v1/apps/{id}/uptime           (metrics:read) one app's check: status,
 //                                        last probe (TLS expiry, DNS), uptime %,
 //                                        a 48 × 30 min status strip, 90 daily
 //                                        bars, response times and incidents
-//   PUT  /api/apps/{id}/uptime           (apps:write) path, interval, expected
+//   PUT  /api/v1/apps/{id}/uptime           (apps:write) path, interval, expected
 //                                        status, timeout, on/off
-//   POST /api/apps/{id}/uptime/check     (metrics:read) probe now
-//   GET  /api/system/uptime              (metrics:read) the dashboard's own check
-//   PUT  /api/system/uptime              (settings:write)
-//   POST /api/system/uptime/check        (metrics:read)
+//   POST /api/v1/apps/{id}/uptime/check     (metrics:read) probe now
+//   GET  /api/v1/system/uptime              (metrics:read) the dashboard's own check
+//   PUT  /api/v1/system/uptime              (settings:write)
+//   POST /api/v1/system/uptime/check        (metrics:read)
 //
 // `{id}` may be the app's id or name. An app without a domain has no check
 // (`check: null` with a reason).
@@ -19,11 +19,10 @@
 use std::collections::HashMap;
 
 use axum::{
-    Json, Router,
+    Json,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use tond_common::{ApiResponse, TondError};
@@ -39,26 +38,12 @@ use crate::{
     },
 };
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/api/uptime", get(list_checks))
-        .route(
-            "/api/apps/{id}/uptime",
-            get(get_app_check).put(update_app_check),
-        )
-        .route("/api/apps/{id}/uptime/check", post(check_app_now))
-        .route(
-            "/api/system/uptime",
-            get(get_dashboard_check).put(update_dashboard_check),
-        )
-        .route("/api/system/uptime/check", post(check_dashboard_now))
-}
-
 const INCIDENT_LIMIT: i64 = 50;
 
 // ── Responses ──
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct CheckSettingsResponse {
     pub id: i64,
     pub enabled: bool,
@@ -82,6 +67,7 @@ impl From<&CheckRow> for CheckSettingsResponse {
 }
 
 #[derive(Debug, Default, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct UptimePercentResponse {
     pub day: Option<f64>,
     pub week: Option<f64>,
@@ -101,6 +87,7 @@ impl UptimePercentResponse {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct LastProbeResponse {
     #[serde(flatten)]
     pub probe: LastProbe,
@@ -110,6 +97,7 @@ pub struct LastProbeResponse {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct IncidentResponse {
     #[serde(flatten)]
     pub incident: Incident,
@@ -118,6 +106,7 @@ pub struct IncidentResponse {
 }
 
 #[derive(Debug, Default, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct LatencyResponse {
     pub t: Vec<i64>,
     pub ms: Vec<i64>,
@@ -125,6 +114,7 @@ pub struct LatencyResponse {
 
 /// One check, in full.
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct UptimeCheckResponse {
     /// None when the app has no domain.
     pub check: Option<CheckSettingsResponse>,
@@ -146,8 +136,9 @@ pub struct UptimeCheckResponse {
     pub incidents: Vec<IncidentResponse>,
 }
 
-/// One row of GET /api/uptime.
+/// One row of GET /api/v1/uptime.
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct UptimeSummaryResponse {
     pub check_id: i64,
     /// "app" | "dashboard"
@@ -341,6 +332,7 @@ pub async fn get_dashboard_check(
 
 /// PUT body. Every field is required: the form sends the whole check.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct UpdateCheckRequest {
     pub enabled: bool,
     pub path: String,

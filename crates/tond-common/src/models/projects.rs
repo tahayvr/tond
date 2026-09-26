@@ -9,6 +9,7 @@ use uuid::Uuid;
 /// A project groups related apps under a single logical unit and provides
 /// shared environment variables injected into every member app at deploy time.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Project {
     pub id: String,
     pub name: String,
@@ -36,6 +37,7 @@ impl Project {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ProjectResponse {
     pub id: String,
     pub name: String,
@@ -69,8 +71,9 @@ impl ProjectResponse {
     }
 }
 
-/// POST /api/projects
+/// POST /api/v1/projects
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreateProjectRequest {
     pub name: String,
     pub description: Option<String>,
@@ -78,8 +81,9 @@ pub struct CreateProjectRequest {
     pub env_vars: Option<serde_json::Value>,
 }
 
-/// PUT /api/projects/{id}
+/// PUT /api/v1/projects/{id}
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateProjectRequest {
     pub name: Option<String>,
     pub description: Option<String>,
@@ -87,8 +91,9 @@ pub struct UpdateProjectRequest {
     pub env_vars: Option<serde_json::Value>,
 }
 
-/// PUT /api/apps/{id}/project — assign or remove an app's project
+/// PUT /api/v1/apps/{id}/project — assign or remove an app's project
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AssignProjectRequest {
     /// Project ID to assign. null = remove from any project.
     pub project_id: Option<String>,

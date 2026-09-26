@@ -52,7 +52,7 @@
 		}
 	});
 
-	// Errors reported by the GitHub App callbacks (/api/github-apps/callback and
+	// Errors reported by the GitHub App callbacks (/api/v1/github-apps/callback and
 	// /webhooks/source/github/install redirect here with ?error=<code>).
 	const GITHUB_FLOW_ERRORS: Record<string, string> = {
 		missing_state:

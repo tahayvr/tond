@@ -94,7 +94,7 @@
 			});
 			ondeployed(result);
 		} catch (e: any) {
-			if (e instanceof ApiError && e.code === 'insufficient_memory') {
+			if (e instanceof ApiError && e.code === 'INSUFFICIENT_MEMORY') {
 				// Free memory changed since the page loaded: ask again.
 				allowLowMemory = false;
 			}

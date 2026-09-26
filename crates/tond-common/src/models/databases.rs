@@ -238,6 +238,7 @@ pub fn engine_for(db_type: &str) -> Option<&'static DbEngineConfig> {
 /// A managed database container created and supervised by Tond.
 /// One row per database instance.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ManagedDatabase {
     pub id: String,
     /// User-chosen name; also used as the Docker container name suffix
@@ -365,8 +366,9 @@ impl ManagedDatabase {
 
 /// API view of a managed database. Passwords are write-only: the response
 /// says whether they are set, and connection strings are masked. Read the
-/// plaintext with GET /api/databases/{id}/credentials (audit-logged).
+/// plaintext with GET /api/v1/databases/{id}/credentials (audit-logged).
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ManagedDatabaseResponse {
     pub id: String,
     pub name: String,
@@ -423,9 +425,10 @@ impl From<ManagedDatabase> for ManagedDatabaseResponse {
     }
 }
 
-/// GET /api/databases/{id} response — includes generated connection strings,
+/// GET /api/v1/databases/{id} response — includes generated connection strings,
 /// with the password masked (`mask_url_password`).
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ManagedDatabaseDetail {
     #[serde(flatten)]
     pub database: ManagedDatabaseResponse,
@@ -443,6 +446,7 @@ pub struct ManagedDatabaseDetail {
 
 /// An app as shown in database access lists.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DatabaseAppRef {
     pub id: String,
     pub name: String,
@@ -450,11 +454,12 @@ pub struct DatabaseAppRef {
     pub project_id: Option<String>,
 }
 
-/// GET /api/databases/{id}/access — which apps can reach a database.
+/// GET /api/v1/databases/{id}/access — which apps can reach a database.
 ///
 /// Apps in the database's project share its network; other apps need a
 /// link, which attaches the database to that app's network.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DatabaseAccessResponse {
     pub database_id: String,
     /// The database's project, if any (`{id, name}`)
@@ -470,13 +475,15 @@ pub struct DatabaseAccessResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DatabaseProjectRef {
     pub id: String,
     pub name: String,
 }
 
-/// One database an app can reach (GET /api/apps/{id}/databases).
+/// One database an app can reach (GET /api/v1/apps/{id}/databases).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AppDatabaseAccess {
     pub id: String,
     pub name: String,
@@ -488,9 +495,10 @@ pub struct AppDatabaseAccess {
     pub internal_port: u16,
 }
 
-/// GET /api/databases/{id}/credentials — the plaintext credentials and
+/// GET /api/v1/databases/{id}/credentials — the plaintext credentials and
 /// connection strings (admin only, audit-logged).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DatabaseCredentialsResponse {
     pub db_user: Option<String>,
     pub db_password: Option<String>,
@@ -501,11 +509,12 @@ pub struct DatabaseCredentialsResponse {
     pub internal_connection_string: Option<String>,
 }
 
-/// POST /api/databases response: the (masked) detail plus the freshly
+/// POST /api/v1/databases response: the (masked) detail plus the freshly
 /// generated credentials, returned once so the creator can wire them into an
 /// app (templates interpolate `${db.<name>.internal_connection_string}`).
 /// `credentials` is null for callers without `db:credentials`.
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreatedDatabaseResponse {
     #[serde(flatten)]
     pub detail: ManagedDatabaseDetail,
@@ -549,8 +558,9 @@ pub fn mask_url_password(url: &str) -> String {
     out
 }
 
-/// POST /api/databases request body
+/// POST /api/v1/databases request body
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreateDatabaseRequest {
     pub name: String,
     /// "postgres" | "mysql" | "redis"
@@ -564,12 +574,13 @@ pub struct CreateDatabaseRequest {
     pub public_access: bool,
 }
 
-/// PATCH /api/databases/{id} request body
+/// PATCH /api/v1/databases/{id} request body
 ///
 /// Only the fields present in the request body are updated (partial update).
 /// Setting a field to an empty string clears the override and reverts to the
 /// auto-computed value.
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateDatabaseRequest {
     /// Override for the external connection string (replaces the auto-computed one).
     /// Send `null` or omit to leave unchanged; send `""` to clear the override.
@@ -589,13 +600,14 @@ pub struct UpdateDatabaseRequest {
     pub public_access: Option<bool>,
 }
 
-/// PATCH /api/databases/{id}/credentials request body
+/// PATCH /api/v1/databases/{id}/credentials request body
 ///
-/// PATCH /api/databases/{id}/credentials — change passwords inside the running
+/// PATCH /api/v1/databases/{id}/credentials — change passwords inside the running
 /// database (ALTER ROLE / ALTER USER via docker exec), then persist them.
 /// Send `null`, omit a field or send `""` to leave it unchanged. Renaming the
 /// database or user is refused: engines ignore those once data exists.
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateDatabaseCredentials {
     /// Must equal the current database name if sent (renames are refused).
     pub db_name: Option<String>,

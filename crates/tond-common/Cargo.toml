@@ -21,6 +21,12 @@ serde_with = { workspace = true }
 rustls = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# JSON Schema derives for the OpenAPI spec. Only tond-server's tests (which
+# generate docs/openapi.json) enable it, so release binaries don't carry it.
+schemars = { workspace = true, optional = true }
+
+[features]
+schema = ["dep:schemars"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

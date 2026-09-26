@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 /// A scheduled job that runs a Docker container on a cron schedule.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CronJob {
     pub id: String,
     /// User-chosen unique name
@@ -102,6 +103,7 @@ impl CronJob {
 
 /// API view of a cron job (enabled is returned as bool for ergonomics).
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CronJobResponse {
     pub id: String,
     pub name: String,
@@ -142,6 +144,7 @@ pub struct CronJobResponse {
 /// directory `<data>/volumes/_cron/<job-id>/<name>`, or — when `app` is set —
 /// that app's volume `<data>/volumes/<app>/<name>`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CronVolume {
     /// Share a volume of this app instead of using the job's own directory
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -156,6 +159,7 @@ pub struct CronVolume {
 
 /// A cron volume as sent by clients.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CronVolumeRequest {
     /// Share a volume of this existing app (e.g. to back up its data)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -207,6 +211,7 @@ impl CronJobResponse {
 
 /// One execution record for a cron job.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CronJobRun {
     pub id: String,
     pub cron_job_id: String,
@@ -221,8 +226,9 @@ pub struct CronJobRun {
     pub attempt: i64,
 }
 
-/// POST /api/cron request body
+/// POST /api/v1/cron request body
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreateCronJobRequest {
     pub name: String,
     pub schedule: String,
@@ -250,8 +256,9 @@ pub struct CreateCronJobRequest {
     pub volumes: Option<Vec<CronVolumeRequest>>,
 }
 
-/// PATCH /api/cron/{id} request body (all fields optional)
+/// PATCH /api/v1/cron/{id} request body (all fields optional)
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateCronJobRequest {
     /// Rename the job. Returns 409 if the new name is already taken.
     pub name: Option<String>,
@@ -263,6 +270,7 @@ pub struct UpdateCronJobRequest {
     /// Maximum wall-clock seconds the container may run. None = no change.
     /// Pass `Some(None)` to clear (remove timeout), `Some(Some(n))` to set.
     #[serde(default, with = "::serde_with::rust::double_option")]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<i64>"))]
     pub timeout_seconds: Option<Option<i64>>,
     /// Replace all environment variables. None = no change; Some({}) = clear all.
     pub env: Option<std::collections::HashMap<String, String>>,
@@ -274,17 +282,21 @@ pub struct UpdateCronJobRequest {
     pub env_unset: Vec<String>,
     /// Link/unlink a project. None = no change; Some(None) = unlink; Some(Some(id)) = link.
     #[serde(default, with = "::serde_with::rust::double_option")]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
     pub project_id: Option<Option<String>>,
     /// Concurrency policy: "skip" or "allow". None = no change.
     pub concurrency_policy: Option<String>,
     /// Memory limit in MiB. None = no change. Some(None) = clear limit.
     #[serde(default, with = "::serde_with::rust::double_option")]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<i64>"))]
     pub memory_mb: Option<Option<i64>>,
     /// Docker CPU shares. None = no change. Some(None) = clear (use default).
     #[serde(default, with = "::serde_with::rust::double_option")]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<i64>"))]
     pub cpu_shares: Option<Option<i64>>,
     /// IANA timezone. None = no change. Some(None) = revert to UTC.
     #[serde(default, with = "::serde_with::rust::double_option")]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
     pub timezone: Option<Option<String>>,
     /// Max automatic retries on non-zero exit. None = no change.
     pub max_retries: Option<i64>,

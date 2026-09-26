@@ -2,16 +2,16 @@
 //
 // Implements the full GitHub App Manifest flow:
 //
-//   GET  /api/github-apps
+//   GET  /api/v1/github-apps
 //     List all registered GitHub App registrations.
 //
-//   POST /api/github-apps/manifest
+//   POST /api/v1/github-apps/manifest
 //     Generate a GitHub App manifest and the `github.com/settings/apps/new?state=`
 //     URL the dashboard POSTs it to. Requires `dashboard_domain` and a logged-in
 //     admin session: a pending `manifest` flow (github_app_flows) is created
 //     for that admin and expires after FLOW_TTL_MINUTES.
 //
-//   GET  /api/github-apps/callback?code=<code>&state=<state>
+//   GET  /api/v1/github-apps/callback?code=<code>&state=<state>
 //     GitHub redirects here after App creation. The state must match a pending
 //     manifest flow owned by the admin whose session cookie comes with the
 //     request; the flow is consumed (single use) before the one-time code is
@@ -23,24 +23,24 @@
 //     Stores `installation_id` only for a pending `install` flow owned by the
 //     session's admin. There is no fallback for requests without state.
 //
-//   POST /api/github-apps/{id}/install
+//   POST /api/v1/github-apps/{id}/install
 //     Start an installation flow (admin session required) and return the
 //     GitHub installation URL carrying its state.
 //
-//   PATCH /api/github-apps/{id}
+//   PATCH /api/v1/github-apps/{id}
 //     Update a registration (e.g. rename or set installation_id manually).
 //
-//   DELETE /api/github-apps/{id}
+//   DELETE /api/v1/github-apps/{id}
 //     Remove a GitHub App registration. Detaches all apps that reference it.
 //
-//   GET  /api/github-apps/{id}/repos
+//   GET  /api/v1/github-apps/{id}/repos
 //     Use the installation access token to list repositories the App is
 //     installed on (`GET https://api.github.com/installation/repositories`).
 //
-//   GET  /api/github-apps/{id}/repos/{owner}/{repo}/branches
+//   GET  /api/v1/github-apps/{id}/repos/{owner}/{repo}/branches
 //     Return the branch list for a specific repo.
 //
-//   PUT  /api/apps/{app_id}/github-app
+//   PUT  /api/v1/apps/{app_id}/github-app
 //     Link or unlink a GitHub App registration from an app.
 
 use axum::{
@@ -273,7 +273,7 @@ pub async fn post_or_update_pr_comment(
     Ok(id)
 }
 
-// ── GET /api/github-apps ──────────────────────────────────────────────────────
+// ── GET /api/v1/github-apps ──────────────────────────────────────────────────────
 
 pub async fn list_github_apps(
     _rate: RateLimit,
@@ -380,7 +380,7 @@ async fn redirect_to_integrations(state: &AppState, error: Option<&str>) -> Resp
     Redirect::to(&target).into_response()
 }
 
-// ── POST /api/github-apps/manifest ───────────────────────────────────────────
+// ── POST /api/v1/github-apps/manifest ───────────────────────────────────────────
 
 /// Returns the manifest and the GitHub URL the dashboard POSTs it to.
 ///
@@ -428,9 +428,9 @@ pub async fn get_manifest_url(
             "url": format!("{}/webhooks/source/github/events", base_url),
             "active": true
         },
-        "redirect_url": format!("{}/api/github-apps/callback", base_url),
+        "redirect_url": format!("{}/api/v1/github-apps/callback", base_url),
         "callback_urls": [
-            format!("{}/api/github-apps/callback", base_url)
+            format!("{}/api/v1/github-apps/callback", base_url)
         ],
         "setup_url": format!("{}/webhooks/source/github/install", base_url),
         "setup_on_update": true,
@@ -469,7 +469,7 @@ pub async fn get_manifest_url(
 // The session cookie is SameSite=Strict, so it is NOT sent on that request.
 // The GET callbacks therefore only bounce the browser to the dashboard page
 // /integrations/github/complete, which finishes the flow with a same-origin
-// POST /api/github-apps/complete: that request carries the admin's session
+// POST /api/v1/github-apps/complete: that request carries the admin's session
 // cookie and the CSRF header, and consumes the single-use state bound to that
 // admin. Nothing is stored before that POST.
 
@@ -489,7 +489,7 @@ async fn redirect_to_completion(state: &AppState, query: &[(&str, String)]) -> R
     Redirect::to(&format!("{base}?{qs}")).into_response()
 }
 
-/// GET /api/github-apps/callback?code=<code>&state=<state>
+/// GET /api/v1/github-apps/callback?code=<code>&state=<state>
 ///
 /// GitHub redirects here after App creation. Hands off to the dashboard.
 pub async fn github_app_callback(
@@ -532,7 +532,7 @@ pub async fn github_install_callback(
     .await
 }
 
-/// POST /api/github-apps/complete — body `{kind, state, code?, installation_id?}`.
+/// POST /api/v1/github-apps/complete — body `{kind, state, code?, installation_id?}`.
 ///
 /// Called by the dashboard page GitHub's redirect lands on. Returns 200 when
 /// the flow completed, otherwise 400 with an error code the page explains:
@@ -578,7 +578,10 @@ pub async fn complete_github_flow(
             .into_response(),
         Err(code) => (
             StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<()>::err(code.to_string())),
+            Json(ApiResponse::<()>::err(
+                tond_common::code::INVALID_INPUT,
+                code.to_string(),
+            )),
         )
             .into_response(),
     }
@@ -717,7 +720,7 @@ async fn exchange_manifest_code(state: &AppState, code: &str) -> anyhow::Result<
     Ok(GitHubAppResponse::from_app(gh_app))
 }
 
-/// Complete a pending `install` flow started (via `POST /api/github-apps/{id}/install`)
+/// Complete a pending `install` flow started (via `POST /api/v1/github-apps/{id}/install`)
 /// by the admin whose session accompanies the request. A request without state
 /// changes nothing.
 async fn finish_install_flow(
@@ -769,7 +772,7 @@ async fn finish_install_flow(
     Ok(())
 }
 
-// ── POST /api/github-apps/{id}/install ────────────────────────────────────────
+// ── POST /api/v1/github-apps/{id}/install ────────────────────────────────────────
 
 /// Start an installation flow: returns the GitHub installation URL carrying
 /// a single-use state bound to the logged-in admin.
@@ -799,7 +802,7 @@ pub async fn get_install_url(
     ))
 }
 
-// ── PATCH /api/github-apps/{id} ───────────────────────────────────────────────
+// ── PATCH /api/v1/github-apps/{id} ───────────────────────────────────────────────
 
 pub async fn update_github_app(
     _rate: RateLimit,
@@ -841,7 +844,7 @@ pub async fn update_github_app(
     ))
 }
 
-// ── DELETE /api/github-apps/{id} ──────────────────────────────────────────────
+// ── DELETE /api/v1/github-apps/{id} ──────────────────────────────────────────────
 
 pub async fn delete_github_app(
     _rate: RateLimit,
@@ -879,7 +882,7 @@ pub async fn delete_github_app(
     ))
 }
 
-// ── GET /api/github-apps/{id}/repos ──────────────────────────────────────────
+// ── GET /api/v1/github-apps/{id}/repos ──────────────────────────────────────────
 
 /// List repositories accessible via the GitHub App installation.
 pub async fn list_repos(
@@ -963,7 +966,7 @@ pub async fn list_repos(
     Ok((StatusCode::OK, Json(ApiResponse::ok(repos))))
 }
 
-// ── GET /api/github-apps/{id}/repos/{owner}/{repo}/branches ──────────────────
+// ── GET /api/v1/github-apps/{id}/repos/{owner}/{repo}/branches ──────────────────
 
 pub async fn list_branches(
     _rate: RateLimit,
@@ -1022,7 +1025,7 @@ pub async fn list_branches(
     Ok((StatusCode::OK, Json(ApiResponse::ok(branches))))
 }
 
-// ── GET /api/apps/{app_id}/github-prs ────────────────────────────────────────
+// ── GET /api/v1/apps/{app_id}/github-prs ────────────────────────────────────────
 
 /// Response for a single open pull request.
 #[derive(Serialize)]
@@ -1144,7 +1147,7 @@ pub async fn list_open_prs(
     Ok((StatusCode::OK, Json(ApiResponse::ok(prs))))
 }
 
-// ── PUT /api/apps/{app_id}/github-app ─────────────────────────────────────────
+// ── PUT /api/v1/apps/{app_id}/github-app ─────────────────────────────────────────
 /// Link or unlink a GitHub App from an app.
 pub async fn set_app_github_app(
     _rate: RateLimit,
