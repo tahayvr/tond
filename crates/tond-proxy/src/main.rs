@@ -975,7 +975,17 @@ fn main() {
     });
     let challenges = acme::new_challenge_map();
 
-    let mut server = Server::new(None).unwrap();
+    // Pingora waits 300 s (+ a final step) for connections on SIGTERM by
+    // default, which makes every restart of tond-proxy crawl. Proxied requests
+    // are short; give them a few seconds to finish.
+    let mut server = Server::new_with_opt_and_conf(
+        None,
+        pingora::server::configuration::ServerConf {
+            grace_period_seconds: Some(5),
+            graceful_shutdown_timeout_seconds: Some(5),
+            ..pingora::server::configuration::ServerConf::new().unwrap_or_default()
+        },
+    );
     server.bootstrap();
 
     let route_db = Arc::new(
