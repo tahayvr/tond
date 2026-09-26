@@ -309,8 +309,8 @@ fn webhook_trigger_detail(provider: &str, branch: Option<&str>) -> String {
     }
 }
 
-/// Check auto_deploy, the branch filter and the per-app rate limit, then spawn
-/// a background deploy.
+/// Check auto_deploy, the branch filter and the per-app rate limit, then queue
+/// a deploy (deploy/queue.rs).
 async fn trigger_webhook_deploy(
     state: &AppState,
     app: App,
@@ -356,22 +356,34 @@ async fn trigger_webhook_deploy(
         branch
     );
 
+    // A burst of pushes coalesces in the queue: the newest supersedes a
+    // deploy that has not started yet.
     let detail = webhook_trigger_detail(provider, branch);
-    if let Err(e) = deploy::start(
+    let app_id = app.id.clone();
+    match deploy::start(
         state,
         app,
         deploy::DeployRequest::source("webhook", Some(detail)),
     )
     .await
     {
-        tracing::error!("[webhook/{}] could not start deploy: {}", provider, e);
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "could not start the deployment",
-        );
+        Ok(queued) => (
+            StatusCode::ACCEPTED,
+            Json(ApiResponse::ok(crate::handlers::queued_response(
+                "Deployment queued",
+                &app_id,
+                &queued,
+            ))),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("[webhook/{}] could not queue deploy: {}", provider, e);
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not queue the deploy",
+            )
+        }
     }
-
-    (StatusCode::ACCEPTED, Json(ApiResponse::<()>::ok(()))).into_response()
 }
 
 /// Fetch an app by UUID for webhook use. Names are not accepted: webhook URLs

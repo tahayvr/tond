@@ -5,14 +5,17 @@
 //
 // Public surface (re-exported from deploy/mod.rs):
 //
-//   start(state, app, request) -> deployment id
-//     Create the deployment row and run it in the background. Used by the
-//     deploy, upload, rollback and webhook handlers, which return the id so
-//     the dashboard can open the live deploy view.
+//   start(state, app, request) -> queue::Enqueued
+//     Create the deployment row (status 'queued') and hand it to the build
+//     queue (queue.rs: one deploy per app, a newer request supersedes a
+//     queued one, builds share the global build slots). Used by the deploy,
+//     upload, rollback, webhook and project handlers, which return the id and
+//     queue position so the dashboard can open the live deploy view.
 //
-//   create(state, app, request) + run(state, app, id, request)
-//     The two halves of start(), for callers that deploy sequentially
-//     (project deploys) and wait for the outcome.
+//   create(state, app, request) + run(state, app, id, request, ctx)
+//     The two halves; the queue's runner calls run() with a DeployCtx that
+//     holds the build slot during the build phase and moves the row
+//     queued -> running.
 //
 // A deployment walks through phases — clone, build, start, health, release —
 // recorded by deploy::progress on the deployment row and published on the log
@@ -62,6 +65,9 @@ use super::failure::{self, ContainerExit, FailureContext, ProbeResult};
 use super::git::{GitHttpAuth, redact_url_credentials, split_url_credentials};
 use super::images;
 use super::progress;
+use super::queue::{self, DeployCtx};
+use crate::proxy_link;
+use crate::runtime::shutdown;
 
 /// Work out the clone URL and HTTPS credentials for a git app.
 ///
@@ -220,8 +226,8 @@ pub enum DeployOutcome {
     Failed(DeployFailure),
 }
 
-/// Insert the deployment row (status "running") and return its id. The
-/// caller then runs it with [`run`] (or uses [`start`] for both).
+/// Insert the deployment row (status "queued") and return its id. The build
+/// queue runs it with [`run`]; use [`start`] for both.
 pub async fn create(state: &AppState, app: &App, req: &DeployRequest) -> Result<String> {
     let deployment_id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
@@ -239,13 +245,19 @@ pub async fn create(state: &AppState, app: &App, req: &DeployRequest) -> Result<
     };
     let phases = progress::plan_for_app(plan_source, app);
     let phases_json = serde_json::to_string(&phases).unwrap_or_else(|_| "[]".to_string());
+    let kind = match req.kind {
+        DeployKind::Rollback { .. } => "rollback",
+        DeployKind::Upload { .. } => "upload",
+        DeployKind::Source => "deploy",
+    };
     sqlx::query(
-        "INSERT INTO deployments (id, app_id, image_tag, status, trigger_source, trigger_detail, rollback_of, phases, started_at, created_at)
-         VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO deployments (id, app_id, image_tag, status, kind, trigger_source, trigger_detail, rollback_of, phases, started_at, created_at)
+         VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&deployment_id)
     .bind(&app.id)
     .bind(image_tag)
+    .bind(kind)
     .bind(&req.trigger_source)
     .bind(&req.trigger_detail)
     .bind(rollback_of)
@@ -257,17 +269,11 @@ pub async fn create(state: &AppState, app: &App, req: &DeployRequest) -> Result<
     Ok(deployment_id)
 }
 
-/// Create a deployment and run it in the background. Returns its id at once
-/// so the caller can hand it to a live deploy view.
-pub async fn start(state: &AppState, app: App, req: DeployRequest) -> Result<String> {
+/// Create a deployment and queue it (deploy/queue.rs). Returns its id and
+/// place in line at once so the caller can hand them to a live deploy view.
+pub async fn start(state: &AppState, app: App, req: DeployRequest) -> Result<queue::Enqueued> {
     let deployment_id = create(state, &app, &req).await?;
-    let state = state.clone();
-    let id = deployment_id.clone();
-    tokio::spawn(async move {
-        let mut app = app;
-        run(&state, &mut app, &id, &req).await;
-    });
-    Ok(deployment_id)
+    Ok(queue::submit_request(state, &app.id, deployment_id, req).await)
 }
 
 /// Run a created deployment to completion: the pipeline, the result on the
@@ -277,8 +283,19 @@ pub async fn run(
     app: &mut App,
     deployment_id: &str,
     req: &DeployRequest,
+    ctx: &DeployCtx,
 ) -> DeployOutcome {
     let app_id = app.id.clone();
+    // Leave the queue: wait for a build slot unless nothing is built
+    // (rollbacks re-run an existing image). The row becomes 'running'.
+    let started = if matches!(req.kind, DeployKind::Rollback { .. }) {
+        ctx.begin(state).await
+    } else {
+        ctx.begin_build(state).await
+    };
+    if let Err(e) = started {
+        tracing::warn!("Deployment {deployment_id} could not leave the queue: {e:#}");
+    }
     let plan_source = match req.kind {
         DeployKind::Rollback { .. } => "rollback",
         DeployKind::Upload { .. } => "tarball",
@@ -290,7 +307,8 @@ pub async fn run(
     let previous_status = app.status.clone();
     let old_container_id = app.container_id.clone();
     let mut facts = HealthFacts::default();
-    let result = pipeline(state, app, deployment_id, req, &mut facts).await;
+    let result = pipeline(state, app, deployment_id, req, &mut facts, ctx).await;
+    ctx.release_build();
 
     if let DeployKind::Upload { dir } = &req.kind {
         let _ = tokio::fs::remove_dir_all(dir).await;
@@ -387,6 +405,7 @@ async fn pipeline(
     deployment_id: &str,
     req: &DeployRequest,
     facts: &mut HealthFacts,
+    ctx: &DeployCtx,
 ) -> Result<()> {
     let app_id = app.id.clone();
     let app_name = app.name.clone();
@@ -423,7 +442,7 @@ async fn pipeline(
             let snap_state = state.clone();
             let snap_app_name = app_name.clone();
             let snap_deploy_id = deployment_id.to_string();
-            tokio::spawn(async move {
+            shutdown::spawn_tracked(async move {
                 let _ = backup::create_snapshot(
                     &snap_state,
                     SnapshotTrigger::PreDeploy {
@@ -497,6 +516,9 @@ async fn pipeline(
         }
     };
 
+    // The image exists: give the build slot to the next deployment.
+    ctx.release_build();
+
     // Record the image tag on the deployment row now that we know it.
     let _ = sqlx::query("UPDATE deployments SET image_tag = ? WHERE id = ?")
         .bind(&image_name)
@@ -566,6 +588,8 @@ async fn pipeline(
     // (zero-downtime staging swap), so we cannot reuse the existing port here.
     // On the very first deploy there is no old container and no reserved port,
     // so this also handles that case correctly.
+    // Held until the new container owns its port (see queue::port_allocation).
+    let port_guard = queue::port_allocation().await;
     let new_host_port = docker::find_free_port(&state.docker, 8100).await?;
     let container_port = app.container_port as u16;
 
@@ -651,6 +675,7 @@ async fn pipeline(
         .await
         .context("Docker could not start the new container")?
     };
+    drop(port_guard);
 
     // ── Health ──
     //
@@ -769,8 +794,9 @@ async fn pipeline(
 
     // ── Release: atomic traffic cutover ──
     //
-    // Update the DB in a single statement. tond-proxy reads host_port every
-    // 5 s; after this write the old port stops receiving new requests.
+    // Update the DB in a single statement (the route_state trigger bumps the
+    // route version), then have tond-proxy reload and acknowledge it before
+    // the old container is stopped.
     progress::start(state, &app_id, DeployPhase::Release).await;
     sqlx::query(
         "UPDATE apps SET container_id = ?, host_port = ?, status = 'running', updated_at = datetime('now') WHERE id = ?",
@@ -785,32 +811,19 @@ async fn pipeline(
     app.host_port = Some(new_host_port as i64);
     app.status = "running".to_string();
 
-    // ── Zero-downtime cutover: wait → SIGTERM old → rename staging ──
+    // ── Zero-downtime cutover: proxy ack → SIGTERM old → rename staging ──
     //
-    // After writing the new port to the DB the proxy needs up to PROXY_POLL_SECS
-    // to pick up the change and start routing to the new container. Only then
-    // can we safely SIGTERM the old one.
+    // tond-proxy must be routing to the new port before the old container is
+    // stopped: wait for its acknowledgement (tens of milliseconds).
     //
     // On the first deploy there is no old container and the new one already has
     // the canonical name, so skip this block entirely.
-    const PROXY_POLL_SECS: u64 = 3; // must be > the proxy's 2 s poll interval
     if let Some(ref old_id) = old_container_id
         && old_id != &new_container_id
     {
         // Workers are never routed: nothing for the proxy to pick up.
         if readiness.serves_traffic() {
-            log_deploy(
-                state,
-                &app_id,
-                "info",
-                trigger_source,
-                &format!(
-                    "Waiting {}s for proxy to pick up new port before stopping old container",
-                    PROXY_POLL_SECS
-                ),
-            )
-            .await?;
-            tokio::time::sleep(std::time::Duration::from_secs(PROXY_POLL_SECS)).await;
+            wait_for_proxy_cutover(state, &app_id, trigger_source).await?;
         }
 
         log_deploy(
@@ -857,6 +870,21 @@ async fn pipeline(
 
     images::prune_app_images(state, &app_id, &app_name).await;
 
+    Ok(())
+}
+
+/// Wait until tond-proxy routes the app's new port (see proxy_link.rs), and
+/// say in the deploy log how the cutover was confirmed.
+async fn wait_for_proxy_cutover(
+    state: &AppState,
+    app_id: &str,
+    trigger_source: &str,
+) -> Result<()> {
+    let outcome = proxy_link::sync_routes(state).await;
+    log_deploy(state, app_id, "info", trigger_source, &outcome.describe()).await?;
+    if let Some(wait) = outcome.fallback_wait() {
+        tokio::time::sleep(wait).await;
+    }
     Ok(())
 }
 
@@ -1069,6 +1097,12 @@ pub async fn deploy_preview(
 
     tracing::info!("Starting preview deploy for {} (slug: {})", app_name, slug);
 
+    // Previews build outside the per-app queue but share the global build
+    // slots, and use their own build directory so they never race the app's
+    // production build.
+    let build_slot = queue::build_slot().await;
+    let work_name = format!("{app_name}-preview-{slug}");
+
     let image_name = match app.source_type.as_str() {
         "git" => {
             let source_url = app
@@ -1094,7 +1128,7 @@ pub async fn deploy_preview(
             build_from_git(
                 state,
                 &app_id,
-                &app_name,
+                &work_name,
                 &clone_url,
                 git_auth.as_ref(),
                 branch,
@@ -1132,7 +1166,7 @@ pub async fn deploy_preview(
             build_from_inline_dockerfile(
                 state,
                 &app_id,
-                &app_name,
+                &work_name,
                 content,
                 &images::preview_tag(&app_name, &slug),
                 "preview",
@@ -1150,6 +1184,7 @@ pub async fn deploy_preview(
         }
     };
 
+    drop(build_slot);
     preview.image_tag = Some(image_name.clone());
 
     // Update image_tag in DB now that we know it
@@ -1160,6 +1195,7 @@ pub async fn deploy_preview(
         .await;
 
     // Pick a free port in the preview range (8200+)
+    let port_guard = queue::port_allocation().await;
     let host_port = docker::find_free_port(&state.docker, 8200).await?;
     let container_port = app.container_port as u16;
 
@@ -1210,6 +1246,7 @@ pub async fn deploy_preview(
         None,
     )
     .await?;
+    drop(port_guard);
 
     // Update the preview row with runtime details
     sqlx::query(
@@ -1761,7 +1798,7 @@ mod tests {
             .fetch_one(&state.db)
             .await
             .unwrap_or_else(|e| panic!("read: {e}"));
-        assert_eq!(row.status, "running");
+        assert_eq!(row.status, "queued", "the build queue moves it to running");
         assert_eq!(row.trigger_detail.as_deref(), Some("ada@example.com"));
         let phases = row.phase_records();
         assert_eq!(phases.len(), 5);

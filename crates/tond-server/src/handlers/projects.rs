@@ -353,30 +353,30 @@ pub async fn deploy_project(
     }
 
     let queued = apps.len();
-    // Deploys are run sequentially in a background task to avoid the port
-    // allocation race: find_free_port reads live container ports, so two
-    // concurrent deploys that both need a new port will see the same snapshot
-    // and pick the same port, causing one container to fail with "port already
-    // allocated". Running them one after another ensures each deploy binds its
-    // port before the next one calls find_free_port.
-    let state_clone = state.clone();
+    // Each app gets its own queued deployment. The build queue runs one build
+    // at a time and serialises port allocation (deploy/queue.rs), so the apps
+    // no longer need to be deployed strictly one after another here.
     let detail = Some(format!(
         "project {} ({})",
         project.name,
         handlers::deploy_trigger(&auth).1.unwrap_or_default()
     ));
-    tokio::spawn(async move {
-        for mut app in apps {
-            let req = deploy::DeployRequest::source("manual", detail.clone());
-            match deploy::create(&state_clone, &app, &req).await {
-                // run() records the result, updates the app status and alerts.
-                Ok(id) => {
-                    let _ = deploy::run(&state_clone, &mut app, &id, &req).await;
-                }
-                Err(e) => tracing::error!("Project deploy error for {}: {}", app.name, e),
-            }
-        }
-    });
+    let mut deployment_ids = Vec::with_capacity(apps.len());
+    for app in apps {
+        let name = app.name.clone();
+        let q = deploy::start(
+            &state,
+            app,
+            deploy::DeployRequest::source("manual", detail.clone()),
+        )
+        .await
+        .map_err(|e| {
+            AppError(TondError::Internal(format!(
+                "Could not queue the deploy of {name}: {e}"
+            )))
+        })?;
+        deployment_ids.push(q.deployment_id);
+    }
 
     write_audit_log(
         &state.db,
@@ -392,7 +392,8 @@ pub async fn deploy_project(
         StatusCode::ACCEPTED,
         Json(ApiResponse::ok(serde_json::json!({
             "queued": queued,
-            "message": format!("deploying {} app(s)", queued)
+            "deployment_ids": deployment_ids,
+            "message": format!("Queued {} deployment(s)", queued)
         }))),
     ))
 }

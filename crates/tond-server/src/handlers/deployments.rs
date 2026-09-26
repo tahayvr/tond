@@ -143,6 +143,7 @@ fn pick_rollback_target<'a>(
 
 /// Deployment rows plus rollback metadata for the API.
 fn deployment_responses(app: &App, deployments: Vec<Deployment>) -> Vec<DeploymentResponse> {
+    let positions = deploy::queue::global().positions();
     let current = current_image_tag(&deployments).map(str::to_string);
     let mut seen_current = false;
     deployments
@@ -161,6 +162,9 @@ fn deployment_responses(app: &App, deployments: Vec<Deployment>) -> Vec<Deployme
             resp.is_current = is_current;
             resp.rollback_available = blocker.is_none();
             resp.rollback_unavailable_reason = blocker;
+            if resp.status == "queued" {
+                resp.queue_position = positions.get(&resp.id).map(|p| *p as u32);
+            }
             resp
         })
         .collect()
@@ -229,7 +233,7 @@ pub async fn rollback_app(
     let app_name = app.name.clone();
     let app_id = app.id.clone();
     let detail = handlers::deploy_trigger(&auth).1;
-    let deployment_id = deploy::start(
+    let queued = deploy::start(
         &state,
         app,
         deploy::DeployRequest {
@@ -252,22 +256,15 @@ pub async fn rollback_app(
         &auth.audit_actor(),
         Some(&format!(
             "deployment={} image_tag={} rollback_deployment={}",
-            target_id, image_tag, deployment_id
+            target_id, image_tag, queued.deployment_id
         )),
     )
     .await;
 
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(ApiResponse::ok(json!({
-            "message": "Rollback started",
-            "app_id": app_id,
-            "image_tag": image_tag,
-            "target_deployment_id": target_id,
-            "deployment_id": deployment_id,
-            "status": "running",
-        }))),
-    ))
+    let mut body = crate::handlers::queued_response("Rollback queued", &app_id, &queued);
+    body["image_tag"] = json!(image_tag);
+    body["target_deployment_id"] = json!(target_id);
+    Ok((StatusCode::ACCEPTED, Json(ApiResponse::ok(body))))
 }
 
 // ── Deployment detail and live stream ──
@@ -587,6 +584,9 @@ mod tests {
             finished_at: Some("2026-04-08T12:01:00Z".to_string()),
             created_at: "2026-04-08T12:00:00Z".to_string(),
             image_pruned: false,
+            kind: "deploy".to_string(),
+            error: None,
+            superseded_by: None,
             commit_sha: None,
             commit_message: None,
             commit_author: None,

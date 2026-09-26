@@ -50,6 +50,7 @@ import {
 	MOCK_PREVIEW_ENV_VARS,
 	MOCK_CERTIFICATES,
 	makeMockSystemMetrics,
+	makeMockSystemSelf,
 	makeMockMetrics,
 	MOCK_DATABASE_SECRETS
 } from './fixtures';
@@ -1700,10 +1701,13 @@ export const handlers = [
 			{
 				success: true,
 				data: {
-					message: 'Deployment started',
+					message: 'Deployment queued',
 					app_id: app.id,
 					deployment_id: d.id,
-					status: 'running'
+					status: 'queued',
+					// The mock never has to wait: the build queue is always free.
+					queue_position: 1,
+					superseded: null
 				},
 				error: null
 			},
@@ -2054,12 +2058,14 @@ export const handlers = [
 			{
 				success: true,
 				data: {
-					message: 'Rollback started',
+					message: 'Rollback queued',
 					app_id: app.id,
 					image_tag: target.image_tag,
 					target_deployment_id: target.id,
 					deployment_id: d.id,
-					status: 'running'
+					status: 'queued',
+					queue_position: 1,
+					superseded: null
 				},
 				error: null
 			},
@@ -2383,6 +2389,11 @@ export const handlers = [
 	http.get('/api/cron/:id/metrics', async ({ request }) => {
 		await delay(LATENCY);
 		return ok(makeMockMetrics(new URL(request.url).searchParams.get('range') ?? '1h', true));
+	}),
+
+	http.get('/api/system/self', async () => {
+		await delay(LATENCY);
+		return ok(makeMockSystemSelf());
 	}),
 
 	http.get('/api/system/metrics', async () => {

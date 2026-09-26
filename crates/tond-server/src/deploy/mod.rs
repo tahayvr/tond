@@ -6,12 +6,14 @@
 //   git.rs      — clone hardening: credentials via env, log redaction,
 //                 known_hosts; commit and branch listing helpers
 //   progress.rs — phase tracking and log attribution for the active deployment
+//   queue.rs    — the build/deploy queue: one deploy per app, coalescing, a
+//                 global build semaphore; deploy::start() queues through it
 //   failure.rs  — classify a failed deployment into a likely cause + fix hint
 //   images.rs   — per-deployment image tags and pruning
 //
 // Public surface:
-//   deploy::start(state, app, DeployRequest) -> deployment id (runs in background)
-//   deploy::create(..) + deploy::run(..)   — the same, run in the caller's task
+//   deploy::start(state, app, DeployRequest) -> queue::Enqueued (id, place in line)
+//   deploy::create(..) + deploy::run(.., ctx) — the halves (run by the queue)
 //   deploy::deploy_preview(state, app, preview)
 
 mod build;
@@ -20,10 +22,10 @@ pub mod failure;
 pub mod git;
 pub mod images;
 pub mod progress;
+pub mod queue;
 
 pub use build::{compose_project_name, validate_base_dir};
 pub use core::{
-    DeployKind, DeployRequest, create, deploy_preview, fetch_registry_credentials, pull_image, run,
-    start,
+    DeployKind, DeployRequest, deploy_preview, fetch_registry_credentials, pull_image, run, start,
 };
 pub use git::{GitHttpAuth, redact_url_credentials};

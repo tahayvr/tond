@@ -66,9 +66,15 @@ async fn run_snapshot(
     trigger: SnapshotTrigger,
 ) -> Result<SnapshotResponse, AppError> {
     let (tx, _rx) = mpsc::channel(32);
-    let id = backup::create_snapshot(state, trigger, Some(tx))
-        .await
-        .map_err(|e| AppError(TondError::Internal(format!("Snapshot failed: {e:#}"))))?;
+    // Tracked work: a graceful shutdown lets the snapshot finish even if this
+    // request's connection is closed first.
+    let worker = state.clone();
+    let id = crate::runtime::shutdown::spawn_tracked(async move {
+        backup::create_snapshot(&worker, trigger, Some(tx)).await
+    })
+    .await
+    .map_err(|e| AppError(TondError::Internal(format!("Snapshot task failed: {e}"))))?
+    .map_err(|e| AppError(TondError::Internal(format!("Snapshot failed: {e:#}"))))?;
     Ok(SnapshotResponse::from(
         fetch_snapshot_row(state, &id).await?,
     ))

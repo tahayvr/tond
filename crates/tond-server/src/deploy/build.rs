@@ -91,12 +91,39 @@ pub fn compose_project_name(app_name: &str) -> String {
     app_name.to_ascii_lowercase()
 }
 
+/// Default cgroup parent for build containers: a systemd slice that
+/// install.sh caps at MemoryMax=60% (see release/tondbuild.slice).
+pub const DEFAULT_BUILD_CGROUP_PARENT: &str = "tondbuild.slice";
+
+/// Cgroup parent for `docker build` RUN steps: TOND_BUILD_CGROUP_PARENT, else
+/// DEFAULT_BUILD_CGROUP_PARENT; an empty value disables it.
+///
+/// Why a cgroup parent: BuildKit (the default builder behind `docker build`)
+/// ignores the classic builder's --memory flag, but honours --cgroup-parent
+/// for the containers that run RUN steps (the docker driver). With Docker's
+/// systemd cgroup driver the value names a slice, so every build step lands
+/// in tondbuild.slice and the slice's MemoryMax bounds all builds together.
+/// If the slice unit is missing, systemd creates it with no limit, so the flag
+/// is always safe to pass.
+fn build_cgroup_parent() -> Option<String> {
+    match std::env::var("TOND_BUILD_CGROUP_PARENT") {
+        Ok(v) if v.trim().is_empty() => None,
+        Ok(v) => Some(v.trim().to_string()),
+        Err(_) => Some(DEFAULT_BUILD_CGROUP_PARENT.to_string()),
+    }
+}
+
 fn docker_build_args<'a>(
     image_tag: &'a str,
     context_dir: &'a str,
     dockerfile_path: Option<&'a str>,
+    cgroup_parent: Option<&'a str>,
 ) -> Vec<&'a str> {
     let mut args = vec!["build"];
+    if let Some(parent) = cgroup_parent {
+        args.push("--cgroup-parent");
+        args.push(parent);
+    }
     if let Some(path) = dockerfile_path {
         args.push("-f");
         args.push(path);
@@ -505,7 +532,13 @@ pub(super) async fn build_with_dockerfile(
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     let dockerfile = format!("{dir}/Dockerfile");
-    let args = docker_build_args(image_tag, context_dir.unwrap_or(dir), Some(&dockerfile));
+    let cgroup_parent = build_cgroup_parent();
+    let args = docker_build_args(
+        image_tag,
+        context_dir.unwrap_or(dir),
+        Some(&dockerfile),
+        cgroup_parent.as_deref(),
+    );
 
     let mut child = tokio::process::Command::new("docker")
         .args(&args)
@@ -814,7 +847,8 @@ mod tests {
             docker_build_args(
                 "tond-web",
                 "/tmp/repo",
-                Some("/tmp/repo/apps/web/Dockerfile")
+                Some("/tmp/repo/apps/web/Dockerfile"),
+                None,
             ),
             vec![
                 "build",
@@ -826,6 +860,34 @@ mod tests {
             ],
             "nested builds should point docker build at the selected Dockerfile while keeping the repo root as the build context"
         );
+    }
+
+    #[test]
+    fn builds_run_under_the_build_slice() {
+        assert_eq!(
+            docker_build_args("t", "/ctx", None, Some(DEFAULT_BUILD_CGROUP_PARENT)),
+            vec![
+                "build",
+                "--cgroup-parent",
+                "tondbuild.slice",
+                "-t",
+                "t",
+                "/ctx"
+            ]
+        );
+        // SAFETY: only this test reads TOND_BUILD_CGROUP_PARENT.
+        unsafe { std::env::remove_var("TOND_BUILD_CGROUP_PARENT") };
+        assert_eq!(
+            build_cgroup_parent().as_deref(),
+            Some(DEFAULT_BUILD_CGROUP_PARENT)
+        );
+        unsafe { std::env::set_var("TOND_BUILD_CGROUP_PARENT", " ") };
+        assert_eq!(
+            build_cgroup_parent(),
+            None,
+            "empty disables the cgroup parent"
+        );
+        unsafe { std::env::remove_var("TOND_BUILD_CGROUP_PARENT") };
     }
 
     #[tokio::test]

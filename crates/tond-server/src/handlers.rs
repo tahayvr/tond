@@ -58,6 +58,7 @@ pub mod projects;
 pub mod registry_credentials;
 pub mod settings;
 pub mod storage_providers;
+pub mod system_self;
 pub mod templates;
 pub mod terminal;
 pub mod tokens;
@@ -80,7 +81,7 @@ use crate::{
     auth::{Authz, Principal, RateLimit, principal::Actor, scope},
     compose_policy, deploy, docker,
     error::AppError,
-    secrets,
+    proxy_link, secrets,
     state::AppState,
     volumes,
 };
@@ -545,16 +546,11 @@ pub(crate) fn deploy_trigger(principal: &Principal) -> (&'static str, Option<Str
 pub(crate) fn deployment_started(
     message: &str,
     app_id: &str,
-    deployment_id: &str,
+    queued: &deploy::queue::Enqueued,
 ) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
     (
         StatusCode::ACCEPTED,
-        Json(ApiResponse::ok(json!({
-            "message": message,
-            "app_id": app_id,
-            "deployment_id": deployment_id,
-            "status": "running",
-        }))),
+        Json(ApiResponse::ok(queued_response(message, app_id, queued))),
     )
 }
 
@@ -569,7 +565,7 @@ pub async fn deploy_app(
     let app_name = app.name.clone();
 
     let (trigger, detail) = deploy_trigger(&auth);
-    let deployment_id = deploy::start(&state, app, deploy::DeployRequest::source(trigger, detail))
+    let queued = deploy::start(&state, app, deploy::DeployRequest::source(trigger, detail))
         .await
         .map_err(|e| AppError(TondError::Internal(e.to_string())))?;
 
@@ -579,15 +575,31 @@ pub async fn deploy_app(
         Some(&app_name),
         "deploy",
         &auth.audit_actor(),
-        Some(&format!("deployment={deployment_id}")),
+        Some(&format!("deployment={}", queued.deployment_id)),
     )
     .await;
 
-    Ok(deployment_started(
-        "Deployment started",
-        &app_id,
-        &deployment_id,
-    ))
+    Ok(deployment_started("Deployment queued", &app_id, &queued))
+}
+
+/// Body of a 202 answer to a queued deployment (deploy/queue.rs).
+pub(crate) fn queued_response(
+    message: &str,
+    app_id: &str,
+    queued: &deploy::queue::Enqueued,
+) -> serde_json::Value {
+    json!({
+        "message": if queued.queue_position > 1 {
+            format!("{message} (position {} in the queue)", queued.queue_position)
+        } else {
+            message.to_string()
+        },
+        "app_id": app_id,
+        "deployment_id": queued.deployment_id,
+        "status": queued.status,
+        "queue_position": queued.queue_position,
+        "superseded": queued.superseded,
+    })
 }
 
 // ── Stop App ──
@@ -860,6 +872,9 @@ pub async fn retry_cert(
     if updated == 0 {
         return Err(TondError::NotFound(format!("No certificate for {domain}")).into());
     }
+
+    // Ask tond-proxy to try right away instead of at its next scheduled pass.
+    tokio::spawn(proxy_link::request_certs(Some(domain.clone())));
 
     record(
         &state.db,
@@ -1247,9 +1262,9 @@ pub async fn upload_deploy(
 ) -> Result<impl IntoResponse, AppError> {
     let mut app = fetch_app(&state.db, &id).await?;
 
-    // Extract tarball from multipart upload
-    let extract_dir = format!("/tmp/tond-uploads/{}", app.name);
-    let _ = tokio::fs::remove_dir_all(&extract_dir).await;
+    // Extract into a directory of its own: an earlier upload of the same app
+    // may still be waiting in the build queue or building.
+    let extract_dir = format!("/tmp/tond-uploads/{}", uuid::Uuid::new_v4());
     tokio::fs::create_dir_all(&extract_dir).await.map_err(|e| {
         AppError(TondError::Internal(format!(
             "Failed to create upload dir: {}",
@@ -1282,6 +1297,7 @@ pub async fn upload_deploy(
                 .map_err(|e| AppError(TondError::Internal(format!("Failed to run tar: {}", e))))?;
 
             if !output.status.success() {
+                let _ = tokio::fs::remove_dir_all(&extract_dir).await;
                 return Err(AppError(TondError::InvalidInput(
                     "Failed to extract tarball".to_string(),
                 )));
@@ -1306,7 +1322,7 @@ pub async fn upload_deploy(
 
     // Build and deploy in the background as one deployment (build phase
     // included), so its log and progress show in the live deploy view.
-    let deployment_id = deploy::start(
+    let queued = deploy::start(
         &state,
         app,
         deploy::DeployRequest {
@@ -1324,14 +1340,17 @@ pub async fn upload_deploy(
         Some(&app_name),
         "deploy",
         &auth.audit_actor(),
-        Some("source=upload"),
+        Some(&format!(
+            "source=upload deployment={}",
+            queued.deployment_id
+        )),
     )
     .await;
 
     Ok(deployment_started(
-        "Upload received, building & deploying...",
+        "Upload received; build queued",
         &app_id,
-        &deployment_id,
+        &queued,
     ))
 }
 
