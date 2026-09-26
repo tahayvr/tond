@@ -1013,7 +1013,10 @@ read -r code body < <(api_send PUT /api/settings "{\"apps_domain\": \"apps.${BAS
 [[ "$code" == 400 ]] || fail "an apps domain on the dashboard's site must be rejected (got ${code}: ${body})"
 pass "an apps domain on the dashboard's site (apps.${BASE}) is rejected"
 if [[ -n "$APPS_DOMAIN" ]]; then
-    tond settings | grep -qE "^apps-domain +${APPS_DOMAIN}$" || fail "install.sh must set the apps domain to ${APPS_DOMAIN}"
+    # Capture first: grep -q exiting early would SIGPIPE tond under pipefail.
+    apps_settings_out="$(tond settings)"
+    grep -qE "^apps-domain +${APPS_DOMAIN}$" <<< "$apps_settings_out" \
+        || fail "install.sh must set the apps domain to ${APPS_DOMAIN}"
     tond apps create e2e-auto --source-type image --source traefik/whoami:v1.10 --port 80 > /dev/null
     tond apps deploy e2e-auto > /dev/null
     wait_for_app_running e2e-auto 180
