@@ -10,7 +10,7 @@ website = "https://github.com/dani-garcia/vaultwarden"
 docs = "https://github.com/dani-garcia/vaultwarden/wiki"
 repository = "https://github.com/dani-garcia/vaultwarden"
 ram_mb = 60
-setup_notes = "Open the app and create your account. Then open /admin with the admin token shown below and turn off 'Allow new signups' so nobody else can register."
+setup_notes = "Open the app and create your account. Then open /admin with the admin token Tond showed after the deploy and turn off 'Allow new signups' so nobody else can register."
 upgrade_notes = "Change the image to a newer 1.x tag and redeploy. Snapshot the app first: the SQLite database holds every vault."
 post_deploy_checks = ["Create your account", "Disable new signups in /admin", "Set up backups of this app"]
 

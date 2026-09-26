@@ -10,7 +10,7 @@ website = "https://docs.paperless-ngx.com"
 docs = "https://docs.paperless-ngx.com/setup/"
 repository = "https://github.com/paperless-ngx/paperless-ngx"
 ram_mb = 800
-setup_notes = "Sign in as admin with the password shown below, then upload a document from the web UI or the mobile apps."
+setup_notes = "Sign in as admin with the password Tond showed after the deploy, then upload a document from the web UI or the mobile apps."
 upgrade_notes = "Change the image to a newer 2.x tag and redeploy; migrations run on start. Paperless 3 has breaking changes: read its release notes and snapshot first."
 post_deploy_checks = ["Sign in as admin", "Upload a PDF and search for a word in it"]
 

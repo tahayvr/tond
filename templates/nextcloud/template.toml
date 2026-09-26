@@ -10,7 +10,7 @@ website = "https://nextcloud.com"
 docs = "https://github.com/nextcloud/docker"
 repository = "https://github.com/nextcloud/server"
 ram_mb = 600
-setup_notes = "The first start installs Nextcloud and takes a minute or two. Then sign in as admin with the password shown below. Install the desktop and mobile clients and point them at this address."
+setup_notes = "The first start installs Nextcloud and takes a minute or two. Then sign in as admin with the password Tond showed after the deploy. Install the desktop and mobile clients and point them at this address."
 upgrade_notes = "Nextcloud only upgrades one major version at a time (34 → 35, never 34 → 36). Snapshot the app, change the image tag to the next major and redeploy; the upgrade runs on start."
 post_deploy_checks = ["Sign in as admin", "Check Administration → Overview for warnings"]
 

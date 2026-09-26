@@ -10,7 +10,7 @@ website = "https://directus.io"
 docs = "https://directus.io/docs/self-hosting/overview"
 repository = "https://github.com/directus/directus"
 ram_mb = 300
-setup_notes = "Sign in with the admin email and the password shown below."
+setup_notes = "Sign in with the admin email and the password Tond showed after the deploy."
 upgrade_notes = "Change the image to a newer 11.x tag and redeploy; migrations run on start. Directus 12 has breaking changes: read its migration guide and snapshot first."
 post_deploy_checks = ["Sign in to the data studio", "Create a collection and fetch it from the API"]
 

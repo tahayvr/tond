@@ -9,7 +9,7 @@ website = "https://miniflux.app"
 docs = "https://miniflux.app/docs/docker.html"
 repository = "https://github.com/miniflux/v2"
 ram_mb = 100
-setup_notes = "Sign in as admin with the password shown below and add your first feeds, or import an OPML file."
+setup_notes = "Sign in as admin with the password Tond showed after the deploy and add your first feeds, or import an OPML file."
 upgrade_notes = "Change the image to a newer 2.x tag and redeploy; migrations run on start."
 post_deploy_checks = ["Sign in as admin", "Import an OPML file or add a feed"]
 

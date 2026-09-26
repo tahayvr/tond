@@ -10,7 +10,7 @@ website = "https://listmonk.app"
 docs = "https://listmonk.app/docs/installation/"
 repository = "https://github.com/knadh/listmonk"
 ram_mb = 120
-setup_notes = "Sign in as admin with the password shown below. Set the root URL under Settings → General to this app's address and add your SMTP server under Settings → SMTP."
+setup_notes = "Sign in as admin with the password Tond showed after the deploy. Set the root URL under Settings → General to this app's address and add your SMTP server under Settings → SMTP."
 upgrade_notes = "Change the image to a newer tag and redeploy; the container runs listmonk --upgrade on every start. Snapshot the app first."
 post_deploy_checks = ["Sign in and set the root URL", "Configure SMTP and send a test campaign"]
 

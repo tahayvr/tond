@@ -10,7 +10,7 @@ website = "https://coder.com/docs/code-server"
 docs = "https://coder.com/docs/code-server/install#docker"
 repository = "https://github.com/coder/code-server"
 ram_mb = 350
-setup_notes = "Open the app and sign in with the password shown below. Your work lives in /home/coder/project."
+setup_notes = "Open the app and sign in with the password Tond showed after the deploy. Your work lives in /home/coder/project."
 upgrade_notes = "Change the image to a newer 4.x tag and redeploy. Extensions and settings are kept in the volumes."
 post_deploy_checks = ["Sign in with the password", "Open a terminal and clone a repository"]
 

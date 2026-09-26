@@ -161,7 +161,7 @@
         "credential": true
       }
     ],
-    "setup_notes": "Open the app and sign in with the password shown below. Your work lives in /home/coder/project.",
+    "setup_notes": "Open the app and sign in with the password Tond showed after the deploy. Your work lives in /home/coder/project.",
     "upgrade_notes": "Change the image to a newer 4.x tag and redeploy. Extensions and settings are kept in the volumes.",
     "post_deploy_checks": [
       "Sign in with the password",
@@ -248,7 +248,7 @@
         "credential": true
       }
     ],
-    "setup_notes": "Sign in with the admin email and the password shown below.",
+    "setup_notes": "Sign in with the admin email and the password Tond showed after the deploy.",
     "upgrade_notes": "Change the image to a newer 11.x tag and redeploy; migrations run on start. Directus 12 has breaking changes: read its migration guide and snapshot first.",
     "post_deploy_checks": [
       "Sign in to the data studio",
@@ -274,7 +274,7 @@
     "website": "https://docmost.com",
     "docs": "https://docmost.com/docs/installation",
     "repository": "https://github.com/docmost/docmost",
-    "ram_mb": 400,
+    "ram_mb": 500,
     "fits_2gb": true,
     "public": {
       "service": "docmost",
@@ -306,7 +306,7 @@
         "service": "docmost",
         "path": "./storage",
         "description": "Uploaded files and attachments",
-        "owner": null
+        "owner": "1000:1000"
       },
       {
         "service": "db",
@@ -514,7 +514,7 @@
         "credential": true
       }
     ],
-    "setup_notes": "Sign in as admin with the password shown below. Mobile apps use the API password, also shown below, with the address /api/greader.php.",
+    "setup_notes": "Sign in as admin with the password Tond showed after the deploy. Mobile apps use the API password (also shown after the deploy) with the address /api/greader.php.",
     "upgrade_notes": "Change the image to a newer 1.x tag and redeploy.",
     "post_deploy_checks": [
       "Sign in as admin",
@@ -708,7 +708,7 @@
         "credential": true
       }
     ],
-    "setup_notes": "Sign in as admin with the password shown below, then add a data source under Connections.",
+    "setup_notes": "Sign in as admin with the password Tond showed after the deploy, then add a data source under Connections.",
     "upgrade_notes": "Change the image to a newer tag and redeploy; the SQLite database is migrated on start. Snapshot first before a major version.",
     "post_deploy_checks": [
       "Sign in as admin",
@@ -781,7 +781,7 @@
         "credential": true
       }
     ],
-    "setup_notes": "Sign in to Grafana as admin with the password shown below; the Prometheus data source is already set up. Metrics are kept for 15 days.",
+    "setup_notes": "Sign in to Grafana as admin with the password Tond showed after the deploy; the Prometheus data source is already set up. Metrics are kept for 15 days.",
     "upgrade_notes": "Change either image tag and redeploy. Prometheus keeps its data format across 3.x releases; snapshot the app before a major version.",
     "post_deploy_checks": [
       "Sign in to Grafana",
@@ -807,7 +807,7 @@
     "website": "https://immich.app",
     "docs": "https://immich.app/docs/install/docker-compose",
     "repository": "https://github.com/immich-app/immich",
-    "ram_mb": 1500,
+    "ram_mb": 1600,
     "fits_2gb": false,
     "public": {
       "service": "immich-server",
@@ -926,7 +926,7 @@
     "website": "https://linkding.link",
     "docs": "https://linkding.link/installation/",
     "repository": "https://github.com/sissbruecker/linkding",
-    "ram_mb": 120,
+    "ram_mb": 150,
     "fits_2gb": true,
     "public": {
       "service": "linkding",
@@ -961,7 +961,7 @@
         "credential": true
       }
     ],
-    "setup_notes": "Sign in as admin with the password shown below, then install the browser extension from Settings → Integrations.",
+    "setup_notes": "Sign in as admin with the password Tond showed after the deploy, then install the browser extension from Settings → Integrations.",
     "upgrade_notes": "Change the image to a newer 1.x tag and redeploy; migrations run on start.",
     "post_deploy_checks": [
       "Sign in as admin",
@@ -1053,7 +1053,7 @@
         "credential": false
       }
     ],
-    "setup_notes": "Sign in as admin with the password shown below. Set the root URL under Settings → General to this app's address and add your SMTP server under Settings → SMTP.",
+    "setup_notes": "Sign in as admin with the password Tond showed after the deploy. Set the root URL under Settings → General to this app's address and add your SMTP server under Settings → SMTP.",
     "upgrade_notes": "Change the image to a newer tag and redeploy; the container runs listmonk --upgrade on every start. Snapshot the app first.",
     "post_deploy_checks": [
       "Sign in and set the root URL",
@@ -1389,7 +1389,7 @@
         "credential": false
       }
     ],
-    "setup_notes": "Sign in as admin with the password shown below and add your first feeds, or import an OPML file.",
+    "setup_notes": "Sign in as admin with the password Tond showed after the deploy and add your first feeds, or import an OPML file.",
     "upgrade_notes": "Change the image to a newer 2.x tag and redeploy; migrations run on start.",
     "post_deploy_checks": [
       "Sign in as admin",
@@ -1544,7 +1544,7 @@
         "credential": false
       }
     ],
-    "setup_notes": "The first start installs Nextcloud and takes a minute or two. Then sign in as admin with the password shown below. Install the desktop and mobile clients and point them at this address.",
+    "setup_notes": "The first start installs Nextcloud and takes a minute or two. Then sign in as admin with the password Tond showed after the deploy. Install the desktop and mobile clients and point them at this address.",
     "upgrade_notes": "Nextcloud only upgrades one major version at a time (34 → 35, never 34 → 36). Snapshot the app, change the image tag to the next major and redeploy; the upgrade runs on start.",
     "post_deploy_checks": [
       "Sign in as admin",
@@ -1692,7 +1692,7 @@
         "credential": false
       }
     ],
-    "setup_notes": "Sign in as admin with the password shown below, then upload a document from the web UI or the mobile apps.",
+    "setup_notes": "Sign in as admin with the password Tond showed after the deploy, then upload a document from the web UI or the mobile apps.",
     "upgrade_notes": "Change the image to a newer 2.x tag and redeploy; migrations run on start. Paperless 3 has breaking changes: read its release notes and snapshot first.",
     "post_deploy_checks": [
       "Sign in as admin",
@@ -1858,7 +1858,7 @@
         "credential": true
       }
     ],
-    "setup_notes": "Open /_/ on the app's address and sign in with the superuser email and the password shown below.",
+    "setup_notes": "Open /_/ on the app's address and sign in with the superuser email and the password Tond showed after the deploy.",
     "upgrade_notes": "PocketBase is pre-1.0 and minor versions can break. Read the changelog, snapshot the app, then change the image tag and redeploy.",
     "post_deploy_checks": [
       "Sign in to the dashboard at /_/",
@@ -1919,7 +1919,7 @@
         "credential": true
       }
     ],
-    "setup_notes": "Sign in as admin with the password shown below; you'll be asked to change it. Add more users under Settings.",
+    "setup_notes": "Sign in as admin with the password Tond showed after the deploy; you'll be asked to change it. Add more users under Settings.",
     "upgrade_notes": "Change the image to a newer tag and redeploy. Read the release notes before a major version.",
     "post_deploy_checks": [
       "Sign in and change the password",
@@ -2198,7 +2198,7 @@
         "credential": true
       }
     ],
-    "setup_notes": "Open the app and create your account. Then open /admin with the admin token shown below and turn off 'Allow new signups' so nobody else can register.",
+    "setup_notes": "Open the app and create your account. Then open /admin with the admin token Tond showed after the deploy and turn off 'Allow new signups' so nobody else can register.",
     "upgrade_notes": "Change the image to a newer 1.x tag and redeploy. Snapshot the app first: the SQLite database holds every vault.",
     "post_deploy_checks": [
       "Create your account",

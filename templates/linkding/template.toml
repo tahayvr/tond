@@ -8,8 +8,8 @@ version = "1.47"
 website = "https://linkding.link"
 docs = "https://linkding.link/installation/"
 repository = "https://github.com/sissbruecker/linkding"
-ram_mb = 120
-setup_notes = "Sign in as admin with the password shown below, then install the browser extension from Settings → Integrations."
+ram_mb = 150
+setup_notes = "Sign in as admin with the password Tond showed after the deploy, then install the browser extension from Settings → Integrations."
 upgrade_notes = "Change the image to a newer 1.x tag and redeploy; migrations run on start."
 post_deploy_checks = ["Sign in as admin", "Save a bookmark"]
 

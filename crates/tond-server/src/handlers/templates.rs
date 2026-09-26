@@ -212,6 +212,15 @@ async fn deploy_from_template(
     let resolved = resolve_inputs(&template.manifest, &req.inputs, &ctx)
         .map_err(|e| AppError(TondError::InvalidInput(e.to_string())))?;
 
+    // An existing app of this name owns its volume directory: say so (409)
+    // rather than calling its data "left over".
+    let taken: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM apps WHERE name = ?")
+        .bind(&name)
+        .fetch_one(&state.db)
+        .await?;
+    if taken > 0 {
+        return Err(AppError(TondError::AppAlreadyExists(name)));
+    }
     check_no_leftover_data(data_dir, &name)?;
 
     let public = &template.manifest.public;
@@ -450,7 +459,19 @@ mod tests {
             "env vars are stored encrypted"
         );
 
-        // A second app of the same name would reuse the first one's data.
+        // The name is taken while the app exists…
+        let err = deploy(
+            &state,
+            dir.path(),
+            "vaultwarden",
+            deploy_request("vault", &[]),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("a taken name is refused"));
+        assert_eq!(err.0.status_code(), 409);
+
+        // …and after it's deleted its data would not match new passwords.
         sqlx::query("DELETE FROM apps")
             .execute(&state.db)
             .await

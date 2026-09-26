@@ -10,7 +10,7 @@ website = "https://grafana.com/oss/grafana/"
 docs = "https://grafana.com/docs/grafana/latest/setup-grafana/installation/docker/"
 repository = "https://github.com/grafana/grafana"
 ram_mb = 150
-setup_notes = "Sign in as admin with the password shown below, then add a data source under Connections."
+setup_notes = "Sign in as admin with the password Tond showed after the deploy, then add a data source under Connections."
 upgrade_notes = "Change the image to a newer tag and redeploy; the SQLite database is migrated on start. Snapshot first before a major version."
 post_deploy_checks = ["Sign in as admin", "Add a data source"]
 

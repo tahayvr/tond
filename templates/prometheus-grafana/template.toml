@@ -10,7 +10,7 @@ website = "https://prometheus.io"
 docs = "https://prometheus.io/docs/prometheus/latest/configuration/configuration/"
 repository = "https://github.com/prometheus/prometheus"
 ram_mb = 350
-setup_notes = "Sign in to Grafana as admin with the password shown below; the Prometheus data source is already set up. Metrics are kept for 15 days."
+setup_notes = "Sign in to Grafana as admin with the password Tond showed after the deploy; the Prometheus data source is already set up. Metrics are kept for 15 days."
 upgrade_notes = "Change either image tag and redeploy. Prometheus keeps its data format across 3.x releases; snapshot the app before a major version."
 post_deploy_checks = ["Sign in to Grafana", "Open Explore and query the 'up' metric"]
 
