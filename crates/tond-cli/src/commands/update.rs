@@ -7,20 +7,38 @@
 //   2. Run it under sudo (or directly, if already root).
 //
 // The script is extracted from the release tarball rather than pulled from the
-// raw main branch, so the logic is stable and matches the target artefact.
+// raw main branch, so the logic is stable and matches the target artefact. The
+// tarball is the one for this host's architecture (tond-linux-x86_64 or
+// tond-linux-aarch64 — the CLI is built for the host it runs on) and is
+// verified against the release's .sha256 before anything in it is run.
 
 use std::path::{Path, PathBuf};
 use std::process;
 
 use anyhow::{Context, Result, bail};
 
-const LATEST_TARBALL_URL: &str =
-    "https://github.com/tahayvr/tond/releases/latest/download/tond-linux-x86_64.tar.gz";
 const FALLBACK_SCRIPT: &str = "/opt/tond/bin/update.sh";
 
-/// Build the tarball URL for a specific version (without leading `v`).
-fn versioned_tarball_url(version: &str) -> String {
-    format!("https://github.com/tahayvr/tond/releases/download/v{version}/tond-linux-x86_64.tar.gz")
+/// Release bundle name for this build's architecture, e.g. `tond-linux-aarch64`.
+fn bundle_name() -> String {
+    format!("tond-linux-{}", std::env::consts::ARCH)
+}
+
+/// Tarball URL for the latest release, or a specific version (without leading `v`).
+fn tarball_url(version: Option<&str>) -> String {
+    let bundle = bundle_name();
+    match version {
+        Some(v) => {
+            format!("https://github.com/tahayvr/tond/releases/download/v{v}/{bundle}.tar.gz")
+        }
+        None => format!("https://github.com/tahayvr/tond/releases/latest/download/{bundle}.tar.gz"),
+    }
+}
+
+/// First field of a `sha256sum` line, if it is a SHA-256 hex digest.
+fn parse_sha256_line(line: &str) -> Option<String> {
+    let hash = line.split_whitespace().next()?.to_ascii_lowercase();
+    (hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())).then_some(hash)
 }
 
 /// Handle `tond update [OPTIONS]`.
@@ -132,12 +150,11 @@ fn run_script(
 ///
 /// Returns the path to the extracted script.
 fn download_update_script(dir: &Path, version: Option<&str>) -> Result<PathBuf> {
-    let url = match version {
-        Some(v) => versioned_tarball_url(v),
-        None => LATEST_TARBALL_URL.to_string(),
-    };
+    let url = tarball_url(version);
+    let bundle = bundle_name();
 
     let tarball_path = dir.join("tond.tar.gz");
+    let checksum_path = dir.join("tond.tar.gz.sha256");
 
     // Download
     let status = process::Command::new("curl")
@@ -151,13 +168,37 @@ fn download_update_script(dir: &Path, version: Option<&str>) -> Result<PathBuf> 
         bail!("curl failed to download {url}");
     }
 
+    // Verify the tarball against the release checksum before extracting.
+    let status = process::Command::new("curl")
+        .args(["-fsSL", "-o"])
+        .arg(&checksum_path)
+        .arg(format!("{url}.sha256"))
+        .status()
+        .context("Failed to run curl")?;
+    if !status.success() {
+        bail!("curl failed to download {url}.sha256");
+    }
+    let expected = std::fs::read_to_string(&checksum_path)
+        .ok()
+        .and_then(|s| parse_sha256_line(&s))
+        .context("release checksum file is malformed")?;
+    let output = process::Command::new("sha256sum")
+        .arg(&tarball_path)
+        .output()
+        .context("Failed to run sha256sum")?;
+    let actual = parse_sha256_line(&String::from_utf8_lossy(&output.stdout))
+        .context("sha256sum produced no digest")?;
+    if actual != expected {
+        bail!("checksum mismatch for {url} (download corrupted or tampered with)");
+    }
+
     // Extract only the update.sh file from the tarball.
     let extract_status = process::Command::new("tar")
         .args(["-xzf"])
         .arg(&tarball_path)
         .args(["-C"])
         .arg(dir)
-        .arg("tond-linux-x86_64/update.sh")
+        .arg(format!("{bundle}/update.sh"))
         .status()
         .context("Failed to run tar")?;
 
@@ -165,7 +206,7 @@ fn download_update_script(dir: &Path, version: Option<&str>) -> Result<PathBuf> 
         bail!("tar failed to extract update.sh from {url}");
     }
 
-    let script = dir.join("tond-linux-x86_64/update.sh");
+    let script = dir.join(format!("{bundle}/update.sh"));
     if !script.exists() {
         bail!("update.sh not found in tarball at expected path");
     }
@@ -221,4 +262,37 @@ fn create_temp_dir() -> Result<PathBuf> {
     let path = String::from_utf8(output.stdout).context("mktemp output is not valid UTF-8")?;
 
     Ok(PathBuf::from(path.trim()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tarball_url_names_the_bundle_for_this_architecture() {
+        let arch = std::env::consts::ARCH;
+        assert_eq!(
+            tarball_url(None),
+            format!(
+                "https://github.com/tahayvr/tond/releases/latest/download/tond-linux-{arch}.tar.gz"
+            )
+        );
+        assert_eq!(
+            tarball_url(Some("0.2.0")),
+            format!(
+                "https://github.com/tahayvr/tond/releases/download/v0.2.0/tond-linux-{arch}.tar.gz"
+            )
+        );
+    }
+
+    #[test]
+    fn parse_sha256_line_accepts_sha256sum_output_only() {
+        let hash = "a".repeat(64);
+        assert_eq!(
+            parse_sha256_line(&format!("{hash}  tond-linux-x86_64.tar.gz\n")),
+            Some(hash)
+        );
+        assert_eq!(parse_sha256_line("not-a-hash  file"), None);
+        assert_eq!(parse_sha256_line(""), None);
+    }
 }
