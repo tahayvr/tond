@@ -1,4 +1,4 @@
-// acme.rs — ACME HTTP-01 certificate provisioning via Let's Encrypt
+// acme.rs — ACME certificate provisioning (HTTP-01 and DNS-01) via Let's Encrypt
 //
 // Handles the full ACME workflow so tond-proxy can obtain and renew real
 // TLS certificates automatically, without any manual cert management.
@@ -8,12 +8,15 @@
 //      tond-server writes a 'pending' cert row to the database.
 //   2. The issuance loop (issuance.rs, every 30 s with per-domain backoff)
 //      decides which domains need a cert or a renewal.
-//   3. For each of those, provision_cert() runs the full ACME HTTP-01 flow:
+//   3. For each of those, provision_cert() runs the full ACME flow:
 //        a. Get/restore an ACME account (credentials persisted to disk as
 //           acme_account.json so the same account is reused across restarts)
 //        b. Create an ACME order for the domain
-//        c. Place the HTTP-01 challenge token into ChallengeMap (shared
-//           with run_http_server() which serves it at /.well-known/acme-challenge/)
+//        c. HTTP-01: place the challenge token into ChallengeMap (shared
+//           with run_http_server() which serves it at /.well-known/acme-challenge/).
+//           DNS-01 (wildcards, or domains whose zone has a DNS provider):
+//           ask tond-server to publish `_acme-challenge.<domain>` TXT
+//           (dns01.rs) — the proxy never holds a DNS provider token
 //        d. Tell Let's Encrypt the challenge is ready and poll for validation
 //        e. Finalize the order (auto-generates a CSR via rcgen)
 //        f. Retrieve the signed cert and store it in CertStore (memory + disk)
@@ -40,15 +43,18 @@
 
 use anyhow::{Context, Result};
 use instant_acme::{
-    Account, AccountCredentials, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder,
-    OrderStatus, RetryPolicy,
+    Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, LetsEncrypt,
+    NewAccount, NewOrder, OrderStatus, RetryPolicy,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tond_common::dns::acme_challenge_name;
+use tond_common::proxy_control::DnsTxtAction;
 
 use crate::certs::CertStore;
+use crate::dns01::DnsBridge;
 
 /// Shared state for pending ACME HTTP-01 challenges.
 /// Maps token -> key_authorization for `/.well-known/acme-challenge/{token}`.
@@ -133,51 +139,78 @@ async fn get_or_create_account(data_dir: &Path, staging: bool) -> Result<Account
     }
 }
 
-/// Provision a certificate for the given domain via ACME HTTP-01.
+/// How the CA validates a domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Challenge {
+    /// A token served on port 80 (ChallengeMap).
+    Http01,
+    /// A TXT record tond-server publishes with the zone's DNS provider
+    /// (required for wildcards).
+    Dns01,
+}
+
+impl Challenge {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Challenge::Http01 => "http-01",
+            Challenge::Dns01 => "dns-01",
+        }
+    }
+}
+
+/// Everything an order needs besides the domain.
+pub struct Provisioner<'a> {
+    pub data_dir: &'a Path,
+    pub cert_store: &'a CertStore,
+    pub challenges: &'a ChallengeMap,
+    pub dns: &'a DnsBridge,
+    pub staging: bool,
+}
+
+/// Provision a certificate for `domain` (a hostname or `*.base`) and store
+/// it in the cert store:
+/// 1. create/restore the ACME account, 2. create an order,
+/// 3. answer each authorization with HTTP-01 (token in the challenge map) or
+///    DNS-01 (TXT record via tond-server), 4. wait for validation,
+/// 5. finalize, 6. store the certificate.
 ///
-/// This function:
-/// 1. Creates/restores an ACME account
-/// 2. Creates a new order for the domain
-/// 3. Sets up the HTTP-01 challenge token in the challenge map
-/// 4. Waits for the challenge to be validated
-/// 5. Finalizes the order and retrieves the certificate
-/// 6. Stores the certificate in the cert store
-pub async fn provision_cert(
-    domain: &str,
-    data_dir: &Path,
-    cert_store: &CertStore,
-    challenges: &ChallengeMap,
-    staging: bool,
-) -> Result<()> {
+/// HTTP-01 tokens and DNS-01 records are removed afterwards either way.
+pub async fn provision_cert(p: &Provisioner<'_>, domain: &str, challenge: Challenge) -> Result<()> {
     let mut tokens = Vec::new();
-    let result = provision_cert_inner(
-        domain,
-        data_dir,
-        cert_store,
-        challenges,
-        staging,
-        &mut tokens,
-    )
-    .await;
+    let mut records = Vec::new();
+    let result = provision_cert_inner(p, domain, challenge, &mut tokens, &mut records).await;
     // Challenge responses are only needed while the order is validated.
-    let mut map = challenges.write().await;
-    for token in tokens {
-        map.remove(&token);
+    {
+        let mut map = p.challenges.write().await;
+        for token in tokens {
+            map.remove(&token);
+        }
+    }
+    for (name, value) in records {
+        if let Err(e) = p.dns.txt(DnsTxtAction::Clear, &name, &value).await {
+            tracing::warn!("[cert] could not remove the DNS record {name}: {e:#}");
+        }
     }
     result
 }
 
 async fn provision_cert_inner(
+    p: &Provisioner<'_>,
     domain: &str,
-    data_dir: &Path,
-    cert_store: &CertStore,
-    challenges: &ChallengeMap,
-    staging: bool,
+    challenge_type: Challenge,
     tokens: &mut Vec<String>,
+    records: &mut Vec<(String, String)>,
 ) -> Result<()> {
-    tracing::debug!("Starting ACME cert provisioning for {}", domain);
+    tracing::debug!(
+        "Starting ACME cert provisioning for {} ({})",
+        domain,
+        challenge_type.as_str()
+    );
+    if domain.starts_with("*.") && challenge_type != Challenge::Dns01 {
+        anyhow::bail!("wildcard certificates need a DNS provider (DNS-01)");
+    }
 
-    let account = get_or_create_account(data_dir, staging).await?;
+    let account = get_or_create_account(p.data_dir, p.staging).await?;
 
     // Create order
     let identifiers = [Identifier::Dns(domain.to_string())];
@@ -193,35 +226,43 @@ async fn provision_cert_inner(
     let mut authz_stream = order.authorizations();
     while let Some(authz_result) = authz_stream.next().await {
         let mut authz = authz_result.context("fetching authorization")?;
-
-        // Get the HTTP-01 challenge
-        let mut challenge = authz
-            .challenge(ChallengeType::Http01)
-            .context("no HTTP-01 challenge available")?;
-
-        let token = challenge.token.clone();
-        let key_auth = challenge.key_authorization();
-        let key_auth_str = key_auth.as_str().to_string();
-
-        tracing::debug!(
-            "HTTP-01 challenge for {}: token={}, serving key auth",
-            domain,
-            token
-        );
-
-        // Store the challenge response so the proxy can serve it
-        {
-            let mut map = challenges.write().await;
-            map.insert(token.clone(), key_auth_str);
+        if authz.status == AuthorizationStatus::Valid {
+            continue; // validated recently; nothing to prove
         }
-        tokens.push(token.clone());
 
-        // Tell the ACME server we're ready
-        challenge
-            .set_ready()
-            .await
-            .context("signaling challenge ready")?;
-
+        match challenge_type {
+            Challenge::Http01 => {
+                let mut challenge = authz
+                    .challenge(ChallengeType::Http01)
+                    .context("no HTTP-01 challenge available")?;
+                let token = challenge.token.clone();
+                let key_auth = challenge.key_authorization().as_str().to_string();
+                tracing::debug!("HTTP-01 challenge for {}: token={}", domain, token);
+                p.challenges.write().await.insert(token.clone(), key_auth);
+                tokens.push(token);
+                challenge
+                    .set_ready()
+                    .await
+                    .context("signaling challenge ready")?;
+            }
+            Challenge::Dns01 => {
+                let mut challenge = authz
+                    .challenge(ChallengeType::Dns01)
+                    .context("no DNS-01 challenge available")?;
+                let name = acme_challenge_name(&challenge.identifier().to_string());
+                let value = challenge.key_authorization().dns_value();
+                tracing::debug!("DNS-01 challenge for {}: publishing {}", domain, name);
+                p.dns
+                    .txt(DnsTxtAction::Set, &name, &value)
+                    .await
+                    .context("publishing the DNS-01 record")?;
+                records.push((name, value));
+                challenge
+                    .set_ready()
+                    .await
+                    .context("signaling challenge ready")?;
+            }
+        }
         tracing::debug!("Challenge marked ready for {}", domain);
     }
 
@@ -253,7 +294,7 @@ async fn provision_cert_inner(
     tracing::debug!("Certificate obtained for {}", domain);
 
     // Store cert in the cert store (memory + disk)
-    cert_store
+    p.cert_store
         .store(domain, cert_pem.as_bytes(), private_key_pem.as_bytes())
         .await
         .context("storing certificate")?;
@@ -278,6 +319,11 @@ pub(crate) struct CertDetails {
 /// certificate in the chain).
 pub(crate) fn certificate_details(cert_pem: &[u8]) -> Result<CertDetails> {
     let cert = openssl::x509::X509::from_pem(cert_pem).context("parsing issued certificate PEM")?;
+    details_of(&cert)
+}
+
+/// Validity window and issuer of a parsed certificate.
+pub(crate) fn details_of(cert: &openssl::x509::X509Ref) -> Result<CertDetails> {
     Ok(CertDetails {
         issued_at: asn1_to_rfc3339(cert.not_before())?,
         expires_at: asn1_to_rfc3339(cert.not_after())?,

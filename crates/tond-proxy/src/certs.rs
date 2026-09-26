@@ -16,6 +16,17 @@
 //
 // CertPair wraps the parsed OpenSSL objects (X509 + PKey<Private>) so the
 // TLS layer can inject them directly without re-parsing on every handshake.
+//
+// Wildcards: a certificate for `*.example.com` is cached under that name and
+// stored in `<certs_dir>/_wildcard.example.com/`. SNI lookup takes an exact
+// certificate first, then the wildcard one label up, then the fallback — so
+// hosts under the apps / preview domains are served by one wildcard
+// certificate and need no order of their own.
+//
+// Uploaded certificates (tond-server's POST /api/certs/custom) arrive over the
+// control socket; validate_upload() checks them (key matches the leaf, chain
+// in order, valid now, covers the domain) before they are stored like any
+// other certificate. The files belong to tond-proxy (key 0600).
 
 //! Certificate manager: in-memory cache, disk persistence, self-signed fallback.
 //!
@@ -60,6 +71,148 @@ impl CertPair {
     }
 }
 
+/// Directory name for a domain's files: `*.x` is stored as `_wildcard.x`.
+pub fn dir_name(domain: &str) -> String {
+    match domain.strip_prefix("*.") {
+        Some(base) => format!("_wildcard.{base}"),
+        None => domain.to_string(),
+    }
+}
+
+/// Inverse of `dir_name`.
+fn domain_from_dir(name: &str) -> String {
+    match name.strip_prefix("_wildcard.") {
+        Some(base) => format!("*.{base}"),
+        None => name.to_string(),
+    }
+}
+
+/// What an uploaded certificate turned out to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadDetails {
+    pub issued_at: String,
+    pub expires_at: String,
+    pub issuer: Option<String>,
+    pub names: Vec<String>,
+}
+
+/// DNS names a certificate is valid for: its subjectAltNames, or the CN
+/// when it has none.
+pub fn cert_names(cert: &X509) -> Vec<String> {
+    let sans: Vec<String> = cert
+        .subject_alt_names()
+        .into_iter()
+        .flatten()
+        .filter_map(|n| n.dnsname().map(str::to_ascii_lowercase))
+        .collect();
+    if !sans.is_empty() {
+        return sans;
+    }
+    cert.subject_name()
+        .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+        .filter_map(|e| e.data().to_string().ok())
+        .map(|s| s.to_ascii_lowercase())
+        .collect()
+}
+
+/// A certificate name (possibly a wildcard) covers `domain` (possibly a
+/// wildcard itself, which only an identical wildcard covers).
+fn name_covers(name: &str, domain: &str) -> bool {
+    name == domain || (!domain.starts_with("*.") && tond_common::dns::wildcard_covers(name, domain))
+}
+
+fn subject_line(cert: &X509) -> String {
+    cert.subject_name()
+        .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+        .next()
+        .and_then(|e| e.data().to_string().ok())
+        .unwrap_or_else(|| "(no common name)".into())
+}
+
+/// Validate an uploaded certificate for `domain`: PEM parses, the private
+/// key belongs to the leaf, each certificate is issued (and signed) by the
+/// next one, every certificate is valid now, and the leaf covers `domain`.
+pub fn validate_upload(domain: &str, cert_pem: &[u8], key_pem: &[u8]) -> Result<UploadDetails> {
+    use openssl::x509::X509VerifyResult;
+
+    let chain = X509::stack_from_pem(cert_pem)
+        .map_err(|_| anyhow::anyhow!("The certificate isn't valid PEM. Paste the -----BEGIN CERTIFICATE----- blocks, leaf first."))?;
+    let leaf = chain.first().ok_or_else(|| {
+        anyhow::anyhow!(
+            "The certificate isn't valid PEM: no -----BEGIN CERTIFICATE----- block found."
+        )
+    })?;
+    let key = PKey::private_key_from_pem(key_pem).map_err(|_| {
+        anyhow::anyhow!(
+            "The private key isn't a readable PEM key. Upload it unencrypted (no passphrase), \
+             as -----BEGIN PRIVATE KEY----- (or RSA/EC PRIVATE KEY)."
+        )
+    })?;
+    let leaf_key = leaf
+        .public_key()
+        .context("reading the certificate's public key")?;
+    if !leaf_key.public_eq(&key) {
+        anyhow::bail!(
+            "The private key doesn't belong to the certificate for {}. Upload the key that was \
+             generated with this certificate's request.",
+            subject_line(leaf)
+        );
+    }
+    for (i, pair) in chain.windows(2).enumerate() {
+        let (child, parent) = (&pair[0], &pair[1]);
+        let signed = parent
+            .public_key()
+            .ok()
+            .and_then(|k| child.verify(&k).ok())
+            .unwrap_or(false);
+        if parent.issued(child) != X509VerifyResult::OK || !signed {
+            anyhow::bail!(
+                "The chain is out of order: certificate {} ({}) did not issue certificate {} ({}). \
+                 Put the leaf first, then each intermediate in order.",
+                i + 2,
+                subject_line(parent),
+                i + 1,
+                subject_line(child)
+            );
+        }
+    }
+    let now = Asn1Time::days_from_now(0).context("reading the clock")?;
+    for (i, cert) in chain.iter().enumerate() {
+        let what = if i == 0 {
+            "The certificate".to_string()
+        } else {
+            format!("Intermediate {} ({})", i, subject_line(cert))
+        };
+        if cert.not_after() < now {
+            anyhow::bail!(
+                "{what} has expired ({}). Upload a current one.",
+                cert.not_after()
+            );
+        }
+        if cert.not_before() > now {
+            anyhow::bail!("{what} isn't valid until {}.", cert.not_before());
+        }
+    }
+    let names = cert_names(leaf);
+    if !names.iter().any(|n| name_covers(n, domain)) {
+        anyhow::bail!(
+            "The certificate is for {}, not {domain}.",
+            if names.is_empty() {
+                "no DNS names".to_string()
+            } else {
+                names.join(", ")
+            }
+        );
+    }
+    let details = crate::acme::details_of(leaf)?;
+    Ok(UploadDetails {
+        issued_at: details.issued_at,
+        expires_at: details.expires_at,
+        issuer: details.issuer,
+        names,
+    })
+}
+
 /// Thread-safe certificate store with in-memory cache and disk backing.
 #[derive(Clone)]
 pub struct CertStore {
@@ -94,13 +247,49 @@ impl CertStore {
         Ok(store)
     }
 
-    /// Get the cert pair for a domain, falling back to the self-signed cert.
+    /// The cert pair for an SNI name: an exact certificate, else the
+    /// wildcard one label up, else the self-signed fallback.
     pub async fn get(&self, domain: &str) -> CertPair {
         let cache = self.cache.read().await;
         cache
             .get(domain)
+            .or_else(|| tond_common::dns::wildcard_for(domain).and_then(|w| cache.get(&w)))
             .cloned()
             .unwrap_or_else(|| (*self.fallback).clone())
+    }
+
+    /// The cached name that serves `host` (itself or its wildcard), if any.
+    pub async fn serving_name(&self, host: &str) -> Option<String> {
+        let cache = self.cache.read().await;
+        if cache.contains_key(host) {
+            return Some(host.to_string());
+        }
+        tond_common::dns::wildcard_for(host).filter(|w| cache.contains_key(w))
+    }
+
+    /// Forget a certificate and delete its files.
+    pub async fn remove(&self, domain: &str) -> Result<()> {
+        self.cache.write().await.remove(domain);
+        let dir = self.certs_dir.join(dir_name(domain));
+        match tokio::fs::remove_dir_all(&dir).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("removing {}", dir.display())),
+        }
+        tracing::info!("Removed certificate for {}", domain);
+        Ok(())
+    }
+
+    /// Validate an uploaded certificate, then store and serve it.
+    pub async fn install_upload(
+        &self,
+        domain: &str,
+        cert_pem: &[u8],
+        key_pem: &[u8],
+    ) -> Result<UploadDetails> {
+        let details = validate_upload(domain, cert_pem, key_pem)?;
+        self.store(domain, cert_pem, key_pem).await?;
+        Ok(details)
     }
 
     /// Check if we have a cert (non-fallback) for this domain.
@@ -131,7 +320,7 @@ impl CertStore {
         let pair = CertPair::from_pem(cert_pem, key_pem)?;
 
         // Write to disk
-        let domain_dir = self.certs_dir.join(domain);
+        let domain_dir = self.certs_dir.join(dir_name(domain));
         tokio::fs::create_dir_all(&domain_dir).await?;
 
         let cert_path = domain_dir.join("cert.pem");
@@ -153,7 +342,7 @@ impl CertStore {
     /// Used by tond-server when recording cert paths in the database.
     #[allow(dead_code)]
     pub fn cert_paths(&self, domain: &str) -> (PathBuf, PathBuf) {
-        let domain_dir = self.certs_dir.join(domain);
+        let domain_dir = self.certs_dir.join(dir_name(domain));
         (domain_dir.join("cert.pem"), domain_dir.join("key.pem"))
     }
 
@@ -173,7 +362,7 @@ impl CertStore {
             }
 
             let domain = match path.file_name().and_then(|n| n.to_str()) {
-                Some(name) => name.to_string(),
+                Some(name) => domain_from_dir(name),
                 None => continue,
             };
 
@@ -524,6 +713,212 @@ mod tests {
             None,
             "days_until_expiry should return None for domains without a cached certificate"
         );
+    }
+
+    /// A root → intermediate → leaf chain for `names`.
+    struct Chain {
+        leaf: String,
+        intermediate: String,
+        key: String,
+    }
+
+    fn chain(names: &[&str], leaf_expired: bool) -> Chain {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+        let ca = |cn: &str| {
+            let mut p = CertificateParams::new(Vec::<String>::new())
+                .unwrap_or_else(|e| panic!("params: {e}"));
+            p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            p.distinguished_name.push(DnType::CommonName, cn);
+            p
+        };
+        let root_key = KeyPair::generate().unwrap_or_else(|e| panic!("key: {e}"));
+        let root = ca("Test Root");
+        let root_issuer = Issuer::from_params(&root, &root_key);
+        let inter_key = KeyPair::generate().unwrap_or_else(|e| panic!("key: {e}"));
+        let inter = ca("Test Intermediate");
+        let inter_cert = inter
+            .signed_by(&inter_key, &root_issuer)
+            .unwrap_or_else(|e| panic!("sign intermediate: {e}"));
+        let inter_issuer = Issuer::from_params(&inter, &inter_key);
+        let leaf_key = KeyPair::generate().unwrap_or_else(|e| panic!("key: {e}"));
+        let mut leaf =
+            CertificateParams::new(names.iter().map(|n| n.to_string()).collect::<Vec<_>>())
+                .unwrap_or_else(|e| panic!("params: {e}"));
+        leaf.distinguished_name.push(DnType::CommonName, names[0]);
+        if leaf_expired {
+            leaf.not_before = rcgen::date_time_ymd(2020, 1, 1);
+            leaf.not_after = rcgen::date_time_ymd(2021, 1, 1);
+        }
+        let leaf_cert = leaf
+            .signed_by(&leaf_key, &inter_issuer)
+            .unwrap_or_else(|e| panic!("sign leaf: {e}"));
+        Chain {
+            leaf: leaf_cert.pem(),
+            intermediate: inter_cert.pem(),
+            key: leaf_key.serialize_pem(),
+        }
+    }
+
+    fn bundle(parts: &[&str]) -> Vec<u8> {
+        parts.concat().into_bytes()
+    }
+
+    fn upload_error(domain: &str, cert: &[u8], key: &[u8]) -> String {
+        validate_upload(domain, cert, key)
+            .err()
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_valid_upload_reports_its_names_issuer_and_dates() {
+        let c = chain(&["shop.example.com", "www.shop.example.com"], false);
+        let details = validate_upload(
+            "www.shop.example.com",
+            &bundle(&[&c.leaf, &c.intermediate]),
+            c.key.as_bytes(),
+        )
+        .unwrap_or_else(|e| panic!("valid upload rejected: {e:#}"));
+        assert_eq!(
+            details.names,
+            vec!["shop.example.com", "www.shop.example.com"]
+        );
+        assert_eq!(details.issuer.as_deref(), Some("Test Intermediate"));
+        assert!(details.expires_at.starts_with("4096-"));
+    }
+
+    #[test]
+    fn uploads_with_a_foreign_key_a_bad_order_or_the_wrong_name_are_refused() {
+        let c = chain(&["shop.example.com"], false);
+        let other = chain(&["shop.example.com"], false);
+
+        let err = upload_error("shop.example.com", c.leaf.as_bytes(), other.key.as_bytes());
+        assert!(err.contains("doesn't belong to the certificate"), "{err}");
+
+        let err = upload_error(
+            "shop.example.com",
+            &bundle(&[&c.intermediate, &c.leaf]),
+            c.key.as_bytes(),
+        );
+        assert!(
+            err.contains("doesn't belong") || err.contains("out of order"),
+            "{err}"
+        );
+
+        let err = upload_error(
+            "shop.example.com",
+            &bundle(&[&c.leaf, &other.intermediate]),
+            c.key.as_bytes(),
+        );
+        assert!(err.contains("out of order"), "{err}");
+
+        let err = upload_error("api.example.com", c.leaf.as_bytes(), c.key.as_bytes());
+        assert!(
+            err.contains("is for shop.example.com, not api.example.com"),
+            "{err}"
+        );
+
+        let expired = chain(&["old.example.com"], true);
+        let err = upload_error(
+            "old.example.com",
+            expired.leaf.as_bytes(),
+            expired.key.as_bytes(),
+        );
+        assert!(err.contains("has expired"), "{err}");
+
+        let err = upload_error("shop.example.com", b"nope", c.key.as_bytes());
+        assert!(err.contains("isn't valid PEM"), "{err}");
+        let err = upload_error("shop.example.com", c.leaf.as_bytes(), b"nope");
+        assert!(err.contains("isn't a readable PEM key"), "{err}");
+    }
+
+    #[test]
+    fn wildcard_uploads_cover_one_label_and_only_the_same_wildcard() {
+        let c = chain(&["*.corp.example.com"], false);
+        assert!(validate_upload("*.corp.example.com", c.leaf.as_bytes(), c.key.as_bytes()).is_ok());
+        assert!(validate_upload("a.corp.example.com", c.leaf.as_bytes(), c.key.as_bytes()).is_ok());
+        assert!(
+            validate_upload("a.b.corp.example.com", c.leaf.as_bytes(), c.key.as_bytes()).is_err()
+        );
+        let single = chain(&["a.corp.example.com"], false);
+        assert!(
+            validate_upload(
+                "*.corp.example.com",
+                single.leaf.as_bytes(),
+                single.key.as_bytes()
+            )
+            .is_err(),
+            "a single-name certificate doesn't serve a wildcard"
+        );
+    }
+
+    #[tokio::test]
+    async fn sni_prefers_an_exact_certificate_then_the_wildcard_then_the_fallback() {
+        let dir = temp_dir();
+        let certs_dir = dir.path().join("certs");
+        let store = CertStore::new(&certs_dir)
+            .await
+            .unwrap_or_else(|err| panic!("store: {err}"));
+        let wildcard = chain(&["*.apps.test"], false);
+        store
+            .store(
+                "*.apps.test",
+                wildcard.leaf.as_bytes(),
+                wildcard.key.as_bytes(),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("store wildcard: {err}"));
+        let (_, exact_pem, exact_key) = generate_self_signed_for_domain("special.apps.test")
+            .unwrap_or_else(|err| panic!("fixture: {err}"));
+        store
+            .store("special.apps.test", &exact_pem, &exact_key)
+            .await
+            .unwrap_or_else(|err| panic!("store exact: {err}"));
+
+        let der = |p: &CertPair| p.cert.to_der().unwrap_or_default();
+        let wildcard_der = X509::from_pem(wildcard.leaf.as_bytes())
+            .and_then(|c| c.to_der())
+            .unwrap_or_default();
+        assert_eq!(der(&store.get("web.apps.test").await), wildcard_der);
+        assert_eq!(
+            der(&store.get("special.apps.test").await),
+            X509::from_pem(&exact_pem)
+                .and_then(|c| c.to_der())
+                .unwrap_or_default()
+        );
+        assert_eq!(
+            der(&store.get("a.b.apps.test").await),
+            der(&store.fallback),
+            "a wildcard covers one label only"
+        );
+        assert_eq!(der(&store.get("apps.test").await), der(&store.fallback));
+        assert_eq!(
+            store.serving_name("web.apps.test").await.as_deref(),
+            Some("*.apps.test")
+        );
+        assert_eq!(
+            store.serving_name("special.apps.test").await.as_deref(),
+            Some("special.apps.test")
+        );
+
+        // Stored as _wildcard.apps.test and loaded back under its real name.
+        assert!(
+            certs_dir
+                .join("_wildcard.apps.test")
+                .join("key.pem")
+                .exists()
+        );
+        let reloaded = CertStore::new(&certs_dir)
+            .await
+            .unwrap_or_else(|err| panic!("reload: {err}"));
+        assert!(reloaded.has_cert("*.apps.test").await);
+
+        reloaded
+            .remove("*.apps.test")
+            .await
+            .unwrap_or_else(|err| panic!("remove: {err}"));
+        assert!(!reloaded.has_cert("*.apps.test").await);
+        assert!(!certs_dir.join("_wildcard.apps.test").exists());
     }
 
     #[test]
