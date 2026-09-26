@@ -175,6 +175,14 @@ pub async fn run_janitor(state: AppState) {
             Ok(_) => {}
             Err(e) => tracing::warn!("Janitor: preview volume prune failed: {e}"),
         }
+        // Access logs of deleted apps (<data>/access, written by tond-proxy).
+        match crate::access_logs::prune_orphans(&state.db, &crate::auth::secret_file::data_dir())
+            .await
+        {
+            Ok(n) if n > 0 => tracing::info!("Janitor: removed {n} access log file(s)"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("Janitor: access log prune failed: {e}"),
+        }
         // Networks of finished previews and cron runs, deleted apps, …
         match docker::prune_networks(&state.docker).await {
             Ok(n) if n > 0 => tracing::info!("Janitor: removed {n} unused Docker network(s)"),

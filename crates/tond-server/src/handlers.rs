@@ -35,6 +35,7 @@
 //   handler spawns tokio::spawn -> deploy::deploy() -> docker::run_container()
 //   The handler returns 202 immediately; the caller polls app status.
 
+pub mod access_log;
 pub mod alerts;
 pub mod audit_log;
 pub mod auth;
@@ -57,6 +58,7 @@ pub mod previews;
 pub mod project_previews;
 pub mod projects;
 pub mod registry_credentials;
+pub mod requests;
 pub mod settings;
 pub mod storage_providers;
 pub mod system_self;
