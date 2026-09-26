@@ -1,6 +1,9 @@
-// log_scrub.rs — remove secrets from deploy log lines before they are stored
+// log_scrub.rs — remove secrets from log lines before anyone sees them
 //
-// Every line written with `deploy::log_deploy` passes through `scrub_for_app`:
+// Every line written with `deploy::log_deploy` passes through `scrub_for_app`
+// before it is stored, and so does every container log line the API returns
+// or streams (handlers/logs.rs, GET /api/apps/{id}/logs); database container
+// logs get the same treatment without app secrets (`scrub(line, &[])`):
 //
 //   1. credentials in URLs (`https://user:token@host` → `https://***@host`);
 //   2. the app's own secret values — env vars and preview overrides of at
@@ -41,6 +44,12 @@ pub fn forget_app(app_id: &str) {
 pub async fn scrub_for_app(db: &SqlitePool, app_id: &str, message: &str) -> String {
     let secrets = app_secrets(db, app_id).await;
     scrub(message, &secrets)
+}
+
+/// Scrub many lines of one app with a single secret lookup.
+pub async fn scrub_lines_for_app(db: &SqlitePool, app_id: &str, lines: Vec<String>) -> Vec<String> {
+    let secrets = app_secrets(db, app_id).await;
+    lines.into_iter().map(|l| scrub(&l, &secrets)).collect()
 }
 
 /// Scrub `message`: URL credentials, the given secret values, key patterns.
@@ -231,6 +240,44 @@ fn scrub_aws_access_keys(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn container_lines_lose_the_apps_secret_values() {
+        let db = SqlitePool::connect("sqlite::memory:")
+            .await
+            .unwrap_or_else(|e| panic!("pool: {e}"));
+        crate::db::migrate(&db)
+            .await
+            .unwrap_or_else(|e| panic!("migrate: {e}"));
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("DB_PASSWORD".to_string(), "s3cret-value-123".to_string());
+        let sealed = crate::secrets::seal_app_env(&env).unwrap_or_else(|e| panic!("seal: {e}"));
+        sqlx::query(
+            "INSERT INTO apps (id, name, env_vars, created_at, updated_at)
+             VALUES ('scrub-app', 'web', ?, 'x', 'x')",
+        )
+        .bind(sealed)
+        .execute(&db)
+        .await
+        .unwrap_or_else(|e| panic!("app: {e}"));
+        forget_app("scrub-app");
+        let out = scrub_lines_for_app(
+            &db,
+            "scrub-app",
+            vec![
+                "connecting with s3cret-value-123".to_string(),
+                "GET https://admin:pw@api.internal/x".to_string(),
+            ],
+        )
+        .await;
+        assert_eq!(
+            out,
+            vec![
+                "connecting with [redacted]".to_string(),
+                "GET https://***@api.internal/x".to_string()
+            ]
+        );
+    }
 
     #[test]
     fn scrubs_env_values_and_lines_of_multiline_values() {

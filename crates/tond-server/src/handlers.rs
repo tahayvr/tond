@@ -87,7 +87,7 @@ use crate::{
     auth::{Authz, Principal, RateLimit, principal::Actor, scope},
     compose_policy, deploy, docker, domains as domain_rules,
     error::AppError,
-    networks, secrets,
+    log_scrub, networks, secrets,
     state::AppState,
     upload, volumes,
 };
@@ -778,7 +778,7 @@ pub async fn app_logs(
     .await
     .unwrap_or_default();
 
-    // Get container logs if running
+    // Get container logs if running, without the app's secrets
     let container_logs = if let Some(container_id) = &app.container_id {
         docker::get_logs(&state.docker, container_id, 100)
             .await
@@ -786,6 +786,7 @@ pub async fn app_logs(
     } else {
         vec![]
     };
+    let container_logs = log_scrub::scrub_lines_for_app(&state.db, &app.id, container_logs).await;
 
     Ok((
         StatusCode::OK,
