@@ -22,6 +22,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 NON_INTERACTIVE=false
 DASHBOARD_DOMAIN=""
 PREVIEW_DOMAIN=""
+APPS_DOMAIN=""
+APPS_DOMAIN_SET=false
 # Unprivileged user tond-proxy runs as (see tond-proxy.service); its group
 # shares tond.db with tond-server.
 TERMINAL_USER="tond"
@@ -76,7 +78,72 @@ check_preview_domain() {
     return 0
 }
 
-mark_pass() { printf "%b✓%b %s\n" "$GREEN" "$NC" "$1"; }
+# Registrable-ish suffix used by the early checks below: the last two labels.
+# tond-server does the real Public Suffix List check when the domains are
+# saved; this only catches obvious mistakes before anything is installed.
+site_of() {
+    awk -F. '{ if (NF >= 2) print $(NF-1) "." $NF; else print $0 }' <<<"$1"
+}
+
+# Early check: the apps domain must be a different site from the dashboard
+# and preview domains. Prints the reason and returns 1 when invalid.
+check_apps_domain() {
+    local apps=$1 dashboard=$2 preview=$3
+    if ! is_valid_domain "$apps"; then
+        echo "Invalid apps domain: ${apps}"
+        return 1
+    fi
+    if [[ -n "$dashboard" && "$(site_of "$apps")" == "$(site_of "$dashboard")" ]]; then
+        echo "The apps domain (${apps}) must be on a different site from the dashboard (${dashboard}): apps run your code, and an app on the dashboard's site could send same-site requests to it and set its cookies. Use a separate domain, e.g. example-apps.com."
+        return 1
+    fi
+    if [[ -n "$preview" && "$(site_of "$apps")" == "$(site_of "$preview")" ]]; then
+        echo "The apps domain (${apps}) must be on a different site from the preview domain (${preview}): previews run pull-request code and must not share a site with production apps."
+        return 1
+    fi
+    return 0
+}
+
+# Default apps domain: the server's IP under a public wildcard DNS service on
+# a different site from the dashboard. <ip>.nip.io and <ip>.sslip.io both
+# resolve to <ip>; they are different registrable domains, so when the
+# dashboard uses one the apps use the other (apps.<ip>.sslip.io would be
+# same-site with a <ip>.sslip.io dashboard).
+suggest_apps_domain() {
+    local dashboard=$1 ip dashed
+    ip=$(get_server_ip)
+    is_public_ipv4 "$ip" || return 0
+    dashed="${ip//./-}"
+    if [[ "$(site_of "$dashboard")" == "nip.io" ]]; then
+        echo "${dashed}.sslip.io"
+    else
+        echo "${dashed}.nip.io"
+    fi
+}
+
+choose_apps_domain() {
+    [[ "$APPS_DOMAIN_SET" == false ]] || return 0
+    local suggestion
+    suggestion="$(suggest_apps_domain "$DASHBOARD_DOMAIN")"
+    if [[ "$NON_INTERACTIVE" == false && -r /dev/tty ]]; then
+        echo "Apps get automatic addresses <app>.<apps-domain>. Use a domain with a wildcard"
+        echo "DNS record on a different site from the dashboard (apps run your code)."
+        if [[ -n "$suggestion" ]]; then
+            echo "No domain yet? Press Enter to use ${suggestion}, which resolves to this server."
+            read -r -p "Apps domain [${suggestion}]: " APPS_DOMAIN < /dev/tty || APPS_DOMAIN=""
+            APPS_DOMAIN="${APPS_DOMAIN:-$suggestion}"
+        else
+            read -r -p "Apps domain (optional, Enter to skip): " APPS_DOMAIN < /dev/tty || APPS_DOMAIN=""
+        fi
+        APPS_DOMAIN="$(echo "$APPS_DOMAIN" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+        APPS_DOMAIN="${APPS_DOMAIN%.}"
+    elif [[ -n "$suggestion" ]]; then
+        APPS_DOMAIN="$suggestion"
+        info "No --apps-domain given: apps are served at <app>.${APPS_DOMAIN} (resolves to this server)"
+    fi
+}
+
+mark_pass() { printf"%b✓%b %s\n" "$GREEN" "$NC" "$1"; }
 mark_warn() { printf "%b!%b %s\n" "$YELLOW" "$NC" "$1"; }
 mark_fail() { printf "%b✗%b %s\n" "$RED" "$NC" "$1"; }
 
@@ -95,6 +162,88 @@ spinner() {
     printf "    \b\b\b\b"
 }
 
+# ── Release signatures (keep in sync: install.sh, update.sh, web/install.sh,
+# web/update.sh; crates/tond-cli/src/signature.rs has the same policy) ──
+#
+# Releases are signed with minisign (release/SIGNING.md). A signature that is
+# present must verify; a missing one is refused unless the release predates
+# signing (TOND_UNSIGNED_RELEASES) or TOND_ALLOW_UNSIGNED=1 is set. The check
+# needs only openssl (Ed25519 over the file's BLAKE2b-512 hash, which is what
+# minisign's default "ED" signatures are).
+TOND_RELEASE_PUBKEY=""
+TOND_UNSIGNED_RELEASES="v0.1.0"
+
+# verify_minisig FILE SIGFILE PUBKEY_B64 — succeeds when SIGFILE is a valid
+# prehashed minisign signature of FILE by PUBKEY_B64.
+verify_minisig() {
+    _vm_dir=$(mktemp -d) || return 1
+    _vm_rc=1
+    if printf '%s' "$3" | base64 -d > "$_vm_dir/pub.bin" 2>/dev/null \
+        && sed -n 2p "$2" | base64 -d > "$_vm_dir/sig.bin" 2>/dev/null \
+        && [ "$(wc -c < "$_vm_dir/pub.bin")" -eq 42 ] \
+        && [ "$(wc -c < "$_vm_dir/sig.bin")" -eq 74 ] \
+        && [ "$(head -c 2 "$_vm_dir/pub.bin")" = "Ed" ] \
+        && [ "$(head -c 2 "$_vm_dir/sig.bin")" = "ED" ] \
+        && [ "$(tail -c +3 "$_vm_dir/pub.bin" | head -c 8 | od -An -tx1)" = "$(tail -c +3 "$_vm_dir/sig.bin" | head -c 8 | od -An -tx1)" ]; then
+        # DER SubjectPublicKeyInfo prefix for an Ed25519 key, then the key.
+        printf '\060\052\060\005\006\003\053\145\160\003\041\000' > "$_vm_dir/pub.der"
+        tail -c 32 "$_vm_dir/pub.bin" >> "$_vm_dir/pub.der"
+        tail -c 64 "$_vm_dir/sig.bin" > "$_vm_dir/sig.raw"
+        if openssl dgst -blake2b512 -binary "$1" > "$_vm_dir/hash.bin" 2>/dev/null \
+            && openssl pkeyutl -verify -pubin -keyform DER -inkey "$_vm_dir/pub.der" \
+                -rawin -in "$_vm_dir/hash.bin" -sigfile "$_vm_dir/sig.raw" > /dev/null 2>&1; then
+            _vm_rc=0
+        fi
+    fi
+    rm -rf "$_vm_dir"
+    return $_vm_rc
+}
+
+# check_release_signature TAG TARBALL SIGFILE — apply the policy above.
+# SIGFILE may be missing or empty (the release has no signature). Prints why
+# and fails when the release must not be used.
+check_release_signature() {
+    if [ -z "$TOND_RELEASE_PUBKEY" ]; then
+        echo "Warning: this installer has no release signing key; only the checksum of $1 was verified." >&2
+        return 0
+    fi
+    if [ -s "$3" ]; then
+        if ! command -v openssl > /dev/null 2>&1; then
+            echo "openssl is needed to verify the signature of $1. Install it (apt-get install openssl) and try again." >&2
+            return 1
+        fi
+        if verify_minisig "$2" "$3" "$TOND_RELEASE_PUBKEY"; then
+            echo "Signature of $1 verified."
+            return 0
+        fi
+        echo "The signature of release $1 does not verify. The download may have been tampered with; nothing was installed." >&2
+        return 1
+    fi
+    case " $TOND_UNSIGNED_RELEASES " in
+        *" $1 "*)
+            echo "Warning: $1 was published before releases were signed; only its checksum was verified." >&2
+            return 0
+            ;;
+    esac
+    if [ "${TOND_ALLOW_UNSIGNED:-}" = "1" ]; then
+        echo "Warning: TOND_ALLOW_UNSIGNED=1 is set, so the missing signature of $1 was ignored." >&2
+        return 0
+    fi
+    echo "Release $1 has no signature (.minisig), so it can't be verified and was not installed. If you trust this download anyway, rerun with TOND_ALLOW_UNSIGNED=1." >&2
+    return 1
+}
+
+# latest_release_tag — the tag of the latest GitHub release (e.g. v0.2.0).
+latest_release_tag() {
+    _lr_api="https://api.github.com/repos/tahayvr/tond/releases/latest"
+    if command -v curl > /dev/null 2>&1; then
+        curl -fsSL "$_lr_api"
+    else
+        wget -qO- "$_lr_api"
+    fi | sed -n 's/.*"tag_name": *"\(v[^"]*\)".*/\1/p' | head -n 1
+}
+# ── end release signatures ──
+
 # Check if we're in bundled mode or need to download
 is_bundled() {
     [[ -f "${SCRIPT_DIR}/tond-server" && -f "${SCRIPT_DIR}/tond-proxy" && -f "${SCRIPT_DIR}/tond" && -d "${SCRIPT_DIR}/dashboard" ]]
@@ -109,10 +258,13 @@ download_release() {
     [[ -n "$arch" ]] || fatal "Unsupported architecture: $(uname -m). Tond supports x86_64 (amd64) and aarch64 (arm64)."
 
     local tmp_dir=$(mktemp -d)
-    local release_url="https://github.com/tahayvr/tond/releases/latest/download/tond-linux-${arch}.tar.gz"
+    local tag
+    tag="$(latest_release_tag || true)"
+    [[ -n "$tag" ]] || fatal "Could not look up the latest Tond release"
+    local release_url="https://github.com/tahayvr/tond/releases/download/${tag}/tond-linux-${arch}.tar.gz"
     local checksum_url="${release_url}.sha256"
     
-    info "Downloading tond-linux-${arch} from GitHub..."
+    info "Downloading tond-linux-${arch} ${tag} from GitHub..."
     curl -fsSL -o "${tmp_dir}/tond.tar.gz" "$release_url" || fatal "Failed to download release"
     
     info "Verifying checksum..."
@@ -126,7 +278,13 @@ download_release() {
         fatal "Checksum verification failed! Download may be corrupted or tampered with."
     fi
     info "✓ Checksum verified"
-    
+
+    info "Verifying signature..."
+    curl -fsSL -o "${tmp_dir}/tond.tar.gz.minisig" "${release_url}.minisig" 2>/dev/null \
+        || rm -f "${tmp_dir}/tond.tar.gz.minisig"
+    check_release_signature "$tag" "${tmp_dir}/tond.tar.gz" "${tmp_dir}/tond.tar.gz.minisig" \
+        || fatal "Refusing to install an unverified release"
+
     info "Extracting..."
     tar -xzf "${tmp_dir}/tond.tar.gz" -C "$tmp_dir" || fatal "Failed to extract archive"
     
@@ -313,6 +471,9 @@ check_prerequisites() {
     if [[ -n "$DASHBOARD_DOMAIN" ]]; then
         mark_warn "Dashboard domain seed: ${DASHBOARD_DOMAIN} (DNS does not need to be ready before install completes)"
     fi
+    if [[ -n "$APPS_DOMAIN" ]]; then
+        mark_warn "Apps domain: ${APPS_DOMAIN} (needs a wildcard DNS record *.${APPS_DOMAIN})"
+    fi
     if [[ -n "$PREVIEW_DOMAIN" ]]; then
         mark_warn "Preview domain: ${PREVIEW_DOMAIN} (needs a wildcard DNS record *.${PREVIEW_DOMAIN})"
     fi
@@ -383,7 +544,7 @@ install_dependencies() {
     spinner $!
     
     info "Installing required packages..."
-    apt-get install -y -qq curl git ca-certificates jq ufw > /dev/null 2>&1 &
+    apt-get install -y -qq curl git ca-certificates gnupg openssl jq ufw > /dev/null 2>&1 &
     spinner $!
     
     info "Dependencies installed"
@@ -397,17 +558,57 @@ install_dependencies() {
     fi
 }
 
+# Docker's apt signing key ("Docker Release (CE deb)"), as published at
+# https://docs.docker.com/engine/install/ubuntu/ — the downloaded key must
+# have exactly this fingerprint before apt trusts it.
+DOCKER_APT_KEY_FINGERPRINT="9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
+DOCKER_APT_KEYRING="/etc/apt/keyrings/docker.asc"
+
+# Install Docker Engine from Docker's apt repository, signed by the key above
+# (no `curl | sh` of a convenience script).
 install_docker() {
     step "Setting up Docker"
-    
+
     if command -v docker &> /dev/null; then
         info "Docker already installed: $(docker --version)"
-    else
-        info "Installing Docker Engine..."
-        curl -fsSL https://get.docker.com | sh > /dev/null 2>&1
-        systemctl enable --now docker > /dev/null 2>&1
-        info "Docker installed: $(docker --version)"
+        return 0
     fi
+
+    local os_id="" codename=""
+    if [[ -f /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        os_id="$(. /etc/os-release && echo "${ID:-}")"
+        codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-}")"
+    fi
+    case "$os_id" in
+        ubuntu|debian) ;;
+        *) fatal "Tond installs Docker automatically on Ubuntu and Debian only. Install Docker Engine (https://docs.docker.com/engine/install/) and run this installer again." ;;
+    esac
+    [[ -n "$codename" ]] || fatal "Could not determine the ${os_id} release codename for Docker's apt repository"
+
+    info "Adding Docker's apt repository (signed by ${DOCKER_APT_KEY_FINGERPRINT})..."
+    install -m 0755 -d "$(dirname "$DOCKER_APT_KEYRING")"
+    local key_tmp
+    key_tmp="$(mktemp)"
+    curl -fsSL "https://download.docker.com/linux/${os_id}/gpg" -o "$key_tmp" \
+        || { rm -f "$key_tmp"; fatal "Failed to download Docker's apt signing key"; }
+    local fingerprints
+    fingerprints="$(gpg --show-keys --with-colons "$key_tmp" 2>/dev/null | awk -F: '$1 == "fpr" { print $10 }')"
+    if ! grep -qx "$DOCKER_APT_KEY_FINGERPRINT" <<<"$fingerprints"; then
+        rm -f "$key_tmp"
+        fatal "Docker's apt signing key has an unexpected fingerprint; refusing to trust it"
+    fi
+    install -m 0644 "$key_tmp" "$DOCKER_APT_KEYRING"
+    rm -f "$key_tmp"
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=${DOCKER_APT_KEYRING}] https://download.docker.com/linux/${os_id} ${codename} stable" \
+        > /etc/apt/sources.list.d/docker.list
+
+    info "Installing Docker Engine..."
+    apt-get update -qq > /dev/null 2>&1 || fatal "apt-get update failed after adding Docker's repository"
+    apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
+        > /dev/null 2>&1 || fatal "Failed to install Docker Engine from Docker's apt repository"
+    systemctl enable --now docker > /dev/null 2>&1
+    info "Docker installed: $(docker --version)"
 }
 
 # Default log rotation for every container on the host. Tond sets rotation on
@@ -416,7 +617,7 @@ install_docker() {
 # and a non-rotating driver choice (journald, syslog, ...) is left untouched.
 DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
 configure_docker_daemon() {
-    step "Configuring Docker log rotation"
+    step "Configuring Docker defaults"
 
     local defaults='{"log-driver":"json-file","log-opts":{"max-size":"10m","max-file":"3"}}'
     local current='{}'
@@ -429,14 +630,18 @@ configure_docker_daemon() {
     fi
 
     local merged
+    # icc=false: containers left on Docker's default bridge (Tond never puts
+    # any there; see networks.rs) can't reach each other. An explicit
+    # setting wins.
     merged=$(jq -S -c --argjson d "$defaults" '
-        if (has("log-driver") and (.["log-driver"] | IN("json-file", "local") | not)) then .
+        (if (has("log-driver") and (.["log-driver"] | IN("json-file", "local") | not)) then .
         else .["log-driver"] = (.["log-driver"] // $d["log-driver"])
              | .["log-opts"] = ($d["log-opts"] + (.["log-opts"] // {}))
-        end' <<<"$current")
+        end)
+        | if has("icc") then . else .icc = false end' <<<"$current")
 
     if [[ "$merged" == "$current" ]]; then
-        info "Docker log rotation already configured"
+        info "Docker defaults already configured"
         return 0
     fi
 
@@ -446,7 +651,7 @@ configure_docker_daemon() {
     fi
     jq . <<<"$merged" > "${DOCKER_DAEMON_JSON}.tmp"
     mv "${DOCKER_DAEMON_JSON}.tmp" "$DOCKER_DAEMON_JSON"
-    info "Wrote container log rotation defaults to ${DOCKER_DAEMON_JSON}"
+    info "Wrote container log rotation and icc=false to ${DOCKER_DAEMON_JSON}"
 
     # dockerd only reads daemon.json at start. Restart it now, during install,
     # so the defaults apply before any Tond container exists.
@@ -711,30 +916,78 @@ EOF
 # CLI socket), so tond-server validates them together — the preview domain
 # must be on a different site than the dashboard.
 configure_domains() {
-    if [[ -z "$PREVIEW_DOMAIN" ]]; then
+    if [[ -z "$PREVIEW_DOMAIN" && -z "$APPS_DOMAIN" ]]; then
         return 0
     fi
 
-    step "Configuring preview domain"
+    step "Configuring app and preview domains"
 
     if [[ -n "$DASHBOARD_DOMAIN" ]]; then
         tond settings set-dashboard-domain "$DASHBOARD_DOMAIN" > /dev/null \
             || { error "Could not set the dashboard domain"; return 1; }
     fi
-    if ! tond settings set-preview-domain "$PREVIEW_DOMAIN"; then
-        error "tond-server rejected the preview domain ${PREVIEW_DOMAIN}"
-        error "Fix it later with: tond settings set-preview-domain <domain>"
-        return 1
+    if [[ -n "$PREVIEW_DOMAIN" ]]; then
+        if ! tond settings set-preview-domain "$PREVIEW_DOMAIN" > /dev/null; then
+            error "tond-server rejected the preview domain ${PREVIEW_DOMAIN}"
+            error "Fix it later with: tond settings set-preview-domain <domain>"
+            return 1
+        fi
+        info "Previews will be served at <id>-<app>.${PREVIEW_DOMAIN}"
     fi
-    info "Previews will be served at <id>-<app>.${PREVIEW_DOMAIN}"
+    if [[ -n "$APPS_DOMAIN" ]]; then
+        if ! tond settings set-apps-domain "$APPS_DOMAIN" > /dev/null; then
+            error "tond-server rejected the apps domain ${APPS_DOMAIN}"
+            error "Fix it later with: tond settings set-apps-domain <domain>"
+            return 1
+        fi
+        info "Apps will be served at <app>.${APPS_DOMAIN}"
+    fi
+}
+
+# TCP ports sshd accepts connections on, one per line: the port of the SSH
+# session running this installer, sshd's effective configuration, the sockets
+# sshd listens on, and systemd's ssh.socket (Ubuntu 22.10+ socket-activates
+# sshd, so the listener belongs to systemd, not sshd).
+detect_ssh_ports() {
+    {
+        if [[ -n "${SSH_CONNECTION:-}" ]]; then
+            awk '{ print $4 }' <<<"$SSH_CONNECTION"
+        fi
+        if command -v sshd &> /dev/null; then
+            sshd -T 2>/dev/null | awk '$1 == "port" { print $2 }'
+        fi
+        if command -v ss &> /dev/null; then
+            ss -Htlnp 2>/dev/null | awk '/"sshd"/ { n = split($4, a, ":"); print a[n] }'
+        fi
+        if systemctl list-unit-files ssh.socket &> /dev/null \
+            && systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
+            systemctl show -p Listen ssh.socket 2>/dev/null | grep -oE ':[0-9]+ ' | tr -d ': '
+        fi
+    } | grep -E '^[0-9]+$' | awk '$1 > 0 && $1 < 65536' | sort -un
+}
+
+# Allow every detected SSH port (22 when none is found) so enabling the
+# firewall can't lock the admin out.
+allow_ssh_ports() {
+    local ports port
+    ports="$(detect_ssh_ports)"
+    if [[ -z "$ports" ]]; then
+        warn "Could not detect sshd's port; allowing 22/tcp"
+        ports="22"
+    fi
+    for port in $ports; do
+        ufw allow "${port}/tcp" comment 'SSH' > /dev/null 2>&1
+    done
+    info "SSH allowed on port(s): $(tr '\n' ' ' <<<"$ports")"
 }
 
 configure_firewall() {
     step "Configuring firewall"
-    
+
     # Check if UFW is active
     if ufw status | grep -q "Status: active"; then
-        info "UFW is active, ensuring ports 80 and 443 are open"
+        info "UFW is active, ensuring SSH, 80 and 443 are open"
+        allow_ssh_ports
         ufw allow 80/tcp > /dev/null 2>&1
         ufw allow 443/tcp > /dev/null 2>&1
         info "Ports 80 and 443 opened"
@@ -751,13 +1004,15 @@ configure_firewall() {
             fi
         fi
         if [[ "$enable_ufw" == true ]]; then
-            ufw --force enable > /dev/null 2>&1
+            # Rules first, then enable: SSH must be allowed before the
+            # firewall starts dropping connections.
             ufw default deny incoming > /dev/null 2>&1
             ufw default allow outgoing > /dev/null 2>&1
-            ufw allow ssh > /dev/null 2>&1
+            allow_ssh_ports
             ufw allow 80/tcp > /dev/null 2>&1
             ufw allow 443/tcp > /dev/null 2>&1
-            info "UFW enabled with ports 22 (SSH), 80 (HTTP), and 443 (HTTPS) open"
+            ufw --force enable > /dev/null 2>&1
+            info "UFW enabled with SSH, 80 (HTTP) and 443 (HTTPS) open"
         fi
     fi
 }
@@ -838,6 +1093,21 @@ print_summary() {
     if [[ -s "$ROOT_KEY_FILE" ]]; then
         echo -e "${BOLD}Root API key${NC} (advanced / automation access) is stored in ${ROOT_KEY_FILE} (root only)."
         echo "  Show it with: sudo cat ${ROOT_KEY_FILE}"
+        echo ""
+    fi
+
+    if [[ "$APPS_DOMAIN" == *.nip.io || "$APPS_DOMAIN" == *.sslip.io ]]; then
+        echo -e "${BOLD}Apps:${NC}       Served at <app>.${APPS_DOMAIN} (already resolves to this server)."
+        echo "            For production, use your own domain on a different site from the"
+        echo "            dashboard: tond settings set-apps-domain <domain>"
+        echo ""
+    elif [[ -n "$APPS_DOMAIN" ]]; then
+        echo -e "${BOLD}Apps:${NC}       Create a wildcard A record: *.${APPS_DOMAIN} -> ${server_ip}"
+        echo "            Apps are served at <app>.${APPS_DOMAIN}"
+        echo ""
+    else
+        echo -e "${BOLD}Apps:${NC}       No apps domain: give each app a custom domain, or set one with"
+        echo "            tond settings set-apps-domain <domain> (a different site from the dashboard)"
         echo ""
     fi
 
@@ -946,13 +1216,25 @@ main() {
                 PREVIEW_DOMAIN="${PREVIEW_DOMAIN%.}"
                 shift 2
                 ;;
+            --apps-domain)
+                [[ $# -ge 2 ]] || fatal "Missing value for --apps-domain"
+                APPS_DOMAIN="$(echo "$2" | tr '[:upper:]' '[:lower:]')"
+                APPS_DOMAIN="${APPS_DOMAIN%.}"
+                APPS_DOMAIN_SET=true
+                shift 2
+                ;;
             --help|-h)
-                echo "Usage: install.sh [--non-interactive|-y] [--dashboard-domain <domain>] [--preview-domain <domain>]"
+                echo "Usage: install.sh [--non-interactive|-y] [--dashboard-domain <domain>] [--apps-domain <domain>] [--preview-domain <domain>]"
                 echo ""
                 echo "  --non-interactive, -y   Skip all prompts and apply safe defaults"
                 echo "                          (enables UFW and prints browser-first next steps)"
                 echo "  --dashboard-domain      Dashboard domain (default: <server-ip>.sslip.io when the"
                 echo "                          server has a public IPv4 address)"
+                echo "  --apps-domain           Domain apps are served under (<app>.<domain>). Must be on a"
+                echo "                          different site from the dashboard and preview domains, with"
+                echo "                          a wildcard DNS record. Default: <server-ip>.nip.io (or"
+                echo "                          .sslip.io when the dashboard is on nip.io). Pass \"\" for"
+                echo "                          none (apps then need a custom domain)."
                 echo "  --preview-domain        Domain previews are served under (<id>-<app>.<domain>)."
                 echo "                          Must be a separate domain you own — not the dashboard"
                 echo "                          domain or on the same registrable domain — with a"
@@ -980,6 +1262,11 @@ main() {
     if [[ -n "$PREVIEW_DOMAIN" ]]; then
         local preview_error
         preview_error="$(check_preview_domain "$PREVIEW_DOMAIN" "$DASHBOARD_DOMAIN")" || fatal "$preview_error"
+    fi
+    choose_apps_domain
+    if [[ -n "$APPS_DOMAIN" ]]; then
+        local apps_error
+        apps_error="$(check_apps_domain "$APPS_DOMAIN" "$DASHBOARD_DOMAIN" "$PREVIEW_DOMAIN")" || fatal "$apps_error"
     fi
 
     # Check if we need to download the release

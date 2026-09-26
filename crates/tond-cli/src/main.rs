@@ -26,6 +26,7 @@
 
 mod client;
 mod commands;
+mod signature;
 
 use std::path::PathBuf;
 
