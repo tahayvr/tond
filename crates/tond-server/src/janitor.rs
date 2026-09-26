@@ -15,10 +15,14 @@
 //   cron_job_runs  — per job, keep the last N runs and drop runs older than M
 //                    days (the latest run is always kept; running rows never
 //                    deleted).
-//   audit_log      — drop rows older than N days (security data: default 90).
+//   audit_log      — drop rows older than N days (security data: default 90)
+//                    through audit_log::prune_before, which removes a prefix
+//                    of the hash chain and records a checkpoint so the rest
+//                    still verifies.
 //   metrics        — drop samples older than N days (was a full-table scan
 //                    every 30 s in metrics.rs; now indexed and hourly).
-//   sessions / mfa_pending — drop expired rows.
+//   sessions / mfa_pending / password_links — drop expired rows (sessions
+//                    also when idle past the idle timeout).
 //   terminal_tickets / github_app_flows — drop expired rows.
 //   webhook_deliveries — drop replay IDs older than the 72 h replay window.
 //   preview_deployments — drop expired/failed rows a week after they expired.
@@ -287,19 +291,11 @@ pub async fn run_once(db: &SqlitePool, policy: &RetentionPolicy) -> Result<Janit
         .await?;
     }
 
-    // ── audit_log (created_at uses SQLite's datetime('now') format) ──
+    // ── audit_log (RFC 3339 timestamps; keeps the hash chain verifiable) ──
     if policy.audit_log_days > 0 {
-        let modifier = format!("-{} days", policy.audit_log_days);
-        report.audit_log += delete_in_batches(|| {
-            sqlx::query(
-                "DELETE FROM audit_log WHERE rowid IN (
-                    SELECT rowid FROM audit_log WHERE created_at < datetime('now', ?) LIMIT ?)",
-            )
-            .bind(&modifier)
-            .bind(BATCH_SIZE)
-            .execute(db)
-        })
-        .await?;
+        let cutoff = (now - chrono::Duration::days(policy.audit_log_days))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        report.audit_log += crate::audit_log::prune_before(db, &cutoff, BATCH_SIZE).await?;
     }
 
     // ── metrics (collected_at uses datetime('now') format) ──
@@ -333,6 +329,29 @@ pub async fn run_once(db: &SqlitePool, policy: &RetentionPolicy) -> Result<Janit
         .bind(&now_str)
         .execute(db)
         .await?;
+    let _ = sqlx::query("DELETE FROM password_links WHERE expires_at < ?")
+        .bind(&now_str)
+        .execute(db)
+        .await?;
+    // Sessions idle past the timeout can never be used again.
+    let idle_hours: i64 = sqlx::query_scalar(
+        "SELECT CAST(value AS INTEGER) FROM settings WHERE key = 'session_idle_timeout_hours'",
+    )
+    .fetch_optional(db)
+    .await?
+    .filter(|h: &i64| *h > 0)
+    .unwrap_or(tond_common::DEFAULT_SESSION_IDLE_HOURS);
+    let idle_cutoff = (now - chrono::Duration::hours(idle_hours)).to_rfc3339();
+    report.sessions += delete_in_batches(|| {
+        sqlx::query(
+            "DELETE FROM sessions WHERE rowid IN (
+                SELECT rowid FROM sessions WHERE COALESCE(last_used_at, created_at) < ? LIMIT ?)",
+        )
+        .bind(&idle_cutoff)
+        .bind(BATCH_SIZE)
+        .execute(db)
+    })
+    .await?;
 
     // ── expired one-time tokens and flows ──
     for sql in [
@@ -636,10 +655,17 @@ mod tests {
             .unwrap_or_else(|err| panic!("seed run: {err}"));
         }
 
-        sqlx::query("INSERT INTO audit_log (id, action, actor, created_at) VALUES ('au-old', 'x', 'y', datetime('now', '-100 days')), ('au-new', 'x', 'y', datetime('now', '-1 days'))")
-            .execute(&db)
-            .await
-            .unwrap_or_else(|err| panic!("seed audit: {err}"));
+        let actor = crate::audit_log::AuditActor::system("test");
+        for (action, days) in [("au-old", 100), ("au-new", 1)] {
+            crate::audit_log::record_at(
+                &db,
+                &actor,
+                crate::audit_log::AuditEntry::new(action),
+                &(chrono::Utc::now() - chrono::Duration::days(days))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            )
+            .await;
+        }
         sqlx::query("INSERT INTO metrics (id, app_id, collected_at) VALUES ('m-old', 'a', datetime('now', '-8 days')), ('m-new', 'a', datetime('now', '-1 days'))")
             .execute(&db)
             .await
@@ -671,7 +697,18 @@ mod tests {
             vec!["r-new-2", "r-new-3", "r-old-running"],
             "keeps the last 2 runs and never deletes a running row"
         );
-        assert_eq!(ids(&db, "SELECT id FROM audit_log").await, vec!["au-new"]);
+        assert_eq!(
+            ids(&db, "SELECT action FROM audit_log ORDER BY seq").await,
+            vec!["au-new", "audit_pruned"],
+            "old entries are pruned and the pruning is recorded"
+        );
+        assert!(
+            crate::audit_log::verify(&db)
+                .await
+                .unwrap_or_else(|err| panic!("verify: {err}"))
+                .ok,
+            "the chain still verifies after retention"
+        );
         assert_eq!(ids(&db, "SELECT id FROM metrics").await, vec!["m-new"]);
         assert_eq!(ids(&db, "SELECT id FROM sessions").await, vec!["s-live"]);
         assert_eq!(report.cron_job_runs, 2);

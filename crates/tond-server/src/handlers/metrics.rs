@@ -22,7 +22,7 @@ use sysinfo::System;
 use tond_common::*;
 
 use crate::{
-    auth::{RateLimit, RequireAuth},
+    auth::{Authz, RateLimit, scope},
     error::AppError,
     state::AppState,
 };
@@ -31,7 +31,7 @@ use crate::{
 
 pub async fn get_app_metrics(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::MetricsRead>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(query): Query<MetricsQuery>,
@@ -69,7 +69,7 @@ pub async fn get_app_metrics(
 
 pub async fn get_system_metrics(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::MetricsRead>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     // ── Host stats (sysinfo) ──
