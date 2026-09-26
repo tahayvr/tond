@@ -1072,6 +1072,11 @@ step "Scheduled database backups and restore into a new database"
 [[ "$(api_req PUT /api/v1/databases/e2e-redis/backup-schedule '{"schedule":"0 3 * * *","retention":0}')" == 400 ]] \
     || fail "a backup schedule keeping zero backups must be refused: $(cat "$API_BODY")"
 [[ "$(jq -r '.error.code' "$API_BODY")" == INVALID_INPUT ]] || fail "expected INVALID_INPUT: $(cat "$API_BODY")"
+for body in '{"full_retention_count":0}' '{"pre_deploy_retention_per_app":0}'; do
+    [[ "$(api_req PUT /api/v1/snapshots/config "$body")" == 400 ]] \
+        || fail "a snapshot retention of 0 must be refused (${body}): $(cat "$API_BODY")"
+done
+pass "retention counts below one are refused (database schedule, full and pre-deploy snapshots)"
 # Data to find again in the restored copy.
 docker exec -e REDISCLI_AUTH="${REDIS_PASS}" tond-db-e2e-redis redis-cli --no-auth-warning --user "${REDIS_USER}" \
     SET e2e-restore-key restored-ok > /dev/null
