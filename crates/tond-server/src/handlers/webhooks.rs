@@ -422,7 +422,7 @@ async fn authenticate_webhook(
         );
         return Ok(Err(error_response(
             StatusCode::CONFLICT,
-            "duplicate webhook delivery",
+            "duplicate webhook delivery: this delivery was already received and is not processed twice. To deploy again, push a new commit or use Re-deploy in the Tond dashboard.",
         )));
     }
 
@@ -974,7 +974,10 @@ pub async fn github_app_events(
                 "[github-app-events] rejected replayed delivery {:?}",
                 delivery
             );
-            return error_response(StatusCode::CONFLICT, "duplicate webhook delivery");
+            return error_response(
+                StatusCode::CONFLICT,
+                "duplicate webhook delivery: this delivery was already received and is not processed twice. To deploy again, push a new commit or use Re-deploy in the Tond dashboard.",
+            );
         }
         Err(e) => {
             tracing::error!("[github-app-events] database error: {}", e);
