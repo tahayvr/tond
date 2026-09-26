@@ -74,6 +74,9 @@ pub enum Purpose {
     IntegrationSecret,
     /// alert_rules.webhook_url (Slack/Discord-style URLs are bearer secrets)
     AlertWebhookUrl,
+    /// heartbeat_config.url_enc (a heartbeat URL is a bearer secret: anyone
+    /// holding it can report the server healthy)
+    HeartbeatUrl,
 }
 
 impl Purpose {
@@ -97,6 +100,7 @@ impl Purpose {
             Purpose::GithubPrivateKey => b"tond:github_apps.private_key",
             Purpose::IntegrationSecret => b"tond:integrations.config",
             Purpose::AlertWebhookUrl => b"tond:alert_rules.webhook_url",
+            Purpose::HeartbeatUrl => b"tond:heartbeat_config.url_enc",
         }
     }
 }
@@ -455,6 +459,7 @@ pub async fn reencrypt_stored_secrets(
 /// counts as one value). Key rotation walks this list: a new secret column
 /// must be added here.
 pub const SCALAR_SECRET_COLUMNS: &[(&str, &str, Purpose)] = &[
+    ("heartbeat_config", "url_enc", Purpose::HeartbeatUrl),
     (
         "registry_credentials",
         "password_enc",

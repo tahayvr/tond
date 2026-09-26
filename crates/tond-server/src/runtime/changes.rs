@@ -36,10 +36,12 @@ pub enum Table {
     RouteState,
     Deployments,
     Databases,
+    /// uptime_checks rows; the heartbeat settings handler notifies it too.
+    Uptime,
 }
 
 impl Table {
-    const ALL: [Table; 8] = [
+    const ALL: [Table; 9] = [
         Table::Apps,
         Table::PreviewDeployments,
         Table::CronJobs,
@@ -48,6 +50,7 @@ impl Table {
         Table::RouteState,
         Table::Deployments,
         Table::Databases,
+        Table::Uptime,
     ];
 
     fn index(self) -> usize {
@@ -68,6 +71,7 @@ impl Table {
             "route_state" => Table::RouteState,
             "deployments" => Table::Deployments,
             "databases" => Table::Databases,
+            "uptime_checks" => Table::Uptime,
             _ => return None,
         })
     }

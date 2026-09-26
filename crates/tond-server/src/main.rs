@@ -100,6 +100,7 @@ mod state;
 mod static_files;
 mod storage;
 mod upload;
+mod uptime;
 mod volumes;
 
 use std::future::IntoFuture;
@@ -233,6 +234,7 @@ async fn run() -> Result<()> {
     tokio::spawn(janitor::run_janitor(state.clone()));
     tokio::spawn(backup::backup_scheduler(state.clone()));
     tokio::spawn(run_preview_cleanup_loop(state.clone()));
+    tokio::spawn(uptime::run(state.clone()));
 
     // Control connection to tond-proxy: route nudges, cutover acks, cert results.
     tokio::spawn(proxy_link::run(state.clone()));

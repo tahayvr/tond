@@ -5104,8 +5104,10 @@ dependencies = [
  "portable-pty",
  "psl",
  "rand 0.10.3",
+ "rcgen",
  "reqwest",
  "rustix",
+ "rustls",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -5117,6 +5119,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tokio-util",
  "tond-common",
@@ -5129,6 +5132,7 @@ dependencies = [
  "urlencoding",
  "uuid",
  "walkdir",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]

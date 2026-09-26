@@ -21,7 +21,10 @@
 //                    still verifies.
 //   metrics        — tiered retention (raw 25 h, 5-minute rollups 8 days,
 //                    hourly rollups and events 90 days) plus targets whose
-//                    owner is gone; see metrics::store::prune.
+//                    owner is gone; see metrics::store::prune. Host history
+//                    (1-minute 48 h, hourly 1 year; metrics::host_history)
+//                    and uptime results (1-minute 48 h, hourly and incidents
+//                    90 days; uptime::store) are counted here too.
 //   sessions / mfa_pending / password_links — drop expired rows (sessions
 //                    also when idle past the idle timeout).
 //   terminal_tickets / github_app_flows — drop expired rows.
@@ -321,6 +324,8 @@ pub async fn run_once(db: &SqlitePool, policy: &RetentionPolicy) -> Result<Janit
 
     // ── metrics (fixed tiers, see metrics/store.rs) ──
     report.metrics += metrics::store::prune(db, now.timestamp()).await?;
+    report.metrics += metrics::host_history::prune(db, now.timestamp()).await?;
+    report.metrics += crate::uptime::store::prune(db, now.timestamp()).await?;
 
     // ── expired sessions and MFA challenges (RFC 3339 timestamps) ──
     let now_str = now.to_rfc3339();
