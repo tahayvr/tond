@@ -38,15 +38,7 @@ const SHOTS = [
 	{ page: 'previews', name: 'previews', path: '/apps/app_running?tab=settings&section=previews' },
 	{ page: 'databases', name: 'databases', path: '/databases' },
 	{ page: 'backups', name: 'snapshots', path: '/snapshots' },
-	{
-		page: 'templates',
-		name: 'templates',
-		path: '/apps/new',
-		run: async (p) => {
-			await p.getByRole('button', { name: /templates/i }).first().click();
-			await p.waitForTimeout(800);
-		}
-	},
+	{ page: 'templates', name: 'templates', path: '/templates' },
 	{ page: 'upgrading', name: 'available', path: '/system?tab=updates' },
 	{
 		page: 'upgrading',
