@@ -60,6 +60,10 @@ describe('integrations page', () => {
 								chat_id: '123456'
 							},
 							saved_secrets: ['bot_token'],
+							quiet_hours: { mode: 'global' as const },
+							last_sent_at: null,
+							last_error: null,
+							last_error_at: null,
 							created_at: '2026-01-01T00:00:00.000Z',
 							updated_at: '2026-01-01T00:00:00.000Z'
 						}

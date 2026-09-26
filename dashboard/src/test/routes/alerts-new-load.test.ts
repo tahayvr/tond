@@ -1,30 +1,30 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { listApps, listIntegrations } = vi.hoisted(() => ({
+const { listApps, listIntegrations, listAlertKinds, getAlertSettings } = vi.hoisted(() => ({
 	listApps: vi.fn(),
-	listIntegrations: vi.fn()
+	listIntegrations: vi.fn(),
+	listAlertKinds: vi.fn(),
+	getAlertSettings: vi.fn()
 }));
 
-vi.mock('$lib/api', () => ({
-	listApps,
-	listIntegrations,
-	ALERT_GROUPS: [{ id: 'resource', label: 'Resource', metrics: [], events: [] }]
-}));
+vi.mock('$lib/api', () => ({ listApps, listIntegrations, listAlertKinds, getAlertSettings }));
 
 describe('alerts/new page load', () => {
 	beforeEach(() => {
-		listApps.mockReset();
-		listApps.mockResolvedValue([{ id: 'app_1', name: 'api-service' }]);
-		listIntegrations.mockReset();
-		listIntegrations.mockResolvedValue([{ id: 'int_1', name: 'ops', kind: 'slack' }]);
+		listApps.mockReset().mockResolvedValue([{ id: 'app_1', name: 'api-service' }]);
+		listIntegrations.mockReset().mockResolvedValue([{ id: 'int_1', name: 'ops', kind: 'slack' }]);
+		listAlertKinds.mockReset().mockResolvedValue([{ kind: 'cpu' }]);
+		getAlertSettings.mockReset().mockResolvedValue({ quiet_hours: { enabled: false } });
 	});
 
-	it('loads alert creation route data before render', async () => {
+	it('loads kinds, apps, channels and quiet hours before render', async () => {
 		const pageModule = await import('../../routes/alerts/new/+page');
 
 		await expect(pageModule.load()).resolves.toEqual({
+			kinds: [{ kind: 'cpu' }],
 			apps: [{ id: 'app_1', name: 'api-service' }],
-			integrations: [{ id: 'int_1', name: 'ops', kind: 'slack' }]
+			integrations: [{ id: 'int_1', name: 'ops', kind: 'slack' }],
+			quietHours: { enabled: false }
 		});
 	});
 });

@@ -42,6 +42,10 @@ describe('NotificationChannelList', () => {
 			kind,
 			config,
 			saved_secrets: ['smtp_password'],
+			quiet_hours: { mode: 'global' as const },
+			last_sent_at: null,
+			last_error: null,
+			last_error_at: null,
 			enabled: true,
 			created_at: '2026-01-02T00:00:00.000Z',
 			updated_at: '2026-01-02T00:00:00.000Z'
@@ -52,6 +56,10 @@ describe('NotificationChannelList', () => {
 			kind: 'email',
 			config: payload.config ?? emailConfig,
 			saved_secrets: ['smtp_password'],
+			quiet_hours: { mode: 'global' as const },
+			last_sent_at: null,
+			last_error: null,
+			last_error_at: null,
 			enabled: payload.enabled ?? true,
 			created_at: '2026-01-01T00:00:00.000Z',
 			updated_at: '2026-01-03T00:00:00.000Z'
@@ -81,6 +89,10 @@ describe('NotificationChannelList', () => {
 							to_addrs: ['ops@example.com']
 						},
 						saved_secrets: ['smtp_password'],
+						quiet_hours: { mode: 'global' as const },
+						last_sent_at: null,
+						last_error: null,
+						last_error_at: null,
 						created_at: '2026-01-01T00:00:00.000Z',
 						updated_at: '2026-01-01T00:00:00.000Z'
 					}
@@ -116,7 +128,8 @@ describe('NotificationChannelList', () => {
 		expect(api.createIntegration).toHaveBeenCalledWith({
 			name: 'Pager Email',
 			kind: 'email',
-			config: emailConfig
+			config: emailConfig,
+			quiet_hours: { mode: 'global' }
 		});
 		expect(await screen.findByText(/pager email/i)).toBeInTheDocument();
 	});
@@ -135,6 +148,10 @@ describe('NotificationChannelList', () => {
 						enabled: true,
 						config: emailConfig,
 						saved_secrets: ['smtp_password'],
+						quiet_hours: { mode: 'global' as const },
+						last_sent_at: null,
+						last_error: null,
+						last_error_at: null,
 						created_at: '2026-01-01T00:00:00.000Z',
 						updated_at: '2026-01-01T00:00:00.000Z'
 					}
@@ -167,6 +184,10 @@ describe('NotificationChannelList', () => {
 						enabled: true,
 						config: emailConfig,
 						saved_secrets: ['smtp_password'],
+						quiet_hours: { mode: 'global' as const },
+						last_sent_at: null,
+						last_error: null,
+						last_error_at: null,
 						created_at: '2026-01-01T00:00:00.000Z',
 						updated_at: '2026-01-01T00:00:00.000Z'
 					}

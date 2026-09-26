@@ -8,9 +8,14 @@
 //   DELETE /api/integrations/:id          — delete integration (cascades links)
 //   POST   /api/integrations/:id/test     — send a test notification
 //
-// Secret config fields (bot tokens, webhook URLs, SMTP passwords) are stored
-// encrypted and never returned: responses list them in `saved_secrets`, and a
-// PATCH that omits one keeps the saved value (see `secrets::seal_integration_config`).
+// Secret config fields (bot tokens, webhook URLs, SMTP passwords, API tokens)
+// are stored encrypted and never returned: responses list them in
+// `saved_secrets`, a PATCH that omits one keeps the saved value and `null`
+// clears an optional one (see `secrets::seal_integration_config`).
+//
+// Each channel can follow the global quiet hours, have none, or its own
+// (`quiet_hours`). Responses carry the channel's delivery health
+// (`last_sent_at`, `last_error`).
 
 use axum::{
     Json,
@@ -23,20 +28,49 @@ use uuid::Uuid;
 
 use crate::audit_log::{AuditEntry, record};
 use crate::{
+    alerts::{self, quiet},
     auth::{Authz, RateLimit, scope},
     error::AppError,
-    notifications, secrets,
+    secrets,
     state::AppState,
 };
 
-const VALID_KINDS: &[&str] = &["telegram", "discord", "slack", "email"];
-
 fn validate_kind(kind: &str) -> Result<(), AppError> {
-    if !VALID_KINDS.contains(&kind) {
+    if !INTEGRATION_KINDS.contains(&kind) {
         return Err(AppError(TondError::InvalidInput(format!(
             "kind must be one of: {}",
-            VALID_KINDS.join(", ")
+            INTEGRATION_KINDS.join(", ")
         ))));
+    }
+    Ok(())
+}
+
+/// Stored form of a channel's quiet hours (None = follow the global setting).
+fn quiet_hours_json(q: &ChannelQuietHours) -> Result<Option<String>, AppError> {
+    match q {
+        ChannelQuietHours::Global => Ok(None),
+        ChannelQuietHours::Custom(window) => {
+            quiet::validate(window).map_err(|e| AppError(TondError::InvalidInput(e)))?;
+            Ok(Some(serde_json::to_string(q).unwrap_or_default()))
+        }
+        ChannelQuietHours::Off => Ok(Some(serde_json::to_string(q).unwrap_or_default())),
+    }
+}
+
+/// URLs a channel posts to must be http(s).
+fn validate_urls(config: &serde_json::Value) -> Result<(), AppError> {
+    for field in ["webhook_url", "server_url"] {
+        if let Some(url) = config.get(field).and_then(|v| v.as_str())
+            && !url.trim().is_empty()
+        {
+            let ok = reqwest::Url::parse(url.trim())
+                .is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some());
+            if !ok {
+                return Err(AppError(TondError::InvalidInput(format!(
+                    "{field} must be an http:// or https:// URL"
+                ))));
+            }
+        }
     }
     Ok(())
 }
@@ -100,18 +134,21 @@ pub async fn create_integration(
         )));
     }
     validate_kind(&req.kind)?;
+    validate_urls(&req.config)?;
     let config_str = validate_and_seal_config(&req.kind, &req.config, None)?;
+    let quiet = quiet_hours_json(&req.quiet_hours.clone().unwrap_or_default())?;
 
     let id = Uuid::new_v4().to_string();
 
     sqlx::query(
-        "INSERT INTO integrations (id, name, kind, config, enabled)
-         VALUES (?, ?, ?, ?, 1)",
+        "INSERT INTO integrations (id, name, kind, config, enabled, quiet_hours)
+         VALUES (?, ?, ?, ?, 1, ?)",
     )
     .bind(&id)
     .bind(req.name.trim())
     .bind(&req.kind)
     .bind(&config_str)
+    .bind(&quiet)
     .execute(&state.db)
     .await?;
 
@@ -149,8 +186,15 @@ pub async fn update_integration(
     }
 
     let config_str = match req.config {
-        Some(ref cfg) => validate_and_seal_config(&row.kind, cfg, Some(&row.config))?,
+        Some(ref cfg) => {
+            validate_urls(cfg)?;
+            validate_and_seal_config(&row.kind, cfg, Some(&row.config))?
+        }
         None => row.config,
+    };
+    let quiet = match &req.quiet_hours {
+        Some(q) => quiet_hours_json(q)?,
+        None => row.quiet_hours,
     };
 
     let enabled: i64 = req
@@ -160,12 +204,13 @@ pub async fn update_integration(
 
     sqlx::query(
         "UPDATE integrations
-         SET name = ?, config = ?, enabled = ?, updated_at = datetime('now')
+         SET name = ?, config = ?, enabled = ?, quiet_hours = ?, updated_at = datetime('now')
          WHERE id = ?",
     )
     .bind(&name)
     .bind(&config_str)
     .bind(enabled)
+    .bind(&quiet)
     .bind(&id)
     .execute(&state.db)
     .await?;
@@ -191,12 +236,7 @@ pub async fn delete_integration(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
-    // Remove linked alert_rule_notifications first (no FK cascade in SQLite default)
-    sqlx::query("DELETE FROM alert_rule_notifications WHERE integration_id = ?")
-        .bind(&id)
-        .execute(&state.db)
-        .await?;
-
+    // Rule links and queued deliveries go with it (ON DELETE CASCADE).
     let deleted = sqlx::query("DELETE FROM integrations WHERE id = ?")
         .bind(&id)
         .execute(&state.db)
@@ -230,21 +270,13 @@ pub async fn test_integration(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let row = fetch_integration(&state.db, &id).await?;
-    let config = secrets::open_integration_config(&row.kind, &row.config)
-        .map_err(|e| AppError(TondError::Internal(format!("{e:#}"))))?;
-
-    let payload = notifications::NotificationPayload {
-        rule_name: "Test".to_string(),
-        event_or_metric: "test".to_string(),
-        app_name: None,
-        detail: Some("This is a test notification from Tond.".to_string()),
-        fired_at: chrono::Utc::now().to_rfc3339(),
-    };
-
-    notifications::dispatch(&config, &payload)
+    alerts::test_channel(&state, &row.id, &row.name, &row.kind, &row.config, None)
         .await
-        .map_err(|e| AppError(TondError::Internal(format!("Test failed: {}", e))))?;
-
+        .map_err(|e| {
+            AppError(TondError::InvalidInput(format!(
+                "The test didn't arrive: {e:#}"
+            )))
+        })?;
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(

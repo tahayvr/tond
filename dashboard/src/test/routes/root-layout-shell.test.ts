@@ -19,7 +19,8 @@ vi.mock('$app/state', () => ({
 
 vi.mock('$lib/auth.svelte', () => ({
 	checkAuth: vi.fn().mockResolvedValue(undefined),
-	getStatus: () => state.status
+	getStatus: () => state.status,
+	can: () => false
 }));
 
 vi.mock('$lib/ui-context.svelte', () => ({
