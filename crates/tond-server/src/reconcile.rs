@@ -14,7 +14,9 @@
 //     in the service's private /tmp and are gone;
 //   - apps whose recorded status disagrees with their container (status
 //     'building' with nothing deploying, 'running' with a stopped or missing
-//     container, 'stopped' with a running one) get the status Docker reports.
+//     container, 'stopped' with a running one) get the status Docker reports;
+//     an app left running in its staging container (tond-<app>-next, a deploy
+//     cut off right after cutover) gets the swap finished.
 //
 // Cron runs are reconciled by the cron scheduler itself
 // (cron::reconcile_interrupted_runs, which also removes orphaned containers).
@@ -139,7 +141,12 @@ async fn reconcile_apps(state: &AppState) -> Result<u64> {
                 .inspect_container(id, None::<InspectContainerOptions>)
                 .await
             {
-                Ok(info) => Some(info.state.and_then(|s| s.running).unwrap_or(false)),
+                Ok(info) => {
+                    if info.name.as_deref() == Some(format!("/tond-{}-next", app.name).as_str()) {
+                        promote_staging_container(state, &app.name, id).await;
+                    }
+                    Some(info.state.and_then(|s| s.running).unwrap_or(false))
+                }
                 Err(bollard::errors::Error::DockerResponseServerError {
                     status_code: 404, ..
                 }) => None,
@@ -170,6 +177,39 @@ async fn reconcile_apps(state: &AppState) -> Result<u64> {
         }
     }
     Ok(corrected)
+}
+
+/// A deploy cut off after its cutover leaves the app running in the staging
+/// container (`tond-<app>-next`). The next deploy would reuse (and remove)
+/// that name, so finish the swap now: drop a stale canonical container and
+/// rename staging to `tond-<app>`.
+async fn promote_staging_container(state: &AppState, app_name: &str, container_id: &str) {
+    use bollard::query_parameters::RemoveContainerOptionsBuilder;
+    let canonical = format!("tond-{app_name}");
+    if let Ok(existing) = state
+        .docker
+        .inspect_container(&canonical, None::<InspectContainerOptions>)
+        .await
+        && existing.id.as_deref() != Some(container_id)
+    {
+        let _ = state
+            .docker
+            .remove_container(
+                &canonical,
+                Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+            )
+            .await;
+    }
+    match crate::docker::rename_container(
+        &state.docker,
+        &format!("tond-{app_name}-next"),
+        &canonical,
+    )
+    .await
+    {
+        Ok(()) => tracing::info!("App {app_name}: finished an interrupted container swap"),
+        Err(e) => tracing::warn!("App {app_name}: could not finish an interrupted container swap: {e}"),
+    }
 }
 
 /// Startup reconciliation (see module docs). Never fatal: failures are logged.

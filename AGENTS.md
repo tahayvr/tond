@@ -150,11 +150,15 @@ VITE_MOCK_API=true          # start MSW service worker to intercept /api request
 - Production target: a **single Linux VPS, x86_64 or aarch64 (ARM64)**. Both are built,
   packaged (`dist/tond-linux-<arch>`) and end-to-end tested. Keep resource usage minimal.
 - `tond-proxy` runs as the unprivileged `tond-proxy` user (only `CAP_NET_BIND_SERVICE`);
-  `tond-server` runs as root. They share `tond.db` through the `tond-proxy` group
-  (`/opt/tond/data` is `root:tond-proxy 3770`, `tond.db*` `0660`). Anything else under
-  `/opt/tond/data` must stay root-only; never make the proxy depend on Docker or on files
-  outside `tond.db`, `certs/` and `acme_account.json` (see `secure_data_dir` in
-  `release/install.sh`).
+  `tond-server` runs as root. The proxy reads `tond.db` through the `tond-proxy` group
+  (`/opt/tond/data` is `root:tond-proxy 3770`, `tond.db*` `0640`) and opens it `mode=ro`:
+  **the proxy never writes the database** — what it has to report (certificate results)
+  goes to tond-server over its control socket `proxy.sock` (owned by tond-proxy, 0600,
+  root/own-uid peers only; protocol in `tond_common::proxy_control`). tond-server keeps
+  the WAL persistent (`SQLITE_FCNTL_PERSIST_WAL`) because a read-only reader cannot
+  create `-wal`/`-shm`. Anything else under `/opt/tond/data` must stay root-only; never
+  make the proxy depend on Docker or on files outside `tond.db*`, `certs/`,
+  `acme_account.json` and `proxy.sock` (see `secure_data_dir` in `release/install.sh`).
 - Previews run pull-request code and are served only as `<id>-<app>.<preview_domain>`, a
   separate registrable domain from the dashboard (`preview_domain` setting, validated with
   the Public Suffix List in `crates/tond-server/src/domains.rs`). tond-proxy never serves
@@ -168,5 +172,18 @@ VITE_MOCK_API=true          # start MSW service worker to intercept /api request
   credential-free path is the root-only Unix socket (`TOND_SOCKET_PATH`), marked by the
   `LocalSocket` request extension that only the socket listener adds (see
   `crates/tond-server/src/auth/extractor.rs`). Never derive trust from a header either.
-- `tond-proxy` opens a fresh DB connection every 5s to poll for cert/route updates;
-  do not refactor this without considering the two-process architecture.
+- Routing is event-driven: SQL triggers bump `route_state.version` whenever anything the
+  proxy routes on changes; tond-server's SQLite update hook sees that and nudges the
+  proxy over `proxy.sock`, and a deploy stops the old container only after the proxy
+  acknowledges the new version (`proxy_link::sync_routes`). The proxy keeps one
+  persistent read-only connection and a 60 s fallback check. If you add a table or
+  column the proxy routes on, extend the triggers in the `route_state` migration.
+- Every production deploy goes through the build queue (`deploy/queue.rs`: one deploy
+  per app, newest supersedes a queued one, global build slots). Never spawn
+  `deploy::deploy` directly. Long-running work (deploys, cron runs, snapshots) is spawned
+  with `runtime::shutdown::spawn_tracked` so SIGTERM waits for it; `reconcile.rs` fixes
+  up whatever a crash left behind at startup.
+- Idle budget: background loops sleep until their next deadline or a table change
+  (`runtime::changes::Watch`), never on a short fixed tick; register them in
+  `runtime::loops` so `/api/system/self` shows their health. `e2e/budget.sh` checks RSS,
+  wakeups, DB queries and journal lines at idle.
