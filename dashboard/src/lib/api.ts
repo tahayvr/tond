@@ -4377,7 +4377,7 @@ export interface Snapshot {
 	id: string;
 	name: string;
 	status: string; // "pending" | "running" | "completed" | "failed"
-	trigger: string; // "scheduled" | "manual" | "pre_deploy" | "pre_restore" | "pre_update"
+	trigger: string; // "scheduled" | "manual" | "pre_deploy" | "pre_restore" | "pre_update" | "pre_upgrade"
 	scope: string; // "full" | "app:name" | "database:name"
 	trigger_app: string | null;
 	deployment_id: string | null;

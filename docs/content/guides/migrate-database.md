@@ -2,28 +2,28 @@
 
 This guide moves an existing PostgreSQL, MySQL (or MariaDB) or Redis database into a database managed by Tond, connects your app to it, and switches over. You need SSH access to the Tond server as root, a dump of the old database, and a few minutes of write downtime for the final switch.
 
-Tond has no import button. You create an empty managed database, then load the dump into its container with the engine's own client over `docker exec`. The whole process runs on the server.
+Tond has no import button for outside dumps. You create an empty managed database, then load the dump into its container with the engine's own client over `docker exec`. The whole process runs on the server. (**Restore to new…** on a database's **Backups** tab only restores Tond's own backups.)
 
-Managed databases run these images by default:
+Managed databases run in a container named `tond-db-<name>`. You choose the major version when you create one:
 
-| Engine | Image | Container name |
-| --- | --- | --- |
-| PostgreSQL | `postgres:16-alpine` | `tond-db-<name>` |
-| MySQL | `mysql:8` | `tond-db-<name>` |
-| MariaDB | `mariadb:11` | `tond-db-<name>` |
-| Redis | `redis:7-alpine` | `tond-db-<name>` |
+| Engine | Versions (default in bold) |
+| --- | --- |
+| PostgreSQL | 14, 15, **16**, 17, 18 |
+| MySQL | 8.0, **8.4** |
+| MariaDB | 10.11, 11.4, **11.8** |
+| Redis | 6, **7**, 8 |
 
-Make the dump with a client that is no newer than the target's major version. A Redis RDB file from a newer Redis release won't load.
+Pick the same major version as the old database, or a newer one. Make the dump with a client that is no newer than the target's major version. A Redis RDB file from a newer Redis release won't load. If you start on the old version, you can [upgrade](/concepts/databases#major-version-upgrades) later from the database's **Settings** tab.
 
 ## 1. Create the managed database
 
-In the dashboard, open **Databases → New database**, pick the engine, enter a **Database Name** and, if the app belongs to a project, choose the same **Project**. From the CLI:
+In the dashboard, open **Databases → New database**, pick the engine, enter a **Database Name**, choose the **Version** (and, for PostgreSQL, a variant such as pgvector or PostGIS if the old database uses those extensions) and, if the app belongs to a project, the same **Project**. From the CLI:
 
 ```sh
 tond db create shop-db --db-type postgres
 ```
 
-Use `--project <project-id>` to put it in a project and `--memory-mb` to cap its memory.
+The CLI always uses the engine's default version. Use `--project <project-id>` to put it in a project and `--memory-mb` to cap its memory.
 
 Tond generates the user and password. The CLI prints the connection string once.
 
@@ -144,9 +144,9 @@ A trial import in steps 3 to 5 tells you how long the real one takes. For the fi
 
 ## 7. Back it up
 
-Take a first backup right away: on the database page, open **Backups** and click **Back up now**. Scheduled snapshots and off-server copies are covered in [Backups to S3](/guides/backups-s3).
+Take a first backup right away: on the database page, open **Backups** and click **Back up now**. On the same tab, check the database's **Schedule**: databases created in the dashboard are backed up every day at 03:00 UTC by default, while those created with the CLI have no schedule until you set one. See [Databases](/concepts/databases#backup-schedule). Off-server copies are covered in [Backups to S3](/guides/backups-s3).
 
 ## Next steps
 
-- [Databases](/concepts/databases) explains managed databases, public access and custom images.
-- [Snapshots and backups](/concepts/backups) covers restores.
+- [Databases](/concepts/databases) explains managed databases, versions, upgrades, public access and custom images.
+- [Snapshots and backups](/concepts/backups) covers restores, including restoring a backup into a new database.

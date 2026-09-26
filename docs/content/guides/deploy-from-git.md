@@ -8,7 +8,9 @@ Tond clones the repository, builds it (see [Build sources](/guides/sources)) and
 | --- | --- | --- |
 | Public, any host | Plain HTTPS clone | A per-app webhook |
 | Private on GitHub | The Tond GitHub App | The GitHub App (no per-repo webhook) |
-| Private, any host | An SSH deploy key (or a GitLab access token) | A per-app webhook |
+| Private, any host | An SSH deploy key, or a GitLab or Gitea/Forgejo access token | A per-app webhook |
+
+The GitHub App and the GitLab and Gitea/Forgejo tokens also let Tond report back to the forge: a [commit status](#commit-statuses) on every deployed commit, and a status and comment on each pull request preview.
 
 ## Deploy a public repository
 
@@ -29,7 +31,7 @@ tond apps deploy web
 
 ## Private GitHub repositories: the GitHub App
 
-The GitHub App gives Tond short-lived access tokens for the repositories you choose, delivers push and pull request events, and posts preview status back to pull requests. You create the App from the dashboard; it belongs to your GitHub account and to this Tond server.
+The GitHub App gives Tond short-lived access tokens for the repositories you choose, delivers push and pull request events, and posts commit statuses and preview comments back to GitHub. You create the App from the dashboard; it belongs to your GitHub account and to this Tond server.
 
 Before you start, set a **Dashboard Domain** under **Settings** and make sure it serves HTTPS. GitHub sends its callbacks and webhooks there.
 
@@ -53,9 +55,7 @@ When the App receives a push, Tond deploys every app linked to that App whose Gi
 > [!TIP]
 > Disconnecting a GitHub App in Tond removes it from Tond only. Delete it on GitHub as well if you no longer need it.
 
-### Pull request previews
-
-With the GitHub App linked, an app can get a preview deployment for every pull request. Tond posts a `tond/preview` commit status (pending, then success with the preview URL) and a comment on the pull request with the link. Previews need a separate preview domain and must be turned on per app under **Settings → Previews**. See [Previews](/concepts/previews).
+With the GitHub App linked, an app can also get a preview deployment for every pull request. See [Pull and merge request previews](#pull-and-merge-request-previews).
 
 ## Private repositories on any host: SSH deploy key
 
@@ -66,21 +66,35 @@ With the GitHub App linked, an app can get a preview deployment for every pull r
 
 Tond keeps the private key on the server, root-only, and uses it only for this app. Host keys of the large providers are pinned; other hosts are trusted on first connection and then verified. Regenerating the key replaces it, so update the deploy key in your Git host too.
 
-## Private GitLab repositories: access token
+## GitLab and Gitea/Forgejo: access tokens
 
-For GitLab (gitlab.com or self-hosted), Tond can clone with a personal access token instead of a deploy key. This is available through the API only:
+For GitLab (gitlab.com or self-hosted) and Gitea or Forgejo (for example Codeberg), Tond can use an access token. A token linked to an app clones its private repository instead of a deploy key, and lets Tond post commit statuses and preview comments.
 
-1. Store the token (admin, `settings:write`). Tond checks it against GitLab before saving and encrypts it at rest.
+1. Create the token on the forge:
+   - **GitLab**: a personal or project access token with the `api` scope (Preferences → Access tokens).
+   - **Gitea / Forgejo**: a token with read and write access to repositories and issues (Settings → Applications).
+2. In Tond, open **Integrations → GitLab** or **Integrations → Gitea / Forgejo**, and add the token with the instance URL. Tond checks it against the forge before saving and encrypts it at rest. Adding tokens needs `settings:write`.
+3. Open the app's **Settings → Git**. Under **Commit statuses and previews**, pick the token in **Report through**. The choice is saved at once and needs `apps:write`. An app reports through one forge at a time, and an app linked to a GitHub App reports through the App.
 
-   ```sh
-   curl -X POST https://tond.example.com/api/v1/gitlab-tokens \
-     -H "Authorization: Bearer $TOND_TOKEN" -H "Content-Type: application/json" \
-     -d '{"name":"gitlab","token":"glpat-…","gitlab_url":"https://gitlab.com"}'
-   ```
+Through the API, the tokens are `/api/v1/gitlab-tokens` and `/api/v1/gitea-tokens`, linked with `PUT /api/v1/apps/{id}/gitlab-token` (`{"gitlab_token_id":"<id>"}`) or `PUT /api/v1/apps/{id}/gitea-token` (`{"gitea_token_id":"<id>"}`). See the [HTTP API](/reference/api/) for the full request shapes.
 
-2. Link it to the app with `PUT /api/v1/apps/{id}/gitlab-token` and the body `{"gitlab_token_id":"<id>"}`.
+## Commit statuses
 
-An app linked to a GitLab token also gets merge request previews from the GitLab webhook (below). See the [HTTP API](/reference/api/) for the full request shapes.
+When a production deploy of a Git app has checked out its commit, Tond sets a `tond/deploy` status on that commit: pending while it deploys, success when it goes live, and failure when it fails, is cancelled or is replaced by a newer deploy in the queue. The status's details link opens the deployment page in the dashboard. Rollbacks don't report, because they redeploy an older image rather than a new commit.
+
+Statuses go through whatever the app is linked to: the GitHub App, a GitLab token or a Gitea/Forgejo token. Reporting is best effort: if the forge is down or the token lacks a scope, Tond logs it and the deploy carries on.
+
+## Pull and merge request previews
+
+An app can get a preview deployment for every pull request (GitHub, Gitea, Forgejo) or merge request (GitLab). Previews need a separate preview domain and must be turned on per app under **Settings → Previews**. See [Previews](/concepts/previews).
+
+| Forge | Events come from | Status and comment need |
+| --- | --- | --- |
+| GitHub | The GitHub App | The GitHub App |
+| GitLab | The app's GitLab webhook with **Merge request events** | A GitLab token linked to the app |
+| Gitea / Forgejo | The app's Gitea webhook with pull request events | A Gitea/Forgejo token linked to the app |
+
+Opening or reopening a pull request, or pushing to it, deploys its preview and replaces the previous one. Tond sets a `tond/preview` status on the head commit (pending, then success or failure) and posts one comment with the preview URL, which later pushes edit in place. Closing or merging the pull request removes its previews. Only pull requests for the app's own repository are previewed.
 
 ## Deploy on push
 
@@ -106,7 +120,7 @@ Every app has its own webhook URLs and a secret. Open **Settings → Git → Web
 | --- | --- | --- |
 | GitHub | Repository → Settings → Webhooks | Content type `application/json`, the secret, "Just the push event" |
 | GitLab | Project → Settings → Webhooks | The secret as **Secret token**, **Push events** (and **Merge request events** for previews) |
-| Gitea / Forgejo | Repository → Settings → Webhooks | Content type `application/json`, the secret, push events |
+| Gitea / Forgejo | Repository → Settings → Webhooks | Content type `application/json`, the secret, push events (and pull request events for previews) |
 
 The CLI prints the same URLs:
 

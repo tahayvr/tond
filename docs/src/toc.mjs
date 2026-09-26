@@ -60,7 +60,7 @@ export const sections = [
 			{
 				text: 'Domains and certificates',
 				link: '/concepts/domains',
-				description: 'Dashboard domain, apps domain, custom domains and TLS certificates.'
+				description: 'Dashboard, apps and preview domains, app domains and redirects, wildcard and uploaded certificates.'
 			},
 			{
 				text: 'Volumes',

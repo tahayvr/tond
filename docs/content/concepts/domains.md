@@ -1,6 +1,6 @@
 # Domains and certificates
 
-Tond serves everything over HTTPS through tond-proxy, on ports 80 and 443 of your server. Each hostname gets a free certificate from Let's Encrypt, obtained and renewed automatically. This page explains the kinds of domains Tond uses, what DNS they need, and how certificates are issued.
+Tond serves everything over HTTPS through tond-proxy, on ports 80 and 443 of your server. Certificates come from Let's Encrypt and are obtained and renewed automatically: one per hostname, or one wildcard for many. You can also upload your own. This page explains the kinds of domains Tond uses, how an app gets several domains and redirects, what DNS they need, and how certificates are issued.
 
 ## Three domains, three sites
 
@@ -68,41 +68,67 @@ DNS: an `A` record (and `AAAA` if you use IPv6) for the dashboard domain, pointi
 
 ## Apps domain
 
-When an app without a domain deploys for the first time, Tond gives it the hostname `<app>.<apps domain>`. Background workers get no hostname. If no apps domain is set, the deploy log says the app has no public address yet, and the app needs a custom domain.
+When an app without a domain deploys for the first time, Tond gives it the hostname `<app>.<apps domain>` as its primary domain. Background workers get no hostname. If no apps domain is set, the deploy log says the app has no public address yet, and the app needs a domain of your own.
 
 DNS: a wildcard record `*.<apps domain>` pointing at the server, so every app is covered by one record.
 
-## Custom domains
+## App domains
 
-Each app has one domain. It is either the automatic hostname or a custom domain you set. Set it in the app's **Settings → Domain**, or with the CLI:
+An app can answer on any number of domains. Each one has a kind:
+
+| Kind | What it does |
+| --- | --- |
+| Primary | The app's main address. An app has at most one. |
+| Alias | Serves the same app as the primary. |
+| Redirect | tond-proxy answers with a `308` (the default, which keeps the method) or a `301` to another domain of the same app. The path and query are kept, and the app never sees the request. |
+
+The first serving domain you add becomes the primary, later ones become aliases. If you remove the primary, the oldest alias becomes the primary. The automatic `<app>.<apps domain>` hostname is an ordinary entry in this list, marked **Automatic**.
+
+Manage the list in the app's **Settings → Domain**. **Add domain** asks for the name and whether it **Serves the app** or **Redirects to another domain**. For a serving domain such as `example.com`, you can also tick **Also add `www.example.com`, redirecting here** (or the reverse for a `www.` name), so visitors who type either name end up on one address. Each row shows the domain's DNS and HTTPS status, with **Make primary**, **Redirect** (or **Edit redirect** and **Serve instead**) and a remove button. Select a domain to see the DNS records to create, what it resolves to now, and the certificate that serves it.
+
+With the CLI:
 
 ```sh
-tond apps domain web www.example.com
+tond apps domains list web
+tond apps domains add web www.example.com       # an alias, or the primary if the app has none
+tond apps domains add web example.com --www     # example.com serves, www.example.com redirects to it
+tond apps domains add web old.example.com --redirect-to example.com --code 301
+tond apps domains set-primary web example.com
+tond apps domains redirect web www.example.com --to example.com
+tond apps domains remove web old.example.com
 ```
 
-A custom domain must:
+`tond apps domain web example.com` is a shortcut: it adds the domain if needed and makes it the primary. The previous primary stays as an alias.
+
+A domain must:
 
 - be a valid hostname with at least two labels;
 - not be the dashboard domain;
 - not be under the preview domain, which serves only previews;
 - not be used by another app.
 
-A custom domain may be on the same site as the dashboard: you own both. The dashboard then shows a warning, because the app could send same-site requests to the dashboard. For code you don't fully trust, use a domain on a different site.
+Redirects follow a few rules, so they never chain or point away from the app:
 
-The **Domain** section checks DNS as you type. It resolves the name, compares it with the server's public addresses, and tells you which records to create. For a domain under the apps domain, it also suggests the wildcard record.
+- A redirect points at a serving domain (the primary or an alias) of the same app, never at another redirect.
+- A domain that other domains redirect to can't be removed or turned into a redirect until they point elsewhere.
+- The primary can't become a redirect. Make another domain primary first.
 
-DNS: an `A` record (and `AAAA` for IPv6) pointing at the server. If a CDN or another proxy sits in front, it must pass HTTP requests on port 80 through to the server, for certificate validation.
+A domain may be on the same site as the dashboard: you own both. The dashboard then shows a warning, because the app could send same-site requests to the dashboard. For code you don't fully trust, use a domain on a different site.
+
+DNS: an `A` record (and `AAAA` for IPv6) for each domain, pointing at the server. A domain under the apps domain is covered by the wildcard record. If a CDN or another proxy sits in front, it must pass HTTP requests on port 80 through to the server for certificate validation, unless a [DNS provider](#dns-providers-and-wildcard-certificates) covers the domain.
 
 ## HTTP and HTTPS
 
-- **Port 443** serves every routed hostname over TLS.
-- **Port 80** answers Let's Encrypt validation requests. It redirects every other request for a hostname Tond serves to HTTPS with `301`, and answers `404` for any other hostname, so it is never an open redirect.
+- **Port 443** serves every routed hostname over TLS. Redirect domains are answered there with their `301` or `308`.
+- **Port 80** answers Let's Encrypt validation requests. It sends a request for a redirect domain straight to its target over HTTPS, redirects every other request for a hostname Tond serves to HTTPS with `301`, and answers `404` for any other hostname, so it is never an open redirect.
 
-Tond routes an app's domain only while the app is running and serves traffic (not a background worker). A stopped app's domain isn't routed.
+Tond routes an app's domains only while the app is running and serves traffic (not a background worker). A stopped app's domains, redirects included, aren't routed.
 
 ## Certificates
 
-tond-proxy obtains certificates from Let's Encrypt with the ACME HTTP-01 challenge, one certificate per hostname. There are no wildcard certificates. It requests a certificate for every hostname it routes: the dashboard domain, running apps' domains and running previews.
+tond-proxy requests a certificate for every hostname it routes: the dashboard domain, running apps' domains and running previews. By default it gets one certificate per hostname from Let's Encrypt, validated with the ACME HTTP-01 challenge. A [DNS provider](#dns-providers-and-wildcard-certificates) adds wildcard certificates and DNS-01 validation, and you can [upload a certificate](#uploaded-certificates) instead.
+
+For each TLS connection, tond-proxy picks the certificate for the exact hostname, or else the wildcard one label up (`*.example.com` for `web.example.com`).
 
 ![The Certificates page: every hostname, its certificate status and expiry](/img/domains/certificates.light.webp)
 
@@ -116,9 +142,35 @@ tond-proxy obtains certificates from Let's Encrypt with the ACME HTTP-01 challen
 
 Certificates and keys live under `<data>/certs/<domain>/`, and the ACME account in `<data>/acme_account.json`.
 
+### DNS providers and wildcard certificates
+
+A DNS provider gives Tond API access to your DNS, so it can prove it controls a domain with an `_acme-challenge` TXT record (ACME DNS-01). Add one under **Integrations → DNS providers**:
+
+| Provider | Credential |
+| --- | --- |
+| Cloudflare | An API token with Zone → DNS → Edit, limited to your zone |
+| Hetzner DNS | An API token with read and write permission |
+| DigitalOcean | A personal access token with the `domain` create, read and delete scopes |
+| Amazon Route 53 | The access key ID and secret access key of an IAM user allowed to change the zone's records |
+
+Each provider lists the zones it hosts, for example `example.com`. **Test** checks every zone against the provider's API. Tond only adds and removes `_acme-challenge` records. Tokens are encrypted at rest and never shown again. Only tond-server holds them: tond-proxy, which faces the internet, asks tond-server over its control socket to publish a record, and tond-server publishes records only for domains Tond serves.
+
+When a provider covers the zone:
+
+- **Wildcard certificates.** tond-proxy orders one certificate for `*.<apps domain>` and one for `*.<preview domain>`, instead of one per app or preview. A new app or preview under them has a trusted certificate at once, without an order of its own, and per-host certificates the wildcard replaces are dropped. If the wildcard fails twice, the hosts fall back to certificates of their own until it is issued.
+- **DNS-01 for other domains.** Any other domain in a covered zone, such as a custom app domain or the dashboard domain, is validated with DNS-01 instead of HTTP-01. This also works for domains behind a CDN or not reachable on port 80.
+
+After publishing a record, tond-server waits for it to propagate before the CA checks it: 30 seconds, or 60 for Route 53 (see `TOND_DNS_PROPAGATION_SECS` in [Configuration](/reference/configuration)). The **DNS providers** page shows which wildcard certificates each provider covers.
+
+### Uploaded certificates
+
+To serve a certificate from another CA, click **Upload certificate** on the **Certificates** page (admins, `settings:write`). Enter the domain (a hostname, or a wildcard such as `*.example.com`), the certificate chain in PEM with the leaf first, and its private key. tond-proxy checks that the key matches the certificate, the chain is in order, the certificate is currently valid and covers the domain. It then stores it like its own certificates (key mode `0600`) and serves it.
+
+An uploaded certificate replaces the Let's Encrypt one for that domain, and hosts it covers get no certificate of their own. Tond never renews it: upload the renewed certificate with **Replace** before it expires. **Remove** deletes it, and Tond requests a Let's Encrypt certificate again.
+
 ### The Certificates page
 
-**Certificates** in the dashboard lists every certificate with what it serves (the dashboard, an app, a preview or nothing any more), its issuer, days left and state:
+**Certificates** in the dashboard lists every certificate with what it serves (the dashboard, an app, a preview, a wildcard for every app or every preview with the number of hosts it covers, or nothing any more), its issuer (**Uploaded** for your own), whether it was validated with DNS-01, days left and state:
 
 | Label | Meaning |
 | --- | --- |
@@ -126,14 +178,14 @@ Certificates and keys live under `<data>/certs/<domain>/`, and the ACME account 
 | Requesting | The first request is in progress |
 | Waiting for DNS | The last attempt failed and a retry is scheduled |
 | Failed | Issuance failed |
-| Expiring soon | Renewal is overdue |
+| Expiring soon | Renewal is overdue, or an uploaded certificate is close to expiry |
 | Renewal failing | A valid certificate exists, but the last renewal attempt failed |
 | Expired | The certificate has expired |
 | Untrusted (staging) | Issued by the Let's Encrypt staging CA, which browsers don't trust |
 
-Each problem shows the last error. **Retry now** skips the backoff and tries again at once. Saving a domain again also resets its retry state.
+Each problem shows the last error. **Retry now** skips the backoff and tries again at once. Adding a domain to an app also resets its retry state. Hosts that an issued wildcard or uploaded certificate covers aren't listed as waiting for a certificate.
 
-To be told before a certificate expires, create a **Certificate expiry** alert rule (default: 14 days). See [Metrics, uptime and alerts](/concepts/observability). For certificate problems, see [Troubleshooting](/operations/troubleshooting).
+To be told before a certificate expires, uploaded ones included, create a **Certificate expiry** alert rule (default: 14 days). See [Metrics, uptime and alerts](/concepts/observability). For certificate problems, see [Troubleshooting](/operations/troubleshooting).
 
 ## Related
 

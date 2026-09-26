@@ -9,9 +9,13 @@ A snapshot is a point-in-time copy of Tond's data on the server: its database, a
 | Kind | Scope | Taken | Contents |
 | --- | --- | --- | --- |
 | Full | `full` | By you, or on the schedule | Tond's SQLite database, every app volume, every managed database, SSH deploy keys |
+| Before a Tond update | `full` | Automatically, before Tond updates itself or rolls back an update | Same as a full snapshot |
 | Pre-deploy | `app:<name>` | At the start of each deploy of an app with volumes | That app's volumes |
-| Database backup | `database:<name>` | By you (**Back up now** on the database page) | One managed database |
+| Database backup | `database:<name>` | By you (**Back up now** on the database page), or on the database's own schedule | One managed database |
+| Before an upgrade | `database:<name>` | Automatically, before a major-version upgrade of the database | One managed database |
 | Pre-restore (safety net) | `full` or `database:<name>` | Automatically, before a full or database restore | What the restore is about to overwrite |
+
+Each snapshot records its trigger: `manual`, `scheduled`, `pre_deploy`, `pre_restore`, `pre_update` (before a Tond update, labelled **Before a Tond update**) or `pre_upgrade` (before a database upgrade). A database's scheduled backups have the trigger `scheduled` and the scope `database:<name>`. See [Upgrading Tond](/guides/upgrading) and [Databases](/concepts/databases#major-version-upgrades).
 
 Take a full snapshot from the **Snapshots** page or with the CLI:
 
@@ -54,10 +58,13 @@ tond snapshot config set --schedule "0 3 * * *" --retain 14 --pre-deploy-retain 
 
 The schedule accepts standard five-field cron expressions, evaluated in UTC, and macros such as `@daily`. Scheduled backups are off until you turn on **Enable scheduled backups** in the dashboard.
 
+These settings schedule full snapshots. Each managed database can also have a backup schedule of its own, with its own retention count, set on the database's **Backups** tab (see [Databases](/concepts/databases#backup-schedule)). The two are independent: a database schedule runs whether or not full snapshots are scheduled. When several are due at once, they run one after another.
+
 After each snapshot, Tond deletes the oldest ones beyond the limits, both the local directory and the remote copy:
 
-- full snapshots: keep the newest *Retain* count;
-- database backups: keep the same count per database;
+- full snapshots (including those taken before a Tond update): keep the newest *Retain* count;
+- a database's scheduled backups: keep the newest count set on that database (default 7);
+- a database's other backups (manual, pre-restore, pre-upgrade): keep the newest *Retain* count per database;
 - pre-deploy snapshots: keep the newest *Pre-deploy retain* count per app.
 
 ## Remote copies
@@ -81,6 +88,7 @@ To set up a provider, see [Backups to S3](/guides/backups-s3).
 | Full | Tond's database, all app volumes, all database data directories, deploy keys | A full pre-restore snapshot | tond-server restarts |
 | App | One app's volume directory | None | The app's container stops briefly |
 | Database | One database's data | A backup of that database | The database container stops briefly |
+| Database, into a new one | Nothing: creates a new database | Not needed | None |
 
 ```sh
 tond snapshot restore <snapshot-id>                       # full, asks for confirmation
@@ -91,6 +99,7 @@ tond snapshot rollback <snapshot-id> --database shop-db   # one database
 - **Full restore** works only from a full snapshot. Tond first takes a pre-restore snapshot, then verifies the snapshot, stops every app and database container, replaces the data, and exits so systemd restarts tond-server with the restored database.
 - **App restore** stops the app's container, replaces `<data>/volumes/<app>` with the snapshot's copy and starts the container again. It needs a snapshot that contains the app's volumes: a full snapshot or one of the app's pre-deploy snapshots. It doesn't change the app's code or image. To go back to earlier code, [roll back the deployment](/concepts/deploys) as well.
 - **Database restore** works from a full snapshot or a backup of that database. Tond first backs up the current data, and the restore fails without changing anything if that backup can't be made. It then stops the container, swaps in the saved data directory, starts the container and imports the logical dump. To undo the restore, restore the safety-net backup.
+- **Restore into a new database** (**Restore to new…** on the database's **Backups** tab) creates a new managed database from a full snapshot or a database backup, with the same engine, version and variant, new credentials and its own port. The original keeps running untouched. See [Databases](/concepts/databases#restore).
 
 The dashboard asks you to confirm every restore before it overwrites data.
 
@@ -101,6 +110,8 @@ The dashboard asks you to confirm every restore before it overwrites data.
 | See snapshots and backup status | `snapshots:read` |
 | Take a snapshot or database backup | `snapshots:create` |
 | Restore or delete a snapshot | `snapshots:restore` |
+| Restore a database into a new one | `snapshots:restore` and `db:write` |
+| Set a database's backup schedule | `db:write` |
 | Change backup settings and storage providers | `settings:write` |
 
 ## Related

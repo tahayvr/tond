@@ -95,10 +95,12 @@ When the deploy is done the app is running at `https://hello.203-0-113-10.nip.io
 ## 4. Give it your own domain
 
 1. At your DNS provider, create an `A` record for the domain (say `hello.example.com`) pointing at the server's IP address.
-2. In the dashboard, open the app → **Settings** → **Domain**, enter `hello.example.com` and save. Or run `tond apps domain hello hello.example.com`.
-3. Tond checks the DNS record and tond-proxy gets a Let's Encrypt certificate as soon as the name resolves to the server. It usually takes under a minute; follow it on the **Certificates** page.
+2. In the dashboard, open the app → **Settings** → **Domain**, click **Add domain**, enter `hello.example.com` and click **Add domain** again. If the app already has its automatic address, the new domain is added as an alias; click **Make primary** on it to make it the app's main address. Or run `tond apps domain hello hello.example.com`, which adds it and makes it the primary in one step.
+3. Tond checks the DNS record and tond-proxy gets a Let's Encrypt certificate as soon as the name resolves to the server. It usually takes under a minute. Select the domain in the list to follow its DNS and HTTPS status, or open the **Certificates** page.
 
-![An app's Domain settings](/img/quickstart/domain.light.webp)
+![An app's Domain settings: its domains, with DNS and HTTPS status](/img/quickstart/domain.light.webp)
+
+An app can have several domains. To send `www.hello.example.com` to the same place, add it as a redirect: `tond apps domains add hello www.hello.example.com --redirect-to hello.example.com`.
 
 To serve every app under your own domain automatically (`<app>.apps.example.com`), set an apps domain with a wildcard DNS record. See [Domains and certificates](/concepts/domains).
 

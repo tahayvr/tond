@@ -26,6 +26,7 @@ Tond has three layers of configuration: environment variables read by the proces
 | `TOND_BUILD_CGROUP_PARENT` | `tondbuild.slice` | Cgroup parent passed to `docker build`, which puts every build under the memory cap of `tondbuild.slice`. An empty value disables it. |
 | `TOND_SHUTDOWN_GRACE_SECS` | `45` | How long in-flight deploys, cron runs and snapshots may run after SIGTERM before they are marked interrupted. |
 | `TOND_LOG_FORMAT` | `text` | `json` writes one JSON object per log line. Anything else is text. |
+| `TOND_DNS_PROPAGATION_SECS` | `30` (`60` for Route 53) | Seconds tond-server waits after publishing an ACME DNS-01 record through a DNS provider, before tond-proxy lets the CA check it. At most 600. See [Domains and certificates](/concepts/domains#dns-providers-and-wildcard-certificates). |
 | `RUST_LOG` | `info` | Log level filter (`trace`, `debug`, `info`, `warn`, `error`, or per-module directives). |
 | `DOCKER_CONFIG` | unit sets `/opt/tond/data/docker-config` | Docker CLI config directory. It must be writable; `/root` is read-only under the service sandbox. |
 | `DOCKER_HOST` | Docker's default socket | Docker daemon address, honoured by the Docker client library and passed to `docker compose`. |
@@ -39,6 +40,7 @@ Some variables exist for development and the end-to-end tests. You should not ne
 | `TOND_PROC_ROOT` | `/proc` | Where the metrics collector reads process files. |
 | `TOND_UPTIME_RESOLVE` | unset | Address uptime probes connect to instead of resolving the domain. |
 | `TOND_UPTIME_CA_FILE` | unset | Extra PEM certificates uptime probes trust. |
+| `TOND_DNS_TEST_PROVIDER` | unset | `1` or `true` allows the test-only `challtestsrv` DNS provider kind (Pebble's challenge test server), used by the end-to-end test. Debug builds always allow it. The installer never sets it. |
 
 ### tond-proxy
 
@@ -54,7 +56,7 @@ Some variables exist for development and the end-to-end tests. You should not ne
 | `RUST_LOG` | `info` | Log level filter. |
 | `MALLOC_ARENA_MAX` | unit sets `2` | Limits glibc malloc arenas. |
 
-The proxy reads the dashboard domain and preview domain from the database, not from its environment.
+The proxy reads the dashboard, apps and preview domains, and the zones of configured DNS providers (never their tokens), from the database, not from its environment.
 
 ### tond CLI
 
@@ -159,6 +161,9 @@ Each retention rule is a settings key. Change them in the dashboard under **Sett
 A few groups of settings have their own tables instead of `settings` rows:
 
 - **Snapshots** (`backup_config`): schedule, how many snapshots to keep, pre-deploy snapshots, remote storage. Change them on the Snapshots page or with `tond snapshot config set`. See [Snapshots and backups](/concepts/backups).
+- **Database backup schedules** (columns of `databases`): each database's own backup schedule and how many scheduled backups to keep. Change them on the database's Backups tab or with `PUT /api/v1/databases/{id}/backup-schedule`. See [Databases](/concepts/databases#backup-schedule).
+- **DNS providers** (`dns_providers`): Integrations → DNS providers, or `/api/v1/dns-providers`. Tokens are encrypted with `TOND_SECRET_KEY`. See [Domains and certificates](/concepts/domains#dns-providers-and-wildcard-certificates).
+- **Git forge tokens** (`gitlab_tokens`, `gitea_tokens`): Integrations → GitLab and Integrations → Gitea / Forgejo. See [Deploy from Git](/guides/deploy-from-git).
 - **Heartbeat** (`heartbeat_config`): Settings → Heartbeat. See [Alerts and heartbeat](/guides/alerts).
 - **Audit log shipping** (`audit_shipping`): Settings → Audit log shipping. See [Audit log](/concepts/audit-log).
 
