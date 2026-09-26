@@ -12,6 +12,9 @@ import type {
 	CronJob,
 	CronJobRun,
 	Deployment,
+	DeploymentLogLine,
+	DeployPhase,
+	PhaseRecord,
 	DeployKey,
 	GitHubApp,
 	GitHubRepo,
@@ -19,7 +22,6 @@ import type {
 	Integration,
 	LoopStats,
 	ManagedDatabase,
-	SystemSelf,
 	TemplateCatalogEntry,
 	MetricsRange,
 	MetricsResponse,
@@ -32,6 +34,7 @@ import type {
 	Snapshot,
 	StorageProvider,
 	SystemMetrics,
+	SystemSelf,
 	User,
 	AdminUser,
 	ApiToken,
@@ -313,7 +316,10 @@ export const MOCK_PROJECTS: Project[] = [
 		id: 'proj_1',
 		name: 'web-platform',
 		description: 'Frontend and backend for the main product',
-		env_vars: { NODE_ENV: 'production', LOG_LEVEL: 'info' },
+		env: [
+			{ key: 'LOG_LEVEL', masked: '••••••••' },
+			{ key: 'NODE_ENV', masked: '••••••••' }
+		],
 		active_preview_count: 1,
 		created_at: '2025-01-08T10:00:00.000Z',
 		updated_at: '2025-02-20T09:00:00.000Z'
@@ -322,7 +328,7 @@ export const MOCK_PROJECTS: Project[] = [
 		id: 'proj_2',
 		name: 'data-pipeline',
 		description: null,
-		env_vars: {},
+		env: [],
 		active_preview_count: 0,
 		created_at: '2025-02-15T14:00:00.000Z',
 		updated_at: '2025-02-15T14:00:00.000Z'
@@ -769,6 +775,41 @@ export function makeMockMetrics(range: string, empty = false): MetricsResponse {
 
 // ── Deployments ────────────────────────────────────────────────────────────
 
+/** ISO timestamp `minutes` ago (fixtures read as recent activity). */
+function minutesAgo(minutes: number, plusSeconds = 0): string {
+	return new Date(Date.now() - minutes * 60_000 + plusSeconds * 1000).toISOString();
+}
+
+/** A finished phase list: every visible step succeeded, `seconds` apart. */
+function donePhases(start: string, steps: [DeployPhase, string | null, number][]): PhaseRecord[] {
+	let t = new Date(start).getTime();
+	return steps.map(([phase, label, secs]) => {
+		if (label === null) return { phase, status: 'skipped' as const };
+		const started_at = new Date(t).toISOString();
+		t += secs * 1000;
+		return {
+			phase,
+			status: 'succeeded' as const,
+			label,
+			started_at,
+			finished_at: new Date(t).toISOString()
+		};
+	});
+}
+
+const GIT_STEPS: [DeployPhase, string | null, number][] = [
+	['clone', 'Clone repository', 3],
+	['build', 'Build image', 71],
+	['start', 'Start container', 2],
+	['health', 'Health check', 6],
+	['release', 'Switch traffic', 4]
+];
+
+const DEP3_START = minutesAgo(42);
+const DEP2_START = minutesAgo(60 * 26);
+const DEP1_START = minutesAgo(60 * 50);
+const FAILED_START = minutesAgo(18);
+
 export const MOCK_DEPLOYMENTS: Record<string, Deployment[]> = {
 	app_running: [
 		{
@@ -777,15 +818,18 @@ export const MOCK_DEPLOYMENTS: Record<string, Deployment[]> = {
 			image_tag: 'tond-api-service:3f2a1b9c1234',
 			status: 'succeeded',
 			trigger_source: 'webhook',
+			trigger_detail: 'GitHub push to main',
+			commit_sha: '3f2a1b9c12d4e5f60718293a4b5c6d7e8f901234',
+			commit_message: 'Cache product queries for 60 s',
+			commit_author: 'Ada Lovelace',
 			has_generated_dockerfile: true,
-			started_at: '2025-03-01T08:55:00.000Z',
-			finished_at: '2025-03-01T09:02:00.000Z',
-			created_at: '2025-03-01T08:55:00.000Z',
+			started_at: DEP3_START,
+			finished_at: minutesAgo(42, 86),
+			created_at: DEP3_START,
+			duration_secs: 86,
+			phases: donePhases(DEP3_START, GIT_STEPS),
+			failure: null,
 			image_pruned: false,
-			kind: 'deploy',
-			error: null,
-			superseded_by: null,
-			queue_position: null,
 			is_current: true,
 			rollback_available: false,
 			rollback_unavailable_reason: 'This image is already running'
@@ -796,15 +840,18 @@ export const MOCK_DEPLOYMENTS: Record<string, Deployment[]> = {
 			image_tag: 'tond-api-service:7f3a9b1d0e2c',
 			status: 'succeeded',
 			trigger_source: 'manual',
+			trigger_detail: 'admin@tond.local',
+			commit_sha: '7f3a9b1d0e2c4b5a69788f7e6d5c4b3a29181716',
+			commit_message: 'Add /v2/orders endpoint',
+			commit_author: 'Grace Hopper',
 			has_generated_dockerfile: true,
-			started_at: '2025-02-15T14:10:00.000Z',
-			finished_at: '2025-02-15T14:17:00.000Z',
-			created_at: '2025-02-15T14:10:00.000Z',
+			started_at: DEP2_START,
+			finished_at: minutesAgo(60 * 26, 94),
+			created_at: DEP2_START,
+			duration_secs: 94,
+			phases: donePhases(DEP2_START, GIT_STEPS),
+			failure: null,
 			image_pruned: false,
-			kind: 'deploy',
-			error: null,
-			superseded_by: null,
-			queue_position: null,
 			is_current: false,
 			rollback_available: true,
 			rollback_unavailable_reason: null
@@ -814,16 +861,15 @@ export const MOCK_DEPLOYMENTS: Record<string, Deployment[]> = {
 			app_id: 'app_running',
 			image_tag: 'tond-api-service:c0ffee123456',
 			status: 'succeeded',
-			trigger_source: 'manual',
+			trigger_source: 'rollback',
+			trigger_detail: 'admin@tond.local',
+			rollback_of: 'dep_0',
 			has_generated_dockerfile: false,
-			started_at: '2025-02-12T09:00:00.000Z',
-			finished_at: '2025-02-12T09:05:00.000Z',
-			created_at: '2025-02-12T09:00:00.000Z',
+			started_at: minutesAgo(60 * 49),
+			finished_at: minutesAgo(60 * 49, 12),
+			created_at: minutesAgo(60 * 49),
+			duration_secs: 12,
 			image_pruned: true,
-			kind: 'deploy',
-			error: null,
-			superseded_by: null,
-			queue_position: null,
 			is_current: false,
 			rollback_available: false,
 			rollback_unavailable_reason: "This deployment's image was pruned to save disk space"
@@ -831,18 +877,97 @@ export const MOCK_DEPLOYMENTS: Record<string, Deployment[]> = {
 		{
 			id: 'dep_1',
 			app_id: 'app_running',
-			image_tag: 'tond-api-service:1a2b3c4d5e6f',
+			image_tag: null,
 			status: 'failed',
 			trigger_source: 'manual',
+			trigger_detail: 'admin@tond.local',
+			commit_sha: '1a2b3c4d5e6f708192a3b4c5d6e7f80910111213',
+			commit_message: 'Upgrade to TypeScript 6',
+			commit_author: 'Ada Lovelace',
+			has_generated_dockerfile: true,
+			started_at: DEP1_START,
+			finished_at: minutesAgo(60 * 50, 48),
+			created_at: DEP1_START,
+			duration_secs: 48,
+			phases: [
+				{
+					phase: 'clone',
+					status: 'succeeded',
+					label: 'Clone repository',
+					started_at: DEP1_START,
+					finished_at: minutesAgo(60 * 50, 3)
+				},
+				{
+					phase: 'build',
+					status: 'failed',
+					label: 'Build image',
+					started_at: minutesAgo(60 * 50, 3),
+					finished_at: minutesAgo(60 * 50, 48)
+				},
+				{ phase: 'start', status: 'pending', label: 'Start container' },
+				{ phase: 'health', status: 'pending', label: 'Health check' },
+				{ phase: 'release', status: 'pending', label: 'Switch traffic' }
+			],
+			failure: {
+				phase: 'build',
+				code: 'build_failed',
+				title: 'The build failed (exit code 1)',
+				hint: 'The lines below are where the build stopped. Fix the error in your code or Dockerfile and deploy again.',
+				detail: 'Docker build failed (exit code: exit status: 1)',
+				excerpt: [
+					'#12 [builder 5/6] RUN npm run build',
+					"#12 4.211 src/orders/total.ts(14,7): error TS2322: Type 'string' is not assignable to type 'number'.",
+					'#12 4.388 npm error Lifecycle script `build` failed with error: code 2',
+					'#12 ERROR: process "/bin/sh -c npm run build" did not complete successfully: exit code: 2'
+				]
+			},
+			image_pruned: false,
+			is_current: false,
+			rollback_available: false,
+			rollback_unavailable_reason: 'Only successful deployments can be restored'
+		}
+	],
+	app_failed: [
+		{
+			id: 'dep_wq_1',
+			app_id: 'app_failed',
+			image_tag: 'tond-worker-queue:9d8c7b6a5f4e',
+			status: 'failed',
+			trigger_source: 'manual',
+			trigger_detail: 'admin@tond.local',
+			commit_sha: '9d8c7b6a5f4e3d2c1b0a99887766554433221100',
+			commit_message: 'Serve the dashboard with nginx',
+			commit_author: 'Grace Hopper',
 			has_generated_dockerfile: false,
-			started_at: '2025-02-10T10:00:00.000Z',
-			finished_at: '2025-02-10T10:03:00.000Z',
-			created_at: '2025-02-10T10:00:00.000Z',
-			image_pruned: true,
-			kind: 'deploy',
-			error: 'Interrupted: Tond restarted while this was in progress. Deploy again to retry.',
-			superseded_by: null,
-			queue_position: null,
+			started_at: FAILED_START,
+			finished_at: minutesAgo(18, 131),
+			created_at: FAILED_START,
+			duration_secs: 131,
+			phases: [
+				...donePhases(FAILED_START, GIT_STEPS.slice(0, 3)),
+				{
+					phase: 'health',
+					status: 'failed',
+					label: 'Wait for the app to listen',
+					started_at: minutesAgo(18, 71),
+					finished_at: minutesAgo(18, 131)
+				},
+				{ phase: 'release', status: 'pending', label: 'Switch traffic' }
+			],
+			failure: {
+				phase: 'health',
+				code: 'port_not_listening',
+				title: 'Nothing answered on port 4000 within 60s',
+				hint: "Tond expected the app to listen on port 4000 inside the container. If it uses another port (nginx listens on 80, many Node apps on 3000), change the app's port; make sure the app binds to 0.0.0.0, not localhost.",
+				detail:
+					'the new container did not become ready within 60s; the previous version keeps serving',
+				excerpt: [
+					'/docker-entrypoint.sh: Configuration complete; ready for start up',
+					'2025/03/05 11:44:02 [notice] 1#1: nginx/1.27.3',
+					'2025/03/05 11:44:02 [notice] 1#1: start worker processes'
+				]
+			},
+			image_pruned: false,
 			is_current: false,
 			rollback_available: false,
 			rollback_unavailable_reason: 'Only successful deployments can be restored'
@@ -850,150 +975,89 @@ export const MOCK_DEPLOYMENTS: Record<string, Deployment[]> = {
 	]
 };
 
-// Deployment dep_3 superseded a webhook deploy that was still waiting.
-MOCK_DEPLOYMENTS.app_running.splice(1, 0, {
-	id: 'dep_2b',
-	app_id: 'app_running',
-	image_tag: null,
-	status: 'superseded',
-	trigger_source: 'webhook',
-	has_generated_dockerfile: false,
-	started_at: '2025-03-01T08:54:30.000Z',
-	finished_at: '2025-03-01T08:55:00.000Z',
-	created_at: '2025-03-01T08:54:30.000Z',
-	image_pruned: false,
-	kind: 'deploy',
-	error: 'Replaced by a newer deploy before it started',
-	superseded_by: 'dep_3',
-	queue_position: null,
-	is_current: false,
-	rollback_available: false,
-	rollback_unavailable_reason: 'Only successful deployments can be restored'
-});
-
-// ── Tond measuring itself ──────────────────────────────────────────────────
-
-const loop = (name: string, extra: Partial<LoopStats> = {}): LoopStats => ({
-	name,
-	wakeups: 12,
-	runs: 12,
-	errors: 0,
-	last_run_at: new Date(Date.now() - 4 * 60_000).toISOString(),
-	last_duration_ms: 3.2,
-	last_error: null,
-	max_lag_ms: 1.4,
-	next_wake_at: new Date(Date.now() + 56 * 60_000).toISOString(),
-	...extra
-});
-
-export function makeMockSystemSelf(): SystemSelf {
-	const now = Date.now();
-	return {
-		version: '0.1.0',
-		server: {
-			rss_bytes: 13.4 * 1024 * 1024,
-			cpu_seconds: 41.2,
-			open_fds: 23,
-			threads: 6,
-			context_switches: 48210,
-			cpu_percent: 0.05,
-			uptime_secs: 3 * 86_400 + 4 * 3600,
-			tokio_alive_tasks: 14,
-			tokio_workers: 2,
-			tokio_parks: 9120
+/** Deploy log lines per fixture deployment (live mock deploys add their own). */
+export const MOCK_DEPLOYMENT_LOGS: Record<string, DeploymentLogLine[]> = {
+	dep_3: mockBuildLog(DEP3_START, 'Cache product queries for 60 s', true),
+	dep_2: mockBuildLog(DEP2_START, 'Add /v2/orders endpoint', true),
+	dep_1: mockBuildLog(DEP1_START, 'Upgrade to TypeScript 6', false),
+	dep_wq_1: [
+		{ level: 'info', message: 'Starting deployment...', ts: FAILED_START },
+		{
+			level: 'info',
+			message: 'Commit 9d8c7b6 by Grace Hopper: Serve the dashboard with nginx',
+			ts: minutesAgo(18, 2)
 		},
-		loops: [
-			loop('health', {
-				wakeups: 412,
-				runs: 412,
-				last_run_at: new Date(now - 12_000).toISOString(),
-				last_duration_ms: 18.5,
-				next_wake_at: new Date(now + 18_000).toISOString()
-			}),
-			loop('metrics', {
-				last_run_at: new Date(now - 21_000).toISOString(),
-				last_duration_ms: 42.1,
-				next_wake_at: new Date(now + 9_000).toISOString()
-			}),
-			loop('alerts', { next_wake_at: null }),
-			loop('cron', { next_wake_at: new Date(now + 26 * 60_000).toISOString() }),
-			loop('janitor', {
-				last_run_at: new Date(now - 38 * 60_000).toISOString(),
-				last_duration_ms: 64.8,
-				next_wake_at: new Date(now + 22 * 60_000).toISOString()
-			}),
-			loop('backup-scheduler', { next_wake_at: new Date(now + 9 * 3_600_000).toISOString() }),
-			loop('preview-cleanup'),
-			loop('proxy-link', { next_wake_at: null }),
-			loop('route-nudge', { last_duration_ms: 11.3, next_wake_at: null })
-		],
-		db: {
-			size_bytes: 1.8 * 1024 * 1024,
-			wal_bytes: 96 * 1024,
-			queries_total: 18342,
-			slow_total: 1,
-			slow_threshold_ms: 100,
-			recent_slow: [
-				{
-					sql: 'DELETE FROM deploy_logs WHERE rowid IN (SELECT rowid FROM deploy_logs WHERE app_id = ? AND created_at < ? LIMIT ?)',
-					elapsed_ms: 131.2,
-					at: new Date(now - 38 * 60_000).toISOString()
-				}
-			],
-			top_statements: [
-				{
-					sql: 'SELECT * FROM apps WHERE status IN (?, ?) AND health_check_path IS NOT NULL',
-					count: 412
-				}
-			]
+		{ level: 'info', message: 'Building with Dockerfile', ts: minutesAgo(18, 3) },
+		{
+			level: 'info',
+			message: '#8 naming to docker.io/library/tond-worker-queue:9d8c7b6a5f4e done',
+			ts: minutesAgo(18, 66)
 		},
-		http_bucket_bounds_ms: [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000],
-		http: [
-			{
-				method: 'GET',
-				route: '/api/apps',
-				count: 120,
-				errors: 0,
-				sum_ms: 240,
-				buckets: [60, 55, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-				p50_ms: 5,
-				p95_ms: 5
-			}
-		],
-		build_queue: { build_slots: 1, active: 0, queued: 0 },
-		proxy: {
-			connected: true,
-			cpu_percent: 0.02,
-			stats: {
-				pid: 812,
-				rss_bytes: 9.6 * 1024 * 1024,
-				cpu_seconds: 12.7,
-				open_fds: 31,
-				threads: 5,
-				context_switches: 90111,
-				uptime_secs: 3 * 86_400 + 4 * 3600,
-				route_version: 57,
-				routes: 6,
-				reloads: 57,
-				loops: [
-					loop('route-sync', { wakeups: 0, runs: 58, last_duration_ms: 1.1, next_wake_at: null }),
-					loop('route-poll', {
-						wakeups: 4560,
-						last_run_at: new Date(now - 31_000).toISOString(),
-						last_duration_ms: 0.4,
-						next_wake_at: new Date(now + 29_000).toISOString()
-					}),
-					loop('certificates', {
-						last_run_at: new Date(now - 2 * 3_600_000).toISOString(),
-						last_duration_ms: 2.3,
-						next_wake_at: new Date(now + 10 * 3_600_000).toISOString()
-					})
-				]
-			}
+		{ level: 'info', message: 'Starting new container on port 8104:4000', ts: minutesAgo(18, 67) },
+		{
+			level: 'info',
+			message: 'Waiting up to 60s for the app to answer on port 4000',
+			ts: minutesAgo(18, 71)
+		},
+		{
+			level: 'error',
+			message: 'Deployment failed: Nothing answered on port 4000 within 60s',
+			ts: minutesAgo(18, 131)
 		}
-	};
-}
+	]
+};
 
+/** A plausible TBuild/docker build log with ANSI colours. */
+export function mockBuildLog(start: string, commit: string, ok: boolean): DeploymentLogLine[] {
+	const t0 = new Date(start).getTime();
+	const at = (s: number) => new Date(t0 + s * 1000).toISOString();
+	const lines: [number, string, string][] = [
+		[0, 'info', 'Starting deployment...'],
+		[0, 'info', 'Using GitHub App installation token for clone'],
+		[1, 'info', 'Cloning https://github.com/example/api-service.git (main)'],
+		[3, 'info', `Commit 3f2a1b9 by Ada Lovelace: ${commit}`],
+		[3, 'info', 'Building with TBuild (tond-scanner)'],
+		[3, 'info', 'TBuild detection: stack=node profile=node-npm confidence=high'],
+		[4, 'info', '#1 [internal] load build definition from Dockerfile'],
+		[4, 'info', '#1 transferring dockerfile: 612B \u001b[32mdone\u001b[0m'],
+		[5, 'info', '#5 [builder 1/6] FROM docker.io/library/node:20-alpine'],
+		[9, 'info', '#9 [builder 3/6] RUN npm ci'],
+		[31, 'info', '#9 21.87 added 412 packages, and audited 413 packages in 21s'],
+		[31, 'info', '#9 21.88 \u001b[33m2 moderate severity vulnerabilities\u001b[0m'],
+		[32, 'info', '#12 [builder 5/6] RUN npm run build'],
+		[33, 'info', '#12 0.412 > api-service@2.3.0 build'],
+		[33, 'info', '#12 0.413 > tsc -p tsconfig.build.json']
+	];
+	if (!ok) {
+		lines.push(
+			[
+				47,
+				'info',
+				"#12 4.211 src/orders/total.ts(14,7): \u001b[31merror\u001b[0m \u001b[90mTS2322\u001b[0m: Type 'string' is not assignable to type 'number'."
+			],
+			[48, 'info', '#12 4.388 npm error Lifecycle script `build` failed with error: code 2'],
+			[
+				48,
+				'info',
+				'#12 \u001b[31mERROR\u001b[0m: process "/bin/sh -c npm run build" did not complete successfully: exit code: 2'
+			],
+			[48, 'error', 'Deployment failed: The build failed (exit code 1)']
+		);
+	} else {
+		lines.push(
+			[70, 'info', '#12 36.02 \u001b[32m✓\u001b[0m compiled 214 files'],
+			[74, 'info', '#15 exporting to image'],
+			[75, 'info', '#15 naming to docker.io/library/tond-api-service:3f2a1b9c1234 done'],
+			[77, 'info', 'Starting new container on port 8107:8080'],
+			[77, 'info', 'Waiting up to 30s for the health check on port 8080/healthz to pass'],
+			[82, 'info', 'New container is ready — cutting over traffic'],
+			[82, 'info', 'Waiting 3s for proxy to pick up new port before stopping old container'],
+			[85, 'info', 'Draining old container 4be1c2a9d0f3 (30s grace)'],
+			[86, 'info', 'Deployed successfully! Container: 9a8b7c6d5e4f']
+		);
+	}
+	return lines.map(([s, level, message]) => ({ level, message, ts: at(s) }));
+}
 export const MOCK_GENERATED_DOCKERFILES: Record<string, string> = {
 	dep_3: `FROM node:20-alpine AS builder
 WORKDIR /app
@@ -1142,7 +1206,8 @@ export const MOCK_ALERT_RULES: AlertRule[] = [
 		name: 'High CPU on api-service',
 		metric: 'cpu',
 		threshold: 80,
-		webhook_url: 'https://hooks.example.com/cpu-alert',
+		has_webhook_url: true,
+		webhook_host: 'hooks.example.com',
 		enabled: true,
 		events: [],
 		last_fired_at: '2025-03-06T04:12:00.000Z',
@@ -1155,7 +1220,8 @@ export const MOCK_ALERT_RULES: AlertRule[] = [
 		name: 'Global Memory Usage',
 		metric: 'memory',
 		threshold: 85,
-		webhook_url: 'https://hooks.example.com/memory-alert',
+		has_webhook_url: true,
+		webhook_host: 'hooks.example.com',
 		enabled: false,
 		events: [],
 		last_fired_at: null,
@@ -1168,7 +1234,8 @@ export const MOCK_ALERT_RULES: AlertRule[] = [
 		name: 'Deployment Notifications',
 		metric: null,
 		threshold: 0,
-		webhook_url: '',
+		has_webhook_url: false,
+		webhook_host: null,
 		enabled: true,
 		events: ['deployment_success', 'deployment_failure'],
 		last_fired_at: null,
@@ -1359,8 +1426,8 @@ export const MOCK_DATABASES: ManagedDatabase[] = [
 		status: 'running',
 		db_name: 'app_db',
 		db_user: 'app_user',
-		db_password: 'mock_password_1',
-		root_password: null,
+		has_password: true,
+		has_root_password: false,
 		memory_limit: 268435456,
 		custom_external_url: null,
 		custom_internal_url: null,
@@ -1379,8 +1446,8 @@ export const MOCK_DATABASES: ManagedDatabase[] = [
 		status: 'running',
 		db_name: null,
 		db_user: 'default',
-		db_password: 'mock_redis_password',
-		root_password: null,
+		has_password: true,
+		has_root_password: false,
 		memory_limit: null,
 		custom_external_url: null,
 		custom_internal_url: null,
@@ -1399,8 +1466,8 @@ export const MOCK_DATABASES: ManagedDatabase[] = [
 		status: 'stopped',
 		db_name: 'legacy_db',
 		db_user: 'legacy_user',
-		db_password: 'mock_password_2',
-		root_password: 'mock_root_password_mysql',
+		has_password: true,
+		has_root_password: true,
 		memory_limit: 536870912,
 		custom_external_url: null,
 		custom_internal_url: null,
@@ -1419,8 +1486,8 @@ export const MOCK_DATABASES: ManagedDatabase[] = [
 		status: 'running',
 		db_name: 'analytics_db',
 		db_user: 'analytics_user',
-		db_password: 'mock_mariadb_password',
-		root_password: 'mock_root_password_mariadb',
+		has_password: true,
+		has_root_password: true,
 		memory_limit: 268435456,
 		custom_external_url: null,
 		custom_internal_url: null,
@@ -1431,6 +1498,17 @@ export const MOCK_DATABASES: ManagedDatabase[] = [
 		public_access: true
 	}
 ];
+
+/** Stored database passwords (the API never returns them; see the reveal handler). */
+export const MOCK_DATABASE_SECRETS: Record<
+	string,
+	{ db_password: string | null; root_password: string | null }
+> = {
+	db_pg1: { db_password: 'mock_password_1', root_password: null },
+	db_redis1: { db_password: 'mock_redis_password', root_password: null },
+	db_mysql1: { db_password: 'mock_password_2', root_password: 'mock_root_password_mysql' },
+	db_mariadb1: { db_password: 'mock_mariadb_password', root_password: 'mock_root_password_mariadb' }
+};
 
 // ── Cron Jobs (Phase 6.4) ──────────────────────────────────────────────────
 
@@ -1449,7 +1527,10 @@ export const MOCK_CRON_JOBS: CronJob[] = [
 		created_at: '2025-02-01T10:00:00.000Z',
 		updated_at: new Date(Date.now() - 45 * 60_000).toISOString(),
 		timeout_seconds: 60,
-		env: { REPORT_URL: 'https://example.com/report', API_KEY: 'secret123' },
+		env: [
+			{ key: 'API_KEY', masked: '••••••••' },
+			{ key: 'REPORT_URL', masked: '••••••••' }
+		],
 		last_run_status: 'success',
 		concurrency_policy: 'skip',
 		memory_mb: 128,
@@ -1473,7 +1554,7 @@ export const MOCK_CRON_JOBS: CronJob[] = [
 		created_at: '2025-01-15T08:00:00.000Z',
 		updated_at: new Date(Date.now() - 22 * 3_600_000).toISOString(),
 		timeout_seconds: 300,
-		env: null,
+		env: [],
 		last_run_status: 'success',
 		concurrency_policy: 'skip',
 		memory_mb: 256,
@@ -1503,7 +1584,7 @@ export const MOCK_CRON_JOBS: CronJob[] = [
 		created_at: '2025-03-01T09:00:00.000Z',
 		updated_at: '2025-03-01T09:00:00.000Z',
 		timeout_seconds: null,
-		env: null,
+		env: [],
 		last_run_status: null,
 		concurrency_policy: 'skip',
 		memory_mb: null,
@@ -1670,7 +1751,8 @@ export const MOCK_INTEGRATIONS: Integration[] = [
 		id: 'int_telegram_1',
 		name: 'Ops Telegram',
 		kind: 'telegram',
-		config: { bot_token: '123456789:AABBccDDeeffGGhhIIjjKKll', chat_id: '-1001234567890' },
+		config: { chat_id: '-1001234567890' },
+		saved_secrets: ['bot_token'],
 		enabled: true,
 		created_at: '2025-03-01T10:00:00.000Z',
 		updated_at: '2025-03-01T10:00:00.000Z'
@@ -1679,7 +1761,8 @@ export const MOCK_INTEGRATIONS: Integration[] = [
 		id: 'int_discord_1',
 		name: 'Discord #alerts',
 		kind: 'discord',
-		config: { webhook_url: 'https://discord.com/api/webhooks/1234567890/mock-token' },
+		config: {},
+		saved_secrets: ['webhook_url'],
 		enabled: true,
 		created_at: '2025-03-05T12:00:00.000Z',
 		updated_at: '2025-03-05T12:00:00.000Z'
@@ -1688,7 +1771,8 @@ export const MOCK_INTEGRATIONS: Integration[] = [
 		id: 'int_slack_1',
 		name: 'Slack #incidents',
 		kind: 'slack',
-		config: { webhook_url: 'https://hooks.slack.com/services/T00/B00/mock-token' },
+		config: {},
+		saved_secrets: ['webhook_url'],
 		enabled: false,
 		created_at: '2025-03-10T08:00:00.000Z',
 		updated_at: '2025-03-10T08:00:00.000Z'
@@ -1703,10 +1787,10 @@ export const MOCK_INTEGRATIONS: Integration[] = [
 			smtp_host: 'smtp.example.com',
 			smtp_port: 587,
 			smtp_user: 'alerts@example.com',
-			smtp_password: 'smtp-mock-password',
 			smtp_encryption: 'starttls',
 			to_addrs: ['ops@example.com', 'admin@example.com']
 		},
+		saved_secrets: ['smtp_password'],
 		enabled: true,
 		created_at: '2025-03-12T09:00:00.000Z',
 		updated_at: '2025-03-12T09:00:00.000Z'
@@ -1763,11 +1847,14 @@ export const MOCK_SNAPSHOTS: Snapshot[] = [
 		delta_bytes: 2_202_009,
 		total_bytes: 98_304_000,
 		local_path: '/opt/tond/snapshots/snap_1',
-		remote_key: 'prod/snap_1.tar.gz',
+		remote_key: 'snapshots/snap_1.tondsnap',
 		storage_provider_id: 'sp_r2_1',
 		checksum_sha256: 'abc123def456',
 		error_message: null,
-		notes: null
+		notes: null,
+		remote_status: 'uploaded',
+		remote_error: null,
+		archive_bytes: 41_943_040
 	},
 	{
 		id: 'snap_2',
@@ -1787,7 +1874,10 @@ export const MOCK_SNAPSHOTS: Snapshot[] = [
 		storage_provider_id: null,
 		checksum_sha256: null,
 		error_message: null,
-		notes: null
+		notes: null,
+		remote_status: null,
+		remote_error: null,
+		archive_bytes: null
 	},
 	{
 		id: 'snap_3',
@@ -1807,7 +1897,10 @@ export const MOCK_SNAPSHOTS: Snapshot[] = [
 		storage_provider_id: null,
 		checksum_sha256: null,
 		error_message: null,
-		notes: null
+		notes: null,
+		remote_status: null,
+		remote_error: null,
+		archive_bytes: null
 	},
 	{
 		id: 'snap_4',
@@ -1823,11 +1916,14 @@ export const MOCK_SNAPSHOTS: Snapshot[] = [
 		delta_bytes: 1_887_436,
 		total_bytes: 96_102_400,
 		local_path: '/opt/tond/snapshots/snap_4',
-		remote_key: 'prod/snap_4.tar.gz',
+		remote_key: 'snapshots/snap_4.tondsnap',
 		storage_provider_id: 'sp_r2_1',
 		checksum_sha256: 'def456ghi789',
 		error_message: null,
-		notes: null
+		notes: null,
+		remote_status: 'uploaded',
+		remote_error: null,
+		archive_bytes: 41_943_040
 	},
 	{
 		id: 'snap_5',
@@ -1847,7 +1943,10 @@ export const MOCK_SNAPSHOTS: Snapshot[] = [
 		storage_provider_id: null,
 		checksum_sha256: null,
 		error_message: null,
-		notes: null
+		notes: null,
+		remote_status: null,
+		remote_error: null,
+		archive_bytes: null
 	},
 	{
 		id: 'snap_failed',
@@ -1867,7 +1966,10 @@ export const MOCK_SNAPSHOTS: Snapshot[] = [
 		storage_provider_id: null,
 		checksum_sha256: null,
 		error_message: 'Disk write error: no space left on device',
-		notes: null
+		notes: null,
+		remote_status: null,
+		remote_error: null,
+		archive_bytes: null
 	}
 ];
 
@@ -1882,3 +1984,126 @@ export const MOCK_BACKUP_CONFIG: BackupConfig = {
 	keep_local: true,
 	storage_provider_id: 'sp_r2_1'
 };
+
+// ── Tond measuring itself ──────────────────────────────────────────────────
+
+const loop = (name: string, extra: Partial<LoopStats> = {}): LoopStats => ({
+	name,
+	wakeups: 12,
+	runs: 12,
+	errors: 0,
+	last_run_at: new Date(Date.now() - 4 * 60_000).toISOString(),
+	last_duration_ms: 3.2,
+	last_error: null,
+	max_lag_ms: 1.4,
+	next_wake_at: new Date(Date.now() + 56 * 60_000).toISOString(),
+	...extra
+});
+
+export function makeMockSystemSelf(): SystemSelf {
+	const now = Date.now();
+	return {
+		version: '0.1.0',
+		server: {
+			rss_bytes: 13.4 * 1024 * 1024,
+			cpu_seconds: 41.2,
+			open_fds: 23,
+			threads: 6,
+			context_switches: 48210,
+			cpu_percent: 0.05,
+			uptime_secs: 3 * 86_400 + 4 * 3600,
+			tokio_alive_tasks: 14,
+			tokio_workers: 2,
+			tokio_parks: 9120
+		},
+		loops: [
+			loop('health', {
+				wakeups: 412,
+				runs: 412,
+				last_run_at: new Date(now - 12_000).toISOString(),
+				last_duration_ms: 18.5,
+				next_wake_at: new Date(now + 18_000).toISOString()
+			}),
+			loop('metrics', {
+				last_run_at: new Date(now - 21_000).toISOString(),
+				last_duration_ms: 42.1,
+				next_wake_at: new Date(now + 9_000).toISOString()
+			}),
+			loop('alerts', { next_wake_at: null }),
+			loop('cron', { next_wake_at: new Date(now + 26 * 60_000).toISOString() }),
+			loop('janitor', {
+				last_run_at: new Date(now - 38 * 60_000).toISOString(),
+				last_duration_ms: 64.8,
+				next_wake_at: new Date(now + 22 * 60_000).toISOString()
+			}),
+			loop('backup-scheduler', { next_wake_at: new Date(now + 9 * 3_600_000).toISOString() }),
+			loop('preview-cleanup'),
+			loop('proxy-link', { next_wake_at: null }),
+			loop('route-nudge', { last_duration_ms: 11.3, next_wake_at: null })
+		],
+		db: {
+			size_bytes: 1.8 * 1024 * 1024,
+			wal_bytes: 96 * 1024,
+			queries_total: 18342,
+			slow_total: 1,
+			slow_threshold_ms: 100,
+			recent_slow: [
+				{
+					sql: 'DELETE FROM deploy_logs WHERE rowid IN (SELECT rowid FROM deploy_logs WHERE app_id = ? AND created_at < ? LIMIT ?)',
+					elapsed_ms: 131.2,
+					at: new Date(now - 38 * 60_000).toISOString()
+				}
+			],
+			top_statements: [
+				{
+					sql: 'SELECT * FROM apps WHERE status IN (?, ?) AND health_check_path IS NOT NULL',
+					count: 412
+				}
+			]
+		},
+		http_bucket_bounds_ms: [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000],
+		http: [
+			{
+				method: 'GET',
+				route: '/api/apps',
+				count: 120,
+				errors: 0,
+				sum_ms: 240,
+				buckets: [60, 55, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+				p50_ms: 5,
+				p95_ms: 5
+			}
+		],
+		build_queue: { build_slots: 1, active: 0, queued: 0 },
+		proxy: {
+			connected: true,
+			cpu_percent: 0.02,
+			stats: {
+				pid: 812,
+				rss_bytes: 9.6 * 1024 * 1024,
+				cpu_seconds: 12.7,
+				open_fds: 31,
+				threads: 5,
+				context_switches: 90111,
+				uptime_secs: 3 * 86_400 + 4 * 3600,
+				route_version: 57,
+				routes: 6,
+				reloads: 57,
+				loops: [
+					loop('route-sync', { wakeups: 0, runs: 58, last_duration_ms: 1.1, next_wake_at: null }),
+					loop('route-poll', {
+						wakeups: 4560,
+						last_run_at: new Date(now - 31_000).toISOString(),
+						last_duration_ms: 0.4,
+						next_wake_at: new Date(now + 29_000).toISOString()
+					}),
+					loop('certificates', {
+						last_run_at: new Date(now - 2 * 3_600_000).toISOString(),
+						last_duration_ms: 2.3,
+						next_wake_at: new Date(now + 10 * 3_600_000).toISOString()
+					})
+				]
+			}
+		}
+	};
+}

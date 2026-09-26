@@ -22,9 +22,11 @@ use tond_common::*;
 
 use crate::{
     audit_log::write_audit_log,
-    auth::{Authz, Principal, RateLimit, scope},
+    auth::{Authz, RateLimit, scope},
     deploy, docker,
     error::AppError,
+    handlers::{self, env_map_from_json},
+    secrets,
     state::AppState,
 };
 
@@ -37,23 +39,9 @@ struct ProjectDetailResponse {
     apps: Vec<AppResponse>,
 }
 
-/// Shown instead of shared env values to callers without `env:read-values`.
-const MASKED_VALUE: &str = "********";
-
-/// Replace shared env values with a mask unless the caller may read values.
-fn mask_env_values(env: serde_json::Value, auth: &Principal) -> serde_json::Value {
-    if auth.has(Scope::EnvReadValues) {
-        return env;
-    }
-    match env {
-        serde_json::Value::Object(map) => serde_json::Value::Object(
-            map.into_iter()
-                .map(|(k, _)| (k, serde_json::Value::String(MASKED_VALUE.to_string())))
-                .collect(),
-        ),
-        other => other,
-    }
-}
+// Shared env values are stored encrypted and are write-only: every response
+// lists the keys with masked values (`ProjectResponse::new`), whatever the
+// caller's scopes, like app env vars.
 
 // ── List projects ──
 
@@ -94,23 +82,19 @@ pub async fn list_projects(
     .fetch_all(&state.db)
     .await?;
 
-    let responses: Vec<ProjectResponse> = rows
-        .into_iter()
-        .filter(|r| auth.can_see_project(&r.id))
-        .map(|r| {
-            let env_vars: serde_json::Value = serde_json::from_str(&r.env_vars)
-                .unwrap_or(serde_json::Value::Object(Default::default()));
-            ProjectResponse {
-                id: r.id,
-                name: r.name,
-                description: r.description,
-                env_vars: mask_env_values(env_vars, &auth),
-                created_at: r.created_at,
-                updated_at: r.updated_at,
-                active_preview_count: r.active_preview_count,
-            }
-        })
-        .collect();
+    let mut responses: Vec<ProjectResponse> = Vec::with_capacity(rows.len());
+    for r in rows.into_iter().filter(|r| auth.can_see_project(&r.id)) {
+        let env = secrets::project_env(&r.env_vars)?;
+        let project = Project {
+            id: r.id,
+            name: r.name,
+            description: r.description,
+            env_vars: r.env_vars,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        };
+        responses.push(ProjectResponse::new(project, &env, r.active_preview_count));
+    }
 
     Ok(Json(ApiResponse::ok(responses)))
 }
@@ -119,7 +103,7 @@ pub async fn list_projects(
 
 pub async fn get_project(
     _rate: RateLimit,
-    auth: Authz<scope::AppsRead>,
+    _auth: Authz<scope::AppsRead>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -141,10 +125,9 @@ pub async fn get_project(
 
     let app_responses: Vec<AppResponse> = apps.into_iter().map(AppResponse::from).collect();
 
-    let mut project = ProjectResponse::from(project);
-    project.env_vars = mask_env_values(project.env_vars, &auth);
+    let env = secrets::project_env(&project.env_vars)?;
     Ok(Json(ApiResponse::ok(ProjectDetailResponse {
-        project,
+        project: ProjectResponse::new(project, &env, 0),
         apps: app_responses,
     })))
 }
@@ -178,13 +161,15 @@ pub async fn create_project(
 
     let project = Project::new(name.clone(), req.description.clone());
 
-    // Use caller-supplied env_vars if provided
-    let env_vars_str = if let Some(ev) = req.env_vars {
-        auth.require(Scope::EnvWrite)?;
-        serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_string())
-    } else {
-        "{}".to_string()
+    // Use caller-supplied env_vars if provided (stored encrypted)
+    let env = match req.env_vars {
+        Some(ref ev) => {
+            auth.require(Scope::EnvWrite)?;
+            env_map_from_json(ev)?
+        }
+        None => Default::default(),
     };
+    let env_vars_str = secrets::seal_project_env(&env)?;
 
     sqlx::query(
         "INSERT INTO projects (id, name, description, env_vars, created_at, updated_at)
@@ -213,7 +198,7 @@ pub async fn create_project(
     project.env_vars = env_vars_str;
     Ok((
         StatusCode::CREATED,
-        Json(ApiResponse::ok(ProjectResponse::from(project))),
+        Json(ApiResponse::ok(ProjectResponse::new(project, &env, 0))),
     ))
 }
 
@@ -237,14 +222,17 @@ pub async fn update_project(
 
     let new_name = req.name.as_deref().unwrap_or(&project.name).to_string();
     let new_desc = req.description.or(project.description.clone());
-    let new_env_str = if let Some(ev) = req.env_vars {
-        // Shared env vars are replaced as a whole, so editing them means
-        // seeing them: env:write plus env:read-values.
-        auth.require(Scope::EnvWrite)?;
-        auth.require(Scope::EnvReadValues)?;
-        serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_string())
-    } else {
-        project.env_vars.clone()
+    let (new_env_str, env) = match req.env_vars {
+        Some(ref ev) => {
+            // Shared env vars are replaced as a whole (write-only values).
+            auth.require(Scope::EnvWrite)?;
+            let env = env_map_from_json(ev)?;
+            (secrets::seal_project_env(&env)?, env)
+        }
+        None => (
+            project.env_vars.clone(),
+            secrets::project_env(&project.env_vars)?,
+        ),
     };
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -277,7 +265,9 @@ pub async fn update_project(
         updated_at: now,
         ..project
     };
-    Ok(Json(ApiResponse::ok(ProjectResponse::from(updated))))
+    Ok(Json(ApiResponse::ok(ProjectResponse::new(
+        updated, &env, 0,
+    ))))
 }
 
 // ── Delete project ──
@@ -366,16 +356,25 @@ pub async fn deploy_project(
     // Each app gets its own queued deployment. The build queue runs one build
     // at a time and serialises port allocation (deploy/queue.rs), so the apps
     // no longer need to be deployed strictly one after another here.
+    let detail = Some(format!(
+        "project {} ({})",
+        project.name,
+        handlers::deploy_trigger(&auth).1.unwrap_or_default()
+    ));
     let mut deployment_ids = Vec::with_capacity(apps.len());
-    for app in &apps {
-        let q = deploy::queue::enqueue(&state, app, deploy::queue::JobKind::Deploy, "manual")
-            .await
-            .map_err(|e| {
-                AppError(TondError::Internal(format!(
-                    "Could not queue the deploy of {}: {e}",
-                    app.name
-                )))
-            })?;
+    for app in apps {
+        let name = app.name.clone();
+        let q = deploy::start(
+            &state,
+            app,
+            deploy::DeployRequest::source("manual", detail.clone()),
+        )
+        .await
+        .map_err(|e| {
+            AppError(TondError::Internal(format!(
+                "Could not queue the deploy of {name}: {e}"
+            )))
+        })?;
         deployment_ids.push(q.deployment_id);
     }
 

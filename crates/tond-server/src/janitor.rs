@@ -9,7 +9,7 @@
 //                    Older logs are also dropped after M days, except the logs
 //                    of the app's most recent deployment, which are always kept.
 //   deployments    — per app, keep the last N rows. Unfinished rows (queued,
-//                    building, deploying) and the last few succeeded deployments with an
+//                    running) and the last few succeeded deployments with an
 //                    image (the rollback candidates) are never deleted. Rows
 //                    whose app no longer exists are deleted.
 //   cron_job_runs  — per job, keep the last N runs and drop runs older than M
@@ -222,7 +222,7 @@ pub async fn run_once(db: &SqlitePool, policy: &RetentionPolicy) -> Result<Janit
             "DELETE FROM deployments WHERE rowid IN (
                 SELECT rowid FROM deployments
                 WHERE app_id NOT IN (SELECT id FROM apps)
-                  AND status NOT IN ('queued', 'building', 'deploying')
+                  AND status NOT IN ('queued', 'running', 'pending')
                 LIMIT ?)",
         )
         .bind(BATCH_SIZE)
@@ -236,7 +236,7 @@ pub async fn run_once(db: &SqlitePool, policy: &RetentionPolicy) -> Result<Janit
                     "DELETE FROM deployments WHERE rowid IN (
                         SELECT rowid FROM deployments
                         WHERE app_id = ?1
-                          AND status NOT IN ('queued', 'building', 'deploying')
+                          AND status NOT IN ('queued', 'running', 'pending')
                           AND id NOT IN (
                               SELECT id FROM deployments WHERE app_id = ?1
                               ORDER BY created_at DESC LIMIT ?2)
@@ -604,7 +604,7 @@ mod tests {
         // three recent failures.
         seed_deployment(&db, "old-ok", "a1", "succeeded", Some("img:1"), &ts(10, 0)).await;
         seed_deployment(&db, "old-fail", "a1", "failed", None, &ts(9, 0)).await;
-        seed_deployment(&db, "stuck", "a1", "building", None, &ts(8, 0)).await;
+        seed_deployment(&db, "stuck", "a1", "running", None, &ts(8, 0)).await;
         for i in 0..3 {
             seed_deployment(&db, &format!("new-{i}"), "a1", "failed", None, &ts(1, i)).await;
         }

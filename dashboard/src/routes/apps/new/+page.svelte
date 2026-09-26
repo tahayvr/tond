@@ -5,8 +5,13 @@
 		createApp,
 		createDatabase,
 		createProject,
+		deleteApp,
+		deleteDatabase,
+		deleteProject,
 		deployApp,
-		type ManagedDatabaseDetail,
+		getSystemMetrics,
+		type DatabaseCredentials,
+		type DeployStarted,
 		type Project,
 		type RegistryCredential,
 		type TemplateCatalogEntry,
@@ -76,15 +81,19 @@
 	// Step 2: Build
 	let buildMethod = $state<'dockerfile' | 'tbuild'>('tbuild');
 	let containerPort = $state(8080);
+	/** The user typed a port; detected ports no longer overwrite it. */
+	let portTouched = $state(false);
 	let autoDeploy = $state(false);
-	let watchBranch = $state('main');
+	/** Branch to deploy; auto-deploy watches it too. Empty until the repo's default is known. */
+	let branch = $state('');
 	let templateSourceRef = $state('');
 	let baseDir = $state('');
 	let staticBuild = $state(false);
 
 	// Step 3: Network
 	let domain = $state('');
-	let healthCheckPath = $state('/health');
+	// No path by default: the deploy then waits for any answer on the port.
+	let healthCheckPath = $state('');
 	let healthCheckInterval = $state(30);
 	let healthFailureThreshold = $state(3);
 	let drainTimeout = $state(30);
@@ -114,6 +123,17 @@
 			: []
 	);
 
+	/** Git-based source (including git templates): branch and auto-deploy apply. */
+	let isGitSource = $derived(
+		sourceSubType === 'git-public' ||
+			sourceSubType === 'git-github-app' ||
+			(sourceSubType === 'template' && selectedTemplate?.source.kind === 'git')
+	);
+	/** What the Deploy button is doing right now. */
+	let createStage = $state('');
+	/** Total server memory, to explain the default memory cap. */
+	let hostMemoryBytes = $state<number | null>(null);
+
 	// Initialize
 	$effect(() => {
 		setUiContext(projectsContext());
@@ -121,6 +141,14 @@
 			selectedProjectId = projectIdFromQuery;
 		}
 		return () => clearUiContext();
+	});
+
+	// The resources step explains the default memory cap for this server.
+	$effect(() => {
+		if (currentStep !== 3 || hostMemoryBytes !== null) return;
+		getSystemMetrics()
+			.then((m) => (hostMemoryBytes = m.mem_total || null))
+			.catch(() => {});
 	});
 
 	function applyTemplate(templateId: string) {
@@ -138,7 +166,7 @@
 		healthCheckPath = template.deploy.health_check_path ?? '';
 		buildMethod = template.deploy.method === 'dockerfile' ? 'dockerfile' : 'tbuild';
 		if (template.source.kind === 'git') {
-			watchBranch = template.source.ref ?? watchBranch ?? 'main';
+			branch = template.source.ref ?? '';
 		}
 		volumes = template.deploy.volumes.map(
 			(volume: TemplateCatalogEntry['deploy']['volumes'][number]) => ({
@@ -275,6 +303,10 @@
 	}
 
 	function validateNetworkStep(): boolean {
+		if (!Number.isInteger(containerPort) || containerPort < 1 || containerPort > 65535) {
+			error = 'Enter the port your app listens on (1-65535)';
+			return false;
+		}
 		if (domain && !isValidDomain(domain)) {
 			error = 'Please enter a valid domain';
 			return false;
@@ -314,6 +346,10 @@
 	async function handleCreate() {
 		error = '';
 		loading = true;
+		createStage = 'Creating the app…';
+
+		// Everything this attempt creates, so a failure can undo it (newest first).
+		const created: { kind: 'project' | 'database' | 'app'; id: string; name: string }[] = [];
 
 		try {
 			// Calculate memory limit in bytes
@@ -334,18 +370,23 @@
 			const effectiveProjectId = selectedProjectId || undefined;
 
 			if (selectedTemplate?.project) {
+				createStage = `Creating project ${selectedTemplate.project.name}…`;
 				const createdProject = await createProject({
 					name: selectedTemplate.project.name,
 					description: selectedTemplate.project.description ?? undefined
 				});
+				created.push({ kind: 'project', id: createdProject.id, name: createdProject.name });
 				templateProjectId = createdProject.id;
 				projects = [createdProject, ...projects];
 			}
 
 			if (selectedTemplate) {
-				const dependencyDetails = new SvelteMap<string, ManagedDatabaseDetail>();
+				// Creation returns the generated credentials once; the template
+				// interpolates the plaintext connection strings into the app env.
+				const dependencyDetails = new SvelteMap<string, DatabaseCredentials>();
 				for (const dependency of selectedTemplate.dependencies) {
 					if (dependency.kind !== 'database' || !dependency.name || !dependency.engine) continue;
+					createStage = `Creating database ${dependency.name}…`;
 					const database = await createDatabase({
 						name: dependency.name,
 						db_type: dependency.engine,
@@ -353,7 +394,8 @@
 							? { project_id: templateProjectId ?? effectiveProjectId }
 							: {})
 					});
-					dependencyDetails.set(dependency.name, database);
+					created.push({ kind: 'database', id: database.id, name: database.name });
+					dependencyDetails.set(dependency.name, database.credentials);
 				}
 
 				for (const env of selectedTemplate.required_env) {
@@ -372,10 +414,7 @@
 				template: selectedTemplate?.source.kind ?? 'image'
 			};
 			const apiSourceType = sourceTypeMap[sourceSubType];
-			const isGit =
-				sourceSubType === 'git-public' ||
-				sourceSubType === 'git-github-app' ||
-				(sourceSubType === 'template' && apiSourceType === 'git');
+			const deployBranch = (branch.trim() || templateSourceRef || 'main').trim();
 
 			const appData: Parameters<typeof createApp>[0] = {
 				name: name.trim(),
@@ -387,12 +426,8 @@
 				...(templateProjectId || effectiveProjectId
 					? { project_id: templateProjectId ?? effectiveProjectId }
 					: {}),
-				...(isGit
-					? {
-							branch: templateSourceRef || watchBranch || 'main',
-							auto_deploy: autoDeploy,
-							watch_branch: watchBranch || templateSourceRef || 'main'
-						}
+				...(isGitSource
+					? { branch: deployBranch, auto_deploy: autoDeploy, watch_branch: deployBranch }
 					: {}),
 				...(healthCheckPath.trim() ? { health_check_path: healthCheckPath.trim() } : {}),
 				health_check_interval: healthCheckInterval,
@@ -410,22 +445,60 @@
 				...(staticBuild ? { static_build: true } : {})
 			};
 
+			createStage = 'Creating the app…';
 			const app = await createApp(appData);
-			// Trigger the first deployment immediately — do not await so we can
-			// navigate to the app page while the deploy runs in the background.
-			deployApp(app.id).catch(() => {
-				// Errors will appear in the feed panel on the app page.
-			});
-			goto(`/apps/${app.id}`);
+			created.push({ kind: 'app', id: app.id, name: app.name });
+
+			// Start the first deployment and follow it live.
+			createStage = 'Starting the first deploy…';
+			let started: DeployStarted;
+			try {
+				started = await deployApp(app.id);
+			} catch {
+				// The app exists and is fine; only the deploy request failed.
+				await goto(`/apps/${app.id}`);
+				return;
+			}
+			await goto(`/apps/${app.id}/deployments/${started.deployment_id}`);
 		} catch (e: any) {
-			error = e.message ?? 'Failed to create app';
+			const message = e.message ?? 'Failed to create app';
+			const leftovers = await rollBackCreated(created);
+			error = leftovers.length
+				? `${message}. Tond couldn't remove what it had created: ${leftovers.join(', ')}. Delete ${leftovers.length === 1 ? 'it' : 'them'} before trying again.`
+				: created.length
+					? `${message}. Nothing was left behind; fix the problem and try again.`
+					: message;
 			loading = false;
+			createStage = '';
 		}
+	}
+
+	/**
+	 * Undo a failed create: delete what was created, newest first. Returns the
+	 * names of anything that couldn't be deleted.
+	 */
+	async function rollBackCreated(
+		created: { kind: 'project' | 'database' | 'app'; id: string; name: string }[]
+	): Promise<string[]> {
+		const leftovers: string[] = [];
+		for (const item of [...created].reverse()) {
+			try {
+				if (item.kind === 'app') await deleteApp(item.id);
+				else if (item.kind === 'database') await deleteDatabase(item.id);
+				else {
+					await deleteProject(item.id);
+					projects = projects.filter((p) => p.id !== item.id);
+				}
+			} catch {
+				leftovers.push(`${item.kind} ${item.name}`);
+			}
+		}
+		return leftovers;
 	}
 
 	function interpolateTemplateValue(
 		value: string,
-		dependencies: Pick<SvelteMap<string, ManagedDatabaseDetail>, 'get'>
+		dependencies: Pick<SvelteMap<string, DatabaseCredentials>, 'get'>
 	): string {
 		if (!value.startsWith('${db.') || !value.endsWith('}')) {
 			return value;
@@ -535,6 +608,7 @@
 					bind:sourceSubType
 					bind:sourceUrl
 					bind:githubAppId
+					bind:branch
 					bind:dockerfileContent
 					bind:composeContent
 					bind:selectedTemplateId
@@ -545,12 +619,13 @@
 			{:else if currentStep === 1}
 				<AppWizardBuild
 					bind:buildMethod
-					bind:containerPort
 					bind:autoDeploy
-					bind:watchBranch
+					bind:branch
 					bind:baseDir
 					bind:staticBuild
 					{sourceSubType}
+					{sourceUrl}
+					{githubAppId}
 				/>
 			{:else if currentStep === 2}
 				<AppWizardNetwork
@@ -559,9 +634,19 @@
 					bind:healthCheckInterval
 					bind:healthFailureThreshold
 					bind:drainTimeout
+					bind:containerPort
+					bind:portTouched
+					{sourceSubType}
+					{sourceUrl}
+					{dockerfileContent}
+					{composeContent}
+					{registryCredentialId}
+					{buildMethod}
+					templatePort={selectedTemplate?.deploy.default_port ?? null}
 				/>
 			{:else if currentStep === 3}
 				<AppWizardResources
+					{hostMemoryBytes}
 					appName={name}
 					canEditVolumes={isAdmin()}
 					bind:memoryLimit
@@ -591,7 +676,7 @@
 					{buildMethod}
 					{containerPort}
 					{autoDeploy}
-					{watchBranch}
+					branch={isGitSource ? branch || templateSourceRef : ''}
 					{baseDir}
 					{staticBuild}
 					{domain}
@@ -633,7 +718,7 @@
 						class="border-success text-success"
 					>
 						{#if loading}
-							<span class="animate-pulse">Deploying...</span>
+							<span class="animate-pulse">{createStage || 'Deploying…'}</span>
 						{:else}
 							<Rocket class="mr-2 h-4 w-4" />
 							Deploy Application

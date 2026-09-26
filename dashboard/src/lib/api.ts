@@ -1,4 +1,4 @@
-import { connectWithRetry, wsUrl } from './reconnecting-socket';
+import { connectWithRetry, wsUrl, type ReconnectingSocket } from './reconnecting-socket';
 
 export interface DeployLog {
 	level: string;
@@ -367,24 +367,9 @@ export async function deleteApp(id: string): Promise<void> {
 	await request(`/apps/${id}`, { method: 'DELETE' });
 }
 
-/**
- * Answer to a deploy or rollback request (202): the deployment waits in the
- * build queue — one deploy per app at a time, builds share the server's build
- * slots. A newer request replaces one that has not started yet.
- */
-export interface QueuedDeployment {
-	message: string;
-	app_id: string;
-	deployment_id: string;
-	status: 'queued';
-	/** 1-based place in line across all apps */
-	queue_position: number;
-	/** The waiting deployment this one replaced, if any */
-	superseded: string | null;
-}
-
-export async function deployApp(id: string): Promise<QueuedDeployment> {
-	return request<QueuedDeployment>(`/apps/${id}/deploy`, { method: 'POST' });
+/** Start a deployment; the result carries its id for the live deploy view. */
+export async function deployApp(id: string): Promise<DeployStarted> {
+	return request<DeployStarted>(`/apps/${id}/deploy`, { method: 'POST' });
 }
 
 export async function stopApp(id: string): Promise<void> {
@@ -511,6 +496,14 @@ export async function updateHealth(
 	await request(`/apps/${id}/health`, {
 		method: 'PUT',
 		body: JSON.stringify({ health_check_path, health_check_interval, health_failure_threshold })
+	});
+}
+
+/** Set the port the app listens on inside its container (applies on the next deploy). */
+export async function updateContainerPort(id: string, container_port: number): Promise<App> {
+	return request<App>(`/apps/${id}/port`, {
+		method: 'PUT',
+		body: JSON.stringify({ container_port })
 	});
 }
 
@@ -866,6 +859,11 @@ export interface ServerSettings {
 	 * different registrable domain from `dashboard_domain`; empty = previews disabled.
 	 */
 	preview_domain: string;
+	/**
+	 * Domain apps get an automatic address under (`<app>.<apps_domain>`), when
+	 * the server has the setting; the dashboard domain is used otherwise.
+	 */
+	apps_domain?: string;
 	/** Sessions end after this many hours without a request (1–720, default 12) */
 	session_idle_timeout_hours?: number;
 	/** Sessions end this many days after sign-in (1–365, default 30) */
@@ -906,28 +904,64 @@ export async function updateSettings(data: Partial<ServerSettings>): Promise<Ser
 
 // ── Deployments ──
 
-/** Where a deployment is in its life. */
-export type DeploymentStatus =
-	'queued' | 'building' | 'deploying' | 'succeeded' | 'failed' | 'superseded';
+/** Steps of a deployment, in order ("release" = switch traffic, stop the old container). */
+export type DeployPhase = 'clone' | 'build' | 'start' | 'health' | 'release';
+export type PhaseStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'skipped';
+
+export interface PhaseRecord {
+	phase: DeployPhase;
+	status: PhaseStatus;
+	/** This deployment's flavour of the step, e.g. "Pull image" */
+	label?: string;
+	started_at?: string;
+	finished_at?: string;
+}
+
+/** The likely cause of a failed deployment, with what to do about it. */
+export interface DeployFailure {
+	phase?: DeployPhase;
+	/** e.g. "build_failed", "port_not_listening", "image_pull_denied" */
+	code: string;
+	title: string;
+	hint: string;
+	detail?: string;
+	/** Log lines that show the problem */
+	excerpt?: string[];
+}
 
 export interface Deployment {
 	id: string;
 	app_id: string;
 	image_tag: string | null;
-	status: DeploymentStatus;
+	/**
+	 * "running" | "succeeded" | "failed"; a build queue may add others (e.g.
+	 * "queued", "superseded") — treat unknown values generically.
+	 */
+	status: string;
+	/** "manual" | "webhook" | "upload" | "rollback" | "cli" | "api" | … */
 	trigger_source: string;
-	/** "deploy" | "rollback" | "upload" */
-	kind: string;
-	/** Why it failed, was superseded or was interrupted */
-	error: string | null;
-	/** The deployment that replaced this one while it was queued */
-	superseded_by: string | null;
-	/** Place in the build queue while queued */
-	queue_position: number | null;
+	/** Who or what triggered it: a user's email, "GitHub push to main", … */
+	trigger_detail?: string | null;
 	has_generated_dockerfile: boolean;
 	started_at: string;
 	finished_at: string | null;
 	created_at: string;
+	duration_secs?: number | null;
+	commit_sha?: string | null;
+	commit_message?: string | null;
+	commit_author?: string | null;
+	/** For rollbacks: the deployment whose image was restored */
+	rollback_of?: string | null;
+	phases?: PhaseRecord[];
+	failure?: DeployFailure | null;
+	/** 1-based place in the build queue while status is "queued" */
+	queue_position?: number | null;
+	/** "deploy" | "rollback" | "upload" */
+	kind?: string;
+	/** Why it was superseded, or why it failed before running (app deleted, upload lost) */
+	error?: string | null;
+	/** The deployment that replaced this one while it was queued (status "superseded") */
+	superseded_by?: string | null;
 	/** The image was removed from the server to save disk space */
 	image_pruned: boolean;
 	/** This deployment's image is what the app runs now */
@@ -938,8 +972,104 @@ export interface Deployment {
 	rollback_unavailable_reason: string | null;
 }
 
+export interface DeploymentLogLine {
+	level: string;
+	message: string;
+	ts: string;
+}
+
+/** A deployment with its log, as returned by GET …/deployments/{id} and the stream snapshot. */
+export interface DeploymentDetail extends Deployment {
+	logs: DeploymentLogLine[];
+	logs_truncated: boolean;
+	/** Port Tond expects the app to listen on */
+	container_port: number;
+	health_check_path: string | null;
+	source_type: string;
+}
+
+/** 202 body of deploy, rollback and upload requests. */
+export interface DeployStarted {
+	message: string;
+	app_id: string;
+	deployment_id: string;
+	/** "queued": deploys run one per app, builds share the server's build slots */
+	status?: string;
+	/** 1-based place in the build queue */
+	queue_position?: number | null;
+	/** The still-waiting deployment this request replaced, if any */
+	superseded?: string | null;
+}
+
 export async function listDeployments(id: string): Promise<Deployment[]> {
 	return request<Deployment[]>(`/apps/${id}/deployments`);
+}
+
+export async function getDeployment(id: string, deploymentId: string): Promise<DeploymentDetail> {
+	return request<DeploymentDetail>(`/apps/${id}/deployments/${deploymentId}`);
+}
+
+export interface DeploymentStreamCallbacks {
+	/** Full state on connect (and on every reconnect). */
+	onSnapshot: (detail: DeploymentDetail) => void;
+	onLog: (line: DeploymentLogLine) => void;
+	/** The deployment row changed (phase, commit, result). */
+	onDeployment: (deployment: Deployment) => void;
+	/** Connected (again); a snapshot follows. */
+	onOpen?: (reconnected: boolean) => void;
+	/** The connection dropped; it reconnects by itself in `retryInMs`. */
+	onDisconnect?: (retryInMs: number) => void;
+}
+
+/** Statuses after which a deployment no longer changes. */
+const FINISHED_DEPLOYMENT = ['succeeded', 'failed', 'superseded', 'cancelled', 'canceled'];
+
+/**
+ * Live deploy view stream. Reconnects after a drop (each connection starts
+ * with a full snapshot, so nothing is missed) and closes for good once the
+ * deployment has finished. Returns a `close()` function for $effect cleanup.
+ * See handlers/deployments.rs `stream_deployment` for the frames.
+ */
+export function openDeploymentStream(
+	id: string,
+	deploymentId: string,
+	callbacks: DeploymentStreamCallbacks
+): () => void {
+	const socket: ReconnectingSocket = connectWithRetry(
+		() => wsUrl(`${BASE}/apps/${id}/deployments/${deploymentId}/stream`),
+		{
+			onOpen: (reconnected) => callbacks.onOpen?.(reconnected),
+			onDisconnect: (retryInMs) => callbacks.onDisconnect?.(retryInMs),
+			onMessage: (ev) => {
+				let frame: any;
+				try {
+					frame = JSON.parse(ev.data as string);
+				} catch {
+					return;
+				}
+				let status: string | undefined;
+				if (frame.type === 'snapshot') {
+					status = frame.deployment?.status;
+					callbacks.onSnapshot({
+						...frame.deployment,
+						logs: frame.logs ?? [],
+						logs_truncated: !!frame.logs_truncated,
+						container_port: frame.container_port,
+						health_check_path: frame.health_check_path ?? null,
+						source_type: frame.source_type ?? ''
+					});
+				} else if (frame.type === 'log') {
+					callbacks.onLog({ level: frame.level, message: frame.message, ts: frame.ts });
+				} else if (frame.type === 'deployment') {
+					status = frame.deployment?.status;
+					callbacks.onDeployment(frame.deployment);
+				}
+				// Finished: the server closes the socket; don't reconnect.
+				if (status && FINISHED_DEPLOYMENT.includes(status)) socket.close();
+			}
+		}
+	);
+	return () => socket.close();
 }
 
 export async function getDeploymentGeneratedDockerfile(
@@ -956,11 +1086,99 @@ export async function getDeploymentGeneratedDockerfile(
  * Redeploy the exact image of an earlier deployment. Without `deploymentId`
  * the server restores the previous distinct image.
  */
-export async function rollbackApp(id: string, deploymentId?: string): Promise<QueuedDeployment> {
-	return request<QueuedDeployment>(`/apps/${id}/rollback`, {
+export async function rollbackApp(id: string, deploymentId?: string): Promise<DeployStarted> {
+	return request<DeployStarted>(`/apps/${id}/rollback`, {
 		method: 'POST',
 		...(deploymentId ? { body: JSON.stringify({ deployment_id: deploymentId }) } : {})
 	});
+}
+
+// ── Source inspection (new-app wizard) ──
+
+export interface RemoteBranches {
+	default_branch: string | null;
+	/** Default branch first */
+	branches: string[];
+	truncated: boolean;
+}
+
+/** Branches of a Git repository (http/https URLs only). */
+export async function listRemoteBranches(
+	url: string,
+	opts: { github_app_id?: string; gitlab_token_id?: string } = {}
+): Promise<RemoteBranches> {
+	return request<RemoteBranches>('/git/branches', {
+		method: 'POST',
+		body: JSON.stringify({ url, ...opts })
+	});
+}
+
+export interface ImageInspection {
+	image: string;
+	exposed_ports: number[];
+	env_port: number | null;
+	suggested_port: number | null;
+	pulled: boolean;
+}
+
+/** Ports an image exposes (pulls it first if it isn't on the server yet). */
+export async function inspectImage(
+	image: string,
+	registryCredentialId?: string
+): Promise<ImageInspection> {
+	return request<ImageInspection>('/images/inspect', {
+		method: 'POST',
+		body: JSON.stringify({
+			image,
+			...(registryCredentialId ? { registry_credential_id: registryCredentialId } : {})
+		})
+	});
+}
+
+// ── Domain checks ──
+
+export interface DnsRecord {
+	type: 'A' | 'AAAA';
+	/** Name relative to the zone: "app", "@", "*.apps" */
+	name: string;
+	host: string;
+	value: string;
+}
+
+export type DnsCheckStatus = 'ok' | 'mismatch' | 'missing' | 'inconclusive';
+
+export interface DomainCertificate {
+	status: string;
+	issued_at: string;
+	expires_at: string;
+	last_error: string | null;
+	last_attempt_at: string | null;
+	next_retry_at: string | null;
+	failure_count: number;
+}
+
+export interface DomainCheck {
+	domain: string;
+	zone: string | null;
+	apps_domain: string | null;
+	under_apps_domain: boolean;
+	records: DnsRecord[];
+	wildcard_records: DnsRecord[];
+	server_ips: string[];
+	dns: {
+		status: DnsCheckStatus;
+		resolved: string[];
+		expected: string[];
+		stray: string[];
+		message: string;
+	};
+	certificate: DomainCertificate | null;
+	checked_at: string;
+}
+
+/** Live DNS check: the records to create, what the domain resolves to, and its certificate. */
+export async function checkDomain(domain: string): Promise<DomainCheck> {
+	return request<DomainCheck>(`/domains/check?domain=${encodeURIComponent(domain)}`);
 }
 
 // ── Git Integration ──
@@ -991,10 +1209,22 @@ export interface WebhookConfig {
 	paths: WebhookUrls;
 	/** Absolute URLs when the dashboard domain is configured, else null */
 	urls: WebhookUrls | null;
-	/** Shared secret: HMAC key for GitHub/Gitea/generic, token for GitLab */
-	secret: string;
+	/**
+	 * Whether a shared secret (HMAC key for GitHub/Gitea/generic, token for
+	 * GitLab) is set. The secret is write-only: see `revealWebhookSecret`.
+	 */
+	has_secret: boolean;
 	auto_deploy: boolean;
 	watch_branch: string | null;
+}
+
+export interface WebhookSecret {
+	secret: string;
+}
+
+/** Reveal the webhook secret (admin only; every reveal is audit-logged). */
+export async function revealWebhookSecret(id: string): Promise<WebhookSecret> {
+	return request<WebhookSecret>(`/apps/${id}/webhook-secret`);
 }
 
 export async function getWebhookConfig(id: string): Promise<WebhookConfig> {
@@ -1009,9 +1239,12 @@ export async function setWebhookSecret(id: string, secret: string): Promise<Webh
 	});
 }
 
-/** Generate a new webhook secret; the old one stops working immediately. */
-export async function rotateWebhookSecret(id: string): Promise<WebhookConfig> {
-	return request<WebhookConfig>(`/apps/${id}/webhook-secret/rotate`, { method: 'POST' });
+/**
+ * Generate a new webhook secret; the old one stops working immediately. The
+ * new secret is returned once, in this response.
+ */
+export async function rotateWebhookSecret(id: string): Promise<WebhookSecret> {
+	return request<WebhookSecret>(`/apps/${id}/webhook-secret/rotate`, { method: 'POST' });
 }
 
 export async function setAutoDeploy(
@@ -1487,7 +1720,10 @@ export interface AlertRule {
 	/** Threshold-based metric, null for pure event-based rules */
 	metric: AlertMetric | null;
 	threshold: number;
-	webhook_url: string;
+	/** Whether a webhook URL is set (the URL itself is write-only) */
+	has_webhook_url: boolean;
+	/** Host of the saved webhook URL, e.g. "hooks.slack.com" */
+	webhook_host: string | null;
 	enabled: boolean;
 	/** Event slugs this rule subscribes to */
 	events: AlertEvent[];
@@ -1524,6 +1760,7 @@ export async function updateAlertRule(
 		name: string;
 		metric: AlertMetric | null;
 		threshold: number;
+		/** Omit to keep the saved URL, "" to remove it */
 		webhook_url: string;
 		enabled: boolean;
 		events: AlertEvent[];
@@ -1612,7 +1849,8 @@ export interface Project {
 	id: string;
 	name: string;
 	description: string | null;
-	env_vars: Record<string, string>;
+	/** Shared env var keys; values are masked (write-only) */
+	env: EnvVarEntry[];
 	created_at: string;
 	updated_at: string;
 	/** Number of active (non-expired) project previews. Returned by GET /projects. */
@@ -1717,11 +1955,14 @@ export interface ManagedDatabase {
 	status: string;
 	db_name: string | null;
 	db_user: string | null;
-	db_password: string | null;
-	/** Separate root/admin password for MySQL and MariaDB. Null for other engines. */
-	root_password: string | null;
+	/** Whether the database has an application password (never returned) */
+	has_password: boolean;
+	/** Whether there is a separate root/admin password (MySQL and MariaDB) */
+	has_root_password: boolean;
 	memory_limit: number | null;
+	/** Connection-string override, password masked */
 	custom_external_url: string | null;
+	/** Connection-string override, password masked */
 	custom_internal_url: string | null;
 	/** Docker image actually used when the container was last created/redeployed */
 	image_used: string | null;
@@ -1733,11 +1974,42 @@ export interface ManagedDatabase {
 	public_access: boolean;
 }
 
+/** Connection strings in a detail response have the password masked. */
 export interface ManagedDatabaseDetail extends ManagedDatabase {
 	connection_string: string | null;
 	/** Connection string via the server's public address; only when public_access is on */
 	public_connection_string: string | null;
 	internal_connection_string: string | null;
+}
+
+/** Plaintext credentials: GET /databases/{id}/credentials (admin, audit-logged). */
+export interface DatabaseCredentials {
+	db_user: string | null;
+	db_password: string | null;
+	root_password: string | null;
+	connection_string: string | null;
+	public_connection_string: string | null;
+	internal_connection_string: string | null;
+}
+
+/** POST /databases: the detail plus the generated credentials, shown once. */
+export interface CreatedDatabase extends ManagedDatabaseDetail {
+	credentials: DatabaseCredentials;
+}
+
+/** Reveal a database's passwords and connection strings (admin only; audit-logged). */
+export async function revealDatabaseCredentials(id: string): Promise<DatabaseCredentials> {
+	return request<DatabaseCredentials>(`/databases/${id}/credentials`);
+}
+
+/** A database's own backups plus the full snapshots (which hold every database). */
+export async function listDatabaseBackups(id: string): Promise<Snapshot[]> {
+	return request<Snapshot[]>(`/databases/${id}/backups`);
+}
+
+/** Back up one database now. Resolves when the local copy is complete. */
+export async function createDatabaseBackup(id: string): Promise<Snapshot> {
+	return request<Snapshot>(`/databases/${id}/backups`, { method: 'POST' });
 }
 
 export async function listDatabases(): Promise<ManagedDatabase[]> {
@@ -1753,8 +2025,8 @@ export async function createDatabase(data: {
 	db_type: string;
 	project_id?: string;
 	memory_limit?: number;
-}): Promise<ManagedDatabaseDetail> {
-	return request<ManagedDatabaseDetail>('/databases', {
+}): Promise<CreatedDatabase> {
+	return request<CreatedDatabase>('/databases', {
 		method: 'POST',
 		body: JSON.stringify(data)
 	});
@@ -1834,8 +2106,8 @@ export interface CronJob {
 	updated_at: string;
 	/** Maximum wall-clock seconds the container may run. null = no timeout. */
 	timeout_seconds: number | null;
-	/** Environment variables. null = none defined. */
-	env: Record<string, string> | null;
+	/** Environment variable keys; values are masked (write-only). */
+	env: EnvVarEntry[];
 	/** Denormalised last-run outcome: "success" | "failed" | null (never run). */
 	last_run_status: string | null;
 	/** Concurrency policy: "skip" (default) or "allow". */
@@ -1917,7 +2189,12 @@ export async function updateCronJob(
 		enabled: boolean;
 		/** Pass null to clear, a number to set, omit to leave unchanged */
 		timeout_seconds: number | null;
+		/** Replace all environment variables */
 		env: Record<string, string>;
+		/** Add or overwrite these variables (keeps the others) */
+		env_set: Record<string, string>;
+		/** Remove these variables */
+		env_unset: string[];
 		/** "skip" or "allow" */
 		concurrency_policy: string;
 		/** Memory limit in MiB. null = no limit. */
@@ -2206,18 +2483,22 @@ export function openTerminalSession(
 
 export type IntegrationKind = 'telegram' | 'discord' | 'slack' | 'email';
 
+// Secret fields (bot_token, webhook_url, smtp_password) are write-only: the
+// server never returns them (see `Integration.saved_secrets`), and an update
+// that omits one, or sends "", keeps the saved value.
+
 export interface TelegramConfig {
-	bot_token: string;
+	bot_token?: string;
 	chat_id: string;
 	thread_id?: string;
 }
 
 export interface DiscordConfig {
-	webhook_url: string;
+	webhook_url?: string;
 }
 
 export interface SlackConfig {
-	webhook_url: string;
+	webhook_url?: string;
 }
 
 export interface EmailConfig {
@@ -2226,7 +2507,7 @@ export interface EmailConfig {
 	smtp_host: string;
 	smtp_port: number;
 	smtp_user: string;
-	smtp_password: string;
+	smtp_password?: string;
 	/** "tls" | "starttls" | "none" */
 	smtp_encryption: string;
 	to_addrs: string[];
@@ -2238,7 +2519,10 @@ export interface Integration {
 	id: string;
 	name: string;
 	kind: IntegrationKind;
+	/** Config without its secret fields */
 	config: IntegrationConfig;
+	/** Secret fields that have a saved value, e.g. ["bot_token"] */
+	saved_secrets: string[];
 	enabled: boolean;
 	created_at: string;
 	updated_at: string;
@@ -2385,9 +2669,16 @@ export interface Snapshot {
 	local_path: string | null;
 	remote_key: string | null;
 	storage_provider_id: string | null;
+	/** SHA-256 of the encrypted archive in remote storage */
 	checksum_sha256: string | null;
 	error_message: string | null;
 	notes: string | null;
+	/** null (local only) | "uploading" | "uploaded" | "failed" */
+	remote_status: 'uploading' | 'uploaded' | 'failed' | null;
+	/** Why the last remote upload failed */
+	remote_error: string | null;
+	/** Size of the encrypted archive in remote storage */
+	archive_bytes: number | null;
 }
 
 export interface BackupConfig {
@@ -2442,11 +2733,21 @@ export async function rollbackAppToSnapshot(
 	});
 }
 
+export interface RestoreDatabaseResult {
+	message: string;
+	/** Backup of the data as it was just before the restore */
+	pre_restore_snapshot_id: string;
+}
+
+/**
+ * Restore one database from a snapshot that holds it. The server backs up the
+ * current data first and returns that backup's id.
+ */
 export async function restoreDatabase(
 	snapshotId: string,
 	dbName: string
-): Promise<{ message: string }> {
-	return request<{ message: string }>(`/snapshots/${snapshotId}/restore-database`, {
+): Promise<RestoreDatabaseResult> {
+	return request<RestoreDatabaseResult>(`/snapshots/${snapshotId}/restore-database`, {
 		method: 'POST',
 		body: JSON.stringify({ db_name: dbName })
 	});

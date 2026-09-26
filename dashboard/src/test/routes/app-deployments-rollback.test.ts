@@ -16,11 +16,8 @@ function deployment(overrides: Partial<Deployment>): Deployment {
 		started_at: '2026-01-01T00:00:00.000Z',
 		finished_at: '2026-01-01T00:01:00.000Z',
 		created_at: '2026-01-01T00:00:00.000Z',
+		duration_secs: 60,
 		image_pruned: false,
-		kind: 'deploy',
-		error: null,
-		superseded_by: null,
-		queue_position: null,
 		is_current: false,
 		rollback_available: false,
 		rollback_unavailable_reason: null,
@@ -32,10 +29,31 @@ const deployments: Deployment[] = [
 	deployment({
 		id: 'dep_current',
 		image_tag: 'tond-web:cccccccccccc',
+		commit_sha: 'cccccccccccccccccccc',
+		commit_message: 'Add dark mode',
+		trigger_detail: 'ada@example.com',
 		is_current: true,
 		rollback_unavailable_reason: 'This image is already running'
 	}),
-	deployment({ id: 'dep_prev', image_tag: 'tond-web:bbbbbbbbbbbb', rollback_available: true }),
+	deployment({
+		id: 'dep_prev',
+		image_tag: 'tond-web:bbbbbbbbbbbb',
+		commit_sha: 'bbbbbbbbbbbbbbbbbbbb',
+		commit_message: 'Fix login redirect',
+		rollback_available: true
+	}),
+	deployment({
+		id: 'dep_failed',
+		status: 'failed',
+		image_tag: null,
+		trigger_source: 'webhook',
+		trigger_detail: 'GitHub push to main',
+		failure: {
+			code: 'build_failed',
+			title: 'The build failed (exit code 1)',
+			hint: 'Fix it'
+		}
+	}),
 	deployment({
 		id: 'dep_pruned',
 		image_tag: 'tond-web:aaaaaaaaaaaa',
@@ -44,69 +62,68 @@ const deployments: Deployment[] = [
 	})
 ];
 
-describe('app deployments rollback', () => {
-	it('offers restore only for deployments whose exact image is still available', () => {
+function rows() {
+	return within(screen.getByRole('list', { name: 'Deployments' })).getAllByRole('listitem');
+}
+
+describe('app deployments', () => {
+	it('shows commit, trigger, duration and failure reason, and links each row to its log', () => {
 		render(AppDeploymentsHarness, { props: { deployments, onRollback: vi.fn() } });
 
-		const rows = screen.getAllByRole('row').slice(1);
-		expect(within(rows[0]).getByText('current')).toBeInTheDocument();
-		expect(within(rows[0]).queryByRole('button', { name: /restore/i })).not.toBeInTheDocument();
-		expect(within(rows[1]).getByRole('button', { name: /restore/i })).toBeEnabled();
-		expect(within(rows[2]).getByRole('button', { name: /restore/i })).toBeDisabled();
-		expect(within(rows[2]).getByText('(pruned)')).toBeInTheDocument();
+		const [current, prev, failed] = rows();
+		expect(within(current).getByText('ccccccc Add dark mode')).toBeInTheDocument();
+		expect(within(current).getByText('current')).toBeInTheDocument();
+		expect(within(current).getByText(/Manual · ada@example.com/)).toBeInTheDocument();
+		expect(within(current).getByText(/1m 00s/)).toBeInTheDocument();
+		expect(within(failed).getByText('The build failed (exit code 1)')).toBeInTheDocument();
+		expect(within(failed).getByText(/Webhook · GitHub push to main/)).toBeInTheDocument();
+		expect(within(prev).getByRole('link')).toHaveAttribute(
+			'href',
+			'/apps/app_1/deployments/dep_prev'
+		);
 	});
 
-	it('restores the chosen deployment after confirmation', async () => {
+	it('offers rollback only for deployments whose exact image is still available', () => {
+		render(AppDeploymentsHarness, { props: { deployments, onRollback: vi.fn() } });
+
+		const [current, prev, , pruned] = rows();
+		expect(
+			within(current).queryByRole('button', { name: /roll back to this/i })
+		).not.toBeInTheDocument();
+		expect(within(prev).getByRole('button', { name: /roll back to this/i })).toBeEnabled();
+		expect(within(pruned).getByRole('button', { name: /roll back to this/i })).toBeDisabled();
+		expect(within(pruned).getByText('(pruned)')).toBeInTheDocument();
+	});
+
+	it('names the target and what stays before rolling back', async () => {
 		const user = userEvent.setup();
 		const onRollback = vi.fn();
 		render(AppDeploymentsHarness, { props: { deployments, onRollback } });
 
-		const rows = screen.getAllByRole('row').slice(1);
-		await user.click(within(rows[1]).getByRole('button', { name: /restore/i }));
-		expect(await screen.findByText(/restore this deployment\?/i)).toBeInTheDocument();
-		await user.click(screen.getByRole('button', { name: /restore image/i }));
+		await user.click(within(rows()[1]).getByRole('button', { name: /roll back to this/i }));
+		const dialog = await screen.findByRole('dialog');
+		expect(within(dialog).getByText('Roll back web?')).toBeInTheDocument();
+		expect(within(dialog).getByText('Fix login redirect')).toBeInTheDocument();
+		expect(within(dialog).getByText('tond-web:bbbbbbbbbbbb')).toBeInTheDocument();
+		expect(within(dialog).getByText(/environment variables, volumes/i)).toBeInTheDocument();
+		expect(onRollback).not.toHaveBeenCalled();
+		await user.click(within(dialog).getByRole('button', { name: /^roll back$/i }));
 
 		expect(onRollback).toHaveBeenCalledWith('dep_prev');
 	});
 
-	it('shows queue position, progress and why a deploy was superseded or failed', () => {
-		render(AppDeploymentsHarness, {
-			props: {
-				deployments: [
-					deployment({ id: 'dep_q', status: 'queued', queue_position: 2, image_tag: null }),
-					deployment({ id: 'dep_b', status: 'building', image_tag: null }),
-					deployment({
-						id: 'dep_s',
-						status: 'superseded',
-						superseded_by: 'dep_q',
-						image_tag: null
-					}),
-					deployment({
-						id: 'dep_f',
-						status: 'failed',
-						error: 'Interrupted: Tond restarted while this was in progress. Deploy again to retry.'
-					})
-				],
-				onRollback: vi.fn()
-			}
-		});
-
-		const rows = screen.getAllByRole('row').slice(1);
-		expect(within(rows[0]).getByText('Queued')).toBeInTheDocument();
-		expect(within(rows[0]).getByText('2nd in line')).toBeInTheDocument();
-		expect(within(rows[0]).getByText('Waiting')).toBeInTheDocument();
-		expect(within(rows[1]).getByText('Building')).toBeInTheDocument();
-		expect(within(rows[2]).getByText('Superseded')).toBeInTheDocument();
-		expect(
-			within(rows[2]).getByText('Replaced by a newer deploy before it started')
-		).toBeInTheDocument();
-		expect(within(rows[3]).getByText(/Deploy again to retry/)).toBeInTheDocument();
-	});
-
 	it('disables the roll back button when nothing can be restored', () => {
 		render(AppDeploymentsHarness, {
-			props: { deployments: [deployments[0], deployments[2]], onRollback: vi.fn() }
+			props: { deployments: [deployments[0], deployments[3]], onRollback: vi.fn() }
 		});
+		expect(screen.getByRole('button', { name: /roll back to previous/i })).toBeDisabled();
+	});
+
+	it('offers no rollback to roles without apps:rollback', () => {
+		render(AppDeploymentsHarness, {
+			props: { deployments, onRollback: vi.fn(), canRollback: false }
+		});
+		expect(screen.queryByRole('button', { name: /roll back to this/i })).not.toBeInTheDocument();
 		expect(screen.getByRole('button', { name: /roll back to previous/i })).toBeDisabled();
 	});
 });

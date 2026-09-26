@@ -22,8 +22,8 @@
 
 use crate::runtime::changes::{Table, Watch};
 use crate::runtime::loops;
-use crate::{metrics, notifications, state::AppState};
-use tond_common::{AlertRule, IntegrationConfig};
+use crate::{metrics, notifications, secrets, state::AppState};
+use tond_common::AlertRule;
 
 const CHECK_INTERVAL_SECS: u64 = 60;
 /// Longest sleep while no threshold rule exists (a rule change wakes us).
@@ -204,11 +204,10 @@ async fn fire_threshold_alert(
     let metric = rule.metric.as_deref().unwrap_or("unknown");
 
     tracing::info!(
-        "Firing threshold alert '{}' (rule {}) metric={} → {}",
+        "Firing threshold alert '{}' (rule {}) metric={}",
         rule.name,
         rule.id,
-        metric,
-        rule.webhook_url
+        metric
     );
 
     let message = match metric {
@@ -330,9 +329,17 @@ fn build_event_message(event: &str, app_name: Option<&str>, detail: Option<&str>
 // ── Shared webhook helpers ───────────────────────────────────────────────────
 
 async fn post_webhook(rule: &AlertRule, event: &str, value: f64, threshold: f64, message: &str) {
-    if rule.webhook_url.is_empty() {
-        return;
-    }
+    let url = match secrets::alert_webhook_url(&rule.webhook_url) {
+        Ok(url) if !url.is_empty() => url,
+        Ok(_) => return,
+        Err(e) => {
+            tracing::warn!(
+                "alert rule {}: webhook URL cannot be decrypted: {e:#}",
+                rule.id
+            );
+            return;
+        }
+    };
     let payload = serde_json::json!({
         "rule_id":   rule.id,
         "alert":     rule.name,
@@ -346,7 +353,7 @@ async fn post_webhook(rule: &AlertRule, event: &str, value: f64, threshold: f64,
 
     let client = reqwest::Client::new();
     let _ = client
-        .post(&rule.webhook_url)
+        .post(&url)
         .json(&payload)
         .timeout(std::time::Duration::from_secs(10))
         .send()
@@ -392,7 +399,7 @@ async fn dispatch_integrations(
     };
 
     for (kind, config_json) in rows {
-        let config = match IntegrationConfig::parse(&kind, &config_json) {
+        let config = match secrets::open_integration_config(&kind, &config_json) {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(

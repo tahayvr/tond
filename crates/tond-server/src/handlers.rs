@@ -26,6 +26,7 @@
 //   app_logs()          GET  /api/apps/{id}/logs   — last 50 deploy_logs + 100 container lines
 //   (env vars live in handlers/env.rs: masked GET, PATCH, per-key reveal)
 //   update_domain()     PUT  /api/apps/{id}/domain — set domain, upsert 'pending' cert record
+//   update_port()       PUT  /api/apps/{id}/port   — container port (next deploy)
 //   list_certs()        GET  /api/certs            — all certificate rows
 //   upload_deploy()     POST /api/apps/{id}/upload — accept .tar.gz, extract, build,
 //                                                    then deploy — all in background, returns 202
@@ -41,10 +42,12 @@ pub mod backups;
 pub mod cron;
 pub mod databases;
 pub mod deployments;
+pub mod domains;
 pub mod env;
 pub mod git;
 pub mod github_apps;
 pub mod gitlab_tokens;
+pub mod images;
 pub mod integrations;
 pub mod logs;
 pub mod metrics;
@@ -75,10 +78,10 @@ use tond_common::*;
 use crate::audit_log::{AuditEntry, record};
 use crate::{
     audit_log::write_audit_log,
-    auth::{Authz, RateLimit, scope},
+    auth::{Authz, Principal, RateLimit, principal::Actor, scope},
     compose_policy, deploy, docker,
     error::AppError,
-    proxy_link,
+    proxy_link, secrets,
     state::AppState,
     volumes,
 };
@@ -87,6 +90,37 @@ use crate::{
 
 pub async fn health() -> impl IntoResponse {
     Json(json!({ "status": "ok", "service": "tond" }))
+}
+
+/// Env vars from a request's JSON object: string values are kept, other
+/// scalars are stringified, keys must be valid variable names.
+pub(crate) fn env_map_from_json(
+    value: &serde_json::Value,
+) -> Result<std::collections::BTreeMap<String, String>, AppError> {
+    if value.is_null() {
+        return Ok(Default::default());
+    }
+    let object = value.as_object().ok_or_else(|| {
+        AppError(TondError::InvalidInput(
+            "env_vars must be an object of NAME: value pairs".to_string(),
+        ))
+    })?;
+    let mut env = std::collections::BTreeMap::new();
+    for (key, value) in object {
+        if !is_valid_env_key(key) {
+            return Err(AppError(TondError::InvalidInput(format!(
+                "'{key}' is not a valid variable name: use letters, digits and underscores, \
+                 not starting with a digit"
+            ))));
+        }
+        let value = match value {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Null => String::new(),
+            other => other.to_string(),
+        };
+        env.insert(key.clone(), value);
+    }
+    Ok(env)
 }
 
 // ── Shared lookup helper ──
@@ -272,9 +306,11 @@ pub async fn create_app(
         app.domain = Some(domain);
     }
 
-    if let Some(env) = req.env_vars {
-        app.env_vars = Some(env.to_string());
-    }
+    let env = match req.env_vars {
+        Some(value) => env_map_from_json(&value)?,
+        None => Default::default(),
+    };
+    secrets::seal_new_app(&mut app, &env)?;
 
     if let Some(memory_limit) = req.memory_limit {
         app.memory_limit = Some(memory_limit);
@@ -488,6 +524,28 @@ pub async fn delete_app(
 
 // ── Deploy App ──
 
+/// How a deploy request was triggered, for the deployment row:
+/// `(trigger_source, trigger_detail)`.
+pub(crate) fn deploy_trigger(principal: &Principal) -> (&'static str, Option<String>) {
+    match principal.actor() {
+        Actor::LocalSocket => ("cli", Some("tond CLI on the server".to_string())),
+        Actor::Token { name, .. } => ("api", Some(format!("token {name}"))),
+        Actor::User { email, .. } => ("manual", Some(email.clone())),
+    }
+}
+
+/// 202 body for a started deployment.
+pub(crate) fn deployment_started(
+    message: &str,
+    app_id: &str,
+    queued: &deploy::queue::Enqueued,
+) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiResponse::ok(queued_response(message, app_id, queued))),
+    )
+}
+
 pub async fn deploy_app(
     _rate: RateLimit,
     auth: Authz<scope::AppsDeploy>,
@@ -495,39 +553,38 @@ pub async fn deploy_app(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let app = fetch_app(&state.db, &id).await?;
+    let app_id = app.id.clone();
+    let app_name = app.name.clone();
 
-    // Queued behind the app's running deploy / the build slots (deploy/queue.rs).
-    let queued = deploy::queue::enqueue(&state, &app, deploy::queue::JobKind::Deploy, "manual")
+    let (trigger, detail) = deploy_trigger(&auth);
+    let queued = deploy::start(&state, app, deploy::DeployRequest::source(trigger, detail))
         .await
-        .map_err(|e| {
-            AppError(TondError::Internal(format!(
-                "Could not queue the deploy: {e}"
-            )))
-        })?;
+        .map_err(|e| AppError(TondError::Internal(e.to_string())))?;
 
     write_audit_log(
         &state.db,
-        Some(&app.id),
-        Some(&app.name),
+        Some(&app_id),
+        Some(&app_name),
         "deploy",
         &auth.audit_actor(),
         Some(&format!("deployment={}", queued.deployment_id)),
     )
     .await;
 
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(ApiResponse::ok(queued_response(&app.id, &queued))),
-    ))
+    Ok(deployment_started("Deployment queued", &app_id, &queued))
 }
 
-/// Body of a 202 answer to a queued deploy.
-pub(crate) fn queued_response(app_id: &str, queued: &deploy::queue::Enqueued) -> serde_json::Value {
+/// Body of a 202 answer to a queued deployment (deploy/queue.rs).
+pub(crate) fn queued_response(
+    message: &str,
+    app_id: &str,
+    queued: &deploy::queue::Enqueued,
+) -> serde_json::Value {
     json!({
         "message": if queued.queue_position > 1 {
-            format!("Deployment queued (position {})", queued.queue_position)
+            format!("{message} (position {} in the queue)", queued.queue_position)
         } else {
-            "Deployment queued".to_string()
+            message.to_string()
         },
         "app_id": app_id,
         "deployment_id": queued.deployment_id,
@@ -1034,6 +1091,51 @@ pub async fn update_drain_timeout(
     ))
 }
 
+// ── Update Container Port ──
+//
+// PUT /api/apps/{id}/port  { "container_port": 80 }
+// The port the app listens on inside its container (also passed as $PORT).
+// Takes effect on the next deploy.
+
+#[derive(Debug, Deserialize)]
+pub struct UpdatePortRequest {
+    pub container_port: i64,
+}
+
+pub async fn update_port(
+    _rate: RateLimit,
+    auth: Authz<scope::AppsWrite>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdatePortRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let app = fetch_app(&state.db, &id).await?;
+    if !(1..=65535).contains(&req.container_port) {
+        return Err(AppError(TondError::InvalidInput(
+            "container_port must be between 1 and 65535".to_string(),
+        )));
+    }
+    sqlx::query("UPDATE apps SET container_port = ?, updated_at = datetime('now') WHERE id = ?")
+        .bind(req.container_port)
+        .bind(&app.id)
+        .execute(&state.db)
+        .await?;
+    write_audit_log(
+        &state.db,
+        Some(&app.id),
+        Some(&app.name),
+        "port_update",
+        &auth.audit_actor(),
+        Some(&format!("container_port={}", req.container_port)),
+    )
+    .await;
+    let updated = fetch_app(&state.db, &app.id).await?;
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(AppResponse::from(updated))),
+    ))
+}
+
 pub async fn upload_deploy(
     _rate: RateLimit,
     auth: Authz<scope::AppsDeploy>,
@@ -1098,26 +1200,27 @@ pub async fn upload_deploy(
     .await?;
     app.source_type = "tarball".to_string();
 
-    // Build + deploy through the queue; the job removes extract_dir when done.
-    let queued = deploy::queue::enqueue(
+    let app_id = app.id.clone();
+    let app_name = app.name.clone();
+
+    // Build and deploy in the background as one deployment (build phase
+    // included), so its log and progress show in the live deploy view.
+    let queued = deploy::start(
         &state,
-        &app,
-        deploy::queue::JobKind::Upload {
-            dir: extract_dir.clone(),
+        app,
+        deploy::DeployRequest {
+            kind: deploy::DeployKind::Upload { dir: extract_dir },
+            trigger_source: "upload".to_string(),
+            trigger_detail: deploy_trigger(&auth).1,
         },
-        "upload",
     )
     .await
-    .map_err(|e| {
-        AppError(TondError::Internal(format!(
-            "Could not queue the deploy: {e}"
-        )))
-    })?;
+    .map_err(|e| AppError(TondError::Internal(e.to_string())))?;
 
     write_audit_log(
         &state.db,
-        Some(&app.id),
-        Some(&app.name),
+        Some(&app_id),
+        Some(&app_name),
         "deploy",
         &auth.audit_actor(),
         Some(&format!(
@@ -1127,9 +1230,10 @@ pub async fn upload_deploy(
     )
     .await;
 
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(ApiResponse::ok(queued_response(&app.id, &queued))),
+    Ok(deployment_started(
+        "Upload received; build queued",
+        &app_id,
+        &queued,
     ))
 }
 
@@ -1864,6 +1968,49 @@ mod tests {
             data[0]["id"],
             serde_json::json!(app.id),
             "list_apps with ?name should return the matching app record"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_port_validates_and_saves_the_container_port() {
+        let state = test_state().await;
+        let app = seed_app(&state, "portapp").await;
+        let bad = update_port(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            State(state.clone()),
+            Path(app.id.clone()),
+            Json(UpdatePortRequest { container_port: 0 }),
+        )
+        .await;
+        assert!(bad.is_err(), "port 0 is rejected");
+        update_port(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            State(state.clone()),
+            Path(app.id.clone()),
+            Json(UpdatePortRequest { container_port: 80 }),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("update_port should succeed: {}", err.0));
+        let port: i64 = sqlx::query_scalar("SELECT container_port FROM apps WHERE id = ?")
+            .bind(&app.id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_else(|err| panic!("read port: {err}"));
+        assert_eq!(port, 80);
+    }
+
+    #[test]
+    fn deploy_trigger_names_the_caller() {
+        assert_eq!(deploy_trigger(&Principal::local_socket()).0, "cli");
+        assert_eq!(
+            deploy_trigger(&Principal::test_token(ScopeSet::all(), None)),
+            ("api", Some("token test-token".to_string()))
+        );
+        assert_eq!(
+            deploy_trigger(&Principal::test_user(Role::Deployer)),
+            ("manual", Some("deployer@example.com".to_string()))
         );
     }
 

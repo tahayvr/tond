@@ -18,7 +18,7 @@
 		buildMethod: 'dockerfile' | 'tbuild';
 		containerPort: number;
 		autoDeploy: boolean;
-		watchBranch: string;
+		branch: string;
 		baseDir: string;
 		staticBuild: boolean;
 		domain: string;
@@ -47,7 +47,7 @@
 		buildMethod,
 		containerPort,
 		autoDeploy,
-		watchBranch,
+		branch,
 		baseDir,
 		staticBuild,
 		domain,
@@ -79,16 +79,18 @@
 		dockerfile: 'Dockerfile'
 	};
 
-	let isGit = $derived(sourceSubType === 'git-public' || sourceSubType === 'git-github-app');
+	let isGit = $derived(
+		sourceSubType === 'git-public' || sourceSubType === 'git-github-app' || !!branch
+	);
 	let envKeys = $derived(Object.keys(envVars));
 
 	function getMemoryDisplay(limit: number | null, unit: 'mb' | 'gb'): string {
-		if (!limit) return 'Unlimited';
+		if (!limit) return 'No app limit (host cap: 75% of RAM)';
 		return `${limit} ${unit.toUpperCase()}`;
 	}
 
 	function getCpuDisplay(limit: number | null): string {
-		if (!limit) return 'Unlimited';
+		if (!limit) return 'All cores';
 		return `${limit} CPU${limit !== 1 ? 's' : ''}`;
 	}
 </script>
@@ -174,15 +176,13 @@
 				</div>
 				{#if isGit}
 					<div>
-						<span class="text-muted-foreground">Auto Deploy:</span>
-						{autoDeploy ? 'Yes' : 'No'}
+						<span class="text-muted-foreground">Branch:</span>
+						<span class="font-mono text-xs">{branch || 'main'}</span>
 					</div>
-					{#if autoDeploy}
-						<div>
-							<span class="text-muted-foreground">Watch Branch:</span>
-							<span class="font-mono text-xs">{watchBranch}</span>
-						</div>
-					{/if}
+					<div>
+						<span class="text-muted-foreground">Auto Deploy:</span>
+						{autoDeploy ? `Yes, on push to ${branch || 'main'}` : 'No'}
+					</div>
 				{/if}
 			</div>
 		</div>

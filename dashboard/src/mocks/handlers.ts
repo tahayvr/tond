@@ -7,13 +7,15 @@
 import { http, HttpResponse, ws, delay } from 'msw';
 
 // WebSocket links must be declared at module scope so MSW can track clients
-// across the service worker boundary via a stable BroadcastChannel.
-const appLogStream = ws.link('ws://*/api/apps/*/logs/stream');
-const systemLogStream = ws.link('ws://*/api/system/logs/stream');
-const allDatabaseLogStream = ws.link('ws://*/api/databases/logs/stream');
-const databaseLogStream = ws.link('ws://*/api/databases/*/logs/stream');
-const cronRunStream = ws.link('ws://*/api/cron/*/runs/stream');
-const terminalStream = ws.link('ws://*/api/terminal/ws*');
+// across the service worker boundary via a stable BroadcastChannel. Use paths
+// relative to the page origin: a wildcard host ("ws://*/…") never matches.
+const appLogStream = ws.link('/api/apps/:id/logs/stream');
+const systemLogStream = ws.link('/api/system/logs/stream');
+const allDatabaseLogStream = ws.link('/api/databases/logs/stream');
+const databaseLogStream = ws.link('/api/databases/:id/logs/stream');
+const cronRunStream = ws.link('/api/cron/:id/runs/stream');
+const terminalStream = ws.link('/api/terminal/ws');
+const deploymentStream = ws.link('/api/apps/:id/deployments/:deploymentId/stream');
 
 import {
 	MOCK_USER,
@@ -24,6 +26,8 @@ import {
 	MOCK_SETTINGS,
 	MOCK_ONBOARDING_STATUS,
 	MOCK_DEPLOYMENTS,
+	MOCK_DEPLOYMENT_LOGS,
+	mockBuildLog,
 	MOCK_GENERATED_DOCKERFILES,
 	MOCK_DEPLOY_KEYS,
 	MOCK_PREVIEWS,
@@ -47,7 +51,8 @@ import {
 	MOCK_CERTIFICATES,
 	makeMockSystemMetrics,
 	makeMockSystemSelf,
-	makeMockMetrics
+	makeMockMetrics,
+	MOCK_DATABASE_SECRETS
 } from './fixtures';
 import type {
 	AlertRule,
@@ -57,6 +62,9 @@ import type {
 	CronJob,
 	CronJobRun,
 	Deployment,
+	DeploymentLogLine,
+	DeployPhase,
+	PhaseRecord,
 	GitHubApp,
 	GithubPR,
 	Integration,
@@ -71,7 +79,9 @@ import type {
 	ProjectPreview,
 	RegistryCredential,
 	Snapshot,
-	StorageProvider
+	StorageProvider,
+	EnvVarEntry,
+	DatabaseCredentials
 } from '$lib/api';
 import { MOCK_ALERT_RULES } from './fixtures';
 
@@ -195,13 +205,13 @@ function mockComposeProblems(content: string): string[] {
 	return problems;
 }
 
-/** Public connection string (only when public access is on). */
-function mockPublicUrl(db: ManagedDatabase): string | null {
+/** Public connection string (only when public access is on), plaintext. */
+function mockPublicUrl(db: ManagedDatabase, password: string | null): string | null {
 	if (!db.public_access || !db.host_port) return null;
 	const isRedisLike = db.db_type === 'redis' || db.db_type === 'keydb';
 	return isRedisLike
-		? `redis://${db.db_user}:${db.db_password}@tond.example.com:${db.host_port}`
-		: `${db.db_type}://${db.db_user}:${db.db_password}@tond.example.com:${db.host_port}/${db.db_name}`;
+		? `redis://${db.db_user}:${password}@tond.example.com:${db.host_port}`
+		: `${db.db_type}://${db.db_user}:${password}@tond.example.com:${db.host_port}/${db.db_name}`;
 }
 
 // Mirrors tond-server's domains.rs: previews need a preview domain on a different
@@ -288,112 +298,6 @@ let projects: Project[] = structuredClone(MOCK_PROJECTS);
 const templates: TemplateCatalogEntry[] = structuredClone(MOCK_TEMPLATES);
 let alertRules: AlertRule[] = structuredClone(MOCK_ALERT_RULES);
 const deployments: Record<string, Deployment[]> = structuredClone(MOCK_DEPLOYMENTS);
-
-// Deploys started in the mock walk through the build queue on a clock, so the
-// dashboard's queue position and progress can be seen:
-// queued → building → deploying → succeeded. Deploys of one app run one at a
-// time; a newer request supersedes one that is still queued.
-const QUEUE_MS = 2500;
-const BUILD_MS = 6000;
-const CUTOVER_MS = 2500;
-const TOTAL_MS = QUEUE_MS + BUILD_MS + CUTOVER_MS;
-/** deployment id → when it may start (its queue wait ends) */
-const deployClock = new Map<string, number>();
-const UNFINISHED = ['queued', 'building', 'deploying'];
-
-function advanceDeployments(appId: string) {
-	const now = Date.now();
-	const list = deployments[appId] ?? [];
-	const queuedIds = list
-		.filter((d) => d.status === 'queued')
-		.map((d) => d.id)
-		.reverse();
-	deployments[appId] = list.map((d) => {
-		const start = deployClock.get(d.id);
-		if (start === undefined || !UNFINISHED.includes(d.status)) return d;
-		const age = now - start;
-		if (age < QUEUE_MS) {
-			return { ...d, status: 'queued', queue_position: queuedIds.indexOf(d.id) + 1 };
-		}
-		if (age < QUEUE_MS + BUILD_MS) {
-			return {
-				...d,
-				status: 'building',
-				queue_position: null,
-				started_at: new Date(start + QUEUE_MS).toISOString()
-			};
-		}
-		if (age < TOTAL_MS) return { ...d, status: 'deploying', queue_position: null };
-		deployClock.delete(d.id);
-		return {
-			...d,
-			status: 'succeeded',
-			queue_position: null,
-			finished_at: new Date(start + TOTAL_MS).toISOString(),
-			image_tag: d.image_tag ?? `tond-${appId}:${d.id.slice(-12)}`
-		};
-	});
-}
-
-function enqueueMockDeployment(appId: string, kind: string, imageTag: string | null = null) {
-	advanceDeployments(appId);
-	const list = deployments[appId] ?? [];
-	const id = `dep_${crypto.randomUUID().replaceAll('-', '').slice(0, 16)}`;
-	const now = Date.now();
-	// Supersede a deploy that has not started yet.
-	const waiting = list.find((d) => d.status === 'queued');
-	const running = list.find((d) => d.status === 'building' || d.status === 'deploying');
-	const runningStart = running ? (deployClock.get(running.id) ?? now) : now;
-	if (waiting) deployClock.delete(waiting.id);
-	const startAt = running ? runningStart + TOTAL_MS - QUEUE_MS : now;
-	deployClock.set(id, startAt);
-	const created = new Date(now).toISOString();
-	const deployment: Deployment = {
-		id,
-		app_id: appId,
-		image_tag: imageTag,
-		status: 'queued',
-		trigger_source: kind === 'rollback' ? 'rollback' : 'manual',
-		kind,
-		error: null,
-		superseded_by: null,
-		queue_position: running ? 2 : 1,
-		has_generated_dockerfile: false,
-		started_at: created,
-		finished_at: null,
-		created_at: created,
-		image_pruned: false,
-		is_current: false,
-		rollback_available: false,
-		rollback_unavailable_reason: 'Only successful deployments can be restored'
-	};
-	deployments[appId] = [
-		deployment,
-		...list.map((d) =>
-			d.id === waiting?.id
-				? {
-						...d,
-						status: 'superseded' as const,
-						superseded_by: id,
-						finished_at: created,
-						queue_position: null,
-						error: 'Replaced by a newer deploy before it started'
-					}
-				: d
-		)
-	];
-	return {
-		message:
-			deployment.queue_position! > 1
-				? `Deployment queued (position ${deployment.queue_position})`
-				: 'Deployment queued',
-		app_id: appId,
-		deployment_id: id,
-		status: 'queued' as const,
-		queue_position: deployment.queue_position!,
-		superseded: waiting?.id ?? null
-	};
-}
 let previews: Record<string, PreviewDeployment[]> = structuredClone(MOCK_PREVIEWS);
 let projectPreviews: Record<string, ProjectPreview[]> = structuredClone(MOCK_PROJECT_PREVIEWS);
 let databases: ManagedDatabase[] = structuredClone(MOCK_DATABASES);
@@ -404,6 +308,122 @@ let githubApps: GitHubApp[] = structuredClone(MOCK_GITHUB_APPS);
 
 // Per-app webhook secrets (the real server generates one at app creation).
 const webhookSecrets: Record<string, string> = {};
+
+// Stored secrets live beside the rows, like the server's encrypted columns:
+// responses only ever carry masked values or `has_*` flags.
+const ENV_MASK = '••••••••';
+
+function urlHost(url: string): string | null {
+	try {
+		return new URL(url).host || null;
+	} catch {
+		return null;
+	}
+}
+
+/** Mirrors tond_common::mask_url_password. */
+function maskUrlPassword(url: string): string {
+	return url.replace(/(:\/\/[^:/@\s]+):[^/\s]+@/g, `$1:${ENV_MASK}@`);
+}
+
+const INTEGRATION_SECRET_FIELDS = ['bot_token', 'webhook_url', 'smtp_password'] as const;
+const integrationSecrets: Record<string, Record<string, string>> = {};
+
+/** Split a submitted integration config into its plain part and saved secrets. */
+function storeIntegrationConfig(
+	id: string,
+	config: Record<string, unknown>
+): { config: Integration['config']; saved_secrets: string[] } {
+	const saved = (integrationSecrets[id] ??= {});
+	const plain: Record<string, unknown> = { ...config };
+	for (const field of INTEGRATION_SECRET_FIELDS) {
+		const value = plain[field];
+		delete plain[field];
+		if (typeof value === 'string' && value.trim()) saved[field] = value.trim();
+	}
+	return {
+		config: plain as unknown as Integration['config'],
+		saved_secrets: INTEGRATION_SECRET_FIELDS.filter((f) => saved[f])
+	};
+}
+
+const cronEnv: Record<string, Record<string, string>> = Object.fromEntries(
+	cronJobs.map((job) => [job.id, Object.fromEntries(job.env.map((e) => [e.key, 'mock-value']))])
+);
+const projectEnv: Record<string, Record<string, string>> = {};
+
+// Managed database secrets, stored beside the rows (see MOCK_DATABASE_SECRETS).
+const dbSecrets: Record<string, { db_password: string | null; root_password: string | null }> =
+	structuredClone(MOCK_DATABASE_SECRETS);
+/** Plaintext connection-string overrides (rows carry the masked form). */
+const dbCustomUrls: Record<string, { external: string | null; internal: string | null }> = {};
+
+/** Plaintext connection strings, as the credentials reveal returns them. */
+function dbCredentials(db: ManagedDatabase): DatabaseCredentials {
+	const password = dbSecrets[db.id]?.db_password ?? null;
+	const isRedisLike = db.db_type === 'redis' || db.db_type === 'keydb';
+	const port = db.db_type === 'mysql' || db.db_type === 'mariadb' ? 3306 : 5432;
+	const auth = db.db_user && password ? `${db.db_user}:${password}@` : '';
+	const computedExternal = db.host_port
+		? isRedisLike
+			? `redis://${auth}localhost:${db.host_port}`
+			: `${db.db_type}://${auth}localhost:${db.host_port}/${db.db_name}`
+		: null;
+	const computedInternal = db.project_id
+		? isRedisLike
+			? `redis://${auth}tond-db-${db.name}:6379`
+			: `${db.db_type}://${auth}tond-db-${db.name}:${port}/${db.db_name}`
+		: null;
+	const custom = dbCustomUrls[db.id];
+	return {
+		db_user: db.db_user,
+		db_password: password,
+		root_password: dbSecrets[db.id]?.root_password ?? null,
+		connection_string: custom?.external ?? computedExternal,
+		public_connection_string: mockPublicUrl(db, password),
+		internal_connection_string: custom?.internal ?? computedInternal
+	};
+}
+
+/** A database detail response: connection strings with the password masked. */
+function dbDetail(db: ManagedDatabase) {
+	const creds = dbCredentials(db);
+	const mask = (url: string | null) => (url ? maskUrlPassword(url) : null);
+	return {
+		...db,
+		connection_string: mask(creds.connection_string),
+		public_connection_string: mask(creds.public_connection_string),
+		internal_connection_string: mask(creds.internal_connection_string)
+	};
+}
+
+function mockDatabaseSnapshot(dbName: string, trigger: 'manual' | 'pre_restore'): Snapshot {
+	const now = new Date().toISOString();
+	const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
+	return {
+		id: `snap_${trigger}_${Date.now()}`,
+		name: trigger === 'manual' ? `${dbName} ${stamp}` : `pre-restore ${dbName} ${stamp}`,
+		status: 'completed',
+		trigger,
+		scope: `database:${dbName}`,
+		trigger_app: null,
+		deployment_id: null,
+		parent_snapshot_id: null,
+		created_at: now,
+		completed_at: now,
+		delta_bytes: 3_145_728,
+		total_bytes: 3_145_728,
+		local_path: `/opt/tond/data/backups/snapshots/snap_${Date.now()}`,
+		remote_key: null,
+		storage_provider_id: null,
+		checksum_sha256: null,
+		error_message: null,
+		notes: null,
+		remote_status: backupConfig.storage_provider_id ? 'uploading' : null,
+		remote_error: null,
+		archive_bytes: null
+	};
+}
 
 function randomHex(bytes: number): string {
 	const buf = new Uint8Array(bytes);
@@ -432,7 +452,7 @@ function webhookConfig(app: App) {
 		app_id: app.id,
 		paths,
 		urls,
-		secret: webhookSecrets[app.id],
+		has_secret: true,
 		auto_deploy: app.auto_deploy,
 		watch_branch: app.watch_branch
 	};
@@ -458,7 +478,7 @@ function previewStore(appId: string) {
 	return (previewEnvVars[appId] ??= {});
 }
 
-function maskedEntries(vars: Record<string, string>) {
+function maskedEntries(vars: Record<string, string>): EnvVarEntry[] {
 	return Object.keys(vars)
 		.sort()
 		.map((key) => ({ key, masked: vars[key] ? '••••••••' : '' }));
@@ -547,6 +567,366 @@ function currentMockUser() {
 }
 
 const CREDENTIAL_PATHS = ['/api/auth/'];
+
+// ── Mock deploy engine ────────────────────────────────────────────────────────
+//
+// POST /api/apps/:id/deploy (and rollback) start a scripted deployment that
+// walks through the phases and writes log lines over ~15 s, so the live deploy
+// view can be developed without a server. Apps named "worker-queue" fail the
+// health step (nothing listening on the port); everything else succeeds.
+
+const deploymentLogs: Record<string, DeploymentLogLine[]> = structuredClone(MOCK_DEPLOYMENT_LOGS);
+type DeployFrame = { type: 'log' | 'deployment'; [key: string]: unknown };
+const deployListeners = new Map<string, Set<(frame: DeployFrame) => void>>();
+
+function emitDeploy(deploymentId: string, frame: DeployFrame) {
+	for (const listener of deployListeners.get(deploymentId) ?? []) listener(frame);
+}
+
+function mockPhasePlan(plan: string, healthPath: string | null): PhaseRecord[] {
+	const health = healthPath ? 'Health check' : 'Wait for the app to listen';
+	const table: Record<string, (string | null)[]> = {
+		git: ['Clone repository', 'Build image', 'Start container', health, 'Switch traffic'],
+		image: ['Pull image', null, 'Start container', health, 'Switch traffic'],
+		tarball: [null, 'Build uploaded source', 'Start container', health, 'Switch traffic'],
+		dockerfile: [null, 'Build image', 'Start container', health, 'Switch traffic'],
+		compose: [null, 'docker compose up', 'Find the service port', null, 'Switch traffic'],
+		rollback: [null, null, 'Start container', health, 'Switch traffic']
+	};
+	const labels = table[plan] ?? table.rollback;
+	const phases: DeployPhase[] = ['clone', 'build', 'start', 'health', 'release'];
+	return phases.map((phase, i) =>
+		labels[i] === null
+			? { phase, status: 'skipped' as const }
+			: { phase, status: 'pending' as const, label: labels[i] as string }
+	);
+}
+
+function updateDeployment(appId: string, id: string, change: (d: Deployment) => Deployment) {
+	const list = deployments[appId] ?? [];
+	const idx = list.findIndex((d) => d.id === id);
+	if (idx === -1) return;
+	list[idx] = change(list[idx]);
+	emitDeploy(id, { type: 'deployment', deployment: list[idx] });
+}
+
+function startMockDeploy(
+	app: App,
+	opts: { trigger_source: string; trigger_detail: string | null; rollbackOf?: Deployment }
+): Deployment {
+	const id = `dep_${Date.now().toString(36)}`;
+	const now = new Date().toISOString();
+	const plan = opts.rollbackOf ? 'rollback' : app.source_type;
+	const deployment: Deployment = {
+		id,
+		app_id: app.id,
+		image_tag: opts.rollbackOf?.image_tag ?? null,
+		status: 'running',
+		trigger_source: opts.trigger_source,
+		trigger_detail: opts.trigger_detail,
+		rollback_of: opts.rollbackOf?.id ?? null,
+		commit_sha: opts.rollbackOf?.commit_sha ?? null,
+		commit_message: opts.rollbackOf?.commit_message ?? null,
+		commit_author: opts.rollbackOf?.commit_author ?? null,
+		has_generated_dockerfile: false,
+		started_at: now,
+		finished_at: null,
+		created_at: now,
+		duration_secs: null,
+		phases: mockPhasePlan(plan, app.health_check_path),
+		failure: null,
+		image_pruned: false,
+		is_current: false,
+		rollback_available: false,
+		rollback_unavailable_reason: null
+	};
+	deployments[app.id] = [deployment, ...(deployments[app.id] ?? [])];
+	deploymentLogs[id] = [];
+	const appIdx = apps.findIndex((a) => a.id === app.id);
+	if (appIdx !== -1) apps[appIdx] = { ...apps[appIdx], status: 'building' };
+
+	const fail = app.name === 'worker-queue';
+	const tag = `tond-${app.name}:${id.slice(4, 16).padEnd(12, '0')}`;
+	const log = (level: string, message: string) => {
+		const line = { level, message, ts: new Date().toISOString() };
+		deploymentLogs[id].push(line);
+		emitDeploy(id, { type: 'log', ...line });
+	};
+	const phase = (name: DeployPhase) =>
+		updateDeployment(app.id, id, (d) => {
+			const ts = new Date().toISOString();
+			return {
+				...d,
+				phases: (d.phases ?? []).map((p) =>
+					p.phase === name
+						? { ...p, status: 'running' as const, started_at: ts }
+						: p.status === 'running'
+							? { ...p, status: 'succeeded' as const, finished_at: ts }
+							: p
+				)
+			};
+		});
+	const finish = () => {
+		const ts = new Date().toISOString();
+		const duration = Math.round((Date.parse(ts) - Date.parse(now)) / 1000);
+		if (fail) {
+			log('error', `Deployment failed: Nothing answered on port ${app.container_port} within 60s`);
+			updateDeployment(app.id, id, (d) => ({
+				...d,
+				status: 'failed',
+				finished_at: ts,
+				duration_secs: duration,
+				phases: (d.phases ?? []).map((p) =>
+					p.status === 'running' ? { ...p, status: 'failed' as const, finished_at: ts } : p
+				),
+				failure: {
+					phase: 'health',
+					code: 'port_not_listening',
+					title: `Nothing answered on port ${app.container_port} within 60s`,
+					hint: `Tond expected the app to listen on port ${app.container_port} inside the container. If it uses another port (nginx listens on 80, many Node apps on 3000), change the app's port; make sure the app binds to 0.0.0.0, not localhost.`,
+					detail:
+						'the new container did not become ready within 60s; the previous version keeps serving',
+					excerpt: [
+						'/docker-entrypoint.sh: Configuration complete; ready for start up',
+						'nginx: [notice] start worker processes'
+					]
+				}
+			}));
+			if (appIdx !== -1) apps[appIdx] = { ...apps[appIdx], status: 'failed' };
+			return;
+		}
+		log('info', `Deployed successfully! Container: ${id.slice(4, 16)}`);
+		deployments[app.id] = (deployments[app.id] ?? []).map((d) =>
+			d.id === id
+				? d
+				: {
+						...d,
+						is_current: false,
+						rollback_available: d.status === 'succeeded' && !d.image_pruned,
+						rollback_unavailable_reason:
+							d.status === 'succeeded' && !d.image_pruned ? null : d.rollback_unavailable_reason
+					}
+		);
+		updateDeployment(app.id, id, (d) => ({
+			...d,
+			status: 'succeeded',
+			finished_at: ts,
+			duration_secs: duration,
+			image_tag: d.image_tag ?? tag,
+			is_current: true,
+			rollback_unavailable_reason: 'This image is already running',
+			phases: (d.phases ?? []).map((p) =>
+				p.status === 'running'
+					? { ...p, status: 'succeeded' as const, finished_at: ts }
+					: p.status === 'pending'
+						? { ...p, status: 'skipped' as const }
+						: p
+			)
+		}));
+		if (appIdx !== -1) apps[appIdx] = { ...apps[appIdx], status: 'running' };
+	};
+
+	const script: [number, () => void][] = [
+		[300, () => log('info', opts.rollbackOf ? 'Starting rollback...' : 'Starting deployment...')]
+	];
+	if (plan === 'git') {
+		script.push(
+			[400, () => phase('clone')],
+			[300, () => log('info', `Cloning ${app.source_url ?? 'repository'} (main)`)],
+			[
+				1200,
+				() => {
+					updateDeployment(app.id, id, (d) => ({
+						...d,
+						commit_sha: '4e5f6a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5',
+						commit_message: 'Tidy up the order totals',
+						commit_author: 'Ada Lovelace'
+					}));
+					log('info', 'Commit 4e5f6a7 by Ada Lovelace: Tidy up the order totals');
+				}
+			],
+			[300, () => phase('build')]
+		);
+		for (const line of mockBuildLog(now, 'Tidy up the order totals', true).slice(4, 15)) {
+			script.push([500, () => log(line.level, line.message)]);
+		}
+		script.push([1500, () => log('info', '#15 exporting to image')]);
+	} else if (plan === 'image') {
+		script.push(
+			[400, () => phase('clone')],
+			[300, () => log('info', `Pulling image: ${app.source_url ?? 'image'}`)],
+			[2000, () => log('info', `Pinned ${app.source_url} as ${tag}`)]
+		);
+	} else if (plan !== 'rollback') {
+		script.push(
+			[400, () => phase('build')],
+			[1500, () => log('info', '#1 [internal] load build definition from Dockerfile')],
+			[1500, () => log('info', `#6 naming to docker.io/library/${tag} \u001b[32mdone\u001b[0m`)]
+		);
+	} else {
+		script.push([300, () => log('info', `Rolling back to image: ${opts.rollbackOf?.image_tag}`)]);
+	}
+	script.push(
+		[500, () => phase('start')],
+		[300, () => log('info', `Starting new container on port 8108:${app.container_port}`)],
+		[800, () => phase('health')],
+		[
+			300,
+			() =>
+				log(
+					'info',
+					app.health_check_path
+						? `Waiting up to 30s for the health check on port ${app.container_port}${app.health_check_path} to pass`
+						: `Waiting up to 60s for the app to answer on port ${app.container_port}`
+				)
+		]
+	);
+	if (fail) {
+		script.push([4000, finish]);
+	} else {
+		script.push(
+			[2000, () => log('info', 'New container is ready — cutting over traffic')],
+			[200, () => phase('release')],
+			[
+				300,
+				() => log('info', 'Waiting 3s for proxy to pick up new port before stopping old container')
+			],
+			[1500, () => log('info', 'Draining old container 4be1c2a9d0f3 (30s grace)')],
+			[800, finish]
+		);
+	}
+
+	let wait = 0;
+	for (const [ms, action] of script) {
+		wait += ms;
+		setTimeout(action, wait);
+	}
+	return deployment;
+}
+
+function deploymentDetail(app: App, d: Deployment) {
+	return {
+		...d,
+		logs: deploymentLogs[d.id] ?? [],
+		logs_truncated: false,
+		container_port: app.container_port,
+		health_check_path: app.health_check_path,
+		source_type: app.source_type
+	};
+}
+
+function isFinishedStatus(status: string) {
+	return ['succeeded', 'failed', 'superseded', 'cancelled'].includes(status);
+}
+
+const deploymentStreamHandler = deploymentStream.addEventListener('connection', ({ client }) => {
+	const match = client.url.pathname.match(/\/api\/apps\/([^/]+)\/deployments\/([^/]+)\/stream/);
+	const app = match ? apps.find((a) => a.id === match[1] || a.name === match[1]) : undefined;
+	const d = app ? (deployments[app.id] ?? []).find((x) => x.id === match?.[2]) : undefined;
+	if (!app || !d) {
+		client.close(4004, 'Deployment not found');
+		return;
+	}
+	const detail = deploymentDetail(app, d);
+	client.send(
+		JSON.stringify({
+			type: 'snapshot',
+			deployment: d,
+			logs: detail.logs,
+			logs_truncated: false,
+			container_port: detail.container_port,
+			health_check_path: detail.health_check_path,
+			source_type: detail.source_type
+		})
+	);
+	if (isFinishedStatus(d.status)) {
+		setTimeout(() => client.close(1000, 'Deployment finished'), 50);
+		return;
+	}
+	const listener = (frame: DeployFrame) => {
+		client.send(JSON.stringify(frame));
+		const dep = frame.deployment as Deployment | undefined;
+		if (frame.type === 'deployment' && dep && isFinishedStatus(dep.status)) {
+			// Let the last frames go out before closing, as a real socket would.
+			setTimeout(() => client.close(1000, 'Deployment finished'), 50);
+		}
+	};
+	const set = deployListeners.get(d.id) ?? new Set();
+	set.add(listener);
+	deployListeners.set(d.id, set);
+	client.addEventListener('close', () => set.delete(listener));
+});
+
+/** Mock of GET /api/domains/check (server: handlers/domains.rs). */
+function mockDomainCheck(domain: string) {
+	const serverIp = '203.0.113.10';
+	const parts = domain.split('.');
+	const zone = parts.length >= 2 ? parts.slice(-2).join('.') : null;
+	const rel = (host: string) =>
+		zone && host === zone ? '@' : zone ? host.slice(0, -(zone.length + 1)) : host;
+	const appsDomain = MOCK_SETTINGS.dashboard_domain;
+	const under = domain.endsWith(`.${appsDomain}`);
+	const record = (host: string) => ({
+		type: 'A' as const,
+		name: rel(host),
+		host,
+		value: serverIp
+	});
+	const resolved: Record<string, string[]> = {
+		'api.example.com': [serverIp],
+		'app.example.com': ['198.51.100.23'],
+		'db.example.com': [serverIp, '198.51.100.23']
+	};
+	const ips = under ? [serverIp] : (resolved[domain] ?? []);
+	const stray = ips.filter((ip) => ip !== serverIp);
+	let status: 'ok' | 'mismatch' | 'missing' | 'inconclusive';
+	let message: string;
+	if (ips.length === 0) {
+		status = 'missing';
+		message = `${domain} has no A or AAAA record yet. Create the record below; DNS changes usually show up within a few minutes.`;
+	} else if (ips.includes(serverIp)) {
+		status = 'ok';
+		message = stray.length
+			? `${domain} points at this server, but also at ${stray.join(', ')}. Remove that record: visitors and Let's Encrypt may reach the other address.`
+			: `${domain} points at this server.`;
+	} else {
+		status = 'mismatch';
+		message = `DNS for ${domain} points to ${ips.join(', ')}, expected ${serverIp}. Update the domain's A/AAAA record to this server.`;
+	}
+	const cert = certificates.find((c) => c.domain === domain) ?? null;
+	return {
+		domain,
+		zone,
+		apps_domain: appsDomain,
+		under_apps_domain: under,
+		records: [record(domain)],
+		wildcard_records: under ? [record(`*.${appsDomain}`)] : [],
+		server_ips: [serverIp],
+		dns: { status, resolved: ips, expected: [serverIp], stray, message },
+		certificate: cert
+			? {
+					status: cert.status,
+					issued_at: cert.issued_at,
+					expires_at: cert.expires_at,
+					last_error: cert.last_error,
+					last_attempt_at: cert.last_attempt_at,
+					next_retry_at: cert.next_retry_at,
+					failure_count: cert.failure_count
+				}
+			: null,
+		checked_at: new Date().toISOString()
+	};
+}
+
+/** Ports a few well-known images expose (mock of POST /api/images/inspect). */
+function mockImagePorts(image: string): { exposed: number[]; env: number | null } {
+	const name = image.toLowerCase();
+	if (/nginx|httpd|caddy|whoami|apache/.test(name)) return { exposed: [80], env: null };
+	if (/grafana|metabase/.test(name)) return { exposed: [3000], env: null };
+	if (/ghost/.test(name)) return { exposed: [2368], env: null };
+	if (/node|next/.test(name)) return { exposed: [], env: 3000 };
+	return { exposed: [], env: null };
+}
 
 export const handlers = [
 	// Scenario gate: runs first and falls through (returns undefined) when idle.
@@ -1086,11 +1466,13 @@ export const handlers = [
 			description?: string;
 			env_vars?: Record<string, string>;
 		};
+		const newProjectId = `proj_${Date.now()}`;
+		projectEnv[newProjectId] = body.env_vars ?? {};
 		const newProject: Project = {
-			id: `proj_${Date.now()}`,
+			id: newProjectId,
 			name: body.name,
 			description: body.description ?? null,
-			env_vars: body.env_vars ?? {},
+			env: maskedEntries(body.env_vars ?? {}),
 			active_preview_count: 0,
 			created_at: new Date().toISOString(),
 			updated_at: new Date().toISOString()
@@ -1111,10 +1493,16 @@ export const handlers = [
 		await delay(LATENCY);
 		const idx = projects.findIndex((p) => p.id === params.id || p.name === params.id);
 		if (idx === -1) return err('Project not found', 404);
-		const body = (await request.json()) as Partial<
-			Pick<Project, 'name' | 'description' | 'env_vars'>
+		const { env_vars, ...body } = (await request.json()) as Partial<
+			Pick<Project, 'name' | 'description'> & { env_vars: Record<string, string> }
 		>;
-		projects[idx] = { ...projects[idx], ...body, updated_at: new Date().toISOString() };
+		if (env_vars) projectEnv[projects[idx].id] = env_vars;
+		projects[idx] = {
+			...projects[idx],
+			...body,
+			...(env_vars && { env: maskedEntries(env_vars) }),
+			updated_at: new Date().toISOString()
+		};
 		return ok(projects[idx]);
 	}),
 
@@ -1234,13 +1622,96 @@ export const handlers = [
 
 	http.post('/api/apps/:id/deploy', async ({ params }) => {
 		await delay(LATENCY);
-		const idx = apps.findIndex((a) => a.id === params.id);
-		if (idx === -1) return err('App not found', 404);
-		apps[idx] = { ...apps[idx], updated_at: new Date().toISOString() };
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
+		if (!app) return err('App not found', 404);
+		const d = startMockDeploy(app, { trigger_source: 'manual', trigger_detail: MOCK_USER.email });
 		return HttpResponse.json(
-			{ success: true, data: enqueueMockDeployment(params.id as string, 'deploy'), error: null },
+			{
+				success: true,
+				data: {
+					message: 'Deployment queued',
+					app_id: app.id,
+					deployment_id: d.id,
+					status: 'queued',
+					// The mock never has to wait: the build queue is always free.
+					queue_position: 1,
+					superseded: null
+				},
+				error: null
+			},
 			{ status: 202 }
 		);
+	}),
+
+	http.put('/api/apps/:id/port', async ({ params, request }) => {
+		await delay(LATENCY);
+		const idx = apps.findIndex((a) => a.id === params.id);
+		if (idx === -1) return err('App not found', 404);
+		const body = (await request.json()) as { container_port: number };
+		const port = Number(body.container_port);
+		if (!Number.isInteger(port) || port < 1 || port > 65535) {
+			return err('Invalid input: container_port must be between 1 and 65535');
+		}
+		apps[idx] = { ...apps[idx], container_port: port, updated_at: new Date().toISOString() };
+		return ok(apps[idx]);
+	}),
+
+	// ── Source inspection and domain checks ──
+
+	http.post('/api/git/branches', async ({ request }) => {
+		await delay(LATENCY * 2);
+		const body = (await request.json()) as { url: string; github_app_id?: string };
+		if (!/^https?:\/\//.test(body.url ?? '')) {
+			return err(
+				'Invalid input: Branches can only be listed for http(s) Git URLs; type the branch name instead'
+			);
+		}
+		if (/private/.test(body.url) && !body.github_app_id) {
+			return err(
+				"Invalid input: Tond couldn't read this repository. If it's private, pick a connected GitHub App or add credentials; you can also type the branch name."
+			);
+		}
+		const trunk = /legacy/.test(body.url) ? 'master' : 'main';
+		return ok({
+			default_branch: trunk,
+			branches: [trunk, 'develop', 'feature/checkout', 'release/2.4'],
+			truncated: false
+		});
+	}),
+
+	http.post('/api/images/inspect', async ({ request }) => {
+		await delay(LATENCY * 4);
+		const body = (await request.json()) as { image: string };
+		const image = (body.image ?? '').trim();
+		if (!image || /\s/.test(image)) {
+			return err(
+				'Invalid input: Enter an image reference like nginx:alpine or ghcr.io/org/app:1.2'
+			);
+		}
+		if (/does-not-exist/.test(image)) {
+			return err(
+				`Invalid input: Couldn't pull ${image}: manifest unknown. Check the name and tag; private images need registry credentials.`
+			);
+		}
+		const { exposed, env } = mockImagePorts(image);
+		const suggested =
+			env && (exposed.length === 0 || exposed.includes(env)) ? env : (exposed[0] ?? null);
+		return ok({
+			image,
+			exposed_ports: exposed,
+			env_port: env,
+			suggested_port: suggested,
+			pulled: true
+		});
+	}),
+
+	http.get('/api/domains/check', async ({ request }) => {
+		await delay(LATENCY * 2);
+		const domain = (new URL(request.url).searchParams.get('domain') ?? '').trim().toLowerCase();
+		if (!/^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z][a-z0-9-]*$/.test(domain)) {
+			return err(`Invalid input: '${domain}' isn't a valid domain name`);
+		}
+		return ok(mockDomainCheck(domain));
 	}),
 
 	http.post('/api/apps/:id/stop', async ({ params }) => {
@@ -1435,7 +1906,6 @@ export const handlers = [
 	// ── Deployments ───────────────────────────────────────────────────────────
 
 	http.get('/api/apps/:id/deployments', async ({ params }) => {
-		advanceDeployments(params.id as string);
 		await delay(LATENCY);
 		return ok(deployments[params.id as string] ?? []);
 	}),
@@ -1479,32 +1949,39 @@ export const handlers = [
 				400
 			);
 		}
-		const idx = apps.findIndex((a) => a.id === params.id);
-		if (idx !== -1) {
-			apps[idx] = { ...apps[idx], status: 'running', updated_at: new Date().toISOString() };
-		}
-		// The restored image becomes current.
-		deployments[params.id as string] = list.map((d) => ({
-			...d,
-			is_current: d.id === target.id,
-			rollback_available: d.id !== target.id && d.status === 'succeeded' && !d.image_pruned,
-			rollback_unavailable_reason:
-				d.id === target.id ? 'This image is already running' : d.rollback_unavailable_reason
-		}));
-		const queued = enqueueMockDeployment(params.id as string, 'rollback', target.image_tag);
+		const app = apps.find((a) => a.id === params.id);
+		if (!app) return err('App not found', 404);
+		const d = startMockDeploy(app, {
+			trigger_source: 'rollback',
+			trigger_detail: MOCK_USER.email,
+			rollbackOf: target
+		});
 		return HttpResponse.json(
 			{
 				success: true,
 				data: {
-					...queued,
 					message: 'Rollback queued',
+					app_id: app.id,
 					image_tag: target.image_tag,
-					target_deployment_id: target.id
+					target_deployment_id: target.id,
+					deployment_id: d.id,
+					status: 'queued',
+					queue_position: 1,
+					superseded: null
 				},
 				error: null
 			},
 			{ status: 202 }
 		);
+	}),
+
+	http.get('/api/apps/:id/deployments/:deploymentId', async ({ params }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
+		if (!app) return err('App not found', 404);
+		const d = (deployments[app.id] ?? []).find((x) => x.id === params.deploymentId);
+		if (!d) return err(`Not found: deployment '${params.deploymentId}'`, 404);
+		return ok(deploymentDetail(app, d));
 	}),
 
 	http.post('/api/compose/validate', async ({ request }) => {
@@ -1556,12 +2033,20 @@ export const handlers = [
 		return ok(webhookConfig(app));
 	}),
 
+	http.get('/api/apps/:id/webhook-secret', async ({ params }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
+		if (!app) return err('App not found', 404);
+		webhookConfig(app);
+		return ok({ secret: webhookSecrets[app.id] });
+	}),
+
 	http.post('/api/apps/:id/webhook-secret/rotate', async ({ params }) => {
 		await delay(LATENCY);
 		const app = apps.find((a) => a.id === params.id || a.name === params.id);
 		if (!app) return err('App not found', 404);
 		webhookSecrets[app.id] = randomHex(32);
-		return ok(webhookConfig(app));
+		return ok({ secret: webhookSecrets[app.id] });
 	}),
 
 	http.put('/api/apps/:id/auto-deploy', async ({ params, request }) => {
@@ -1808,21 +2293,14 @@ export const handlers = [
 		return ok(makeMockMetrics(new URL(request.url).searchParams.get('range') ?? '1h', true));
 	}),
 
+	http.get('/api/system/self', async () => {
+		await delay(LATENCY);
+		return ok(makeMockSystemSelf());
+	}),
+
 	http.get('/api/system/metrics', async () => {
 		await delay(LATENCY);
 		return ok(makeMockSystemMetrics());
-	}),
-
-	http.get('/api/system/self', async () => {
-		await delay(LATENCY);
-		const self = makeMockSystemSelf();
-		const queued = Object.values(deployments)
-			.flat()
-			.filter((d) => d.status === 'queued').length;
-		const active = Object.values(deployments)
-			.flat()
-			.filter((d) => d.status === 'building' || d.status === 'deploying').length;
-		return ok({ ...self, build_queue: { ...self.build_queue, queued, active } });
 	}),
 
 	// ── Settings ──────────────────────────────────────────────────────────────
@@ -1908,8 +2386,14 @@ export const handlers = [
 		await delay(LATENCY);
 		const body = (await request.json()) as Omit<
 			AlertRule,
-			'id' | 'enabled' | 'last_fired_at' | 'created_at' | 'updated_at'
-		>;
+			| 'id'
+			| 'enabled'
+			| 'last_fired_at'
+			| 'created_at'
+			| 'updated_at'
+			| 'has_webhook_url'
+			| 'webhook_host'
+		> & { webhook_url?: string };
 		const validMetrics = ['cpu', 'memory', 'app_down', 'disk_usage'];
 		const validEvents = [
 			'deployment_success',
@@ -1936,7 +2420,8 @@ export const handlers = [
 			name: body.name,
 			metric: body.metric ?? null,
 			threshold: body.threshold ?? 0,
-			webhook_url: body.webhook_url,
+			has_webhook_url: !!body.webhook_url?.trim(),
+			webhook_host: urlHost(body.webhook_url?.trim() ?? ''),
 			enabled: true,
 			events: body.events ?? [],
 			last_fired_at: null,
@@ -1951,9 +2436,18 @@ export const handlers = [
 		await delay(LATENCY);
 		const idx = alertRules.findIndex((r) => r.id === params.id);
 		if (idx === -1) return err('Alert rule not found', 404);
-		const body = (await request.json()) as Partial<
-			Pick<AlertRule, 'name' | 'metric' | 'threshold' | 'webhook_url' | 'enabled' | 'events'>
+		const { webhook_url, ...body } = (await request.json()) as Partial<
+			Pick<AlertRule, 'name' | 'metric' | 'threshold' | 'enabled' | 'events'> & {
+				webhook_url: string;
+			}
 		>;
+		if (webhook_url !== undefined) {
+			alertRules[idx] = {
+				...alertRules[idx],
+				has_webhook_url: !!webhook_url.trim(),
+				webhook_host: urlHost(webhook_url.trim())
+			};
+		}
 		if (body.metric) {
 			const validMetrics = ['cpu', 'memory', 'app_down', 'disk_usage'];
 			if (!validMetrics.includes(body.metric)) {
@@ -2068,6 +2562,9 @@ export const handlers = [
 	}),
 
 	// ── Managed Databases (Phase 6.3) ─────────────────────────────────────────
+	// Passwords and connection-string overrides are write-only, like the
+	// server: responses carry has_password flags and masked strings, and the
+	// plaintext comes only from the (audited) credentials reveal.
 
 	http.get('/api/databases', async () => {
 		await delay(LATENCY);
@@ -2102,8 +2599,8 @@ export const handlers = [
 			status: 'running',
 			db_name: isRedisLike ? null : body.name.replace(/-/g, '_'),
 			db_user: isRedisLike ? 'default' : body.name.replace(/-/g, '_') + '_user',
-			db_password: 'mock_password_new',
-			root_password: isMysqlLike ? 'mock_root_password_new' : null,
+			has_password: true,
+			has_root_password: isMysqlLike,
 			memory_limit: body.memory_limit ?? null,
 			custom_external_url: null,
 			custom_internal_url: null,
@@ -2113,44 +2610,46 @@ export const handlers = [
 			updated_at: new Date().toISOString(),
 			public_access: body.public_access ?? false
 		};
+		dbSecrets[newDb.id] = {
+			db_password: randomHex(12),
+			root_password: isMysqlLike ? randomHex(12) : null
+		};
 		databases = [...databases, newDb];
-		const newDbUser = newDb.db_user!;
-		const newDbPass = newDb.db_password!;
-		const newConnectionString = isRedisLike
-			? `redis://${newDbUser}:${newDbPass}@localhost:${newDb.host_port}`
-			: `${body.db_type}://${newDbUser}:${newDbPass}@localhost:${newDb.host_port}/${newDb.db_name}`;
-		return ok({
-			...newDb,
-			connection_string: newConnectionString,
-			public_connection_string: mockPublicUrl(newDb),
-			internal_connection_string: null
-		});
+		// The creator gets the generated credentials once.
+		return ok({ ...dbDetail(newDb), credentials: dbCredentials(newDb) });
 	}),
 
 	http.get('/api/databases/:id', async ({ params }) => {
 		await delay(LATENCY);
 		const db = databases.find((d) => d.id === params.id || d.name === params.id);
 		if (!db) return err('Database not found', 404);
-		const isRedisLike = db.db_type === 'redis' || db.db_type === 'keydb';
-		const redisPort = 6379;
-		const computedExternal = db.host_port
-			? isRedisLike
-				? db.db_user && db.db_password
-					? `redis://${db.db_user}:${db.db_password}@localhost:${db.host_port}`
-					: `redis://localhost:${db.host_port}`
-				: `${db.db_type}://${db.db_user}:${db.db_password}@localhost:${db.host_port}/${db.db_name}`
-			: null;
-		const computedInternal = isRedisLike
-			? db.db_user && db.db_password
-				? `redis://${db.db_user}:${db.db_password}@tond-db-${db.name}:${redisPort}`
-				: `redis://tond-db-${db.name}:${redisPort}`
-			: `${db.db_type}://${db.db_user}:${db.db_password}@tond-db-${db.name}:${db.db_type === 'mysql' || db.db_type === 'mariadb' ? 3306 : 5432}/${db.db_name}`;
-		return ok({
-			...db,
-			connection_string: db.custom_external_url ?? computedExternal,
-			public_connection_string: mockPublicUrl(db),
-			internal_connection_string: db.custom_internal_url ?? computedInternal
-		});
+		return ok(dbDetail(db));
+	}),
+
+	http.get('/api/databases/:id/credentials', async ({ params }) => {
+		await delay(LATENCY);
+		const db = databases.find((d) => d.id === params.id || d.name === params.id);
+		if (!db) return err('Database not found', 404);
+		if (currentMockUser().role !== 'admin') {
+			return err('Forbidden: only admins can reveal database credentials', 403);
+		}
+		return ok(dbCredentials(db));
+	}),
+
+	http.get('/api/databases/:id/backups', async ({ params }) => {
+		await delay(LATENCY);
+		const db = databases.find((d) => d.id === params.id || d.name === params.id);
+		if (!db) return err(`database '${params.id}' not found`, 404);
+		return ok(snapshots.filter((s) => s.scope === 'full' || s.scope === `database:${db.name}`));
+	}),
+
+	http.post('/api/databases/:id/backups', async ({ params }) => {
+		await delay(LATENCY * 4);
+		const db = databases.find((d) => d.id === params.id || d.name === params.id);
+		if (!db) return err(`database '${params.id}' not found`, 404);
+		const snap = mockDatabaseSnapshot(db.name, 'manual');
+		snapshots = [snap, ...snapshots];
+		return HttpResponse.json({ success: true, data: snap, error: null }, { status: 201 });
 	}),
 
 	http.delete('/api/databases/:id', async ({ params }) => {
@@ -2172,17 +2671,15 @@ export const handlers = [
 		};
 		// Apply updates — empty string clears the override (mirrors backend behaviour)
 		const updated = { ...databases[idx] };
+		const urls = (dbCustomUrls[updated.id] ??= { external: null, internal: null });
+		const clean = (v: string | null) => (v === null || v.trim() === '' ? null : v.trim());
 		if (body.custom_external_url !== undefined) {
-			updated.custom_external_url =
-				body.custom_external_url === '' || body.custom_external_url === null
-					? null
-					: body.custom_external_url;
+			urls.external = clean(body.custom_external_url);
+			updated.custom_external_url = urls.external && maskUrlPassword(urls.external);
 		}
 		if (body.custom_internal_url !== undefined) {
-			updated.custom_internal_url =
-				body.custom_internal_url === '' || body.custom_internal_url === null
-					? null
-					: body.custom_internal_url;
+			urls.internal = clean(body.custom_internal_url);
+			updated.custom_internal_url = urls.internal && maskUrlPassword(urls.internal);
 		}
 		if (body.custom_image !== undefined) {
 			updated.custom_image =
@@ -2196,28 +2693,7 @@ export const handlers = [
 		}
 		updated.updated_at = new Date().toISOString();
 		databases[idx] = updated;
-		const db = databases[idx];
-		// Return ManagedDatabaseDetail with resolved connection strings
-		const isRedisLike2 = db.db_type === 'redis' || db.db_type === 'keydb';
-		const redisPort2 = 6379;
-		const computedExternal = db.host_port
-			? isRedisLike2
-				? db.db_user && db.db_password
-					? `redis://${db.db_user}:${db.db_password}@localhost:${db.host_port}`
-					: `redis://localhost:${db.host_port}`
-				: `${db.db_type}://${db.db_user}:${db.db_password}@localhost:${db.host_port}/${db.db_name}`
-			: null;
-		const computedInternal = isRedisLike2
-			? db.db_user && db.db_password
-				? `redis://${db.db_user}:${db.db_password}@tond-db-${db.name}:${redisPort2}`
-				: `redis://tond-db-${db.name}:${redisPort2}`
-			: `${db.db_type}://${db.db_user}:${db.db_password}@tond-db-${db.name}:${db.db_type === 'mysql' || db.db_type === 'mariadb' ? 3306 : 5432}/${db.db_name}`;
-		return ok({
-			...db,
-			connection_string: db.custom_external_url ?? computedExternal,
-			public_connection_string: mockPublicUrl(db),
-			internal_connection_string: db.custom_internal_url ?? computedInternal
-		});
+		return ok(dbDetail(updated));
 	}),
 
 	http.patch('/api/databases/:id/credentials', async ({ params, request }) => {
@@ -2233,6 +2709,7 @@ export const handlers = [
 		// Mirrors the server: passwords change inside the running engine; renames,
 		// Redis/KeyDB and stopped databases are refused and nothing is saved.
 		const current = databases[idx];
+		const secrets = (dbSecrets[current.id] ??= { db_password: null, root_password: null });
 		const renamed = (next: string | null | undefined, now: string | null) =>
 			!!next?.trim() && next.trim() !== now;
 		if (renamed(body.db_name, current.db_name) || renamed(body.db_user, current.db_user)) {
@@ -2241,17 +2718,10 @@ export const handlers = [
 			);
 		}
 		const changed: string[] = [];
-		const updated = { ...current };
 		const nextPw = body.db_password?.trim();
-		if (nextPw && nextPw !== current.db_password) {
-			updated.db_password = nextPw;
-			changed.push('db_password');
-		}
+		if (nextPw && nextPw !== secrets.db_password) changed.push('db_password');
 		const nextRoot = body.root_password?.trim();
-		if (nextRoot && nextRoot !== current.root_password) {
-			updated.root_password = nextRoot;
-			changed.push('root_password');
-		}
+		if (nextRoot && nextRoot !== secrets.root_password) changed.push('root_password');
 		if (changed.length === 0) return err('Invalid input: Nothing to change: enter a new password.');
 		if (current.db_type === 'redis' || current.db_type === 'keydb') {
 			return err(
@@ -2264,32 +2734,16 @@ export const handlers = [
 			);
 		}
 		await delay(LATENCY * 3); // simulate the docker exec
-		updated.updated_at = new Date().toISOString();
+		if (changed.includes('db_password')) secrets.db_password = nextPw!;
+		if (changed.includes('root_password')) secrets.root_password = nextRoot!;
+		const updated = {
+			...current,
+			has_password: !!secrets.db_password,
+			has_root_password: !!secrets.root_password,
+			updated_at: new Date().toISOString()
+		};
 		databases[idx] = updated;
-		const db = databases[idx];
-		const isRedisLikeC = db.db_type === 'redis' || db.db_type === 'keydb';
-		const redisPortC = 6379;
-		const computedExternalC = db.host_port
-			? isRedisLikeC
-				? db.db_user && db.db_password
-					? `redis://${db.db_user}:${db.db_password}@localhost:${db.host_port}`
-					: `redis://localhost:${db.host_port}`
-				: `${db.db_type}://${db.db_user}:${db.db_password}@localhost:${db.host_port}/${db.db_name}`
-			: null;
-		const computedInternalC = isRedisLikeC
-			? db.db_user && db.db_password
-				? `redis://${db.db_user}:${db.db_password}@tond-db-${db.name}:${redisPortC}`
-				: `redis://tond-db-${db.name}:${redisPortC}`
-			: `${db.db_type}://${db.db_user}:${db.db_password}@tond-db-${db.name}:${db.db_type === 'mysql' || db.db_type === 'mariadb' ? 3306 : 5432}/${db.db_name}`;
-		return ok({
-			database: {
-				...db,
-				connection_string: db.custom_external_url ?? computedExternalC,
-				public_connection_string: mockPublicUrl(db),
-				internal_connection_string: db.custom_internal_url ?? computedInternalC
-			},
-			changed
-		});
+		return ok({ database: dbDetail(updated), changed });
 	}),
 
 	http.post('/api/databases/:id/stop', async ({ params }) => {
@@ -2340,26 +2794,7 @@ export const handlers = [
 			updated_at: new Date().toISOString()
 		};
 		databases[idx] = updated;
-		const isRedisLike = updated.db_type === 'redis' || updated.db_type === 'keydb';
-		const redisPort = 6379;
-		const computedExternal = updated.host_port
-			? isRedisLike
-				? updated.db_user && updated.db_password
-					? `redis://${updated.db_user}:${updated.db_password}@localhost:${updated.host_port}`
-					: `redis://localhost:${updated.host_port}`
-				: `${updated.db_type}://${updated.db_user}:${updated.db_password}@localhost:${updated.host_port}/${updated.db_name}`
-			: null;
-		const computedInternal = isRedisLike
-			? updated.db_user && updated.db_password
-				? `redis://${updated.db_user}:${updated.db_password}@tond-db-${updated.name}:${redisPort}`
-				: `redis://tond-db-${updated.name}:${redisPort}`
-			: `${updated.db_type}://${updated.db_user}:${updated.db_password}@tond-db-${updated.name}:${updated.db_type === 'mysql' || updated.db_type === 'mariadb' ? 3306 : 5432}/${updated.db_name}`;
-		return ok({
-			...updated,
-			connection_string: updated.custom_external_url ?? computedExternal,
-			public_connection_string: mockPublicUrl(updated),
-			internal_connection_string: updated.custom_internal_url ?? computedInternal
-		});
+		return ok(dbDetail(updated));
 	}),
 
 	// ── Cron Jobs (Phase 6.4) ──────────────────────────────────────────────────
@@ -2401,7 +2836,7 @@ export const handlers = [
 			created_at: new Date().toISOString(),
 			updated_at: new Date().toISOString(),
 			timeout_seconds: body.timeout_seconds ?? null,
-			env: body.env && Object.keys(body.env).length > 0 ? body.env : null,
+			env: maskedEntries(body.env ?? {}),
 			last_run_status: null,
 			concurrency_policy: body.concurrency_policy ?? 'skip',
 			memory_mb: body.memory_mb ?? null,
@@ -2412,6 +2847,7 @@ export const handlers = [
 			volumes: mockCronVolumes(`cron_${Date.now()}`, body.volumes)
 		};
 		cronJobs = [...cronJobs, newJob];
+		cronEnv[newJob.id] = body.env ?? {};
 		cronRuns[newJob.id] = [];
 		return ok(newJob);
 	}),
@@ -2436,6 +2872,8 @@ export const handlers = [
 			enabled: boolean;
 			timeout_seconds: number | null;
 			env: Record<string, string>;
+			env_set: Record<string, string>;
+			env_unset: string[];
 			concurrency_policy: string;
 			memory_mb: number | null;
 			cpu_shares: number | null;
@@ -2444,6 +2882,11 @@ export const handlers = [
 			retry_delay_seconds: number;
 			volumes: CronVolumeInput[] | null;
 		}>;
+		// Env: full replace, then set/unset patches (values stay write-only)
+		const jobId = cronJobs[idx].id;
+		const nextEnv = { ...(body.env ?? cronEnv[jobId] ?? {}), ...(body.env_set ?? {}) };
+		for (const key of body.env_unset ?? []) delete nextEnv[key];
+		cronEnv[jobId] = nextEnv;
 		// Check for name conflict
 		if (body.name !== undefined && body.name !== cronJobs[idx].name) {
 			const conflict = cronJobs.some((j, i) => i !== idx && j.name === body.name);
@@ -2458,9 +2901,7 @@ export const handlers = [
 			...(body.command !== undefined && { command: JSON.stringify(body.command) }),
 			...(body.enabled !== undefined && { enabled: body.enabled }),
 			...('timeout_seconds' in body && { timeout_seconds: body.timeout_seconds ?? null }),
-			...('env' in body && {
-				env: body.env && Object.keys(body.env).length > 0 ? body.env : null
-			}),
+			env: maskedEntries(nextEnv),
 			...(body.concurrency_policy !== undefined && {
 				concurrency_policy: body.concurrency_policy
 			}),
@@ -2566,6 +3007,9 @@ export const handlers = [
 
 		client.addEventListener('close', () => clearInterval(timer));
 	}),
+
+	// ── WebSocket: live deploy view (see the mock deploy engine above) ─────────
+	deploymentStreamHandler,
 
 	// ── WebSocket: App log stream ─────────────────────────────────────────────
 	//
@@ -2799,12 +3243,27 @@ export const handlers = [
 
 	http.post('/api/integrations', async ({ request }) => {
 		await delay(LATENCY * 2);
-		const body = (await request.json()) as { name: string; kind: string; config: unknown };
+		const body = (await request.json()) as {
+			name: string;
+			kind: string;
+			config: Record<string, unknown>;
+		};
+		const newId = `int_${Date.now()}`;
+		const stored = storeIntegrationConfig(newId, body.config ?? {});
+		const needed: Record<string, string> = {
+			telegram: 'bot_token',
+			discord: 'webhook_url',
+			slack: 'webhook_url',
+			email: 'smtp_password'
+		};
+		if (!stored.saved_secrets.includes(needed[body.kind])) {
+			return err(`invalid config for ${body.kind}: missing field \`${needed[body.kind]}\``, 400);
+		}
 		const newIntegration: Integration = {
-			id: `int_${Date.now()}`,
+			id: newId,
 			name: body.name,
 			kind: body.kind as Integration['kind'],
-			config: body.config as Integration['config'],
+			...stored,
 			enabled: true,
 			created_at: new Date().toISOString(),
 			updated_at: new Date().toISOString()
@@ -2824,10 +3283,15 @@ export const handlers = [
 		await delay(LATENCY);
 		const idx = integrations.findIndex((i) => i.id === params.id);
 		if (idx === -1) return err('Integration not found', 404);
-		const body = (await request.json()) as Partial<
-			Pick<Integration, 'name' | 'config' | 'enabled'>
+		const { config, ...body } = (await request.json()) as Partial<
+			Pick<Integration, 'name' | 'enabled'> & { config: Record<string, unknown> }
 		>;
-		integrations[idx] = { ...integrations[idx], ...body, updated_at: new Date().toISOString() };
+		integrations[idx] = {
+			...integrations[idx],
+			...body,
+			...(config && storeIntegrationConfig(integrations[idx].id, config)),
+			updated_at: new Date().toISOString()
+		};
 		return ok(integrations[idx]);
 	}),
 
@@ -3144,7 +3608,10 @@ export const handlers = [
 			storage_provider_id: null,
 			checksum_sha256: null,
 			error_message: null,
-			notes: null
+			notes: null,
+			remote_status: backupConfig.storage_provider_id ? 'uploading' : null,
+			remote_error: null,
+			archive_bytes: null
 		};
 		snapshots = [snap, ...snapshots];
 		return ok(snap);
@@ -3181,7 +3648,10 @@ export const handlers = [
 			storage_provider_id: null,
 			checksum_sha256: null,
 			error_message: null,
-			notes: null
+			notes: null,
+			remote_status: backupConfig.storage_provider_id ? 'uploading' : null,
+			remote_error: null,
+			archive_bytes: null
 		};
 		snapshots = [preRestore, ...snapshots];
 		return ok({
@@ -3202,8 +3672,20 @@ export const handlers = [
 		await delay(LATENCY * 2);
 		const snap = snapshots.find((s) => s.id === params.id);
 		if (!snap) return err('Snapshot not found', 404);
-		const body = (await request.json()) as any;
-		return ok({ message: `Database '${body.db_name}' restored successfully.` });
+		const body = (await request.json()) as { db_name: string };
+		if (snap.scope !== 'full' && snap.scope !== `database:${body.db_name}`) {
+			return err(
+				`Database restore failed: This snapshot doesn't include the database '${body.db_name}'`,
+				500
+			);
+		}
+		await delay(LATENCY * 3);
+		const safetyNet = mockDatabaseSnapshot(body.db_name, 'pre_restore');
+		snapshots = [safetyNet, ...snapshots];
+		return ok({
+			message: `Database '${body.db_name}' restored. The data it held just before is saved as a backup.`,
+			pre_restore_snapshot_id: safetyNet.id
+		});
 	}),
 
 	http.get('/api/snapshots/config', async () => {

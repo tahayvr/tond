@@ -3,8 +3,7 @@
 -- ── Build/deploy queue ────────────────────────────────────────────────────
 -- deployments.status is now:
 --   'queued'     waiting for the app's previous deploy or a build slot
---   'building'   building / pulling the image
---   'deploying'  starting the container, health check, traffic cutover
+--   'running'    in progress (the phases column says which step)
 --   'succeeded' | 'failed'
 --   'superseded' a newer deploy of the same app replaced it while queued
 -- kind: 'deploy' (build or pull from the app's source), 'rollback' (re-run
@@ -16,7 +15,7 @@ ALTER TABLE deployments ADD COLUMN error TEXT;
 ALTER TABLE deployments ADD COLUMN superseded_by TEXT;
 -- Startup reconciliation and the queue look up unfinished rows.
 CREATE INDEX deployments_unfinished_idx ON deployments(status, created_at)
-  WHERE status IN ('queued', 'building', 'deploying');
+  WHERE status IN ('queued', 'running');
 
 -- ── Route version ─────────────────────────────────────────────────────────
 -- A single counter bumped whenever anything tond-proxy routes on changes.

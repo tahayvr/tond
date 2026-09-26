@@ -128,7 +128,7 @@ wait_for_app_running() {
 }
 
 delete_e2e_resources() {
-    for app in e2e-whoami e2e-static e2e-rooted e2e-compose; do
+    for app in e2e-whoami e2e-static e2e-rooted e2e-compose e2e-badport; do
         tond apps delete "$app" -y > /dev/null 2>&1 || true
     done
     tond db delete e2e-redis -y > /dev/null 2>&1 || true
@@ -578,9 +578,11 @@ status_of() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
 WHOAMI_ID=$(app_field e2e-whoami id)
 [[ "$WHOAMI_ID" =~ ^[0-9a-f-]{36}$ ]] || fail "could not read the e2e-whoami app id (got: ${WHOAMI_ID})"
 WEBHOOK_JSON=$(api "/api/apps/${WHOAMI_ID}/webhook")
-WEBHOOK_SECRET=$(jq -r '.data.secret // empty' <<< "$WEBHOOK_JSON")
+[[ "$(jq -r '.data.has_secret' <<< "$WEBHOOK_JSON")" == true && "$(jq -r '.data.secret // empty' <<< "$WEBHOOK_JSON")" == "" ]] \
+    || fail "the webhook config must say a secret is set without returning it"
+WEBHOOK_SECRET=$(api "/api/apps/${WHOAMI_ID}/webhook-secret" | jq -r '.data.secret // empty')
 [[ ${#WEBHOOK_SECRET} -ge 32 ]] || fail "every app must get a generated webhook secret"
-pass "app has a generated webhook secret"
+pass "app has a generated webhook secret (write-only; revealed on request)"
 [[ "$(jq -r '.data.paths.github' <<< "$WEBHOOK_JSON")" == "/api/webhooks/github/${WHOAMI_ID}" ]] \
     || fail "webhook URLs must be addressed by app UUID"
 pass "webhook URLs are addressed by app UUID"
@@ -841,8 +843,10 @@ wait_for 240 "e2e-redis running" \
     bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/databases | jq -e '.data[] | select(.name == \"e2e-redis\" and .status == \"running\")'"
 pass "e2e-redis is running"
 REDIS_DETAIL=$(api /api/databases/e2e-redis)
-REDIS_USER=$(jq -r '.data.db_user' <<<"$REDIS_DETAIL")
-REDIS_PASS=$(jq -r '.data.db_password' <<<"$REDIS_DETAIL")
+REDIS_CREDS=$(api /api/databases/e2e-redis/credentials)
+REDIS_USER=$(jq -r '.data.db_user' <<<"$REDIS_CREDS")
+REDIS_PASS=$(jq -r '.data.db_password' <<<"$REDIS_CREDS")
+[[ ${#REDIS_PASS} -ge 16 ]] || fail "the credentials reveal must return the Redis password"
 # The server may still be loading right after "running"; retry the auth check briefly.
 wait_for 30 "e2e-redis answering authenticated PING" \
     bash -c "docker exec -e REDISCLI_AUTH='${REDIS_PASS}' tond-db-e2e-redis redis-cli --no-auth-warning --user '${REDIS_USER}' PING | grep -qx PONG"
@@ -850,9 +854,60 @@ noauth=$(docker exec tond-db-e2e-redis redis-cli PING 2>&1 || true)
 [[ "$noauth" == *NOAUTH* ]] || fail "managed Redis must refuse unauthenticated clients, got: ${noauth}"
 wrong=$(docker exec -e REDISCLI_AUTH=wrong tond-db-e2e-redis redis-cli --no-auth-warning --user "$REDIS_USER" PING 2>&1 || true)
 [[ "$wrong" != *PONG* ]] || fail "managed Redis must refuse a wrong password"
-jq -e --arg u "$REDIS_USER" --arg p "$REDIS_PASS" '.data.connection_string | contains($u + ":" + $p + "@")' <<<"$REDIS_DETAIL" > /dev/null \
-    || fail "the Redis connection string must carry the credentials"
-pass "managed Redis requires auth (NOAUTH without, PONG with the ACL user); connection string carries credentials"
+jq -e --arg u "$REDIS_USER" --arg p "$REDIS_PASS" '.data.connection_string | contains($u + ":" + $p + "@")' <<<"$REDIS_CREDS" > /dev/null \
+    || fail "the revealed Redis connection string must carry the credentials"
+pass "managed Redis requires auth (NOAUTH without, PONG with the ACL user); revealed connection string carries credentials"
+
+step "Secrets at rest and write-only API secrets"
+# The database detail never carries the password; its connection string is masked.
+[[ "$(jq -r '.data.db_password // empty' <<<"$REDIS_DETAIL")" == "" && "$(jq -r '.data.has_password' <<<"$REDIS_DETAIL")" == true ]] \
+    || fail "the database detail must report has_password without the password"
+grep -qF "$REDIS_PASS" <<<"$REDIS_DETAIL" && fail "the database detail must not contain the password"
+jq -e '.data.connection_string | contains("••••••••")' <<<"$REDIS_DETAIL" > /dev/null \
+    || fail "the database detail's connection string must be masked"
+pass "database detail: has_password, masked connection string, no password"
+
+# An env var value is stored encrypted: neither the database file (nor its
+# WAL) nor the env listing contains it; an explicit reveal returns it.
+CANARY="e2e-canary-$(date +%s)-${RANDOM}${RANDOM}"
+[[ "$(api_req PATCH "/api/apps/${WHOAMI_ID}/env" "{\"set\":{\"E2E_CANARY\":\"${CANARY}\"}}")" == 200 ]] \
+    || fail "setting an env var must succeed: $(cat "$API_BODY")"
+grep -qF "$CANARY" "$API_BODY" && fail "the env patch response must not echo the value"
+api "/api/apps/${WHOAMI_ID}/env" | grep -qF "$CANARY" && fail "the env listing must mask values"
+[[ "$(api "/api/apps/${WHOAMI_ID}/env/E2E_CANARY" | jq -r '.data.value')" == "$CANARY" ]] \
+    || fail "revealing an env var must return its value"
+for f in "${DATA_DIR}"/tond.db*; do
+    grep -qaF "$CANARY" "$f" && fail "env var value found in plaintext in ${f}"
+    grep -qaF "$REDIS_PASS" "$f" && fail "database password found in plaintext in ${f}"
+    grep -qaF "$WEBHOOK_SECRET" "$f" && fail "webhook secret found in plaintext in ${f}"
+done
+pass "env values, database passwords and webhook secrets are not stored in plaintext"
+
+for action in env_reveal webhook_secret_reveal db_credentials_reveal; do
+    api "/api/audit-log?action=${action}&limit=1" | jq -e '.data.entries | length > 0' > /dev/null \
+        || fail "a ${action} must be audit-logged"
+done
+pass "every secret reveal is audit-logged"
+
+step "Per-database backup"
+[[ "$(api_req POST /api/databases/e2e-redis/backups '{}')" == 201 ]] \
+    || fail "backing up a database must succeed: $(cat "$API_BODY")"
+[[ "$(jq -r '.data.status + " " + .data.scope' "$API_BODY")" == "completed database:e2e-redis" ]] \
+    || fail "a database backup must complete with the database scope: $(cat "$API_BODY")"
+DB_BACKUP_ID=$(jq -r '.data.id' "$API_BODY")
+api /api/databases/e2e-redis/backups | jq -e --arg id "$DB_BACKUP_ID" '.data[] | select(.id == $id)' > /dev/null \
+    || fail "the database backup must be listed for the database"
+[[ -d "${DATA_DIR}/backups/snapshots/${DB_BACKUP_ID}/databases/e2e-redis" ]] \
+    || fail "the database backup must hold the database's data"
+pass "database backed up and listed"
+[[ "$(api_req POST "/api/snapshots/${DB_BACKUP_ID}/restore-database" '{"db_name":"e2e-redis"}')" == 200 ]] \
+    || fail "restoring the database must succeed: $(cat "$API_BODY")"
+SAFETY_ID=$(jq -r '.data.pre_restore_snapshot_id // empty' "$API_BODY")
+api /api/snapshots | jq -e --arg id "$SAFETY_ID" '.data[] | select(.id == $id and .scope == "database:e2e-redis" and .trigger == "pre_restore")' > /dev/null \
+    || fail "a database restore must back up the current data first"
+wait_for 60 "e2e-redis answering after the restore" \
+    bash -c "docker exec -e REDISCLI_AUTH='${REDIS_PASS}' tond-db-e2e-redis redis-cli --no-auth-warning --user '${REDIS_USER}' PING | grep -qx PONG"
+pass "database restored from its backup (safety-net backup taken first)"
 
 step "Cron job"
 tond cron create e2e-cron --schedule "0 0 1 1 *" --image alpine:3 --command "echo tond-e2e-cron-ok" > /dev/null
@@ -967,6 +1022,60 @@ tond apps logs e2e-whoami 2>/dev/null | grep -q "Proxy confirmed the new route i
 pass "cutover waited for the proxy's acknowledgement ($(tond apps logs e2e-whoami | grep -o 'confirmed the new route in [0-9]* ms' | tail -1))"
 wait_for 30 "route after queued deploys" bash -c "curl -sk --resolve '${WHOAMI_DOMAIN}:443:${IP}' 'https://${WHOAMI_DOMAIN}/' | grep -q Hostname:"
 
+step "Deploy UX: phases, trigger, likely cause, DNS check"
+ROLLBACK_ROW=$(deployments | jq -c '.data[0]')
+[[ "$(jq -r '.rollback_of' <<< "$ROLLBACK_ROW")" == "$FIRST_ID" ]] \
+    || fail "the rollback deployment must name the deployment it restored: ${ROLLBACK_ROW}"
+jq -e '[.phases[] | select(.status != "skipped")] | length > 0 and all(.status == "succeeded")' <<< "$ROLLBACK_ROW" > /dev/null \
+    || fail "a successful rollback must record every step as succeeded: ${ROLLBACK_ROW}"
+jq -e '.duration_secs >= 0' <<< "$ROLLBACK_ROW" > /dev/null || fail "deployments must record a duration"
+pass "rollback recorded its target, steps and duration"
+
+code=$(api_req POST /api/apps/e2e-whoami/deploy '{}')
+[[ "$code" == 202 ]] || fail "deploy should be accepted, got ${code}: $(cat "$API_BODY")"
+DEP_ID=$(jq -r '.data.deployment_id' "$API_BODY")
+[[ "$DEP_ID" =~ ^[0-9a-f-]{36}$ ]] || fail "deploy must return the new deployment's id, got: $(cat "$API_BODY")"
+wait_for 300 "deployment ${DEP_ID} to succeed" \
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/apps/e2e-whoami/deployments/${DEP_ID} | jq -e '.data.status == \"succeeded\"'"
+DETAIL=$(api "/api/apps/e2e-whoami/deployments/${DEP_ID}")
+jq -e '.data.trigger_source == "cli"' <<< "$DETAIL" > /dev/null \
+    || fail "a deploy over the local socket is triggered by the CLI: $(jq -c '.data | {trigger_source, trigger_detail}' <<< "$DETAIL")"
+jq -e '[.data.phases[] | .phase] == ["clone","build","start","health","release"]' <<< "$DETAIL" > /dev/null \
+    || fail "deployments record the five steps: $(jq -c '.data.phases' <<< "$DETAIL")"
+jq -e '.data.logs | length > 0 and any(.message | test("Pulling image"))' <<< "$DETAIL" > /dev/null \
+    || fail "the deployment's own log must be returned with it"
+pass "deploy returned ${DEP_ID}; its steps, trigger and log are recorded"
+wait_for_app_running e2e-whoami 120
+
+# whoami listens on 80; telling Tond 8081 must fail the first deploy with
+# a clear cause instead of 'running' with nothing behind the route.
+tond apps create e2e-badport --source-type image --source traefik/whoami:v1.10 --port 8081 > /dev/null
+code=$(api_req POST /api/apps/e2e-badport/deploy '{}')
+[[ "$code" == 202 ]] || fail "deploy should be accepted, got ${code}: $(cat "$API_BODY")"
+BAD_ID=$(jq -r '.data.deployment_id' "$API_BODY")
+wait_for 240 "deployment ${BAD_ID} to fail" \
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/apps/e2e-badport/deployments/${BAD_ID} | jq -e '.data.status == \"failed\"'"
+BAD=$(api "/api/apps/e2e-badport/deployments/${BAD_ID}")
+[[ "$(jq -r '.data.failure.code' <<< "$BAD")" == port_not_listening ]] \
+    || fail "a wrong port must be classified as port_not_listening: $(jq -c '.data.failure' <<< "$BAD")"
+jq -e '.data.failure.title | test("8081")' <<< "$BAD" > /dev/null || fail "the cause must name the expected port"
+jq -e '.data.phases[] | select(.phase == "health") | .status == "failed"' <<< "$BAD" > /dev/null \
+    || fail "the health step must be the one that failed"
+[[ "$(app_field e2e-badport status)" == failed ]] || fail "a failed first deploy leaves the app failed"
+[[ -z "$(docker ps -aq --filter name='^tond-e2e-badport$')" ]] || fail "the container of a failed deploy must be removed"
+pass "wrong port → failed with 'port_not_listening' naming port 8081"
+
+code=$(api_req GET "/api/domains/check?domain=${WHOAMI_DOMAIN}" '')
+[[ "$code" == 200 ]] || fail "domain check should answer 200, got ${code}: $(cat "$API_BODY")"
+jq -e '.data.dns.status | IN("ok","mismatch","missing","inconclusive")' "$API_BODY" > /dev/null \
+    || fail "domain check must report a DNS status: $(cat "$API_BODY")"
+jq -e --arg d "$WHOAMI_DOMAIN" '.data.domain == $d and (.data.records | all(.type == "A" or .type == "AAAA"))' "$API_BODY" > /dev/null \
+    || fail "domain check must list A/AAAA records to create: $(cat "$API_BODY")"
+DNS_STATUS=$(jq -r '.data.dns.status' "$API_BODY")
+code=$(api_req GET "/api/domains/check?domain=not_a_domain" '')
+[[ "$code" == 400 ]] || fail "an invalid domain must be rejected with 400, got ${code}"
+pass "domain check reports DNS '${DNS_STATUS}' for ${WHOAMI_DOMAIN}; invalid domains → 400"
+
 step "Resource metrics (cgroup sampling, restarts, cached host stats)"
 # The collector samples every 30 s; the first reading only primes the rates.
 wait_for 150 "e2e-whoami metrics samples" \
@@ -1029,7 +1138,7 @@ journalctl -u tond-server --since "-2min" --no-pager -o cat | grep -q "SIGTERM r
     || fail "tond-server must shut down gracefully on SIGTERM"
 pass "tond-server shut down gracefully on SIGTERM"
 # A restart in the middle of a deploy: the deployment is marked interrupted,
-# never left 'building'/'deploying'.
+# never left 'running'.
 api_req POST /api/apps/e2e-whoami/deploy '{}' > /dev/null
 INTERRUPTED=$(jq -r .data.deployment_id "$API_BODY")
 systemctl kill -s SIGKILL tond-server
@@ -1037,19 +1146,19 @@ wait_for 60 "API health after a crash" curl -sf http://127.0.0.1:3001/health
 status=$(api /api/apps/e2e-whoami/deployments | jq -r --arg id "$INTERRUPTED" '.data[] | select(.id == $id) | .status')
 case "$status" in
     failed)
-        api /api/apps/e2e-whoami/deployments | jq -e --arg id "$INTERRUPTED" '.data[] | select(.id == $id) | .error | test("Interrupted")' > /dev/null \
+        api /api/apps/e2e-whoami/deployments | jq -e --arg id "$INTERRUPTED" '.data[] | select(.id == $id) | .failure.code == "interrupted"' > /dev/null \
             || fail "an interrupted deploy must say so"
         pass "a deploy cut off by a crash is marked failed (interrupted) at startup" ;;
-    queued|building|deploying|succeeded)
+    queued|running|succeeded)
         # It had not started yet (resumed from the queue) or finished first.
         wait_for 300 "the resumed deploy to finish" \
             bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/apps/e2e-whoami/deployments | jq -e --arg id '${INTERRUPTED}' '.data[] | select(.id == \$id and (.status == \"succeeded\" or .status == \"failed\"))'"
         pass "a deploy caught by the crash was resumed or had finished (status was ${status})" ;;
     *) fail "unexpected status for the interrupted deploy: '${status}'" ;;
 esac
-unfinished=$(api /api/apps/e2e-whoami/deployments | jq '[.data[] | select(.status == "building" or .status == "deploying")] | length')
+unfinished=$(api /api/apps/e2e-whoami/deployments | jq '[.data[] | select(.status == "running")] | length')
 wait_for 300 "no deployment left in flight" \
-    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/apps/e2e-whoami/deployments | jq -e '[.data[] | select(.status == \"building\" or .status == \"deploying\" or .status == \"queued\")] | length == 0'"
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/apps/e2e-whoami/deployments | jq -e '[.data[] | select(.status == \"running\" or .status == \"queued\")] | length == 0'"
 wait_for_app_running e2e-whoami 120
 pass "startup reconciliation left nothing in flight (had ${unfinished} right after the crash)"
 

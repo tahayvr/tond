@@ -16,8 +16,8 @@
 //     systemd slice install.sh caps at MemoryMax=60%, so a runaway build can't
 //     push the host into an OOM that takes out running apps or Tond.
 //
-// Deployment row lifecycle:
-//   queued -> building -> deploying -> succeeded | failed
+// Deployment row lifecycle (deploy::create inserts the row as 'queued'):
+//   queued -> running -> succeeded | failed      (phases: deploy::progress)
 //   queued -> superseded
 // A row stays 'queued' while it waits for the app's previous deploy *or* for
 // a build slot; `positions()` gives each queued row its place in line.
@@ -32,39 +32,16 @@ use std::sync::{Arc, LazyLock, Mutex};
 use anyhow::Result;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tond_common::App;
-use uuid::Uuid;
 
-use crate::alerts;
+use super::core::{DeployKind, DeployRequest};
 use crate::runtime::shutdown;
 use crate::state::AppState;
-
-/// What a queued deployment does.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum JobKind {
-    /// Build or pull from the app's configured source.
-    Deploy,
-    /// Re-run an earlier deployment's exact image.
-    Rollback { image_tag: String },
-    /// Build the uploaded source in `dir`, then deploy it.
-    Upload { dir: String },
-}
-
-impl JobKind {
-    fn as_str(&self) -> &'static str {
-        match self {
-            JobKind::Deploy => "deploy",
-            JobKind::Rollback { .. } => "rollback",
-            JobKind::Upload { .. } => "upload",
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct Job {
     pub deployment_id: String,
     pub app_id: String,
-    pub kind: JobKind,
-    pub trigger_source: String,
+    pub req: DeployRequest,
 }
 
 /// Result of `enqueue`, returned by the API as 202 Accepted.
@@ -222,12 +199,12 @@ impl BuildQueue {
     }
 }
 
-/// Per-deployment handle passed to the deploy functions: moves the row
-/// through its states and holds the build slot during the build phase.
+/// Per-deployment handle passed to deploy::run: moves the row out of the
+/// queue and holds the build slot during the build phase.
 pub struct DeployCtx {
     pub deployment_id: String,
     queue: &'static BuildQueue,
-    permit: tokio::sync::Mutex<Option<OwnedSemaphorePermit>>,
+    permit: Mutex<Option<OwnedSemaphorePermit>>,
 }
 
 impl DeployCtx {
@@ -235,42 +212,52 @@ impl DeployCtx {
         Self {
             deployment_id,
             queue,
-            permit: tokio::sync::Mutex::new(None),
+            permit: Mutex::new(None),
         }
     }
 
-    /// Wait for a build slot and mark the row 'building'. Idempotent.
-    pub async fn begin_build(&self, state: &AppState) -> Result<()> {
-        let mut permit = self.permit.lock().await;
-        if permit.is_none() {
-            *permit = Some(self.queue.builds.clone().acquire_owned().await?);
-            self.queue.leave_waiting(&self.deployment_id);
-            set_status(state, &self.deployment_id, "building").await?;
-        }
-        Ok(())
+    fn has_permit(&self) -> bool {
+        self.permit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 
-    /// Release the build slot and mark the row 'deploying'.
-    pub async fn begin_deploy(&self, state: &AppState) -> Result<()> {
-        self.permit.lock().await.take();
+    /// Leave the queue: mark the row 'running'. Idempotent.
+    pub async fn begin(&self, state: &AppState) -> Result<()> {
         self.queue.leave_waiting(&self.deployment_id);
-        set_status(state, &self.deployment_id, "deploying").await
+        mark_running(state, &self.deployment_id).await
+    }
+
+    /// Wait for a build slot, then [`begin`](Self::begin). Idempotent.
+    pub async fn begin_build(&self, state: &AppState) -> Result<()> {
+        if !self.has_permit() {
+            let permit = self.queue.builds.clone().acquire_owned().await?;
+            *self.permit.lock().unwrap_or_else(|e| e.into_inner()) = Some(permit);
+        }
+        self.begin(state).await
+    }
+
+    /// Give the build slot back (the image exists, or the deployment ended).
+    pub fn release_build(&self) {
+        self.permit.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
 }
 
-async fn set_status(state: &AppState, deployment_id: &str, status: &str) -> Result<()> {
-    let now = chrono::Utc::now().to_rfc3339();
+async fn mark_running(state: &AppState, deployment_id: &str) -> Result<()> {
     // started_at marks when work (not waiting) began.
-    sqlx::query(
-        "UPDATE deployments
-         SET status = ?, started_at = CASE WHEN status = 'queued' THEN ? ELSE started_at END
-         WHERE id = ?",
+    let app_id: Option<String> = sqlx::query_scalar(
+        "UPDATE deployments SET status = 'running', started_at = ?
+         WHERE id = ? AND status = 'queued' RETURNING app_id",
     )
-    .bind(status)
-    .bind(&now)
+    .bind(chrono::Utc::now().to_rfc3339())
     .bind(deployment_id)
-    .execute(&state.db)
+    .fetch_optional(&state.db)
     .await?;
+    // Live deploy views re-read the row.
+    if let Some(app_id) = app_id {
+        crate::log_bus::publish_deployment(&app_id, deployment_id);
+    }
     Ok(())
 }
 
@@ -283,7 +270,7 @@ pub async fn finish(
 ) -> Result<()> {
     sqlx::query(
         "UPDATE deployments SET status = ?, error = COALESCE(?, error), finished_at = ?
-         WHERE id = ? AND status IN ('queued', 'building', 'deploying')",
+         WHERE id = ? AND status IN ('queued', 'running')",
     )
     .bind(status)
     .bind(error)
@@ -294,40 +281,19 @@ pub async fn finish(
     Ok(())
 }
 
-/// Queue a deployment of `app`: insert its row and hand it to the app's runner.
-pub async fn enqueue(
+/// Hand a created ('queued') deployment to the app's runner.
+pub async fn submit_request(
     state: &AppState,
-    app: &App,
-    kind: JobKind,
-    trigger_source: &str,
-) -> Result<Enqueued> {
-    let deployment_id = Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-    let image_tag = match &kind {
-        JobKind::Rollback { image_tag } => Some(image_tag.clone()),
-        _ => None,
-    };
-    sqlx::query(
-        "INSERT INTO deployments (id, app_id, image_tag, status, trigger_source, kind, started_at, created_at)
-         VALUES (?, ?, ?, 'queued', ?, ?, ?, ?)",
-    )
-    .bind(&deployment_id)
-    .bind(&app.id)
-    .bind(&image_tag)
-    .bind(trigger_source)
-    .bind(kind.as_str())
-    .bind(&now)
-    .bind(&now)
-    .execute(&state.db)
-    .await?;
-
+    app_id: &str,
+    deployment_id: String,
+    req: DeployRequest,
+) -> Enqueued {
     let job = Job {
         deployment_id,
-        app_id: app.id.clone(),
-        kind,
-        trigger_source: trigger_source.to_string(),
+        app_id: app_id.to_string(),
+        req,
     };
-    Ok(submit(state, global(), job).await)
+    submit(state, global(), job).await
 }
 
 /// Hand an existing 'queued' row back to the queue (startup resume).
@@ -353,7 +319,8 @@ async fn submit(state: &AppState, queue: &'static BuildQueue, job: Job) -> Enque
         .bind(&old.deployment_id)
         .execute(&state.db)
         .await;
-        if let JobKind::Upload { dir } = &old.kind {
+        crate::log_bus::publish_deployment(&app_id, &old.deployment_id);
+        if let DeployKind::Upload { dir } = &old.req.kind {
             let _ = tokio::fs::remove_dir_all(dir).await;
         }
         tracing::info!(
@@ -381,6 +348,7 @@ async fn run_app(state: AppState, queue: &'static BuildQueue, app_id: String) {
     while let Some(job) = queue.next_job(&app_id) {
         let ctx = DeployCtx::with_queue(job.deployment_id.clone(), queue);
         execute(&state, &ctx, &job).await;
+        ctx.release_build();
         queue.leave_waiting(&job.deployment_id);
     }
 }
@@ -400,75 +368,13 @@ async fn execute(state: &AppState, ctx: &DeployCtx, job: &Job) {
             Some("The app was deleted"),
         )
         .await;
-        if let JobKind::Upload { dir } = &job.kind {
+        if let DeployKind::Upload { dir } = &job.req.kind {
             let _ = tokio::fs::remove_dir_all(dir).await;
         }
         return;
     };
-
-    let result = run_job(state, ctx, &mut app, job).await;
-    if let JobKind::Upload { dir } = &job.kind {
-        let _ = tokio::fs::remove_dir_all(dir).await;
-    }
-
-    match result {
-        Ok(()) => {
-            let status: Option<String> =
-                sqlx::query_scalar("SELECT status FROM deployments WHERE id = ?")
-                    .bind(&job.deployment_id)
-                    .fetch_optional(&state.db)
-                    .await
-                    .ok()
-                    .flatten();
-            let (event, detail) = if status.as_deref() == Some("failed") {
-                (
-                    "deployment_failure",
-                    Some(
-                        "The new container failed its health check; the previous version keeps serving",
-                    ),
-                )
-            } else {
-                ("deployment_success", None)
-            };
-            alerts::fire_event_alerts(state, event, Some(&app.id), Some(&app.name), detail).await;
-        }
-        Err(e) => {
-            let message = format!("{e:#}");
-            tracing::error!(
-                "Deploy {} of {} failed: {}",
-                job.deployment_id,
-                app.name,
-                message
-            );
-            let _ = finish(state, &job.deployment_id, "failed", Some(&message)).await;
-            let _ = sqlx::query(
-                "UPDATE apps SET status = 'failed', updated_at = datetime('now') WHERE id = ?",
-            )
-            .bind(&app.id)
-            .execute(&state.db)
-            .await;
-            alerts::fire_event_alerts(
-                state,
-                "deployment_failure",
-                Some(&app.id),
-                Some(&app.name),
-                Some(&message),
-            )
-            .await;
-        }
-    }
-}
-
-async fn run_job(state: &AppState, ctx: &DeployCtx, app: &mut App, job: &Job) -> Result<()> {
-    match &job.kind {
-        JobKind::Deploy => super::deploy(state, app, &job.trigger_source, ctx).await,
-        JobKind::Rollback { image_tag } => super::deploy_image(state, app, image_tag, ctx).await,
-        JobKind::Upload { dir } => {
-            ctx.begin_build(state).await?;
-            super::build_from_dir(state, app, dir).await?;
-            super::deploy(state, app, &job.trigger_source, ctx).await
-        }
-    }
+    // deploy::run records phases, the result, the app status and alerts.
+    super::run(state, &mut app, &job.deployment_id, &job.req, ctx).await;
 }
 
 #[cfg(test)]
@@ -479,8 +385,7 @@ mod tests {
         Job {
             deployment_id: id.to_string(),
             app_id: app.to_string(),
-            kind: JobKind::Deploy,
-            trigger_source: "manual".to_string(),
+            req: DeployRequest::source("manual", None),
         }
     }
 
@@ -560,10 +465,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ctx_moves_the_row_through_its_states_and_holds_one_build_slot() {
+    async fn ctx_moves_the_row_out_of_the_queue_and_holds_one_build_slot() {
         static Q: LazyLock<BuildQueue> = LazyLock::new(|| BuildQueue::new(1));
         let state = test_state().await;
-        for id in ["x1", "x2"] {
+        for id in ["x1", "x2", "x3"] {
             sqlx::query(
                 "INSERT INTO deployments (id, app_id, status, started_at, created_at)
                  VALUES (?, 'app', 'queued', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
@@ -575,27 +480,29 @@ mod tests {
         }
         let a = DeployCtx::with_queue("x1".into(), &Q);
         let b = DeployCtx::with_queue("x2".into(), &Q);
+        let c = DeployCtx::with_queue("x3".into(), &Q);
         a.begin_build(&state)
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         a.begin_build(&state)
             .await
             .unwrap_or_else(|e| panic!("idempotent: {e}"));
-        assert_eq!(status_of(&state, "x1").await.0, "building");
+        assert_eq!(status_of(&state, "x1").await.0, "running");
 
         let blocked =
             tokio::time::timeout(std::time::Duration::from_millis(50), b.begin_build(&state)).await;
         assert!(blocked.is_err(), "only one build at a time");
         assert_eq!(status_of(&state, "x2").await.0, "queued");
 
-        a.begin_deploy(&state)
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(status_of(&state, "x1").await.0, "deploying");
+        // A rollback builds nothing: it runs while the slot is taken.
+        c.begin(&state).await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(status_of(&state, "x3").await.0, "running");
+
+        a.release_build();
         b.begin_build(&state)
             .await
             .unwrap_or_else(|e| panic!("slot freed: {e}"));
-        assert_eq!(status_of(&state, "x2").await.0, "building");
+        assert_eq!(status_of(&state, "x2").await.0, "running");
 
         finish(&state, "x1", "succeeded", None)
             .await

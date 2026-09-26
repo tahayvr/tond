@@ -4,8 +4,9 @@
 // leave work half done. Nothing would ever finish it, so:
 //
 // At shutdown, after the grace period (mark_interrupted):
-//   deployments 'building'/'deploying' -> 'failed' ("Tond was stopped ...")
-//   snapshots   'running'/'pending'    -> 'failed'
+//   deployments 'running'            -> 'failed' (deploy::progress::fail_interrupted:
+//                                       phases closed, failure "interrupted")
+//   snapshots   'running'/'pending'  -> 'failed'
 //
 // At startup (at_startup), before any listener or loop starts:
 //   - the same marking, for work a crash left behind ("Tond restarted ...");
@@ -25,7 +26,8 @@ use anyhow::Result;
 use bollard::query_parameters::InspectContainerOptions;
 use tond_common::App;
 
-use crate::deploy::queue::{self, Job, JobKind};
+use crate::deploy::queue::{self, Job};
+use crate::deploy::{DeployKind, DeployRequest};
 use crate::state::AppState;
 
 pub const RESTART_REASON: &str =
@@ -52,15 +54,7 @@ impl Report {
 /// Mark in-flight deployments and snapshots as interrupted with `reason`.
 pub async fn mark_interrupted(db: &sqlx::SqlitePool, reason: &str) -> Result<Report> {
     let now = chrono::Utc::now().to_rfc3339();
-    let deployments = sqlx::query(
-        "UPDATE deployments SET status = 'failed', error = ?, finished_at = ?
-         WHERE status IN ('building', 'deploying')",
-    )
-    .bind(reason)
-    .bind(&now)
-    .execute(db)
-    .await?
-    .rows_affected();
+    let deployments = crate::deploy::progress::fail_interrupted(db).await?;
     let snapshots = sqlx::query(
         "UPDATE snapshots SET status = 'failed', error_message = ?, completed_at = ?
          WHERE status IN ('running', 'pending')",
@@ -79,17 +73,29 @@ pub async fn mark_interrupted(db: &sqlx::SqlitePool, reason: &str) -> Result<Rep
 
 /// Hand 'queued' deployments back to the build queue (oldest first).
 async fn resume_queued(state: &AppState) -> Result<u64> {
-    let rows: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as(
-        "SELECT id, app_id, kind, trigger_source, image_tag FROM deployments
-         WHERE status = 'queued' ORDER BY created_at",
+    type Row = (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT id, app_id, kind, trigger_source, trigger_detail, image_tag, rollback_of
+         FROM deployments WHERE status = 'queued' ORDER BY created_at",
     )
     .fetch_all(&state.db)
     .await?;
     let mut resumed = 0;
-    for (id, app_id, kind, trigger_source, image_tag) in rows {
+    for (id, app_id, kind, trigger_source, trigger_detail, image_tag, rollback_of) in rows {
         let kind = match (kind.as_str(), image_tag) {
-            ("rollback", Some(image_tag)) => JobKind::Rollback { image_tag },
-            ("deploy", _) => JobKind::Deploy,
+            ("rollback", Some(image_tag)) => DeployKind::Rollback {
+                image_tag,
+                target_deployment_id: rollback_of.unwrap_or_default(),
+            },
+            ("deploy", _) => DeployKind::Source,
             _ => {
                 queue::finish(state, &id, "failed", Some(LOST_UPLOAD_REASON)).await?;
                 continue;
@@ -100,8 +106,11 @@ async fn resume_queued(state: &AppState) -> Result<u64> {
             Job {
                 deployment_id: id,
                 app_id,
-                kind,
-                trigger_source,
+                req: DeployRequest {
+                    kind,
+                    trigger_source,
+                    trigger_detail,
+                },
             },
         )
         .await;
@@ -273,8 +282,8 @@ mod tests {
     async fn in_flight_work_is_marked_interrupted_and_finished_work_is_untouched() {
         let db = db().await;
         for (id, status) in [
-            ("b", "building"),
-            ("d", "deploying"),
+            ("b", "running"),
+            ("d", "running"),
             ("q", "queued"),
             ("ok", "succeeded"),
         ] {
@@ -292,13 +301,18 @@ mod tests {
         assert_eq!(report.snapshots_interrupted, 1);
 
         let rows: Vec<(String, String, Option<String>)> =
-            sqlx::query_as("SELECT id, status, error FROM deployments ORDER BY id")
+            sqlx::query_as("SELECT id, status, failure FROM deployments ORDER BY id")
                 .fetch_all(&db)
                 .await
                 .unwrap_or_else(|e| panic!("rows: {e}"));
-        assert_eq!(
-            rows[0],
-            ("b".into(), "failed".into(), Some(RESTART_REASON.into()))
+        assert_eq!(rows[0].1, "failed");
+        assert!(
+            rows[0]
+                .2
+                .as_deref()
+                .is_some_and(|f| f.contains("\"interrupted\"")),
+            "the failure says it was interrupted: {:?}",
+            rows[0].2
         );
         assert_eq!(rows[1].1, "failed");
         assert_eq!(rows[2], ("ok".into(), "succeeded".into(), None));

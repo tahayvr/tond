@@ -378,7 +378,7 @@ pub fn prometheus(report: &SystemSelfResponse) -> String {
     opt(
         &mut out,
         "tond_deployments_active",
-        "Deployments building or deploying.",
+        "Deployments in progress.",
         "gauge",
         Some(f64::from(b.active)),
     );

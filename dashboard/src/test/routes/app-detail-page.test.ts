@@ -38,6 +38,7 @@ const api = vi.hoisted(() => ({
 	setWebhookSecret: vi.fn(),
 	getWebhookConfig: vi.fn(),
 	rotateWebhookSecret: vi.fn(),
+	revealWebhookSecret: vi.fn(),
 	setAutoDeploy: vi.fn(),
 	updateSource: vi.fn(),
 	listPreviews: vi.fn(),
@@ -55,10 +56,15 @@ const api = vi.hoisted(() => ({
 	listGitHubRepos: vi.fn(),
 	listGitHubBranches: vi.fn(),
 	setAppGitHubApp: vi.fn(),
-	getApp: vi.fn()
+	getApp: vi.fn(),
+	updateContainerPort: vi.fn(),
+	openLogStream: vi.fn((url: string) => {
+		const ws = new WebSocket(url);
+		return () => ws.close();
+	})
 }));
 
-vi.mock('$lib/auth.svelte', () => ({ isAdmin: () => true }));
+vi.mock('$lib/auth.svelte', () => ({ isAdmin: () => true, can: () => true }));
 
 vi.mock('$app/state', () => ({
 	page: state.page
@@ -89,6 +95,10 @@ vi.mock('$lib/components/tabs/app-page/app-environment.svelte', async () => ({
 }));
 
 vi.mock('$lib/components/tabs/app-page/app-domain.svelte', async () => ({
+	default: (await import('../mocks/EmptyComponent.svelte')).default
+}));
+
+vi.mock('$lib/components/tabs/app-page/app-port.svelte', async () => ({
 	default: (await import('../mocks/EmptyComponent.svelte')).default
 }));
 
@@ -198,6 +208,10 @@ describe('apps/[id] page', () => {
 		api.listGitHubRepos.mockResolvedValue([]);
 		api.listGitHubBranches.mockResolvedValue([]);
 		api.getApp.mockResolvedValue({ ...app });
+		api.openLogStream.mockImplementation((url: string) => {
+			const ws = new WebSocket(url);
+			return () => ws.close();
+		});
 	});
 
 	it('renders app detail from route data without an initial loading state', () => {
@@ -221,39 +235,41 @@ describe('apps/[id] page', () => {
 		expect(api.getApp).not.toHaveBeenCalled();
 	});
 
-	it('re-deploys the app and refreshes its data', async () => {
-		api.deployApp.mockResolvedValue(undefined);
-		api.getApp.mockResolvedValue({ ...app, status: 'building' });
+	it('re-deploys the app and opens the live deploy view', async () => {
+		api.deployApp.mockResolvedValue({
+			message: 'Deployment started',
+			app_id: 'app_1',
+			deployment_id: 'dep_9'
+		});
 
 		const user = userEvent.setup();
 		renderPage();
 
 		await user.click(screen.getByRole('button', { name: /re-deploy/i }));
 
-		expect(openFeedPanel).toHaveBeenCalledOnce();
 		expect(api.deployApp).toHaveBeenCalledWith('app_1');
-		expect(api.getApp).toHaveBeenCalledWith('app_1');
+		expect(goto).toHaveBeenCalledWith('/apps/app_1/deployments/dep_9');
 	});
 
-	it('follows a queued deploy and shows its place in line', async () => {
-		api.deployApp.mockResolvedValue({
-			message: 'Deployment queued (position 2)',
-			app_id: 'app_1',
-			deployment_id: 'dep_new',
-			status: 'queued',
-			queue_position: 2,
-			superseded: null
-		});
-		api.getApp.mockResolvedValue({ ...app });
+	it('links to the running deployment while the app builds', async () => {
+		api.listDeployments.mockResolvedValue([
+			{ id: 'dep_live', status: 'running' },
+			{ id: 'dep_old', status: 'succeeded' }
+		]);
+		renderPage({ ...app, status: 'building' });
 
-		const user = userEvent.setup();
+		const link = await screen.findByRole('link', { name: /view deploy/i });
+		expect(link).toHaveAttribute('href', '/apps/app_1/deployments/dep_live');
+	});
+
+	it('opens the tab named in ?tab=', async () => {
+		state.page.url = new URL('http://localhost/apps/app_1?tab=deployments');
 		renderPage();
-
-		await user.click(screen.getByRole('button', { name: /re-deploy/i }));
-
-		const progress = await screen.findByTestId('deploy-progress');
-		expect(progress).toHaveTextContent('Deploy queued: 2nd in line');
-		expect(screen.getByRole('button', { name: /re-deploy/i })).toBeEnabled();
+		expect(screen.getByRole('tab', { name: /deployments/i })).toHaveAttribute(
+			'aria-selected',
+			'true'
+		);
+		await vi.waitFor(() => expect(api.listDeployments).toHaveBeenCalledWith('app_1'));
 	});
 
 	it('stops a running app and refreshes its data', async () => {
@@ -311,7 +327,11 @@ describe('apps/[id] page', () => {
 
 	it('wires the environment tab to the registry credential and redeploy actions', async () => {
 		api.setAppRegistryCredential.mockResolvedValue(undefined);
-		api.deployApp.mockResolvedValue(undefined);
+		api.deployApp.mockResolvedValue({
+			message: 'Deployment started',
+			app_id: 'app_1',
+			deployment_id: 'dep_env'
+		});
 		api.getApp.mockResolvedValue({
 			...app,
 			source_type: 'image',
@@ -329,7 +349,7 @@ describe('apps/[id] page', () => {
 
 		await user.click(screen.getByRole('button', { name: /redeploy from environment/i }));
 		expect(api.deployApp).toHaveBeenCalledWith('app_1');
-		expect(api.getApp).toHaveBeenCalledWith('app_1');
+		expect(goto).toHaveBeenCalledWith('/apps/app_1/deployments/dep_env');
 	});
 
 	it('saves resource limits and updates app context', async () => {
@@ -376,14 +396,16 @@ describe('apps/[id] page', () => {
 				gitea: 'https://dash.example.com/api/webhooks/gitea/app_1',
 				generic: 'https://dash.example.com/api/webhooks/generic/app_1'
 			},
+			has_secret: true,
 			secret,
 			auto_deploy: false,
 			watch_branch: 'main'
 		};
 	}
 
-	it('shows the webhook URL and secret with provider-specific instructions', async () => {
+	it('shows the webhook URL, and the secret only after an explicit reveal', async () => {
 		api.getWebhookConfig.mockResolvedValue(webhookConfig('generated-secret-0123456789'));
+		api.revealWebhookSecret.mockResolvedValue({ secret: 'generated-secret-0123456789' });
 
 		const user = userEvent.setup();
 		renderPage();
@@ -392,9 +414,12 @@ describe('apps/[id] page', () => {
 
 		const url = (await screen.findByLabelText(/payload url/i)) as HTMLInputElement;
 		expect(url.value).toBe('https://dash.example.com/api/webhooks/github/app_1');
-		expect((screen.getByLabelText(/^secret$/i) as HTMLInputElement).value).toBe(
-			'generated-secret-0123456789'
-		);
+		const secretField = screen.getByLabelText(/^secret$/i) as HTMLInputElement;
+		expect(secretField.value).not.toContain('generated-secret');
+		expect(api.revealWebhookSecret).not.toHaveBeenCalled();
+		await user.click(screen.getByRole('button', { name: /^reveal$/i }));
+		expect(api.revealWebhookSecret).toHaveBeenCalledWith('app_1');
+		expect(await screen.findByDisplayValue('generated-secret-0123456789')).toBeInTheDocument();
 		expect(screen.getByText(/just the push event/i)).toBeInTheDocument();
 
 		await user.click(screen.getByRole('tab', { name: /^gitlab$/i }));
@@ -535,7 +560,7 @@ describe('apps/[id] page', () => {
 		});
 
 		it('keeps the log stream open and the feed paused when the app reloads', async () => {
-			api.deployApp.mockResolvedValue(undefined);
+			api.restartApp.mockResolvedValue(undefined);
 			api.getApp.mockResolvedValue({ ...app, status: 'running' });
 
 			const user = userEvent.setup();
@@ -545,8 +570,8 @@ describe('apps/[id] page', () => {
 			expect(FakeWebSocket.instances).toHaveLength(1);
 			expect(FakeWebSocket.instances[0].url).toMatch(/\/api\/apps\/app_1\/logs\/stream$/);
 
-			// Re-deploying reloads the app data, which used to tear everything down.
-			await user.click(screen.getByRole('button', { name: /re-deploy/i }));
+			// Restarting reloads the app data, which used to tear everything down.
+			await user.click(screen.getByRole('button', { name: /^restart$/i }));
 			await vi.waitFor(() => expect(api.getApp).toHaveBeenCalled());
 
 			expect(FakeWebSocket.instances).toHaveLength(1);
@@ -569,7 +594,7 @@ describe('apps/[id] page', () => {
 		});
 
 		it('keeps a single metrics poller across app reloads', async () => {
-			api.deployApp.mockResolvedValue(undefined);
+			api.restartApp.mockResolvedValue(undefined);
 			api.getApp.mockResolvedValue({ ...app, status: 'running' });
 
 			const user = userEvent.setup();
@@ -579,7 +604,7 @@ describe('apps/[id] page', () => {
 			await vi.waitFor(() => expect(api.getMetrics).toHaveBeenCalledTimes(1));
 			expect(api.getMetrics).toHaveBeenCalledWith('apps', app.id, '1h');
 
-			await user.click(screen.getByRole('button', { name: /re-deploy/i }));
+			await user.click(screen.getByRole('button', { name: /^restart$/i }));
 			await vi.waitFor(() => expect(api.getApp).toHaveBeenCalled());
 
 			expect(api.getMetrics).toHaveBeenCalledTimes(1);

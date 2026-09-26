@@ -32,6 +32,8 @@
 		sourceSubType: SourceSubType;
 		sourceUrl: string;
 		githubAppId: string | null;
+		/** Branch picked in the GitHub App repo picker (the Build step shows it too). */
+		branch: string;
 		dockerfileContent: string;
 		composeContent: string;
 		selectedTemplateId: string;
@@ -46,6 +48,7 @@
 		sourceSubType = $bindable('git-public'),
 		sourceUrl = $bindable(''),
 		githubAppId = $bindable(null),
+		branch = $bindable(''),
 		dockerfileContent = $bindable(''),
 		composeContent = $bindable(''),
 		selectedTemplateId = $bindable(''),
@@ -186,6 +189,7 @@
 			}
 		}
 		selectedGithubBranch = repo.default_branch;
+		branch = repo.default_branch;
 		githubAppId = selectedGithubAppId;
 		sourceUrl = repo.clone_url;
 		if (!nameManuallyEdited) {
@@ -193,10 +197,11 @@
 		}
 	}
 
-	function handleGithubBranchChange(branch: string | null) {
-		selectedGithubBranch = branch;
-		if (!nameManuallyEdited && selectedGithubRepo && branch) {
-			name = generateNameFromSource(selectedGithubRepo, branch);
+	function handleGithubBranchChange(next: string | null) {
+		selectedGithubBranch = next;
+		if (next) branch = next;
+		if (!nameManuallyEdited && selectedGithubRepo && next) {
+			name = generateNameFromSource(selectedGithubRepo, next);
 		}
 	}
 

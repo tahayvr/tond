@@ -78,8 +78,9 @@
 		<div>
 			<h3 class="text-sm font-medium">Graceful Deploy Timeout</h3>
 			<p class="mt-1 text-sm text-muted-foreground">
-				When a health check path is set, deploys wait up to this many seconds for the new container
-				to respond before rolling back.
+				Deploys wait up to this many seconds for the new container to pass the health check (or,
+				without one, to answer on its port; at least 60 s) before giving up and keeping the previous
+				version. It is also how long the old container gets to finish requests.
 			</p>
 		</div>
 		<div class="flex items-end gap-3">

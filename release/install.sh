@@ -590,7 +590,7 @@ ensure_secret_key() {
     mv -f "${SECRET_ENV_FILE}.tmp" "$SECRET_ENV_FILE"
 
     info "Encryption key stored in ${SECRET_ENV_FILE} (mode 0600)"
-    warn "Back this file up: without it, stored credentials, tokens and 2FA secrets cannot be decrypted"
+    warn "Back this file up: without it, stored secrets and remote snapshot copies cannot be decrypted"
 }
 
 install_binaries() {
@@ -841,6 +841,14 @@ print_summary() {
         echo "      is issued automatically). The dashboard is only served over HTTPS."
         echo ""
     fi
+
+    echo -e "${YELLOW}${BOLD}Back up your encryption key${NC}"
+    echo "  ${SECRET_ENV_FILE} holds TOND_SECRET_KEY. Every stored secret (env vars, database"
+    echo "  passwords, tokens) and every snapshot copy in remote storage is encrypted with it."
+    echo "  Keep a copy somewhere safe off this server: restoring on a new server needs the"
+    echo "  same key, and without it that data cannot be recovered."
+    echo "  Show it with: sudo cat ${SECRET_ENV_FILE}"
+    echo ""
 
     echo -e "${BOLD}Automation:${NC} Create a scoped API token for CI or scripts (shown once):"
     echo "            sudo tond token create --name ci --preset deployer --app <app> --expires 30d"

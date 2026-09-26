@@ -1,14 +1,17 @@
 // storage.rs — Remote object storage abstraction (S3-compatible SigV4)
 //
 // Public API:
-//   upload(provider, key, path)   — upload a local file as an S3 object
-//   download(provider, key, dest) — download an S3 object to a local file
+//   upload_stream(provider, key, parts) — multipart upload fed part by part
+//                                         (constant memory: one part at a time)
+//   download_to_file(provider, key, dest) — stream an object to a local file,
+//                                           returning its size and SHA-256
 //   list(provider, prefix)        — list objects with the given key prefix
 //   delete(provider, key)         — delete an S3 object
 //   test_connectivity(provider)   — attempt a ListObjects call; Ok = connected
 //
 // All operations are implemented using reqwest + SigV4 signing built from the
 // existing sha2 / hmac / hex / base64 workspace crates. No AWS SDK dependency.
+// Object keys are relative to the provider's optional `prefix`.
 //
 // The `StorageProvider` passed in must already have the secret decrypted
 // (use `handlers::storage_providers::decrypt_provider_secret` before calling).
@@ -16,14 +19,22 @@
 use std::path::Path;
 
 use chrono::Utc;
+use futures::StreamExt;
 use hmac::{Hmac, KeyInit, Mac};
-use reqwest::Client;
+use reqwest::{Client, Method, Response};
 use sha2::{Digest, Sha256};
-use tokio::fs::File;
-use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
 use tond_common::StorageProvider;
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// Size of each multipart upload part. S3 requires at least 5 MiB for every
+/// part but the last; 8 MiB keeps memory small and requests few.
+pub const PART_SIZE: usize = 8 * 1024 * 1024;
+
+/// SHA-256 of an empty body.
+const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 // ── Public surface ────────────────────────────────────────────────────────────
 
@@ -34,112 +45,124 @@ pub struct RemoteObject {
     pub last_modified: String,
 }
 
-/// Upload a local file at `path` to the remote storage under `key`.
-pub async fn upload(provider: &StorageProvider, key: &str, path: &Path) -> anyhow::Result<()> {
-    let cfg = parse_config(provider)?;
-    let mut f = File::open(path).await?;
-    let mut body = Vec::new();
-    f.read_to_end(&mut body).await?;
-
-    let (endpoint, host) = endpoint_and_host(&cfg);
-    let url = format!("{}/{}/{}", endpoint, cfg.bucket, key);
-    let content_type = "application/octet-stream";
-
-    let now = Utc::now();
-    let date_time = now.format("%Y%m%dT%H%M%SZ").to_string();
-    let date_short = now.format("%Y%m%d").to_string();
-
-    let payload_hash = hex_sha256(&body);
-
-    let headers = vec![
-        ("content-type", content_type.to_string()),
-        ("host", host.clone()),
-        ("x-amz-content-sha256", payload_hash.clone()),
-        ("x-amz-date", date_time.clone()),
-    ];
-
-    let signed = sigv4_sign(
-        "PUT",
-        &url_path(&cfg.bucket, key),
-        "",
-        &headers,
-        &payload_hash,
-        &date_time,
-        &date_short,
-        &cfg.region,
-        &cfg.access_key_id,
-        &cfg.secret_access_key,
-    )?;
-
-    let client = Client::new();
-    let resp = client
-        .put(&url)
-        .header("content-type", content_type)
-        .header("host", &host)
-        .header("x-amz-content-sha256", &payload_hash)
-        .header("x-amz-date", &date_time)
-        .header("authorization", &signed)
-        .body(body)
-        .send()
-        .await?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("S3 upload failed ({status}): {body}");
-    }
-    Ok(())
+/// One message of an `upload_stream`.
+#[derive(Debug)]
+pub enum Part {
+    /// The next part of the object (at least 5 MiB unless it is the last)
+    Data(Vec<u8>),
+    /// The object is complete
+    End,
 }
 
-/// Download the object at `key` from remote storage to local `dest`.
-pub async fn download(provider: &StorageProvider, key: &str, dest: &Path) -> anyhow::Result<()> {
+/// Upload the parts received on `parts` as one object under `key`, using an
+/// S3 multipart upload. Only the part being sent is held in memory. The
+/// object is completed only on `Part::End`: if the sender goes away first,
+/// the upload is aborted, so a failed producer never leaves a truncated
+/// object behind (nor does any other error).
+pub async fn upload_stream(
+    provider: &StorageProvider,
+    key: &str,
+    mut parts: mpsc::Receiver<Part>,
+) -> anyhow::Result<u64> {
     let cfg = parse_config(provider)?;
-    let (endpoint, host) = endpoint_and_host(&cfg);
-    let url = format!("{}/{}/{}", endpoint, cfg.bucket, key);
-
-    let now = Utc::now();
-    let date_time = now.format("%Y%m%dT%H%M%SZ").to_string();
-    let date_short = now.format("%Y%m%d").to_string();
-    let payload_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"; // empty body
-
-    let headers = vec![
-        ("host", host.clone()),
-        ("x-amz-content-sha256", payload_hash.to_string()),
-        ("x-amz-date", date_time.clone()),
-    ];
-
-    let signed = sigv4_sign(
-        "GET",
-        &url_path(&cfg.bucket, key),
-        "",
-        &headers,
-        payload_hash,
-        &date_time,
-        &date_short,
-        &cfg.region,
-        &cfg.access_key_id,
-        &cfg.secret_access_key,
-    )?;
-
     let client = Client::new();
-    let resp = client
-        .get(&url)
-        .header("host", &host)
-        .header("x-amz-content-sha256", payload_hash)
-        .header("x-amz-date", &date_time)
-        .header("authorization", &signed)
-        .send()
-        .await?;
 
+    let resp = signed(&client, &cfg, Method::POST, key, "uploads=", Vec::new()).await?;
+    let body = expect_success(resp, "S3 multipart start").await?;
+    let upload_id = extract_xml_value(&body.replace('\n', ""), "UploadId")
+        .ok_or_else(|| anyhow::anyhow!("S3 multipart start: no UploadId in response"))?;
+
+    let result: anyhow::Result<(Vec<String>, u64)> = async {
+        let mut etags = Vec::new();
+        let mut total = 0u64;
+        loop {
+            let part = match parts.recv().await {
+                Some(Part::Data(part)) => part,
+                Some(Part::End) => break,
+                None => anyhow::bail!("the upload stream ended before the object was complete"),
+            };
+            total += part.len() as u64;
+            let number = etags.len() + 1;
+            let query = format!(
+                "partNumber={number}&uploadId={}",
+                urlencoding::encode(&upload_id)
+            );
+            let resp = signed(&client, &cfg, Method::PUT, key, &query, part).await?;
+            let etag = resp
+                .headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            expect_success(resp, "S3 part upload").await?;
+            etags.push(etag.ok_or_else(|| anyhow::anyhow!("S3 part upload: no ETag"))?);
+        }
+        anyhow::ensure!(!etags.is_empty(), "nothing to upload");
+        Ok((etags, total))
+    }
+    .await;
+
+    let query = format!("uploadId={}", urlencoding::encode(&upload_id));
+    let (etags, total) = match result {
+        Ok(done) => done,
+        Err(e) => {
+            let _ = signed(&client, &cfg, Method::DELETE, key, &query, Vec::new()).await;
+            return Err(e);
+        }
+    };
+
+    let mut xml = String::from("<CompleteMultipartUpload>");
+    for (i, etag) in etags.iter().enumerate() {
+        xml.push_str(&format!(
+            "<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>",
+            i + 1,
+            etag
+        ));
+    }
+    xml.push_str("</CompleteMultipartUpload>");
+    let resp = signed(&client, &cfg, Method::POST, key, &query, xml.into_bytes()).await?;
+    let body = match expect_success(resp, "S3 multipart complete").await {
+        Ok(body) => body,
+        Err(e) => {
+            let _ = signed(&client, &cfg, Method::DELETE, key, &query, Vec::new()).await;
+            return Err(e);
+        }
+    };
+    // S3 may answer 200 with an error document for CompleteMultipartUpload.
+    if body.contains("<Error>") {
+        let _ = signed(&client, &cfg, Method::DELETE, key, &query, Vec::new()).await;
+        anyhow::bail!("S3 multipart complete failed: {body}");
+    }
+    Ok(total)
+}
+
+/// Stream the object at `key` to `dest`. Returns (bytes, sha256 hex).
+pub async fn download_to_file(
+    provider: &StorageProvider,
+    key: &str,
+    dest: &Path,
+) -> anyhow::Result<(u64, String)> {
+    let cfg = parse_config(provider)?;
+    let client = Client::new();
+    let resp = signed(&client, &cfg, Method::GET, key, "", Vec::new()).await?;
     let status = resp.status();
     if !status.is_success() {
         let body_text = resp.text().await.unwrap_or_default();
         anyhow::bail!("S3 download failed ({status}): {body_text}");
     }
 
-    let bytes = resp.bytes().await?;
-    tokio::fs::write(dest, &bytes).await?;
-    Ok(())
+    let mut file = tokio::fs::File::create(dest).await?;
+    let mut hasher = Sha256::new();
+    let mut bytes = 0u64;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        hasher.update(&chunk);
+        bytes += chunk.len() as u64;
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    file.sync_all().await?;
+    Ok((bytes, hex::encode(hasher.finalize())))
 }
 
 /// List objects under the given `prefix` in the configured bucket.
@@ -147,10 +170,7 @@ pub async fn list(provider: &StorageProvider, prefix: &str) -> anyhow::Result<Ve
     let cfg = parse_config(provider)?;
     let (endpoint, host) = endpoint_and_host(&cfg);
 
-    let effective_prefix = match &cfg.prefix {
-        Some(p) => format!("{}{}", p, prefix),
-        None => prefix.to_string(),
-    };
+    let effective_prefix = full_key(&cfg, prefix);
     let query = format!(
         "list-type=2&prefix={}",
         urlencoding::encode(&effective_prefix)
@@ -160,20 +180,19 @@ pub async fn list(provider: &StorageProvider, prefix: &str) -> anyhow::Result<Ve
     let now = Utc::now();
     let date_time = now.format("%Y%m%dT%H%M%SZ").to_string();
     let date_short = now.format("%Y%m%d").to_string();
-    let payload_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
     let headers = vec![
         ("host", host.clone()),
-        ("x-amz-content-sha256", payload_hash.to_string()),
+        ("x-amz-content-sha256", EMPTY_SHA256.to_string()),
         ("x-amz-date", date_time.clone()),
     ];
 
-    let signed = sigv4_sign(
+    let signed_auth = sigv4_sign(
         "GET",
         &format!("/{}", cfg.bucket),
         &query,
         &headers,
-        payload_hash,
+        EMPTY_SHA256,
         &date_time,
         &date_short,
         &cfg.region,
@@ -181,72 +200,25 @@ pub async fn list(provider: &StorageProvider, prefix: &str) -> anyhow::Result<Ve
         &cfg.secret_access_key,
     )?;
 
-    let client = Client::new();
-    let resp = client
+    let resp = Client::new()
         .get(&url)
         .header("host", &host)
-        .header("x-amz-content-sha256", payload_hash)
+        .header("x-amz-content-sha256", EMPTY_SHA256)
         .header("x-amz-date", &date_time)
-        .header("authorization", &signed)
+        .header("authorization", &signed_auth)
         .send()
         .await?;
 
-    let status = resp.status();
-    if !status.is_success() {
-        let body_text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("S3 list failed ({status}): {body_text}");
-    }
-
-    let xml = resp.text().await?;
+    let xml = expect_success(resp, "S3 list").await?;
     parse_list_objects_response(&xml)
 }
 
 /// Delete the object at `key` from remote storage.
 pub async fn delete(provider: &StorageProvider, key: &str) -> anyhow::Result<()> {
     let cfg = parse_config(provider)?;
-    let (endpoint, host) = endpoint_and_host(&cfg);
-    let url = format!("{}/{}/{}", endpoint, cfg.bucket, key);
-
-    let now = Utc::now();
-    let date_time = now.format("%Y%m%dT%H%M%SZ").to_string();
-    let date_short = now.format("%Y%m%d").to_string();
-    let payload_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-
-    let headers = vec![
-        ("host", host.clone()),
-        ("x-amz-content-sha256", payload_hash.to_string()),
-        ("x-amz-date", date_time.clone()),
-    ];
-
-    let signed = sigv4_sign(
-        "DELETE",
-        &url_path(&cfg.bucket, key),
-        "",
-        &headers,
-        payload_hash,
-        &date_time,
-        &date_short,
-        &cfg.region,
-        &cfg.access_key_id,
-        &cfg.secret_access_key,
-    )?;
-
-    let client = Client::new();
-    let resp = client
-        .delete(&url)
-        .header("host", &host)
-        .header("x-amz-content-sha256", payload_hash)
-        .header("x-amz-date", &date_time)
-        .header("authorization", &signed)
-        .send()
-        .await?;
-
-    let status = resp.status();
+    let resp = signed(&Client::new(), &cfg, Method::DELETE, key, "", Vec::new()).await?;
     // 204 No Content is the expected success for DELETE
-    if !status.is_success() {
-        let body_text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("S3 delete failed ({status}): {body_text}");
-    }
+    expect_success(resp, "S3 delete").await?;
     Ok(())
 }
 
@@ -255,6 +227,89 @@ pub async fn delete(provider: &StorageProvider, key: &str) -> anyhow::Result<()>
 pub async fn test_connectivity(provider: &StorageProvider) -> anyhow::Result<()> {
     list(provider, "").await?;
     Ok(())
+}
+
+// ── Request helpers ──────────────────────────────────────────────────────────
+
+/// The object key with the provider's prefix applied.
+fn full_key(cfg: &S3ConfigDecrypted, key: &str) -> String {
+    match &cfg.prefix {
+        Some(prefix) => format!("{prefix}{key}"),
+        None => key.to_string(),
+    }
+}
+
+/// URI-encode each path segment of an object key (SigV4 canonical URI).
+fn encode_key(key: &str) -> String {
+    key.split('/')
+        .map(|segment| urlencoding::encode(segment).into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Send a SigV4-signed request for the object `key`. `query` must already be
+/// canonical (sorted, URI-encoded values).
+async fn signed(
+    client: &Client,
+    cfg: &S3ConfigDecrypted,
+    method: Method,
+    key: &str,
+    query: &str,
+    body: Vec<u8>,
+) -> anyhow::Result<Response> {
+    let (endpoint, host) = endpoint_and_host(cfg);
+    let path = url_path(&cfg.bucket, &encode_key(&full_key(cfg, key)));
+    let url = if query.is_empty() {
+        format!("{endpoint}{path}")
+    } else {
+        format!("{endpoint}{path}?{query}")
+    };
+
+    let now = Utc::now();
+    let date_time = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let date_short = now.format("%Y%m%d").to_string();
+    let payload_hash = if body.is_empty() {
+        EMPTY_SHA256.to_string()
+    } else {
+        hex_sha256(&body)
+    };
+    let headers = vec![
+        ("host", host.clone()),
+        ("x-amz-content-sha256", payload_hash.clone()),
+        ("x-amz-date", date_time.clone()),
+    ];
+    let authorization = sigv4_sign(
+        method.as_str(),
+        &path,
+        query,
+        &headers,
+        &payload_hash,
+        &date_time,
+        &date_short,
+        &cfg.region,
+        &cfg.access_key_id,
+        &cfg.secret_access_key,
+    )?;
+
+    Ok(client
+        .request(method, &url)
+        .header("host", &host)
+        .header("x-amz-content-sha256", &payload_hash)
+        .header("x-amz-date", &date_time)
+        .header("authorization", &authorization)
+        .body(body)
+        .send()
+        .await?)
+}
+
+/// The response body when the status is a success, else an error naming `what`.
+async fn expect_success(resp: Response, what: &str) -> anyhow::Result<String> {
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("{what} failed ({status}): {body}");
+    }
+    Ok(body)
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────

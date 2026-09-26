@@ -13,8 +13,9 @@ pub struct Project {
     pub id: String,
     pub name: String,
     pub description: Option<String>,
-    /// Shared environment variables as a JSON object (merged on top of each
-    /// member app's own env_vars at deploy time; app vars take precedence).
+    /// Shared environment variables: a JSON object, stored encrypted by the
+    /// server (`{}` when empty). Never returned: responses carry masked keys.
+    #[serde(skip_serializing)]
     pub env_vars: String,
     pub created_at: String,
     pub updated_at: String,
@@ -39,7 +40,9 @@ pub struct ProjectResponse {
     pub id: String,
     pub name: String,
     pub description: Option<String>,
-    pub env_vars: serde_json::Value,
+    /// Shared env var keys with masked values (values are secrets).
+    #[serde(default)]
+    pub env: Vec<crate::EnvVarEntry>,
     pub created_at: String,
     pub updated_at: String,
     /// Number of active (non-expired) project previews for this project.
@@ -47,18 +50,21 @@ pub struct ProjectResponse {
     pub active_preview_count: i64,
 }
 
-impl From<Project> for ProjectResponse {
-    fn from(p: Project) -> Self {
-        let env_vars: serde_json::Value = serde_json::from_str(&p.env_vars)
-            .unwrap_or(serde_json::Value::Object(Default::default()));
+impl ProjectResponse {
+    /// Build a response from a project and its (decrypted) shared env.
+    pub fn new(
+        p: Project,
+        env: &std::collections::BTreeMap<String, String>,
+        active_preview_count: i64,
+    ) -> Self {
         Self {
             id: p.id,
             name: p.name,
             description: p.description,
-            env_vars,
+            env: crate::masked_env_entries(env),
             created_at: p.created_at,
             updated_at: p.updated_at,
-            active_preview_count: 0,
+            active_preview_count,
         }
     }
 }
@@ -107,46 +113,20 @@ mod tests {
     }
 
     #[test]
-    fn project_response_from_project_parses_valid_env_json() {
-        let project = Project {
-            id: "project-1".to_string(),
-            name: "platform".to_string(),
-            description: Some("Shared services".to_string()),
-            env_vars: serde_json::json!({ "ENV": "prod" }).to_string(),
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-01T00:00:00Z".to_string(),
-        };
+    fn project_response_masks_shared_env_values() {
+        let project = Project::new("platform".to_string(), None);
+        let env =
+            std::collections::BTreeMap::from([("ENV".to_string(), "prod-secret".to_string())]);
 
-        let response = ProjectResponse::from(project);
+        let response = ProjectResponse::new(project, &env, 2);
+        let json = serde_json::to_string(&response).unwrap_or_default();
 
-        assert_eq!(
-            response.env_vars,
-            serde_json::json!({ "ENV": "prod" }),
-            "ProjectResponse should deserialize the stored env_vars JSON"
+        assert!(
+            !json.contains("prod-secret"),
+            "values must be masked: {json}"
         );
-        assert_eq!(
-            response.active_preview_count, 0,
-            "ProjectResponse::from should default active_preview_count to 0"
-        );
-    }
-
-    #[test]
-    fn project_response_from_project_falls_back_to_empty_object_for_invalid_env_json() {
-        let project = Project {
-            id: "project-1".to_string(),
-            name: "platform".to_string(),
-            description: None,
-            env_vars: "not json".to_string(),
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-01T00:00:00Z".to_string(),
-        };
-
-        let response = ProjectResponse::from(project);
-
-        assert_eq!(
-            response.env_vars,
-            serde_json::json!({}),
-            "invalid stored env_vars JSON should fall back to an empty object"
-        );
+        assert_eq!(response.env[0].key, "ENV");
+        assert_eq!(response.env[0].masked, crate::ENV_VALUE_MASK);
+        assert_eq!(response.active_preview_count, 2);
     }
 }

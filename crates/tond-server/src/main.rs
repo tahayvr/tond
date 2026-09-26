@@ -84,13 +84,16 @@ mod handlers;
 mod health;
 mod janitor;
 mod log_bus;
+mod log_scrub;
 mod metrics;
 mod notifications;
 mod proxy_link;
 mod reconcile;
 mod runtime;
 mod secret_key;
+mod secrets;
 mod security_headers;
+mod snapshot_archive;
 mod state;
 mod static_files;
 mod storage;
@@ -331,6 +334,7 @@ async fn run() -> Result<()> {
         )
         .route("/api/apps/{id}/domain", put(handlers::update_domain))
         .route("/api/apps/{id}/health", put(handlers::update_health))
+        .route("/api/apps/{id}/port", put(handlers::update_port))
         .route("/api/compose/validate", post(handlers::validate_compose))
         .route("/api/apps/{id}/volumes", post(handlers::add_volume))
         .route("/api/apps/{id}/volumes", delete(handlers::remove_volume))
@@ -349,9 +353,24 @@ async fn run() -> Result<()> {
             get(handlers::deployments::list_deployments),
         )
         .route(
+            "/api/apps/{id}/deployments/{deployment_id}",
+            get(handlers::deployments::get_deployment),
+        )
+        .route(
+            "/api/apps/{id}/deployments/{deployment_id}/stream",
+            get(handlers::deployments::stream_deployment),
+        )
+        .route(
             "/api/apps/{id}/deployments/{deployment_id}/generated-dockerfile",
             get(handlers::deployments::get_generated_dockerfile),
         )
+        // Source inspection for the new-app wizard, DNS checks for domains
+        .route(
+            "/api/git/branches",
+            post(handlers::git::list_remote_branches),
+        )
+        .route("/api/images/inspect", post(handlers::images::inspect_image))
+        .route("/api/domains/check", get(handlers::domains::check_domain))
         .route(
             "/api/apps/{id}/rollback",
             post(handlers::deployments::rollback_app),
@@ -384,7 +403,7 @@ async fn run() -> Result<()> {
         )
         .route(
             "/api/apps/{id}/webhook-secret",
-            put(handlers::git::update_webhook_secret),
+            put(handlers::git::update_webhook_secret).get(handlers::git::reveal_webhook_secret),
         )
         .route(
             "/api/apps/{id}/webhook-secret/rotate",
@@ -664,8 +683,14 @@ async fn run() -> Result<()> {
             post(handlers::databases::redeploy_database),
         )
         .route(
+            "/api/databases/{id}/backups",
+            get(handlers::backups::list_database_backups)
+                .post(handlers::backups::create_database_backup),
+        )
+        .route(
             "/api/databases/{id}/credentials",
-            axum::routing::patch(handlers::databases::update_database_credentials),
+            axum::routing::patch(handlers::databases::update_database_credentials)
+                .get(handlers::databases::reveal_database_credentials),
         )
         .route(
             "/api/databases/{id}/logs/stream",
