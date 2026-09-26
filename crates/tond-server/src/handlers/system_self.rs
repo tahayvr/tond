@@ -1,6 +1,6 @@
 // handlers/system_self.rs — Tond measuring itself
 //
-// GET /api/system/self — process, background loops, database, HTTP latency,
+// GET /api/system/self — (metrics:read) process, background loops, database, HTTP latency,
 //                        build queue and tond-proxy stats (any signed-in user)
 // GET /metrics         — the same in the Prometheus text format, only on the
 //                        root-only Unix socket (404 over TCP), e.g.
@@ -13,10 +13,10 @@ use axum::{
 };
 use tond_common::ApiResponse;
 
-use crate::auth::{LocalPeer, RateLimit, RequireAuth};
+use crate::auth::{Authz, LocalPeer, RateLimit, scope};
 use crate::runtime::selfstats;
 
-pub async fn get_self(_rate: RateLimit, _auth: RequireAuth) -> impl IntoResponse {
+pub async fn get_self(_rate: RateLimit, _auth: Authz<scope::MetricsRead>) -> impl IntoResponse {
     (
         StatusCode::OK,
         Json(ApiResponse::ok(selfstats::collect().await)),

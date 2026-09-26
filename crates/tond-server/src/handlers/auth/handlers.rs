@@ -19,9 +19,10 @@ use tond_common::*;
 use uuid::Uuid;
 
 use crate::{
-    audit_log::write_audit_log,
+    audit_log::{AuditActor, AuditEntry, record},
     auth::{
         ClientIp, RateLimit,
+        password_policy::check_password,
         rate_limit::{lockout_message, too_many_requests},
         setup_token::{self, setup_token_path},
     },
@@ -34,6 +35,7 @@ use super::helpers::{
     hash_password_throttled, ip_label, mfa_pending_cookie, normalize_email, revoke_other_sessions,
     session_cookie, use_backup_code, verify_password_throttled, verify_totp_once,
 };
+use super::password_links;
 use super::session::{MFA_PENDING_COOKIE, extract_cookie, extract_session_token, validate_session};
 
 // ── Response helpers ──
@@ -77,7 +79,7 @@ fn reject(status: StatusCode, message: impl Into<String>) -> Rejection {
 async fn session_user(state: &AppState, headers: &HeaderMap) -> Result<(String, User), Rejection> {
     let token = extract_session_token(headers)
         .ok_or_else(|| reject(StatusCode::UNAUTHORIZED, "Not authenticated"))?;
-    match validate_session(&state.db, &token).await {
+    match validate_session(state, &token).await {
         Ok(Some(user)) => Ok((token, user)),
         Ok(None) => Err(reject(
             StatusCode::UNAUTHORIZED,
@@ -179,23 +181,25 @@ pub async fn verify_step_up(
     Ok(())
 }
 
-fn validate_admin_password(pwd: &str) -> Result<(), &'static str> {
-    if pwd.chars().count() < 12 {
-        return Err("Password must be at least 12 characters");
-    }
-    if !pwd.chars().any(|c| c.is_uppercase()) {
-        return Err("Password must contain at least one uppercase letter");
-    }
-    if !pwd.chars().any(|c| c.is_lowercase()) {
-        return Err("Password must contain at least one lowercase letter");
-    }
-    if !pwd.chars().any(|c| c.is_ascii_digit()) {
-        return Err("Password must contain at least one number");
-    }
-    if !pwd.chars().any(|c| !c.is_alphanumeric()) {
-        return Err("Password must contain at least one special character");
-    }
-    Ok(())
+/// Apply the password policy (setup, change and set-password links alike).
+fn policy_error(password: &str) -> Option<Response> {
+    check_password(password)
+        .err()
+        .map(|problem| error_response(StatusCode::BAD_REQUEST, problem.to_string()))
+}
+
+/// Configured absolute session lifetime in days.
+async fn session_max_age_days(state: &AppState) -> i64 {
+    state.settings.read().await.session_max_age_days
+}
+
+/// Record a successful sign-in on the user row.
+async fn mark_login(state: &AppState, user_id: &str) {
+    let _ = sqlx::query("UPDATE users SET last_login_at = ? WHERE id = ?")
+        .bind(Utc::now().to_rfc3339())
+        .bind(user_id)
+        .execute(&state.db)
+        .await;
 }
 
 const INVALID_SETUP_TOKEN: &str = "This setup link is invalid or has already been used. \
@@ -212,7 +216,7 @@ pub async fn auth_status(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let user = match extract_session_token(&headers) {
-        Some(token) => validate_session(&state.db, &token).await.unwrap_or(None),
+        Some(token) => validate_session(&state, &token).await.unwrap_or(None),
         None => None,
     };
 
@@ -268,8 +272,8 @@ pub async fn setup(
     if email.is_empty() || !email.contains('@') {
         return error_response(StatusCode::BAD_REQUEST, "Invalid email address");
     }
-    if let Err(message) = validate_admin_password(&req.password) {
-        return error_response(StatusCode::BAD_REQUEST, message);
+    if let Some(response) = policy_error(&req.password) {
+        return response;
     }
 
     let password_hash = match hash_password_throttled(&req.password).await {
@@ -312,32 +316,41 @@ pub async fn setup(
         Err(e) => return internal_error(e),
     }
     let ip_str = ip_label(ip);
-    let session_token =
-        match create_session(&mut *tx, &user_id, ua.as_deref(), ip_str.as_deref()).await {
-            Ok(t) => t,
-            Err(e) => return internal_error(e),
-        };
+    let max_age = session_max_age_days(&state).await;
+    let session_token = match create_session(
+        &mut *tx,
+        &user_id,
+        ua.as_deref(),
+        ip_str.as_deref(),
+        max_age,
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => return internal_error(e),
+    };
     if let Err(e) = tx.commit().await {
         return internal_error(e);
     }
 
     setup_token::remove_token_file(&setup_token_path());
-    write_audit_log(
+    mark_login(&state, &user_id).await;
+    record(
         &state.db,
-        None,
-        None,
-        "admin_setup",
-        &email,
-        Some("first-run admin account created"),
+        &AuditActor::user(&user_id, &email, ip_str.clone()),
+        AuditEntry::new("admin_setup")
+            .resource("user", &user_id, &email)
+            .detail("first-run admin account created"),
     )
     .await;
 
-    let user_resp = UserResponse {
-        id: user_id,
-        email,
-        role: "admin".to_string(),
-        totp_enabled: false,
-        created_at: now,
+    let user_resp = match sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
+        .bind(&user_id)
+        .fetch_one(&state.db)
+        .await
+    {
+        Ok(user) => UserResponse::from(user),
+        Err(e) => return internal_error(e),
     };
     let response = (
         StatusCode::CREATED,
@@ -347,7 +360,7 @@ pub async fn setup(
         }))),
     )
         .into_response();
-    with_cookies(response, &[session_cookie(&session_token)])
+    with_cookies(response, &[session_cookie(&session_token, max_age)])
 }
 
 // ── POST /api/auth/login ──
@@ -396,9 +409,38 @@ pub async fn login(
                 .rate_limiter
                 .record_login_failure(ip, user.as_ref().map(|u| u.id.as_str()))
                 .await;
+            let mut entry = AuditEntry::new("login_failed")
+                .failed()
+                .detail("wrong email or password");
+            if let Some(u) = &user {
+                entry = entry.resource("user", &u.id, &u.email);
+            }
+            record(
+                &state.db,
+                &AuditActor::anonymous(&normalize_email(&req.email), ip_label(ip)),
+                entry,
+            )
+            .await;
             return error_response(StatusCode::UNAUTHORIZED, "Invalid email or password");
         }
     };
+
+    // Only after the password matched, so this doesn't reveal which accounts exist.
+    if user.disabled_at.is_some() {
+        record(
+            &state.db,
+            &AuditActor::user(&user.id, &user.email, ip_label(ip)),
+            AuditEntry::new("login_failed")
+                .resource("user", &user.id, &user.email)
+                .failed()
+                .detail("account disabled"),
+        )
+        .await;
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "This account is disabled. Ask an admin of this server to enable it.",
+        );
+    }
 
     if user.totp_enabled {
         let pending = generate_raw_key();
@@ -427,29 +469,53 @@ pub async fn login(
     }
 
     let ip_str = ip_label(ip);
-    let session_token =
-        match create_session(&state.db, &user.id, ua.as_deref(), ip_str.as_deref()).await {
-            Ok(t) => t,
-            Err(e) => return internal_error(e),
-        };
+    let max_age = session_max_age_days(&state).await;
+    let session_token = match create_session(
+        &state.db,
+        &user.id,
+        ua.as_deref(),
+        ip_str.as_deref(),
+        max_age,
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => return internal_error(e),
+    };
     state.rate_limiter.record_login_success(&user.id).await;
+    mark_login(&state, &user.id).await;
+    record(
+        &state.db,
+        &AuditActor::user(&user.id, &user.email, ip_str),
+        AuditEntry::new("login").resource("user", &user.id, &user.email),
+    )
+    .await;
 
     let response = (
         StatusCode::OK,
         Json(ApiResponse::ok(json!({ "user": UserResponse::from(user) }))),
     )
         .into_response();
-    with_cookies(response, &[session_cookie(&session_token)])
+    with_cookies(response, &[session_cookie(&session_token, max_age)])
 }
 
 // ── POST /api/auth/logout ──
 
 pub async fn logout(
     _rate: RateLimit,
+    ClientIp(ip): ClientIp,
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
     if let Some(token) = extract_session_token(&headers) {
+        if let Ok(Some(user)) = validate_session(&state, &token).await {
+            record(
+                &state.db,
+                &AuditActor::user(&user.id, &user.email, ip_label(ip)),
+                AuditEntry::new("logout").resource("user", &user.id, &user.email),
+            )
+            .await;
+        }
         let _ = sqlx::query("DELETE FROM sessions WHERE id = ?")
             .bind(hash_key(&token))
             .execute(&state.db)
@@ -478,103 +544,6 @@ pub async fn me(_rate: RateLimit, State(state): State<AppState>, headers: Header
         )
             .into_response(),
         Err(response) => *response,
-    }
-}
-
-// ── POST /api/auth/users ──
-// Admin-only: create a new user account.
-
-pub async fn create_user(
-    _rate: RateLimit,
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(req): Json<CreateUserRequest>,
-) -> Response {
-    let caller = match session_user(&state, &headers).await {
-        Ok((_, user)) => user,
-        Err(response) => return *response,
-    };
-    if caller.role != "admin" {
-        return error_response(StatusCode::FORBIDDEN, "Only admins can create users");
-    }
-
-    let email = req.email.trim().to_string();
-    if email.is_empty() || !email.contains('@') {
-        return error_response(StatusCode::BAD_REQUEST, "Invalid email address");
-    }
-    if req.password.chars().count() < 8 {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "Password must be at least 8 characters",
-        );
-    }
-    if !["admin", "member"].contains(&req.role.as_str()) {
-        return error_response(StatusCode::BAD_REQUEST, "Role must be 'admin' or 'member'");
-    }
-
-    let password_hash = match hash_password_throttled(&req.password).await {
-        Ok(h) => h,
-        Err(e) => return password_error_response(e),
-    };
-
-    let now = Utc::now().to_rfc3339();
-    let user_id = Uuid::new_v4().to_string();
-
-    match sqlx::query(
-        "INSERT INTO users (id, email, password_hash, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&user_id)
-    .bind(&email)
-    .bind(&password_hash)
-    .bind(&req.role)
-    .bind(&now)
-    .bind(&now)
-    .execute(&state.db)
-    .await
-    {
-        Ok(_) => {
-            let user_resp = UserResponse {
-                id: user_id,
-                email,
-                role: req.role,
-                totp_enabled: false,
-                created_at: now,
-            };
-            (StatusCode::CREATED, Json(ApiResponse::ok(user_resp))).into_response()
-        }
-        Err(e) if e.to_string().contains("UNIQUE") => error_response(
-            StatusCode::CONFLICT,
-            format!("User with email '{email}' already exists"),
-        ),
-        Err(e) => internal_error(e),
-    }
-}
-
-// ── GET /api/auth/users ──
-// Admin-only: list all users.
-
-pub async fn list_users(
-    _rate: RateLimit,
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
-    let caller = match session_user(&state, &headers).await {
-        Ok((_, user)) => user,
-        Err(response) => return *response,
-    };
-    if caller.role != "admin" {
-        return error_response(StatusCode::FORBIDDEN, "Only admins can list users");
-    }
-
-    match sqlx::query_as::<_, User>("SELECT * FROM users ORDER BY created_at ASC")
-        .fetch_all(&state.db)
-        .await
-    {
-        Ok(users) => {
-            let responses: Vec<UserResponse> = users.into_iter().map(UserResponse::from).collect();
-            (StatusCode::OK, Json(ApiResponse::ok(responses))).into_response()
-        }
-        Err(e) => internal_error(e),
     }
 }
 
@@ -610,11 +579,8 @@ pub async fn change_password(
         return *response;
     }
 
-    if req.new_password.chars().count() < 8 {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "New password must be at least 8 characters",
-        );
+    if let Some(response) = policy_error(&req.new_password) {
+        return response;
     }
 
     let new_hash = match hash_password_throttled(&req.new_password).await {
@@ -633,7 +599,17 @@ pub async fn change_password(
         return internal_error(e);
     }
 
-    let _ = revoke_other_sessions(&state.db, &user.id, Some(&token)).await;
+    let revoked = revoke_other_sessions(&state.db, &user.id, Some(&token))
+        .await
+        .unwrap_or(0);
+    record(
+        &state.db,
+        &AuditActor::user(&user.id, &user.email, ip_label(ip)),
+        AuditEntry::new("password_change")
+            .resource("user", &user.id, &user.email)
+            .detail(format!("signed out {revoked} other session(s)")),
+    )
+    .await;
 
     (
         StatusCode::OK,
@@ -659,34 +635,55 @@ pub async fn list_sessions(
         Err(response) => return *response,
     };
     let current = hash_key(&token);
-    let now = Utc::now().to_rfc3339();
+    let idle_hours = state.settings.read().await.session_idle_timeout_hours;
+    match session_responses(&state.db, &user.id, Some(&current), idle_hours).await {
+        Ok(responses) => (StatusCode::OK, Json(ApiResponse::ok(responses))).into_response(),
+        Err(e) => internal_error(e),
+    }
+}
 
-    let sessions = match sqlx::query_as::<_, Session>(
-        "SELECT * FROM sessions WHERE user_id = ? AND expires_at > ? ORDER BY created_at DESC",
+/// A user's live sessions (not expired, not idle), newest first.
+pub async fn session_responses(
+    db: &sqlx::SqlitePool,
+    user_id: &str,
+    current: Option<&str>,
+    idle_hours: i64,
+) -> Result<Vec<SessionResponse>, sqlx::Error> {
+    let now = Utc::now();
+    let idle = chrono::Duration::hours(idle_hours.max(1));
+    let sessions = sqlx::query_as::<_, Session>(
+        "SELECT * FROM sessions WHERE user_id = ? AND expires_at > ?
+           AND COALESCE(last_used_at, created_at) > ?
+         ORDER BY COALESCE(last_used_at, created_at) DESC",
     )
-    .bind(&user.id)
-    .bind(&now)
-    .fetch_all(&state.db)
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => return internal_error(e),
-    };
+    .bind(user_id)
+    .bind(now.to_rfc3339())
+    .bind((now - idle).to_rfc3339())
+    .fetch_all(db)
+    .await?;
 
-    let responses: Vec<SessionResponse> = sessions
+    Ok(sessions
         .into_iter()
-        .map(|s| SessionResponse {
-            is_current: s.id == current,
-            id: s.id,
-            user_agent: s.user_agent,
-            ip_address: s.ip_address,
-            created_at: s.created_at,
-            last_used_at: s.last_used_at,
-            expires_at: s.expires_at,
+        .map(|s| {
+            let last = s
+                .last_used_at
+                .clone()
+                .unwrap_or_else(|| s.created_at.clone());
+            let idle_expires_at = chrono::DateTime::parse_from_rfc3339(&last)
+                .ok()
+                .map(|t| (t + idle).to_rfc3339());
+            SessionResponse {
+                is_current: current == Some(s.id.as_str()),
+                id: s.id,
+                user_agent: s.user_agent,
+                ip_address: s.ip_address,
+                created_at: s.created_at,
+                last_used_at: s.last_used_at,
+                expires_at: s.expires_at,
+                idle_expires_at,
+            }
         })
-        .collect();
-
-    (StatusCode::OK, Json(ApiResponse::ok(responses))).into_response()
+        .collect())
 }
 
 // ── DELETE /api/auth/sessions/{id} ──
@@ -695,6 +692,7 @@ pub async fn list_sessions(
 
 pub async fn revoke_session(
     _rate: RateLimit,
+    ClientIp(ip): ClientIp,
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(session_id): Path<String>,
@@ -713,11 +711,19 @@ pub async fn revoke_session(
         Ok(r) if r.rows_affected() == 0 => {
             error_response(StatusCode::NOT_FOUND, "Session not found")
         }
-        Ok(_) => (
-            StatusCode::OK,
-            Json(ApiResponse::ok(json!({ "message": "Session revoked" }))),
-        )
-            .into_response(),
+        Ok(_) => {
+            record(
+                &state.db,
+                &AuditActor::user(&user.id, &user.email, ip_label(ip)),
+                AuditEntry::new("session_revoke").resource("user", &user.id, &user.email),
+            )
+            .await;
+            (
+                StatusCode::OK,
+                Json(ApiResponse::ok(json!({ "message": "Session revoked" }))),
+            )
+                .into_response()
+        }
         Err(e) => internal_error(e),
     }
 }
@@ -727,6 +733,7 @@ pub async fn revoke_session(
 
 pub async fn revoke_all_sessions(
     _rate: RateLimit,
+    ClientIp(ip): ClientIp,
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
@@ -736,13 +743,23 @@ pub async fn revoke_all_sessions(
     };
 
     match revoke_other_sessions(&state.db, &user.id, Some(&token)).await {
-        Ok(n) => (
-            StatusCode::OK,
-            Json(ApiResponse::ok(
-                json!({ "message": format!("Revoked {n} session(s)") }),
-            )),
-        )
-            .into_response(),
+        Ok(n) => {
+            record(
+                &state.db,
+                &AuditActor::user(&user.id, &user.email, ip_label(ip)),
+                AuditEntry::new("session_revoke_others")
+                    .resource("user", &user.id, &user.email)
+                    .detail(format!("signed out {n} other session(s)")),
+            )
+            .await;
+            (
+                StatusCode::OK,
+                Json(ApiResponse::ok(
+                    json!({ "message": format!("Revoked {n} session(s)") }),
+                )),
+            )
+                .into_response()
+        }
         Err(e) => internal_error(e),
     }
 }
@@ -920,7 +937,12 @@ pub async fn totp_confirm(
 
     // Anyone else holding a session got in without the new second factor.
     let _ = revoke_other_sessions(&state.db, &user.id, Some(&token)).await;
-    write_audit_log(&state.db, None, None, "2fa_enabled", &user.email, None).await;
+    record(
+        &state.db,
+        &AuditActor::user(&user.id, &user.email, ip_label(ip)),
+        AuditEntry::new("2fa_enabled").resource("user", &user.id, &user.email),
+    )
+    .await;
 
     (
         StatusCode::OK,
@@ -984,7 +1006,12 @@ pub async fn totp_disable(
         .await;
 
     let _ = revoke_other_sessions(&state.db, &user.id, Some(&token)).await;
-    write_audit_log(&state.db, None, None, "2fa_disabled", &user.email, None).await;
+    record(
+        &state.db,
+        &AuditActor::user(&user.id, &user.email, ip_label(ip)),
+        AuditEntry::new("2fa_disabled").resource("user", &user.id, &user.email),
+    )
+    .await;
 
     (
         StatusCode::OK,
@@ -1064,6 +1091,15 @@ pub async fn totp_verify(
 
     if let Err(response) = verify_second_factor(&state, ip, &user, &req.code).await {
         let response = *response;
+        record(
+            &state.db,
+            &AuditActor::user(&user.id, &user.email, ip_label(ip)),
+            AuditEntry::new("login_failed")
+                .resource("user", &user.id, &user.email)
+                .failed()
+                .detail("wrong 2FA code"),
+        )
+        .await;
         if attempts >= MFA_MAX_ATTEMPTS {
             let _ = sqlx::query("DELETE FROM mfa_pending WHERE id = ?")
                 .bind(&pending_hash)
@@ -1085,13 +1121,37 @@ pub async fn totp_verify(
         .execute(&state.db)
         .await;
 
+    if user.disabled_at.is_some() {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "This account is disabled. Ask an admin of this server to enable it.",
+        );
+    }
+
     let ip_str = ip_label(ip);
-    let session_token =
-        match create_session(&state.db, &user.id, ua.as_deref(), ip_str.as_deref()).await {
-            Ok(t) => t,
-            Err(e) => return internal_error(e),
-        };
+    let max_age = session_max_age_days(&state).await;
+    let session_token = match create_session(
+        &state.db,
+        &user.id,
+        ua.as_deref(),
+        ip_str.as_deref(),
+        max_age,
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => return internal_error(e),
+    };
     state.rate_limiter.record_login_success(&user.id).await;
+    mark_login(&state, &user.id).await;
+    record(
+        &state.db,
+        &AuditActor::user(&user.id, &user.email, ip_str),
+        AuditEntry::new("login")
+            .resource("user", &user.id, &user.email)
+            .detail("with 2FA"),
+    )
+    .await;
 
     let response = (
         StatusCode::OK,
@@ -1100,8 +1160,152 @@ pub async fn totp_verify(
         .into_response();
     with_cookies(
         response,
-        &[session_cookie(&session_token), clear_mfa_pending_cookie()],
+        &[
+            session_cookie(&session_token, max_age),
+            clear_mfa_pending_cookie(),
+        ],
     )
+}
+
+// ── POST /api/auth/password-link/check ──
+// Lets the set-password page validate an invite/reset link before showing the form.
+
+pub async fn password_link_check(
+    _rate: RateLimit,
+    State(state): State<AppState>,
+    Json(req): Json<PasswordLinkCheckRequest>,
+) -> Response {
+    match password_links::lookup(&state.db, &req.token).await {
+        Ok(Some(link)) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(json!({
+                "email": link.email,
+                "purpose": link.purpose,
+                "expires_at": link.expires_at,
+            }))),
+        )
+            .into_response(),
+        Ok(None) => error_response(StatusCode::FORBIDDEN, password_links::INVALID_LINK),
+        Err(e) => internal_error(e),
+    }
+}
+
+// ── POST /api/auth/password-link/complete ──
+// Set the password from an invite/reset link (single use), sign out every
+// existing session of the account and sign the browser in.
+
+pub async fn password_link_complete(
+    _rate: RateLimit,
+    ClientIp(ip): ClientIp,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<PasswordLinkCompleteRequest>,
+) -> Response {
+    // Cheap rejection before any argon2 work.
+    match password_links::lookup(&state.db, &req.token).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return error_response(StatusCode::FORBIDDEN, password_links::INVALID_LINK),
+        Err(e) => return internal_error(e),
+    }
+    if let Some(response) = policy_error(&req.password) {
+        return response;
+    }
+    let password_hash = match hash_password_throttled(&req.password).await {
+        Ok(h) => h,
+        Err(e) => return password_error_response(e),
+    };
+
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
+        Err(e) => return internal_error(e),
+    };
+    let link = match password_links::consume(&mut tx, &req.token).await {
+        Ok(Some(link)) => link,
+        Ok(None) => return error_response(StatusCode::FORBIDDEN, password_links::INVALID_LINK),
+        Err(e) => return internal_error(e),
+    };
+    let now = Utc::now().to_rfc3339();
+    let steps = async {
+        sqlx::query("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?")
+            .bind(&password_hash)
+            .bind(&now)
+            .bind(&link.user_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM sessions WHERE user_id = ?")
+            .bind(&link.user_id)
+            .execute(&mut *tx)
+            .await?;
+        Ok::<(), sqlx::Error>(())
+    };
+    if let Err(e) = steps.await {
+        return internal_error(e);
+    }
+    if let Err(e) = tx.commit().await {
+        return internal_error(e);
+    }
+
+    let user = match sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
+        .bind(&link.user_id)
+        .fetch_one(&state.db)
+        .await
+    {
+        Ok(u) => u,
+        Err(e) => return internal_error(e),
+    };
+    let ip_str = ip_label(ip);
+    record(
+        &state.db,
+        &AuditActor::user(&user.id, &user.email, ip_str.clone()),
+        AuditEntry::new(if link.purpose == "invite" {
+            "invite_accepted"
+        } else {
+            "password_reset"
+        })
+        .resource("user", &user.id, &user.email),
+    )
+    .await;
+
+    // A disabled account can set its password but not sign in.
+    if user.disabled_at.is_some() || user.totp_enabled {
+        let message = if user.totp_enabled {
+            "Password set. Sign in with it and your authenticator code."
+        } else {
+            "Password set. This account is disabled; ask an admin to enable it."
+        };
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::ok(
+                json!({ "signed_in": false, "message": message }),
+            )),
+        )
+            .into_response();
+    }
+
+    let ua = extract_user_agent(&headers);
+    let max_age = session_max_age_days(&state).await;
+    let session_token = match create_session(
+        &state.db,
+        &user.id,
+        ua.as_deref(),
+        ip_str.as_deref(),
+        max_age,
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => return internal_error(e),
+    };
+    mark_login(&state, &user.id).await;
+    let response = (
+        StatusCode::OK,
+        Json(ApiResponse::ok(json!({
+            "signed_in": true,
+            "user": UserResponse::from(user),
+        }))),
+    )
+        .into_response();
+    with_cookies(response, &[session_cookie(&session_token, max_age)])
 }
 
 #[cfg(test)]
@@ -1210,6 +1414,7 @@ mod tests {
             user_id,
             Some("curl/8.0"),
             Some("127.0.0.1"),
+            30,
         )
         .await
         .unwrap_or_else(|err| panic!("failed to seed session ({token_hint}): {err}"))
@@ -1860,36 +2065,6 @@ mod tests {
             1
         );
         assert!(sessions.iter().all(|s| s["id"] != serde_json::json!(token)));
-    }
-
-    #[tokio::test]
-    async fn create_user_requires_admin_role() {
-        let state = test_state().await;
-        seed_user(
-            &state,
-            "member-1",
-            "member@example.com",
-            "ValidPass123!",
-            "member",
-            false,
-            None,
-        )
-        .await;
-        let token = seed_session(&state, "member-1", "member-session").await;
-
-        let response = create_user(
-            RateLimit,
-            State(state),
-            session_headers(&token),
-            Json(CreateUserRequest {
-                email: "new@example.com".to_string(),
-                password: "StrongPass1!".to_string(),
-                role: "member".to_string(),
-            }),
-        )
-        .await;
-
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

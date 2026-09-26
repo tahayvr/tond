@@ -4,8 +4,8 @@
 // function maps directly to an Axum route registered in main.rs.
 //
 // All handlers except `health` require both:
-//   _rate: RateLimit    — enforces per-IP token bucket (429 if exceeded)
-//   _auth: RequireAuth  — requires Bearer API key or session cookie (401 if missing)
+//   _rate: RateLimit          — enforces per-IP token bucket (429 if exceeded)
+//   auth: Authz<scope::X>     — authenticated caller holding scope X (401/403)
 //
 // Return type convention:
 //   All handlers return Result<impl IntoResponse, AppError>. AppError wraps
@@ -58,6 +58,8 @@ pub mod storage_providers;
 pub mod system_self;
 pub mod templates;
 pub mod terminal;
+pub mod tokens;
+pub mod users;
 pub mod webhooks;
 
 use axum::{
@@ -70,9 +72,10 @@ use serde::Deserialize;
 use serde_json::json;
 use tond_common::*;
 
+use crate::audit_log::{AuditEntry, record};
 use crate::{
-    audit_log::{AuthActor, write_audit_log},
-    auth::{AuthRole, RateLimit, RequireAdmin, RequireAuth},
+    audit_log::write_audit_log,
+    auth::{Authz, RateLimit, scope},
     compose_policy, deploy, docker,
     error::AppError,
     proxy_link,
@@ -113,13 +116,16 @@ pub struct ListAppsQuery {
 
 pub async fn list_apps(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::AppsRead>,
     State(state): State<AppState>,
     Query(query): Query<ListAppsQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     // If ?name= is provided, return just that one app (or 404).
     if let Some(name) = query.name {
         let app = fetch_app(&state.db, &name).await?;
+        if !auth.can_see_app(&app.id, app.project_id.as_deref()) {
+            return Err(AppError(TondError::AppNotFound(name)));
+        }
         let responses = vec![AppResponse::from(app)];
         return Ok((StatusCode::OK, Json(ApiResponse::ok(responses))));
     }
@@ -128,7 +134,12 @@ pub async fn list_apps(
         .fetch_all(&state.db)
         .await?;
 
-    let responses: Vec<AppResponse> = apps.into_iter().map(AppResponse::from).collect();
+    // Tokens limited to some apps only see those.
+    let responses: Vec<AppResponse> = apps
+        .into_iter()
+        .filter(|a| auth.can_see_app(&a.id, a.project_id.as_deref()))
+        .map(AppResponse::from)
+        .collect();
     Ok((StatusCode::OK, Json(ApiResponse::ok(responses))))
 }
 
@@ -136,7 +147,7 @@ pub async fn list_apps(
 
 pub async fn get_app(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsRead>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -151,17 +162,16 @@ pub async fn get_app(
 
 pub async fn create_app(
     _rate: RateLimit,
-    auth: AuthRole,
-    actor: AuthActor,
+    auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Json(req): Json<CreateAppRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    // Volumes and compose files reach the host, so only admins may set them.
+    // Volumes and compose files reach the host: they also need an admin scope.
     if req.volumes.as_ref().is_some_and(|v| !v.is_empty()) {
-        auth.ensure_admin("configure volumes")?;
+        auth.require_to(Scope::SettingsWrite, "configure volumes")?;
     }
     if req.source_type == "compose" {
-        auth.ensure_admin("deploy Docker Compose apps")?;
+        auth.require_to(Scope::SettingsWrite, "deploy Docker Compose apps")?;
     }
 
     // Validate name (alphanumeric + hyphens)
@@ -389,7 +399,7 @@ pub async fn create_app(
         Some(&app.id),
         Some(&app.name),
         "create",
-        &actor.0,
+        &auth.audit_actor(),
         None,
     )
     .await;
@@ -414,7 +424,7 @@ pub struct ValidateComposeRequest {
 
 pub async fn validate_compose(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsWrite>,
     Json(req): Json<ValidateComposeRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let name = req
@@ -440,8 +450,7 @@ pub async fn validate_compose(
 
 pub async fn delete_app(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::AppsDelete>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -466,7 +475,7 @@ pub async fn delete_app(
         Some(&app.id),
         Some(&app.name),
         "delete",
-        &actor.0,
+        &auth.audit_actor(),
         None,
     )
     .await;
@@ -481,8 +490,7 @@ pub async fn delete_app(
 
 pub async fn deploy_app(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::AppsDeploy>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -502,7 +510,7 @@ pub async fn deploy_app(
         Some(&app.id),
         Some(&app.name),
         "deploy",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("deployment={}", queued.deployment_id)),
     )
     .await;
@@ -533,8 +541,7 @@ pub(crate) fn queued_response(app_id: &str, queued: &deploy::queue::Enqueued) ->
 
 pub async fn stop_app(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::AppsControl>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -559,7 +566,7 @@ pub async fn stop_app(
         Some(&app.id),
         Some(&app.name),
         "stop",
-        &actor.0,
+        &auth.audit_actor(),
         None,
     )
     .await;
@@ -574,8 +581,7 @@ pub async fn stop_app(
 
 pub async fn start_app(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::AppsControl>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -600,7 +606,7 @@ pub async fn start_app(
         Some(&app.id),
         Some(&app.name),
         "start",
-        &actor.0,
+        &auth.audit_actor(),
         None,
     )
     .await;
@@ -615,8 +621,7 @@ pub async fn start_app(
 
 pub async fn restart_app(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::AppsControl>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -644,7 +649,7 @@ pub async fn restart_app(
         Some(&app.id),
         Some(&app.name),
         "restart",
-        &actor.0,
+        &auth.audit_actor(),
         None,
     )
     .await;
@@ -659,7 +664,7 @@ pub async fn restart_app(
 
 pub async fn app_logs(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::LogsRead>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -696,8 +701,7 @@ pub async fn app_logs(
 
 pub async fn update_domain(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateDomainRequest>,
@@ -750,7 +754,7 @@ pub async fn update_domain(
         Some(&app.id),
         Some(&app.name),
         "domain_update",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("domain={}", req.domain)),
     )
     .await;
@@ -767,7 +771,7 @@ pub async fn update_domain(
 
 pub async fn list_certs(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsRead>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     let certs =
@@ -787,7 +791,7 @@ pub async fn list_certs(
 /// count is kept, so repeated retries of a broken domain still back off.
 pub async fn retry_cert(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Path(domain): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -807,6 +811,12 @@ pub async fn retry_cert(
     // Ask tond-proxy to try right away instead of at its next scheduled pass.
     tokio::spawn(proxy_link::request_certs(Some(domain.clone())));
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("cert_retry").resource("certificate", &domain, &domain),
+    )
+    .await;
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(
@@ -819,7 +829,7 @@ pub async fn retry_cert(
 
 pub async fn update_health(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateHealthRequest>,
@@ -839,6 +849,12 @@ pub async fn update_health(
     .execute(&state.db)
     .await?;
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("health_update").resource("app", &app.id, &app.name),
+    )
+    .await;
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(
@@ -851,8 +867,7 @@ pub async fn update_health(
 
 pub async fn add_volume(
     _rate: RateLimit,
-    _admin: RequireAdmin,
-    actor: AuthActor,
+    auth: Authz<(scope::AppsWrite, scope::SettingsWrite)>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<VolumeRequest>,
@@ -881,7 +896,7 @@ pub async fn add_volume(
         Some(&app.id),
         Some(&app.name),
         "volume_add",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&detail),
     )
     .await;
@@ -898,7 +913,7 @@ pub async fn add_volume(
 
 pub async fn remove_volume(
     _rate: RateLimit,
-    _admin: RequireAdmin,
+    auth: Authz<(scope::AppsWrite, scope::SettingsWrite)>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<VolumeRequest>,
@@ -925,6 +940,14 @@ pub async fn remove_volume(
         .execute(&state.db)
         .await?;
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("volume_remove")
+            .resource("app", &app.id, &app.name)
+            .detail(req.container_path.clone()),
+    )
+    .await;
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(
@@ -937,8 +960,7 @@ pub async fn remove_volume(
 
 pub async fn update_app_resources(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateAppResourcesRequest>,
@@ -961,7 +983,7 @@ pub async fn update_app_resources(
         Some(&app.id),
         Some(&app.name),
         "resources_update",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!(
             "memory_limit={:?},cpu_limit={:?}",
             req.memory_limit, req.cpu_limit
@@ -979,7 +1001,7 @@ pub async fn update_app_resources(
 
 pub async fn update_drain_timeout(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateDrainTimeoutRequest>,
@@ -998,6 +1020,12 @@ pub async fn update_drain_timeout(
         .execute(&state.db)
         .await?;
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("drain_timeout_update").resource("app", &app.id, &app.name),
+    )
+    .await;
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(
@@ -1008,8 +1036,7 @@ pub async fn update_drain_timeout(
 
 pub async fn upload_deploy(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::AppsDeploy>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     mut multipart: Multipart,
@@ -1092,7 +1119,7 @@ pub async fn upload_deploy(
         Some(&app.id),
         Some(&app.name),
         "deploy",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!(
             "source=upload deployment={}",
             queued.deployment_id
@@ -1114,8 +1141,7 @@ pub async fn upload_deploy(
 
 pub async fn assign_project(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<AssignProjectRequest>,
@@ -1144,7 +1170,7 @@ pub async fn assign_project(
         Some(&app.id),
         Some(&app.name),
         "assign_project",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!(
             "project_id={}",
             req.project_id.as_deref().unwrap_or("null")
@@ -1181,8 +1207,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        audit_log::AuthActor,
-        auth::{RateLimiter, RequireAdmin, RequireAuth, extractor::Role, rate_limit::RateLimit},
+        auth::{Authz, Principal, RateLimiter, rate_limit::RateLimit},
         state::AppState,
     };
 
@@ -1280,8 +1305,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(CreateAppRequest {
                 name: "bad name".to_string(),
@@ -1327,8 +1351,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(CreateAppRequest {
                 name: "demo".to_string(),
@@ -1374,8 +1397,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(CreateAppRequest {
                 name: "demo".to_string(),
@@ -1421,8 +1443,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(CreateAppRequest {
                 name: "demo".to_string(),
@@ -1468,8 +1489,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(CreateAppRequest {
                 name: "demo".to_string(),
@@ -1515,8 +1535,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(CreateAppRequest {
                 name: "demo".to_string(),
@@ -1562,8 +1581,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(CreateAppRequest {
                 name: "demo-image".to_string(),
@@ -1609,8 +1627,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(CreateAppRequest {
                 name: "demo-dockerfile".to_string(),
@@ -1655,8 +1672,7 @@ mod tests {
         let state = test_state().await;
         let response = create_app(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(CreateAppRequest {
                 name: "inline-dockerfile".to_string(),
@@ -1704,8 +1720,7 @@ mod tests {
         let state = test_state().await;
         let response = create_app(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(CreateAppRequest {
                 name: "image-app".to_string(),
@@ -1752,8 +1767,7 @@ mod tests {
         let state = test_state().await;
         let response = create_app(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Json(CreateAppRequest {
                 name: "demo".to_string(),
@@ -1827,7 +1841,7 @@ mod tests {
 
         let response = list_apps(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Query(ListAppsQuery {
                 name: Some("demo".to_string()),
@@ -1860,8 +1874,7 @@ mod tests {
 
         let response = update_domain(
             RateLimit,
-            RequireAuth,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.id.clone()),
             Json(UpdateDomainRequest {
@@ -1915,7 +1928,7 @@ mod tests {
 
         let response = update_health(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.id.clone()),
             Json(UpdateHealthRequest {
@@ -1966,8 +1979,7 @@ mod tests {
 
         let error = add_volume(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Path(app.id),
             Json(VolumeRequest {
@@ -1994,8 +2006,7 @@ mod tests {
 
         let add_response = add_volume(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.id.clone()),
             Json(VolumeRequest {
@@ -2029,8 +2040,7 @@ mod tests {
 
         let error = add_volume(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.id.clone()),
             Json(VolumeRequest {
@@ -2050,7 +2060,7 @@ mod tests {
 
         let remove_response = remove_volume(
             RateLimit,
-            RequireAdmin,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.id.clone()),
             Json(VolumeRequest {
@@ -2088,8 +2098,7 @@ mod tests {
         for host_path in ["/", "/etc", "/var/run/docker.sock", "/opt/tond/data"] {
             let error = add_volume(
                 RateLimit,
-                RequireAdmin,
-                AuthActor("admin@example.com".to_string()),
+                Authz::unchecked(Principal::test_user(Role::Admin)),
                 State(state.clone()),
                 Path(app.id.clone()),
                 Json(VolumeRequest {
@@ -2153,8 +2162,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Json(request),
         )
@@ -2202,8 +2210,7 @@ mod tests {
         };
         let error = create_app(
             RateLimit,
-            AuthRole(Role::Member),
-            AuthActor("member@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Deployer)),
             State(state.clone()),
             Json(request),
         )
@@ -2247,8 +2254,7 @@ mod tests {
         let state = test_state().await;
         let error = create_app(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Json(compose_request(
                 "evil",
@@ -2266,8 +2272,7 @@ mod tests {
         // Members can't deploy compose apps at all; admins can deploy clean ones.
         let error = create_app(
             RateLimit,
-            AuthRole(Role::Member),
-            AuthActor("member@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Deployer)),
             State(state.clone()),
             Json(compose_request(
                 "member-compose",
@@ -2281,8 +2286,7 @@ mod tests {
 
         let response = create_app(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Json(compose_request(
                 "clean",
@@ -2299,7 +2303,7 @@ mod tests {
     async fn validate_compose_lists_problems_without_failing_the_request() {
         let response = validate_compose(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             Json(ValidateComposeRequest {
                 app_name: Some("web".to_string()),
                 compose_content: "services:\n  a:\n    image: x\n    privileged: true\n"
@@ -2319,7 +2323,7 @@ mod tests {
 
         let response = validate_compose(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             Json(ValidateComposeRequest {
                 app_name: None,
                 compose_content: "services:\n  a:\n    image: x\n".to_string(),
@@ -2339,7 +2343,7 @@ mod tests {
 
         let error = update_drain_timeout(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Path(app.id),
             Json(UpdateDrainTimeoutRequest { drain_timeout: -1 }),
@@ -2362,8 +2366,7 @@ mod tests {
 
         let error = assign_project(
             RateLimit,
-            RequireAuth,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.id.clone()),
             Json(AssignProjectRequest {
@@ -2382,8 +2385,7 @@ mod tests {
         seed_project(&state, "project-1", "Platform").await;
         let response = assign_project(
             RateLimit,
-            RequireAuth,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.id.clone()),
             Json(AssignProjectRequest {
@@ -2430,7 +2432,7 @@ mod tests {
 
         let response = retry_cert(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path("x.example.com".to_string()),
         )
@@ -2450,7 +2452,7 @@ mod tests {
 
         let missing = retry_cert(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Path("nope.example.com".to_string()),
         )

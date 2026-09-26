@@ -16,7 +16,6 @@ DATA_DIR="${INSTALL_DIR}/data"
 DASHBOARD_DIR="${INSTALL_DIR}/dashboard"
 SECRET_ENV_FILE="${DATA_DIR}/tond.env"
 # Written by tond-server on first start, root-only (0600), never logged:
-ROOT_KEY_FILE="${DATA_DIR}/root-api-key"      # root API key for automation
 SETUP_TOKEN_FILE="${DATA_DIR}/setup-token"    # one-time admin setup token (removed after setup)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 NON_INTERACTIVE=false
@@ -501,7 +500,7 @@ ensure_terminal_user() {
 #                                             tond-proxy (which also opens it mode=ro)
 #   proxy.sock          tond-proxy 0600       created by tond-proxy at start
 #   certs/, acme_account.json  tond-proxy     0700 dirs / 0600 files (TLS + ACME keys)
-#   tond.env, root-api-key, setup-token   root 0600 (written by tond-server/install.sh)
+#   tond.env, setup-token                 root 0600 (written by tond-server/install.sh)
 #   everything else     root only: top-level entries lose group/other access;
 #                       builds/ compose/ volumes/ databases/ keys/ backups/
 #                       docker-config/ are 0700 (the parents are what keep their
@@ -781,8 +780,10 @@ read_setup_token() {
             tr -d '[:space:]' < "$SETUP_TOKEN_FILE"
             return 0
         fi
-        # Setup already done: the server removes the token file and never recreates it.
-        if [[ -s "$ROOT_KEY_FILE" && $i -ge 5 ]]; then
+        # Setup already done: the server writes the token (if needed) before it
+        # opens its socket, so a listening server without a token file means
+        # the admin account exists.
+        if [[ -S "${DATA_DIR}/tond.sock" && $i -ge 2 ]]; then
             return 0
         fi
         sleep 1
@@ -841,11 +842,9 @@ print_summary() {
         echo ""
     fi
 
-    if [[ -s "$ROOT_KEY_FILE" ]]; then
-        echo -e "${BOLD}Root API key${NC} (advanced / automation access) is stored in ${ROOT_KEY_FILE} (root only)."
-        echo "  Show it with: sudo cat ${ROOT_KEY_FILE}"
-        echo ""
-    fi
+    echo -e "${BOLD}Automation:${NC} Create a scoped API token for CI or scripts (shown once):"
+    echo "            sudo tond token create --name ci --preset deployer --app <app> --expires 30d"
+    echo ""
 
     if [[ -n "$PREVIEW_DOMAIN" ]]; then
         echo -e "${BOLD}Previews:${NC}   Create a wildcard A record: *.${PREVIEW_DOMAIN} -> ${server_ip}"

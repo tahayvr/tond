@@ -43,7 +43,7 @@ use uuid::Uuid;
 
 use crate::runtime::changes::{Table, Watch};
 use crate::runtime::{loops, shutdown};
-use crate::{alerts, docker, state::AppState, volumes};
+use crate::{alerts, docker, metrics, state::AppState, volumes};
 
 /// Longest sleep when no job is scheduled soon (a cron_jobs change wakes us).
 const MAX_SLEEP: std::time::Duration = std::time::Duration::from_secs(3600);
@@ -539,6 +539,7 @@ async fn run_cron_container(
             let mut m = HashMap::new();
             m.insert("managed-by".to_string(), "tond".to_string());
             m.insert("tond-type".to_string(), "cron".to_string());
+            m.insert(metrics::CRON_JOB_LABEL.to_string(), job.id.clone());
             Some(m)
         },
         host_config: Some(host_config),

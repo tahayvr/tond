@@ -844,7 +844,14 @@ mod tests {
     fn builds_run_under_the_build_slice() {
         assert_eq!(
             docker_build_args("t", "/ctx", None, Some(DEFAULT_BUILD_CGROUP_PARENT)),
-            vec!["build", "--cgroup-parent", "tondbuild.slice", "-t", "t", "/ctx"]
+            vec![
+                "build",
+                "--cgroup-parent",
+                "tondbuild.slice",
+                "-t",
+                "t",
+                "/ctx"
+            ]
         );
         // SAFETY: only this test reads TOND_BUILD_CGROUP_PARENT.
         unsafe { std::env::remove_var("TOND_BUILD_CGROUP_PARENT") };
@@ -853,7 +860,11 @@ mod tests {
             Some(DEFAULT_BUILD_CGROUP_PARENT)
         );
         unsafe { std::env::set_var("TOND_BUILD_CGROUP_PARENT", " ") };
-        assert_eq!(build_cgroup_parent(), None, "empty disables the cgroup parent");
+        assert_eq!(
+            build_cgroup_parent(),
+            None,
+            "empty disables the cgroup parent"
+        );
         unsafe { std::env::remove_var("TOND_BUILD_CGROUP_PARENT") };
     }
 

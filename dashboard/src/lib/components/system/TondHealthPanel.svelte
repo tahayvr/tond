@@ -142,18 +142,20 @@
 				<caption class="sr-only">Background loops</caption>
 				<thead>
 					<tr class="border-b bg-muted/50 text-left">
-						<th class="px-3 py-2 sm:px-4 font-medium text-muted-foreground">
+						<th class="px-3 py-2 font-medium text-muted-foreground sm:px-4">
 							Background work
 							{#if failing > 0}
 								<span class="ml-1 text-destructive">· {failing} failing</span>
 							{/if}
 						</th>
-						<th class="px-3 py-2 sm:px-4 font-medium text-muted-foreground">Last run</th>
-						<th class="hidden px-3 py-2 sm:px-4 font-medium text-muted-foreground sm:table-cell">Took</th>
-						<th class="hidden px-3 py-2 sm:px-4 font-medium text-muted-foreground md:table-cell">
+						<th class="px-3 py-2 font-medium text-muted-foreground sm:px-4">Last run</th>
+						<th class="hidden px-3 py-2 font-medium text-muted-foreground sm:table-cell sm:px-4"
+							>Took</th
+						>
+						<th class="hidden px-3 py-2 font-medium text-muted-foreground sm:px-4 md:table-cell">
 							Next check
 						</th>
-						<th class="px-3 py-2 sm:px-4 text-right font-medium text-muted-foreground">Errors</th>
+						<th class="px-3 py-2 text-right font-medium text-muted-foreground sm:px-4">Errors</th>
 					</tr>
 				</thead>
 				<tbody>
@@ -183,18 +185,20 @@
 									</p>
 								{/if}
 							</td>
-							<td class="px-3 py-2 sm:px-4 whitespace-nowrap text-muted-foreground">
+							<td class="px-3 py-2 whitespace-nowrap text-muted-foreground sm:px-4">
 								{relativeTime(loop.last_run_at, now)}
 							</td>
-							<td class="hidden px-3 py-2 sm:px-4 text-muted-foreground tabular-nums sm:table-cell">
+							<td class="hidden px-3 py-2 text-muted-foreground tabular-nums sm:table-cell sm:px-4">
 								{formatMs(loop.last_duration_ms)}
 							</td>
-							<td class="hidden px-3 py-2 sm:px-4 whitespace-nowrap text-muted-foreground md:table-cell">
+							<td
+								class="hidden px-3 py-2 whitespace-nowrap text-muted-foreground sm:px-4 md:table-cell"
+							>
 								{loop.next_wake_at ? relativeTime(loop.next_wake_at, now) : 'on change'}
 							</td>
 							<td
 								class={cn(
-									'px-3 py-2 sm:px-4 text-right tabular-nums',
+									'px-3 py-2 text-right tabular-nums sm:px-4',
 									loop.errors > 0 ? 'text-destructive' : 'text-muted-foreground'
 								)}
 							>

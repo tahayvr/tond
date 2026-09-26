@@ -25,6 +25,31 @@ pub struct ServerSettings {
     /// preview pages are cross-site to the dashboard. Empty = previews disabled.
     #[serde(default)]
     pub preview_domain: String,
+    /// Dashboard sessions end after this many hours without a request
+    /// (settings key `session_idle_timeout_hours`).
+    #[serde(default = "default_session_idle_hours")]
+    pub session_idle_timeout_hours: i64,
+    /// Dashboard sessions end this many days after sign-in, however active
+    /// (settings key `session_max_age_days`).
+    #[serde(default = "default_session_max_age_days")]
+    pub session_max_age_days: i64,
+}
+
+/// Default idle timeout for dashboard sessions.
+pub const DEFAULT_SESSION_IDLE_HOURS: i64 = 12;
+/// Default absolute lifetime of dashboard sessions.
+pub const DEFAULT_SESSION_MAX_AGE_DAYS: i64 = 30;
+/// Accepted range for `session_idle_timeout_hours` (1 hour … 30 days).
+pub const SESSION_IDLE_HOURS_RANGE: std::ops::RangeInclusive<i64> = 1..=720;
+/// Accepted range for `session_max_age_days` (1 day … 1 year).
+pub const SESSION_MAX_AGE_DAYS_RANGE: std::ops::RangeInclusive<i64> = 1..=365;
+
+fn default_session_idle_hours() -> i64 {
+    DEFAULT_SESSION_IDLE_HOURS
+}
+
+fn default_session_max_age_days() -> i64 {
+    DEFAULT_SESSION_MAX_AGE_DAYS
 }
 
 impl Default for ServerSettings {
@@ -33,6 +58,8 @@ impl Default for ServerSettings {
             server_name: default_server_name(),
             dashboard_domain: String::new(),
             preview_domain: String::new(),
+            session_idle_timeout_hours: DEFAULT_SESSION_IDLE_HOURS,
+            session_max_age_days: DEFAULT_SESSION_MAX_AGE_DAYS,
         }
     }
 }
@@ -46,10 +73,14 @@ pub struct SettingRow {
 
 /// PUT /api/settings request body — all fields are optional so the caller
 /// can update only the keys they care about.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct UpdateSettingsRequest {
     pub server_name: Option<String>,
     pub dashboard_domain: Option<String>,
     #[serde(default)]
     pub preview_domain: Option<String>,
+    #[serde(default)]
+    pub session_idle_timeout_hours: Option<i64>,
+    #[serde(default)]
+    pub session_max_age_days: Option<i64>,
 }

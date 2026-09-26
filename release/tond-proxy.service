@@ -17,7 +17,7 @@ Type=simple
 #   proxy.sock                      tond-proxy 0600: control socket; only root
 #                                   (tond-server) and tond-proxy may connect
 #   certs/, acme_account.json       tond-proxy only (0700 / 0600)
-#   tond.env, root-api-key, setup-token, tond.sock, keys/, backups/, ...  root only
+#   tond.env, setup-token, tond.sock, keys/, backups/, ...  root only
 User=tond-proxy
 Group=tond-proxy
 WorkingDirectory=/opt/tond

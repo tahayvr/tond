@@ -4,13 +4,14 @@
 //   - The SQLite database connection (via AppState)
 //   - The Docker daemon connection (via AppState)
 //   - All HTTP route definitions
-//   - Startup bootstrapping (migrations, root API key)
+//   - Startup bootstrapping (migrations, first-run setup token)
 //
 // Architecture overview:
 //   Every request flows through the Axum router defined here. Protected
 //   routes require two extractors in the handler signature:
 //     _rate: RateLimit   — per-IP token bucket, 60 req burst / 10 req/s
-//     _auth: RequireAuth — local Unix socket, Bearer token OR session cookie
+//     auth: Authz<scope::X> — authenticates (local Unix socket, Bearer token or
+//                            session cookie) and checks the scope (auth/principal.rs)
 //
 // Route groups:
 //   /health              — public liveness probe
@@ -52,8 +53,8 @@
 //   The same router is served on two listeners. TCP (TOND_BIND:TOND_PORT) is
 //   what tond-proxy forwards dashboard traffic to, so it gets no implicit trust.
 //   The Unix socket (mode 0600) is for the `tond` CLI on the host; its router
-//   adds the `LocalSocket` extension, which RequireAuth accepts in place of
-//   credentials.
+//   adds the `LocalSocket` extension, which authentication treats as root
+//   (every scope, audited as `local-socket`).
 //
 // Browser protections (applied to every response / TCP request):
 //   auth::csrf::enforce_same_origin    — Origin check on mutations and WebSocket
@@ -63,8 +64,9 @@
 //                                        nosniff, Referrer-Policy, X-Frame-Options.
 //
 // One-time credentials (never logged; see auth/secret_file.rs):
-//   <data dir>/root-api-key  — root API key, written when first generated
 //   <data dir>/setup-token   — first-run setup token, removed after setup
+//   There is no root API key: automation gets a scoped token from
+//   `tond token create` over the root-only socket.
 
 mod alerts;
 mod audit_log;
@@ -90,6 +92,7 @@ mod runtime;
 mod secret_key;
 mod security_headers;
 mod state;
+mod static_files;
 mod storage;
 mod volumes;
 
@@ -102,7 +105,6 @@ use axum::{
     Extension, Router,
     routing::{delete, get, post, put},
 };
-use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
@@ -171,6 +173,16 @@ async fn run() -> Result<()> {
                 "server_name" => s.server_name = row.value,
                 "dashboard_domain" => s.dashboard_domain = row.value,
                 "preview_domain" => s.preview_domain = row.value,
+                "session_idle_timeout_hours" => {
+                    if let Ok(v) = row.value.parse() {
+                        s.session_idle_timeout_hours = v;
+                    }
+                }
+                "session_max_age_days" => {
+                    if let Ok(v) = row.value.parse() {
+                        s.session_max_age_days = v;
+                    }
+                }
                 _ => {}
             }
         }
@@ -181,13 +193,6 @@ async fn run() -> Result<()> {
             s.preview_domain
         );
     }
-
-    // Ensure a root API key exists (generates one on first run, into a root-only file)
-    auth::ensure_root_key(
-        &state.db,
-        &auth::secret_file::data_dir().join(auth::secret_file::ROOT_API_KEY_FILE),
-    )
-    .await?;
 
     // While no admin exists, keep a one-time setup token in a root-only file
     auth::setup_token::ensure_setup_token(&state.db, &auth::setup_token::setup_token_path())
@@ -213,15 +218,51 @@ async fn run() -> Result<()> {
     // API routes
     let api = Router::new()
         .route("/health", get(handlers::health))
-        // Dashboard auth routes (no RequireAuth -- they handle their own auth)
+        // Dashboard auth routes (they handle their own auth)
         .route("/api/auth/status", get(handlers::auth::auth_status))
         .route("/api/auth/setup", post(handlers::auth::setup))
         .route("/api/auth/setup/check", post(handlers::auth::setup_check))
         .route("/api/auth/login", post(handlers::auth::login))
         .route("/api/auth/logout", post(handlers::auth::logout))
         .route("/api/auth/me", get(handlers::auth::me))
-        .route("/api/auth/users", post(handlers::auth::create_user))
-        .route("/api/auth/users", get(handlers::auth::list_users))
+        .route("/api/auth/whoami", get(handlers::tokens::whoami))
+        // One-time set-password links (invites and admin resets); public
+        .route(
+            "/api/auth/password-link/check",
+            post(handlers::auth::password_link_check),
+        )
+        .route(
+            "/api/auth/password-link/complete",
+            post(handlers::auth::password_link_complete),
+        )
+        // User management (users:admin)
+        .route(
+            "/api/users",
+            get(handlers::users::list_users).post(handlers::users::create_user),
+        )
+        .route(
+            "/api/users/{id}",
+            axum::routing::patch(handlers::users::update_user).delete(handlers::users::delete_user),
+        )
+        .route(
+            "/api/users/{id}/password-link",
+            post(handlers::users::create_password_link),
+        )
+        .route(
+            "/api/users/{id}/sessions",
+            get(handlers::users::list_user_sessions).delete(handlers::users::revoke_user_sessions),
+        )
+        .route(
+            "/api/users/{id}/sessions/{session_id}",
+            delete(handlers::users::revoke_user_session),
+        )
+        // API tokens
+        .route("/api/tokens/catalog", get(handlers::tokens::token_catalog))
+        .route(
+            "/api/tokens",
+            get(handlers::tokens::list_tokens).post(handlers::tokens::create_token),
+        )
+        .route("/api/tokens/{id}", delete(handlers::tokens::revoke_token))
         // Phase 7.1 — Password management & session management
         .route(
             "/api/auth/change-password",
@@ -245,7 +286,7 @@ async fn run() -> Result<()> {
             "/api/onboarding/status",
             get(handlers::onboarding::get_status),
         )
-        // App management routes (require API key or session)
+        // App management routes (API token or session; each handler declares its scope)
         .route("/api/apps", get(handlers::list_apps))
         .route("/api/apps", post(handlers::create_app))
         .route("/api/apps/{id}", get(handlers::get_app))
@@ -437,7 +478,7 @@ async fn run() -> Result<()> {
             "/api/apps/{id}/gitlab-token",
             put(handlers::gitlab_tokens::set_app_gitlab_token),
         )
-        // GitHub App callback routes — public (no RequireAuth), called by GitHub
+        // GitHub App callback routes — public (no auth extractor), called by GitHub
         .route(
             "/api/github-apps/callback",
             get(handlers::github_apps::github_app_callback),
@@ -450,7 +491,7 @@ async fn run() -> Result<()> {
             "/webhooks/source/github/install",
             get(handlers::github_apps::github_install_callback),
         )
-        // Webhook endpoints — public (no RequireAuth), called by GitHub/GitLab/etc.
+        // Webhook endpoints — public (no auth extractor), called by GitHub/GitLab/etc.
         .route(
             "/api/webhooks/github/{app_id}",
             post(handlers::webhooks::github_webhook),
@@ -493,6 +534,14 @@ async fn run() -> Result<()> {
         .route(
             "/api/apps/{id}/metrics",
             get(handlers::metrics::get_app_metrics),
+        )
+        .route(
+            "/api/databases/{id}/metrics",
+            get(handlers::metrics::get_database_metrics),
+        )
+        .route(
+            "/api/cron/{id}/metrics",
+            get(handlers::metrics::get_cron_metrics),
         )
         .route(
             "/api/system/metrics",
@@ -549,6 +598,10 @@ async fn run() -> Result<()> {
         )
         // Audit log
         .route("/api/audit-log", get(handlers::audit_log::list_audit_log))
+        .route(
+            "/api/audit-log/verify",
+            get(handlers::audit_log::verify_audit_log),
+        )
         // Projects (Phase 6.1)
         .route("/api/projects", get(handlers::projects::list_projects))
         .route("/api/projects", post(handlers::projects::create_project))
@@ -709,9 +762,7 @@ async fn run() -> Result<()> {
     {
         tracing::info!("Serving dashboard from {}", dashboard_dir);
         security_headers::init_from_dashboard(Path::new(&dashboard_dir));
-        let serve_dir = ServeDir::new(&dashboard_dir)
-            .not_found_service(ServeFile::new(format!("{}/index.html", dashboard_dir)));
-        api.fallback_service(serve_dir)
+        api.fallback_service(static_files::dashboard_router(Path::new(&dashboard_dir)))
     } else {
         tracing::info!("No dashboard found at {}, running API-only", dashboard_dir);
         api

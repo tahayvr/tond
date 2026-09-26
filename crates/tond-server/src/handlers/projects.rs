@@ -3,7 +3,7 @@
 // Projects group related apps under a single logical unit and provide
 // shared environment variables injected into every member app at deploy time.
 //
-// Routes (all require RequireAuth + RateLimit):
+// Routes (all require RateLimit + an Authz scope, see each handler):
 //   GET    /api/projects              — list all projects
 //   POST   /api/projects              — create a project
 //   GET    /api/projects/{id}         — get project details (with member apps)
@@ -21,8 +21,8 @@ use axum::{
 use tond_common::*;
 
 use crate::{
-    audit_log::{AuthActor, write_audit_log},
-    auth::{RateLimit, RequireAuth},
+    audit_log::write_audit_log,
+    auth::{Authz, Principal, RateLimit, scope},
     deploy, docker,
     error::AppError,
     state::AppState,
@@ -37,11 +37,29 @@ struct ProjectDetailResponse {
     apps: Vec<AppResponse>,
 }
 
+/// Shown instead of shared env values to callers without `env:read-values`.
+const MASKED_VALUE: &str = "********";
+
+/// Replace shared env values with a mask unless the caller may read values.
+fn mask_env_values(env: serde_json::Value, auth: &Principal) -> serde_json::Value {
+    if auth.has(Scope::EnvReadValues) {
+        return env;
+    }
+    match env {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(k, _)| (k, serde_json::Value::String(MASKED_VALUE.to_string())))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 // ── List projects ──
 
 pub async fn list_projects(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::AppsRead>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     // Include a count of active (non-expired) project previews per project.
@@ -78,6 +96,7 @@ pub async fn list_projects(
 
     let responses: Vec<ProjectResponse> = rows
         .into_iter()
+        .filter(|r| auth.can_see_project(&r.id))
         .map(|r| {
             let env_vars: serde_json::Value = serde_json::from_str(&r.env_vars)
                 .unwrap_or(serde_json::Value::Object(Default::default()));
@@ -85,7 +104,7 @@ pub async fn list_projects(
                 id: r.id,
                 name: r.name,
                 description: r.description,
-                env_vars,
+                env_vars: mask_env_values(env_vars, &auth),
                 created_at: r.created_at,
                 updated_at: r.updated_at,
                 active_preview_count: r.active_preview_count,
@@ -100,7 +119,7 @@ pub async fn list_projects(
 
 pub async fn get_project(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::AppsRead>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -122,8 +141,10 @@ pub async fn get_project(
 
     let app_responses: Vec<AppResponse> = apps.into_iter().map(AppResponse::from).collect();
 
+    let mut project = ProjectResponse::from(project);
+    project.env_vars = mask_env_values(project.env_vars, &auth);
     Ok(Json(ApiResponse::ok(ProjectDetailResponse {
-        project: ProjectResponse::from(project),
+        project,
         apps: app_responses,
     })))
 }
@@ -132,8 +153,7 @@ pub async fn get_project(
 
 pub async fn create_project(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Json(req): Json<CreateProjectRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -160,6 +180,7 @@ pub async fn create_project(
 
     // Use caller-supplied env_vars if provided
     let env_vars_str = if let Some(ev) = req.env_vars {
+        auth.require(Scope::EnvWrite)?;
         serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_string())
     } else {
         "{}".to_string()
@@ -183,7 +204,7 @@ pub async fn create_project(
         None,
         None,
         "create_project",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("name={}", name)),
     )
     .await;
@@ -200,8 +221,7 @@ pub async fn create_project(
 
 pub async fn update_project(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateProjectRequest>,
@@ -218,6 +238,10 @@ pub async fn update_project(
     let new_name = req.name.as_deref().unwrap_or(&project.name).to_string();
     let new_desc = req.description.or(project.description.clone());
     let new_env_str = if let Some(ev) = req.env_vars {
+        // Shared env vars are replaced as a whole, so editing them means
+        // seeing them: env:write plus env:read-values.
+        auth.require(Scope::EnvWrite)?;
+        auth.require(Scope::EnvReadValues)?;
         serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_string())
     } else {
         project.env_vars.clone()
@@ -241,7 +265,7 @@ pub async fn update_project(
         None,
         None,
         "update_project",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("id={}", project.id)),
     )
     .await;
@@ -260,8 +284,7 @@ pub async fn update_project(
 
 pub async fn delete_project(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::AppsDelete>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -294,7 +317,7 @@ pub async fn delete_project(
         None,
         None,
         "delete_project",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("name={}", project.name)),
     )
     .await;
@@ -311,8 +334,7 @@ pub async fn delete_project(
 
 pub async fn deploy_project(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::AppsDeploy>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -362,7 +384,7 @@ pub async fn deploy_project(
         None,
         None,
         "deploy_project",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("project={} apps={}", project.name, queued)),
     )
     .await;

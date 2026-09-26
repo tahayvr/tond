@@ -275,9 +275,10 @@ restart-proxy:
 restart-server:
     ssh {{ server }} "systemctl restart tond-server && echo Done"
 
-# Print the root API key (written once to a root-only file on first start)
-root-key:
-    ssh {{ server }} "cat /opt/tond/data/root-api-key"
+# Create a scoped API token on the server (printed once), e.g.
+#   just token "--name ci --preset deployer --app web --expires 30d"
+token args:
+    ssh {{ server }} "tond token create {{ args }}"
 
 # Print the one-time admin setup link (until the admin account exists)
 setup-link:

@@ -56,7 +56,7 @@
 				disabled={revokingAll}
 				class="text-xs"
 			>
-				{revokingAll ? 'Signing out…' : 'Sign out everywhere'}
+				{revokingAll ? 'Signing out…' : 'Sign out other sessions'}
 			</Button>
 		{/if}
 	</div>
@@ -102,8 +102,12 @@
 							{/if}
 						</div>
 						<div class="font-mono text-[10px] text-muted-foreground/60">
-							{session.ip_address ?? 'unknown IP'} · last used {formatDate(session.last_used_at)} · expires
-							{formatDate(session.expires_at)}
+							{session.ip_address ?? 'unknown IP'} · last used {formatDate(session.last_used_at)} ·
+							{#if session.idle_expires_at && session.idle_expires_at < session.expires_at}
+								ends {formatDate(session.idle_expires_at)} if unused
+							{:else}
+								expires {formatDate(session.expires_at)}
+							{/if}
 						</div>
 					</div>
 

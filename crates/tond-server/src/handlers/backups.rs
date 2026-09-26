@@ -27,8 +27,9 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tond_common::*;
 
+use crate::audit_log::{AuditEntry, record};
 use crate::{
-    auth::{RateLimit, RequireAdmin, RequireAuth},
+    auth::{Authz, RateLimit, scope},
     backup::{self, SnapshotTrigger},
     error::AppError,
     handlers::storage_providers::decrypt_provider_secret,
@@ -40,7 +41,7 @@ use crate::{
 
 pub async fn create_snapshot(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::SnapshotsCreate>,
     State(state): State<AppState>,
     Json(req): Json<CreateSnapshotRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -62,6 +63,12 @@ pub async fn create_snapshot(
         )))
     })?;
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("snapshot_create").resource("snapshot", &id, &id),
+    )
+    .await;
     Ok((
         StatusCode::ACCEPTED,
         Json(ApiResponse::ok(SnapshotStarted {
@@ -82,7 +89,7 @@ pub struct ListSnapshotsQuery {
 
 pub async fn list_snapshots(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::SnapshotsRead>,
     State(state): State<AppState>,
     Query(query): Query<ListSnapshotsQuery>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -121,7 +128,7 @@ pub async fn list_snapshots(
 
 pub async fn delete_snapshot(
     _rate: RateLimit,
-    _admin: RequireAdmin,
+    auth: Authz<scope::SnapshotsRestore>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -152,6 +159,12 @@ pub async fn delete_snapshot(
         .execute(&state.db)
         .await?;
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("snapshot_delete").resource("snapshot", &snap.id, &snap.name),
+    )
+    .await;
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(json!({ "deleted": id }))),
@@ -162,7 +175,7 @@ pub async fn delete_snapshot(
 
 pub async fn get_backup_config(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::SnapshotsRead>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     let cfg = backup::get_backup_config(&state)
@@ -179,7 +192,7 @@ pub async fn get_backup_config(
 
 pub async fn update_backup_config(
     _rate: RateLimit,
-    _admin: RequireAdmin,
+    auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Json(req): Json<UpdateBackupConfigRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -245,6 +258,12 @@ pub async fn update_backup_config(
         .await
         .map_err(|e| AppError(TondError::Internal(e.to_string())))?;
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("backup_config_update").kind("backup_config"),
+    )
+    .await;
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(BackupConfigResponse::from(updated))),
@@ -255,7 +274,7 @@ pub async fn update_backup_config(
 
 pub async fn stream_snapshot_logs(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::SnapshotsRead>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<axum::response::Response, AppError> {
@@ -343,10 +362,18 @@ pub async fn stream_snapshot_logs(
 
 pub async fn restore_snapshot(
     _rate: RateLimit,
-    _admin: RequireAdmin,
+    auth: Authz<scope::SnapshotsRestore>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
+    // Recorded before starting: a full restore replaces the database (and
+    // this log with it) and restarts the server.
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("snapshot_restore_full").resource("snapshot", &id, &id),
+    )
+    .await;
     let pre_restore_id = backup::restore_full(&state, id)
         .await
         .map_err(|e| AppError(TondError::Internal(format!("Restore failed: {}", e))))?;
@@ -364,7 +391,7 @@ pub async fn restore_snapshot(
 
 pub async fn restore_app(
     _rate: RateLimit,
-    _admin: RequireAdmin,
+    auth: Authz<scope::SnapshotsRestore>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<RestoreAppRequest>,
@@ -373,6 +400,14 @@ pub async fn restore_app(
         .await
         .map_err(|e| AppError(TondError::Internal(format!("App restore failed: {}", e))))?;
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("snapshot_restore_app")
+            .resource("snapshot", &id, &id)
+            .detail(format!("app={}", req.app_name)),
+    )
+    .await;
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(json!({
@@ -388,7 +423,7 @@ pub async fn restore_app(
 
 pub async fn restore_database(
     _rate: RateLimit,
-    _admin: RequireAdmin,
+    auth: Authz<scope::SnapshotsRestore>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<RestoreDatabaseRequest>,
@@ -402,6 +437,14 @@ pub async fn restore_database(
             )))
         })?;
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("snapshot_restore_database")
+            .resource("snapshot", &id, &id)
+            .detail(format!("database={}", req.db_name)),
+    )
+    .await;
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(json!({

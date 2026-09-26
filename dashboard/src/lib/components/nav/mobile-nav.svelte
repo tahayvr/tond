@@ -4,7 +4,9 @@
 	import * as Sheet from '$lib/components/ui/sheet/index.js';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { cn } from '$lib/utils';
-	import navItems, { isActive } from './nav-items.svelte.ts';
+	import { isActive, visibleNavItems } from './nav-items.svelte.ts';
+
+	const items = $derived(visibleNavItems());
 
 	let { email, onLogout }: { email?: string; onLogout: () => void } = $props();
 
@@ -34,7 +36,7 @@
 		</Sheet.Header>
 		<nav class="flex-1 overflow-y-auto p-2" aria-label="Main">
 			<ul class="flex flex-col gap-1">
-				{#each navItems as item (item.href)}
+				{#each items as item (item.href)}
 					{@const active = isActive(item.href, page.url.pathname)}
 					<li>
 						<a

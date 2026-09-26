@@ -117,6 +117,12 @@ impl LoopHandle {
         self.0.wakeups.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count a wake-up of a loop that drives its own timer (e.g. a
+    /// `tokio::time::interval` inside a `select!`).
+    pub fn woke(&self) {
+        self.0.wakeups.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn record_lag(&self, lag: Duration) {
         let us = u64::try_from(lag.as_micros()).unwrap_or(u64::MAX);
         self.0.max_lag_us.fetch_max(us, Ordering::Relaxed);

@@ -31,8 +31,9 @@ use tond_common::{
 };
 use uuid::Uuid;
 
+use crate::audit_log::{AuditEntry, record};
 use crate::{
-    auth::{RateLimit, RequireAdmin, RequireAuth},
+    auth::{Authz, RateLimit, scope},
     error::AppError,
     secret_key::{self, Purpose},
     state::AppState,
@@ -43,7 +44,7 @@ use crate::{
 /// GET /api/registry-credentials
 pub async fn list_registry_credentials(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsRead>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     let creds =
@@ -59,7 +60,7 @@ pub async fn list_registry_credentials(
 /// POST /api/registry-credentials
 pub async fn create_registry_credential(
     _rate: RateLimit,
-    _admin: RequireAdmin,
+    auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Json(payload): Json<CreateRegistryCredentialRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -102,6 +103,16 @@ pub async fn create_registry_credential(
             .fetch_one(&state.db)
             .await?;
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("registry_credential_create").resource(
+            "registry_credential",
+            &cred.id,
+            &cred.name,
+        ),
+    )
+    .await;
     Ok((
         StatusCode::CREATED,
         Json(ApiResponse::ok(RegistryCredentialResponse::from(cred))),
@@ -111,7 +122,7 @@ pub async fn create_registry_credential(
 /// DELETE /api/registry-credentials/{id}
 pub async fn delete_registry_credential(
     _rate: RateLimit,
-    _admin: RequireAdmin,
+    auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Path(cred_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -128,6 +139,16 @@ pub async fn delete_registry_credential(
         ))));
     }
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("registry_credential_delete").resource(
+            "registry_credential",
+            &cred_id,
+            &cred_id,
+        ),
+    )
+    .await;
     Ok((StatusCode::OK, Json(ApiResponse::<()>::ok(()))))
 }
 
@@ -136,7 +157,7 @@ pub async fn delete_registry_credential(
 /// Attach or detach a registry credential from an app.
 pub async fn set_app_registry_credential(
     _rate: RateLimit,
-    _admin: RequireAdmin,
+    auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Path(app_id): Path<String>,
     Json(payload): Json<SetRegistryCredentialRequest>,
@@ -180,6 +201,12 @@ pub async fn set_app_registry_credential(
         .fetch_one(&state.db)
         .await?;
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("registry_credential_assign").resource("app", &updated.id, &updated.name),
+    )
+    .await;
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(AppResponse::from(updated))),

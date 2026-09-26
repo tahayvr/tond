@@ -208,7 +208,9 @@ async fn promote_staging_container(state: &AppState, app_name: &str, container_i
     .await
     {
         Ok(()) => tracing::info!("App {app_name}: finished an interrupted container swap"),
-        Err(e) => tracing::warn!("App {app_name}: could not finish an interrupted container swap: {e}"),
+        Err(e) => {
+            tracing::warn!("App {app_name}: could not finish an interrupted container swap: {e}")
+        }
     }
 }
 
