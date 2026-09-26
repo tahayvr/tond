@@ -144,6 +144,27 @@ async fn resolve_git_source(
                 .await?;
             }
         }
+    } else if let Some(ref token_id) = app.gitea_token_id
+        && let Ok(Some(token)) = sqlx::query_as::<_, tond_common::GiteaToken>(
+            "SELECT * FROM gitea_tokens WHERE id = ? LIMIT 1",
+        )
+        .bind(token_id)
+        .fetch_optional(&state.db)
+        .await
+    {
+        match crate::handlers::gitea_tokens::gitea_git_credentials(&token) {
+            Ok(auth) => {
+                log("info", "Using the Gitea token for clone".into()).await?;
+                return Ok((clean_url, Some(auth)));
+            }
+            Err(e) => {
+                log(
+                    "warn",
+                    format!("The Gitea token could not be used ({e}); cloning without it"),
+                )
+                .await?;
+            }
+        }
     }
 
     Ok((clean_url, url_auth))
@@ -1282,120 +1303,9 @@ pub async fn deploy_preview(
         preview.expires_at
     );
 
-    // Post a "success" commit status and PR comment to GitHub if this is a PR preview.
-    if let (Some(sha), Some(gh_app_id)) = (&preview.head_sha, &app.github_app_id) {
-        let source_url = app.source_url.as_deref().unwrap_or("");
-        if let Some((owner, repo)) = parse_github_owner_repo(source_url)
-            && let Ok(Some(gh_app)) = sqlx::query_as::<_, tond_common::GitHubApp>(
-                "SELECT * FROM github_apps WHERE id = ? LIMIT 1",
-            )
-            .bind(gh_app_id)
-            .fetch_optional(&state.db)
-            .await
-        {
-            let preview_url = preview.subdomain.as_ref().map(|s| format!("https://{}", s));
-            let _ = github_apps::post_commit_status(
-                &gh_app,
-                &owner,
-                &repo,
-                sha,
-                "success",
-                "Preview environment is live",
-                preview_url.as_deref(),
-                "tond/preview",
-            )
-            .await
-            .map_err(|e| {
-                tracing::warn!("[preview] failed to post commit status: {}", e);
-            });
-
-            // Post (or update) a PR comment with the preview URL.
-            if let (Some(pr_number), Some(url)) = (preview.pr_number, &preview_url) {
-                // Fetch the current comment_id for this preview row (may have been set
-                // by a previous synchronize cycle on the same row, though in practice
-                // each synchronize creates a fresh row — use the old row's comment_id
-                // which the webhook copied into this new row as None currently).
-                let existing_comment_id: Option<i64> =
-                    sqlx::query_scalar("SELECT comment_id FROM preview_deployments WHERE id = ?")
-                        .bind(&preview.id)
-                        .fetch_optional(&state.db)
-                        .await
-                        .ok()
-                        .flatten()
-                        .flatten();
-
-                let comment_body = format!(
-                    "### Tond Preview Deployment\n\n\
-                     | | |\n\
-                     |---|---|\n\
-                     | **Status** | live |\n\
-                     | **URL** | [{}]({}) |\n\
-                     | **Branch** | `{}` |\n\
-                     | **Commit** | `{}` |\n\n\
-                     The preview will be automatically removed when the PR is closed.",
-                    url,
-                    url,
-                    preview.head_ref.as_deref().unwrap_or("—"),
-                    &sha[..sha.len().min(7)],
-                );
-
-                match github_apps::post_or_update_pr_comment(
-                    &gh_app,
-                    &owner,
-                    &repo,
-                    pr_number,
-                    &comment_body,
-                    existing_comment_id,
-                )
-                .await
-                {
-                    Ok(comment_id) => {
-                        let _ = sqlx::query(
-                            "UPDATE preview_deployments SET comment_id = ? WHERE id = ?",
-                        )
-                        .bind(comment_id)
-                        .bind(&preview.id)
-                        .execute(&state.db)
-                        .await;
-                    }
-                    Err(e) => {
-                        tracing::warn!("[preview] failed to post PR comment: {}", e);
-                    }
-                }
-            }
-        }
-    }
-
-    // Post a "success" commit status to GitLab if this is a GitLab MR preview.
-    if let (Some(sha), Some(gl_token_id), Some(gl_project_id)) = (
-        &preview.head_sha,
-        &app.gitlab_token_id,
-        &preview.gitlab_project_id,
-    ) && let Ok(Some(gl_token)) = sqlx::query_as::<_, tond_common::GitLabToken>(
-        "SELECT * FROM gitlab_tokens WHERE id = ? LIMIT 1",
-    )
-    .bind(gl_token_id)
-    .fetch_optional(&state.db)
-    .await
-    {
-        let preview_url = preview.subdomain.as_ref().map(|s| format!("https://{}", s));
-        let _ = gitlab_tokens::post_gitlab_commit_status(
-            &gl_token,
-            *gl_project_id,
-            sha,
-            "success",
-            "Preview environment is live",
-            preview_url.as_deref(),
-        )
-        .await
-        .map_err(|e| {
-            tracing::warn!(
-                "[preview] failed to post GitLab success commit status: {}",
-                e
-            );
-        });
-    }
-
+    // A pull/merge request preview: success status and a comment with the URL
+    // on its forge (GitHub, GitLab or Gitea).
+    crate::forge::announce_preview_live(state, app, preview).await;
     Ok(())
 }
 
@@ -1567,25 +1477,6 @@ async fn probe_until_ready(
     }
 }
 
-/// Extract (owner, repo) from a GitHub HTTPS clone URL.
-///
-/// Handles:
-///   `https://github.com/owner/repo.git`  → ("owner", "repo")
-///   `https://github.com/owner/repo`      → ("owner", "repo")
-fn parse_github_owner_repo(url: &str) -> Option<(String, String)> {
-    let path = url
-        .strip_prefix("https://github.com/")
-        .or_else(|| url.strip_prefix("http://github.com/"))?;
-    let path = path.strip_suffix(".git").unwrap_or(path);
-    let mut parts = path.splitn(2, '/');
-    let owner = parts.next()?.to_string();
-    let repo = parts.next()?.to_string();
-    if owner.is_empty() || repo.is_empty() {
-        return None;
-    }
-    Some((owner, repo))
-}
-
 /// Fetch and decrypt registry credentials for a given credential ID.
 /// Returns None if the credential is not found (non-fatal — fall back to unauthenticated pull).
 pub async fn fetch_registry_credentials(
@@ -1745,30 +1636,6 @@ mod tests {
             rate_limiter: RateLimiter::new(60, 10.0),
             settings: Arc::new(RwLock::new(ServerSettings::default())),
         }
-    }
-
-    #[test]
-    fn parse_github_owner_repo_accepts_http_and_https_urls_and_rejects_invalid_paths() {
-        assert_eq!(
-            parse_github_owner_repo("https://github.com/tond-dev/mvp-dev.git"),
-            Some(("tond-dev".to_string(), "mvp-dev".to_string())),
-            "parse_github_owner_repo should extract owner and repo from HTTPS clone URLs"
-        );
-        assert_eq!(
-            parse_github_owner_repo("http://github.com/tond-dev/mvp-dev"),
-            Some(("tond-dev".to_string(), "mvp-dev".to_string())),
-            "parse_github_owner_repo should extract owner and repo from HTTP clone URLs without the .git suffix"
-        );
-        assert_eq!(
-            parse_github_owner_repo("https://github.com/tond-dev"),
-            None,
-            "parse_github_owner_repo should reject GitHub URLs missing the repository segment"
-        );
-        assert_eq!(
-            parse_github_owner_repo("git@github.com:tond-dev/mvp-dev.git"),
-            None,
-            "parse_github_owner_repo should reject unsupported SSH clone URL formats"
-        );
     }
 
     #[test]

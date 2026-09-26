@@ -138,7 +138,9 @@ delete_e2e_resources() {
     done
     # A template refuses a name whose volume directory still holds data.
     rm -rf "${DATA_DIR}/volumes/e2e-vault"
-    tond db delete e2e-redis -y > /dev/null 2>&1 || true
+    for db in e2e-redis e2e-redis-copy e2e-pg e2e-pg-copy; do
+        tond db delete "$db" -y > /dev/null 2>&1 || true
+    done
     tond cron delete e2e-cron -y > /dev/null 2>&1 || true
 }
 
@@ -1035,6 +1037,104 @@ api /api/v1/snapshots | jq -e --arg id "$SAFETY_ID" '.data[] | select(.id == $id
 wait_for 60 "e2e-redis answering after the restore" \
     bash -c "docker exec -e REDISCLI_AUTH='${REDIS_PASS}' tond-db-e2e-redis redis-cli --no-auth-warning --user '${REDIS_USER}' PING | grep -qx PONG"
 pass "database restored from its backup (safety-net backup taken first)"
+
+step "Scheduled database backups and restore into a new database"
+# A schedule that keeps no backups is refused with a structured error.
+[[ "$(api_req PUT /api/v1/databases/e2e-redis/backup-schedule '{"schedule":"0 3 * * *","retention":0}')" == 400 ]] \
+    || fail "a backup schedule keeping zero backups must be refused: $(cat "$API_BODY")"
+[[ "$(jq -r '.error.code' "$API_BODY")" == INVALID_INPUT ]] || fail "expected INVALID_INPUT: $(cat "$API_BODY")"
+# Data to find again in the restored copy.
+docker exec -e REDISCLI_AUTH="${REDIS_PASS}" tond-db-e2e-redis redis-cli --no-auth-warning --user "${REDIS_USER}" \
+    SET e2e-restore-key restored-ok > /dev/null
+[[ "$(api_req PUT /api/v1/databases/e2e-redis/backup-schedule '{"schedule":"* * * * *","retention":2}')" == 200 ]] \
+    || fail "scheduling database backups must succeed: $(cat "$API_BODY")"
+jq -e '.data.schedule == "* * * * *" and .data.retention == 2 and (.data.next_run_at | type == "string")' "$API_BODY" > /dev/null \
+    || fail "the schedule must report its next run: $(cat "$API_BODY")"
+wait_for 150 "a scheduled backup of e2e-redis" \
+    bash -c "curl -sf --unix-socket '$SOCK' 'http://localhost/api/v1/databases/e2e-redis/backups' | jq -e '.data[] | select(.scope == \"database:e2e-redis\" and .trigger == \"scheduled\" and .status == \"completed\")'"
+SCHED_ID=$(api /api/v1/databases/e2e-redis/backups \
+    | jq -r '[.data[] | select(.scope == "database:e2e-redis" and .trigger == "scheduled" and .status == "completed")][0].id')
+[[ -f "${DATA_DIR}/backups/snapshots/${SCHED_ID}/databases/e2e-redis/meta.json" ]] \
+    || fail "a database backup must describe the database (meta.json) for restores into a new database"
+[[ "$(api_req PUT /api/v1/databases/e2e-redis/backup-schedule '{"schedule":null}')" == 200 ]] \
+    || fail "turning the schedule off must succeed: $(cat "$API_BODY")"
+pass "a scheduled backup ran from the database's own schedule (retention 0 refused)"
+
+[[ "$(api_req POST "/api/v1/snapshots/${SCHED_ID}/restore-new-database" '{"source":"e2e-redis","name":"e2e-redis-copy"}')" == 201 ]] \
+    || fail "restoring into a new database must succeed: $(cat "$API_BODY")"
+COPY_CREDS=$(api /api/v1/databases/e2e-redis-copy/credentials)
+COPY_USER=$(jq -r '.data.db_user' <<<"$COPY_CREDS")
+COPY_PASS=$(jq -r '.data.db_password' <<<"$COPY_CREDS")
+[[ "$COPY_PASS" != "$REDIS_PASS" ]] || fail "the restored copy must get its own password"
+wait_for 60 "e2e-redis-copy holding the backed-up key" \
+    bash -c "docker exec -e REDISCLI_AUTH='${COPY_PASS}' tond-db-e2e-redis-copy redis-cli --no-auth-warning --user '${COPY_USER}' GET e2e-restore-key | grep -qx restored-ok"
+docker exec -e REDISCLI_AUTH="${REDIS_PASS}" tond-db-e2e-redis redis-cli --no-auth-warning --user "${REDIS_USER}" PING | grep -qx PONG \
+    || fail "the original database must keep running during a restore into a new database"
+pass "redis backup restored into e2e-redis-copy with its own credentials; e2e-redis untouched"
+
+# PostgreSQL: a row survives backup → restore into a new database (new owner).
+tond db create e2e-pg --db-type postgres > /dev/null
+wait_for 240 "e2e-pg running" \
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/databases/e2e-pg | jq -e '.data.status == \"running\" and .data.version == \"16\"'"
+PG_CREDS=$(api /api/v1/databases/e2e-pg/credentials)
+PG_USER=$(jq -r '.data.db_user' <<<"$PG_CREDS")
+wait_for 60 "e2e-pg accepting SQL" docker exec tond-db-e2e-pg psql -U "$PG_USER" -d "$PG_USER" -c 'SELECT 1'
+docker exec tond-db-e2e-pg psql -v ON_ERROR_STOP=1 -U "$PG_USER" -d "$PG_USER" \
+    -c "CREATE TABLE e2e(id int PRIMARY KEY, v text); INSERT INTO e2e VALUES (1, 'restored-ok');" > /dev/null
+[[ "$(api_req POST /api/v1/databases/e2e-pg/extensions '{"name":"pg_trgm"}')" == 200 ]] \
+    || fail "enabling an offered extension must succeed: $(cat "$API_BODY")"
+api /api/v1/databases/e2e-pg/extensions | jq -e '.data[] | select(.name == "pg_trgm" and .installed_version != null)' > /dev/null \
+    || fail "pg_trgm must be listed as enabled"
+[[ "$(api_req POST /api/v1/databases/e2e-pg/extensions '{"name":"plpython3u"}')" == 400 ]] \
+    || fail "extensions outside the offered list must be refused"
+[[ "$(api_req POST /api/v1/databases/e2e-pg/backups '{}')" == 201 ]] || fail "backing up e2e-pg must succeed: $(cat "$API_BODY")"
+PG_BACKUP_ID=$(jq -r '.data.id' "$API_BODY")
+[[ -s "${DATA_DIR}/backups/snapshots/${PG_BACKUP_ID}/databases/e2e-pg/dump.archive" ]] \
+    || fail "a postgres backup must hold a pg_dump archive"
+[[ "$(api_req POST "/api/v1/snapshots/${PG_BACKUP_ID}/restore-new-database" '{"source":"e2e-pg","name":"e2e-pg-copy"}')" == 201 ]] \
+    || fail "restoring e2e-pg into a new database must succeed: $(cat "$API_BODY")"
+PGC_USER=$(api /api/v1/databases/e2e-pg-copy/credentials | jq -r '.data.db_user')
+[[ "$(docker exec tond-db-e2e-pg-copy psql -At -U "$PGC_USER" -d "$PGC_USER" -c 'SELECT v FROM e2e WHERE id = 1')" == restored-ok ]] \
+    || fail "the restored postgres copy must hold the backed-up row"
+[[ "$(docker exec tond-db-e2e-pg-copy psql -At -U "$PGC_USER" -d "$PGC_USER" -c "SELECT tableowner FROM pg_tables WHERE tablename = 'e2e'")" == "$PGC_USER" ]] \
+    || fail "restored tables must belong to the new database's own user"
+pass "postgres row restored into e2e-pg-copy (owned by its own user); pg_trgm enabled through the API"
+
+step "Database major-version upgrade and public access allowlist"
+[[ "$(api_req POST /api/v1/databases/e2e-pg-copy/upgrade '{"version":"15"}')" == 400 ]] \
+    || fail "a downgrade must be refused: $(cat "$API_BODY")"
+[[ "$(api_req POST /api/v1/databases/e2e-pg-copy/upgrade '{"version":"17"}')" == 202 ]] \
+    || fail "starting an upgrade must succeed: $(cat "$API_BODY")"
+wait_for 600 "the e2e-pg-copy upgrade waiting for confirmation" \
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/databases/e2e-pg-copy | jq -e '.data.upgrade.status == \"awaiting_confirmation\" or .data.upgrade.status == \"failed\"'"
+UPGRADE=$(api /api/v1/databases/e2e-pg-copy | jq -c '.data.upgrade')
+[[ "$(jq -r '.status' <<<"$UPGRADE")" == awaiting_confirmation ]] || fail "the upgrade failed: ${UPGRADE}"
+[[ "$(docker exec tond-db-e2e-pg-copy psql -At -U "$PGC_USER" -d "$PGC_USER" -c 'SHOW server_version_num' | cut -c1-2)" == 17 ]] \
+    || fail "e2e-pg-copy must run PostgreSQL 17 after the upgrade"
+[[ "$(docker exec tond-db-e2e-pg-copy psql -At -U "$PGC_USER" -d "$PGC_USER" -c 'SELECT v FROM e2e WHERE id = 1')" == restored-ok ]] \
+    || fail "the upgraded database must keep its data"
+[[ -d "$(jq -r '.rollback_dir' <<<"$UPGRADE")" ]] || fail "the old data directory must be kept until confirmed"
+[[ "$(api_req POST /api/v1/databases/e2e-pg-copy/upgrade/confirm '{}')" == 200 ]] || fail "confirming must succeed: $(cat "$API_BODY")"
+[[ ! -d "$(jq -r '.rollback_dir' <<<"$UPGRADE")" ]] || fail "confirming must delete the old data directory"
+pass "e2e-pg-copy upgraded 16 → 17 with its data (downgrade refused, old data kept until confirmed)"
+
+# The allowlist lands in the DOCKER-USER chain (TOND-DB) and goes away again.
+[[ "$(api_req PATCH /api/v1/databases/e2e-pg-copy '{"public_access":true,"allowlist":["192.0.2.10","198.51.100.0/24"]}')" == 200 ]] \
+    || fail "making a database public with an allowlist must succeed: $(cat "$API_BODY")"
+PGC_PORT=$(jq -r '.data.host_port' "$API_BODY")
+jq -e '.data.allowlist_enforced == true and .data.access_warning == null' "$API_BODY" > /dev/null \
+    || fail "the allowlist must be enforced: $(cat "$API_BODY")"
+iptables -S DOCKER-USER | grep -q -- "-j TOND-DB" || fail "DOCKER-USER must jump to TOND-DB"
+iptables -S TOND-DB | grep -- "--ctorigdstport ${PGC_PORT} " | grep -- "-s 192.0.2.10/32" | grep -q -- "-j RETURN" \
+    || fail "the allowlist must accept 192.0.2.10 on port ${PGC_PORT}: $(iptables -S TOND-DB)"
+iptables -S TOND-DB | grep -q -- "--ctorigdstport ${PGC_PORT} -j DROP" || fail "other sources must be dropped"
+[[ "$(api_req PATCH /api/v1/databases/e2e-pg-copy '{"public_access":false,"allowlist":[]}')" == 200 ]] \
+    || fail "making the database private again must succeed: $(cat "$API_BODY")"
+! iptables -S TOND-DB | grep -q -- "--ctorigdstport ${PGC_PORT} " || fail "a private database must leave no allowlist rules"
+pass "allowlist enforced in TOND-DB for the public port, removed when private"
+tond db delete e2e-redis-copy -y > /dev/null
+tond db delete e2e-pg-copy -y > /dev/null
+tond db delete e2e-pg -y > /dev/null
 
 step "Cron job"
 tond cron create e2e-cron --schedule "0 0 1 1 *" --image alpine:3 --command "echo tond-e2e-cron-ok" > /dev/null

@@ -1,4 +1,9 @@
-import { listGitHubApps, listRegistryCredentials } from '$lib/api';
+import {
+	listGitHubApps,
+	listGitLabTokens,
+	listGiteaTokens,
+	listRegistryCredentials
+} from '$lib/api';
 
 export async function load({ params }: { params: { source: string } }) {
 	if (params.source === 'github') {
@@ -7,6 +12,14 @@ export async function load({ params }: { params: { source: string } }) {
 				githubApps: await listGitHubApps()
 			}
 		};
+	}
+
+	if (params.source === 'gitlab') {
+		return { sourceData: { gitlabTokens: await listGitLabTokens() } };
+	}
+
+	if (params.source === 'gitea') {
+		return { sourceData: { giteaTokens: await listGiteaTokens() } };
 	}
 
 	if (params.source === 'registry') {

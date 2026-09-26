@@ -33,6 +33,7 @@ import type {
 	ManagedDatabase,
 	Template,
 	TemplateHostMemory,
+	DbCatalogEntry,
 	MetricsRange,
 	MetricsResponse,
 	RequestMetricsResponse,
@@ -2352,11 +2353,18 @@ export const MOCK_DATABASES: ManagedDatabase[] = [
 		memory_limit: 268435456,
 		custom_external_url: null,
 		custom_internal_url: null,
-		image_used: 'postgres:16-alpine',
+		image_used: 'pgvector/pgvector:0.8.1-pg16',
 		custom_image: null,
 		created_at: '2025-02-01T10:00:00.000Z',
 		updated_at: '2025-03-01T09:00:00.000Z',
-		public_access: false
+		public_access: false,
+		version: '16',
+		variant: 'pgvector',
+		backup_schedule: '0 3 * * *',
+		backup_retention: 7,
+		allowlist: [],
+		tls: false,
+		upgrade: null
 	},
 	{
 		id: 'db_redis1',
@@ -2376,7 +2384,14 @@ export const MOCK_DATABASES: ManagedDatabase[] = [
 		custom_image: null,
 		created_at: '2025-02-10T14:00:00.000Z',
 		updated_at: '2025-02-10T14:00:00.000Z',
-		public_access: false
+		public_access: false,
+		version: '7',
+		variant: '',
+		backup_schedule: null,
+		backup_retention: 7,
+		allowlist: [],
+		tls: false,
+		upgrade: null
 	},
 	{
 		id: 'db_mysql1',
@@ -2392,11 +2407,18 @@ export const MOCK_DATABASES: ManagedDatabase[] = [
 		memory_limit: 536870912,
 		custom_external_url: null,
 		custom_internal_url: null,
-		image_used: 'mysql:8',
+		image_used: 'mysql:8.0',
 		custom_image: null,
 		created_at: '2025-01-20T08:00:00.000Z',
 		updated_at: '2025-02-28T12:00:00.000Z',
-		public_access: false
+		public_access: false,
+		version: '8.0',
+		variant: '',
+		backup_schedule: null,
+		backup_retention: 7,
+		allowlist: [],
+		tls: false,
+		upgrade: null
 	},
 	{
 		id: 'db_mariadb1',
@@ -2412,11 +2434,129 @@ export const MOCK_DATABASES: ManagedDatabase[] = [
 		memory_limit: 268435456,
 		custom_external_url: null,
 		custom_internal_url: null,
-		image_used: 'mariadb:11',
+		image_used: 'mariadb:11.4',
 		custom_image: null,
 		created_at: '2025-03-01T12:00:00.000Z',
 		updated_at: '2025-03-01T12:00:00.000Z',
-		public_access: true
+		public_access: true,
+		version: '11.4',
+		variant: '',
+		backup_schedule: '30 2 * * *',
+		backup_retention: 14,
+		allowlist: [],
+		tls: true,
+		upgrade: null
+	}
+];
+
+/** What the server can run (GET /api/databases/catalog), as on an x86_64 server. */
+export const MOCK_DB_CATALOG: DbCatalogEntry[] = [
+	{
+		db_type: 'postgres',
+		variant: '',
+		label: '',
+		description: '',
+		versions: ['14', '15', '16', '17', '18'],
+		default_version: '16',
+		extensions: [
+			'pg_stat_statements',
+			'pg_trgm',
+			'pgcrypto',
+			'uuid-ossp',
+			'citext',
+			'hstore',
+			'btree_gin',
+			'btree_gist',
+			'unaccent',
+			'ltree'
+		],
+		available: true,
+		supports_tls: true,
+		supports_upgrade: true
+	},
+	{
+		db_type: 'postgres',
+		variant: 'pgvector',
+		label: 'PostgreSQL + pgvector',
+		description: 'Vector similarity search for embeddings (the pgvector image).',
+		versions: ['14', '15', '16', '17', '18'],
+		default_version: '16',
+		extensions: ['vector', 'pg_stat_statements', 'pg_trgm', 'pgcrypto', 'uuid-ossp', 'citext'],
+		available: true,
+		supports_tls: true,
+		supports_upgrade: true
+	},
+	{
+		db_type: 'postgres',
+		variant: 'postgis',
+		label: 'PostgreSQL + PostGIS',
+		description: 'Geographic objects and spatial queries (the PostGIS image). x86_64 servers only.',
+		versions: ['14', '15', '16', '17', '18'],
+		default_version: '16',
+		extensions: ['postgis', 'postgis_topology', 'fuzzystrmatch', 'pg_trgm', 'uuid-ossp'],
+		available: true,
+		supports_tls: true,
+		supports_upgrade: true
+	},
+	{
+		db_type: 'mysql',
+		variant: '',
+		label: '',
+		description: '',
+		versions: ['8.0', '8.4'],
+		default_version: '8.4',
+		extensions: [],
+		available: true,
+		supports_tls: true,
+		supports_upgrade: true
+	},
+	{
+		db_type: 'mariadb',
+		variant: '',
+		label: '',
+		description: '',
+		versions: ['10.11', '11.4', '11.8'],
+		default_version: '11.8',
+		extensions: [],
+		available: true,
+		supports_tls: true,
+		supports_upgrade: true
+	},
+	{
+		db_type: 'redis',
+		variant: '',
+		label: '',
+		description: '',
+		versions: ['6', '7', '8'],
+		default_version: '7',
+		extensions: [],
+		available: true,
+		supports_tls: false,
+		supports_upgrade: true
+	},
+	{
+		db_type: 'keydb',
+		variant: '',
+		label: '',
+		description: '',
+		versions: ['latest'],
+		default_version: 'latest',
+		extensions: [],
+		available: true,
+		supports_tls: false,
+		supports_upgrade: false
+	},
+	{
+		db_type: 'mongodb',
+		variant: '',
+		label: '',
+		description: '',
+		versions: ['6', '7', '8'],
+		default_version: '7',
+		extensions: [],
+		available: true,
+		supports_tls: false,
+		supports_upgrade: true
 	}
 ];
 

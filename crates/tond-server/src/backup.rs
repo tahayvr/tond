@@ -48,7 +48,7 @@ use uuid::Uuid;
 
 use crate::handlers::storage_providers::decrypt_provider_secret;
 use crate::state::AppState;
-use crate::{db, docker, secret_key, secrets, snapshot_archive, storage};
+use crate::{db, db_exec, docker, secret_key, secrets, snapshot_archive, storage};
 use tond_common::{BackupConfig, ManagedDatabase, Snapshot};
 
 // ── Progress event ────────────────────────────────────────────────────────────
@@ -86,15 +86,24 @@ pub enum SnapshotTrigger {
     PreRestoreDatabase {
         db_name: String,
     },
+    /// One database's own schedule (`databases.backup_schedule`)
+    ScheduledDatabase {
+        db_name: String,
+    },
+    /// Taken before a major-version upgrade touches the database
+    PreUpgradeDatabase {
+        db_name: String,
+    },
 }
 
 impl SnapshotTrigger {
     fn trigger_str(&self) -> &'static str {
         match self {
             Self::Manual { .. } | Self::ManualDatabase { .. } => "manual",
-            Self::Scheduled => "scheduled",
+            Self::Scheduled | Self::ScheduledDatabase { .. } => "scheduled",
             Self::PreDeploy { .. } => "pre_deploy",
             Self::PreRestore { .. } | Self::PreRestoreDatabase { .. } => "pre_restore",
+            Self::PreUpgradeDatabase { .. } => "pre_upgrade",
         }
     }
 
@@ -102,9 +111,10 @@ impl SnapshotTrigger {
         match self {
             Self::Manual { .. } | Self::Scheduled | Self::PreRestore { .. } => "full".to_string(),
             Self::PreDeploy { app_name, .. } => format!("app:{}", app_name),
-            Self::ManualDatabase { db_name } | Self::PreRestoreDatabase { db_name } => {
-                format!("database:{db_name}")
-            }
+            Self::ManualDatabase { db_name }
+            | Self::PreRestoreDatabase { db_name }
+            | Self::ScheduledDatabase { db_name }
+            | Self::PreUpgradeDatabase { db_name } => format!("database:{db_name}"),
         }
     }
 
@@ -145,6 +155,18 @@ impl SnapshotTrigger {
             Self::PreRestoreDatabase { db_name } => {
                 format!(
                     "pre-restore {db_name} {}",
+                    Utc::now().format("%Y-%m-%d %H:%M")
+                )
+            }
+            Self::ScheduledDatabase { db_name } => {
+                format!(
+                    "{db_name} scheduled {}",
+                    Utc::now().format("%Y-%m-%d %H:%M")
+                )
+            }
+            Self::PreUpgradeDatabase { db_name } => {
+                format!(
+                    "pre-upgrade {db_name} {}",
                     Utc::now().format("%Y-%m-%d %H:%M")
                 )
             }
@@ -369,7 +391,19 @@ async fn build_snapshot(
             match db_row {
                 Some(db) => {
                     let db = secrets::open_database(db)?;
+                    // What restoring into a new database needs to know, even
+                    // after this database is gone.
+                    tokio::fs::write(
+                        dest_db.join(DB_META_FILE),
+                        serde_json::to_vec_pretty(&DatabaseMeta::of(&db))?,
+                    )
+                    .await?;
                     if let Err(e) = dump_database(&state.docker, &db, &dest_db).await {
+                        // A copy of a running engine's files isn't consistent:
+                        // a backup of just this database needs the dump.
+                        if db_scope.is_some() && db.status == "running" {
+                            return Err(e.context(format!("couldn't dump {db_name}")));
+                        }
                         tracing::warn!("Logical dump of {db_name} failed: {e:#}");
                     }
                 }
@@ -493,6 +527,8 @@ async fn list_subdirs(base: &Path) -> Vec<String> {
         while let Ok(Some(entry)) = entries.next_entry().await {
             if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false)
                 && let Some(n) = entry.file_name().to_str().map(|s| s.to_string())
+                // Hidden entries are Tond's own (TLS copies, work dirs).
+                && !n.starts_with('.')
             {
                 names.push(n);
             }
@@ -954,83 +990,306 @@ pub async fn restore_database(
         let _ = docker::start_container(&state.docker, cid).await;
     }
 
-    // Import logical dump
-    let dump_path = db_staging.join("dump.archive");
-    if dump_path.exists() {
-        let _ = import_database_dump(&state.docker, &db_row, &dump_path).await;
-    }
-    let dump_sql = db_staging.join("dump.sql");
-    if dump_sql.exists() {
-        let _ = import_database_dump_sql(&state.docker, &db_row, &dump_sql).await;
+    // Import the logical dump over the raw copy (a raw copy of a running
+    // engine isn't consistent on its own) once the engine accepts connections.
+    let has_dump = ["dump.archive", "dump.sql"]
+        .iter()
+        .any(|f| db_staging.join(f).exists());
+    if has_dump && let Some(ref cid) = db_row.container_id {
+        let imported = async {
+            db_exec::wait_ready(
+                &state.docker,
+                cid,
+                &db_row,
+                std::time::Duration::from_secs(180),
+            )
+            .await?;
+            import_database_dump(&state.docker, &db_row, &db_staging).await
+        }
+        .await;
+        if let Err(e) = imported {
+            tracing::warn!("Importing the dump into {db_name} failed: {e:#}");
+        }
     }
 
     Ok(safety_net)
 }
 
+// ── Restore into a new database ───────────────────────────────────────────────
+
+/// What a snapshot records about each database it holds
+/// (`databases/<name>/meta.json`), so it can be restored into a new database
+/// of the same engine, version and variant even after the original is gone.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DatabaseMeta {
+    pub db_type: String,
+    pub version: Option<String>,
+    #[serde(default)]
+    pub variant: String,
+    /// The engine database name (MongoDB restores rename its namespace)
+    pub db_name: Option<String>,
+    pub memory_limit: Option<i64>,
+}
+
+pub(crate) const DB_META_FILE: &str = "meta.json";
+
+impl DatabaseMeta {
+    pub fn of(db: &ManagedDatabase) -> Self {
+        Self {
+            db_type: db.db_type.clone(),
+            version: Some(db.effective_version()),
+            variant: db.variant.clone(),
+            db_name: db.db_name.clone(),
+            memory_limit: db.memory_limit,
+        }
+    }
+}
+
+/// Restore the database `source` held by a snapshot into a NEW managed
+/// database `name` — same engine, version and variant, fresh credentials,
+/// its own port. The original is not touched. If anything fails the new
+/// database is removed again. Returns the new database's row.
+pub async fn restore_to_new_database(
+    state: &AppState,
+    snapshot_id: &str,
+    source: &str,
+    name: &str,
+    project_id: Option<String>,
+) -> Result<ManagedDatabase> {
+    use crate::handlers::databases as dbh;
+
+    let snap = fetch_snapshot(state, snapshot_id).await?;
+    anyhow::ensure!(
+        snap.scope == "full" || snap.scope == format!("database:{source}"),
+        "This snapshot doesn't include the database '{source}'"
+    );
+    dbh::validate_database_name(name).map_err(|e| anyhow::anyhow!(e.0.to_string()))?;
+    let taken: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM databases WHERE name = ?)")
+        .bind(name)
+        .fetch_one(&state.db)
+        .await?;
+    anyhow::ensure!(
+        !taken,
+        "A database named '{name}' already exists. Choose another name."
+    );
+
+    let local_path = ensure_local(state, &snap).await?;
+    let dump_dir = local_path.join("databases").join(source);
+    anyhow::ensure!(
+        dump_dir.exists(),
+        "This snapshot doesn't include the database '{source}'"
+    );
+
+    // Engine, version and variant: from the snapshot, or (older snapshots)
+    // from the source database if it still exists.
+    let source_row: Option<ManagedDatabase> =
+        sqlx::query_as("SELECT * FROM databases WHERE name = ? LIMIT 1")
+            .bind(source)
+            .fetch_optional(&state.db)
+            .await?;
+    let meta = match tokio::fs::read(dump_dir.join(DB_META_FILE)).await {
+        Ok(bytes) => serde_json::from_slice::<DatabaseMeta>(&bytes)
+            .context("the snapshot's database description is unreadable")?,
+        Err(_) => source_row.as_ref().map(DatabaseMeta::of).with_context(|| {
+            format!(
+                "This snapshot predates restoring into a new database and '{source}' no longer exists"
+            )
+        })?,
+    };
+    anyhow::ensure!(
+        tond_common::image_for(&meta.db_type, &meta.variant, meta.version.as_deref()).is_some(),
+        "This server can't run {} {} {} any more",
+        meta.db_type,
+        meta.variant,
+        meta.version.as_deref().unwrap_or_default()
+    );
+
+    let project_id = project_id.or_else(|| source_row.as_ref().and_then(|r| r.project_id.clone()));
+    let mut db = ManagedDatabase::new(name.to_string(), meta.db_type.clone(), project_id);
+    db.version = meta.version.clone();
+    db.variant = meta.variant.clone();
+    db.memory_limit = meta.memory_limit;
+
+    let redis_like = matches!(db.db_type.as_str(), "redis" | "keydb");
+    let volume = PathBuf::from(data_dir()).join("databases").join(name);
+    if volume.exists() {
+        // Leftovers of a database with this name that was deleted by hand.
+        let mut entries = tokio::fs::read_dir(&volume).await?;
+        anyhow::ensure!(
+            entries.next_entry().await?.is_none(),
+            "{} already holds data; remove it or choose another name",
+            volume.display()
+        );
+    }
+    if redis_like {
+        // Redis loads dump.rdb when it starts: put it in place first.
+        place_redis_dump(&dump_dir, &volume).await?;
+    }
+
+    if let Err(e) = dbh::provision_database(state, &mut db).await {
+        if redis_like {
+            let _ = tokio::fs::remove_dir_all(&volume).await;
+        }
+        anyhow::bail!("{}", e.0);
+    }
+
+    let loaded = async {
+        let cid = db.container_id.clone().context("no container")?;
+        db_exec::wait_ready(
+            &state.docker,
+            &cid,
+            &db,
+            std::time::Duration::from_secs(240),
+        )
+        .await?;
+        load_dump_into(&state.docker, &db, &cid, &dump_dir, meta.db_name.as_deref()).await
+    }
+    .await;
+    if let Err(e) = loaded {
+        let _ = dbh::destroy_database(state, &db).await;
+        return Err(e.context(format!(
+            "restoring into '{name}' failed, so '{name}' was removed again; '{source}' is untouched"
+        )));
+    }
+    Ok(db)
+}
+
 // ── Backup scheduler ──────────────────────────────────────────────────────────
 
-/// Sleeps until the next scheduled snapshot; a change to backup_config wakes
-/// it to re-plan. Disabled or invalid schedules wait for a config change.
-#[allow(dead_code)]
+/// A scheduled backup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ScheduledJob {
+    /// A full snapshot (backup_config)
+    Full,
+    /// One database's own schedule
+    Database(String),
+}
+
+/// Wake the scheduler to re-plan (a database schedule changed).
+pub fn schedules_changed() {
+    crate::runtime::changes::notify(crate::runtime::changes::Table::BackupConfig);
+}
+
+/// The next run of every schedule after `now`: the full snapshot (when
+/// enabled) and each database with a schedule. Invalid schedules are skipped.
+pub(crate) fn plan_schedules(
+    cfg: &BackupConfig,
+    databases: &[(String, String)],
+    now: chrono::DateTime<Utc>,
+) -> Vec<(chrono::DateTime<Utc>, ScheduledJob)> {
+    let next = |expr: &str| {
+        crate::cron::parse_schedule(expr)
+            .ok()
+            .and_then(|s| s.after(&now).next())
+    };
+    let mut out = Vec::new();
+    if cfg.enabled != 0
+        && let Some(t) = next(&cfg.full_schedule_cron)
+    {
+        out.push((t, ScheduledJob::Full));
+    }
+    for (name, expr) in databases {
+        if let Some(t) = next(expr) {
+            out.push((t, ScheduledJob::Database(name.clone())));
+        }
+    }
+    out.sort_by_key(|(t, _)| *t);
+    out
+}
+
+/// The next run of one cron expression (for the API).
+pub fn next_run(expr: &str) -> Option<chrono::DateTime<Utc>> {
+    crate::cron::parse_schedule(expr)
+        .ok()
+        .and_then(|s| s.after(&Utc::now()).next())
+}
+
+/// Sleeps until the next scheduled backup — the full snapshot or any
+/// database's own schedule, whichever is first. A change to backup_config or
+/// to a database schedule (`schedules_changed`) wakes it to re-plan. With
+/// nothing scheduled it waits for a change. Jobs due together run one after
+/// another (they may dump the same database).
 pub async fn backup_scheduler(state: AppState) {
     use crate::runtime::changes::{Table, Watch};
     use crate::runtime::loops::{self, Wake};
 
-    const IDLE: std::time::Duration = std::time::Duration::from_secs(3600);
+    const IDLE: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
     let lp = loops::register("backup-scheduler");
     let mut watch = Watch::new(&[Table::BackupConfig]);
 
     loop {
-        let cfg = match get_backup_config(&state).await {
-            Ok(c) => c,
+        let planned = async {
+            let cfg = get_backup_config(&state).await?;
+            let dbs: Vec<(String, String)> = sqlx::query_as(
+                "SELECT name, backup_schedule FROM databases WHERE backup_schedule IS NOT NULL",
+            )
+            .fetch_all(&state.db)
+            .await?;
+            anyhow::Ok(plan_schedules(&cfg, &dbs, Utc::now()))
+        }
+        .await;
+        let plan = match planned {
+            Ok(p) => p,
             Err(e) => {
-                tracing::warn!("backup_scheduler: failed to read config: {}", e);
+                tracing::warn!("backup_scheduler: failed to read the schedules: {e:#}");
                 lp.wait(Some(std::time::Duration::from_secs(60)), &mut watch)
                     .await;
                 continue;
             }
         };
-
-        if cfg.enabled == 0 {
+        let Some(&(next, _)) = plan.first() else {
             lp.wait(Some(IDLE), &mut watch).await;
             continue;
-        }
-
-        let schedule = match crate::cron::parse_schedule(&cfg.full_schedule_cron) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(
-                    "backup_scheduler: invalid cron '{}': {}",
-                    cfg.full_schedule_cron,
-                    e
-                );
-                lp.wait(Some(IDLE), &mut watch).await;
-                continue;
-            }
         };
 
-        if let Some(next) = schedule.upcoming(chrono::Utc).next() {
-            let now = chrono::Utc::now();
-            let wait = (next - now)
-                .to_std()
-                .unwrap_or(std::time::Duration::from_secs(60));
-            tracing::debug!("backup_scheduler: next run in {:?}", wait);
-            if lp.wait(Some(wait), &mut watch).await == Wake::Event {
-                continue; // config changed: re-plan
-            }
-            if crate::runtime::shutdown::is_shutting_down() {
-                return;
-            }
-            drop(lp.run());
-
-            let state_clone = state.clone();
-            crate::runtime::shutdown::spawn_tracked(async move {
-                let _ = create_snapshot(&state_clone, SnapshotTrigger::Scheduled, None).await;
-            });
-        } else {
-            lp.wait(Some(IDLE), &mut watch).await;
+        let wait = (next - Utc::now())
+            .to_std()
+            .unwrap_or(std::time::Duration::from_secs(1));
+        tracing::debug!("backup_scheduler: next run in {:?}", wait);
+        if lp.wait(Some(wait), &mut watch).await == Wake::Event {
+            continue; // a schedule changed: re-plan
         }
+        if crate::runtime::shutdown::is_shutting_down() {
+            return;
+        }
+        drop(lp.run());
+
+        let now = Utc::now();
+        let due: Vec<ScheduledJob> = plan
+            .into_iter()
+            .filter(|(t, _)| *t <= now)
+            .map(|(_, job)| job)
+            .collect();
+        let state_clone = state.clone();
+        crate::runtime::shutdown::spawn_tracked(async move {
+            for job in due {
+                let trigger = match job {
+                    ScheduledJob::Full => SnapshotTrigger::Scheduled,
+                    ScheduledJob::Database(db_name) => {
+                        SnapshotTrigger::ScheduledDatabase { db_name }
+                    }
+                };
+                // A failure marks the snapshot failed, which the alert
+                // engine's "backup failed" rule picks up.
+                let _ = create_snapshot(&state_clone, trigger, None).await;
+            }
+        });
     }
+}
+
+// ── Dump lock ─────────────────────────────────────────────────────────────────
+
+/// One dump at a time per database: dumps write to a fixed path inside the
+/// container, so a manual backup racing a scheduled one would corrupt both.
+fn dump_lock(db_name: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+    static LOCKS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    let mut map = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    // Forget locks nobody holds (databases come and go).
+    map.retain(|_, l| Arc::strong_count(l) > 1);
+    map.entry(db_name.to_string()).or_default().clone()
 }
 
 // ── SSE progress helper ───────────────────────────────────────────────────────
@@ -1159,7 +1418,8 @@ async fn enforce_retention(
     trigger_app: Option<&str>,
     db_scope: Option<&str>,
 ) {
-    // Full snapshots: keep last N
+    // Full snapshots: keep last N (never fewer than one: a retention of zero
+    // would delete the snapshot just taken)
     if let Ok(old_full) = sqlx::query_as::<_, Snapshot>(
         "SELECT * FROM snapshots WHERE scope = 'full' AND status = 'completed'
          ORDER BY created_at DESC",
@@ -1167,12 +1427,17 @@ async fn enforce_retention(
     .fetch_all(&state.db)
     .await
     {
-        for snap in old_full.iter().skip(cfg.full_retention_count as usize) {
+        for snap in old_full
+            .iter()
+            .skip(cfg.full_retention_count.max(1) as usize)
+        {
             delete_snapshot_files_and_row(state, snap).await;
         }
     }
 
-    // Database backups: keep last N per database
+    // Database backups, per database: its scheduled backups keep its own
+    // retention count; the others (manual, before a restore or an upgrade)
+    // keep the full-snapshot count.
     if let Some(db_name) = db_scope
         && let Ok(old_db) = sqlx::query_as::<_, Snapshot>(
             "SELECT * FROM snapshots WHERE scope = ? AND status = 'completed'
@@ -1182,11 +1447,18 @@ async fn enforce_retention(
         .fetch_all(&state.db)
         .await
     {
-        for snap in old_db.iter().skip(cfg.full_retention_count as usize) {
+        let own_retention: i64 =
+            sqlx::query_scalar("SELECT backup_retention FROM databases WHERE name = ?")
+                .bind(db_name)
+                .fetch_optional(&state.db)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(tond_common::DEFAULT_DB_BACKUP_RETENTION);
+        for snap in retention_victims(&old_db, own_retention, cfg.full_retention_count) {
             delete_snapshot_files_and_row(state, snap).await;
         }
     }
-
     // Pre-deploy snapshots per app
     if let Some(app) = trigger_app {
         let scope = format!("app:{}", app);
@@ -1206,6 +1478,19 @@ async fn enforce_retention(
             }
         }
     }
+}
+
+/// Which of one database's completed backups (newest first) retention
+/// removes: scheduled ones beyond `scheduled_keep`, the others beyond
+/// `other_keep` (each at least one).
+fn retention_victims(backups: &[Snapshot], scheduled_keep: i64, other_keep: i64) -> Vec<&Snapshot> {
+    let (scheduled, other): (Vec<&Snapshot>, Vec<&Snapshot>) =
+        backups.iter().partition(|s| s.trigger == "scheduled");
+    scheduled
+        .into_iter()
+        .skip(scheduled_keep.max(1) as usize)
+        .chain(other.into_iter().skip(other_keep.max(1) as usize))
+        .collect()
 }
 
 /// Delete a snapshot's local directory, its remote archive (best effort) and
@@ -1274,18 +1559,14 @@ fn mysql_exec_env(user: &str, password: &str, dbname: &str) -> Vec<String> {
     ]
 }
 
-async fn dump_database(docker: &bollard::Docker, db: &ManagedDatabase, dest: &Path) -> Result<()> {
-    use bollard::exec::CreateExecOptions;
+/// How long a dump or an import may run.
+const DUMP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
 
-    let container_id = db
-        .container_id
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("DB container not running"))?;
-
+/// The dump command of an engine and the file it writes inside the
+/// container. Credentials go in the exec env, never into a shell string.
+fn dump_command(db: &ManagedDatabase) -> Option<(db_exec::Cmd, &'static str)> {
     let kind = db.db_type.as_str();
-    // Credentials go in the exec env, never into a shell string (see mysql below).
-    let mut env: Vec<String> = Vec::new();
-    let (cmd, out_file) = match kind {
+    Some(match kind {
         "redis" | "keydb" => {
             // Managed Redis requires ACL auth (see handlers/databases.rs).
             // SAVE writes a consistent dump.rdb, which is then copied out.
@@ -1295,18 +1576,10 @@ async fn dump_database(docker: &bollard::Docker, db: &ManagedDatabase, dest: &Pa
             } else {
                 "redis-cli"
             };
-            env.push(format!(
-                "REDISCLI_AUTH={}",
-                db.db_password.as_deref().unwrap_or("")
-            ));
+            let user = db.db_user.as_deref().unwrap_or("default");
             (
-                vec![
-                    cli.to_string(),
-                    "--user".to_string(),
-                    db.db_user.as_deref().unwrap_or("default").to_string(),
-                    "--no-auth-warning".to_string(),
-                    "SAVE".to_string(),
-                ],
+                db_exec::Cmd::new(&[cli, "--user", user, "--no-auth-warning", "SAVE"])
+                    .env("REDISCLI_AUTH", db.db_password.as_deref().unwrap_or("")),
                 "/data/dump.rdb",
             )
         }
@@ -1314,16 +1587,16 @@ async fn dump_database(docker: &bollard::Docker, db: &ManagedDatabase, dest: &Pa
             let user = db.db_user.as_deref().unwrap_or("postgres");
             let dbname = db.db_name.as_deref().unwrap_or("postgres");
             (
-                vec![
-                    "pg_dump".to_string(),
-                    "-U".to_string(),
-                    user.to_string(),
-                    "-F".to_string(),
-                    "c".to_string(),
-                    "-f".to_string(),
-                    "/tmp/dump.archive".to_string(),
-                    dbname.to_string(),
-                ],
+                db_exec::Cmd::new(&[
+                    "pg_dump",
+                    "-U",
+                    user,
+                    "-F",
+                    "c",
+                    "-f",
+                    "/tmp/dump.archive",
+                    dbname,
+                ]),
                 "/tmp/dump.archive",
             )
         }
@@ -1331,70 +1604,71 @@ async fn dump_database(docker: &bollard::Docker, db: &ManagedDatabase, dest: &Pa
             let user = db.db_user.as_deref().unwrap_or("root");
             let pass = db.db_password.as_deref().unwrap_or("");
             let dbname = db.db_name.as_deref().unwrap_or("mysql");
-            env = mysql_exec_env(user, pass, dbname);
-            (
-                vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    MYSQL_DUMP_SCRIPT.to_string(),
-                ],
-                "/tmp/dump.sql",
-            )
+            let mut cmd = db_exec::Cmd::sh(MYSQL_DUMP_SCRIPT);
+            cmd.env = mysql_exec_env(user, pass, dbname);
+            (cmd, "/tmp/dump.sql")
         }
         "mongodb" => {
             let user = db.db_user.as_deref().unwrap_or("");
             let pass = db.db_password.as_deref().unwrap_or("");
             (
-                vec![
-                    "mongodump".to_string(),
-                    "--archive=/tmp/dump.archive".to_string(),
-                    format!("--username={}", user),
-                    format!("--password={}", pass),
-                    "--authenticationDatabase=admin".to_string(),
-                ],
+                db_exec::Cmd::new(&[
+                    "mongodump",
+                    "--archive=/tmp/dump.archive",
+                    &format!("--username={user}"),
+                    &format!("--password={pass}"),
+                    "--authenticationDatabase=admin",
+                ]),
                 "/tmp/dump.archive",
             )
         }
-        _ => {
-            tracing::debug!("DB kind '{}': raw volume copy only, no logical dump", kind);
-            return Ok(());
-        }
-    };
+        _ => return None,
+    })
+}
 
-    let exec = docker
-        .create_exec(
-            container_id,
-            CreateExecOptions {
-                cmd: Some(cmd),
-                env: Some(env),
-                attach_stdout: Some(true),
-                attach_stderr: Some(true),
-                ..Default::default()
-            },
-        )
-        .await?;
-
-    let start_result = docker.start_exec(&exec.id, None).await?;
-    // Wait for exec to finish by inspecting
-    loop {
-        let info = docker.inspect_exec(&exec.id).await?;
-        if !info.running.unwrap_or(true) {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
-    drop(start_result);
-
-    // Copy dump from container to host using `docker cp`-style read
-    let dump_filename = if out_file.ends_with(".archive") {
+/// The file name a dump is stored under in a snapshot.
+fn dump_file_name(out_file: &str) -> &'static str {
+    if out_file.ends_with(".archive") {
         "dump.archive"
     } else if out_file.ends_with(".rdb") {
         "dump.rdb"
     } else {
         "dump.sql"
-    };
-    let dest_file = dest.join(dump_filename);
+    }
+}
 
+/// Write a logical dump of `db` into the directory `dest` (dump.archive,
+/// dump.sql or dump.rdb). Fails when the engine's dump command fails.
+pub(crate) async fn dump_database(
+    docker: &bollard::Docker,
+    db: &ManagedDatabase,
+    dest: &Path,
+) -> Result<()> {
+    let container_id = db
+        .container_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("DB container not running"))?;
+
+    let lock = dump_lock(&db.name);
+    let _guard = lock.lock().await;
+    let Some((cmd, out_file)) = dump_command(db) else {
+        tracing::debug!(
+            "DB kind '{}': raw volume copy only, no logical dump",
+            db.db_type
+        );
+        return Ok(());
+    };
+    db_exec::run(
+        docker,
+        container_id,
+        &cmd,
+        DUMP_TIMEOUT,
+        &db_exec::secrets_of(db),
+    )
+    .await
+    .context("the dump failed")?;
+
+    let dest_file = dest.join(dump_file_name(out_file));
     // Stream the dump out of the container (Docker sends a tar holding the
     // one file) to disk, then unpack that file: constant memory for any size.
     let tar_path = dest.join(".dump.tar");
@@ -1407,9 +1681,19 @@ async fn dump_database(docker: &bollard::Docker, db: &ManagedDatabase, dest: &Pa
     }
     .await;
     let _ = tokio::fs::remove_file(&tar_path).await;
+    if !out_file.starts_with("/data/") {
+        // Don't leave a copy of the data in the container's /tmp.
+        let _ = db_exec::run(
+            docker,
+            container_id,
+            &db_exec::Cmd::new(&["rm", "-f", out_file]),
+            std::time::Duration::from_secs(30),
+            &[],
+        )
+        .await;
+    }
     result
 }
-
 /// Stream `path` from a container (a tar archive) into the file `dest`.
 async fn download_from_container_to_file(
     docker: &bollard::Docker,
@@ -1547,124 +1831,181 @@ impl Write for ChunkWriter {
     }
 }
 
+/// Replace the data of `db` with the dump in `dump_dir` (in place: the
+/// database keeps its name and credentials). Postgres drops what the dump
+/// recreates, MongoDB drops the collections it restores.
 async fn import_database_dump(
     docker: &bollard::Docker,
     db: &ManagedDatabase,
-    dump_path: &Path,
+    dump_dir: &Path,
 ) -> Result<()> {
-    use bollard::exec::CreateExecOptions;
-
     let container_id = db
         .container_id
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("DB container not running"))?;
-
-    let kind = db.db_type.as_str();
     let user = db.db_user.as_deref().unwrap_or("postgres");
     let dbname = db.db_name.as_deref().unwrap_or("postgres");
-
-    // Stream the dump into the container
-    upload_file_to_container(docker, container_id, "/tmp", "dump.archive", dump_path).await?;
-
-    // Run the restore command
-    let cmd = match kind {
-        "postgres" => vec![
-            "pg_restore".to_string(),
-            "-U".to_string(),
-            user.to_string(),
-            "-d".to_string(),
-            dbname.to_string(),
-            "--clean".to_string(),
-            "/tmp/dump.archive".to_string(),
-        ],
-        "mongodb" => vec![
-            "mongorestore".to_string(),
-            "--archive=/tmp/dump.archive".to_string(),
-            format!("--username={}", user),
-            format!("--password={}", db.db_password.as_deref().unwrap_or("")),
-            "--authenticationDatabase=admin".to_string(),
-            "--drop".to_string(),
-        ],
+    let (file, cmd) = match db.db_type.as_str() {
+        "postgres" => (
+            "dump.archive",
+            db_exec::Cmd::new(&[
+                "pg_restore",
+                "-U",
+                user,
+                "-d",
+                dbname,
+                "--clean",
+                "--if-exists",
+                "/tmp/dump.archive",
+            ]),
+        ),
+        "mongodb" => (
+            "dump.archive",
+            db_exec::Cmd::new(&[
+                "mongorestore",
+                "--archive=/tmp/dump.archive",
+                &format!("--username={user}"),
+                &format!("--password={}", db.db_password.as_deref().unwrap_or("")),
+                "--authenticationDatabase=admin",
+                "--drop",
+            ]),
+        ),
+        "mysql" | "mariadb" => {
+            let mut cmd = db_exec::Cmd::sh(MYSQL_IMPORT_SCRIPT);
+            cmd.env = mysql_exec_env(
+                db.db_user.as_deref().unwrap_or("root"),
+                db.db_password.as_deref().unwrap_or(""),
+                db.db_name.as_deref().unwrap_or("mysql"),
+            );
+            ("dump.sql", cmd)
+        }
         _ => return Ok(()),
     };
-
-    let exec = docker
-        .create_exec(
-            container_id,
-            CreateExecOptions {
-                cmd: Some(cmd),
-                attach_stdout: Some(true),
-                attach_stderr: Some(true),
-                ..Default::default()
-            },
-        )
-        .await?;
-
-    let _start = docker.start_exec(&exec.id, None).await?;
-    loop {
-        let info = docker.inspect_exec(&exec.id).await?;
-        if !info.running.unwrap_or(true) {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
-
-    Ok(())
+    run_import(docker, container_id, db, dump_dir, file, &cmd).await
 }
 
-async fn import_database_dump_sql(
+/// Load the dump in `dump_dir` into `target`, a freshly created database
+/// (a restore into a new database, or the new version during an upgrade).
+/// `source_db_name` is the engine database name the dump came from (MongoDB
+/// renames its namespace to the target's). Redis-like engines don't load
+/// here: their dump.rdb is placed in the data directory before the start
+/// (`place_redis_dump`).
+pub(crate) async fn load_dump_into(
     docker: &bollard::Docker,
-    db: &ManagedDatabase,
-    dump_path: &Path,
+    target: &ManagedDatabase,
+    container_id: &str,
+    dump_dir: &Path,
+    source_db_name: Option<&str>,
 ) -> Result<()> {
-    use bollard::exec::CreateExecOptions;
-
-    let container_id = db
-        .container_id
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("DB container not running"))?;
-
-    let kind = db.db_type.as_str();
-    let user = db.db_user.as_deref().unwrap_or("root");
-    let pass = db.db_password.as_deref().unwrap_or("");
-    let dbname = db.db_name.as_deref().unwrap_or("mysql");
-
-    upload_file_to_container(docker, container_id, "/tmp", "dump.sql", dump_path).await?;
-
-    let cmd = match kind {
-        "mysql" | "mariadb" => vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            MYSQL_IMPORT_SCRIPT.to_string(),
-        ],
-        _ => return Ok(()),
-    };
-
-    let exec = docker
-        .create_exec(
-            container_id,
-            CreateExecOptions {
-                cmd: Some(cmd),
-                env: Some(mysql_exec_env(user, pass, dbname)),
-                attach_stdout: Some(true),
-                attach_stderr: Some(true),
-                ..Default::default()
-            },
-        )
-        .await?;
-
-    let _start = docker.start_exec(&exec.id, None).await?;
-    loop {
-        let info = docker.inspect_exec(&exec.id).await?;
-        if !info.running.unwrap_or(true) {
-            break;
+    let user = target.db_user.as_deref().unwrap_or("postgres");
+    let dbname = target.db_name.as_deref().unwrap_or("postgres");
+    let (file, cmd) = match target.db_type.as_str() {
+        // No owner or grants from the dump: everything belongs to the new
+        // database's own user. Stops at the first error.
+        "postgres" => (
+            "dump.archive",
+            db_exec::Cmd::new(&[
+                "pg_restore",
+                "-U",
+                user,
+                "-d",
+                dbname,
+                "--no-owner",
+                "--no-acl",
+                "--exit-on-error",
+                "/tmp/dump.archive",
+            ]),
+        ),
+        // As root: views and routines carry DEFINER clauses naming the
+        // source's user.
+        "mysql" | "mariadb" => {
+            let root_pw = target
+                .root_password
+                .as_deref()
+                .or(target.db_password.as_deref())
+                .unwrap_or("");
+            let mut cmd = db_exec::Cmd::sh(MYSQL_IMPORT_SCRIPT);
+            cmd.env = mysql_exec_env("root", root_pw, dbname);
+            ("dump.sql", cmd)
         }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
-
-    Ok(())
+        "mongodb" => {
+            let mut argv = vec![
+                "mongorestore".to_string(),
+                "--archive=/tmp/dump.archive".to_string(),
+                format!("--username={user}"),
+                format!("--password={}", target.db_password.as_deref().unwrap_or("")),
+                "--authenticationDatabase=admin".to_string(),
+                "--drop".to_string(),
+            ];
+            if let Some(src) = source_db_name.filter(|s| *s != dbname) {
+                argv.push(format!("--nsFrom={src}.*"));
+                argv.push(format!("--nsTo={dbname}.*"));
+            }
+            (
+                "dump.archive",
+                db_exec::Cmd {
+                    argv,
+                    env: Vec::new(),
+                },
+            )
+        }
+        "redis" | "keydb" => return Ok(()),
+        other => anyhow::bail!("Tond can't load {other} dumps"),
+    };
+    run_import(docker, container_id, target, dump_dir, file, &cmd).await
 }
 
+/// Upload `dump_dir/file` into the container's /tmp and run `cmd`.
+async fn run_import(
+    docker: &bollard::Docker,
+    container_id: &str,
+    db: &ManagedDatabase,
+    dump_dir: &Path,
+    file: &str,
+    cmd: &db_exec::Cmd,
+) -> Result<()> {
+    let dump = dump_dir.join(file);
+    anyhow::ensure!(
+        dump.exists(),
+        "the backup has no {file} for this database (it was taken while the database was stopped); \
+         restore it in place instead"
+    );
+    upload_file_to_container(docker, container_id, "/tmp", file, &dump).await?;
+    let result = db_exec::run(
+        docker,
+        container_id,
+        cmd,
+        DUMP_TIMEOUT,
+        &db_exec::secrets_of(db),
+    )
+    .await
+    .context("loading the dump failed");
+    let _ = db_exec::run(
+        docker,
+        container_id,
+        &db_exec::Cmd::new(&["rm", "-f", &format!("/tmp/{file}")]),
+        std::time::Duration::from_secs(30),
+        &[],
+    )
+    .await;
+    result.map(|_| ())
+}
+
+/// Copy a Redis-like dump (dump.rdb from the logical dump, else the one in
+/// the raw volume copy) into a data directory that isn't in use yet.
+pub(crate) async fn place_redis_dump(dump_dir: &Path, data_dir: &Path) -> Result<()> {
+    let candidates = [
+        dump_dir.join("dump.rdb"),
+        dump_dir.join("volume").join("dump.rdb"),
+    ];
+    let src = candidates
+        .iter()
+        .find(|p| p.exists())
+        .context("the backup holds no dump.rdb for this database")?;
+    tokio::fs::create_dir_all(data_dir).await?;
+    tokio::fs::copy(src, data_dir.join("dump.rdb")).await?;
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use std::{fs, os::unix::fs::MetadataExt};
@@ -1977,6 +2318,157 @@ mod tests {
             "snapshots/snap-123.tondsnap",
             "upload_key_for_snapshot should store archives under the snapshots/ prefix"
         );
+    }
+
+    fn cfg(enabled: bool, cron: &str) -> BackupConfig {
+        BackupConfig {
+            id: 1,
+            enabled: i64::from(enabled),
+            full_schedule_cron: cron.to_string(),
+            full_retention_count: 7,
+            pre_deploy_enabled: 1,
+            pre_deploy_retention_per_app: 10,
+            keep_local: 1,
+            storage_provider_id: None,
+        }
+    }
+
+    #[test]
+    fn the_scheduler_plans_full_and_per_database_runs_in_order() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-03-01T10:30:00Z")
+            .unwrap_or_else(|e| panic!("{e}"))
+            .with_timezone(&Utc);
+        let dbs = vec![
+            ("shop".to_string(), "0 11 * * *".to_string()),
+            ("cache".to_string(), "*/15 * * * *".to_string()),
+            ("broken".to_string(), "not a cron".to_string()),
+        ];
+        let plan = plan_schedules(&cfg(true, "0 3 * * *"), &dbs, now);
+        let jobs: Vec<(String, ScheduledJob)> = plan
+            .iter()
+            .map(|(t, j)| (t.format("%d %H:%M").to_string(), j.clone()))
+            .collect();
+        assert_eq!(
+            jobs,
+            vec![
+                (
+                    "01 10:45".to_string(),
+                    ScheduledJob::Database("cache".to_string())
+                ),
+                (
+                    "01 11:00".to_string(),
+                    ScheduledJob::Database("shop".to_string())
+                ),
+                ("02 03:00".to_string(), ScheduledJob::Full),
+            ],
+            "soonest first; an invalid schedule is skipped"
+        );
+        // Full snapshots off: only the database schedules remain.
+        let plan = plan_schedules(&cfg(false, "0 3 * * *"), &dbs[..1], now);
+        assert_eq!(plan.len(), 1);
+        assert!(plan_schedules(&cfg(false, "0 3 * * *"), &[], now).is_empty());
+    }
+
+    fn snap(id: &str, trigger: &str) -> Snapshot {
+        Snapshot {
+            id: id.to_string(),
+            name: id.to_string(),
+            status: "completed".to_string(),
+            trigger: trigger.to_string(),
+            scope: "database:shop".to_string(),
+            trigger_app: None,
+            deployment_id: None,
+            parent_snapshot_id: None,
+            created_at: String::new(),
+            completed_at: None,
+            delta_bytes: None,
+            total_bytes: None,
+            local_path: None,
+            remote_key: None,
+            storage_provider_id: None,
+            checksum_sha256: None,
+            error_message: None,
+            notes: None,
+            remote_status: None,
+            remote_error: None,
+            archive_bytes: None,
+        }
+    }
+
+    #[test]
+    fn database_retention_counts_scheduled_backups_separately() {
+        // Newest first.
+        let backups = vec![
+            snap("s5", "scheduled"),
+            snap("m2", "manual"),
+            snap("s4", "scheduled"),
+            snap("s3", "scheduled"),
+            snap("m1", "manual"),
+            snap("u1", "pre_upgrade"),
+        ];
+        let ids = |v: Vec<&Snapshot>| v.iter().map(|s| s.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(retention_victims(&backups, 2, 2)), vec!["s3", "u1"]);
+        assert_eq!(ids(retention_victims(&backups, 3, 1)), vec!["m1", "u1"]);
+        // A retention of zero still keeps the newest.
+        assert_eq!(ids(retention_victims(&backups, 0, 10)), vec!["s4", "s3"]);
+    }
+
+    #[test]
+    fn database_scoped_triggers_report_their_scope_and_kind() {
+        let scheduled = SnapshotTrigger::ScheduledDatabase {
+            db_name: "shop".to_string(),
+        };
+        assert_eq!(scheduled.trigger_str(), "scheduled");
+        assert_eq!(scheduled.scope(), "database:shop");
+        let pre = SnapshotTrigger::PreUpgradeDatabase {
+            db_name: "shop".to_string(),
+        };
+        assert_eq!(pre.trigger_str(), "pre_upgrade");
+        assert_eq!(pre.scope(), "database:shop");
+        assert!(pre.name().starts_with("pre-upgrade shop "));
+    }
+
+    #[test]
+    fn database_meta_round_trips_what_a_new_database_needs() {
+        let mut db = ManagedDatabase::new("shop".to_string(), "postgres".to_string(), None);
+        db.variant = "pgvector".to_string();
+        db.memory_limit = Some(256);
+        let meta = DatabaseMeta::of(&db);
+        assert_eq!(
+            meta.version.as_deref(),
+            Some("16"),
+            "the effective version is recorded"
+        );
+        let json = serde_json::to_string(&meta).unwrap_or_default();
+        assert!(!json.contains("password"), "{json}");
+        let back: DatabaseMeta = serde_json::from_str(&json).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(back, meta);
+    }
+
+    #[tokio::test]
+    async fn redis_dumps_are_placed_from_the_dump_or_the_raw_copy() {
+        let dir = temp_dir();
+        let dump_dir = dir.path().join("backup");
+        fs::create_dir_all(dump_dir.join("volume")).unwrap_or_else(|e| panic!("{e}"));
+        fs::write(dump_dir.join("volume").join("dump.rdb"), b"raw")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let data = dir.path().join("data");
+        place_redis_dump(&dump_dir, &data)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(fs::read(data.join("dump.rdb")).unwrap_or_default(), b"raw");
+
+        fs::write(dump_dir.join("dump.rdb"), b"logical").unwrap_or_else(|e| panic!("{e}"));
+        place_redis_dump(&dump_dir, &data)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            fs::read(data.join("dump.rdb")).unwrap_or_default(),
+            b"logical"
+        );
+
+        let empty = dir.path().join("empty");
+        assert!(place_redis_dump(&empty, &data).await.is_err());
     }
 
     // ── Streaming upload / restore against a fake S3 ─────────────────────────

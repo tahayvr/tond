@@ -276,6 +276,11 @@ pub fn entries() -> Vec<Doc> {
         e("DELETE /api/v1/gitlab-tokens/{id}", "Delete a GitLab access token").null(),
         e("GET /api/v1/gitlab-tokens/{id}/repos", "Projects a GitLab token can access").returns::<Vec<GitLabRepoResponse>>(),
         e("GET /api/v1/gitlab-tokens/{id}/repos/{project_id}/branches", "Branches of a GitLab project").returns::<Vec<GitLabBranchResponse>>(),
+        e("GET /api/v1/gitea-tokens", "List Gitea/Forgejo access tokens").returns::<Vec<GiteaTokenResponse>>(),
+        e("POST /api/v1/gitea-tokens", "Add a Gitea/Forgejo access token").created().returns::<GiteaTokenResponse>()
+            .about("The token is checked against <base_url>/api/v1/user first. Linked to an app it clones private repositories and reports commit statuses and pull request previews."),
+        e("DELETE /api/v1/gitea-tokens/{id}", "Delete a Gitea/Forgejo access token").null(),
+        e("PUT /api/v1/apps/{id}/gitea-token", "Link or unlink a Gitea/Forgejo token and an app").returns::<AppResponse>(),
         e("PUT /api/v1/apps/{id}/gitlab-token", "Use a GitLab token for an app's repository").returns::<AppResponse>(),
         // ── Push webhooks (called by the forge) ──
         e("POST /api/v1/webhooks/github/{app_id}", "GitHub push/PR webhook")
@@ -383,6 +388,17 @@ pub fn entries() -> Vec<Doc> {
         e("POST /api/v1/databases/{id}/start", "Start a database").message(),
         e("POST /api/v1/databases/{id}/redeploy", "Recreate a database's container (data kept)").returns::<ManagedDatabaseDetail>(),
         e("GET /api/v1/databases/{id}/backups", "A database's backups").returns::<Vec<SnapshotResponse>>(),
+        e("GET /api/v1/databases/catalog", "Engines, versions and image variants a database can run").returns::<Vec<DbCatalogEntry>>(),
+        e("GET /api/v1/databases/{id}/backup-schedule", "A database's backup schedule and backup health").returns::<DatabaseBackupStatus>(),
+        e("PUT /api/v1/databases/{id}/backup-schedule", "Set or turn off a database's backup schedule").returns::<DatabaseBackupStatus>()
+            .about("Scheduled backups run in the backup scheduler (UTC cron) and keep `retention` (1–365) backups; a failure fires the \"backup failed\" alert for that database."),
+        e("GET /api/v1/databases/{id}/extensions", "PostgreSQL extensions offered for a database").returns::<Vec<DatabaseExtension>>(),
+        e("POST /api/v1/databases/{id}/extensions", "Enable a PostgreSQL extension").message(),
+        e("POST /api/v1/databases/{id}/upgrade", "Start a major-version upgrade").accepted().returns::<DbUpgradeState>()
+            .about("Admin only. Backs up, loads the data into a fresh data directory of the new version, switches, and keeps the old data until confirmed. Downgrades are refused."),
+        e("POST /api/v1/databases/{id}/upgrade/confirm", "Keep an upgraded version (deletes the old data)").message(),
+        e("POST /api/v1/databases/{id}/upgrade/rollback", "Roll an upgrade back to the old version and data").message(),
+        e("POST /api/v1/databases/{id}/upgrade/dismiss", "Clear a failed upgrade's state").null(),
         e("POST /api/v1/databases/{id}/backups", "Back up a database now").created().returns::<SnapshotResponse>(),
         e("PATCH /api/v1/databases/{id}/credentials", "Change a database's credentials").object("`{database, changed}`"),
         e("GET /api/v1/databases/{id}/credentials", "Reveal a database's credentials").returns::<DatabaseCredentialsResponse>(),
@@ -417,5 +433,8 @@ pub fn entries() -> Vec<Doc> {
             .object("`{pre_restore_snapshot_id, message}`; a snapshot of the current state is taken first."),
         e("POST /api/v1/snapshots/{id}/restore-app", "Restore one app from a snapshot").object("`{message, …}`"),
         e("POST /api/v1/snapshots/{id}/restore-database", "Restore one database from a snapshot").returns::<RestoreDatabaseResponse>(),
+        e("POST /api/v1/snapshots/{id}/restore-new-database", "Restore one database of a snapshot into a new database")
+            .created()
+            .object("`{message, database}`; the original database is not touched."),
     ]
 }

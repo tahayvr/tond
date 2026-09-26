@@ -705,6 +705,55 @@ async fn event_style_rules_follow_their_tables() {
 }
 
 #[tokio::test]
+async fn a_failing_database_backup_fires_even_after_a_good_full_snapshot() {
+    let state = test_state().await;
+    let db = &state.db;
+    seed_webhook(db, "hook", "http://127.0.0.1:1/hook", None).await;
+    seed_rule(
+        db,
+        Rule {
+            id: "backup",
+            kind: "backup_failed",
+            ..Rule::default()
+        },
+    )
+    .await;
+    exec(
+        db,
+        "INSERT INTO snapshots (id, name, status, trigger, scope, created_at) VALUES
+        ('s1', 's', 'failed', 'scheduled', 'database:shop', '2026-01-01 00:00:00'),
+        ('s2', 's', 'completed', 'scheduled', 'full', '2026-01-02 00:00:00'),
+        ('s3', 's', 'completed', 'scheduled', 'database:cache', '2026-01-02 00:00:00')",
+    )
+    .await;
+    let none = Source::Fixed(Inputs::default());
+    eval(&state, T0, &none).await;
+    let firing: Vec<(String, String)> = sqlx::query_as(
+        "SELECT target, target_label FROM alert_states WHERE state = 'firing' ORDER BY target",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        firing,
+        vec![(
+            "backup:database:shop".to_string(),
+            "Backups of shop".to_string()
+        )]
+    );
+
+    // The next scheduled backup of shop succeeds: resolved.
+    exec(
+        db,
+        "INSERT INTO snapshots (id, name, status, trigger, scope, created_at) VALUES
+        ('s4', 's', 'completed', 'scheduled', 'database:shop', '2026-01-03 00:00:00')",
+    )
+    .await;
+    let r = eval(&state, T0 + 60, &none).await;
+    assert_eq!(r.resolved, 1);
+}
+
+#[tokio::test]
 async fn http_rules_fire_from_the_proxy_request_metrics() {
     use tond_common::traffic::{RouteKind, TrafficCounters};
     let state = test_state().await;
