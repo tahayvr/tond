@@ -33,6 +33,7 @@
 		type Tone
 	} from '$lib/updates';
 	import { cn } from '$lib/utils';
+	import { docsUrl } from '$lib/docs';
 	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import ReleaseNotes from './ReleaseNotes.svelte';
 	import { Button } from '$lib/components/ui/button/index.js';
@@ -201,6 +202,13 @@
 						{:else}
 							New releases are looked up once a day.
 						{/if}
+						·
+						<a
+							href={docsUrl('/guides/upgrading')}
+							target="_blank"
+							rel="noopener noreferrer"
+							class="underline underline-offset-2 hover:no-underline">How updates work</a
+						>
 					</Card.Description>
 				</div>
 				{#if canManage}

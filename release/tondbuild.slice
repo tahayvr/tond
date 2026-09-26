@@ -1,6 +1,6 @@
 [Unit]
 Description=Tond image builds
-Documentation=https://docs.tond.io
+Documentation=https://tond.io/docs
 Before=slices.target
 
 # tond-server runs `docker build --cgroup-parent tondbuild.slice`, so every

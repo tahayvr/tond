@@ -12,7 +12,9 @@ export default function rehypeHeadingAnchors() {
 				properties: {
 					className: ['anchor'],
 					href: `#${node.properties.id}`,
-					ariaLabel: 'Link to this section'
+					ariaLabel: 'Link to this section',
+					// Keep the "#" out of search results.
+					dataPagefindIgnore: ''
 				},
 				children: [{ type: 'text', value: '#' }]
 			});

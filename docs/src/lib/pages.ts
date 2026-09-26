@@ -12,6 +12,8 @@ export interface Page {
 	/** Site-relative link without the base, e.g. `/concepts/apps`. */
 	link: string;
 	title: string;
+	/** Short name for the sidebar and prev/next links (from src/toc.mjs). */
+	label: string;
 	description: string;
 	section: string;
 	/** Nested under another page in the sidebar (generated API pages). */
@@ -76,6 +78,7 @@ async function build(): Promise<{ pages: Page[]; nav: NavSection[] }> {
 			id,
 			link: id === 'index' ? '/' : `/${id}`,
 			title: titleOf(entry.body, item.text),
+			label: item.text,
 			description: item.description ?? '',
 			section,
 			parent,

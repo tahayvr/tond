@@ -82,7 +82,9 @@ Automation:
 Exit codes:
   0 ok  1 error  2 usage  3 not found  4 denied  5 conflict
   6 build/deploy failed  7 approval required  8 server unavailable
-  Details and the error codes behind each: tond help exit-codes";
+  Details and the error codes behind each: tond help exit-codes
+
+Docs: https://tond.io/docs (CLI reference: https://tond.io/docs/reference/cli)";
 
 #[derive(Parser)]
 #[command(

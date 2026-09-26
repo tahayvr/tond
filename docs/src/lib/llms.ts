@@ -26,8 +26,8 @@ export function portableMarkdown(body: string): string {
 		body
 			// <figure class="diagram">…<svg …><title>…</title><desc>…</desc>…</svg>…</figure>
 			.replace(/<figure class="diagram"[\s\S]*?<\/figure>/g, (figure) => {
-				const title = /<title>([\s\S]*?)<\/title>/.exec(figure)?.[1]?.trim();
-				const desc = /<desc>([\s\S]*?)<\/desc>/.exec(figure)?.[1]?.trim();
+				const title = /<title[^>]*>([\s\S]*?)<\/title>/.exec(figure)?.[1]?.trim();
+				const desc = /<desc[^>]*>([\s\S]*?)<\/desc>/.exec(figure)?.[1]?.trim();
 				const caption = /<figcaption>([\s\S]*?)<\/figcaption>/.exec(figure)?.[1]?.trim();
 				const text = [title, desc, caption].filter(Boolean).join('. ');
 				return text ? `[Diagram: ${text}]` : '';
@@ -49,7 +49,7 @@ export function llmsIndex(pages: Page[]): string {
 	const lines = [
 		'# Tond',
 		'',
-		'> Tond is a fast, lightweight, self-hosted platform (PaaS) for running apps and databases on one cheap VPS: git push or upload to deploy, automatic HTTPS, previews, managed PostgreSQL/MySQL/Redis, snapshots to S3, metrics, uptime checks and alerts, with a dashboard, a CLI (`tond`) and an HTTP API.',
+		'> Tond is a fast, lightweight, self-hosted platform (PaaS) for running apps and databases on one cheap VPS: git push or upload to deploy, automatic HTTPS, previews, managed PostgreSQL, MySQL, MariaDB, Redis, KeyDB and MongoDB, snapshots to S3, metrics, uptime checks and alerts, with a dashboard, a CLI (`tond`) and an HTTP API.',
 		'',
 		'Every page below is also available as Markdown at the linked `.md` URL. `llms-full.txt` contains all of them in reading order.',
 		''

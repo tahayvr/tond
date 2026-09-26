@@ -96,7 +96,7 @@ const isActive = (p: Page) => p.id === page.id;
 											href={href(item.link)}
 											aria-current={isActive(item) ? 'page' : undefined}
 										>
-											{item.title}
+											{item.label}
 										</a>
 										{children.length > 0 && (isActive(item) || children.some(isActive)) && (
 											<ul class="nav-children">
@@ -106,7 +106,7 @@ const isActive = (p: Page) => p.id === page.id;
 															href={href(child.link)}
 															aria-current={isActive(child) ? 'page' : undefined}
 														>
-															{child.title}
+															{child.label}
 														</a>
 													</li>
 												))}
@@ -147,7 +147,7 @@ const isActive = (p: Page) => p.id === page.id;
 								<span class="pager-dir">
 									<Icon name="arrow-left-line" /> Previous
 								</span>
-								<span class="pager-title">{prev.title}</span>
+								<span class="pager-title">{prev.label}</span>
 							</a>
 						) : (
 							<span />
@@ -159,7 +159,7 @@ const isActive = (p: Page) => p.id === page.id;
 								<span class="pager-dir">
 									Next <Icon name="arrow-right-line" />
 								</span>
-								<span class="pager-title">{next.title}</span>
+								<span class="pager-title">{next.label}</span>
 							</a>
 						)
 					}

@@ -10,7 +10,8 @@ export type PaletteAction =
 	| { kind: 'deploy'; appId: string; appName: string }
 	| { kind: 'theme' }
 	| { kind: 'terminal' }
-	| { kind: 'shortcuts' };
+	| { kind: 'shortcuts' }
+	| { kind: 'docs' };
 
 export interface PaletteEntry {
 	id: string;
@@ -119,6 +120,14 @@ export function buildPaletteEntries(
 			label: 'Keyboard shortcuts',
 			keywords: ['help', 'keys', 'hotkeys'],
 			action: { kind: 'shortcuts' }
+		},
+		{
+			id: 'act:docs',
+			group: 'Actions',
+			label: 'Open the documentation',
+			keywords: ['help', 'docs', 'manual', 'guide', 'tond.io'],
+			hint: 'tond.io/docs',
+			action: { kind: 'docs' }
 		}
 	);
 

@@ -296,6 +296,10 @@ a {
 	text-decoration: none;
 	line-height: 1.4;
 }
+.toc a,
+.toc-mobile a {
+	overflow-wrap: anywhere;
+}
 .toc a:hover,
 .toc-mobile a:hover {
 	color: var(--foreground);

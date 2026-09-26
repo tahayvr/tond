@@ -281,7 +281,7 @@ Options:
   --help, -h               Show this help
 
 The dashboard (System → Updates) and \`tond update\` take a full snapshot first
-and then run this script; prefer them.
+and then run this script; prefer them. Docs: https://tond.io/docs/guides/upgrading
 
 Examples:
   sudo ./update.sh                    # update to the latest release

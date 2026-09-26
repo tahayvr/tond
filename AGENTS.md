@@ -198,6 +198,24 @@ One system for all of these — never hand-roll a pill, banner or `confirm()`:
 
 ---
 
+## Docs (`docs/`, published at https://tond.io/docs)
+
+- A static Astro site with its own layout (dashboard tokens, no Starlight). Pages are plain
+  Markdown in `docs/content/`, ordered by `docs/src/toc.mjs`: a page missing from the table
+  of contents (or an entry without a page) fails the build. Links are site-absolute without
+  the base (`/concepts/apps`); the build prefixes `/docs` and checks every link and anchor.
+- Callouts are GitHub alerts (`> [!TIP]`). Screenshots: reference the light file
+  (`![alt](/img/<page>/<name>.light.webp)`), the dark one is swapped in; retake them with
+  `just docs-screenshots` after UI changes. Diagrams are inline SVG using the CSS tokens,
+  with `<title>`/`<desc>` (they become the text in `llms-full.txt`).
+- Generated, never edited by hand: `content/reference/cli.md` and `src/data/exit-codes.json`
+  (`just docs-gen` after changing the CLI; tests fail when stale), the API pages and the
+  error/exit-code pages (built from `docs/openapi.json` and `docs/templates/`).
+- `just docs` previews, `just docs-build` builds (part of `just check`). Link docs from the
+  product as `https://tond.io/docs/...` (`docsUrl()` in the dashboard's `$lib/docs.ts`).
+
+---
+
 ## Key Technical Constraints
 
 - Production target: a **single Linux VPS, x86_64 or aarch64 (ARM64)**. Both are built,
@@ -244,3 +262,10 @@ One system for all of these — never hand-roll a pill, banner or `confirm()`:
 - Spawn child processes with `crate::process::command(..)`, not `tokio::process::Command::new`:
   tond-server runs with `OOMScoreAdjust=-900`, and the helper resets children (git, docker CLI,
   tar) to a neutral OOM score so they can't hide behind Tond's protection.
+- Tond updates itself out of process: `POST /api/v1/system/update` takes a snapshot, then
+  starts the transient unit `tond-update.service` (systemd-run), which runs the target
+  release's `update.sh` (verified by `tond update --direct`). `update.sh` owns the swap,
+  migration, health check and automatic rollback and reports in `<data>/update/status.json`
+  (a file, not a row: a rollback may restore an older `tond.db`). `install.sh` and
+  `update.sh` share the supported-systems and release-signature blocks verbatim
+  (`release/tests/distro-test.sh` compares the systems block); keep the copies in sync.

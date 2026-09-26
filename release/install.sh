@@ -1298,7 +1298,7 @@ print_summary() {
     echo "  journalctl -fu tond-server"
     echo ""
 
-    echo -e "${BOLD}Documentation:${NC} https://docs.tond.io"
+    echo -e "${BOLD}Documentation:${NC} https://tond.io/docs"
     echo ""
 }
 
