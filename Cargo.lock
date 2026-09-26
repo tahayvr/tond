@@ -5023,6 +5023,7 @@ dependencies = [
  "psl",
  "rand 0.10.3",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "serde_yaml",

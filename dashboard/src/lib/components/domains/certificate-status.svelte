@@ -76,6 +76,7 @@
 
 <script lang="ts">
 	import { listCertificates, retryCertificate } from '$lib/api';
+	import { pollWhileVisible } from '$lib/polling';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { cn } from '$lib/utils';
 	import LockIcon from '~icons/ri/lock-line';
@@ -139,11 +140,15 @@
 		loaded = false;
 		if (!target) return;
 		load(target);
-		const timer = setInterval(() => {
-			if (cert?.status !== 'active') load(target);
-			else now = Date.now();
-		}, POLL_MS);
-		return () => clearInterval(timer);
+		// Paused while the tab is hidden; refreshes as soon as it is shown again.
+		return pollWhileVisible(
+			() => {
+				if (cert?.status !== 'active') return load(target);
+				now = Date.now();
+			},
+			POLL_MS,
+			{ immediate: false }
+		);
 	});
 </script>
 
