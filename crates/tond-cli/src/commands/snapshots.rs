@@ -92,9 +92,18 @@ pub async fn handle(client: &TondClient, action: SnapshotAction) -> Result<()> {
     match action {
         SnapshotAction::Create { name } => {
             println!("Creating snapshot…");
-            let started = client.create_snapshot(name.as_deref()).await?;
-            println!("Snapshot started: {}", started.id);
-            println!("Check progress with: tond snapshot list");
+            let snapshot = client.create_snapshot(name.as_deref()).await?;
+            println!("Snapshot created: {} ({})", snapshot.name, snapshot.id);
+            if snapshot.remote_status.as_deref() == Some("uploading") {
+                println!(
+                    "An encrypted copy is uploading to remote storage; check with: tond snapshot list"
+                );
+            }
+            println!(
+                "Remote copies are encrypted with this server's TOND_SECRET_KEY \
+                 (/opt/tond/data/tond.env). Keep a copy of it somewhere safe: restoring \
+                 on a new server needs the same key."
+            );
         }
 
         SnapshotAction::List { app } => {

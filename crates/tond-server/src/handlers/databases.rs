@@ -479,8 +479,9 @@ pub async fn create_database(
         "INSERT INTO databases
             (id, name, db_type, project_id, container_id, host_port, status,
              db_name, db_user, db_password, root_password, volume_path, memory_limit,
+             custom_external_url, custom_internal_url,
              image_used, created_at, updated_at, public_access)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&db.id)
     .bind(&db.name)
@@ -495,6 +496,8 @@ pub async fn create_database(
     .bind(&sealed.root_password)
     .bind(&db.volume_path)
     .bind(db.memory_limit)
+    .bind(&sealed.custom_external_url)
+    .bind(&sealed.custom_internal_url)
     .bind(&db.image_used)
     .bind(&db.created_at)
     .bind(&db.updated_at)

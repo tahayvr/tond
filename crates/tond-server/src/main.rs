@@ -72,6 +72,7 @@ mod notifications;
 mod secret_key;
 mod secrets;
 mod security_headers;
+mod snapshot_archive;
 mod state;
 mod storage;
 mod volumes;
@@ -578,6 +579,11 @@ async fn main() -> Result<()> {
         .route(
             "/api/databases/{id}/redeploy",
             post(handlers::databases::redeploy_database),
+        )
+        .route(
+            "/api/databases/{id}/backups",
+            get(handlers::backups::list_database_backups)
+                .post(handlers::backups::create_database_backup),
         )
         .route(
             "/api/databases/{id}/credentials",

@@ -40,7 +40,7 @@ use tond_common::{
     CreateDatabaseRequest, CreatedDatabaseResponse, CronJobResponse, CronJobRun,
     DatabaseCredentialsResponse, DeployKeyResponse, DeploymentResponse, IntegrationResponse,
     ManagedDatabaseDetail, ManagedDatabaseResponse, PreviewDeploymentResponse,
-    ProjectPreviewResponse, ProjectResponse, ServerSettings, SnapshotResponse, SnapshotStarted,
+    ProjectPreviewResponse, ProjectResponse, ServerSettings, SnapshotResponse,
     StorageProviderResponse, UpdateCronJobRequest, UpdateSettingsRequest, WebhookConfigResponse,
     WebhookSecretResponse,
 };
@@ -1323,13 +1323,15 @@ impl TondClient {
 
     // ── Snapshots ─────────────────────────────────────────────────────────────
 
-    /// Start a snapshot. It runs in the background; poll `list_snapshots` for its status.
-    pub async fn create_snapshot(&self, name: Option<&str>) -> Result<SnapshotStarted> {
+    /// Take a full snapshot. Returns once the local copy is complete; a remote
+    /// upload (when configured) continues in the background.
+    pub async fn create_snapshot(&self, name: Option<&str>) -> Result<SnapshotResponse> {
         let req = self
             .client
             .post(format!("{}/api/snapshots", self.base_url))
             .json(&serde_json::json!({ "name": name }));
-        let resp: ApiResponse<SnapshotStarted> = self.auth_header(req).send().await?.json().await?;
+        let resp: ApiResponse<SnapshotResponse> =
+            self.auth_header(req).send().await?.json().await?;
         if resp.success {
             resp.data.context("No data returned")
         } else {
