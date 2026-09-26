@@ -163,6 +163,53 @@ get_server_ip() {
         || ip addr show | grep 'inet ' | grep -v '127.0.0.1' | awk '{print $2}' | cut -d'/' -f1 | head -1
 }
 
+# Is $1 a public IPv4 address (not private, loopback, link-local or CGNAT)?
+is_public_ipv4() {
+    local ip="$1" a b
+    [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+    a=${BASH_REMATCH[1]} b=${BASH_REMATCH[2]}
+    ((a == 10 || a == 127 || a == 0 || a >= 224)) && return 1
+    ((a == 172 && b >= 16 && b <= 31)) && return 1
+    ((a == 192 && b == 168)) && return 1
+    ((a == 169 && b == 254)) && return 1
+    ((a == 100 && b >= 64 && b <= 127)) && return 1
+    return 0
+}
+
+# Without a dashboard domain the dashboard is only reachable through an SSH
+# tunnel. Default to <ip>.sslip.io, a public wildcard DNS name that resolves to
+# the IP it contains, so HTTPS works right after install. Users can switch to
+# their own domain later with `tond settings set-dashboard-domain`.
+choose_dashboard_domain() {
+    [[ -z "$DASHBOARD_DOMAIN" ]] || return 0
+    local ip suggestion=""
+    ip=$(get_server_ip)
+    if is_public_ipv4 "$ip"; then
+        suggestion="${ip//./-}.sslip.io"
+    fi
+
+    if [[ "$NON_INTERACTIVE" == false && -r /dev/tty ]]; then
+        echo "The dashboard is served over HTTPS on a domain that points at this server."
+        if [[ -n "$suggestion" ]]; then
+            echo "No domain yet? Press Enter to use ${suggestion}, which resolves to this"
+            echo "server's IP (you can switch to your own domain later in Settings)."
+            read -r -p "Dashboard domain [${suggestion}]: " DASHBOARD_DOMAIN < /dev/tty || DASHBOARD_DOMAIN=""
+            DASHBOARD_DOMAIN="${DASHBOARD_DOMAIN:-$suggestion}"
+        else
+            read -r -p "Dashboard domain (optional, Enter to skip): " DASHBOARD_DOMAIN < /dev/tty || DASHBOARD_DOMAIN=""
+        fi
+        DASHBOARD_DOMAIN="$(echo "$DASHBOARD_DOMAIN" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+        DASHBOARD_DOMAIN="${DASHBOARD_DOMAIN%.}"
+        if [[ -n "$DASHBOARD_DOMAIN" ]] && ! is_valid_domain "$DASHBOARD_DOMAIN"; then
+            fatal "Invalid dashboard domain: ${DASHBOARD_DOMAIN}"
+        fi
+    elif [[ -n "$suggestion" ]]; then
+        DASHBOARD_DOMAIN="$suggestion"
+        info "No --dashboard-domain given: using ${DASHBOARD_DOMAIN} (resolves to this server)"
+        info "Switch to your own domain later with: sudo tond settings set-dashboard-domain <domain>"
+    fi
+}
+
 # Print banner
 print_banner() {
     echo -e "${CYAN}"
@@ -777,7 +824,11 @@ print_summary() {
         echo ""
     fi
 
-    if [[ -n "$DASHBOARD_DOMAIN" ]]; then
+    if [[ "$DASHBOARD_DOMAIN" == *.sslip.io ]]; then
+        echo -e "${BOLD}DNS:${NC}        Nothing to do: ${DASHBOARD_DOMAIN} already resolves to this server."
+        echo "            To use your own domain: sudo tond settings set-dashboard-domain <domain>"
+        echo ""
+    elif [[ -n "$DASHBOARD_DOMAIN" ]]; then
         echo -e "${BOLD}DNS:${NC}        Create an A record: ${DASHBOARD_DOMAIN} -> ${server_ip}"
         echo -e "${YELLOW}Note:${NC} HTTPS starts working once DNS points at this server (the certificate"
         echo "      is issued automatically). The dashboard is only served over HTTPS."
@@ -900,7 +951,8 @@ main() {
                 echo ""
                 echo "  --non-interactive, -y   Skip all prompts and apply safe defaults"
                 echo "                          (enables UFW and prints browser-first next steps)"
-                echo "  --dashboard-domain      Seed the dashboard domain for unattended installs"
+                echo "  --dashboard-domain      Dashboard domain (default: <server-ip>.sslip.io when the"
+                echo "                          server has a public IPv4 address)"
                 echo "  --preview-domain        Domain previews are served under (<id>-<app>.<domain>)."
                 echo "                          Must be a separate domain you own — not the dashboard"
                 echo "                          domain or on the same registrable domain — with a"
@@ -915,6 +967,8 @@ main() {
     done
 
     print_banner
+
+    choose_dashboard_domain
 
     if [[ -z "$PREVIEW_DOMAIN" && "$NON_INTERACTIVE" == false && -r /dev/tty ]]; then
         echo "Previews run pull-request code, so they are served on a separate domain you own"
