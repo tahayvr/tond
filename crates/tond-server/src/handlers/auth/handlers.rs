@@ -22,7 +22,7 @@ use crate::{
     audit_log::write_audit_log,
     auth::{
         ClientIp, RateLimit,
-        rate_limit::lockout_message,
+        rate_limit::{lockout_message, too_many_requests},
         setup_token::{self, setup_token_path},
     },
     state::AppState,
@@ -94,7 +94,7 @@ async fn check_lockout(
     account: Option<&str>,
 ) -> Result<(), Rejection> {
     match state.rate_limiter.login_retry_after(ip, account).await {
-        Some(wait) => Err(reject(StatusCode::TOO_MANY_REQUESTS, lockout_message(wait))),
+        Some(wait) => Err(Box::new(too_many_requests(&lockout_message(wait), wait))),
         None => Ok(()),
     }
 }

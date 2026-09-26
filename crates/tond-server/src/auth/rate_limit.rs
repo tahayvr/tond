@@ -28,7 +28,8 @@ use std::time::{Duration, Instant};
 use axum::{
     Json,
     extract::{ConnectInfo, FromRequestParts},
-    http::{StatusCode, request::Parts},
+    http::{HeaderValue, StatusCode, header, request::Parts},
+    response::{IntoResponse, Response},
 };
 use tokio::sync::Mutex;
 use tond_common::ApiResponse;
@@ -255,6 +256,12 @@ impl RateLimiter {
 
     /// Try to consume one token for the given client key. Returns true if allowed.
     pub async fn check(&self, key: &str) -> bool {
+        self.check_wait(key).await.is_none()
+    }
+
+    /// Try to consume one token for the given client key. Returns `None` when
+    /// allowed, or how long until the next token is available.
+    pub async fn check_wait(&self, key: &str) -> Option<Duration> {
         let mut buckets = self.buckets.lock().await;
         let now = Instant::now();
         let capacity = self.capacity as f64;
@@ -270,9 +277,13 @@ impl RateLimiter {
 
         if bucket.tokens >= 1.0 {
             bucket.tokens -= 1.0;
-            true
+            None
+        } else if self.refill_rate > 0.0 {
+            Some(Duration::from_secs_f64(
+                (1.0 - bucket.tokens) / self.refill_rate,
+            ))
         } else {
-            false
+            Some(LOCKOUT_MAX)
         }
     }
 
@@ -323,7 +334,7 @@ impl RateLimiter {
 pub struct RateLimit;
 
 impl FromRequestParts<AppState> for RateLimit {
-    type Rejection = (StatusCode, Json<ApiResponse<()>>);
+    type Rejection = Response;
 
     async fn from_request_parts(
         parts: &mut Parts,
@@ -337,20 +348,33 @@ impl FromRequestParts<AppState> for RateLimit {
             .map(client_key)
             .unwrap_or_else(|| "unknown".to_string());
 
-        if state.rate_limiter.check(&key).await {
-            Ok(RateLimit)
-        } else {
-            Err(too_many_requests("Rate limit exceeded. Try again later."))
+        match state.rate_limiter.check_wait(&key).await {
+            None => Ok(RateLimit),
+            Some(wait) => Err(too_many_requests(
+                "Rate limit exceeded. Try again later.",
+                wait,
+            )),
         }
     }
 }
 
-/// 429 response with the given message.
-pub fn too_many_requests(message: &str) -> (StatusCode, Json<ApiResponse<()>>) {
-    (
+/// Whole seconds for a `Retry-After` header (at least 1).
+pub fn retry_after_secs(wait: Duration) -> u64 {
+    wait.as_secs_f64().ceil().max(1.0) as u64
+}
+
+/// 429 response with the given message and a `Retry-After` header, so clients
+/// can tell the user how long to wait.
+pub fn too_many_requests(message: &str, wait: Duration) -> Response {
+    let mut response = (
         StatusCode::TOO_MANY_REQUESTS,
-        Json(ApiResponse::err(message)),
+        Json(ApiResponse::<()>::err(message)),
     )
+        .into_response();
+    if let Ok(value) = HeaderValue::from_str(&retry_after_secs(wait).to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
 }
 
 /// Human-friendly lockout message for a failed-login backoff.
@@ -566,6 +590,31 @@ mod tests {
         assert_eq!(locks[0], LOCKOUT_BASE);
         assert_eq!(locks[1], LOCKOUT_BASE * 2);
         assert_eq!(*locks.last().unwrap_or(&Duration::ZERO), LOCKOUT_MAX);
+    }
+
+    #[tokio::test]
+    async fn check_wait_reports_when_the_next_token_arrives() {
+        let limiter = RateLimiter::new(1, 0.5);
+        assert!(limiter.check_wait("203.0.113.9").await.is_none());
+        let wait = limiter
+            .check_wait("203.0.113.9")
+            .await
+            .unwrap_or_else(|| panic!("an empty bucket should report a wait"));
+        assert!(wait <= Duration::from_secs(2) && wait > Duration::from_millis(1500));
+        assert_eq!(retry_after_secs(wait), 2);
+    }
+
+    #[test]
+    fn too_many_requests_sets_retry_after() {
+        let response = too_many_requests("slow down", Duration::from_millis(1200));
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("2")
+        );
     }
 
     #[test]
