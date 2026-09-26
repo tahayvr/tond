@@ -16,6 +16,12 @@
 
 	let { open = $bindable(false), existingKeys, targetLabel, onApply }: Props = $props();
 
+	const PLACEHOLDER = [
+		'# comments are ignored',
+		'DATABASE_URL=postgres://user:pass@db:5432/app',
+		'export API_KEY="abc123"'
+	].join('\n');
+
 	let text = $state('');
 	let error = $state('');
 	let saving = $state(false);
@@ -63,7 +69,7 @@
 				<Textarea
 					id="env-import-text"
 					bind:value={text}
-					placeholder={'# comments are ignored\nDATABASE_URL=postgres://user:pass@db:5432/app\nexport API_KEY="abc123"'}
+					placeholder={PLACEHOLDER}
 					class="max-h-64 min-h-32 font-mono text-xs"
 					autocomplete="off"
 					spellcheck={false}
