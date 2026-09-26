@@ -37,6 +37,7 @@ use uuid::Uuid;
 
 use crate::backup::{self, SnapshotTrigger};
 use crate::docker;
+use crate::domains;
 use crate::handlers::{github_apps, gitlab_tokens};
 use crate::log_bus::{self, DeployLogEvent};
 use crate::networks;
@@ -143,13 +144,46 @@ async fn persist_generated_dockerfile(
     }
 }
 
-fn auto_domain(base_domain: &str, app_name: &str) -> String {
-    let base = if base_domain.is_empty() {
-        "localhost"
-    } else {
-        base_domain
-    };
-    format!("{}.{}", app_name, base)
+/// The automatic hostname for an app: `<app>.<apps_domain>`, or `None` when
+/// no apps domain is configured. Apps never default to a name under the
+/// dashboard domain: that would put user code on the dashboard's site.
+fn auto_domain(apps_domain: &str, app_name: &str) -> Option<String> {
+    (!apps_domain.is_empty()).then(|| domains::app_host(app_name, apps_domain))
+}
+
+/// Give an app without a domain its automatic hostname, or log how to reach
+/// it when there is no apps domain.
+async fn assign_automatic_domain(
+    state: &AppState,
+    app: &mut App,
+    trigger_source: &str,
+) -> Result<()> {
+    if app.domain.is_some() {
+        return Ok(());
+    }
+    let apps_domain = state.settings.read().await.apps_domain.clone();
+    match auto_domain(&apps_domain, &app.name) {
+        Some(domain) => {
+            sqlx::query("UPDATE apps SET domain = ? WHERE id = ?")
+                .bind(&domain)
+                .bind(&app.id)
+                .execute(&state.db)
+                .await?;
+            app.domain = Some(domain);
+        }
+        None => {
+            log_deploy(
+                state,
+                &app.id,
+                "info",
+                trigger_source,
+                "No apps domain is set, so this app has no public address yet. Add a custom \
+                 domain on the app's page, or set an apps domain in Settings.",
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 /// The environment of a preview container: only the app variables listed in
@@ -421,19 +455,8 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
         app.host_port = Some(host_port as i64);
         app.status = "running".to_string();
 
-        // Auto-assign a domain if none is set (same logic as regular deploy).
-        if app.domain.is_none() {
-            let base = {
-                let s = state.settings.read().await;
-                s.dashboard_domain.clone()
-            };
-            let domain = auto_domain(&base, &app_name);
-            sqlx::query("UPDATE apps SET domain = ? WHERE id = ?")
-                .bind(&domain)
-                .bind(&app_id)
-                .execute(&state.db)
-                .await?;
-        }
+        // Automatic hostname if none is set (same logic as regular deploy).
+        assign_automatic_domain(state, app, trigger_source).await?;
 
         log_deploy(
             state,
@@ -693,22 +716,8 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
         let _ = docker::rename_container(&state.docker, &staging_name, &canonical_name).await;
     }
 
-    // Auto-assign a domain if none set.
-    // Use <app-name>.<dashboard-domain> so the app gets a real, routable
-    // subdomain on the same server.  Fall back to <app-name>.localhost only
-    // if dashboard_domain has not been configured yet.
-    if app.domain.is_none() {
-        let base = {
-            let s = state.settings.read().await;
-            s.dashboard_domain.clone()
-        };
-        let domain = auto_domain(&base, &app_name);
-        sqlx::query("UPDATE apps SET domain = ? WHERE id = ?")
-            .bind(&domain)
-            .bind(&app_id)
-            .execute(&state.db)
-            .await?;
-    }
+    // Automatic hostname <app>.<apps_domain> if the app has no domain yet.
+    assign_automatic_domain(state, app, trigger_source).await?;
 
     log_deploy(
         state,
@@ -1544,16 +1553,16 @@ mod tests {
     }
 
     #[test]
-    fn auto_domain_uses_dashboard_domain_or_localhost_fallback() {
+    fn auto_domain_uses_the_apps_domain_and_nothing_else() {
         assert_eq!(
-            auto_domain("dashboard.example.com", "frontend"),
-            "frontend.dashboard.example.com",
-            "auto_domain should suffix the app name with the configured dashboard domain"
+            auto_domain("example-apps.com", "frontend").as_deref(),
+            Some("frontend.example-apps.com"),
+            "auto_domain should suffix the app name with the apps domain"
         );
         assert_eq!(
             auto_domain("", "frontend"),
-            "frontend.localhost",
-            "auto_domain should fall back to localhost when the dashboard domain is not configured"
+            None,
+            "without an apps domain there is no automatic hostname (never the dashboard's site)"
         );
     }
 

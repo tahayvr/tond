@@ -947,9 +947,11 @@ mod tests {
             extract_archive(ArchiveReader::new(rx, 1024 * 1024), &dest_clone, limits())
         });
         for chunk in archive.chunks(7) {
-            tx.send(Ok(Bytes::copy_from_slice(chunk)))
-                .await
-                .unwrap_or_else(|e| panic!("send: {e}"));
+            // The extractor stops at the tar end-of-archive marker and may
+            // drop the receiver before the gzip trailer arrives.
+            if tx.send(Ok(Bytes::copy_from_slice(chunk))).await.is_err() {
+                break;
+            }
         }
         drop(tx);
         let result = job.await.unwrap_or_else(|e| panic!("join: {e}"));

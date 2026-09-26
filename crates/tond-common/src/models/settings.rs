@@ -32,6 +32,12 @@ pub struct ServerSettings {
     /// preview pages are cross-site to the dashboard. Empty = previews disabled.
     #[serde(default)]
     pub preview_domain: String,
+    /// The domain automatic app hostnames live under (`<app>.<apps_domain>`).
+    /// Must be a different registrable domain from both `dashboard_domain`
+    /// and `preview_domain`. Empty = apps get no automatic hostname and need
+    /// a custom domain.
+    #[serde(default)]
+    pub apps_domain: String,
     /// Max unpacked size in bytes of an uploaded source archive (`tond push`).
     /// The compressed upload is capped at the same size.
     #[serde(default = "default_upload_max_bytes")]
@@ -44,6 +50,7 @@ impl Default for ServerSettings {
             server_name: default_server_name(),
             dashboard_domain: String::new(),
             preview_domain: String::new(),
+            apps_domain: String::new(),
             upload_max_bytes: DEFAULT_UPLOAD_MAX_BYTES,
         }
     }
@@ -64,6 +71,8 @@ pub struct UpdateSettingsRequest {
     pub dashboard_domain: Option<String>,
     #[serde(default)]
     pub preview_domain: Option<String>,
+    #[serde(default)]
+    pub apps_domain: Option<String>,
     #[serde(default)]
     pub upload_max_bytes: Option<u64>,
 }

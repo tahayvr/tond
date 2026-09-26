@@ -74,7 +74,7 @@ use crate::{
     alerts::fire_event_alerts,
     audit_log::{AuthActor, write_audit_log},
     auth::{AuthRole, RateLimit, RequireAdmin, RequireAuth},
-    compose_policy, deploy, docker,
+    compose_policy, deploy, docker, domains,
     error::AppError,
     networks,
     state::AppState,
@@ -142,10 +142,32 @@ pub async fn get_app(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let app = fetch_app(&state.db, &id).await?;
-    Ok((
-        StatusCode::OK,
-        Json(ApiResponse::ok(AppResponse::from(app))),
-    ))
+    let mut response = AppResponse::from(app);
+    response.domain_warning = domain_warning(&state, response.domain.as_deref()).await;
+    Ok((StatusCode::OK, Json(ApiResponse::ok(response))))
+}
+
+/// The "same site as your dashboard" warning for an app domain, if it applies.
+async fn domain_warning(state: &AppState, domain: Option<&str>) -> Option<String> {
+    let domain = domain?;
+    let dashboard = state.settings.read().await.dashboard_domain.clone();
+    domains::same_site(domain, &dashboard).then(|| domains::same_site_warning(domain, &dashboard))
+}
+
+/// Normalize and validate a custom app domain against the current settings.
+/// Returns the normalized domain and the same-site warning, if any.
+async fn check_app_domain(
+    state: &AppState,
+    domain: &str,
+) -> Result<(String, Option<String>), AppError> {
+    let domain = domains::normalize_domain(domain);
+    let (dashboard, preview) = {
+        let s = state.settings.read().await;
+        (s.dashboard_domain.clone(), s.preview_domain.clone())
+    };
+    let warning = domains::check_custom_app_domain(&domain, &dashboard, &preview)
+        .map_err(|msg| AppError(TondError::InvalidInput(msg)))?;
+    Ok((domain, warning))
 }
 
 // ── Create App ──
@@ -259,8 +281,8 @@ pub async fn create_app(
         req.container_port,
     );
 
-    if let Some(domain) = req.domain {
-        app.domain = Some(domain);
+    if let Some(domain) = req.domain.filter(|d| !d.trim().is_empty()) {
+        app.domain = Some(check_app_domain(&state, &domain).await?.0);
     }
 
     if let Some(env) = req.env_vars {
@@ -720,6 +742,21 @@ pub async fn update_domain(
     Json(req): Json<UpdateDomainRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let app = fetch_app(&state.db, &id).await?;
+    let (domain, warning) = check_app_domain(&state, &req.domain).await?;
+    let req = UpdateDomainRequest { domain };
+
+    let taken: Option<String> =
+        sqlx::query_scalar("SELECT name FROM apps WHERE domain = ? AND id != ? LIMIT 1")
+            .bind(&req.domain)
+            .bind(&app.id)
+            .fetch_optional(&state.db)
+            .await?;
+    if let Some(other) = taken {
+        return Err(AppError(TondError::InvalidInput(format!(
+            "{} is already used by the app '{other}'",
+            req.domain
+        ))));
+    }
 
     sqlx::query("UPDATE apps SET domain = ?, updated_at = datetime('now') WHERE id = ?")
         .bind(&req.domain)
@@ -774,9 +811,11 @@ pub async fn update_domain(
 
     Ok((
         StatusCode::OK,
-        Json(ApiResponse::ok(
-            json!({ "message": "Domain updated, certificate provisioning queued" }),
-        )),
+        Json(ApiResponse::ok(json!({
+            "message": "Domain updated, certificate provisioning queued",
+            "domain": req.domain,
+            "warning": warning,
+        }))),
     ))
 }
 
@@ -1991,6 +2030,78 @@ mod tests {
             serde_json::json!(app.id),
             "list_apps with ?name should return the matching app record"
         );
+    }
+
+    #[tokio::test]
+    async fn update_domain_warns_on_the_dashboard_site_and_refuses_unroutable_domains() {
+        let state = test_state().await;
+        {
+            let mut s = state.settings.write().await;
+            s.dashboard_domain = "dash.example.com".to_string();
+            s.preview_domain = "example-previews.com".to_string();
+        }
+        let app = seed_app(&state, "demo").await;
+        let set = |domain: &str| {
+            let state = state.clone();
+            let id = app.id.clone();
+            let domain = domain.to_string();
+            async move {
+                update_domain(
+                    RateLimit,
+                    RequireAuth,
+                    AuthActor("admin@example.com".to_string()),
+                    State(state),
+                    Path(id),
+                    Json(UpdateDomainRequest { domain }),
+                )
+                .await
+                .map(IntoResponse::into_response)
+            }
+        };
+
+        let response = set(" Shop.Example.com ")
+            .await
+            .unwrap_or_else(|err| panic!("same-site custom domains are allowed: {}", err.0));
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        assert_eq!(
+            json["data"]["domain"], "shop.example.com",
+            "domains are normalized"
+        );
+        assert!(
+            json["data"]["warning"]
+                .as_str()
+                .is_some_and(|w| w.contains("same site as your dashboard")),
+            "a same-site domain comes back with a warning: {json}"
+        );
+
+        let detail = get_app(
+            RateLimit,
+            RequireAuth,
+            State(state.clone()),
+            Path(app.id.clone()),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("get_app: {}", err.0))
+        .into_response();
+        let body = to_bytes(detail.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        assert!(
+            json["data"]["domain_warning"].is_string(),
+            "the app detail carries the warning too: {json}"
+        );
+
+        for bad in [
+            "dash.example.com",
+            "pr.example-previews.com",
+            "not a domain",
+        ] {
+            assert!(set(bad).await.is_err(), "{bad} must be refused");
+        }
     }
 
     #[tokio::test]

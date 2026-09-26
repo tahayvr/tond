@@ -131,6 +131,7 @@ async fn main() -> Result<()> {
                 "server_name" => s.server_name = row.value,
                 "dashboard_domain" => s.dashboard_domain = row.value,
                 "preview_domain" => s.preview_domain = row.value,
+                "apps_domain" => s.apps_domain = row.value,
                 "upload_max_bytes" => {
                     s.upload_max_bytes = row.value.parse().unwrap_or(s.upload_max_bytes)
                 }

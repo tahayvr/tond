@@ -10,10 +10,10 @@
 // upload_max_bytes caps uploaded source archives (see upload.rs); it must be
 // between 1 MiB and 64 GiB.
 //
-// dashboard_domain and preview_domain are normalized (trimmed, lowercased) and
-// validated together: the preview domain must be a different registrable
-// domain from the dashboard domain (see domains.rs), whichever of the two
-// changes.
+// dashboard_domain, apps_domain and preview_domain are normalized (trimmed,
+// lowercased) and validated together whichever of them changes: the preview
+// and apps domains must each be a different registrable domain from the
+// dashboard domain and from each other (see domains.rs).
 
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use chrono::{Duration, Utc};
@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::{RateLimit, RequireAdmin, RequireAuth},
-    domains::{is_valid_hostname, normalize_domain, validate_preview_domain},
+    domains::{is_valid_hostname, normalize_domain, validate_apps_domain, validate_preview_domain},
     state::AppState,
     upload::{MAX_UPLOAD_MAX_BYTES, MIN_UPLOAD_MAX_BYTES, format_size},
 };
@@ -89,6 +89,7 @@ pub async fn update_settings(
     let current = state.settings.read().await.clone();
     let dashboard_domain = req.dashboard_domain.as_deref().map(normalize_domain);
     let preview_domain = req.preview_domain.as_deref().map(normalize_domain);
+    let apps_domain = req.apps_domain.as_deref().map(normalize_domain);
 
     if let Some(d) = dashboard_domain.as_deref()
         && !d.is_empty()
@@ -111,8 +112,23 @@ pub async fn update_settings(
         return invalid(msg);
     }
 
+    let effective_apps = apps_domain
+        .clone()
+        .unwrap_or_else(|| current.apps_domain.clone());
+    if !effective_apps.is_empty()
+        && (dashboard_domain.is_some() || preview_domain.is_some() || apps_domain.is_some())
+        && let Err(msg) =
+            validate_apps_domain(&effective_apps, &effective_dashboard, &effective_preview)
+    {
+        return invalid(msg);
+    }
+
     if let Some(v) = dashboard_domain {
         pairs.push(("dashboard_domain", v));
+    }
+
+    if let Some(v) = apps_domain {
+        pairs.push(("apps_domain", v));
     }
 
     if let Some(v) = preview_domain {
@@ -169,6 +185,7 @@ pub async fn update_settings(
                 "server_name" => s.server_name = value,
                 "dashboard_domain" => s.dashboard_domain = value,
                 "preview_domain" => s.preview_domain = value,
+                "apps_domain" => s.apps_domain = value,
                 "upload_max_bytes" => {
                     s.upload_max_bytes = value.parse().unwrap_or(s.upload_max_bytes)
                 }
@@ -442,6 +459,68 @@ mod tests {
             stored(&state, "upload_max_bytes").await.as_deref(),
             Some("209715200"),
             "the limit is persisted for restarts"
+        );
+    }
+
+    async fn put_apps(state: &AppState, apps_domain: &str) -> axum::response::Response {
+        update_settings(
+            RateLimit,
+            RequireAdmin,
+            State(state.clone()),
+            Json(UpdateSettingsRequest {
+                apps_domain: Some(apps_domain.to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .into_response()
+    }
+
+    #[tokio::test]
+    async fn apps_domain_must_be_its_own_site() {
+        let (state, _data_dir) = test_state().await;
+        assert_eq!(
+            put(
+                &state,
+                Some("dash.example.com"),
+                Some("example-previews.com")
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        for bad in [
+            "apps.example.com",
+            "apps.dash.example.com",
+            "example-previews.com",
+            "x.example-previews.com",
+        ] {
+            assert_eq!(
+                put_apps(&state, bad).await.status(),
+                StatusCode::BAD_REQUEST,
+                "{bad} must be rejected as the apps domain"
+            );
+        }
+        assert_eq!(
+            put_apps(&state, " Example-Apps.com ").await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(state.settings.read().await.apps_domain, "example-apps.com");
+        assert_eq!(
+            stored(&state, "apps_domain").await.as_deref(),
+            Some("example-apps.com")
+        );
+        assert_eq!(
+            put(&state, None, Some("previews.example-apps.com"))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST,
+            "moving the preview domain onto the apps site is rejected too"
+        );
+        assert_eq!(
+            put_apps(&state, "").await.status(),
+            StatusCode::OK,
+            "clearing is allowed"
         );
     }
 }

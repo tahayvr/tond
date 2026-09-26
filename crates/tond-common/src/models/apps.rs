@@ -225,6 +225,10 @@ pub struct AppResponse {
     pub id: String,
     pub name: String,
     pub domain: Option<String>,
+    /// Set (on GET /api/apps/{id}) when the app's domain is on the same site
+    /// as the dashboard: allowed, but the dashboard shows this warning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_warning: Option<String>,
     pub source_type: String,
     pub source_url: Option<String>,
     pub status: String,
@@ -320,6 +324,7 @@ impl From<App> for AppResponse {
             static_build: app.static_build != 0,
             created_at: app.created_at,
             updated_at: app.updated_at,
+            domain_warning: None,
         }
     }
 }
