@@ -341,7 +341,7 @@
     "website": "https://docmost.com",
     "docs": "https://docmost.com/docs/installation",
     "repository": "https://github.com/docmost/docmost",
-    "ram_mb": 500,
+    "ram_mb": 600,
     "fits_2gb": true,
     "public": {
       "service": "docmost",
@@ -1399,7 +1399,7 @@
     "website": "https://www.metabase.com",
     "docs": "https://www.metabase.com/docs/latest/installation-and-operation/running-metabase-on-docker",
     "repository": "https://github.com/metabase/metabase",
-    "ram_mb": 1100,
+    "ram_mb": 1200,
     "fits_2gb": false,
     "public": {
       "service": "metabase",
@@ -2241,7 +2241,7 @@
     "website": "https://uptime.kuma.pet",
     "docs": "https://github.com/louislam/uptime-kuma/wiki",
     "repository": "https://github.com/louislam/uptime-kuma",
-    "ram_mb": 150,
+    "ram_mb": 230,
     "fits_2gb": true,
     "public": {
       "service": "uptime-kuma",
