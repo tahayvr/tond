@@ -134,6 +134,7 @@ pub async fn revoke_token(
 // ── GET /api/v1/auth/whoami ──
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct WhoAmIResponse {
     /// "user" | "token" | "local_socket"
     pub kind: String,

@@ -43,6 +43,7 @@ const INCIDENT_LIMIT: i64 = 50;
 // ── Responses ──
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct CheckSettingsResponse {
     pub id: i64,
     pub enabled: bool,
@@ -66,6 +67,7 @@ impl From<&CheckRow> for CheckSettingsResponse {
 }
 
 #[derive(Debug, Default, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct UptimePercentResponse {
     pub day: Option<f64>,
     pub week: Option<f64>,
@@ -85,6 +87,7 @@ impl UptimePercentResponse {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct LastProbeResponse {
     #[serde(flatten)]
     pub probe: LastProbe,
@@ -94,6 +97,7 @@ pub struct LastProbeResponse {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct IncidentResponse {
     #[serde(flatten)]
     pub incident: Incident,
@@ -102,6 +106,7 @@ pub struct IncidentResponse {
 }
 
 #[derive(Debug, Default, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct LatencyResponse {
     pub t: Vec<i64>,
     pub ms: Vec<i64>,
@@ -109,6 +114,7 @@ pub struct LatencyResponse {
 
 /// One check, in full.
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct UptimeCheckResponse {
     /// None when the app has no domain.
     pub check: Option<CheckSettingsResponse>,
@@ -132,6 +138,7 @@ pub struct UptimeCheckResponse {
 
 /// One row of GET /api/v1/uptime.
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct UptimeSummaryResponse {
     pub check_id: i64,
     /// "app" | "dashboard"

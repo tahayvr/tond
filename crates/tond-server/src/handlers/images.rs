@@ -35,6 +35,7 @@ pub struct InspectImageRequest {
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct InspectImageResponse {
     pub image: String,
     /// TCP ports from the image's EXPOSE instructions, ascending

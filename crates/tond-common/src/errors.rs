@@ -499,7 +499,7 @@ impl TondError {
             TondError::DatabaseError(_) => code::DATABASE_ERROR,
             TondError::InvalidInput(_) | TondError::InvalidField { .. } => code::INVALID_INPUT,
             TondError::Forbidden(_) => code::FORBIDDEN,
-            TondError::ScopeDenied { code, .. } => *code,
+            TondError::ScopeDenied { code, .. } => code,
             TondError::ApprovalRequired(_) => code::APPROVAL_REQUIRED,
             TondError::Conflict(_) => code::CONFLICT,
             TondError::DeployInProgress(_) => code::DEPLOY_IN_PROGRESS,

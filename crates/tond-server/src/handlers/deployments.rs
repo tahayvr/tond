@@ -262,8 +262,8 @@ pub async fn rollback_app(
     .await;
 
     let mut body = crate::handlers::queued_response("Rollback queued", &app_id, &queued);
-    body["image_tag"] = json!(image_tag);
-    body["target_deployment_id"] = json!(target_id);
+    body.image_tag = Some(image_tag);
+    body.target_deployment_id = Some(target_id);
     Ok((StatusCode::ACCEPTED, Json(ApiResponse::ok(body))))
 }
 

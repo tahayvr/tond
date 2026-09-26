@@ -593,7 +593,7 @@ pub(crate) fn deployment_started(
     message: &str,
     app_id: &str,
     queued: &deploy::queue::Enqueued,
-) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+) -> (StatusCode, Json<ApiResponse<QueuedDeploymentResponse>>) {
     (
         StatusCode::ACCEPTED,
         Json(ApiResponse::ok(queued_response(message, app_id, queued))),
@@ -629,23 +629,50 @@ pub async fn deploy_app(
 }
 
 /// Body of a 202 answer to a queued deployment (deploy/queue.rs).
+#[derive(Debug, Clone, serde::Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct QueuedDeploymentResponse {
+    /// Human summary, with the place in line when it waits.
+    pub message: String,
+    pub app_id: String,
+    /// Follow it at /api/v1/apps/{app_id}/deployments/{deployment_id}(/stream).
+    pub deployment_id: String,
+    /// `queued` (waits for a build slot or the app's running deploy).
+    pub status: String,
+    /// 1-based place in line.
+    pub queue_position: usize,
+    /// The waiting deployment this one replaced, if any.
+    pub superseded: Option<String>,
+    /// Rollbacks: the image being redeployed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_tag: Option<String>,
+    /// Rollbacks: the deployment whose image is redeployed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_deployment_id: Option<String>,
+}
+
 pub(crate) fn queued_response(
     message: &str,
     app_id: &str,
     queued: &deploy::queue::Enqueued,
-) -> serde_json::Value {
-    json!({
-        "message": if queued.queue_position > 1 {
-            format!("{message} (position {} in the queue)", queued.queue_position)
+) -> QueuedDeploymentResponse {
+    QueuedDeploymentResponse {
+        message: if queued.queue_position > 1 {
+            format!(
+                "{message} (position {} in the queue)",
+                queued.queue_position
+            )
         } else {
             message.to_string()
         },
-        "app_id": app_id,
-        "deployment_id": queued.deployment_id,
-        "status": queued.status,
-        "queue_position": queued.queue_position,
-        "superseded": queued.superseded,
-    })
+        app_id: app_id.to_string(),
+        deployment_id: queued.deployment_id.clone(),
+        status: queued.status.to_string(),
+        queue_position: queued.queue_position,
+        superseded: queued.superseded.clone(),
+        image_tag: None,
+        target_deployment_id: None,
+    }
 }
 
 // ── Stop App ──

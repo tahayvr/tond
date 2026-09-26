@@ -50,6 +50,7 @@ fn now() -> i64 {
 // ── Host ──
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct FilesystemResponse {
     pub mount: String,
     pub used: u64,
@@ -59,6 +60,7 @@ pub struct FilesystemResponse {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct HostCurrentResponse {
     pub cpu_percent: f64,
     pub load1: f64,
@@ -77,6 +79,7 @@ pub struct HostCurrentResponse {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct HostResponse {
     /// None until the collector's first sample.
     pub current: Option<HostCurrentResponse>,
@@ -142,6 +145,7 @@ fn default_range() -> String {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct HistoryResponse {
     pub range: &'static str,
     pub step: i64,
@@ -258,6 +262,7 @@ pub async fn cleanup(
 // ── Heartbeat ──
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct HeartbeatResponse {
     pub configured: bool,
     /// The URL's host (the URL itself is never returned).
@@ -380,6 +385,7 @@ pub async fn update_heartbeat(
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct HeartbeatTestResponse {
     #[serde(flatten)]
     pub outcome: heartbeat::Outcome,

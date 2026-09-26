@@ -150,6 +150,7 @@ pub async fn insert_results(db: &SqlitePool, rows: &[ResultRow]) -> sqlx::Result
 
 /// A down period.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, sqlx::FromRow)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Incident {
     pub id: i64,
     pub check_id: i64,
@@ -351,6 +352,7 @@ pub async fn windows(
 
 /// One bar of a status strip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Bar {
     /// Bucket start, unix seconds.
     pub t: i64,

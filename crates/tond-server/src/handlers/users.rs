@@ -43,6 +43,7 @@ use crate::{
 
 /// A user as the admin Users page shows it.
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct AdminUserResponse {
     #[serde(flatten)]
     pub user: UserResponse,

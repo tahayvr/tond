@@ -110,6 +110,7 @@ pub fn subscribe() -> broadcast::Receiver<UptimeEvent> {
 
 /// The newest probe of a check.
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct LastProbe {
     /// Unix seconds.
     pub at: i64,

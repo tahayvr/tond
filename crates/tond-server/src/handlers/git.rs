@@ -462,6 +462,7 @@ pub struct RemoteBranchesRequest {
 
 /// POST /api/v1/git/branches response.
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct RemoteBranchesResponse {
     /// The repository's default branch (its HEAD), when the server says
     pub default_branch: Option<String>,

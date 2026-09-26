@@ -98,6 +98,7 @@ impl TerminalTargetKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct TerminalTargetResponse {
     pub id: String,
     pub kind: TerminalTargetKind,
@@ -124,6 +125,7 @@ pub struct TerminalTicketRequest {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct TerminalTicketResponse {
     pub ticket: String,
     pub expires_in: i64,

@@ -54,6 +54,7 @@ pub struct DomainCheckQuery {
 
 /// A DNS record to create.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct DnsRecord {
     /// "A" | "AAAA"
     #[serde(rename = "type")]
@@ -66,6 +67,7 @@ pub struct DnsRecord {
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct DnsStatus {
     /// "ok" | "mismatch" | "missing" | "inconclusive"
     pub status: &'static str,
@@ -79,6 +81,7 @@ pub struct DnsStatus {
 
 /// The certificate fields the domain card shows.
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct CertificateSummary {
     pub status: String,
     pub issued_at: String,
@@ -104,6 +107,7 @@ impl From<Certificate> for CertificateSummary {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct DomainCheckResponse {
     pub domain: String,
     /// Registrable domain (the DNS zone the records go in), if known
