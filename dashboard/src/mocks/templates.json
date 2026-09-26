@@ -98,6 +98,73 @@
     "compose": "services:\n  appsmith:\n    image: appsmith/appsmith-ce:v2.4.2\n    restart: unless-stopped\n    mem_limit: 3g\n    ports: [\"80\"]\n    environment:\n      APPSMITH_DISABLE_TELEMETRY: \"true\"\n    volumes:\n      - ./stacks:/appsmith-stacks\n"
   },
   {
+    "id": "audiobookshelf",
+    "name": "Audiobookshelf",
+    "description": "Audiobook and podcast server with progress sync and mobile apps.",
+    "about": "Audiobookshelf streams your audiobooks and podcasts to the web and its Android and iOS apps, keeps listening progress in sync across devices, fetches metadata and covers, and downloads new podcast episodes automatically. Upload books from the web UI; they are stored in the app's volume.",
+    "category": "media",
+    "tags": [
+      "audiobooks",
+      "podcasts",
+      "media",
+      "library"
+    ],
+    "logo": "audiobookshelf",
+    "version": "2.36",
+    "website": "https://www.audiobookshelf.org",
+    "docs": "https://www.audiobookshelf.org/docs",
+    "repository": "https://github.com/advplyr/audiobookshelf",
+    "ram_mb": 200,
+    "fits_2gb": true,
+    "public": {
+      "service": "audiobookshelf",
+      "port": 80,
+      "health_path": "/healthcheck"
+    },
+    "services": [
+      {
+        "name": "audiobookshelf",
+        "image": "ghcr.io/advplyr/audiobookshelf:2.36.1",
+        "public": true,
+        "memory_limit_mb": 512
+      }
+    ],
+    "volumes": [
+      {
+        "service": "audiobookshelf",
+        "path": "./config",
+        "description": "The database and settings",
+        "owner": null
+      },
+      {
+        "service": "audiobookshelf",
+        "path": "./metadata",
+        "description": "Covers, cache, backups and logs",
+        "owner": null
+      },
+      {
+        "service": "audiobookshelf",
+        "path": "./audiobooks",
+        "description": "Your audiobooks (/audiobooks)",
+        "owner": null
+      },
+      {
+        "service": "audiobookshelf",
+        "path": "./podcasts",
+        "description": "Downloaded podcast episodes (/podcasts)",
+        "owner": null
+      }
+    ],
+    "inputs": [],
+    "setup_notes": "Open the app right away and create the root user (the first visitor sets it). Then add a library pointing at /audiobooks or /podcasts.",
+    "upgrade_notes": "Change the image to a newer 2.x tag and redeploy; the database is migrated on start. Snapshot the app first.",
+    "post_deploy_checks": [
+      "Create the root user",
+      "Add a library for /audiobooks"
+    ],
+    "compose": "services:\n  audiobookshelf:\n    image: ghcr.io/advplyr/audiobookshelf:2.36.1\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"80\"]\n    environment:\n      TZ: UTC\n    volumes:\n      - ./config:/config\n      - ./metadata:/metadata\n      - ./audiobooks:/audiobooks\n      - ./podcasts:/podcasts\n"
+  },
+  {
     "id": "code-server",
     "name": "code-server",
     "description": "VS Code in the browser, running on your server.",
@@ -343,7 +410,7 @@
       "Create the workspace and admin account",
       "Create a space and a page"
     ],
-    "compose": "services:\n  docmost:\n    image: docmost/docmost:0.95.0\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"3000\"]\n    environment:\n      APP_URL: ${APP_URL}\n      APP_SECRET: ${APP_SECRET}\n      DATABASE_URL: postgresql://docmost:${DB_PASSWORD}@db:5432/docmost?schema=public\n      REDIS_URL: redis://redis:6379\n    volumes:\n      - ./storage:/app/data/storage\n    depends_on:\n      db:\n        condition: service_healthy\n      redis:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: docmost\n      POSTGRES_USER: docmost\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -U docmost -d docmost\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n\n  redis:\n    image: valkey/valkey:8-alpine\n    restart: unless-stopped\n    mem_limit: 128m\n    healthcheck:\n      test: [\"CMD\", \"valkey-cli\", \"ping\"]\n      interval: 5s\n      timeout: 3s\n      retries: 10\n"
+    "compose": "services:\n  docmost:\n    image: docmost/docmost:0.95.0\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"3000\"]\n    environment:\n      APP_URL: ${APP_URL}\n      APP_SECRET: ${APP_SECRET}\n      DATABASE_URL: postgresql://docmost:${DB_PASSWORD}@db:5432/docmost?schema=public\n      REDIS_URL: redis://redis:6379\n    volumes:\n      - ./storage:/app/data/storage\n    depends_on:\n      db:\n        condition: service_healthy\n      redis:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: docmost\n      POSTGRES_USER: docmost\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U docmost -d docmost\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n\n  redis:\n    image: valkey/valkey:8-alpine\n    restart: unless-stopped\n    mem_limit: 128m\n    healthcheck:\n      test: [\"CMD\", \"valkey-cli\", \"ping\"]\n      interval: 5s\n      timeout: 3s\n      retries: 10\n"
   },
   {
     "id": "excalidraw",
@@ -656,6 +723,66 @@
     "compose": "services:\n  gitea:\n    image: gitea/gitea:1.27\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"3000\"]\n    environment:\n      USER_UID: \"1000\"\n      USER_GID: \"1000\"\n      GITEA__database__DB_TYPE: sqlite3\n      GITEA__server__ROOT_URL: ${ROOT_URL}\n      GITEA__server__DOMAIN: ${DOMAIN}\n      GITEA__server__HTTP_PORT: \"3000\"\n      GITEA__server__DISABLE_SSH: \"true\"\n      GITEA__server__START_SSH_SERVER: \"false\"\n      GITEA__service__DISABLE_REGISTRATION: \"true\"\n    volumes:\n      - ./data:/data\n"
   },
   {
+    "id": "gotify",
+    "name": "Gotify",
+    "description": "Simple self-hosted push notifications with a REST API and Android app.",
+    "about": "Gotify sends and receives messages in real time: scripts and services post to its REST API with an app token, and the web UI and Android app show them instantly over WebSockets. A small Go server with an SQLite database.",
+    "category": "communication",
+    "tags": [
+      "notifications",
+      "push",
+      "alerts",
+      "websocket"
+    ],
+    "logo": null,
+    "version": "2.9",
+    "website": "https://gotify.net",
+    "docs": "https://gotify.net/docs/",
+    "repository": "https://github.com/gotify/server",
+    "ram_mb": 30,
+    "fits_2gb": true,
+    "public": {
+      "service": "gotify",
+      "port": 80,
+      "health_path": "/health"
+    },
+    "services": [
+      {
+        "name": "gotify",
+        "image": "gotify/server:2.9.1",
+        "public": true,
+        "memory_limit_mb": 128
+      }
+    ],
+    "volumes": [
+      {
+        "service": "gotify",
+        "path": "./data",
+        "description": "Messages, users, applications and uploaded images (SQLite)",
+        "owner": null
+      }
+    ],
+    "inputs": [
+      {
+        "key": "ADMIN_PASSWORD",
+        "label": "Admin password",
+        "description": null,
+        "kind": "password",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": true
+      }
+    ],
+    "setup_notes": "Sign in as admin with the password Tond showed after the deploy, then create an application to get a token for sending messages.",
+    "upgrade_notes": "Change the image to a newer 2.x tag and redeploy.",
+    "post_deploy_checks": [
+      "Sign in as admin",
+      "Create an application and send a test message"
+    ],
+    "compose": "services:\n  gotify:\n    image: gotify/server:2.9.1\n    restart: unless-stopped\n    mem_limit: 128m\n    ports: [\"80\"]\n    environment:\n      GOTIFY_DEFAULTUSER_NAME: admin\n      GOTIFY_DEFAULTUSER_PASS: ${ADMIN_PASSWORD}\n      GOTIFY_REGISTRATION: \"false\"\n      TZ: UTC\n    volumes:\n      - ./data:/app/data\n"
+  },
+  {
     "id": "grafana",
     "name": "Grafana",
     "description": "Dashboards and alerting for metrics, logs and traces from any data source.",
@@ -866,7 +993,7 @@
       "Create the admin account",
       "Connect the mobile app and back up a photo"
     ],
-    "compose": "services:\n  immich-server:\n    image: ghcr.io/immich-app/immich-server:v2.7.0\n    restart: unless-stopped\n    mem_limit: 2g\n    ports: [\"2283\"]\n    environment:\n      DB_HOSTNAME: database\n      DB_USERNAME: immich\n      DB_PASSWORD: ${DB_PASSWORD}\n      DB_DATABASE_NAME: immich\n      REDIS_HOSTNAME: redis\n      IMMICH_MACHINE_LEARNING_ENABLED: \"false\"\n    volumes:\n      - ./library:/data\n    depends_on:\n      redis:\n        condition: service_healthy\n      database:\n        condition: service_healthy\n\n  redis:\n    image: valkey/valkey:8-alpine\n    restart: unless-stopped\n    mem_limit: 128m\n    healthcheck:\n      test: [\"CMD\", \"valkey-cli\", \"ping\"]\n      interval: 5s\n      timeout: 3s\n      retries: 10\n\n  database:\n    image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0\n    restart: unless-stopped\n    mem_limit: 512m\n    shm_size: 128mb\n    environment:\n      POSTGRES_USER: immich\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n      POSTGRES_DB: immich\n      POSTGRES_INITDB_ARGS: --data-checksums\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -U immich -d immich\"]\n      interval: 5s\n      timeout: 5s\n      retries: 20\n"
+    "compose": "services:\n  immich-server:\n    image: ghcr.io/immich-app/immich-server:v2.7.0\n    restart: unless-stopped\n    mem_limit: 2g\n    ports: [\"2283\"]\n    environment:\n      DB_HOSTNAME: database\n      DB_USERNAME: immich\n      DB_PASSWORD: ${DB_PASSWORD}\n      DB_DATABASE_NAME: immich\n      REDIS_HOSTNAME: redis\n      IMMICH_MACHINE_LEARNING_ENABLED: \"false\"\n    volumes:\n      - ./library:/data\n    depends_on:\n      redis:\n        condition: service_healthy\n      database:\n        condition: service_healthy\n\n  redis:\n    image: valkey/valkey:8-alpine\n    restart: unless-stopped\n    mem_limit: 128m\n    healthcheck:\n      test: [\"CMD\", \"valkey-cli\", \"ping\"]\n      interval: 5s\n      timeout: 3s\n      retries: 10\n\n  database:\n    image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0\n    restart: unless-stopped\n    mem_limit: 512m\n    shm_size: 128mb\n    environment:\n      POSTGRES_USER: immich\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n      POSTGRES_DB: immich\n      POSTGRES_INITDB_ARGS: --data-checksums\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U immich -d immich\"]\n      interval: 5s\n      timeout: 5s\n      retries: 20\n"
   },
   {
     "id": "it-tools",
@@ -991,7 +1118,7 @@
     "public": {
       "service": "listmonk",
       "port": 9000,
-      "health_path": "/api/health"
+      "health_path": "/health"
     },
     "services": [
       {
@@ -1059,7 +1186,7 @@
       "Sign in and set the root URL",
       "Configure SMTP and send a test campaign"
     ],
-    "compose": "services:\n  listmonk:\n    image: listmonk/listmonk:v6.2.0\n    restart: unless-stopped\n    mem_limit: 256m\n    ports: [\"9000\"]\n    command: [sh, -c, \"./listmonk --install --idempotent --yes --config '' && ./listmonk --upgrade --yes --config '' && ./listmonk --config ''\"]\n    environment:\n      LISTMONK_app__address: 0.0.0.0:9000\n      LISTMONK_db__host: db\n      LISTMONK_db__port: \"5432\"\n      LISTMONK_db__user: listmonk\n      LISTMONK_db__password: ${DB_PASSWORD}\n      LISTMONK_db__database: listmonk\n      LISTMONK_db__ssl_mode: disable\n      LISTMONK_ADMIN_USER: admin\n      LISTMONK_ADMIN_PASSWORD: ${ADMIN_PASSWORD}\n      TZ: ${TZ}\n    volumes:\n      - ./uploads:/listmonk/uploads\n    depends_on:\n      db:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: listmonk\n      POSTGRES_USER: listmonk\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -U listmonk -d listmonk\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n"
+    "compose": "services:\n  listmonk:\n    image: listmonk/listmonk:v6.2.0\n    restart: unless-stopped\n    mem_limit: 256m\n    ports: [\"9000\"]\n    command: [sh, -c, \"./listmonk --install --idempotent --yes --config '' && ./listmonk --upgrade --yes --config '' && ./listmonk --config ''\"]\n    environment:\n      LISTMONK_app__address: 0.0.0.0:9000\n      LISTMONK_db__host: db\n      LISTMONK_db__port: \"5432\"\n      LISTMONK_db__user: listmonk\n      LISTMONK_db__password: ${DB_PASSWORD}\n      LISTMONK_db__database: listmonk\n      LISTMONK_db__ssl_mode: disable\n      LISTMONK_ADMIN_USER: admin\n      LISTMONK_ADMIN_PASSWORD: ${ADMIN_PASSWORD}\n      TZ: ${TZ}\n    volumes:\n      - ./uploads:/listmonk/uploads\n    depends_on:\n      db:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: listmonk\n      POSTGRES_USER: listmonk\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U listmonk -d listmonk\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n"
   },
   {
     "id": "mattermost",
@@ -1143,7 +1270,7 @@
       "Create the admin account",
       "Configure SMTP in the System Console for invites and notifications"
     ],
-    "compose": "services:\n  mattermost:\n    image: mattermost/mattermost-team-edition:11.11\n    restart: unless-stopped\n    mem_limit: 1g\n    ports: [\"8065\"]\n    environment:\n      TZ: UTC\n      MM_SQLSETTINGS_DRIVERNAME: postgres\n      MM_SQLSETTINGS_DATASOURCE: postgres://mattermost:${DB_PASSWORD}@db:5432/mattermost?sslmode=disable&connect_timeout=10\n      MM_CONFIG: postgres://mattermost:${DB_PASSWORD}@db:5432/mattermost?sslmode=disable&connect_timeout=10\n      MM_SERVICESETTINGS_SITEURL: ${MM_SERVICESETTINGS_SITEURL}\n      MM_BLEVESETTINGS_INDEXDIR: /mattermost/data/bleve-indexes\n    volumes:\n      - ./data:/mattermost/data\n      - ./plugins:/mattermost/plugins\n      - ./client-plugins:/mattermost/client/plugins\n    depends_on:\n      db:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    restart: unless-stopped\n    mem_limit: 384m\n    environment:\n      POSTGRES_DB: mattermost\n      POSTGRES_USER: mattermost\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -U mattermost -d mattermost\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n"
+    "compose": "services:\n  mattermost:\n    image: mattermost/mattermost-team-edition:11.11\n    restart: unless-stopped\n    mem_limit: 1g\n    ports: [\"8065\"]\n    environment:\n      TZ: UTC\n      MM_SQLSETTINGS_DRIVERNAME: postgres\n      MM_SQLSETTINGS_DATASOURCE: postgres://mattermost:${DB_PASSWORD}@db:5432/mattermost?sslmode=disable&connect_timeout=10\n      MM_CONFIG: postgres://mattermost:${DB_PASSWORD}@db:5432/mattermost?sslmode=disable&connect_timeout=10\n      MM_SERVICESETTINGS_SITEURL: ${MM_SERVICESETTINGS_SITEURL}\n      MM_BLEVESETTINGS_INDEXDIR: /mattermost/data/bleve-indexes\n    volumes:\n      - ./data:/mattermost/data\n      - ./plugins:/mattermost/plugins\n      - ./client-plugins:/mattermost/client/plugins\n    depends_on:\n      db:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    restart: unless-stopped\n    mem_limit: 384m\n    environment:\n      POSTGRES_DB: mattermost\n      POSTGRES_USER: mattermost\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U mattermost -d mattermost\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n"
   },
   {
     "id": "mealie",
@@ -1319,7 +1446,7 @@
       "Complete the setup wizard",
       "Connect a database and build a question"
     ],
-    "compose": "services:\n  metabase:\n    image: metabase/metabase:v0.58.34\n    restart: unless-stopped\n    mem_limit: 1280m\n    ports: [\"3000\"]\n    environment:\n      MB_DB_TYPE: postgres\n      MB_DB_HOST: db\n      MB_DB_PORT: \"5432\"\n      MB_DB_DBNAME: metabase\n      MB_DB_USER: metabase\n      MB_DB_PASS: ${DB_PASSWORD}\n      MB_SITE_URL: ${MB_SITE_URL}\n      MB_ANON_TRACKING_ENABLED: \"false\"\n      JAVA_OPTS: -Xmx768m -XX:+UseSerialGC\n    depends_on:\n      db:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: metabase\n      POSTGRES_USER: metabase\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -U metabase -d metabase\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n"
+    "compose": "services:\n  metabase:\n    image: metabase/metabase:v0.58.34\n    restart: unless-stopped\n    mem_limit: 1280m\n    ports: [\"3000\"]\n    environment:\n      MB_DB_TYPE: postgres\n      MB_DB_HOST: db\n      MB_DB_PORT: \"5432\"\n      MB_DB_DBNAME: metabase\n      MB_DB_USER: metabase\n      MB_DB_PASS: ${DB_PASSWORD}\n      MB_SITE_URL: ${MB_SITE_URL}\n      MB_ANON_TRACKING_ENABLED: \"false\"\n      JAVA_OPTS: -Xmx768m -XX:+UseSerialGC\n    depends_on:\n      db:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: metabase\n      POSTGRES_USER: metabase\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U metabase -d metabase\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n"
   },
   {
     "id": "miniflux",
@@ -1395,7 +1522,7 @@
       "Sign in as admin",
       "Import an OPML file or add a feed"
     ],
-    "compose": "services:\n  miniflux:\n    image: miniflux/miniflux:2.3.3\n    restart: unless-stopped\n    mem_limit: 128m\n    ports: [\"8080\"]\n    environment:\n      DATABASE_URL: postgres://miniflux:${DB_PASSWORD}@db/miniflux?sslmode=disable\n      RUN_MIGRATIONS: \"1\"\n      CREATE_ADMIN: \"1\"\n      ADMIN_USERNAME: admin\n      ADMIN_PASSWORD: ${ADMIN_PASSWORD}\n      BASE_URL: ${BASE_URL}\n      LISTEN_ADDR: 0.0.0.0:8080\n    depends_on:\n      db:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: miniflux\n      POSTGRES_USER: miniflux\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -U miniflux -d miniflux\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n"
+    "compose": "services:\n  miniflux:\n    image: miniflux/miniflux:2.3.3\n    restart: unless-stopped\n    mem_limit: 128m\n    ports: [\"8080\"]\n    environment:\n      DATABASE_URL: postgres://miniflux:${DB_PASSWORD}@db/miniflux?sslmode=disable\n      RUN_MIGRATIONS: \"1\"\n      CREATE_ADMIN: \"1\"\n      ADMIN_USERNAME: admin\n      ADMIN_PASSWORD: ${ADMIN_PASSWORD}\n      BASE_URL: ${BASE_URL}\n      LISTEN_ADDR: 0.0.0.0:8080\n    depends_on:\n      db:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: miniflux\n      POSTGRES_USER: miniflux\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U miniflux -d miniflux\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n"
   },
   {
     "id": "n8n",
@@ -1550,7 +1677,7 @@
       "Sign in as admin",
       "Check Administration → Overview for warnings"
     ],
-    "compose": "services:\n  nextcloud:\n    image: nextcloud:34-apache\n    restart: unless-stopped\n    mem_limit: 768m\n    ports: [\"80\"]\n    environment:\n      POSTGRES_HOST: db\n      POSTGRES_DB: nextcloud\n      POSTGRES_USER: nextcloud\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n      NEXTCLOUD_ADMIN_USER: admin\n      NEXTCLOUD_ADMIN_PASSWORD: ${ADMIN_PASSWORD}\n      NEXTCLOUD_TRUSTED_DOMAINS: ${NEXTCLOUD_TRUSTED_DOMAINS}\n      OVERWRITEPROTOCOL: https\n      OVERWRITECLIURL: ${OVERWRITE_CLI_URL}\n      TRUSTED_PROXIES: 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16\n      PHP_MEMORY_LIMIT: 512M\n      PHP_UPLOAD_LIMIT: 2G\n    volumes:\n      - ./html:/var/www/html\n    depends_on:\n      db:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: nextcloud\n      POSTGRES_USER: nextcloud\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -U nextcloud -d nextcloud\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n"
+    "compose": "services:\n  nextcloud:\n    image: nextcloud:34-apache\n    restart: unless-stopped\n    mem_limit: 768m\n    ports: [\"80\"]\n    environment:\n      POSTGRES_HOST: db\n      POSTGRES_DB: nextcloud\n      POSTGRES_USER: nextcloud\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n      NEXTCLOUD_ADMIN_USER: admin\n      NEXTCLOUD_ADMIN_PASSWORD: ${ADMIN_PASSWORD}\n      NEXTCLOUD_TRUSTED_DOMAINS: ${NEXTCLOUD_TRUSTED_DOMAINS}\n      OVERWRITEPROTOCOL: https\n      OVERWRITECLIURL: ${OVERWRITE_CLI_URL}\n      TRUSTED_PROXIES: 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16\n      PHP_MEMORY_LIMIT: 512M\n      PHP_UPLOAD_LIMIT: 2G\n    volumes:\n      - ./html:/var/www/html\n    depends_on:\n      db:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: nextcloud\n      POSTGRES_USER: nextcloud\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U nextcloud -d nextcloud\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n"
   },
   {
     "id": "ntfy",
@@ -1792,7 +1919,7 @@
       "Register the owner account right away",
       "Add a site and check a page view arrives"
     ],
-    "compose": "services:\n  plausible:\n    image: ghcr.io/plausible/community-edition:v3.2.1\n    restart: unless-stopped\n    mem_limit: 768m\n    command: sh -c \"/entrypoint.sh db createdb && /entrypoint.sh db migrate && /entrypoint.sh run\"\n    ports: [\"8000\"]\n    environment:\n      BASE_URL: ${BASE_URL}\n      SECRET_KEY_BASE: ${SECRET_KEY_BASE}\n      HTTP_PORT: \"8000\"\n      DATABASE_URL: postgres://plausible:${DB_PASSWORD}@db:5432/plausible\n      CLICKHOUSE_DATABASE_URL: http://events:8123/plausible_events\n      DISABLE_REGISTRATION: invite_only\n    volumes:\n      - ./plausible:/var/lib/plausible\n    depends_on:\n      db:\n        condition: service_healthy\n      events:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: plausible\n      POSTGRES_USER: plausible\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -U plausible -d plausible\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n\n  events:\n    image: clickhouse/clickhouse-server:24.12-alpine\n    restart: unless-stopped\n    mem_limit: 1g\n    environment:\n      CLICKHOUSE_SKIP_USER_SETUP: \"1\"\n    volumes:\n      - ./clickhouse:/var/lib/clickhouse\n    configs:\n      - source: clickhouse_logs\n        target: /etc/clickhouse-server/config.d/logs.xml\n      - source: clickhouse_ipv4\n        target: /etc/clickhouse-server/config.d/ipv4-only.xml\n      - source: clickhouse_low_resources\n        target: /etc/clickhouse-server/users.d/low-resources.xml\n    ulimits:\n      nofile:\n        soft: 262144\n        hard: 262144\n    healthcheck:\n      test: [\"CMD-SHELL\", \"wget --no-verbose --tries=1 -O - http://127.0.0.1:8123/ping || exit 1\"]\n      interval: 5s\n      timeout: 5s\n      retries: 20\n      start_period: 5s\n\nconfigs:\n  clickhouse_logs:\n    content: |\n      <clickhouse>\n        <logger><level>warning</level><console>true</console></logger>\n        <query_log replace=\"1\"><database>system</database><table>query_log</table><flush_interval_milliseconds>7500</flush_interval_milliseconds><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></query_log>\n        <query_thread_log remove=\"remove\"/>\n        <metric_log remove=\"remove\"/>\n        <asynchronous_metric_log remove=\"remove\"/>\n        <trace_log remove=\"remove\"/>\n        <text_log remove=\"remove\"/>\n        <session_log remove=\"remove\"/>\n        <part_log remove=\"remove\"/>\n      </clickhouse>\n  clickhouse_ipv4:\n    content: |\n      <clickhouse>\n        <listen_host>0.0.0.0</listen_host>\n      </clickhouse>\n  clickhouse_low_resources:\n    content: |\n      <clickhouse>\n        <profiles>\n          <default>\n            <max_threads>1</max_threads>\n            <max_block_size>8192</max_block_size>\n            <max_download_threads>1</max_download_threads>\n            <input_format_parallel_parsing>0</input_format_parallel_parsing>\n            <output_format_parallel_formatting>0</output_format_parallel_formatting>\n          </default>\n        </profiles>\n      </clickhouse>\n"
+    "compose": "services:\n  plausible:\n    image: ghcr.io/plausible/community-edition:v3.2.1\n    restart: unless-stopped\n    mem_limit: 768m\n    command: sh -c \"/entrypoint.sh db createdb && /entrypoint.sh db migrate && /entrypoint.sh run\"\n    ports: [\"8000\"]\n    environment:\n      BASE_URL: ${BASE_URL}\n      SECRET_KEY_BASE: ${SECRET_KEY_BASE}\n      HTTP_PORT: \"8000\"\n      DATABASE_URL: postgres://plausible:${DB_PASSWORD}@db:5432/plausible\n      CLICKHOUSE_DATABASE_URL: http://events:8123/plausible_events\n      DISABLE_REGISTRATION: invite_only\n    volumes:\n      - ./plausible:/var/lib/plausible\n    depends_on:\n      db:\n        condition: service_healthy\n      events:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: plausible\n      POSTGRES_USER: plausible\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U plausible -d plausible\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n\n  events:\n    image: clickhouse/clickhouse-server:24.12-alpine\n    restart: unless-stopped\n    mem_limit: 1g\n    environment:\n      CLICKHOUSE_SKIP_USER_SETUP: \"1\"\n    volumes:\n      - ./clickhouse:/var/lib/clickhouse\n    configs:\n      - source: clickhouse_logs\n        target: /etc/clickhouse-server/config.d/logs.xml\n      - source: clickhouse_ipv4\n        target: /etc/clickhouse-server/config.d/ipv4-only.xml\n      - source: clickhouse_low_resources\n        target: /etc/clickhouse-server/users.d/low-resources.xml\n    ulimits:\n      nofile:\n        soft: 262144\n        hard: 262144\n    healthcheck:\n      test: [\"CMD-SHELL\", \"wget --no-verbose --tries=1 -O - http://127.0.0.1:8123/ping || exit 1\"]\n      interval: 5s\n      timeout: 5s\n      retries: 20\n      start_period: 5s\n\nconfigs:\n  clickhouse_logs:\n    content: |\n      <clickhouse>\n        <logger><level>warning</level><console>true</console></logger>\n        <query_log replace=\"1\"><database>system</database><table>query_log</table><flush_interval_milliseconds>7500</flush_interval_milliseconds><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></query_log>\n        <query_thread_log remove=\"remove\"/>\n        <metric_log remove=\"remove\"/>\n        <asynchronous_metric_log remove=\"remove\"/>\n        <trace_log remove=\"remove\"/>\n        <text_log remove=\"remove\"/>\n        <session_log remove=\"remove\"/>\n        <part_log remove=\"remove\"/>\n      </clickhouse>\n  clickhouse_ipv4:\n    content: |\n      <clickhouse>\n        <listen_host>0.0.0.0</listen_host>\n      </clickhouse>\n  clickhouse_low_resources:\n    content: |\n      <clickhouse>\n        <profiles>\n          <default>\n            <max_threads>1</max_threads>\n            <max_block_size>8192</max_block_size>\n            <max_download_threads>1</max_download_threads>\n            <input_format_parallel_parsing>0</input_format_parallel_parsing>\n            <output_format_parallel_formatting>0</output_format_parallel_formatting>\n          </default>\n        </profiles>\n      </clickhouse>\n"
   },
   {
     "id": "pocketbase",
@@ -2019,7 +2146,7 @@
       "Create the workspace",
       "Import contacts from CSV"
     ],
-    "compose": "services:\n  server:\n    image: twentycrm/twenty:v2.42.6\n    restart: unless-stopped\n    mem_limit: 1g\n    ports: [\"3000\"]\n    environment:\n      NODE_PORT: \"3000\"\n      SERVER_URL: ${SERVER_URL}\n      APP_SECRET: ${APP_SECRET}\n      PG_DATABASE_URL: postgres://twenty:${DB_PASSWORD}@db:5432/twenty\n      REDIS_URL: redis://redis:6379\n      STORAGE_TYPE: local\n    volumes:\n      - ./storage:/app/packages/twenty-server/.local-storage\n    depends_on:\n      db:\n        condition: service_healthy\n      redis:\n        condition: service_healthy\n\n  worker:\n    image: twentycrm/twenty:v2.42.6\n    restart: unless-stopped\n    mem_limit: 768m\n    command: [\"yarn\", \"worker:prod\"]\n    environment:\n      SERVER_URL: ${SERVER_URL}\n      APP_SECRET: ${APP_SECRET}\n      PG_DATABASE_URL: postgres://twenty:${DB_PASSWORD}@db:5432/twenty\n      REDIS_URL: redis://redis:6379\n      STORAGE_TYPE: local\n      DISABLE_DB_MIGRATIONS: \"true\"\n      DISABLE_CRON_JOBS_REGISTRATION: \"true\"\n    depends_on:\n      - server\n\n  db:\n    image: postgres:16-alpine\n    restart: unless-stopped\n    mem_limit: 384m\n    environment:\n      POSTGRES_DB: twenty\n      POSTGRES_USER: twenty\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -U twenty -d twenty\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n\n  redis:\n    image: valkey/valkey:8-alpine\n    restart: unless-stopped\n    mem_limit: 128m\n    command: [\"valkey-server\", \"--maxmemory-policy\", \"noeviction\"]\n    healthcheck:\n      test: [\"CMD\", \"valkey-cli\", \"ping\"]\n      interval: 5s\n      timeout: 3s\n      retries: 10\n"
+    "compose": "services:\n  server:\n    image: twentycrm/twenty:v2.42.6\n    restart: unless-stopped\n    mem_limit: 1g\n    ports: [\"3000\"]\n    environment:\n      NODE_PORT: \"3000\"\n      SERVER_URL: ${SERVER_URL}\n      APP_SECRET: ${APP_SECRET}\n      PG_DATABASE_URL: postgres://twenty:${DB_PASSWORD}@db:5432/twenty\n      REDIS_URL: redis://redis:6379\n      STORAGE_TYPE: local\n    volumes:\n      - ./storage:/app/packages/twenty-server/.local-storage\n    depends_on:\n      db:\n        condition: service_healthy\n      redis:\n        condition: service_healthy\n\n  worker:\n    image: twentycrm/twenty:v2.42.6\n    restart: unless-stopped\n    mem_limit: 768m\n    command: [\"yarn\", \"worker:prod\"]\n    environment:\n      SERVER_URL: ${SERVER_URL}\n      APP_SECRET: ${APP_SECRET}\n      PG_DATABASE_URL: postgres://twenty:${DB_PASSWORD}@db:5432/twenty\n      REDIS_URL: redis://redis:6379\n      STORAGE_TYPE: local\n      DISABLE_DB_MIGRATIONS: \"true\"\n      DISABLE_CRON_JOBS_REGISTRATION: \"true\"\n    depends_on:\n      - server\n\n  db:\n    image: postgres:16-alpine\n    restart: unless-stopped\n    mem_limit: 384m\n    environment:\n      POSTGRES_DB: twenty\n      POSTGRES_USER: twenty\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U twenty -d twenty\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n\n  redis:\n    image: valkey/valkey:8-alpine\n    restart: unless-stopped\n    mem_limit: 128m\n    command: [\"valkey-server\", \"--maxmemory-policy\", \"noeviction\"]\n    healthcheck:\n      test: [\"CMD\", \"valkey-cli\", \"ping\"]\n      interval: 5s\n      timeout: 3s\n      retries: 10\n"
   },
   {
     "id": "umami",
@@ -2095,7 +2222,7 @@
       "Sign in and change the default admin password",
       "Add your first website and install the tracking script"
     ],
-    "compose": "services:\n  umami:\n    image: ghcr.io/umami-software/umami:3.4.0\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"3000\"]\n    environment:\n      DATABASE_URL: postgresql://umami:${DB_PASSWORD}@db:5432/umami\n      APP_SECRET: ${APP_SECRET}\n      DISABLE_TELEMETRY: \"1\"\n    depends_on:\n      db:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: umami\n      POSTGRES_USER: umami\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -U umami -d umami\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n"
+    "compose": "services:\n  umami:\n    image: ghcr.io/umami-software/umami:3.4.0\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"3000\"]\n    environment:\n      DATABASE_URL: postgresql://umami:${DB_PASSWORD}@db:5432/umami\n      APP_SECRET: ${APP_SECRET}\n      DISABLE_TELEMETRY: \"1\"\n    depends_on:\n      db:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: umami\n      POSTGRES_USER: umami\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U umami -d umami\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n"
   },
   {
     "id": "uptime-kuma",
@@ -2271,6 +2398,6 @@
       "Finish the setup page",
       "Create the home page"
     ],
-    "compose": "services:\n  wiki:\n    image: ghcr.io/requarks/wiki:2.5.315\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"3000\"]\n    environment:\n      DB_TYPE: postgres\n      DB_HOST: db\n      DB_PORT: \"5432\"\n      DB_USER: wikijs\n      DB_PASS: ${DB_PASSWORD}\n      DB_NAME: wiki\n    depends_on:\n      db:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: wiki\n      POSTGRES_USER: wikijs\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -U wikijs -d wiki\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n"
+    "compose": "services:\n  wiki:\n    image: ghcr.io/requarks/wiki:2.5.315\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"3000\"]\n    environment:\n      DB_TYPE: postgres\n      DB_HOST: db\n      DB_PORT: \"5432\"\n      DB_USER: wikijs\n      DB_PASS: ${DB_PASSWORD}\n      DB_NAME: wiki\n    depends_on:\n      db:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: wiki\n      POSTGRES_USER: wikijs\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U wikijs -d wiki\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n"
   }
 ]

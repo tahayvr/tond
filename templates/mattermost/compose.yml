@@ -30,7 +30,7 @@ services:
     volumes:
       - ./postgres:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U mattermost -d mattermost"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U mattermost -d mattermost"]
       interval: 5s
       timeout: 5s
       retries: 10

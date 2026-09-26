@@ -4,6 +4,7 @@
 import type { Component } from 'svelte';
 import ActualBudget from '~icons/simple-icons/actualbudget';
 import Appsmith from '~icons/simple-icons/appsmith';
+import Audiobookshelf from '~icons/simple-icons/audiobookshelf';
 import Coder from '~icons/simple-icons/coder';
 import Directus from '~icons/simple-icons/directus';
 import Excalidraw from '~icons/simple-icons/excalidraw';
@@ -33,6 +34,7 @@ import WikiJs from '~icons/simple-icons/wikidotjs';
 export const TEMPLATE_LOGOS: Record<string, Component> = {
 	actualbudget: ActualBudget,
 	appsmith: Appsmith,
+	audiobookshelf: Audiobookshelf,
 	coder: Coder,
 	directus: Directus,
 	excalidraw: Excalidraw,

@@ -17,7 +17,7 @@ post_deploy_checks = ["Sign in and set the root URL", "Configure SMTP and send a
 [public]
 service = "listmonk"
 port = 9000
-health_path = "/api/health"
+health_path = "/health"
 
 [[inputs]]
 key = "ADMIN_PASSWORD"
