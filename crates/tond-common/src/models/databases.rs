@@ -189,7 +189,7 @@ pub const ALL_ENGINES: &[DbEngineConfig] = &[
     },
     DbEngineConfig {
         db_type: "mysql",
-        image: "mysql:8",
+        image: "mysql:8.4",
         container_port: 3306,
         url_scheme: "mysql",
         uses_credentials: true,
@@ -213,7 +213,7 @@ pub const ALL_ENGINES: &[DbEngineConfig] = &[
     },
     DbEngineConfig {
         db_type: "mariadb",
-        image: "mariadb:11",
+        image: "mariadb:11.8",
         container_port: 3306,
         url_scheme: "mysql", // MariaDB is wire-compatible with MySQL
         uses_credentials: true,
@@ -296,9 +296,48 @@ pub struct ManagedDatabase {
     /// When true the port is published on 0.0.0.0 (reachable from the internet);
     /// otherwise on 127.0.0.1 only. Off by default; admins opt in explicitly.
     pub public_access: bool,
+    /// Cron expression of this database's own backups (None = no schedule)
+    pub backup_schedule: Option<String>,
+    /// Scheduled backups of this database to keep
+    pub backup_retention: i64,
+    /// Engine major version (None = the engine's default, see db_catalog)
+    pub version: Option<String>,
+    /// Image variant: "" | "pgvector" | "postgis"
+    pub variant: String,
+    /// JSON array of source addresses (IP/CIDR) allowed when public
+    pub allowlist: String,
+    /// Serve TLS with a mounted certificate (postgres, mysql, mariadb)
+    pub tls: bool,
+    /// JSON `DbUpgradeState` of an upgrade in progress or awaiting confirmation
+    pub upgrade: Option<String>,
 }
 
 impl ManagedDatabase {
+    /// The major version this database runs.
+    pub fn effective_version(&self) -> String {
+        self.version
+            .clone()
+            .or_else(|| super::db_catalog::default_version(&self.db_type).map(str::to_string))
+            .unwrap_or_default()
+    }
+
+    /// The catalog image for this database's engine, variant and version.
+    pub fn catalog_image(&self) -> Option<&'static str> {
+        super::db_catalog::image_for(&self.db_type, &self.variant, self.version.as_deref())
+    }
+
+    /// The parsed public-access allowlist.
+    pub fn allowlist_entries(&self) -> Vec<String> {
+        serde_json::from_str(&self.allowlist).unwrap_or_default()
+    }
+
+    /// The parsed upgrade state, if any.
+    pub fn upgrade_state(&self) -> Option<DbUpgradeState> {
+        self.upgrade
+            .as_deref()
+            .and_then(|u| serde_json::from_str(u).ok())
+    }
+
     /// Construct a new `ManagedDatabase` with auto-generated credentials.
     /// The container is not started yet — `status` starts as `"pending"`.
     pub fn new(name: String, db_type: String, project_id: Option<String>) -> Self {
@@ -360,6 +399,13 @@ impl ManagedDatabase {
             created_at: now.clone(),
             updated_at: now,
             public_access: false,
+            backup_schedule: None,
+            backup_retention: DEFAULT_DB_BACKUP_RETENTION,
+            version: None,
+            variant: String::new(),
+            allowlist: "[]".to_string(),
+            tls: false,
+            upgrade: None,
         }
     }
 }
@@ -398,10 +444,32 @@ pub struct ManagedDatabaseResponse {
     /// Whether the port is published on all interfaces (internet-reachable)
     #[serde(default)]
     pub public_access: bool,
+    /// Engine major version
+    #[serde(default)]
+    pub version: String,
+    /// Image variant ("" | "pgvector" | "postgis")
+    #[serde(default)]
+    pub variant: String,
+    /// Cron expression of this database's own backups
+    #[serde(default)]
+    pub backup_schedule: Option<String>,
+    #[serde(default)]
+    pub backup_retention: i64,
+    /// Source addresses allowed to connect when public (empty = anyone)
+    #[serde(default)]
+    pub allowlist: Vec<String>,
+    #[serde(default)]
+    pub tls: bool,
+    /// Upgrade in progress or waiting for confirmation
+    #[serde(default)]
+    pub upgrade: Option<DbUpgradeState>,
 }
 
 impl From<ManagedDatabase> for ManagedDatabaseResponse {
     fn from(d: ManagedDatabase) -> Self {
+        let version = d.effective_version();
+        let allowlist = d.allowlist_entries();
+        let upgrade = d.upgrade_state();
         Self {
             id: d.id,
             name: d.name,
@@ -418,6 +486,13 @@ impl From<ManagedDatabase> for ManagedDatabaseResponse {
             custom_internal_url: d.custom_internal_url.as_deref().map(mask_url_password),
             image_used: d.image_used,
             custom_image: d.custom_image,
+            version,
+            allowlist,
+            upgrade,
+            variant: d.variant,
+            backup_schedule: d.backup_schedule,
+            backup_retention: d.backup_retention,
+            tls: d.tls,
             created_at: d.created_at,
             updated_at: d.updated_at,
             public_access: d.public_access,
@@ -440,6 +515,126 @@ pub struct ManagedDatabaseDetail {
     /// Internal connection string (the database's name as host, reachable
     /// from apps in its project and from linked apps), masked
     pub internal_connection_string: Option<String>,
+    /// Newer versions this database can be upgraded to
+    #[serde(default)]
+    pub upgrade_targets: Vec<String>,
+    /// Why public access is risky as configured (public without an
+    /// allowlist), or why the allowlist isn't enforced
+    #[serde(default)]
+    pub access_warning: Option<String>,
+    /// Whether the allowlist is enforced by the server firewall right now
+    #[serde(default)]
+    pub allowlist_enforced: bool,
+    /// Whether TLS is available for this engine (postgres, mysql, mariadb)
+    #[serde(default)]
+    pub supports_tls: bool,
+    /// Set when nothing backs this database up automatically
+    #[serde(default)]
+    pub backup_warning: Option<String>,
+}
+
+/// Scheduled backups of one database kept by default.
+pub const DEFAULT_DB_BACKUP_RETENTION: i64 = 7;
+/// Upper bound on a per-database retention count.
+pub const MAX_DB_BACKUP_RETENTION: i64 = 365;
+
+/// A major-version upgrade (`databases.upgrade`, JSON).
+///
+/// `running` → the guarded flow is working through its steps;
+/// `awaiting_confirmation` → the database runs the new version and the old
+/// data directory is kept until the user confirms (or rolls back);
+/// `failed` → nothing was switched (or it was switched back); the old
+/// version keeps running.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct DbUpgradeState {
+    /// "running" | "awaiting_confirmation" | "failed"
+    pub status: String,
+    pub from_version: String,
+    pub to_version: String,
+    pub from_image: String,
+    pub to_image: String,
+    /// What the upgrade is doing (or did last)
+    pub step: String,
+    /// The backup taken before anything changed
+    pub backup_id: Option<String>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub error: Option<String>,
+    /// The previous data directory, kept for a rollback
+    #[serde(default)]
+    pub rollback_dir: Option<String>,
+}
+
+/// Backup schedule and health of one database
+/// (GET /api/v1/databases/{id}/backup-schedule).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct DatabaseBackupStatus {
+    /// Cron expression of this database's own backups (None = none)
+    pub schedule: Option<String>,
+    pub retention: i64,
+    /// Next run of this database's own schedule (RFC 3339)
+    pub next_run_at: Option<String>,
+    /// Whether full-server snapshots (which hold every database) are scheduled
+    pub full_snapshots_enabled: bool,
+    pub full_schedule: Option<String>,
+    /// Latest completed backup holding this database (own or full)
+    pub last_backup_at: Option<String>,
+    /// Status of the latest backup attempt of this database's own backups
+    pub last_status: Option<String>,
+    pub last_error: Option<String>,
+    /// Set when nothing backs this database up (or it keeps no backups)
+    pub warning: Option<String>,
+}
+
+/// PUT /api/v1/databases/{id}/backup-schedule
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UpdateDatabaseBackupSchedule {
+    /// Cron expression; null or "" turns the schedule off
+    pub schedule: Option<String>,
+    /// Scheduled backups to keep (1–365); omitted = unchanged
+    pub retention: Option<i64>,
+}
+
+/// POST /api/v1/snapshots/{id}/restore-new-database
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RestoreToNewDatabaseRequest {
+    /// The database in the backup to restore
+    pub source: String,
+    /// Name of the new database
+    pub name: String,
+    /// Project for the new database (default: the source's project)
+    #[serde(default)]
+    pub project_id: Option<String>,
+}
+
+/// POST /api/v1/databases/{id}/upgrade
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UpgradeDatabaseRequest {
+    pub version: String,
+}
+
+/// One extension of a postgres database (GET /api/v1/databases/{id}/extensions).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct DatabaseExtension {
+    pub name: String,
+    /// Offered by the image
+    pub available: bool,
+    pub installed_version: Option<String>,
+    pub default_version: Option<String>,
+    pub comment: Option<String>,
+}
+
+/// POST /api/v1/databases/{id}/extensions
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct CreateExtensionRequest {
+    pub name: String,
 }
 
 // ── Database access (links) ──
@@ -559,7 +754,7 @@ pub fn mask_url_password(url: &str) -> String {
 }
 
 /// POST /api/v1/databases request body
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreateDatabaseRequest {
     pub name: String,
@@ -572,6 +767,15 @@ pub struct CreateDatabaseRequest {
     /// Publish the port on all interfaces (internet-reachable). Admin only; default false.
     #[serde(default)]
     pub public_access: bool,
+    /// Major version (default: the engine's default, see db_catalog)
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Image variant ("pgvector", "postgis"); default: the engine's own image
+    #[serde(default)]
+    pub variant: Option<String>,
+    /// Cron expression for this database's own backups
+    #[serde(default)]
+    pub backup_schedule: Option<String>,
 }
 
 /// PATCH /api/v1/databases/{id} request body
@@ -579,7 +783,7 @@ pub struct CreateDatabaseRequest {
 /// Only the fields present in the request body are updated (partial update).
 /// Setting a field to an empty string clears the override and reverts to the
 /// auto-computed value.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateDatabaseRequest {
     /// Override for the external connection string (replaces the auto-computed one).
@@ -598,6 +802,14 @@ pub struct UpdateDatabaseRequest {
     /// recreated immediately so the new port binding takes effect.
     #[serde(default)]
     pub public_access: Option<bool>,
+    /// Source addresses (IP or CIDR) allowed to connect while public; `[]`
+    /// allows any address. Admin only.
+    #[serde(default)]
+    pub allowlist: Option<Vec<String>>,
+    /// Serve TLS (postgres, mysql, mariadb). Admin only; recreates the
+    /// container.
+    #[serde(default)]
+    pub tls: Option<bool>,
 }
 
 /// PATCH /api/v1/databases/{id}/credentials request body

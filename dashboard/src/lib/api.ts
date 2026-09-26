@@ -72,6 +72,10 @@ export interface App {
 	registry_credential_id: string | null;
 	/** GitHub App integration (Phase 4.4) */
 	github_app_id: string | null;
+	/** GitLab token for clones, commit statuses and merge request previews */
+	gitlab_token_id?: string | null;
+	/** Gitea/Forgejo token for clones, commit statuses and pull request previews */
+	gitea_token_id?: string | null;
 	// Project grouping (Phase 6.1)
 	project_id: string | null;
 	/** Raw Dockerfile content (source_type='dockerfile') */
@@ -606,10 +610,88 @@ export async function updateDomain(id: string, domain: string): Promise<UpdateDo
 	});
 }
 
+// ── App domains (several per app) ──
+
+/** primary: the app's main address · alias: also served · redirect: answered with a 301/308 */
+export type DomainKind = 'primary' | 'alias' | 'redirect';
+
+export interface AppDomain {
+	domain: string;
+	kind: DomainKind;
+	/** For redirects: the domain visitors are sent to (a serving domain of the same app) */
+	redirect_to: string | null;
+	/** 301 or 308 */
+	redirect_code: number;
+	/** Compose apps: the service this domain routes to (null: the main container) */
+	service: string | null;
+	port: number | null;
+	created_at: string;
+	/** Under the apps domain (the automatic address) */
+	automatic: boolean;
+	/** Set when the domain is on the same site as the dashboard */
+	warning: string | null;
+}
+
+export interface AddAppDomainRequest {
+	domain: string;
+	/** Default: primary when the app has none, else alias */
+	kind?: DomainKind;
+	redirect_to?: string;
+	redirect_code?: 301 | 308;
+}
+
+export interface UpdateAppDomainRequest {
+	kind?: DomainKind;
+	redirect_to?: string;
+	redirect_code?: 301 | 308;
+}
+
+export async function listAppDomains(id: string): Promise<AppDomain[]> {
+	return request<AppDomain[]>(`/apps/${id}/domains`);
+}
+
+/** Every call returns the app's full, updated domain list. */
+export async function addAppDomain(id: string, req: AddAppDomainRequest): Promise<AppDomain[]> {
+	return request<AppDomain[]>(`/apps/${id}/domains`, {
+		method: 'POST',
+		body: JSON.stringify(req)
+	});
+}
+
+/** Add example.com and www.example.com: `canonical` serves, the other redirects to it. */
+export async function addWwwPair(
+	id: string,
+	domain: string,
+	canonical: 'apex' | 'www',
+	primary = true
+): Promise<AppDomain[]> {
+	return request<AppDomain[]>(`/apps/${id}/domains/www-pair`, {
+		method: 'POST',
+		body: JSON.stringify({ domain, canonical, primary })
+	});
+}
+
+export async function updateAppDomain(
+	id: string,
+	domain: string,
+	req: UpdateAppDomainRequest
+): Promise<AppDomain[]> {
+	return request<AppDomain[]>(`/apps/${id}/domains/${encodeURIComponent(domain)}`, {
+		method: 'PATCH',
+		body: JSON.stringify(req)
+	});
+}
+
+export async function removeAppDomain(id: string, domain: string): Promise<AppDomain[]> {
+	return request<AppDomain[]>(`/apps/${id}/domains/${encodeURIComponent(domain)}`, {
+		method: 'DELETE'
+	});
+}
+
 // ── Certificates ──
 
 /** Which CA issued a certificate. */
-export type IssuerKind = 'letsencrypt' | 'letsencrypt_staging' | 'custom' | 'unknown';
+export type IssuerKind = 'letsencrypt' | 'letsencrypt_staging' | 'custom' | 'uploaded' | 'unknown';
 
 /** What a certificate's domain is used for right now. */
 export type CertificateTarget =
@@ -622,6 +704,8 @@ export type CertificateTarget =
 			preview_id: string;
 			pr_number: number | null;
 	  }
+	/** purpose: apps (the apps domain) | previews (the preview domain) | custom */
+	| { kind: 'wildcard'; purpose: 'apps' | 'previews' | 'custom'; hosts: number }
 	| { kind: 'unused' };
 
 export interface Certificate {
@@ -644,6 +728,8 @@ export interface Certificate {
 	issuer_kind: IssuerKind;
 	/** Last successful issuance or renewal */
 	last_renewed_at: string | null;
+	/** How the CA validated the domain (ACME certificates) */
+	challenge: 'http-01' | 'dns-01' | null;
 	serves: CertificateTarget;
 }
 
@@ -653,6 +739,104 @@ export async function listCertificates(): Promise<Certificate[]> {
 
 export async function retryCertificate(domain: string): Promise<void> {
 	await request(`/certs/${encodeURIComponent(domain)}/retry`, { method: 'POST' });
+}
+
+export interface UploadCertificateRequest {
+	/** app.example.com or *.example.com */
+	domain: string;
+	/** PEM: the leaf first, then the intermediates */
+	cert_pem: string;
+	/** PEM private key (unencrypted) */
+	key_pem: string;
+}
+
+/** tond-proxy validates the upload (key, chain order, validity, names) before serving it. */
+export async function uploadCertificate(
+	req: UploadCertificateRequest
+): Promise<Certificate | null> {
+	return request<Certificate | null>('/certs/custom', {
+		method: 'POST',
+		body: JSON.stringify(req)
+	});
+}
+
+/** Stop serving an uploaded certificate; Tond requests one from Let's Encrypt again. */
+export async function deleteUploadedCertificate(domain: string): Promise<void> {
+	await request(`/certs/custom/${encodeURIComponent(domain)}`, { method: 'DELETE' });
+}
+
+// ── DNS providers (ACME DNS-01: wildcard certificates) ──
+
+export type DnsProviderKind =
+	'cloudflare' | 'hetzner' | 'digitalocean' | 'route53' | 'challtestsrv';
+
+export interface DnsProviderConfig {
+	/** Route 53: the access key id (the secret access key is the token) */
+	access_key_id?: string;
+	/** challtestsrv (tests only): management API URL */
+	url?: string;
+}
+
+export interface DnsProvider {
+	id: string;
+	name: string;
+	kind: DnsProviderKind;
+	/** Zones the provider may write challenge records in, e.g. ["example.com"] */
+	zones: string[];
+	config: DnsProviderConfig;
+	/** The token is write-only: never returned */
+	token_set: boolean;
+	created_at: string;
+	updated_at: string;
+	last_used_at: string | null;
+	last_error: string | null;
+}
+
+export interface CreateDnsProviderRequest {
+	name: string;
+	kind: DnsProviderKind;
+	zones: string[];
+	token: string;
+	config?: DnsProviderConfig;
+}
+
+export interface UpdateDnsProviderRequest {
+	name?: string;
+	zones?: string[];
+	/** Replaced only when sent */
+	token?: string;
+	config?: DnsProviderConfig;
+}
+
+export interface DnsProviderTestResult {
+	ok: boolean;
+	zones: { zone: string; ok: boolean; message: string }[];
+}
+
+export async function listDnsProviders(): Promise<DnsProvider[]> {
+	return request<DnsProvider[]>('/dns-providers');
+}
+
+export async function createDnsProvider(req: CreateDnsProviderRequest): Promise<DnsProvider> {
+	return request<DnsProvider>('/dns-providers', { method: 'POST', body: JSON.stringify(req) });
+}
+
+export async function updateDnsProvider(
+	id: string,
+	req: UpdateDnsProviderRequest
+): Promise<DnsProvider> {
+	return request<DnsProvider>(`/dns-providers/${id}`, {
+		method: 'PATCH',
+		body: JSON.stringify(req)
+	});
+}
+
+export async function deleteDnsProvider(id: string): Promise<void> {
+	await request(`/dns-providers/${id}`, { method: 'DELETE' });
+}
+
+export async function testDnsProvider(id: string): Promise<DnsProviderTestResult> {
+	return request<DnsProviderTestResult>(`/dns-providers/${id}/test`, { method: 'POST' });
 }
 
 export async function updateHealth(
@@ -1528,6 +1712,12 @@ export interface DnsRecord {
 export type DnsCheckStatus = 'ok' | 'mismatch' | 'missing' | 'inconclusive';
 
 export interface DomainCertificate {
+	/** The certificate's own name (`*.apps.example.com` for a wildcard) */
+	domain: string;
+	/** "acme" | "custom" (uploaded) */
+	cert_type: string;
+	challenge: 'http-01' | 'dns-01' | null;
+	issuer: string | null;
 	status: string;
 	issued_at: string;
 	expires_at: string;
@@ -1553,6 +1743,10 @@ export interface DomainCheck {
 		message: string;
 	};
 	certificate: DomainCertificate | null;
+	/** Set when a wildcard certificate serves the domain */
+	covered_by: string | null;
+	/** DNS provider that validates the domain with DNS-01, if any */
+	dns_provider: string | null;
 	checked_at: string;
 	/** Set when the domain is on the same site as the dashboard (allowed, shown as a warning) */
 	warning?: string | null;
@@ -1679,6 +1873,78 @@ export interface GitHubApp {
 
 export async function listGitHubApps(): Promise<GitHubApp[]> {
 	return request<GitHubApp[]>('/github-apps');
+}
+
+// ── Git tokens (GitLab, Gitea/Forgejo) ──
+// A token linked to an app lets Tond clone its private repository, report
+// deploys and previews as commit statuses (tond/deploy, tond/preview) and
+// comment the preview URL on pull/merge requests.
+
+export interface GitLabToken {
+	id: string;
+	name: string;
+	gitlab_url: string;
+	username: string;
+	created_at: string;
+}
+
+export interface GiteaToken {
+	id: string;
+	name: string;
+	/** Instance URL, e.g. https://codeberg.org */
+	base_url: string;
+	username: string;
+	created_at: string;
+}
+
+export async function listGitLabTokens(): Promise<GitLabToken[]> {
+	return request<GitLabToken[]>('/gitlab-tokens');
+}
+
+/** Store a GitLab personal access token (checked against the instance first). */
+export async function createGitLabToken(data: {
+	name: string;
+	token: string;
+	gitlab_url?: string;
+}): Promise<GitLabToken> {
+	return request<GitLabToken>('/gitlab-tokens', { method: 'POST', body: JSON.stringify(data) });
+}
+
+export async function deleteGitLabToken(id: string): Promise<void> {
+	await request(`/gitlab-tokens/${id}`, { method: 'DELETE' });
+}
+
+export async function listGiteaTokens(): Promise<GiteaToken[]> {
+	return request<GiteaToken[]>('/gitea-tokens');
+}
+
+/** Store a Gitea/Forgejo access token (checked against the instance first). */
+export async function createGiteaToken(data: {
+	name: string;
+	token: string;
+	base_url: string;
+}): Promise<GiteaToken> {
+	return request<GiteaToken>('/gitea-tokens', { method: 'POST', body: JSON.stringify(data) });
+}
+
+export async function deleteGiteaToken(id: string): Promise<void> {
+	await request(`/gitea-tokens/${id}`, { method: 'DELETE' });
+}
+
+/** Link (or with null, unlink) a GitLab token and an app. */
+export async function setAppGitLabToken(appId: string, tokenId: string | null): Promise<App> {
+	return request<App>(`/apps/${appId}/gitlab-token`, {
+		method: 'PUT',
+		body: JSON.stringify({ gitlab_token_id: tokenId })
+	});
+}
+
+/** Link (or with null, unlink) a Gitea/Forgejo token and an app. */
+export async function setAppGiteaToken(appId: string, tokenId: string | null): Promise<App> {
+	return request<App>(`/apps/${appId}/gitea-token`, {
+		method: 'PUT',
+		body: JSON.stringify({ gitea_token_id: tokenId })
+	});
 }
 
 export interface GitHubAppManifestForm {
@@ -3128,6 +3394,20 @@ export interface ManagedDatabase {
 	updated_at: string;
 	/** Port published on all interfaces (reachable from the internet). Off by default. */
 	public_access: boolean;
+	/** Engine major version, e.g. "16" */
+	version: string;
+	/** Image variant: "" (the engine's own image) | "pgvector" | "postgis" */
+	variant: string;
+	/** Cron expression of this database's own backups (null = none) */
+	backup_schedule: string | null;
+	/** Scheduled backups of this database kept */
+	backup_retention: number;
+	/** Addresses (IP or CIDR) allowed to connect while public; empty = anyone */
+	allowlist: string[];
+	/** Serves TLS (PostgreSQL, MySQL, MariaDB) */
+	tls: boolean;
+	/** A major-version upgrade in progress or waiting for confirmation */
+	upgrade: DbUpgradeState | null;
 }
 
 /** Connection strings in a detail response have the password masked. */
@@ -3136,6 +3416,149 @@ export interface ManagedDatabaseDetail extends ManagedDatabase {
 	/** Connection string via the server's public address; only when public_access is on */
 	public_connection_string: string | null;
 	internal_connection_string: string | null;
+	/** Newer versions this database can be upgraded to */
+	upgrade_targets: string[];
+	/** Why its network access deserves attention (public without an allowlist, …) */
+	access_warning: string | null;
+	/** The allowlist is loaded into the server firewall */
+	allowlist_enforced: boolean;
+	/** The engine can serve TLS */
+	supports_tls: boolean;
+	/** Set when nothing backs this database up automatically */
+	backup_warning: string | null;
+}
+
+export type DbUpgradeStatus = 'running' | 'awaiting_confirmation' | 'failed';
+
+/** A major-version upgrade (see the server's db_upgrade.rs). */
+export interface DbUpgradeState {
+	status: DbUpgradeStatus;
+	from_version: string;
+	to_version: string;
+	from_image: string;
+	to_image: string;
+	/** What the upgrade is doing, or did last */
+	step: string;
+	/** Backup taken before anything changed */
+	backup_id: string | null;
+	started_at: string;
+	finished_at: string | null;
+	error: string | null;
+	rollback_dir?: string | null;
+}
+
+/** One engine + variant the server can run (GET /databases/catalog). */
+export interface DbCatalogEntry {
+	db_type: string;
+	/** "" = the engine's own image */
+	variant: string;
+	label: string;
+	description: string;
+	/** Oldest first */
+	versions: string[];
+	default_version: string;
+	extensions: string[];
+	/** False for x86_64-only images on an ARM64 server */
+	available: boolean;
+	supports_tls: boolean;
+	supports_upgrade: boolean;
+}
+
+export async function getDatabaseCatalog(): Promise<DbCatalogEntry[]> {
+	return request<DbCatalogEntry[]>('/databases/catalog');
+}
+
+/** Schedule and health of one database's backups. */
+export interface DatabaseBackupStatus {
+	schedule: string | null;
+	retention: number;
+	next_run_at: string | null;
+	full_snapshots_enabled: boolean;
+	full_schedule: string | null;
+	last_backup_at: string | null;
+	/** Latest attempt of this database's own backups */
+	last_status: 'completed' | 'failed' | null;
+	last_error: string | null;
+	warning: string | null;
+}
+
+export async function getDatabaseBackupSchedule(id: string): Promise<DatabaseBackupStatus> {
+	return request<DatabaseBackupStatus>(`/databases/${id}/backup-schedule`);
+}
+
+/** Set (or with an empty/null schedule, turn off) a database's backup schedule. */
+export async function updateDatabaseBackupSchedule(
+	id: string,
+	data: { schedule: string | null; retention?: number }
+): Promise<DatabaseBackupStatus> {
+	return request<DatabaseBackupStatus>(`/databases/${id}/backup-schedule`, {
+		method: 'PUT',
+		body: JSON.stringify(data)
+	});
+}
+
+/** A PostgreSQL extension offered for a database. */
+export interface DatabaseExtension {
+	name: string;
+	/** The image ships it */
+	available: boolean;
+	installed_version: string | null;
+	default_version: string | null;
+	comment: string | null;
+}
+
+export async function listDatabaseExtensions(id: string): Promise<DatabaseExtension[]> {
+	return request<DatabaseExtension[]>(`/databases/${id}/extensions`);
+}
+
+/** CREATE EXTENSION for one of the offered extensions. */
+export async function enableDatabaseExtension(
+	id: string,
+	name: string
+): Promise<{ message: string }> {
+	return request<{ message: string }>(`/databases/${id}/extensions`, {
+		method: 'POST',
+		body: JSON.stringify({ name })
+	});
+}
+
+/** Start a guarded major-version upgrade (admin). Returns the initial state. */
+export async function upgradeDatabase(id: string, version: string): Promise<DbUpgradeState> {
+	return request<DbUpgradeState>(`/databases/${id}/upgrade`, {
+		method: 'POST',
+		body: JSON.stringify({ version })
+	});
+}
+
+/** Keep the new version: the old data directory is deleted. */
+export async function confirmDatabaseUpgrade(id: string): Promise<{ message: string }> {
+	return request<{ message: string }>(`/databases/${id}/upgrade/confirm`, { method: 'POST' });
+}
+
+/** Go back to the old version and its data (writes since the upgrade are lost). */
+export async function rollbackDatabaseUpgrade(id: string): Promise<{ message: string }> {
+	return request<{ message: string }>(`/databases/${id}/upgrade/rollback`, { method: 'POST' });
+}
+
+/** Clear a failed upgrade's notice. */
+export async function dismissDatabaseUpgrade(id: string): Promise<void> {
+	await request(`/databases/${id}/upgrade/dismiss`, { method: 'POST' });
+}
+
+export interface RestoredDatabase {
+	message: string;
+	database: ManagedDatabase;
+}
+
+/** Restore one database of a backup into a NEW database; the original is untouched. */
+export async function restoreDatabaseToNew(
+	snapshotId: string,
+	data: { source: string; name: string; project_id?: string | null }
+): Promise<RestoredDatabase> {
+	return request<RestoredDatabase>(`/snapshots/${snapshotId}/restore-new-database`, {
+		method: 'POST',
+		body: JSON.stringify(data)
+	});
 }
 
 // ── Database access (links) ──
@@ -3237,6 +3660,12 @@ export async function createDatabase(data: {
 	db_type: string;
 	project_id?: string;
 	memory_limit?: number;
+	/** Major version (default: the engine's default) */
+	version?: string;
+	/** Image variant: "pgvector" | "postgis" */
+	variant?: string;
+	/** Cron expression for this database's own backups */
+	backup_schedule?: string;
 }): Promise<CreatedDatabase> {
 	return request<CreatedDatabase>('/databases', {
 		method: 'POST',
@@ -3265,6 +3694,10 @@ export async function updateDatabase(
 		memory_limit?: number | null;
 		/** Admin only. The container is recreated immediately. */
 		public_access?: boolean;
+		/** Admin only. Addresses allowed while public; [] = anyone. */
+		allowlist?: string[];
+		/** Admin only. Recreates the container. */
+		tls?: boolean;
 	}
 ): Promise<ManagedDatabaseDetail> {
 	return request<ManagedDatabaseDetail>(`/databases/${id}`, {

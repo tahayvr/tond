@@ -52,6 +52,8 @@ import {
 	MOCK_APP_ENV_VARS,
 	MOCK_PREVIEW_ENV_VARS,
 	MOCK_CERTIFICATES,
+	MOCK_APP_DOMAINS,
+	MOCK_DNS_PROVIDERS,
 	MOCK_DATABASE_LINKS,
 	makeMockSystemMetrics,
 	makeMockSystemSelf,
@@ -59,7 +61,8 @@ import {
 	makeMockRequestMetrics,
 	makeMockTrafficOverview,
 	makeMockAccessLog,
-	MOCK_DATABASE_SECRETS
+	MOCK_DATABASE_SECRETS,
+	MOCK_DB_CATALOG
 } from './fixtures';
 import type {
 	UpdateAuditShipping,
@@ -73,8 +76,10 @@ import type {
 	BackupConfig,
 	CronJob,
 	CronJobRun,
+	AppDomain,
 	Deployment,
 	DeploymentLogLine,
+	DnsProvider,
 	DeployPhase,
 	PhaseRecord,
 	GitHubApp,
@@ -93,7 +98,12 @@ import type {
 	Snapshot,
 	StorageProvider,
 	EnvVarEntry,
-	DatabaseCredentials
+	DatabaseCredentials,
+	DatabaseBackupStatus,
+	DatabaseExtension,
+	DbUpgradeState,
+	GiteaToken,
+	GitLabToken
 } from '$lib/api';
 import {
 	MOCK_ACTIVE_ALERTS,
@@ -117,6 +127,11 @@ function ok<T>(data: T) {
 
 function err(message: string, status = 400, code?: string) {
 	return HttpResponse.json(errorBody(message, status, code), { status });
+}
+
+/** INVALID_INPUT about one request field. */
+function fieldErr(message: string, field: string) {
+	return HttpResponse.json(errorBody(message, 400, 'INVALID_INPUT', { field }), { status: 400 });
 }
 
 /** The mock password policy: 12–256 characters, no common passwords. */
@@ -229,16 +244,54 @@ function mockComposeProblems(content: string): string[] {
 function mockPublicUrl(db: ManagedDatabase, password: string | null): string | null {
 	if (!db.public_access || !db.host_port) return null;
 	const isRedisLike = db.db_type === 'redis' || db.db_type === 'keydb';
-	return isRedisLike
+	const url = isRedisLike
 		? `redis://${db.db_user}:${password}@tond.example.com:${db.host_port}`
 		: `${db.db_type}://${db.db_user}:${password}@tond.example.com:${db.host_port}/${db.db_name}`;
+	if (!db.tls) return url;
+	if (db.db_type === 'postgres') return `${url}?sslmode=require`;
+	if (db.db_type === 'mysql' || db.db_type === 'mariadb') return `${url}?ssl-mode=REQUIRED`;
+	return url;
+}
+
+/** The catalog entry of a database's engine and variant. */
+function mockCatalogEntry(dbType: string, variant: string) {
+	return MOCK_DB_CATALOG.find((e) => e.db_type === dbType && e.variant === variant);
+}
+
+function mockVersionKey(v: string): number[] {
+	return v === 'latest' ? [Infinity] : v.split('.').map(Number);
+}
+
+function mockNewer(a: string, b: string): boolean {
+	const ka = mockVersionKey(a);
+	const kb = mockVersionKey(b);
+	for (let i = 0; i < Math.max(ka.length, kb.length); i++) {
+		const x = ka[i] ?? 0;
+		const y = kb[i] ?? 0;
+		if (x !== y) return x > y;
+	}
+	return false;
+}
+
+function mockImage(dbType: string, variant: string, version: string): string {
+	if (variant === 'pgvector') return `pgvector/pgvector:0.8.1-pg${version}`;
+	if (variant === 'postgis') return `postgis/postgis:${version}-3.5-alpine`;
+	const images: Record<string, string> = {
+		postgres: `postgres:${version}-alpine`,
+		mysql: `mysql:${version}`,
+		mariadb: `mariadb:${version}`,
+		redis: `redis:${version}-alpine`,
+		keydb: 'eqalpha/keydb:latest',
+		mongodb: `mongo:${version}`
+	};
+	return images[dbType] ?? `${dbType}:${version}`;
 }
 
 // Mirrors tond-server's domains.rs: previews need a preview domain on a different
 // registrable domain from the dashboard. The mock approximates the Public Suffix
 // List check by comparing the last two labels.
 const PREVIEW_DOMAIN_REQUIRED =
-	'Invalid input: Previews need a preview domain. Set one in Settings: a separate domain you own (e.g. example-previews.com, not a subdomain of the dashboard domain) with a wildcard DNS record *.<preview-domain> pointing at this server. Previews run pull-request code, so they must not share a site with the dashboard.';
+	'Previews need a preview domain. Set one in Settings: a separate domain you own (e.g. example-previews.com, not a subdomain of the dashboard domain) with a wildcard DNS record *.<preview-domain> pointing at this server. Previews run pull-request code, so they must not share a site with the dashboard.';
 
 function mockSite(domain: string): string {
 	return domain.split('.').slice(-2).join('.');
@@ -353,8 +406,79 @@ function queueMockCertificate(domain: string) {
 		issuer: null,
 		issuer_kind: 'unknown',
 		last_renewed_at: null,
+		challenge: null,
 		serves: { kind: 'unused' }
 	});
+}
+
+const appDomains: Record<string, AppDomain[]> = structuredClone(MOCK_APP_DOMAINS);
+let dnsProviders: DnsProvider[] = structuredClone(MOCK_DNS_PROVIDERS);
+
+/** Server order: primary, aliases, redirects. */
+function sortedDomains(appId: string): AppDomain[] {
+	const rank = { primary: 0, alias: 1, redirect: 2 } as const;
+	return [...(appDomains[appId] ?? [])].sort(
+		(a, b) => rank[a.kind] - rank[b.kind] || a.created_at.localeCompare(b.created_at)
+	);
+}
+
+/** Keep `App.domain` equal to the primary domain (the server's triggers). */
+function syncPrimary(appId: string) {
+	const idx = apps.findIndex((a) => a.id === appId);
+	if (idx === -1) return;
+	const primary = (appDomains[appId] ?? []).find((d) => d.kind === 'primary')?.domain ?? null;
+	apps[idx] = { ...apps[idx], domain: primary };
+}
+
+/** Oldest alias becomes primary when the app has none. */
+function promoteIfNeeded(appId: string) {
+	const list = appDomains[appId] ?? [];
+	if (list.some((d) => d.kind === 'primary')) return;
+	const alias = [...list]
+		.filter((d) => d.kind === 'alias')
+		.sort((a, b) => a.created_at.localeCompare(b.created_at))[0];
+	if (alias) alias.kind = 'primary';
+}
+
+/** The server's domain rules (app_domains.rs), or an error message. */
+function checkMockDomain(appId: string, raw: string): string | null {
+	const domain = normalizeDomain(raw);
+	if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(domain)) {
+		return `'${domain}' is not a valid domain name (expected something like app.example.com)`;
+	}
+	if (domain === MOCK_SETTINGS.dashboard_domain) {
+		return `${domain} is the dashboard domain; choose another hostname for the app`;
+	}
+	const preview = MOCK_SETTINGS.preview_domain;
+	if (preview && (domain === preview || domain.endsWith(`.${preview}`))) {
+		return `${domain} is under the preview domain (${preview}), which only serves previews; choose a hostname outside it`;
+	}
+	for (const [otherId, list] of Object.entries(appDomains)) {
+		if (otherId !== appId && list.some((d) => d.domain === domain)) {
+			const other = apps.find((a) => a.id === otherId)?.name ?? otherId;
+			return `${domain} is already used by the app '${other}'. Remove it there first.`;
+		}
+	}
+	return null;
+}
+
+function mockDomainRow(
+	domain: string,
+	kind: AppDomain['kind'],
+	redirectTo: string | null = null,
+	code = 308
+): AppDomain {
+	return {
+		domain,
+		kind,
+		redirect_to: redirectTo,
+		redirect_code: code,
+		service: null,
+		port: null,
+		created_at: new Date().toISOString(),
+		automatic: !!MOCK_SETTINGS.apps_domain && domain.endsWith(`.${MOCK_SETTINGS.apps_domain}`),
+		warning: mockDomainWarning(domain)
+	};
 }
 
 // In-memory mutable state (mutations survive page navigation within the session)
@@ -530,13 +654,138 @@ function dbCredentials(db: ManagedDatabase): DatabaseCredentials {
 function dbDetail(db: ManagedDatabase) {
 	const creds = dbCredentials(db);
 	const mask = (url: string | null) => (url ? maskUrlPassword(url) : null);
+	const entry = mockCatalogEntry(db.db_type, db.variant);
+	const upgrade_targets =
+		db.custom_image || db.upgrade || !entry?.supports_upgrade
+			? []
+			: entry.versions.filter((v) => mockNewer(v, db.version));
+	let access_warning: string | null = null;
+	if (db.public_access && db.allowlist.length === 0) {
+		access_warning =
+			'Open to every address on the internet. Add the addresses that need to connect to the allowlist, or make the database private and use an SSH tunnel.';
+	}
 	return {
 		...db,
 		connection_string: mask(creds.connection_string),
 		public_connection_string: mask(creds.public_connection_string),
-		internal_connection_string: mask(creds.internal_connection_string)
+		internal_connection_string: mask(creds.internal_connection_string),
+		upgrade_targets,
+		access_warning,
+		allowlist_enforced: db.public_access && db.allowlist.length > 0,
+		supports_tls: entry?.supports_tls ?? false,
+		backup_warning:
+			db.backup_schedule || backupConfig.enabled
+				? null
+				: `Nothing backs up ${db.name} automatically. Add a schedule, or turn on scheduled snapshots on the Snapshots page.`
 	};
 }
+
+/** Next run of a (mock) cron expression: "m h * * *" daily, else in an hour. */
+function mockNextRun(schedule: string): string {
+	const [m, h] = schedule.split(/\s+/);
+	const next = new Date();
+	if (/^\d+$/.test(m) && /^\d+$/.test(h)) {
+		next.setUTCHours(Number(h), Number(m), 0, 0);
+		if (next.getTime() <= Date.now()) next.setUTCDate(next.getUTCDate() + 1);
+	} else {
+		next.setTime(Date.now() + 3600_000);
+	}
+	return next.toISOString();
+}
+
+function mockBackupStatus(db: ManagedDatabase): DatabaseBackupStatus {
+	const own = snapshots.filter((s) => s.scope === `database:${db.name}`);
+	const held = snapshots.filter(
+		(s) => s.status === 'completed' && (s.scope === 'full' || s.scope === `database:${db.name}`)
+	);
+	const last = own.find((s) => s.status === 'completed' || s.status === 'failed');
+	return {
+		schedule: db.backup_schedule,
+		retention: db.backup_retention,
+		next_run_at: db.backup_schedule ? mockNextRun(db.backup_schedule) : null,
+		full_snapshots_enabled: backupConfig.enabled,
+		full_schedule: backupConfig.enabled ? backupConfig.full_schedule_cron : null,
+		last_backup_at:
+			held
+				.map((s) => s.created_at)
+				.sort()
+				.at(-1) ?? null,
+		last_status: (last?.status as 'completed' | 'failed' | undefined) ?? null,
+		last_error: last?.error_message ?? null,
+		warning:
+			db.backup_schedule || backupConfig.enabled
+				? null
+				: `Nothing backs up ${db.name} automatically. Add a schedule, or turn on scheduled snapshots on the Snapshots page.`
+	};
+}
+
+/** Installed extensions per database (mock state). */
+const dbExtensions: Record<string, Record<string, string>> = {
+	db_pg1: { vector: '0.8.1', pg_trgm: '1.6' }
+};
+
+/** Walk a mock upgrade through its steps, then wait for confirmation. */
+function runMockUpgrade(id: string) {
+	const steps = [
+		'Disconnecting apps',
+		'Backing up the current data',
+		'Starting the new version next to the current one',
+		'Copying the data into the new version',
+		'Switching to the new version'
+	];
+	steps.forEach((step, i) => {
+		setTimeout(
+			() => {
+				const idx = databases.findIndex((d) => d.id === id);
+				const u = databases[idx]?.upgrade;
+				if (!u || u.status !== 'running') return;
+				databases[idx] = { ...databases[idx], upgrade: { ...u, step } };
+			},
+			700 * (i + 1)
+		);
+	});
+	setTimeout(
+		() => {
+			const idx = databases.findIndex((d) => d.id === id);
+			const db = databases[idx];
+			const u = db?.upgrade;
+			if (!u || u.status !== 'running') return;
+			databases[idx] = {
+				...db,
+				version: u.to_version,
+				image_used: u.to_image,
+				upgrade: {
+					...u,
+					status: 'awaiting_confirmation',
+					step: `Running version ${u.to_version}. Check your apps, then confirm or roll back.`,
+					finished_at: new Date().toISOString(),
+					rollback_dir: `/opt/tond/data/db-upgrades/${db.name}/previous`
+				}
+			};
+		},
+		700 * (steps.length + 1)
+	);
+}
+
+/** Mock Git tokens (the token value is never returned). */
+let gitlabTokens: GitLabToken[] = [
+	{
+		id: 'gl_1',
+		name: 'Work GitLab',
+		gitlab_url: 'https://gitlab.com',
+		username: 'dev',
+		created_at: '2025-03-01T10:00:00.000Z'
+	}
+];
+let giteaTokens: GiteaToken[] = [
+	{
+		id: 'gt_1',
+		name: 'Codeberg',
+		base_url: 'https://codeberg.org',
+		username: 'dev',
+		created_at: '2025-03-02T10:00:00.000Z'
+	}
+];
 
 function mockDatabaseSnapshot(dbName: string, trigger: 'manual' | 'pre_restore'): Snapshot {
 	const now = new Date().toISOString();
@@ -640,10 +889,10 @@ function validateEnvPatch(body: { set?: Record<string, string>; unset?: string[]
 	const set = Object.keys(body.set ?? {});
 	const unset = body.unset ?? [];
 	if (set.length === 0 && unset.length === 0) {
-		return 'Invalid input: nothing to change: send at least one variable to set or unset';
+		return 'nothing to change: send at least one variable to set or unset';
 	}
 	const bad = [...set, ...unset].find((key) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key));
-	if (bad) return `Invalid input: '${bad}' is not a valid variable name`;
+	if (bad) return `'${bad}' is not a valid variable name`;
 	return null;
 }
 
@@ -1041,8 +1290,17 @@ function mockDomainCheck(domain: string) {
 		status = 'mismatch';
 		message = `DNS for ${domain} points to ${ips.join(', ')}, expected ${serverIp}. Update the domain's A/AAAA record to this server.`;
 	}
-	const cert = certificates.find((c) => c.domain === domain) ?? null;
+	const parent = domain.split('.').slice(1).join('.');
+	const wildcard = parent.includes('.')
+		? (certificates.find((c) => c.domain === `*.${parent}` && c.status === 'active') ?? null)
+		: null;
+	const own = certificates.find((c) => c.domain === domain) ?? null;
+	const cert = own ?? wildcard;
+	const provider =
+		dnsProviders.find((p) => p.zones.some((z) => domain === z || domain.endsWith(`.${z}`))) ?? null;
 	return {
+		covered_by: own ? null : (wildcard?.domain ?? null),
+		dns_provider: provider?.name ?? null,
 		domain,
 		zone,
 		apps_domain: appsDomain,
@@ -1054,6 +1312,10 @@ function mockDomainCheck(domain: string) {
 		dns: { status, resolved: ips, expected: [serverIp], stray, message },
 		certificate: cert
 			? {
+					domain: cert.domain,
+					cert_type: cert.cert_type,
+					challenge: cert.challenge,
+					issuer: cert.issuer,
 					status: cert.status,
 					issued_at: cert.issued_at,
 					expires_at: cert.expires_at,
@@ -1179,7 +1441,7 @@ export const handlers = [
 		const body = (await request.json()) as { email?: string; role?: string };
 		const email = body.email?.trim() ?? '';
 		if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
-			return err('Invalid input: Enter a valid email address, like name@example.com.', 400);
+			return err('Enter a valid email address, like name@example.com.', 400);
 		}
 		if (users.some((u) => u.email.toLowerCase() === email.toLowerCase())) {
 			return err(`App already exists: a user with the email ${email}`, 409);
@@ -1200,15 +1462,12 @@ export const handlers = [
 		};
 		users = [...users, newUser];
 		return HttpResponse.json(
-			{
-				success: true,
-				data: {
-					user: newUser,
-					token: MOCK_PASSWORD_LINK,
-					path: `/set-password?token=${MOCK_PASSWORD_LINK}`,
-					expires_at: new Date(Date.now() + 86400_000).toISOString()
-				}
-			},
+			okBody({
+				user: newUser,
+				token: MOCK_PASSWORD_LINK,
+				path: `/set-password?token=${MOCK_PASSWORD_LINK}`,
+				expires_at: new Date(Date.now() + 86400_000).toISOString()
+			}),
 			{ status: 201 }
 		);
 	}),
@@ -1217,7 +1476,7 @@ export const handlers = [
 		await delay(LATENCY);
 		const body = (await request.json()) as { role?: string; disabled?: boolean };
 		const target = users.find((u) => u.id === params.id);
-		if (!target) return err('Not found: user', 404);
+		if (!target) return err('user', 404);
 		if (target.is_you) {
 			return err(
 				"Invalid input: You can't change your own role or disable yourself. Ask another admin."
@@ -1239,7 +1498,7 @@ export const handlers = [
 	http.delete('/api/v1/users/:id', async ({ params }) => {
 		await delay(LATENCY);
 		const target = users.find((u) => u.id === params.id);
-		if (!target) return err('Not found: user', 404);
+		if (!target) return err('user', 404);
 		if (target.is_you)
 			return err("Invalid input: You can't delete your own account. Ask another admin.");
 		users = users.filter((u) => u.id !== params.id);
@@ -1249,7 +1508,7 @@ export const handlers = [
 	http.post('/api/v1/users/:id/password-link', async ({ params }) => {
 		await delay(LATENCY);
 		const target = users.find((u) => u.id === params.id);
-		if (!target) return err('Not found: user', 404);
+		if (!target) return err('user', 404);
 		return HttpResponse.json(
 			{
 				success: true,
@@ -1267,7 +1526,7 @@ export const handlers = [
 	http.get('/api/v1/users/:id/sessions', async ({ params }) => {
 		await delay(LATENCY);
 		const target = users.find((u) => u.id === params.id);
-		if (!target) return err('Not found: user', 404);
+		if (!target) return err('user', 404);
 		return ok(
 			Array.from({ length: target.active_sessions }, (_, i) => ({
 				id: `sess_${target.id}_${i}`,
@@ -1288,7 +1547,7 @@ export const handlers = [
 	http.delete('/api/v1/users/:id/sessions', async ({ params }) => {
 		await delay(LATENCY);
 		const target = users.find((u) => u.id === params.id);
-		if (!target) return err('Not found: user', 404);
+		if (!target) return err('user', 404);
 		const revoked = target.is_you ? target.active_sessions - 1 : target.active_sessions;
 		users = users.map((u) =>
 			u.id === params.id ? { ...u, active_sessions: u.active_sessions - revoked } : u
@@ -1361,11 +1620,9 @@ export const handlers = [
 			expires_in_hours?: number;
 		};
 		if (!body.name?.trim()) {
-			return err(
-				'Invalid input: Give the token a name, e.g. the machine or workflow that uses it.'
-			);
+			return err('Give the token a name, e.g. the machine or workflow that uses it.');
 		}
-		if (!body.scopes?.length) return err('Invalid input: Choose at least one scope or a preset.');
+		if (!body.scopes?.length) return err('Choose at least one scope or a preset.');
 		const hex = Array.from({ length: 64 }, () => Math.floor(Math.random() * 16).toString(16)).join(
 			''
 		);
@@ -1395,7 +1652,7 @@ export const handlers = [
 	http.delete('/api/v1/tokens/:id', async ({ params }) => {
 		await delay(LATENCY);
 		const token = apiTokens.find((t) => t.id === params.id);
-		if (!token) return err('Not found: token', 404);
+		if (!token) return err('token', 404);
 		const updated = { ...token, revoked_at: token.revoked_at ?? new Date().toISOString() };
 		apiTokens = apiTokens.map((t) => (t.id === params.id ? updated : t));
 		return ok(updated);
@@ -1718,7 +1975,7 @@ export const handlers = [
 		}
 		if (body.readiness === 'none' && body.domain) {
 			return err(
-				'Invalid input: Background workers have no domain: they serve no traffic. Leave the domain empty.'
+				'Background workers have no domain: they serve no traffic. Leave the domain empty.'
 			);
 		}
 		const newApp: App = {
@@ -1830,7 +2087,7 @@ export const handlers = [
 		if (idx === -1) return err('App not found', 404);
 		const body = (await request.json()) as { readiness: string; ready_after_secs?: number };
 		if (!['http', 'tcp', 'none'].includes(body.readiness)) {
-			return err('Invalid input: readiness must be one of: http, tcp, none');
+			return err('readiness must be one of: http, tcp, none');
 		}
 		const readiness = body.readiness as 'http' | 'tcp' | 'none';
 		apps[idx] = {
@@ -1850,7 +2107,7 @@ export const handlers = [
 		const body = (await request.json()) as { container_port: number };
 		const port = Number(body.container_port);
 		if (!Number.isInteger(port) || port < 1 || port > 65535) {
-			return err('Invalid input: container_port must be between 1 and 65535');
+			return err('container_port must be between 1 and 65535');
 		}
 		apps[idx] = { ...apps[idx], container_port: port, updated_at: new Date().toISOString() };
 		return ok(apps[idx]);
@@ -1862,9 +2119,7 @@ export const handlers = [
 		await delay(LATENCY * 2);
 		const body = (await request.json()) as { url: string; github_app_id?: string };
 		if (!/^https?:\/\//.test(body.url ?? '')) {
-			return err(
-				'Invalid input: Branches can only be listed for http(s) Git URLs; type the branch name instead'
-			);
+			return err('Branches can only be listed for http(s) Git URLs; type the branch name instead');
 		}
 		if (/private/.test(body.url) && !body.github_app_id) {
 			return err(
@@ -1884,9 +2139,7 @@ export const handlers = [
 		const body = (await request.json()) as { image: string; registry_credential_id?: string };
 		const image = (body.image ?? '').trim();
 		if (!image || /\s/.test(image)) {
-			return err(
-				'Invalid input: Enter an image reference like nginx:alpine or ghcr.io/org/app:1.2'
-			);
+			return err('Enter an image reference like nginx:alpine or ghcr.io/org/app:1.2');
 		}
 		if (/does-not-exist|private/.test(image) && !body.registry_credential_id) {
 			// Soft failure, as the server does for a pull the registry refuses.
@@ -1916,7 +2169,7 @@ export const handlers = [
 		await delay(LATENCY * 2);
 		const domain = (new URL(request.url).searchParams.get('domain') ?? '').trim().toLowerCase();
 		if (!/^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z][a-z0-9-]*$/.test(domain)) {
-			return err(`Invalid input: '${domain}' isn't a valid domain name`);
+			return err(`'${domain}' isn't a valid domain name`);
 		}
 		return ok(mockDomainCheck(domain));
 	}),
@@ -1964,7 +2217,7 @@ export const handlers = [
 		const app = apps.find((a) => a.id === params.id);
 		if (!app) return err('App not found', 404);
 		const value = envStore(app.id)[params.key as string];
-		if (value === undefined) return err(`Not found: variable '${params.key}'`, 404);
+		if (value === undefined) return err(`variable '${params.key}'`, 404);
 		return ok({ key: params.key, value });
 	}),
 
@@ -1984,7 +2237,7 @@ export const handlers = [
 		const app = apps.find((a) => a.id === params.id);
 		if (!app) return err('App not found', 404);
 		const value = previewStore(app.id)[params.key as string];
-		if (value === undefined) return err(`Not found: preview override '${params.key}'`, 404);
+		if (value === undefined) return err(`preview override '${params.key}'`, 404);
 		return ok({ key: params.key, value });
 	}),
 
@@ -2018,21 +2271,24 @@ export const handlers = [
 		const domain = normalizeDomain(body.domain);
 		if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(domain)) {
 			return err(
-				`Invalid input: '${domain}' is not a valid domain name (expected something like app.example.com)`
+				`'${domain}' is not a valid domain name (expected something like app.example.com)`
 			);
 		}
 		if (domain === MOCK_SETTINGS.dashboard_domain) {
-			return err(
-				`Invalid input: ${domain} is the dashboard domain; choose another hostname for the app`
-			);
+			return err(`${domain} is the dashboard domain; choose another hostname for the app`);
 		}
 		const preview = MOCK_SETTINGS.preview_domain;
 		if (preview && (domain === preview || domain.endsWith(`.${preview}`))) {
 			return err(
-				`Invalid input: ${domain} is under the preview domain (${preview}), which only serves previews; choose a hostname outside it`
+				`${domain} is under the preview domain (${preview}), which only serves previews; choose a hostname outside it`
 			);
 		}
-		apps[idx] = { ...apps[idx], domain, updated_at: new Date().toISOString() };
+		const list = (appDomains[apps[idx].id] ??= []);
+		for (const d of list) if (d.kind === 'primary') d.kind = 'alias';
+		const existing = list.find((d) => d.domain === domain);
+		if (existing) Object.assign(existing, { kind: 'primary', redirect_to: null });
+		else list.push(mockDomainRow(domain, 'primary'));
+		syncPrimary(apps[idx].id);
 		queueMockCertificate(domain);
 		return ok({
 			message: 'Domain updated, certificate provisioning queued',
@@ -2041,7 +2297,304 @@ export const handlers = [
 		});
 	}),
 
+	// ── App domains ───────────────────────────────────────────────────────────
+
+	http.get('/api/v1/apps/:id/domains', async ({ params }) => {
+		await delay(LATENCY);
+		if (!apps.some((a) => a.id === params.id)) return err('App not found', 404);
+		return ok(sortedDomains(params.id as string));
+	}),
+
+	http.post('/api/v1/apps/:id/domains/www-pair', async ({ params, request }) => {
+		await delay(LATENCY);
+		const id = params.id as string;
+		if (!apps.some((a) => a.id === id)) return err('App not found', 404);
+		const body = (await request.json()) as {
+			domain: string;
+			canonical: 'apex' | 'www';
+			primary?: boolean;
+		};
+		const input = normalizeDomain(body.domain);
+		const apex = input.startsWith('www.') ? input.slice(4) : input;
+		const www = `www.${apex}`;
+		const [canonical, other] = body.canonical === 'apex' ? [apex, www] : [www, apex];
+		const problem = checkMockDomain(id, canonical) ?? checkMockDomain(id, other);
+		if (problem) return err(problem, problem.includes('already used') ? 409 : 400);
+		const list = (appDomains[id] ??= []);
+		const makePrimary = body.primary ?? true;
+		if (makePrimary) for (const d of list) if (d.kind === 'primary') d.kind = 'alias';
+		const upsert = (row: AppDomain) => {
+			const i = list.findIndex((d) => d.domain === row.domain);
+			if (i === -1) {
+				list.push(row);
+				queueMockCertificate(row.domain);
+			} else list[i] = { ...list[i], ...row, created_at: list[i].created_at };
+		};
+		upsert(mockDomainRow(canonical, makePrimary ? 'primary' : 'alias'));
+		for (const d of list) if (d.redirect_to === other) d.redirect_to = canonical;
+		upsert(mockDomainRow(other, 'redirect', canonical));
+		promoteIfNeeded(id);
+		syncPrimary(id);
+		return ok(sortedDomains(id));
+	}),
+
+	http.post('/api/v1/apps/:id/domains', async ({ params, request }) => {
+		await delay(LATENCY);
+		const id = params.id as string;
+		if (!apps.some((a) => a.id === id)) return err('App not found', 404);
+		const body = (await request.json()) as {
+			domain: string;
+			kind?: AppDomain['kind'];
+			redirect_to?: string;
+			redirect_code?: number;
+		};
+		const domain = normalizeDomain(body.domain);
+		const problem = checkMockDomain(id, domain);
+		if (problem) return err(problem, problem.includes('already used') ? 409 : 400);
+		const list = (appDomains[id] ??= []);
+		if (list.some((d) => d.domain === domain)) {
+			return err(`${domain} is already a domain of this app`, 409);
+		}
+		const kind = body.kind ?? (list.some((d) => d.kind === 'primary') ? 'alias' : 'primary');
+		if (kind === 'redirect') {
+			const target = list.find((d) => d.domain === body.redirect_to);
+			if (!target || target.kind === 'redirect') {
+				return err(
+					`${body.redirect_to ?? '(none)'} isn't a serving domain of this app. Redirects can only point at the app's own domains.`
+				);
+			}
+		}
+		if (kind === 'primary') for (const d of list) if (d.kind === 'primary') d.kind = 'alias';
+		list.push(
+			mockDomainRow(
+				domain,
+				kind,
+				kind === 'redirect' ? (body.redirect_to ?? null) : null,
+				body.redirect_code ?? 308
+			)
+		);
+		promoteIfNeeded(id);
+		syncPrimary(id);
+		queueMockCertificate(domain);
+		return ok(sortedDomains(id));
+	}),
+
+	http.patch('/api/v1/apps/:id/domains/:domain', async ({ params, request }) => {
+		await delay(LATENCY);
+		const id = params.id as string;
+		const list = appDomains[id] ?? [];
+		const row = list.find((d) => d.domain === params.domain);
+		if (!row) return err(`${params.domain} is not a domain of this app`, 404);
+		const body = (await request.json()) as {
+			kind?: AppDomain['kind'];
+			redirect_to?: string;
+			redirect_code?: number;
+		};
+		const kind = body.kind ?? row.kind;
+		if (row.kind === 'primary' && kind !== 'primary') {
+			return err(`${row.domain} is the primary domain. Make another domain primary first.`, 409);
+		}
+		if (kind === 'redirect') {
+			const pointing = list.filter((d) => d.redirect_to === row.domain).map((d) => d.domain);
+			if (pointing.length) {
+				return err(
+					`${pointing.join(', ')} redirect${pointing.length === 1 ? 's' : ''} to ${row.domain}; point ${pointing.length === 1 ? 'it' : 'them'} at another domain first`,
+					409
+				);
+			}
+			const target = list.find((d) => d.domain === (body.redirect_to ?? row.redirect_to));
+			if (!target || target.kind === 'redirect' || target.domain === row.domain) {
+				return err(`choose a serving domain of this app to redirect to`);
+			}
+			row.redirect_to = target.domain;
+			row.redirect_code = body.redirect_code ?? row.redirect_code;
+		} else {
+			row.redirect_to = null;
+			row.redirect_code = 308;
+		}
+		if (kind === 'primary') for (const d of list) if (d.kind === 'primary') d.kind = 'alias';
+		row.kind = kind;
+		promoteIfNeeded(id);
+		syncPrimary(id);
+		return ok(sortedDomains(id));
+	}),
+
+	http.delete('/api/v1/apps/:id/domains/:domain', async ({ params }) => {
+		await delay(LATENCY);
+		const id = params.id as string;
+		const list = appDomains[id] ?? [];
+		const row = list.find((d) => d.domain === params.domain);
+		if (!row) return err(`${params.domain} is not a domain of this app`, 404);
+		const pointing = list.filter((d) => d.redirect_to === row.domain).map((d) => d.domain);
+		if (pointing.length) {
+			return err(
+				`${pointing.join(', ')} redirect${pointing.length === 1 ? 's' : ''} to ${row.domain}. Remove ${pointing.length === 1 ? 'it' : 'them'} or point ${pointing.length === 1 ? 'it' : 'them'} at another domain first.`,
+				409
+			);
+		}
+		appDomains[id] = list.filter((d) => d !== row);
+		promoteIfNeeded(id);
+		syncPrimary(id);
+		return ok(sortedDomains(id));
+	}),
+
+	// ── DNS providers ─────────────────────────────────────────────────────────
+
+	http.get('/api/v1/dns-providers', async () => {
+		await delay(LATENCY);
+		return ok(dnsProviders);
+	}),
+
+	http.post('/api/v1/dns-providers', async ({ request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as {
+			name: string;
+			kind: DnsProvider['kind'];
+			zones: string[];
+			token: string;
+			config?: DnsProvider['config'];
+		};
+		if (!body.name?.trim()) return err('Give the provider a name');
+		if (!body.token?.trim()) return err('Paste the API token');
+		const zones = [...new Set(body.zones.map(normalizeDomain).filter(Boolean))];
+		if (zones.length === 0) {
+			return err('List at least one zone (the domain the provider hosts, e.g. example.com)');
+		}
+		if (body.kind === 'route53' && !body.config?.access_key_id?.trim()) {
+			return err(
+				'Route 53 needs the access key id (the secret access key goes in the token field)'
+			);
+		}
+		const taken = dnsProviders.find((p) => p.zones.some((z) => zones.includes(z)));
+		if (taken) {
+			const zone = zones.find((z) => taken.zones.includes(z));
+			return err(`${zone} is already handled by the DNS provider '${taken.name}'`, 409);
+		}
+		const now = new Date().toISOString();
+		const provider: DnsProvider = {
+			id: `dns_${Date.now()}`,
+			name: body.name.trim(),
+			kind: body.kind,
+			zones,
+			config: body.config ?? {},
+			token_set: true,
+			created_at: now,
+			updated_at: now,
+			last_used_at: null,
+			last_error: null
+		};
+		dnsProviders = [...dnsProviders, provider];
+		return ok(provider);
+	}),
+
+	http.patch('/api/v1/dns-providers/:id', async ({ params, request }) => {
+		await delay(LATENCY);
+		const idx = dnsProviders.findIndex((p) => p.id === params.id);
+		if (idx === -1) return err(`DNS provider ${params.id}`, 404);
+		const body = (await request.json()) as {
+			name?: string;
+			zones?: string[];
+			token?: string;
+			config?: DnsProvider['config'];
+		};
+		const current = dnsProviders[idx];
+		dnsProviders[idx] = {
+			...current,
+			name: body.name?.trim() || current.name,
+			zones: body.zones ? body.zones.map(normalizeDomain).filter(Boolean) : current.zones,
+			config: body.config ?? current.config,
+			updated_at: new Date().toISOString(),
+			last_error: null
+		};
+		return ok(dnsProviders[idx]);
+	}),
+
+	http.delete('/api/v1/dns-providers/:id', async ({ params }) => {
+		await delay(LATENCY);
+		dnsProviders = dnsProviders.filter((p) => p.id !== params.id);
+		return ok({ deleted: params.id });
+	}),
+
+	http.post('/api/v1/dns-providers/:id/test', async ({ params }) => {
+		await delay(LATENCY * 3);
+		const provider = dnsProviders.find((p) => p.id === params.id);
+		if (!provider) return err(`DNS provider ${params.id}`, 404);
+		const labels: Record<DnsProvider['kind'], string> = {
+			cloudflare: 'Cloudflare',
+			hetzner: 'Hetzner DNS',
+			digitalocean: 'DigitalOcean',
+			route53: 'Amazon Route 53',
+			challtestsrv: 'challtestsrv (test)'
+		};
+		const zones = provider.zones.map((zone) =>
+			zone.endsWith('.invalid')
+				? {
+						zone,
+						ok: false,
+						message: `${labels[provider.kind]} answered 403: Unauthorized — check the token and its permissions`
+					}
+				: { zone, ok: true, message: `${labels[provider.kind]} can manage ${zone}` }
+		);
+		return ok({ ok: zones.every((z) => z.ok), zones });
+	}),
+
 	// ── Certificates ──────────────────────────────────────────────────────────
+
+	http.post('/api/v1/certs/custom', async ({ request }) => {
+		await delay(LATENCY * 2);
+		const body = (await request.json()) as { domain: string; cert_pem: string; key_pem: string };
+		const domain = normalizeDomain(body.domain);
+		if (!body.cert_pem.includes('-----BEGIN CERTIFICATE-----')) {
+			return fieldErr(
+				'The certificate must be PEM (-----BEGIN CERTIFICATE-----), leaf first, then the intermediates',
+				'cert_pem'
+			);
+		}
+		if (!body.key_pem.includes('PRIVATE KEY-----')) {
+			return fieldErr(
+				'The private key must be PEM (-----BEGIN PRIVATE KEY----- or an RSA/EC key)',
+				'key_pem'
+			);
+		}
+		if (body.key_pem.includes('WRONG')) {
+			return fieldErr(
+				`The private key doesn't belong to the certificate for ${domain}. Upload the key that was generated with this certificate's request.`,
+				'key_pem'
+			);
+		}
+		const now = new Date().toISOString();
+		const row = {
+			id: `cert-${Date.now()}`,
+			domain,
+			cert_type: 'custom',
+			status: 'active',
+			issued_at: now,
+			expires_at: new Date(Date.now() + 365 * 86_400_000).toISOString(),
+			last_error: null,
+			last_attempt_at: now,
+			next_retry_at: null,
+			failure_count: 0,
+			issuer: 'Example Corp Issuing CA',
+			issuer_kind: 'uploaded' as const,
+			last_renewed_at: now,
+			challenge: null,
+			serves: domain.startsWith('*.')
+				? { kind: 'wildcard' as const, purpose: 'custom' as const, hosts: 0 }
+				: { kind: 'unused' as const }
+		};
+		const i = certificates.findIndex((c) => c.domain === domain);
+		if (i === -1) certificates.push(row);
+		else certificates[i] = { ...row, serves: certificates[i].serves };
+		return ok(certificates.find((c) => c.domain === domain) ?? null);
+	}),
+
+	http.delete('/api/v1/certs/custom/:domain', async ({ params }) => {
+		await delay(LATENCY);
+		const i = certificates.findIndex((c) => c.domain === params.domain && c.cert_type === 'custom');
+		if (i === -1) return err(`No uploaded certificate for ${params.domain}`, 404);
+		certificates.splice(i, 1);
+		return ok({ deleted: params.domain });
+	}),
 
 	http.get('/api/v1/certs', async () => {
 		await delay(LATENCY);
@@ -2242,7 +2795,7 @@ export const handlers = [
 		const app = apps.find((a) => a.id === params.id || a.name === params.id);
 		if (!app) return err('App not found', 404);
 		const d = (deployments[app.id] ?? []).find((x) => x.id === params.deploymentId);
-		if (!d) return err(`Not found: deployment '${params.deploymentId}'`, 404);
+		if (!d) return err(`deployment '${params.deploymentId}'`, 404);
 		return ok(deploymentDetail(app, d));
 	}),
 
@@ -2287,7 +2840,7 @@ export const handlers = [
 		const secret = typeof body.secret === 'string' ? body.secret.trim() : '';
 		if (secret.length < 16) {
 			return err(
-				'Invalid input: webhook secret must be at least 16 characters (rotate it to have one generated)',
+				'webhook secret must be at least 16 characters (rotate it to have one generated)',
 				400
 			);
 		}
@@ -2401,7 +2954,7 @@ export const handlers = [
 		};
 		// Mirrors the server: stored PR links must be https:// URLs.
 		if (body.pr_url && !/^https:\/\/[^/@\s]+/i.test(body.pr_url)) {
-			return err('Invalid input: pr_url must be an https:// URL', 400);
+			return err('pr_url must be an https:// URL', 400);
 		}
 		const ttl = (body.ttl_hours ?? 24) * 3600;
 		const slug = `preview-${Date.now()}`;
@@ -3170,6 +3723,289 @@ export const handlers = [
 		return ok(databases);
 	}),
 
+	http.get('/api/v1/databases/catalog', async () => {
+		await delay(LATENCY);
+		return ok(MOCK_DB_CATALOG);
+	}),
+
+	http.get('/api/v1/databases/:id/backup-schedule', async ({ params }) => {
+		await delay(LATENCY);
+		const db = databases.find((d) => d.id === params.id || d.name === params.id);
+		if (!db) return err(`database '${params.id}'`, 404);
+		return ok(mockBackupStatus(db));
+	}),
+
+	http.put('/api/v1/databases/:id/backup-schedule', async ({ params, request }) => {
+		await delay(LATENCY);
+		const idx = databases.findIndex((d) => d.id === params.id || d.name === params.id);
+		if (idx === -1) return err(`database '${params.id}'`, 404);
+		const body = (await request.json()) as { schedule: string | null; retention?: number };
+		const schedule = body.schedule?.trim() || null;
+		if (schedule && schedule.split(/\s+/).length !== 5 && !schedule.startsWith('@')) {
+			return err(
+				`Invalid backup schedule: a schedule needs 5 fields (minute hour day-of-month month day-of-week), got ${schedule.split(/\s+/).length}`
+			);
+		}
+		const retention = body.retention ?? databases[idx].backup_retention;
+		if (retention < 1 || retention > 365) {
+			return err(
+				'Keep between 1 and 365 backups. A schedule that keeps none would delete each backup right after taking it.'
+			);
+		}
+		databases[idx] = { ...databases[idx], backup_schedule: schedule, backup_retention: retention };
+		return ok(mockBackupStatus(databases[idx]));
+	}),
+
+	http.get('/api/v1/databases/:id/extensions', async ({ params }) => {
+		await delay(LATENCY);
+		const db = databases.find((d) => d.id === params.id || d.name === params.id);
+		if (!db) return err('Database not found', 404);
+		if (db.db_type !== 'postgres') return err('Extensions are a PostgreSQL feature.');
+		if (db.status !== 'running') {
+			return err(`Start '${db.name}' first: extensions are read from the running database.`);
+		}
+		const entry = mockCatalogEntry(db.db_type, db.variant);
+		const installed = dbExtensions[db.id] ?? {};
+		const comments: Record<string, string> = {
+			vector: 'vector data type and ivfflat and hnsw access methods',
+			postgis: 'PostGIS geometry and geography spatial types and functions',
+			pg_stat_statements: 'track planning and execution statistics of all SQL statements executed',
+			pg_trgm: 'text similarity measurement and index searching based on trigrams',
+			pgcrypto: 'cryptographic functions',
+			'uuid-ossp': 'generate universally unique identifiers (UUIDs)',
+			citext: 'data type for case-insensitive character strings'
+		};
+		const list: DatabaseExtension[] = (entry?.extensions ?? []).map((name) => ({
+			name,
+			available: true,
+			installed_version: installed[name] ?? null,
+			default_version: name === 'vector' ? '0.8.1' : '1.6',
+			comment: comments[name] ?? null
+		}));
+		return ok(list);
+	}),
+
+	http.post('/api/v1/databases/:id/extensions', async ({ params, request }) => {
+		await delay(LATENCY * 2);
+		const db = databases.find((d) => d.id === params.id || d.name === params.id);
+		if (!db) return err('Database not found', 404);
+		const { name } = (await request.json()) as { name: string };
+		const offered = mockCatalogEntry(db.db_type, db.variant)?.extensions ?? [];
+		if (!offered.includes(name)) {
+			return err(
+				`'${name}' isn't one of the extensions offered for this database: ${offered.join(', ')}`
+			);
+		}
+		(dbExtensions[db.id] ??= {})[name] = name === 'vector' ? '0.8.1' : '1.6';
+		return ok({ message: `${name} is enabled in ${db.name}.` });
+	}),
+
+	http.post('/api/v1/databases/:id/upgrade', async ({ params, request }) => {
+		await delay(LATENCY);
+		const idx = databases.findIndex((d) => d.id === params.id || d.name === params.id);
+		if (idx === -1) return err('Database not found', 404);
+		if (currentMockUser().role !== 'admin') {
+			return err('Forbidden: only admins can upgrade a database to a new version', 403);
+		}
+		const db = databases[idx];
+		const { version } = (await request.json()) as { version: string };
+		if (db.upgrade?.status === 'running') return err('An upgrade is already running.');
+		if (db.status !== 'running') {
+			return err('Start the database first: the upgrade copies its data while it runs.');
+		}
+		if (!mockNewer(version, db.version)) {
+			return err(
+				`Downgrades aren't possible: version ${version} can't read data written by ${db.version}. Restore a backup taken before the upgrade into a new database instead.`
+			);
+		}
+		const upgrade: DbUpgradeState = {
+			status: 'running',
+			from_version: db.version,
+			to_version: version,
+			from_image: db.image_used ?? '',
+			to_image: mockImage(db.db_type, db.variant, version),
+			step: 'Starting',
+			backup_id: null,
+			started_at: new Date().toISOString(),
+			finished_at: null,
+			error: null
+		};
+		databases[idx] = { ...db, upgrade };
+		runMockUpgrade(db.id);
+		return HttpResponse.json(okBody(upgrade), { status: 202 });
+	}),
+
+	http.post('/api/v1/databases/:id/upgrade/confirm', async ({ params }) => {
+		await delay(LATENCY);
+		const idx = databases.findIndex((d) => d.id === params.id || d.name === params.id);
+		if (idx === -1) return err('Database not found', 404);
+		const db = databases[idx];
+		if (db.upgrade?.status !== 'awaiting_confirmation') {
+			return err('No upgrade is waiting for confirmation.');
+		}
+		databases[idx] = { ...db, upgrade: null };
+		return ok({ message: `${db.name} stays on version ${db.version}. The old data was deleted.` });
+	}),
+
+	http.post('/api/v1/databases/:id/upgrade/rollback', async ({ params }) => {
+		await delay(LATENCY * 3);
+		const idx = databases.findIndex((d) => d.id === params.id || d.name === params.id);
+		if (idx === -1) return err('Database not found', 404);
+		const db = databases[idx];
+		const u = db.upgrade;
+		if (u?.status !== 'awaiting_confirmation') {
+			return err('No upgrade is waiting for confirmation.');
+		}
+		databases[idx] = { ...db, version: u.from_version, image_used: u.from_image, upgrade: null };
+		return ok({
+			message: `${db.name} runs version ${u.from_version} again, with its data from before the upgrade.`
+		});
+	}),
+
+	http.post('/api/v1/databases/:id/upgrade/dismiss', async ({ params }) => {
+		await delay(LATENCY);
+		const idx = databases.findIndex((d) => d.id === params.id || d.name === params.id);
+		if (idx === -1) return err('Database not found', 404);
+		if (databases[idx].upgrade?.status === 'failed') {
+			databases[idx] = { ...databases[idx], upgrade: null };
+		}
+		return ok(null);
+	}),
+
+	http.post('/api/v1/snapshots/:id/restore-new-database', async ({ params, request }) => {
+		await delay(LATENCY * 5);
+		const snap = snapshots.find((s) => s.id === params.id);
+		if (!snap) return err('Snapshot not found', 404);
+		const body = (await request.json()) as { source: string; name: string };
+		const source = databases.find((d) => d.name === body.source);
+		if (!source) {
+			return err(
+				`This snapshot predates restoring into a new database and '${body.source}' no longer exists`
+			);
+		}
+		const name = body.name.trim();
+		if (!/^[A-Za-z0-9][A-Za-z0-9-]*$/.test(name)) {
+			return err('Database name must be alphanumeric (hyphens allowed)');
+		}
+		if (databases.some((d) => d.name === name)) {
+			return err(`A database named '${name}' already exists. Choose another name.`);
+		}
+		const isRedisLike = source.db_type === 'redis' || source.db_type === 'keydb';
+		const copy: ManagedDatabase = {
+			...source,
+			id: `db_${Date.now()}`,
+			name,
+			host_port: 5400 + databases.length + 1,
+			status: 'running',
+			db_name: isRedisLike ? null : `tond_${name.replace(/-/g, '_')}`,
+			db_user: isRedisLike ? 'default' : `tond_${name.replace(/-/g, '_')}`,
+			public_access: false,
+			allowlist: [],
+			tls: false,
+			backup_schedule: null,
+			upgrade: null,
+			custom_external_url: null,
+			custom_internal_url: null,
+			created_at: new Date().toISOString(),
+			updated_at: new Date().toISOString()
+		};
+		dbSecrets[copy.id] = { db_password: randomHex(12), root_password: null };
+		databases = [...databases, copy];
+		return HttpResponse.json(
+			okBody({
+				message: `Restored ${source.name} into the new database ${name}. ${source.name} was not changed.`,
+				database: copy
+			}),
+			{ status: 201 }
+		);
+	}),
+
+	// ── Git tokens (GitLab, Gitea/Forgejo) ──
+	http.get('/api/v1/gitlab-tokens', async () => {
+		await delay(LATENCY);
+		return ok(gitlabTokens);
+	}),
+
+	http.post('/api/v1/gitlab-tokens', async ({ request }) => {
+		await delay(LATENCY * 2);
+		const body = (await request.json()) as { name: string; token: string; gitlab_url?: string };
+		if (!body.name?.trim() || !body.token?.trim()) return err('name is required');
+		if (body.token.trim() === 'bad') {
+			return err('GitLab token validation failed (HTTP 401 Unauthorized)');
+		}
+		const token: GitLabToken = {
+			id: `gl_${Date.now()}`,
+			name: body.name.trim(),
+			gitlab_url: (body.gitlab_url || 'https://gitlab.com').replace(/\/+$/, ''),
+			username: 'dev',
+			created_at: new Date().toISOString()
+		};
+		gitlabTokens = [...gitlabTokens, token];
+		return HttpResponse.json(okBody(token), { status: 201 });
+	}),
+
+	http.delete('/api/v1/gitlab-tokens/:id', async ({ params }) => {
+		await delay(LATENCY);
+		gitlabTokens = gitlabTokens.filter((t) => t.id !== params.id);
+		apps = apps.map((a) => (a.gitlab_token_id === params.id ? { ...a, gitlab_token_id: null } : a));
+		return ok(null);
+	}),
+
+	http.get('/api/v1/gitea-tokens', async () => {
+		await delay(LATENCY);
+		return ok(giteaTokens);
+	}),
+
+	http.post('/api/v1/gitea-tokens', async ({ request }) => {
+		await delay(LATENCY * 2);
+		const body = (await request.json()) as { name: string; token: string; base_url: string };
+		if (!body.name?.trim() || !body.token?.trim()) {
+			return err('A name and a token are required');
+		}
+		if (!/^https?:\/\/[^/@\s]+/.test(body.base_url?.trim() ?? '')) {
+			return err(`The instance URL must start with https:// (or http://)`);
+		}
+		if (body.token.trim() === 'bad') {
+			return err(
+				`${body.base_url} refused the token (HTTP 401). Create one under Settings → Applications with repository and issue write access.`
+			);
+		}
+		const token: GiteaToken = {
+			id: `gt_${Date.now()}`,
+			name: body.name.trim(),
+			base_url: body.base_url.trim().replace(/\/+$/, ''),
+			username: 'dev',
+			created_at: new Date().toISOString()
+		};
+		giteaTokens = [...giteaTokens, token];
+		return HttpResponse.json(okBody(token), { status: 201 });
+	}),
+
+	http.delete('/api/v1/gitea-tokens/:id', async ({ params }) => {
+		await delay(LATENCY);
+		giteaTokens = giteaTokens.filter((t) => t.id !== params.id);
+		apps = apps.map((a) => (a.gitea_token_id === params.id ? { ...a, gitea_token_id: null } : a));
+		return ok(null);
+	}),
+
+	http.put('/api/v1/apps/:id/gitlab-token', async ({ params, request }) => {
+		await delay(LATENCY);
+		const idx = apps.findIndex((a) => a.id === params.id || a.name === params.id);
+		if (idx === -1) return err('App not found', 404);
+		const { gitlab_token_id } = (await request.json()) as { gitlab_token_id: string | null };
+		apps[idx] = { ...apps[idx], gitlab_token_id };
+		return ok(apps[idx]);
+	}),
+
+	http.put('/api/v1/apps/:id/gitea-token', async ({ params, request }) => {
+		await delay(LATENCY);
+		const idx = apps.findIndex((a) => a.id === params.id || a.name === params.id);
+		if (idx === -1) return err('App not found', 404);
+		const { gitea_token_id } = (await request.json()) as { gitea_token_id: string | null };
+		apps[idx] = { ...apps[idx], gitea_token_id };
+		return ok(apps[idx]);
+	}),
+
 	http.post('/api/v1/databases', async ({ request }) => {
 		await delay(LATENCY * 2);
 		const body = (await request.json()) as {
@@ -3178,15 +4014,19 @@ export const handlers = [
 			project_id?: string;
 			memory_limit?: number;
 			public_access?: boolean;
+			version?: string;
+			variant?: string;
+			backup_schedule?: string;
 		};
-		const defaultImages: Record<string, string> = {
-			postgres: 'postgres:16-alpine',
-			mysql: 'mysql:8',
-			redis: 'redis:7-alpine',
-			mariadb: 'mariadb:11',
-			keydb: 'eqalpha/keydb:latest',
-			mongodb: 'mongo:7'
-		};
+		const variant = body.variant ?? '';
+		const entry = mockCatalogEntry(body.db_type, variant);
+		if (!entry) return err(`Unknown variant '${variant}' for ${body.db_type}`);
+		const version = body.version || entry.default_version;
+		if (!entry.versions.includes(version)) {
+			return err(
+				`Version ${version} isn't available. Choose one of: ${entry.versions.join(', ')}.`
+			);
+		}
 		const isRedisLike = body.db_type === 'redis' || body.db_type === 'keydb';
 		const isMysqlLike = body.db_type === 'mysql' || body.db_type === 'mariadb';
 		const newDb: ManagedDatabase = {
@@ -3203,11 +4043,18 @@ export const handlers = [
 			memory_limit: body.memory_limit ?? null,
 			custom_external_url: null,
 			custom_internal_url: null,
-			image_used: defaultImages[body.db_type] ?? `${body.db_type}:latest`,
+			image_used: mockImage(body.db_type, variant, version),
 			custom_image: null,
 			created_at: new Date().toISOString(),
 			updated_at: new Date().toISOString(),
-			public_access: body.public_access ?? false
+			public_access: body.public_access ?? false,
+			version,
+			variant,
+			backup_schedule: body.backup_schedule?.trim() || null,
+			backup_retention: 7,
+			allowlist: [],
+			tls: false,
+			upgrade: null
 		};
 		dbSecrets[newDb.id] = {
 			db_password: randomHex(12),
@@ -3228,18 +4075,16 @@ export const handlers = [
 	http.put('/api/v1/databases/:id/links/:app', async ({ params }) => {
 		await delay(LATENCY);
 		const db = databases.find((d) => d.id === params.id || d.name === params.id);
-		if (!db) return err('Not found: database', 404);
+		if (!db) return err('database', 404);
 		const app = apps.find((a) => a.id === params.app || a.name === params.app);
 		if (!app) return err('App not found', 404);
 		if (app.source_type === 'compose') {
 			return err(
-				`Invalid input: '${app.name}' is a compose app: compose apps run on their own compose network and can't be linked.`
+				`'${app.name}' is a compose app: compose apps run on their own compose network and can't be linked.`
 			);
 		}
 		if (db.project_id && db.project_id === app.project_id) {
-			return err(
-				`Invalid input: '${app.name}' is in the same project as '${db.name}' and can already reach it.`
-			);
+			return err(`'${app.name}' is in the same project as '${db.name}' and can already reach it.`);
 		}
 		if (!databaseLinks.some((l) => l.database_id === db.id && l.app_id === app.id)) {
 			databaseLinks = [...databaseLinks, { database_id: db.id, app_id: app.id }];
@@ -3250,7 +4095,7 @@ export const handlers = [
 	http.delete('/api/v1/databases/:id/links/:app', async ({ params }) => {
 		await delay(LATENCY);
 		const db = databases.find((d) => d.id === params.id || d.name === params.id);
-		if (!db) return err('Not found: database', 404);
+		if (!db) return err('database', 404);
 		const app = apps.find((a) => a.id === params.app || a.name === params.app);
 		if (!app) return err('App not found', 404);
 		databaseLinks = databaseLinks.filter((l) => !(l.database_id === db.id && l.app_id === app.id));
@@ -3308,6 +4153,8 @@ export const handlers = [
 			custom_image?: string | null;
 			memory_limit?: number | null;
 			public_access?: boolean;
+			allowlist?: string[];
+			tls?: boolean;
 		};
 		// Apply updates — empty string clears the override (mirrors backend behaviour)
 		const updated = { ...databases[idx] };
@@ -3330,6 +4177,37 @@ export const handlers = [
 		}
 		if (body.public_access !== undefined) {
 			updated.public_access = body.public_access;
+		}
+		if (body.allowlist !== undefined) {
+			const cleaned: string[] = [];
+			for (const raw of body.allowlist) {
+				const entry = raw.trim();
+				if (!entry) continue;
+				const [addr, prefix] = entry.split('/');
+				const octets = addr.split('.');
+				const validIp =
+					octets.length === 4 && octets.every((o) => /^\d+$/.test(o) && Number(o) <= 255);
+				const validPrefix = prefix === undefined || (/^\d+$/.test(prefix) && Number(prefix) <= 32);
+				if (addr.includes(':')) {
+					return err(
+						`'${entry}' is IPv6. Public databases are published on IPv4 only; allow IPv4 addresses.`
+					);
+				}
+				if (!validIp || !validPrefix) {
+					return err(`'${entry}' isn't an IP address or a CIDR range like 203.0.113.0/24`);
+				}
+				const canonical = prefix === '32' ? addr : entry;
+				if (!cleaned.includes(canonical)) cleaned.push(canonical);
+			}
+			updated.allowlist = cleaned;
+		}
+		if (body.tls !== undefined) {
+			if (body.tls && !mockCatalogEntry(updated.db_type, updated.variant)?.supports_tls) {
+				return err(
+					`${updated.db_type} doesn't support TLS in Tond; use an SSH tunnel to encrypt connections.`
+				);
+			}
+			updated.tls = body.tls;
 		}
 		updated.updated_at = new Date().toISOString();
 		databases[idx] = updated;
@@ -3362,7 +4240,7 @@ export const handlers = [
 		if (nextPw && nextPw !== secrets.db_password) changed.push('db_password');
 		const nextRoot = body.root_password?.trim();
 		if (nextRoot && nextRoot !== secrets.root_password) changed.push('root_password');
-		if (changed.length === 0) return err('Invalid input: Nothing to change: enter a new password.');
+		if (changed.length === 0) return err('Nothing to change: enter a new password.');
 		if (current.db_type === 'redis' || current.db_type === 'keydb') {
 			return err(
 				"Invalid input: Redis and KeyDB passwords can't be changed in place yet. The stored password was not changed."
@@ -3370,7 +4248,7 @@ export const handlers = [
 		}
 		if (current.status !== 'running') {
 			return err(
-				`Invalid input: Start '${current.name}' first: the password is changed inside the running database. Nothing was changed.`
+				`Start '${current.name}' first: the password is changed inside the running database. Nothing was changed.`
 			);
 		}
 		await delay(LATENCY * 3); // simulate the docker exec

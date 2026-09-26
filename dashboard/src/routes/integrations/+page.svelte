@@ -1,7 +1,10 @@
 <script lang="ts">
 	import PageTitle from '$lib/components/nav/page-title.svelte';
 	import {
+		type DnsProvider,
 		type GitHubApp,
+		type GitLabToken,
+		type GiteaToken,
 		type RegistryCredential,
 		type Integration,
 		type IntegrationKind
@@ -9,6 +12,8 @@
 	import IntegrationCard from '$lib/components/cards/integrations/integration-card.svelte';
 	import StorageProviderList from '$lib/components/integrations/storage-provider-list.svelte';
 	import Github from '~icons/ri/github-fill';
+	import Gitlab from '~icons/ri/gitlab-fill';
+	import GitRepo from '~icons/ri/git-repository-line';
 	import Package from '~icons/ri/archive-2-line';
 	import Send from '~icons/ri/send-plane-line';
 	import Webhook from '~icons/ri/webhook-line';
@@ -17,6 +22,7 @@
 	import PhoneIcon from '~icons/ri/smartphone-line';
 	import GotifyIcon from '~icons/ri/notification-2-line';
 	import CodeIcon from '~icons/ri/code-s-slash-line';
+	import DnsIcon from '~icons/ri/server-line';
 	import { setUiContext, clearUiContext, integrationsContext } from '$lib/ui-context.svelte';
 	import type { PageProps } from './$types';
 
@@ -25,11 +31,34 @@
 	// ── GitHub ────────────────────────────────────────────────────────────────
 	let githubApps = $derived(data.githubApps as GitHubApp[]);
 
+	// ── GitLab / Gitea tokens ─────────────────────────────────────────────────
+	let gitlabTokens = $derived((data.gitlabTokens ?? []) as GitLabToken[]);
+	let giteaTokens = $derived((data.giteaTokens ?? []) as GiteaToken[]);
+
+	function tokenCard(tokens: { name: string }[]) {
+		return {
+			status: tokens.length > 0 ? ('connected' as const) : ('disconnected' as const),
+			details: tokens.length ? [{ label: 'Tokens', value: String(tokens.length) }] : []
+		};
+	}
+
 	// ── Registry ─────────────────────────────────────────────────────────────
 	let credentials = $derived(data.credentials as RegistryCredential[]);
 
 	// ── Notification integrations ─────────────────────────────────────────────
 	let integrations = $derived(data.integrations as Integration[]);
+
+	// ── DNS providers (ACME DNS-01) ───────────────────────────────────────────
+	let dnsProviders = $derived((data.dnsProviders ?? []) as DnsProvider[]);
+	function dnsDetails() {
+		if (dnsProviders.length === 0) return [];
+		const zones = dnsProviders.flatMap((p) => p.zones);
+		const failing = dnsProviders.filter((p) => p.last_error).length;
+		return [
+			{ label: 'Zones', value: zones.length > 2 ? `${zones.length} zones` : zones.join(', ') },
+			...(failing ? [{ label: 'Failing', value: String(failing) }] : [])
+		];
+	}
 
 	$effect(() => {
 		setUiContext(integrationsContext());
@@ -149,6 +178,22 @@
 		</div>
 	</section>
 
+	<!-- ── DNS Providers ──────────────────────────────────────────────────────── -->
+	<section class="space-y-4">
+		<h2 class="text-xs font-semibold tracking-widest text-muted-foreground uppercase">
+			DNS Providers
+		</h2>
+		<div class="grid grid-cols-1 items-stretch gap-4 sm:grid-cols-2 lg:grid-cols-3">
+			<IntegrationCard
+				name="DNS providers (wildcard certificates)"
+				icon={DnsIcon}
+				status={dnsProviders.length > 0 ? 'connected' : 'disconnected'}
+				details={dnsDetails()}
+				href="/integrations/dns"
+			/>
+		</div>
+	</section>
+
 	<!-- ── Storage Providers ──────────────────────────────────────────────────── -->
 	<section class="space-y-4">
 		<h2 class="text-xs font-semibold tracking-widest text-muted-foreground uppercase">
@@ -169,6 +214,20 @@
 				status={githubStatus()}
 				details={githubDetails()}
 				href="/integrations/github"
+			/>
+			<IntegrationCard
+				name="GitLab"
+				icon={Gitlab}
+				status={tokenCard(gitlabTokens).status}
+				details={tokenCard(gitlabTokens).details}
+				href="/integrations/gitlab"
+			/>
+			<IntegrationCard
+				name="Gitea / Forgejo"
+				icon={GitRepo}
+				status={tokenCard(giteaTokens).status}
+				details={tokenCard(giteaTokens).details}
+				href="/integrations/gitea"
 			/>
 		</div>
 	</section>

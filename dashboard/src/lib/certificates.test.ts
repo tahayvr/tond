@@ -30,6 +30,7 @@ function cert(overrides: Partial<Certificate>): Certificate {
 		issuer: "Let's Encrypt R11",
 		issuer_kind: 'letsencrypt',
 		last_renewed_at: inDays(-10),
+		challenge: 'http-01',
 		serves: { kind: 'app', app_id: 'a1', app_name: 'web' },
 		...overrides
 	};
@@ -117,6 +118,20 @@ describe('badges, labels and retry', () => {
 		expect(canRetry(cert({ issuer_kind: 'letsencrypt_staging' }), NOW)).toBe(false);
 		expect(canRetry(cert({ status: 'failed', last_error: 'x' }), NOW)).toBe(true);
 		expect(canRetry(cert({ last_error: 'x' }), NOW)).toBe(true);
+	});
+
+	it('labels wildcards and uploads, and never offers ACME retries for uploads', () => {
+		expect(targetLabel({ kind: 'wildcard', purpose: 'apps', hosts: 3 })).toEqual({
+			label: 'Wildcard for every app (3 hosts)',
+			href: '/integrations/dns'
+		});
+		expect(targetLabel({ kind: 'wildcard', purpose: 'previews', hosts: 1 }).label).toBe(
+			'Wildcard for every preview (1 host)'
+		);
+		expect(issuerLabel('uploaded', 'Corp CA')).toBe('Uploaded · Corp CA');
+		const upload = cert({ cert_type: 'custom', issuer_kind: 'uploaded', expires_at: inDays(5) });
+		expect(certificateProblem(upload, NOW)).toBe('expiring');
+		expect(canRetry(upload, NOW)).toBe(false);
 	});
 });
 

@@ -43,14 +43,15 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use tokio_tungstenite::tungstenite::Message;
 use tond_common::{
-    ApiErrorBody, AppResponse, AuditLogPage, AuditVerifyReport, BackupConfigResponse,
-    CreateAppRequest, CreateCronJobRequest, CreateDatabaseRequest, CreateTokenRequest,
-    CreatedDatabaseResponse, CreatedTokenResponse, CronJobResponse, CronJobRun,
-    DatabaseCredentialsResponse, DeployKeyResponse, DeploymentResponse, IntegrationResponse,
-    ManagedDatabaseDetail, ManagedDatabaseResponse, PasswordLinkResponse,
-    PreviewDeploymentResponse, ProjectPreviewResponse, ProjectResponse, ServerSettings,
-    SnapshotResponse, StorageProviderResponse, TokenResponse, UpdateCronJobRequest,
-    UpdateSettingsRequest, UserResponse, WebhookConfigResponse, WebhookSecretResponse, code,
+    AddAppDomainRequest, ApiErrorBody, AppDomainResponse, AppResponse, AuditLogPage,
+    AuditVerifyReport, BackupConfigResponse, CreateAppRequest, CreateCronJobRequest,
+    CreateDatabaseRequest, CreateTokenRequest, CreatedDatabaseResponse, CreatedTokenResponse,
+    CronJobResponse, CronJobRun, DatabaseCredentialsResponse, DeployKeyResponse,
+    DeploymentResponse, IntegrationResponse, ManagedDatabaseDetail, ManagedDatabaseResponse,
+    PasswordLinkResponse, PreviewDeploymentResponse, ProjectPreviewResponse, ProjectResponse,
+    ServerSettings, SnapshotResponse, StorageProviderResponse, TokenResponse,
+    UpdateAppDomainRequest, UpdateCronJobRequest, UpdateSettingsRequest, UserResponse,
+    WebhookConfigResponse, WebhookSecretResponse, WwwPairRequest, code,
 };
 
 use crate::error::CliError;
@@ -612,6 +613,59 @@ impl TondClient {
         .await
     }
 
+    pub async fn list_domains(&self, app: &str) -> Result<Vec<AppDomainResponse>> {
+        self.list(&format!("/apps/{app}/domains")).await
+    }
+
+    pub async fn add_domain(
+        &self,
+        app: &str,
+        req: &AddAppDomainRequest,
+    ) -> Result<Vec<AppDomainResponse>> {
+        self.call(
+            Method::POST,
+            &format!("/apps/{app}/domains"),
+            Self::to_body(req)?,
+        )
+        .await
+    }
+
+    pub async fn add_www_pair(
+        &self,
+        app: &str,
+        req: &WwwPairRequest,
+    ) -> Result<Vec<AppDomainResponse>> {
+        self.call(
+            Method::POST,
+            &format!("/apps/{app}/domains/www-pair"),
+            Self::to_body(req)?,
+        )
+        .await
+    }
+
+    pub async fn update_app_domain(
+        &self,
+        app: &str,
+        domain: &str,
+        req: &UpdateAppDomainRequest,
+    ) -> Result<Vec<AppDomainResponse>> {
+        self.call(
+            Method::PATCH,
+            &format!("/apps/{app}/domains/{domain}"),
+            Self::to_body(req)?,
+        )
+        .await
+    }
+
+    pub async fn remove_domain(&self, app: &str, domain: &str) -> Result<Vec<AppDomainResponse>> {
+        self.call(
+            Method::DELETE,
+            &format!("/apps/{app}/domains/{domain}"),
+            None,
+        )
+        .await
+    }
+
     pub async fn update_health(
         &self,
         id: &str,
@@ -880,7 +934,7 @@ impl TondClient {
             db_type: db_type.to_string(),
             project_id: project_id.map(|s| s.to_string()),
             memory_limit,
-            public_access: false,
+            ..Default::default()
         };
         self.call(Method::POST, "/databases", Self::to_body(&body)?)
             .await

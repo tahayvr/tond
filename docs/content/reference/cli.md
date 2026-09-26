@@ -52,7 +52,8 @@ tond apps <COMMAND>
 | `tond apps restart` | Restart an app |
 | `tond apps delete` | Delete an app (asks first; --yes to skip) |
 | `tond apps env` | Set environment variables |
-| `tond apps domain` | Set custom domain for an app |
+| `tond apps domain` | Make a domain the app's primary domain (adding it if needed) |
+| `tond apps domains` | List, add and remove an app's domains (aliases, redirects, www pairs) |
 | `tond apps health` | Configure health checks for an app |
 | `tond apps drain-timeout` | Set the graceful-deploy drain timeout for an app |
 | `tond apps deployments` | Show deployment history for an app |
@@ -229,7 +230,7 @@ tond apps env <APP> <VARS...>
 
 ### tond apps domain
 
-Set custom domain for an app
+Make a domain the app's primary domain (adding it if needed)
 
 ```text
 tond apps domain <APP> <DOMAIN>
@@ -239,6 +240,102 @@ tond apps domain <APP> <DOMAIN>
 | --- | --- |
 | `<APP>` | App name or ID. |
 | `<DOMAIN>` | Domain name. |
+
+### tond apps domains
+
+List, add and remove an app's domains (aliases, redirects, www pairs)
+
+```text
+tond apps domains <COMMAND>
+```
+
+| Command | Description |
+| --- | --- |
+| `tond apps domains list` | List an app's domains |
+| `tond apps domains add` | Add a domain (the first one becomes primary, later ones aliases) |
+| `tond apps domains set-primary` | Make a domain the app's primary domain |
+| `tond apps domains redirect` | Turn a domain into a redirect to another domain of the app |
+| `tond apps domains remove` | Remove a domain (asks first; --yes to skip) |
+
+#### tond apps domains list
+
+List an app's domains
+
+```text
+tond apps domains list <APP>
+```
+
+| Argument | Description |
+| --- | --- |
+| `<APP>` | App name or ID. |
+
+#### tond apps domains add
+
+Add a domain (the first one becomes primary, later ones aliases)
+
+```text
+tond apps domains add [OPTIONS] <APP> <DOMAIN>
+```
+
+| Argument | Description |
+| --- | --- |
+| `<APP>` | App name or ID. |
+| `<DOMAIN>` | Domain name, e.g. shop.example.com. |
+
+| Option | Description |
+| --- | --- |
+| `--primary` | Make it the primary domain. |
+| `--redirect-to <REDIRECT_TO>` | Answer with a redirect to this domain of the app instead of serving. |
+| `--code <CODE>` | Redirect status: 301 or 308 (default 308). |
+| `--www` | Also add www.<domain> / <apex>, redirecting to this name. |
+
+#### tond apps domains set-primary
+
+Make a domain the app's primary domain
+
+```text
+tond apps domains set-primary <APP> <DOMAIN>
+```
+
+| Argument | Description |
+| --- | --- |
+| `<APP>` | App name or ID. |
+| `<DOMAIN>` |  |
+
+#### tond apps domains redirect
+
+Turn a domain into a redirect to another domain of the app
+
+```text
+tond apps domains redirect [OPTIONS] <APP> <DOMAIN>
+```
+
+| Argument | Description |
+| --- | --- |
+| `<APP>` | App name or ID. |
+| `<DOMAIN>` |  |
+
+| Option | Description |
+| --- | --- |
+| `--to <TO>` | Target domain (must be a serving domain of the same app). Required. |
+| `--code <CODE>` | 301 or 308 (default 308). |
+
+#### tond apps domains remove
+
+Remove a domain (asks first; --yes to skip)
+
+```text
+tond apps domains remove [OPTIONS] <APP> <DOMAIN>
+```
+
+| Argument | Description |
+| --- | --- |
+| `<APP>` | App name or ID. |
+| `<DOMAIN>` |  |
+
+| Option | Description |
+| --- | --- |
+| `-y, --yes` | Don't ask for confirmation (required when stdin is not a terminal). |
 
 ### tond apps health
 

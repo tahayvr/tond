@@ -1,0 +1,385 @@
+// handlers/dns_providers.rs — DNS providers for ACME DNS-01 (wildcards)
+//
+//   GET    /api/v1/dns-providers            list (tokens are never returned)
+//   POST   /api/v1/dns-providers            create {name, kind, zones, token, config}
+//   PATCH  /api/v1/dns-providers/{id}       update; `token` replaced only when sent
+//   DELETE /api/v1/dns-providers/{id}
+//   POST   /api/v1/dns-providers/{id}/test  check the token can see every zone
+//
+// Adding, changing or removing a provider bumps route_state (SQL triggers on
+// dns_providers), so tond-proxy reloads the zone list and orders (or stops
+// ordering) wildcard certificates. See dns_providers/ for the design.
+
+use axum::{
+    Json,
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+};
+use tond_common::*;
+
+use crate::audit_log::{AuditEntry, record};
+use crate::auth::{Authz, RateLimit, scope};
+use crate::dns_providers::{self, clean_zones, clients::Reqwest, kind_allowed, to_response};
+use crate::error::AppError;
+use crate::proxy_link;
+use crate::secret_key::{self, Purpose};
+use crate::state::AppState;
+
+fn invalid(msg: impl Into<String>) -> AppError {
+    AppError(TondError::InvalidInput(msg.into()))
+}
+
+fn field(name: &str, msg: impl Into<String>) -> AppError {
+    AppError(TondError::invalid_field(name, msg))
+}
+
+async fn fetch(state: &AppState, id: &str) -> Result<DnsProvider, AppError> {
+    sqlx::query_as::<_, DnsProvider>("SELECT * FROM dns_providers WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError(TondError::NotFound(format!("DNS provider {id}"))))
+}
+
+fn check_config(kind: DnsProviderKind, config: &DnsProviderConfig) -> Result<(), AppError> {
+    if kind == DnsProviderKind::Route53
+        && config
+            .access_key_id
+            .as_deref()
+            .is_none_or(|k| k.trim().is_empty())
+    {
+        return Err(AppError(TondError::invalid_field(
+            "config.access_key_id",
+            "Route 53 needs the access key id (the secret access key goes in the token field)",
+        )));
+    }
+    if let Some(url) = &config.url
+        && !url.is_empty()
+        && !(url.starts_with("http://") || url.starts_with("https://"))
+    {
+        return Err(AppError(TondError::invalid_field(
+            "config.url",
+            "The URL must start with http:// or https://",
+        )));
+    }
+    Ok(())
+}
+
+/// Zones already claimed by another provider (one provider per zone keeps
+/// "who publishes this record" unambiguous).
+async fn check_zone_overlap(
+    state: &AppState,
+    zones: &[String],
+    except: Option<&str>,
+) -> Result<(), AppError> {
+    for other in dns_providers::list(&state.db).await? {
+        if Some(other.id.as_str()) == except {
+            continue;
+        }
+        let theirs = dns_providers::parse_zones(&other.zones);
+        if let Some(z) = zones.iter().find(|z| theirs.contains(z)) {
+            return Err(AppError(
+                TondError::Conflict(format!(
+                    "{z} is already handled by the DNS provider '{}'",
+                    other.name
+                ))
+                .with_hint("Add the zone to that provider, or remove it there first."),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub async fn list_dns_providers(
+    _rate: RateLimit,
+    _auth: Authz<scope::AppsRead>,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, AppError> {
+    let list: Vec<DnsProviderResponse> = dns_providers::list(&state.db)
+        .await?
+        .into_iter()
+        .map(to_response)
+        .collect();
+    Ok((StatusCode::OK, Json(ApiResponse::ok(list))))
+}
+
+pub async fn create_dns_provider(
+    _rate: RateLimit,
+    auth: Authz<scope::SettingsWrite>,
+    State(state): State<AppState>,
+    Json(req): Json<CreateDnsProviderRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(field("name", "Give the provider a name"));
+    }
+    if !kind_allowed(req.kind) {
+        return Err(invalid(format!(
+            "The {} provider is for tests only and is disabled on this server",
+            req.kind.as_str()
+        )));
+    }
+    if req.token.trim().is_empty() && req.kind != DnsProviderKind::Challtestsrv {
+        return Err(field("token", "Paste the API token"));
+    }
+    check_config(req.kind, &req.config)?;
+    let zones = clean_zones(&req.zones).map_err(|m| field("zones", m))?;
+    check_zone_overlap(&state, &zones, None).await?;
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO dns_providers (id, name, kind, zones, config, token_enc, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(name)
+    .bind(req.kind.as_str())
+    .bind(serde_json::to_string(&zones).unwrap_or_else(|_| "[]".into()))
+    .bind(serde_json::to_string(&req.config).unwrap_or_else(|_| "{}".into()))
+    .bind(secret_key::encrypt(Purpose::DnsProviderToken, req.token.trim())?)
+    .bind(&now)
+    .bind(&now)
+    .execute(&state.db)
+    .await?;
+    tokio::spawn(proxy_link::request_certs(None));
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("dns_provider_create")
+            .resource("dns_provider", &id, name)
+            .detail(format!(
+                "kind={} zones={}",
+                req.kind.as_str(),
+                zones.join(",")
+            )),
+    )
+    .await;
+    let row = fetch(&state, &id).await?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(to_response(row)))))
+}
+
+pub async fn update_dns_provider(
+    _rate: RateLimit,
+    auth: Authz<scope::SettingsWrite>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateDnsProviderRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let row = fetch(&state, &id).await?;
+    let kind = DnsProviderKind::parse(&row.kind).unwrap_or(DnsProviderKind::Cloudflare);
+    let name = match &req.name {
+        Some(n) if n.trim().is_empty() => return Err(field("name", "Give the provider a name")),
+        Some(n) => n.trim().to_string(),
+        None => row.name.clone(),
+    };
+    let zones = match &req.zones {
+        Some(z) => {
+            let z = clean_zones(z).map_err(|m| field("zones", m))?;
+            check_zone_overlap(&state, &z, Some(&id)).await?;
+            serde_json::to_string(&z).unwrap_or_else(|_| "[]".into())
+        }
+        None => row.zones.clone(),
+    };
+    let config = match &req.config {
+        Some(c) => {
+            check_config(kind, c)?;
+            serde_json::to_string(c).unwrap_or_else(|_| "{}".into())
+        }
+        None => row.config.clone(),
+    };
+    let token_enc = match req.token.as_deref().map(str::trim) {
+        Some(t) if !t.is_empty() => secret_key::encrypt(Purpose::DnsProviderToken, t)?,
+        _ => row.token_enc.clone(),
+    };
+    sqlx::query(
+        "UPDATE dns_providers SET name = ?, zones = ?, config = ?, token_enc = ?, updated_at = ?,
+                last_error = NULL WHERE id = ?",
+    )
+    .bind(&name)
+    .bind(&zones)
+    .bind(&config)
+    .bind(&token_enc)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(&id)
+    .execute(&state.db)
+    .await?;
+    tokio::spawn(proxy_link::request_certs(None));
+    let mut changed: Vec<&str> = Vec::new();
+    if req.name.is_some() {
+        changed.push("name");
+    }
+    if req.zones.is_some() {
+        changed.push("zones");
+    }
+    if req.config.is_some() {
+        changed.push("config");
+    }
+    if req.token.as_deref().is_some_and(|t| !t.trim().is_empty()) {
+        changed.push("token");
+    }
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("dns_provider_update")
+            .resource("dns_provider", &id, &name)
+            .detail(format!("changed={}", changed.join(","))),
+    )
+    .await;
+    let row = fetch(&state, &id).await?;
+    Ok((StatusCode::OK, Json(ApiResponse::ok(to_response(row)))))
+}
+
+pub async fn delete_dns_provider(
+    _rate: RateLimit,
+    auth: Authz<scope::SettingsWrite>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let row = fetch(&state, &id).await?;
+    sqlx::query("DELETE FROM dns_providers WHERE id = ?")
+        .bind(&id)
+        .execute(&state.db)
+        .await?;
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("dns_provider_delete").resource("dns_provider", &id, &row.name),
+    )
+    .await;
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(serde_json::json!({ "deleted": id }))),
+    ))
+}
+
+pub async fn test_dns_provider(
+    _rate: RateLimit,
+    _auth: Authz<scope::SettingsWrite>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let row = fetch(&state, &id).await?;
+    let client = dns_providers::client(&row).map_err(|e| invalid(format!("{e:#}")))?;
+    let mut zones = Vec::new();
+    for zone in dns_providers::parse_zones(&row.zones) {
+        let (ok, message) = match client.check_zone(&Reqwest, &zone).await {
+            Ok(()) => (true, format!("{} can manage {zone}", client.kind.label())),
+            Err(e) => (false, format!("{e:#}")),
+        };
+        zones.push(DnsZoneCheck { zone, ok, message });
+    }
+    let ok = zones.iter().all(|z| z.ok);
+    let error = (!ok).then(|| {
+        zones
+            .iter()
+            .filter(|z| !z.ok)
+            .map(|z| z.message.clone())
+            .collect::<Vec<_>>()
+            .join("; ")
+    });
+    let _ = sqlx::query("UPDATE dns_providers SET last_error = ? WHERE id = ?")
+        .bind(&error)
+        .bind(&id)
+        .execute(&state.db)
+        .await;
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(DnsProviderTestResult { ok, zones })),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::to_bytes;
+
+    use super::*;
+    use crate::auth::Principal;
+
+    fn admin<R: crate::auth::principal::ScopeReq>() -> Authz<R> {
+        Authz::unchecked(Principal::test_user(Role::Admin))
+    }
+
+    fn cloudflare(zones: &[&str]) -> CreateDnsProviderRequest {
+        CreateDnsProviderRequest {
+            name: "Cloudflare".into(),
+            kind: DnsProviderKind::Cloudflare,
+            zones: zones.iter().map(|z| z.to_string()).collect(),
+            token: "cf-secret-token".into(),
+            config: DnsProviderConfig::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn tokens_are_encrypted_and_never_returned() {
+        let state = AppState::for_tests().await;
+        let resp = create_dns_provider(
+            RateLimit,
+            admin(),
+            State(state.clone()),
+            Json(cloudflare(&["Example.com"])),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create: {}", e.0))
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap_or_default();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("cf-secret-token"), "{text}");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        assert_eq!(json["data"]["token_set"], true);
+        assert_eq!(json["data"]["zones"][0], "example.com");
+
+        let stored: String = sqlx::query_scalar("SELECT token_enc FROM dns_providers")
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_default();
+        assert!(!stored.contains("cf-secret-token"));
+        assert_eq!(
+            secret_key::decrypt(Purpose::DnsProviderToken, &stored)
+                .ok()
+                .as_deref(),
+            Some("cf-secret-token")
+        );
+        let version: i64 = sqlx::query_scalar("SELECT version FROM route_state")
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_default();
+        assert!(version > 0, "tond-proxy reloads the zone list");
+    }
+
+    #[tokio::test]
+    async fn a_zone_belongs_to_one_provider_and_route53_needs_its_key_id() {
+        let state = AppState::for_tests().await;
+        let _ = create_dns_provider(
+            RateLimit,
+            admin(),
+            State(state.clone()),
+            Json(cloudflare(&["example.com"])),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create: {}", e.0));
+        let dup = create_dns_provider(
+            RateLimit,
+            admin(),
+            State(state.clone()),
+            Json(cloudflare(&["example.com"])),
+        )
+        .await;
+        assert!(dup.is_err(), "the zone is taken");
+        let r53 = create_dns_provider(
+            RateLimit,
+            admin(),
+            State(state),
+            Json(CreateDnsProviderRequest {
+                kind: DnsProviderKind::Route53,
+                ..cloudflare(&["other.com"])
+            }),
+        )
+        .await;
+        assert!(matches!(&r53, Err(AppError(e)) if e.field() == Some("config.access_key_id")));
+    }
+}

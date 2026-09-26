@@ -174,7 +174,12 @@ pub fn entries() -> Vec<Doc> {
         e("POST /api/v1/apps/{id}/start", "Start a stopped app").message(),
         e("POST /api/v1/apps/{id}/restart", "Restart an app").message(),
         e("GET /api/v1/apps/{id}/logs", "Recent deploy and container logs").object("`{deploy_logs, container_logs}`"),
-        e("PUT /api/v1/apps/{id}/domain", "Set an app's custom domain").object("`{message, warning?}`; certificate provisioning is queued."),
+        e("PUT /api/v1/apps/{id}/domain", "Make a domain the app's primary domain").object("`{message, domain, warning?}`; the domain is added if needed, the previous primary stays as an alias, and certificate provisioning is queued."),
+        e("GET /api/v1/apps/{id}/domains", "List an app's domains (primary, aliases, redirects)").returns::<Vec<AppDomainResponse>>(),
+        e("POST /api/v1/apps/{id}/domains", "Add a domain to an app").created().returns::<Vec<AppDomainResponse>>(),
+        e("POST /api/v1/apps/{id}/domains/www-pair", "Add a www/apex pair, one redirecting to the other").created().returns::<Vec<AppDomainResponse>>(),
+        e("PATCH /api/v1/apps/{id}/domains/{domain}", "Change a domain's kind, redirect target or code").returns::<Vec<AppDomainResponse>>(),
+        e("DELETE /api/v1/apps/{id}/domains/{domain}", "Remove a domain from an app").returns::<Vec<AppDomainResponse>>(),
         e("PUT /api/v1/apps/{id}/health", "Configure health checks").message(),
         e("PUT /api/v1/apps/{id}/port", "Change the container port").returns::<AppResponse>(),
         e("PUT /api/v1/apps/{id}/readiness", "Configure readiness (when a deploy counts as up)").returns::<AppResponse>(),
@@ -238,6 +243,13 @@ pub fn entries() -> Vec<Doc> {
         // ── Certificates, settings, templates ──
         e("GET /api/v1/certs", "TLS certificates and their status").returns::<Vec<CertificateResponse>>(),
         e("POST /api/v1/certs/{domain}/retry", "Retry issuing a certificate").object("`{message, domain}`"),
+        e("POST /api/v1/certs/custom", "Upload a certificate for a domain").created().returns::<Option<CertificateResponse>>(),
+        e("DELETE /api/v1/certs/custom/{domain}", "Remove an uploaded certificate").object("`{\"deleted\": \"<domain>\"}`"),
+        e("GET /api/v1/dns-providers", "List DNS providers (ACME DNS-01)").returns::<Vec<DnsProviderResponse>>(),
+        e("POST /api/v1/dns-providers", "Add a DNS provider").created().returns::<DnsProviderResponse>(),
+        e("PATCH /api/v1/dns-providers/{id}", "Update a DNS provider").returns::<DnsProviderResponse>(),
+        e("DELETE /api/v1/dns-providers/{id}", "Delete a DNS provider").object(DELETED),
+        e("POST /api/v1/dns-providers/{id}/test", "Check a DNS provider can manage its zones").returns::<DnsProviderTestResult>(),
         e("GET /api/v1/settings", "Server settings").returns::<ServerSettings>(),
         e("PUT /api/v1/settings", "Update server settings").returns::<ServerSettings>(),
         e("GET /api/v1/settings/retention", "Data retention rules and table sizes").returns::<RetentionResponse>(),
@@ -271,6 +283,11 @@ pub fn entries() -> Vec<Doc> {
         e("DELETE /api/v1/gitlab-tokens/{id}", "Delete a GitLab access token").null(),
         e("GET /api/v1/gitlab-tokens/{id}/repos", "Projects a GitLab token can access").returns::<Vec<GitLabRepoResponse>>(),
         e("GET /api/v1/gitlab-tokens/{id}/repos/{project_id}/branches", "Branches of a GitLab project").returns::<Vec<GitLabBranchResponse>>(),
+        e("GET /api/v1/gitea-tokens", "List Gitea/Forgejo access tokens").returns::<Vec<GiteaTokenResponse>>(),
+        e("POST /api/v1/gitea-tokens", "Add a Gitea/Forgejo access token").created().returns::<GiteaTokenResponse>()
+            .about("The token is checked against <base_url>/api/v1/user first. Linked to an app it clones private repositories and reports commit statuses and pull request previews."),
+        e("DELETE /api/v1/gitea-tokens/{id}", "Delete a Gitea/Forgejo access token").null(),
+        e("PUT /api/v1/apps/{id}/gitea-token", "Link or unlink a Gitea/Forgejo token and an app").returns::<AppResponse>(),
         e("PUT /api/v1/apps/{id}/gitlab-token", "Use a GitLab token for an app's repository").returns::<AppResponse>(),
         // ── Push webhooks (called by the forge) ──
         e("POST /api/v1/webhooks/github/{app_id}", "GitHub push/PR webhook")
@@ -383,6 +400,17 @@ pub fn entries() -> Vec<Doc> {
         e("POST /api/v1/databases/{id}/start", "Start a database").message(),
         e("POST /api/v1/databases/{id}/redeploy", "Recreate a database's container (data kept)").returns::<ManagedDatabaseDetail>(),
         e("GET /api/v1/databases/{id}/backups", "A database's backups").returns::<Vec<SnapshotResponse>>(),
+        e("GET /api/v1/databases/catalog", "Engines, versions and image variants a database can run").returns::<Vec<DbCatalogEntry>>(),
+        e("GET /api/v1/databases/{id}/backup-schedule", "A database's backup schedule and backup health").returns::<DatabaseBackupStatus>(),
+        e("PUT /api/v1/databases/{id}/backup-schedule", "Set or turn off a database's backup schedule").returns::<DatabaseBackupStatus>()
+            .about("Scheduled backups run in the backup scheduler (UTC cron) and keep `retention` (1–365) backups; a failure fires the \"backup failed\" alert for that database."),
+        e("GET /api/v1/databases/{id}/extensions", "PostgreSQL extensions offered for a database").returns::<Vec<DatabaseExtension>>(),
+        e("POST /api/v1/databases/{id}/extensions", "Enable a PostgreSQL extension").message(),
+        e("POST /api/v1/databases/{id}/upgrade", "Start a major-version upgrade").accepted().returns::<DbUpgradeState>()
+            .about("Admin only. Backs up, loads the data into a fresh data directory of the new version, switches, and keeps the old data until confirmed. Downgrades are refused."),
+        e("POST /api/v1/databases/{id}/upgrade/confirm", "Keep an upgraded version (deletes the old data)").message(),
+        e("POST /api/v1/databases/{id}/upgrade/rollback", "Roll an upgrade back to the old version and data").message(),
+        e("POST /api/v1/databases/{id}/upgrade/dismiss", "Clear a failed upgrade's state").null(),
         e("POST /api/v1/databases/{id}/backups", "Back up a database now").created().returns::<SnapshotResponse>(),
         e("PATCH /api/v1/databases/{id}/credentials", "Change a database's credentials").object("`{database, changed}`"),
         e("GET /api/v1/databases/{id}/credentials", "Reveal a database's credentials").returns::<DatabaseCredentialsResponse>(),
@@ -417,5 +445,8 @@ pub fn entries() -> Vec<Doc> {
             .object("`{pre_restore_snapshot_id, message}`; a snapshot of the current state is taken first."),
         e("POST /api/v1/snapshots/{id}/restore-app", "Restore one app from a snapshot").object("`{message, …}`"),
         e("POST /api/v1/snapshots/{id}/restore-database", "Restore one database from a snapshot").returns::<RestoreDatabaseResponse>(),
+        e("POST /api/v1/snapshots/{id}/restore-new-database", "Restore one database of a snapshot into a new database")
+            .created()
+            .object("`{message, database}`; the original database is not touched."),
     ]
 }

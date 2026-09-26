@@ -53,9 +53,7 @@ pub fn cli_markdown(root: &Command) -> String {
 }
 
 fn visible_subcommands(cmd: &Command) -> Vec<&Command> {
-    cmd.get_subcommands()
-        .filter(|c| !c.is_hide_set())
-        .collect()
+    cmd.get_subcommands().filter(|c| !c.is_hide_set()).collect()
 }
 
 fn text(s: Option<&clap::builder::StyledStr>) -> Option<String> {
@@ -321,7 +319,10 @@ mod tests {
     /// `tond help exit-codes --json` prints.
     #[test]
     fn the_published_exit_codes_are_up_to_date() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/src/data/exit-codes.json");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/src/data/exit-codes.json"
+        );
         let committed: serde_json::Value = std::fs::read_to_string(path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())

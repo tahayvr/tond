@@ -9,8 +9,11 @@
 // when route_state.version moved and replies with the loaded version,
 // `certs` pokes the certificate loop, `stats` reports process/loop stats, `traffic` the per-route request
 // counters,
-// `ack` drops a delivered cert event) while forwarding every certificate
-// result from the Outbox until tond-server acknowledges it.
+// `ack` drops a delivered cert event, `install_cert` validates and serves an
+// uploaded certificate, `remove_cert` deletes one, `dns_result` answers a
+// DNS-01 record request) while forwarding every certificate result from the
+// Outbox until tond-server acknowledges it, and the DNS-01 record requests
+// of running ACME orders (dns01.rs; the newest connection carries them).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -23,10 +26,13 @@ use tokio::sync::Notify;
 use tond_common::ProxyStats;
 use tond_common::procstat::ProcessSample;
 use tond_common::proxy_control::{
-    MAX_LINE_BYTES, PROXY_SOCKET_NAME, ProxyMessage, ProxyRequest, ReplyBody, encode_line,
+    InstalledCert, MAX_LINE_BYTES, PROXY_SOCKET_NAME, ProxyMessage, ProxyRequest, ReplyBody,
+    encode_line,
 };
 
 use crate::TondProxy;
+use crate::certs::CertStore;
+use crate::dns01::DnsBridge;
 use crate::issuance::Outbox;
 use crate::meters;
 
@@ -34,6 +40,8 @@ pub struct Control {
     pub proxy: TondProxy,
     pub outbox: Arc<Outbox>,
     pub cert_wake: Arc<Notify>,
+    pub cert_store: CertStore,
+    pub dns: Arc<DnsBridge>,
     pub started: Instant,
 }
 
@@ -167,6 +175,57 @@ async fn answer(ctl: &Control, request: ProxyRequest) -> Option<(u64, ReplyBody)
             ctl.outbox.ack(seq);
             None
         }
+        ProxyRequest::InstallCert {
+            id,
+            domain,
+            cert_pem,
+            key_pem,
+        } => {
+            let body = match ctl
+                .cert_store
+                .install_upload(&domain, cert_pem.as_bytes(), key_pem.as_bytes())
+                .await
+            {
+                Ok(details) => {
+                    tracing::info!(
+                        "[cert] Serving an uploaded certificate for {domain} (expires {})",
+                        details.expires_at
+                    );
+                    let (cert_path, key_path) = ctl.cert_store.cert_paths(&domain);
+                    ReplyBody::CertInstalled {
+                        cert: InstalledCert {
+                            domain,
+                            cert_path: cert_path.to_string_lossy().to_string(),
+                            key_path: key_path.to_string_lossy().to_string(),
+                            issued_at: details.issued_at,
+                            expires_at: details.expires_at,
+                            issuer: details.issuer,
+                            names: details.names,
+                        },
+                    }
+                }
+                Err(e) => ReplyBody::Error {
+                    message: format!("{e:#}"),
+                },
+            };
+            Some((id, body))
+        }
+        ProxyRequest::RemoveCert { id, domain } => {
+            let body = match ctl.cert_store.remove(&domain).await {
+                Ok(()) => {
+                    ctl.cert_wake.notify_one();
+                    ReplyBody::Ok
+                }
+                Err(e) => ReplyBody::Error {
+                    message: format!("{e:#}"),
+                },
+            };
+            Some((id, body))
+        }
+        ProxyRequest::DnsResult { id, error } => {
+            ctl.dns.resolve(id, error);
+            None
+        }
     }
 }
 
@@ -182,6 +241,7 @@ async fn connection(stream: UnixStream, ctl: &Control) -> Result<()> {
     .await?;
 
     let mut events = ctl.outbox.subscribe();
+    let mut dns_requests = ctl.dns.attach();
     let mut sent_up_to = 0;
     // Everything still unacknowledged from earlier connections.
     for (seq, report) in ctl.outbox.pending_after(0) {
@@ -207,6 +267,9 @@ async fn connection(stream: UnixStream, ctl: &Control) -> Result<()> {
                 if let Some((id, body)) = answer(ctl, request).await {
                     write(&mut write_half, &ProxyMessage::Reply { id, body }).await?;
                 }
+            }
+            Some(msg) = dns_requests.recv() => {
+                write(&mut write_half, &msg).await?;
             }
             changed = events.changed() => {
                 if changed.is_err() {

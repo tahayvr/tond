@@ -7,7 +7,6 @@
 		startApp,
 		restartApp,
 		deleteApp,
-		updateDomain,
 		updateHealth,
 		updateDrainTimeout,
 		updateAppResources,
@@ -92,6 +91,7 @@
 	import RequestMetricsPanel from '$lib/components/metrics/request-metrics-panel.svelte';
 	import AppHistory from '$lib/components/tabs/app-page/app-history.svelte';
 	import AppWebhooks from '$lib/components/tabs/app-page/app-webhooks.svelte';
+	import AppGitReporting from '$lib/components/tabs/app-page/app-git-reporting.svelte';
 	import { safeUrl } from '$lib/utils';
 	import { SecretInput } from '$lib/components/ui/secret-input/index.js';
 	import Github from '~icons/ri/github-fill';
@@ -137,7 +137,6 @@
 	);
 
 	// Domain form
-	let certRefreshKey = $state(0);
 
 	// Health form
 	let healthPath = $state('');
@@ -379,11 +378,9 @@
 		await startDeploy();
 	}
 
-	/** Domain card save; errors are shown in the card, so this rethrows. */
-	async function handleUpdateDomain(domain: string) {
-		await updateDomain(appId, domain);
+	/** The domain card changed the domains; the primary (app.domain) may have moved. */
+	async function handleDomainsChanged() {
 		await loadApp();
-		certRefreshKey += 1;
 	}
 
 	async function handleUpdateHealth() {
@@ -1073,12 +1070,7 @@
 
 				<!-- Domain tab -->
 				{#if viewAllowed && activeTab === 'domain'}
-					<AppDomain
-						{app}
-						{certRefreshKey}
-						onUpdate={handleUpdateDomain}
-						canEdit={can('apps:write')}
-					/>
+					<AppDomain {app} onChanged={handleDomainsChanged} canEdit={can('apps:write')} />
 				{/if}
 
 				<!-- Databases: what this app can reach (project + links) -->
@@ -1565,6 +1557,9 @@
 
 						{#if canEditApp}
 							<AppWebhooks appId={app.id} />
+							{#if app.source_type === 'git'}
+								<AppGitReporting {app} />
+							{/if}
 						{:else}
 							<p class="text-sm text-muted-foreground">
 								Webhook URLs and secrets are shown to users who can change this app's settings.
