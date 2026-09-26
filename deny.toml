@@ -1,0 +1,85 @@
+# cargo-deny configuration — supply-chain gates for the Rust workspace.
+# Run with `just audit` (or `just audit-rust`); CI runs it in the manual ci.yml.
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Tond ships Linux binaries only (x86_64 and aarch64). Restricting the graph to
+# those targets keeps Windows/macOS-only crates out of the license and ban checks.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+all-features = true
+
+[output]
+feature-depth = 1
+
+# ── Advisories (RustSec) ─────────────────────────────────────────────────────
+[advisories]
+# Unmaintained crates are reported for workspace dependencies' whole tree, but
+# only fail for crates we depend on directly.
+unmaintained = "workspace"
+yanked = "deny"
+# Every ignored advisory needs a reason and a review-by date. Remove the entry
+# once the fix ships; re-evaluate (and move the date) if it has not by then.
+ignore = [
+    # rsa 0.9 "Marvin Attack": timing side channel in RSA *decryption*
+    # (PKCS#1 v1.5), no patched release yet. It reaches us only through
+    # jsonwebtoken's rust_crypto backend, which Tond uses to *sign* GitHub App
+    # JWTs (RS256) on the server — no RSA decryption, no attacker-observable
+    # timing of private-key operations. Review by 2027-03-31.
+    { id = "RUSTSEC-2023-0071", reason = "rsa via jsonwebtoken is only used for RS256 signing of GitHub App JWTs; the Marvin attack targets decryption timing. No fixed release. Review by 2027-03-31." },
+]
+
+# ── Licenses ────────────────────────────────────────────────────────────────
+[licenses]
+# Permissive licenses compatible with distributing Apache-2.0 binaries.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Unlicense",
+    "Unicode-3.0",
+    # webpki-roots / webpki-root-certs (Mozilla's CA bundle data)
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+exceptions = []
+
+[licenses.private]
+# Tond's own crates are not published to crates.io.
+ignore = true
+
+# ── Bans ────────────────────────────────────────────────────────────────────
+[bans]
+# Duplicate versions are common in a tree this size; surface them without
+# failing the build.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+# Crypto stack: rustls with the aws-lc-rs provider (installed process-wide by
+# tond_common::install_crypto_provider) for clients and ACME, and OpenSSL only
+# for Pingora's TLS listener. Duplicate crypto crate versions (sha1/sha2/hmac/
+# rand/...) show up as `multiple-versions` warnings. Known second provider:
+# lettre's `tokio1-rustls-tls` enables rustls' `ring` feature, so ring is
+# compiled in next to aws-lc-rs (unused at runtime — the installed default
+# provider wins). Switching lettre to its aws-lc-rs feature would drop it.
+deny = [
+    { crate = "native-tls", reason = "use rustls (aws-lc-rs) for clients; OpenSSL only via Pingora" },
+    { crate = "openssl-sys", wrappers = ["openssl", "pingora-openssl", "tokio-openssl"], reason = "OpenSSL is reserved for Pingora's TLS listener" },
+]
+skip = []
+skip-tree = []
+
+# ── Sources ─────────────────────────────────────────────────────────────────
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
