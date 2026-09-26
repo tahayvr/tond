@@ -31,6 +31,7 @@ use crate::{
     auth::{RateLimit, RequireAuth},
     deploy, docker,
     error::AppError,
+    handlers::webhooks::sanitize_provider_url,
     state::AppState,
 };
 
@@ -80,7 +81,18 @@ pub async fn create_preview(
     let pr_number = body_ref.and_then(|b| b.pr_number);
     let head_sha = body_ref.and_then(|b| b.head_sha.clone());
     let head_ref = body_ref.and_then(|b| b.head_ref.clone());
-    let pr_url = body_ref.and_then(|b| b.pr_url.clone());
+    let pr_url = match body_ref.and_then(|b| b.pr_url.as_deref()) {
+        None => None,
+        Some(raw) => match sanitize_provider_url(Some(raw)) {
+            Some(url) => Some(url),
+            None => {
+                return AppError(TondError::InvalidInput(
+                    "pr_url must be an https:// URL".to_string(),
+                ))
+                .into_response();
+            }
+        },
+    };
 
     let ttl_seconds = ttl_hours * 3600;
     let slug = random_slug();
@@ -477,6 +489,34 @@ mod tests {
         .unwrap_or_else(|err| panic!("failed to seed preview app: {err}"));
 
         app
+    }
+
+    #[tokio::test]
+    async fn create_preview_rejects_non_https_pr_urls() {
+        let state = test_state().await;
+        let app = seed_preview_app(&state, "frontend", "compose").await;
+
+        let response = create_preview(
+            RateLimit,
+            RequireAuth,
+            State(state.clone()),
+            Path(app.id.clone()),
+            Some(Json(CreatePreviewRequest {
+                ttl_hours: None,
+                pr_number: Some(1),
+                head_sha: None,
+                head_ref: None,
+                pr_url: Some("javascript:alert(document.cookie)".to_string()),
+            })),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM preview_deployments")
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_else(|err| panic!("failed to count previews: {err}"));
+        assert_eq!(rows, 0, "no preview may be stored with a javascript: link");
     }
 
     #[tokio::test]

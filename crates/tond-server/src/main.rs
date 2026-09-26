@@ -251,8 +251,16 @@ async fn main() -> Result<()> {
             put(handlers::git::update_auto_deploy),
         )
         .route(
+            "/api/apps/{id}/webhook",
+            get(handlers::git::get_webhook_config),
+        )
+        .route(
             "/api/apps/{id}/webhook-secret",
             put(handlers::git::update_webhook_secret),
+        )
+        .route(
+            "/api/apps/{id}/webhook-secret/rotate",
+            post(handlers::git::rotate_webhook_secret),
         )
         .route(
             "/api/apps/{id}/deploy-key",
@@ -359,6 +367,10 @@ async fn main() -> Result<()> {
         .route(
             "/api/webhooks/gitlab/{app_id}",
             post(handlers::webhooks::gitlab_webhook),
+        )
+        .route(
+            "/api/webhooks/gitea/{app_id}",
+            post(handlers::webhooks::gitea_webhook),
         )
         .route(
             "/api/webhooks/generic/{app_id}",

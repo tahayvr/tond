@@ -990,7 +990,6 @@ export const MOCK_GITHUB_APPS: GitHubApp[] = [
 		slug: 'tond-dev',
 		installation_id: 78901234,
 		installed: true,
-		install_url: 'https://github.com/apps/tond-dev/installations/new',
 		created_at: '2025-03-01T00:00:00.000Z',
 		updated_at: '2025-03-01T00:00:00.000Z'
 	}

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { safeUrl } from '$lib/utils';
 	import { Badge } from '$lib/components/ui/badge/index.js';
 	import type { App } from '$lib/api';
 
@@ -184,7 +185,7 @@
 					<span class="text-muted-foreground">Domain:</span>
 					{#if app.domain}
 						<a
-							href="https://{app.domain}"
+							href={safeUrl(`https://${app.domain}`)}
 							target="_blank"
 							rel="noopener noreferrer"
 							class="font-mono text-xs text-muted-foreground underline hover:text-foreground"

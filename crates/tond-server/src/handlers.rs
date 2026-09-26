@@ -307,13 +307,15 @@ pub async fn create_app(
         app.compose_content = Some(content);
     }
     if let Some(dir) = req.base_dir {
-        app.base_dir = Some(dir);
+        let dir = deploy::validate_base_dir(&dir)
+            .map_err(|e| AppError(TondError::InvalidInput(e.to_string())))?;
+        app.base_dir = (!dir.is_empty()).then_some(dir);
     }
     app.static_build = if req.static_build { 1 } else { 0 };
 
     sqlx::query(
-		"INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, status, env_vars, memory_limit, cpu_limit, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, auto_deploy, watch_branch, project_id, github_app_id, registry_credential_id, dockerfile_content, compose_content, base_dir, static_build, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		"INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, status, env_vars, memory_limit, cpu_limit, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, project_id, github_app_id, registry_credential_id, dockerfile_content, compose_content, base_dir, static_build, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 	)
 	.bind(&app.id)
 	.bind(&app.name)
@@ -334,6 +336,7 @@ pub async fn create_app(
 	.bind(&app.volumes)
 	.bind(app.drain_timeout)
 	.bind(&app.build_method)
+	.bind(&app.webhook_secret)
 	.bind(app.auto_deploy)
 	.bind(&app.watch_branch)
 	.bind(&app.project_id)

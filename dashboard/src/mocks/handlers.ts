@@ -122,6 +122,42 @@ let cronJobs: CronJob[] = structuredClone(MOCK_CRON_JOBS);
 const cronRuns: Record<string, CronJobRun[]> = structuredClone(MOCK_CRON_RUNS);
 let registryCredentials: RegistryCredential[] = structuredClone(MOCK_REGISTRY_CREDENTIALS);
 let githubApps: GitHubApp[] = structuredClone(MOCK_GITHUB_APPS);
+
+// Per-app webhook secrets (the real server generates one at app creation).
+const webhookSecrets: Record<string, string> = {};
+
+function randomHex(bytes: number): string {
+	const buf = new Uint8Array(bytes);
+	crypto.getRandomValues(buf);
+	return Array.from(buf, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function webhookConfig(app: App) {
+	webhookSecrets[app.id] ??= randomHex(32);
+	const paths = {
+		github: `/api/webhooks/github/${app.id}`,
+		gitlab: `/api/webhooks/gitlab/${app.id}`,
+		gitea: `/api/webhooks/gitea/${app.id}`,
+		generic: `/api/webhooks/generic/${app.id}`
+	};
+	const domain = MOCK_SETTINGS.dashboard_domain.trim();
+	const urls = domain
+		? {
+				github: `https://${domain}${paths.github}`,
+				gitlab: `https://${domain}${paths.gitlab}`,
+				gitea: `https://${domain}${paths.gitea}`,
+				generic: `https://${domain}${paths.generic}`
+			}
+		: null;
+	return {
+		app_id: app.id,
+		paths,
+		urls,
+		secret: webhookSecrets[app.id],
+		auto_deploy: app.auto_deploy,
+		watch_branch: app.watch_branch
+	};
+}
 let users = structuredClone(MOCK_USERS);
 let integrations: Integration[] = structuredClone(MOCK_INTEGRATIONS);
 let storageProviders: StorageProvider[] = structuredClone(MOCK_STORAGE_PROVIDERS);
@@ -665,11 +701,35 @@ export const handlers = [
 		return ok(newKey);
 	}),
 
-	http.put('/api/apps/:id/webhook-secret', async ({ params }) => {
+	http.get('/api/apps/:id/webhook', async ({ params }) => {
 		await delay(LATENCY);
-		const app = apps.find((a) => a.id === params.id);
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
 		if (!app) return err('App not found', 404);
-		return ok(app);
+		return ok(webhookConfig(app));
+	}),
+
+	http.put('/api/apps/:id/webhook-secret', async ({ params, request }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
+		if (!app) return err('App not found', 404);
+		const body = (await request.json()) as { secret?: unknown };
+		const secret = typeof body.secret === 'string' ? body.secret.trim() : '';
+		if (secret.length < 16) {
+			return err(
+				'Invalid input: webhook secret must be at least 16 characters (rotate it to have one generated)',
+				400
+			);
+		}
+		webhookSecrets[app.id] = secret;
+		return ok(webhookConfig(app));
+	}),
+
+	http.post('/api/apps/:id/webhook-secret/rotate', async ({ params }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
+		if (!app) return err('App not found', 404);
+		webhookSecrets[app.id] = randomHex(32);
+		return ok(webhookConfig(app));
 	}),
 
 	http.put('/api/apps/:id/auto-deploy', async ({ params, request }) => {
@@ -758,6 +818,10 @@ export const handlers = [
 			head_ref?: string;
 			pr_url?: string;
 		};
+		// Mirrors the server: stored PR links must be https:// URLs.
+		if (body.pr_url && !/^https:\/\/[^/@\s]+/i.test(body.pr_url)) {
+			return err('Invalid input: pr_url must be an https:// URL', 400);
+		}
 		const ttl = (body.ttl_hours ?? 24) * 3600;
 		const slug = `preview-${Date.now()}`;
 		const newPreview: PreviewDeployment = {
@@ -1684,6 +1748,16 @@ export const handlers = [
 		return ok({
 			github_url: '/integrations/github?mock_github_connected=1',
 			manifest: '{}'
+		});
+	}),
+
+	http.post('/api/github-apps/:id/install', async ({ params }) => {
+		await delay(LATENCY);
+		const app = githubApps.find((a) => a.id === params.id);
+		if (!app) return err('GitHub App not found', 404);
+		// The real server returns a single-use, admin-bound state on the URL.
+		return ok({
+			url: `https://github.com/apps/${encodeURIComponent(app.slug)}/installations/new?state=${randomHex(32)}`
 		});
 	}),
 
