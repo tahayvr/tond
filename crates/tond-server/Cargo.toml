@@ -27,6 +27,9 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 futures = { workspace = true }
 tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+libsqlite3-sys = { workspace = true }
+log = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
 rand = { workspace = true }

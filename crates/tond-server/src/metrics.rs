@@ -2,7 +2,8 @@
 //
 // Background task that collects per-container CPU, memory, network, and
 // restart stats from Docker every 30 seconds and stores them in the
-// `metrics` table. Old rows are pruned by the janitor (janitor.rs).
+// `metrics` table. With no running app it sleeps until the apps table
+// changes (at most IDLE_SLEEP) instead of waking every 30 s. Old rows are pruned by the janitor (janitor.rs).
 //
 // Docker stats are read with a single non-streaming call per container
 // (one_shot=true) to avoid holding a long-lived stream open. Each sample
@@ -13,6 +14,8 @@
 //
 // Entry point: `run_metrics_collector(state)` — spawned once at startup.
 
+use crate::runtime::changes::{Table, Watch};
+use crate::runtime::loops;
 use crate::state::AppState;
 use bollard::models::{
     ContainerCpuStats, ContainerMemoryStats, ContainerNetworkStats, ContainerStatsResponse,
@@ -24,13 +27,27 @@ use uuid::Uuid;
 
 /// How often we sample container stats (seconds).
 const COLLECT_INTERVAL_SECS: u64 = 30;
+/// Longest sleep while no app is running (an apps change wakes us).
+const IDLE_SLEEP: std::time::Duration = std::time::Duration::from_secs(3600);
 
 pub async fn run_metrics_collector(state: AppState) {
+    let lp = loops::register("metrics");
+    let mut watch = Watch::new(&[Table::Apps]);
+    let mut idle = false;
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(COLLECT_INTERVAL_SECS)).await;
-
-        if let Err(e) = collect_and_store(&state).await {
-            tracing::warn!("Metrics collection error: {}", e);
+        if idle {
+            lp.wait(Some(IDLE_SLEEP), &mut watch).await;
+        } else {
+            lp.sleep(std::time::Duration::from_secs(COLLECT_INTERVAL_SECS))
+                .await;
+        }
+        let run = lp.run();
+        match collect_and_store(&state).await {
+            Ok(sampled) => idle = sampled == 0,
+            Err(e) => {
+                tracing::warn!("Metrics collection error: {}", e);
+                run.fail(&e);
+            }
         }
     }
 }
@@ -107,7 +124,8 @@ fn build_metric_sample(stats: &ContainerStatsResponse) -> MetricSample {
     }
 }
 
-async fn collect_and_store(state: &AppState) -> anyhow::Result<()> {
+/// Sample every running app; returns how many apps there were to sample.
+async fn collect_and_store(state: &AppState) -> anyhow::Result<usize> {
     // Fetch all apps that have a container_id and are running or unhealthy
     let apps: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT id, name, container_id FROM apps
@@ -116,6 +134,7 @@ async fn collect_and_store(state: &AppState) -> anyhow::Result<()> {
     )
     .fetch_all(&state.db)
     .await?;
+    let count = apps.len();
 
     for (app_id, _app_name, container_id) in apps {
         match collect_container_stats(state, &app_id, &container_id).await {
@@ -131,7 +150,7 @@ async fn collect_and_store(state: &AppState) -> anyhow::Result<()> {
         }
     }
 
-    Ok(())
+    Ok(count)
 }
 
 async fn collect_container_stats(

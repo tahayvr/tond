@@ -1,6 +1,8 @@
 // alerts.rs — Background alert checker + event firing helper
 //
-// Threshold-based checks (run every 60 s via run_alert_checker):
+// Threshold-based checks (run every 60 s via run_alert_checker while at least
+// one enabled threshold rule exists; with none, the checker sleeps until
+// alert_rules changes):
 //   - "cpu"        → fires if cpu_percent > threshold (app-scoped or MAX across all apps)
 //   - "memory"     → fires if (mem_used/mem_limit)*100 > threshold (app-scoped only)
 //   - "app_down"   → fires if app non-running for >= threshold minutes (specific app only)
@@ -16,10 +18,14 @@
 // A rule will not re-fire within 5 minutes of its last firing (threshold-based
 // only; event-based rules always fire).
 
+use crate::runtime::changes::{Table, Watch};
+use crate::runtime::loops;
 use crate::{notifications, state::AppState};
 use tond_common::{AlertRule, IntegrationConfig};
 
 const CHECK_INTERVAL_SECS: u64 = 60;
+/// Longest sleep while no threshold rule exists (a rule change wakes us).
+const IDLE_SLEEP_SECS: u64 = 3600;
 /// Minimum gap between consecutive firings of the same threshold-based rule (seconds).
 const MIN_REFIRE_SECS: i64 = 300;
 
@@ -42,22 +48,34 @@ fn parse_sqlite_dt(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 // ── Threshold-based background checker ──────────────────────────────────────
 
 pub async fn run_alert_checker(state: AppState) {
+    let lp = loops::register("alerts");
+    let mut watch = Watch::new(&[Table::AlertRules]);
+    let mut sleep_secs = CHECK_INTERVAL_SECS;
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(CHECK_INTERVAL_SECS)).await;
-
-        if let Err(e) = check_all_rules(&state).await {
-            tracing::warn!("Alert checker error: {}", e);
+        lp.wait(Some(std::time::Duration::from_secs(sleep_secs)), &mut watch)
+            .await;
+        let run = lp.run();
+        match check_all_rules(&state).await {
+            Ok(0) => sleep_secs = IDLE_SLEEP_SECS,
+            Ok(_) => sleep_secs = CHECK_INTERVAL_SECS,
+            Err(e) => {
+                tracing::warn!("Alert checker error: {}", e);
+                run.fail(&e);
+                sleep_secs = CHECK_INTERVAL_SECS;
+            }
         }
     }
 }
 
-async fn check_all_rules(state: &AppState) -> anyhow::Result<()> {
+/// Evaluate every enabled threshold rule; returns how many there are.
+async fn check_all_rules(state: &AppState) -> anyhow::Result<usize> {
     // Only fetch rules that have a metric set (event-only rules skip this path)
     let rules = sqlx::query_as::<_, AlertRule>(
         "SELECT * FROM alert_rules WHERE enabled = 1 AND metric IS NOT NULL",
     )
     .fetch_all(&state.db)
     .await?;
+    let count = rules.len();
 
     for rule in rules {
         // Respect minimum re-fire interval
@@ -92,7 +110,7 @@ async fn check_all_rules(state: &AppState) -> anyhow::Result<()> {
         }
     }
 
-    Ok(())
+    Ok(count)
 }
 
 async fn check_cpu_rule(state: &AppState, rule: &AlertRule) -> anyhow::Result<Option<f64>> {
