@@ -228,6 +228,13 @@ done
 [[ "$(systemctl show -p UMask --value tond-proxy)" == 0077 ]] || fail "tond-proxy must run with UMask=0077"
 pass "both units: NoNewPrivileges, PrivateTmp, ProtectSystem=strict, ProtectHome, RestrictSUIDSGID, ...; proxy UMask=0077"
 
+id -u tond > /dev/null 2>&1 || fail "install.sh must create the host terminal user 'tond'"
+for group in docker sudo; do
+    ! id -nG tond | tr ' ' '\n' | grep -qx "$group" \
+        || fail "the host terminal user must not be in the ${group} group"
+done
+pass "host terminal user 'tond' exists and is unprivileged"
+
 step "Authentication boundaries"
 [[ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3001/api/apps)" == 401 ]] \
     || fail "loopback TCP without credentials must get 401"

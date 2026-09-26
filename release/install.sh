@@ -24,6 +24,7 @@ DASHBOARD_DOMAIN=""
 PREVIEW_DOMAIN=""
 # Unprivileged user tond-proxy runs as (see tond-proxy.service); its group
 # shares tond.db with tond-server.
+TERMINAL_USER="tond"
 PROXY_USER="tond-proxy"
 
 # Colors
@@ -339,6 +340,14 @@ install_dependencies() {
     spinner $!
     
     info "Dependencies installed"
+
+    # Private-repo clones pass credentials through GIT_CONFIG_COUNT/KEY_n/VALUE_n
+    # (never in the URL), which needs git 2.31 or newer.
+    local git_version
+    git_version=$(git --version | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    if ! printf '2.31\n%s\n' "$git_version" | sort -V -C; then
+        fatal "git ${git_version} is too old; Tond needs git 2.31 or newer (Ubuntu 22.04+, Debian 12+)"
+    fi
 }
 
 install_docker() {
@@ -417,6 +426,23 @@ ensure_proxy_user() {
             --shell /usr/sbin/nologin "$PROXY_USER"
         info "Created system user ${PROXY_USER}"
     fi
+}
+
+# Unprivileged login user for the dashboard's host terminal (TOND_TERMINAL_USER
+# in tond-server.service). Deliberately not in the docker or sudo groups: the
+# host terminal must not be a path to root. Admins who need root use SSH.
+ensure_terminal_user() {
+    if ! id -u "$TERMINAL_USER" > /dev/null 2>&1; then
+        useradd --create-home --shell /bin/bash --comment "Tond host terminal" "$TERMINAL_USER"
+        passwd --lock "$TERMINAL_USER" > /dev/null
+        info "Created terminal user ${TERMINAL_USER} (unprivileged)"
+    fi
+    for group in docker sudo wheel adm; do
+        if id -nG "$TERMINAL_USER" | tr ' ' '\n' | grep -qx "$group"; then
+            gpasswd -d "$TERMINAL_USER" "$group" > /dev/null
+            warn "Removed ${TERMINAL_USER} from the ${group} group (the host terminal must stay unprivileged)"
+        fi
+    done
 }
 
 # Permission scheme for /opt/tond/data (also applied by update.sh):
@@ -914,6 +940,7 @@ main() {
     install_docker
     configure_docker_daemon
     ensure_proxy_user
+    ensure_terminal_user
     create_directories
     ensure_secret_key
     install_binaries

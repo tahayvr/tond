@@ -15,6 +15,7 @@ BACKUP_DIR="${DATA_DIR}/backups"
 SECRET_ENV_FILE="${DATA_DIR}/tond.env"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Unprivileged user tond-proxy runs as (see tond-proxy.service).
+TERMINAL_USER="tond"
 PROXY_USER="tond-proxy"
 
 # Port tond-server listens on — read from environment or fall back to default.
@@ -117,6 +118,23 @@ ensure_proxy_user() {
             --shell /usr/sbin/nologin "$PROXY_USER"
         info "Created system user ${PROXY_USER}"
     fi
+}
+
+# Unprivileged login user for the dashboard's host terminal (TOND_TERMINAL_USER
+# in tond-server.service). Deliberately not in the docker or sudo groups: the
+# host terminal must not be a path to root. Admins who need root use SSH.
+ensure_terminal_user() {
+    if ! id -u "$TERMINAL_USER" > /dev/null 2>&1; then
+        useradd --create-home --shell /bin/bash --comment "Tond host terminal" "$TERMINAL_USER"
+        passwd --lock "$TERMINAL_USER" > /dev/null
+        info "Created terminal user ${TERMINAL_USER} (unprivileged)"
+    fi
+    for group in docker sudo wheel adm; do
+        if id -nG "$TERMINAL_USER" | tr ' ' '\n' | grep -qx "$group"; then
+            gpasswd -d "$TERMINAL_USER" "$group" > /dev/null
+            warn "Removed ${TERMINAL_USER} from the ${group} group (the host terminal must stay unprivileged)"
+        fi
+    done
 }
 
 secure_data_dir() {
@@ -398,6 +416,7 @@ perform_update() {
     # The new units run tond-proxy as ${PROXY_USER}; fix ownership and modes
     # before either service starts.
     ensure_proxy_user
+    ensure_terminal_user
     secure_data_dir
     
     # Step 4: Start server (runs migrations)
