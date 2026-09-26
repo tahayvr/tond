@@ -40,8 +40,14 @@ use tond_common::{
     CreateDatabaseRequest, CronJobResponse, CronJobRun, DeployKeyResponse, DeploymentResponse,
     IntegrationResponse, ManagedDatabaseDetail, ManagedDatabaseResponse, PreviewDeploymentResponse,
     ProjectPreviewResponse, ProjectResponse, ServerSettings, SnapshotResponse, SnapshotStarted,
-    StorageProviderResponse, UpdateCronJobRequest, UpdateSettingsRequest,
+    StorageProviderResponse, UpdateCronJobRequest, UpdateSettingsRequest, WebhookConfigResponse,
 };
+
+/// Body and response of `/api/settings/host-terminal`.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct HostTerminalSetting {
+    enabled: bool,
+}
 
 pub struct TondClient {
     base_url: String,
@@ -576,8 +582,22 @@ impl TondClient {
         }
     }
 
-    /// Set or clear the HMAC webhook secret for an app.
-    pub async fn set_webhook_secret(&self, id: &str, secret: Option<&str>) -> Result<()> {
+    /// Webhook URLs and secret for an app.
+    pub async fn get_webhook_config(&self, id: &str) -> Result<WebhookConfigResponse> {
+        let req = self
+            .client
+            .get(format!("{}/api/apps/{}/webhook", self.base_url, id));
+        let resp: ApiResponse<WebhookConfigResponse> =
+            self.auth_header(req).send().await?.json().await?;
+        if resp.success {
+            resp.data.context("No data returned")
+        } else {
+            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
+        }
+    }
+
+    /// Replace the webhook secret with a caller-chosen value.
+    pub async fn set_webhook_secret(&self, id: &str, secret: &str) -> Result<()> {
         let req = self
             .client
             .put(format!("{}/api/apps/{}/webhook-secret", self.base_url, id))
@@ -588,6 +608,21 @@ impl TondClient {
             anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
         }
         Ok(())
+    }
+
+    /// Replace the webhook secret with a freshly generated one.
+    pub async fn rotate_webhook_secret(&self, id: &str) -> Result<WebhookConfigResponse> {
+        let req = self.client.post(format!(
+            "{}/api/apps/{}/webhook-secret/rotate",
+            self.base_url, id
+        ));
+        let resp: ApiResponse<WebhookConfigResponse> =
+            self.auth_header(req).send().await?.json().await?;
+        if resp.success {
+            resp.data.context("No data returned")
+        } else {
+            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
+        }
     }
 
     /// Enable or disable auto-deploy, optionally setting the watch branch.
@@ -1061,6 +1096,36 @@ impl TondClient {
         let resp: ApiResponse<ServerSettings> = self.auth_header(req).send().await?.json().await?;
         if resp.success {
             resp.data.context("No data returned")
+        } else {
+            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
+        }
+    }
+
+    /// Whether the dashboard's host terminal is switched on.
+    pub async fn get_host_terminal(&self) -> Result<bool> {
+        let req = self
+            .client
+            .get(format!("{}/api/settings/host-terminal", self.base_url));
+        let resp: ApiResponse<HostTerminalSetting> =
+            self.auth_header(req).send().await?.json().await?;
+        if resp.success {
+            Ok(resp.data.context("No data returned")?.enabled)
+        } else {
+            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
+        }
+    }
+
+    /// Switch the dashboard's host terminal on or off. The server accepts this
+    /// only over the local Unix socket.
+    pub async fn set_host_terminal(&self, enabled: bool) -> Result<bool> {
+        let req = self
+            .client
+            .put(format!("{}/api/settings/host-terminal", self.base_url))
+            .json(&HostTerminalSetting { enabled });
+        let resp: ApiResponse<HostTerminalSetting> =
+            self.auth_header(req).send().await?.json().await?;
+        if resp.success {
+            Ok(resp.data.context("No data returned")?.enabled)
         } else {
             anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
         }

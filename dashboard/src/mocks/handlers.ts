@@ -40,6 +40,7 @@ import {
 	MOCK_STORAGE_PROVIDERS,
 	MOCK_SNAPSHOTS,
 	MOCK_BACKUP_CONFIG,
+	MOCK_CERTIFICATES,
 	makeMockSystemMetrics,
 	makeMockAppMetrics
 } from './fixtures';
@@ -179,10 +180,57 @@ function mockPublicUrl(db: ManagedDatabase): string | null {
 		: `${db.db_type}://${db.db_user}:${db.db_password}@tond.example.com:${db.host_port}/${db.db_name}`;
 }
 
+const certificates = MOCK_CERTIFICATES.map((c) => ({ ...c }));
+
+/** Mirror the server: saving a domain queues a pending cert and resets retry state. */
+function queueMockCertificate(domain: string) {
+	if (!domain.trim()) return;
+	const now = new Date().toISOString();
+	const existing = certificates.find((c) => c.domain === domain);
+	if (existing) {
+		Object.assign(existing, {
+			status: 'pending',
+			last_error: null,
+			next_retry_at: null,
+			failure_count: 0
+		});
+		return;
+	}
+	certificates.push({
+		id: `cert-${Date.now()}`,
+		domain,
+		cert_type: 'acme',
+		status: 'pending',
+		issued_at: now,
+		expires_at: now,
+		last_error: null,
+		last_attempt_at: null,
+		next_retry_at: null,
+		failure_count: 0
+	});
+}
+
 // In-memory mutable state (mutations survive page navigation within the session)
-// Starts as true so that running `pnpm dev:setup` drops straight into the wizard.
-// Flips to false once POST /api/auth/setup is called, matching real server behaviour.
+// Starts as true so that `pnpm dev:setup` begins signed out with setup open.
+// Like the real server, /api/auth/status doesn't reveal it: open the setup link
+// /setup?token=mock-setup-token (MOCK_SETUP_TOKEN) to reach the form.
+// Flips to false once POST /api/auth/setup succeeds.
 let needsSetup = true;
+export const MOCK_SETUP_TOKEN = 'mock-setup-token';
+
+// The host terminal is off by default, as on a real server (where only
+// `sudo tond settings host-terminal on` can enable it). To preview the step-up
+// flow in the mock, run `localStorage.setItem('tond-mock-host-terminal', 'on')`.
+function mockHostTerminalEnabled(): boolean {
+	try {
+		return globalThis.localStorage?.getItem('tond-mock-host-terminal') === 'on';
+	} catch {
+		return false;
+	}
+}
+const MOCK_STEP_UP_PASSWORD = 'ValidPass123!';
+// ticket → target, consumed by the terminal WebSocket mock
+const terminalTickets = new Map<string, { kind: string; id: string }>();
 let apps: App[] = structuredClone(MOCK_APPS);
 let projects: Project[] = structuredClone(MOCK_PROJECTS);
 const templates: TemplateCatalogEntry[] = structuredClone(MOCK_TEMPLATES);
@@ -195,6 +243,42 @@ let cronJobs: CronJob[] = structuredClone(MOCK_CRON_JOBS);
 const cronRuns: Record<string, CronJobRun[]> = structuredClone(MOCK_CRON_RUNS);
 let registryCredentials: RegistryCredential[] = structuredClone(MOCK_REGISTRY_CREDENTIALS);
 let githubApps: GitHubApp[] = structuredClone(MOCK_GITHUB_APPS);
+
+// Per-app webhook secrets (the real server generates one at app creation).
+const webhookSecrets: Record<string, string> = {};
+
+function randomHex(bytes: number): string {
+	const buf = new Uint8Array(bytes);
+	crypto.getRandomValues(buf);
+	return Array.from(buf, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function webhookConfig(app: App) {
+	webhookSecrets[app.id] ??= randomHex(32);
+	const paths = {
+		github: `/api/webhooks/github/${app.id}`,
+		gitlab: `/api/webhooks/gitlab/${app.id}`,
+		gitea: `/api/webhooks/gitea/${app.id}`,
+		generic: `/api/webhooks/generic/${app.id}`
+	};
+	const domain = MOCK_SETTINGS.dashboard_domain.trim();
+	const urls = domain
+		? {
+				github: `https://${domain}${paths.github}`,
+				gitlab: `https://${domain}${paths.gitlab}`,
+				gitea: `https://${domain}${paths.gitea}`,
+				generic: `https://${domain}${paths.generic}`
+			}
+		: null;
+	return {
+		app_id: app.id,
+		paths,
+		urls,
+		secret: webhookSecrets[app.id],
+		auto_deploy: app.auto_deploy,
+		watch_branch: app.watch_branch
+	};
+}
 let users = structuredClone(MOCK_USERS);
 let integrations: Integration[] = structuredClone(MOCK_INTEGRATIONS);
 let storageProviders: StorageProvider[] = structuredClone(MOCK_STORAGE_PROVIDERS);
@@ -220,9 +304,21 @@ export const handlers = [
 	http.get('/api/auth/status', async () => {
 		await delay(LATENCY);
 		if (needsSetup) {
-			return ok({ needs_setup: true, authenticated: false, user: null });
+			return ok({ authenticated: false, user: null });
 		}
-		return ok({ needs_setup: false, authenticated: true, user: MOCK_USER });
+		return ok({ authenticated: true, user: MOCK_USER });
+	}),
+
+	http.post('/api/auth/setup/check', async ({ request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as { token?: string };
+		if (!needsSetup || body.token !== MOCK_SETUP_TOKEN) {
+			return err(
+				'This setup link is invalid or has already been used. If the admin account already exists, sign in instead.',
+				403
+			);
+		}
+		return ok({ valid: true });
 	}),
 
 	http.post('/api/auth/login', async () => {
@@ -240,8 +336,15 @@ export const handlers = [
 		return ok(MOCK_USER);
 	}),
 
-	http.post('/api/auth/setup', async () => {
+	http.post('/api/auth/setup', async ({ request }) => {
 		await delay(LATENCY);
+		const body = (await request.json()) as { token?: string };
+		if (!needsSetup || body.token !== MOCK_SETUP_TOKEN) {
+			return err(
+				'This setup link is invalid or has already been used. If the admin account already exists, sign in instead.',
+				403
+			);
+		}
 		needsSetup = false;
 		return ok({ user: MOCK_USER });
 	}),
@@ -254,7 +357,14 @@ export const handlers = [
 	http.get('/api/terminal/targets', async () => {
 		await delay(LATENCY);
 		return ok([
-			{ id: 'server', kind: 'server', label: 'Server', shell_user: 'tond' },
+			{
+				id: 'server',
+				kind: 'server',
+				label: 'Server',
+				shell_user: 'tond',
+				enabled: mockHostTerminalEnabled(),
+				requires_step_up: true
+			},
 			...apps
 				.filter((app) => app.status === 'running')
 				.slice(0, 4)
@@ -262,7 +372,9 @@ export const handlers = [
 					id: app.id,
 					kind: 'app',
 					label: `App: ${app.name}`,
-					shell_user: null
+					shell_user: null,
+					enabled: true,
+					requires_step_up: false
 				})),
 			...databases
 				.filter((db) => db.status === 'running')
@@ -271,9 +383,55 @@ export const handlers = [
 					id: db.id,
 					kind: 'database',
 					label: `Database: ${db.name}`,
-					shell_user: null
+					shell_user: null,
+					enabled: true,
+					requires_step_up: false
 				}))
 		]);
+	}),
+
+	http.post('/api/terminal/tickets', async ({ request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as {
+			target_kind: string;
+			target_id: string;
+			password?: string;
+			code?: string;
+		};
+		if (body.target_kind === 'server') {
+			if (!mockHostTerminalEnabled()) {
+				return err(
+					'The host terminal is turned off. To turn it on, run `sudo tond settings host-terminal on` on the server.',
+					403
+				);
+			}
+			if (!body.password) {
+				return err('Confirm your password to open the host terminal', 401);
+			}
+			if (body.password !== MOCK_STEP_UP_PASSWORD) {
+				return err('Password is incorrect', 401);
+			}
+		}
+		const ticket = `mock-ticket-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+		terminalTickets.set(ticket, { kind: body.target_kind, id: body.target_id });
+		return HttpResponse.json(
+			{ success: true, data: { ticket, expires_in: 30 }, error: null },
+			{ status: 201 }
+		);
+	}),
+
+	http.get('/api/settings/host-terminal', async () => {
+		await delay(LATENCY);
+		return ok({ enabled: mockHostTerminalEnabled() });
+	}),
+
+	http.put('/api/settings/host-terminal', async ({ request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as { enabled?: boolean };
+		return err(
+			`The host terminal can only be switched on or off on the server itself: run \`sudo tond settings host-terminal ${body.enabled ? 'on' : 'off'}\`.`,
+			403
+		);
 	}),
 
 	http.post('/api/auth/users', async ({ request }) => {
@@ -342,8 +500,12 @@ export const handlers = [
 
 	// ── Phase 7.1 — TOTP 2FA ────────────────────────────────────────────────
 
-	http.post('/api/auth/2fa/setup', async () => {
+	http.post('/api/auth/2fa/setup', async ({ request }) => {
 		await delay(LATENCY);
+		const body = (await request.json()) as { password?: string };
+		if (!body.password || body.password === 'wrong') {
+			return err('Password is incorrect', 401);
+		}
 		const secret = 'JBSWY3DPEHPK3PXP';
 		// Minimal 1×1 white PNG as a stand-in for the real server-generated QR code
 		const qr_code =
@@ -612,7 +774,23 @@ export const handlers = [
 		if (idx === -1) return err('App not found', 404);
 		const body = (await request.json()) as { domain: string };
 		apps[idx] = { ...apps[idx], domain: body.domain, updated_at: new Date().toISOString() };
+		queueMockCertificate(body.domain);
 		return ok(apps[idx]);
+	}),
+
+	// ── Certificates ──────────────────────────────────────────────────────────
+
+	http.get('/api/certs', async () => {
+		await delay(LATENCY);
+		return ok(certificates);
+	}),
+
+	http.post('/api/certs/:domain/retry', async ({ params }) => {
+		await delay(LATENCY);
+		const cert = certificates.find((c) => c.domain === params.domain);
+		if (!cert) return err(`No certificate for ${params.domain}`, 404);
+		cert.next_retry_at = null;
+		return ok({ message: 'Certificate retry queued', domain: cert.domain });
 	}),
 
 	http.put('/api/apps/:id/health', async ({ params, request }) => {
@@ -781,11 +959,35 @@ export const handlers = [
 		return ok(newKey);
 	}),
 
-	http.put('/api/apps/:id/webhook-secret', async ({ params }) => {
+	http.get('/api/apps/:id/webhook', async ({ params }) => {
 		await delay(LATENCY);
-		const app = apps.find((a) => a.id === params.id);
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
 		if (!app) return err('App not found', 404);
-		return ok(app);
+		return ok(webhookConfig(app));
+	}),
+
+	http.put('/api/apps/:id/webhook-secret', async ({ params, request }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
+		if (!app) return err('App not found', 404);
+		const body = (await request.json()) as { secret?: unknown };
+		const secret = typeof body.secret === 'string' ? body.secret.trim() : '';
+		if (secret.length < 16) {
+			return err(
+				'Invalid input: webhook secret must be at least 16 characters (rotate it to have one generated)',
+				400
+			);
+		}
+		webhookSecrets[app.id] = secret;
+		return ok(webhookConfig(app));
+	}),
+
+	http.post('/api/apps/:id/webhook-secret/rotate', async ({ params }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
+		if (!app) return err('App not found', 404);
+		webhookSecrets[app.id] = randomHex(32);
+		return ok(webhookConfig(app));
 	}),
 
 	http.put('/api/apps/:id/auto-deploy', async ({ params, request }) => {
@@ -874,6 +1076,10 @@ export const handlers = [
 			head_ref?: string;
 			pr_url?: string;
 		};
+		// Mirrors the server: stored PR links must be https:// URLs.
+		if (body.pr_url && !/^https:\/\/[^/@\s]+/i.test(body.pr_url)) {
+			return err('Invalid input: pr_url must be an https:// URL', 400);
+		}
 		const ttl = (body.ttl_hours ?? 24) * 3600;
 		const slug = `preview-${Date.now()}`;
 		const newPreview: PreviewDeployment = {
@@ -1059,6 +1265,7 @@ export const handlers = [
 		await delay(LATENCY);
 		const body = (await request.json()) as Partial<typeof MOCK_SETTINGS>;
 		Object.assign(MOCK_SETTINGS, body);
+		if (body.dashboard_domain) queueMockCertificate(body.dashboard_domain);
 		MOCK_ONBOARDING_STATUS.dashboard_domain = MOCK_SETTINGS.dashboard_domain;
 		MOCK_ONBOARDING_STATUS.domain_status.configured =
 			MOCK_SETTINGS.dashboard_domain.trim().length > 0;
@@ -1804,6 +2011,13 @@ export const handlers = [
 		return ok(githubApps);
 	}),
 
+	http.post('/api/github-apps/complete', async ({ request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as { state?: string | null };
+		if (!body.state) return err('missing_state', 400);
+		return ok({ completed: true });
+	}),
+
 	http.post('/api/github-apps/manifest', async () => {
 		await delay(LATENCY);
 		// In mock mode: simulate the manifest flow — return a github_url that points
@@ -1812,6 +2026,16 @@ export const handlers = [
 		return ok({
 			github_url: '/integrations/github?mock_github_connected=1',
 			manifest: '{}'
+		});
+	}),
+
+	http.post('/api/github-apps/:id/install', async ({ params }) => {
+		await delay(LATENCY);
+		const app = githubApps.find((a) => a.id === params.id);
+		if (!app) return err('GitHub App not found', 404);
+		// The real server returns a single-use, admin-bound state on the URL.
+		return ok({
+			url: `https://github.com/apps/${encodeURIComponent(app.slug)}/installations/new?state=${randomHex(32)}`
 		});
 	}),
 
@@ -2051,8 +2275,21 @@ export const handlers = [
 
 	terminalStream.addEventListener('connection', ({ client }) => {
 		const url = new URL(client.url);
-		const targetKind = url.searchParams.get('target_kind') ?? 'server';
-		const targetId = url.searchParams.get('target_id') ?? 'server';
+		const ticket = url.searchParams.get('ticket') ?? '';
+		const grant = terminalTickets.get(ticket);
+		terminalTickets.delete(ticket);
+		if (!grant) {
+			client.send(
+				JSON.stringify({
+					type: 'error',
+					message: 'Terminal ticket is invalid, expired or already used'
+				})
+			);
+			client.close();
+			return;
+		}
+		const targetKind = grant.kind;
+		const targetId = grant.id;
 		const label =
 			targetKind === 'server'
 				? 'server'

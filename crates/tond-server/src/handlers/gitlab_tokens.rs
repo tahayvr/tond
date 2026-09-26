@@ -38,6 +38,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::{RateLimit, RequireAdmin, RequireAuth},
+    deploy::GitHttpAuth,
     error::AppError,
     secret_key::{self, Purpose},
     state::AppState,
@@ -404,42 +405,15 @@ async fn fetch_token(state: &AppState, token_id: &str) -> Result<GitLabToken, Ap
         })
 }
 
-/// Build an authenticated clone URL for a GitLab repo using the stored PAT.
-///
-/// Transforms `https://gitlab.com/group/repo.git`
-///         → `https://oauth2:<token>@gitlab.com/group/repo.git`
-pub async fn build_clone_url_with_token(
-    token: &GitLabToken,
-    source_url: &str,
-    state: &AppState,
-) -> anyhow::Result<String> {
-    // Decrypt the PAT
+/// HTTPS credentials for cloning a GitLab repo with the stored PAT
+/// (`oauth2:<pat>` Basic auth). They are passed to git as a header through its
+/// environment config, never embedded in the clone URL — see deploy/git.rs.
+pub fn gitlab_git_credentials(token: &GitLabToken) -> anyhow::Result<GitHttpAuth> {
     let pat = secret_key::decrypt(Purpose::GitlabToken, &token.token_enc)?;
-
-    // Inject credentials into the URL. Strip any existing `https://` prefix,
-    // then prepend `https://oauth2:<pat>@`.
-    let url = source_url.trim();
-    if let Some(rest) = url.strip_prefix("https://") {
-        // Remove any existing user:pass@ that might already be present
-        let rest = if let Some(at_pos) = rest.find('@') {
-            &rest[at_pos + 1..]
-        } else {
-            rest
-        };
-        return Ok(format!("https://oauth2:{}@{}", pat, rest));
-    }
-    if let Some(rest) = url.strip_prefix("http://") {
-        let rest = if let Some(at_pos) = rest.find('@') {
-            &rest[at_pos + 1..]
-        } else {
-            rest
-        };
-        return Ok(format!("http://oauth2:{}@{}", pat, rest));
-    }
-
-    // Non-http URL — return unchanged (SSH or other scheme)
-    let _ = state;
-    Ok(url.to_string())
+    Ok(GitHttpAuth {
+        username: "oauth2".to_string(),
+        password: pat,
+    })
 }
 
 /// Post a commit status to GitLab (best-effort — errors are logged, not propagated).
@@ -631,36 +605,13 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn build_clone_url_with_token_injects_pat_and_preserves_non_http_urls() {
-        let state = test_state().await;
+    #[test]
+    fn gitlab_git_credentials_decrypt_the_pat_for_header_auth() {
         let token = sample_token();
-
-        assert_eq!(
-            build_clone_url_with_token(&token, "https://gitlab.example.com/group/repo.git", &state)
-                .await
-                .unwrap_or_else(|err| panic!("HTTPS clone URL injection should succeed: {err}")),
-            "https://oauth2:secret-pat@gitlab.example.com/group/repo.git",
-            "build_clone_url_with_token should inject oauth2 credentials into HTTPS clone URLs"
-        );
-        assert_eq!(
-            build_clone_url_with_token(
-                &token,
-                "https://old-user:old-pass@gitlab.example.com/group/repo.git",
-                &state,
-            )
-            .await
-            .unwrap_or_else(|err| panic!("existing credentials should be replaced cleanly: {err}")),
-            "https://oauth2:secret-pat@gitlab.example.com/group/repo.git",
-            "build_clone_url_with_token should strip any pre-existing userinfo before injecting the PAT"
-        );
-        assert_eq!(
-            build_clone_url_with_token(&token, "git@gitlab.example.com:group/repo.git", &state)
-                .await
-                .unwrap_or_else(|err| panic!("SSH URLs should be returned unchanged: {err}")),
-            "git@gitlab.example.com:group/repo.git",
-            "build_clone_url_with_token should leave non-HTTP clone URLs unchanged"
-        );
+        let auth = gitlab_git_credentials(&token)
+            .unwrap_or_else(|err| panic!("PAT decryption should succeed: {err}"));
+        assert_eq!(auth.username, "oauth2");
+        assert_eq!(auth.password, "secret-pat");
     }
 
     #[tokio::test]

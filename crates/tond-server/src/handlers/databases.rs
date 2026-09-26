@@ -796,7 +796,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        auth::{RateLimiter, RequireAuth, Role, rate_limit::RateLimit},
+        auth::{RateLimiter, RequireAuth, extractor::Role, rate_limit::RateLimit},
         state::AppState,
     };
 

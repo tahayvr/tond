@@ -153,6 +153,45 @@ async fn running_image_tag(state: &AppState, container_id: Option<&str>) -> Opti
     info.config.and_then(|c| c.image)
 }
 
+/// Remove per-deployment images of this app that no deployment row refers to
+/// any more (e.g. the janitor trimmed old rows) and that aren't running.
+async fn prune_orphaned_images(
+    state: &AppState,
+    app_name: &str,
+    referenced: &[String],
+    running: Option<&str>,
+) {
+    let reference = format!("{}:*", image_repo(app_name));
+    let filters = std::collections::HashMap::from([("reference".to_string(), vec![reference])]);
+    let Ok(found) = state
+        .docker
+        .list_images(Some(
+            ListImagesOptionsBuilder::default()
+                .filters(&filters)
+                .build(),
+        ))
+        .await
+    else {
+        return;
+    };
+    for tag in found.into_iter().flat_map(|img| img.repo_tags) {
+        if is_deployment_image(app_name, &tag)
+            && !referenced.contains(&tag)
+            && running != Some(tag.as_str())
+        {
+            tracing::info!("[prune] removing orphaned image {tag}");
+            let _ = state
+                .docker
+                .remove_image(
+                    &tag,
+                    Some(RemoveImageOptionsBuilder::default().build()),
+                    None,
+                )
+                .await;
+        }
+    }
+}
+
 /// Remove `tond-<app>:preview-*` images whose preview is no longer live.
 async fn prune_preview_images(state: &AppState, app_id: &str, app_name: &str) {
     let live: Vec<String> = sqlx::query_scalar(
@@ -221,6 +260,17 @@ pub async fn prune_app_images(state: &AppState, app_id: &str, app_name: &str) {
             .flatten()
             .flatten();
     let running = running_image_tag(state, container_id.as_deref()).await;
+
+    let referenced: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT image_tag FROM deployments WHERE app_id = ? AND image_tag IS NOT NULL",
+    )
+    .bind(app_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    if !referenced.is_empty() {
+        prune_orphaned_images(state, app_name, &referenced, running.as_deref()).await;
+    }
 
     for tag in tags_to_prune(app_name, &deployments, running.as_deref(), KEEP_IMAGES) {
         let removed = match state

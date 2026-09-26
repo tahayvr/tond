@@ -8,6 +8,7 @@ import type {
 	AlertRule,
 	AuditLogEntry,
 	BackupConfig,
+	Certificate,
 	CronJob,
 	CronJobRun,
 	Deployment,
@@ -333,6 +334,51 @@ export const MOCK_SETTINGS: ServerSettings = {
 	server_name: 'Tond Server',
 	dashboard_domain: 'dash.example.com'
 };
+
+// ── Certificates ───────────────────────────────────────────────────────────
+
+const minutesFromNow = (m: number) => new Date(Date.now() + m * 60_000).toISOString();
+
+export const MOCK_CERTIFICATES: Certificate[] = [
+	{
+		id: 'cert-001',
+		domain: 'api.example.com',
+		cert_type: 'acme',
+		status: 'active',
+		issued_at: '2026-08-01T00:00:00Z',
+		expires_at: '2026-10-30T00:00:00Z',
+		last_error: null,
+		last_attempt_at: '2026-08-01T00:00:00Z',
+		next_retry_at: null,
+		failure_count: 0
+	},
+	{
+		id: 'cert-002',
+		domain: 'app.example.com',
+		cert_type: 'acme',
+		status: 'pending',
+		issued_at: '2026-09-20T00:00:00Z',
+		expires_at: '2026-12-19T00:00:00Z',
+		last_error:
+			"DNS for app.example.com points to 1.2.3.4, expected 5.6.7.8. Update the domain's A/AAAA record to this server.",
+		last_attempt_at: minutesFromNow(-4),
+		next_retry_at: minutesFromNow(12),
+		failure_count: 4
+	},
+	{
+		id: 'cert-003',
+		domain: 'dash.example.com',
+		cert_type: 'acme',
+		status: 'failed',
+		issued_at: '2026-09-20T00:00:00Z',
+		expires_at: '2026-12-19T00:00:00Z',
+		last_error:
+			'polling order ready: order failed: 403 urn:ietf:params:acme:error:unauthorized: Invalid response from http://dash.example.com/.well-known/acme-challenge/abc: 404',
+		last_attempt_at: minutesFromNow(-1),
+		next_retry_at: minutesFromNow(1),
+		failure_count: 1
+	}
+];
 
 export const MOCK_ONBOARDING_STATUS: OnboardingStatus = {
 	dashboard_domain: MOCK_SETTINGS.dashboard_domain,
@@ -993,7 +1039,6 @@ export const MOCK_GITHUB_APPS: GitHubApp[] = [
 		slug: 'tond-dev',
 		installation_id: 78901234,
 		installed: true,
-		install_url: 'https://github.com/apps/tond-dev/installations/new',
 		created_at: '2025-03-01T00:00:00.000Z',
 		updated_at: '2025-03-01T00:00:00.000Z'
 	}

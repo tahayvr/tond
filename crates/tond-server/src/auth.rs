@@ -6,11 +6,12 @@
 //
 // Two public async functions:
 //
-//   ensure_root_key(pool)
+//   ensure_root_key(pool, key_file)
 //     Called once at server startup. If the api_keys table is empty, it
-//     generates a new root key via ApiKey::generate(), stores the hash in
-//     the DB, and prints the plaintext key to stdout. The raw key is only
-//     ever visible in this log line — it is never stored.
+//     generates a new root key via ApiKey::generate(), writes the plaintext
+//     key to a root-only file (<data dir>/root-api-key, mode 0600) and stores
+//     only its hash in the DB. The key is never logged: journald is readable
+//     by the `adm` group.
 //
 //   validate_key(pool, raw_key)
 //     SHA-256 hashes the incoming raw key and looks it up in api_keys.
@@ -18,26 +19,35 @@
 //     result is discarded). Returns Option<ApiKey>.
 //     Called by the RequireAuth extractor on every Bearer-token request.
 
+pub mod csrf;
 pub mod extractor;
 pub mod rate_limit;
+pub mod secret_file;
+pub mod setup_token;
 
-pub use extractor::{AuthRole, LocalPeer, LocalSocket, RequireAdmin, RequireAuth, Role};
-pub use rate_limit::{RateLimit, RateLimiter};
+pub use extractor::{AuthRole, LocalPeer, LocalSocket, RequireAdmin, RequireAuth};
+pub use rate_limit::{ClientIp, RateLimit, RateLimiter};
+
+use std::path::Path;
 
 use anyhow::Result;
 use chrono::Utc;
 use sqlx::SqlitePool;
 use tond_common::{ApiKey, hash_key};
 
-/// Ensure at least one API key exists. On first run, generate a root key
-/// and print it to stdout for automation and recovery workflows.
-pub async fn ensure_root_key(pool: &SqlitePool) -> Result<()> {
+/// Ensure at least one API key exists. On first run, generate a root key and
+/// write it to `key_file` (mode 0600) for automation and recovery workflows.
+pub async fn ensure_root_key(pool: &SqlitePool, key_file: &Path) -> Result<()> {
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM api_keys")
         .fetch_one(pool)
         .await?;
 
     if count.0 == 0 {
         let (api_key, raw_key) = ApiKey::generate("root");
+
+        // Write the file before storing the hash: a key that was never saved
+        // anywhere would be unusable.
+        secret_file::write_secret_file(key_file, &raw_key)?;
 
         sqlx::query(
             "INSERT INTO api_keys (id, name, key_hash, created_at, last_used_at) VALUES (?, ?, ?, ?, ?)",
@@ -50,13 +60,9 @@ pub async fn ensure_root_key(pool: &SqlitePool) -> Result<()> {
         .execute(pool)
         .await?;
 
-        tracing::info!("================================================");
-        tracing::info!("  ROOT API KEY (advanced / automation access)");
-        tracing::info!("  {}", raw_key);
-        tracing::info!("================================================");
-        tracing::info!("Use the dashboard first to create your admin account.");
         tracing::info!(
-            "This key is for CLI/API automation and can be recovered from the server logs."
+            "Generated the root API key (CLI/API automation access); it is stored in {} (root only)",
+            key_file.display()
         );
     } else {
         tracing::info!("API key(s) found, authentication enabled");
@@ -107,10 +113,30 @@ mod tests {
     #[tokio::test]
     async fn ensure_root_key_creates_single_root_key_when_table_is_empty() {
         let pool = test_pool().await;
+        let dir = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
+        let key_file = dir.path().join(secret_file::ROOT_API_KEY_FILE);
 
-        ensure_root_key(&pool).await.unwrap_or_else(|err| {
-            panic!("ensure_root_key should succeed on an empty table: {err}")
-        });
+        ensure_root_key(&pool, &key_file)
+            .await
+            .unwrap_or_else(|err| {
+                panic!("ensure_root_key should succeed on an empty table: {err}")
+            });
+
+        use std::os::unix::fs::PermissionsExt;
+        let raw_key = secret_file::read_secret_file(&key_file)
+            .unwrap_or_else(|| panic!("the root key must be written to its file"));
+        let mode = std::fs::metadata(&key_file)
+            .unwrap_or_else(|err| panic!("metadata: {err}"))
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "the root key file must be root-only");
+        assert!(
+            validate_key(&pool, &raw_key)
+                .await
+                .unwrap_or_else(|err| panic!("{err}"))
+                .is_some(),
+            "the key in the file must authenticate"
+        );
 
         let keys: Vec<ApiKey> = sqlx::query_as("SELECT * FROM api_keys")
             .fetch_all(&pool)
@@ -145,9 +171,17 @@ mod tests {
         .await
         .unwrap_or_else(|err| panic!("failed to seed existing API key: {err}"));
 
-        ensure_root_key(&pool).await.unwrap_or_else(|err| {
-            panic!("ensure_root_key should succeed when keys already exist: {err}")
-        });
+        let dir = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
+        let key_file = dir.path().join(secret_file::ROOT_API_KEY_FILE);
+        ensure_root_key(&pool, &key_file)
+            .await
+            .unwrap_or_else(|err| {
+                panic!("ensure_root_key should succeed when keys already exist: {err}")
+            });
+        assert!(
+            !key_file.exists(),
+            "no key file is written when a key already exists"
+        );
 
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM api_keys")
             .fetch_one(&pool)

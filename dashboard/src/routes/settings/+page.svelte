@@ -11,6 +11,9 @@
 	// Form state — mirrors settings fields, populated once loaded
 	let serverName = $state('');
 	let dashboardDomain = $state('');
+	// Last saved dashboard domain (drives the certificate status line)
+	let savedDashboardDomain = $state('');
+	let certRefreshKey = $state(0);
 
 	// Per-section save state
 	let savingAccess = $state(false);
@@ -28,6 +31,8 @@
 			});
 			serverName = updated.server_name;
 			dashboardDomain = updated.dashboard_domain;
+			savedDashboardDomain = updated.dashboard_domain;
+			certRefreshKey += 1;
 			accessSaved = true;
 			setTimeout(() => (accessSaved = false), 3000);
 		} catch (e: any) {
@@ -40,6 +45,7 @@
 	$effect(() => {
 		serverName = data.settings.server_name;
 		dashboardDomain = data.settings.dashboard_domain;
+		savedDashboardDomain = data.settings.dashboard_domain;
 	});
 
 	$effect(() => {
@@ -66,6 +72,8 @@
 	<SettingsForm
 		bind:serverName
 		bind:dashboardDomain
+		{savedDashboardDomain}
+		{certRefreshKey}
 		isSaving={savingAccess}
 		saved={accessSaved}
 		error={accessError}

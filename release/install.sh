@@ -15,6 +15,9 @@ BIN_DIR="${INSTALL_DIR}/bin"
 DATA_DIR="${INSTALL_DIR}/data"
 DASHBOARD_DIR="${INSTALL_DIR}/dashboard"
 SECRET_ENV_FILE="${DATA_DIR}/tond.env"
+# Written by tond-server on first start, root-only (0600), never logged:
+ROOT_KEY_FILE="${DATA_DIR}/root-api-key"      # root API key for automation
+SETUP_TOKEN_FILE="${DATA_DIR}/setup-token"    # one-time admin setup token (removed after setup)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 NON_INTERACTIVE=false
 DASHBOARD_DOMAIN=""
@@ -546,6 +549,23 @@ configure_firewall() {
 # Post-install summary
 # -------------------------------------------------------------------
 
+# Wait for tond-server to write its first-run files, then print the setup token
+# (empty when the admin account already exists, e.g. on a reinstall).
+read_setup_token() {
+    local i
+    for i in $(seq 1 15); do
+        if [[ -s "$SETUP_TOKEN_FILE" ]]; then
+            tr -d '[:space:]' < "$SETUP_TOKEN_FILE"
+            return 0
+        fi
+        # Setup already done: the server removes the token file and never recreates it.
+        if [[ -s "$ROOT_KEY_FILE" && $i -ge 5 ]]; then
+            return 0
+        fi
+        sleep 1
+    done
+}
+
 print_summary() {
     echo ""
     echo -e "${GREEN}╔════════════════════════════════════╗${NC}"
@@ -554,39 +574,55 @@ print_summary() {
     echo ""
 
     local server_ip=$(get_server_ip)
-    local dashboard_url="http://${server_ip}"
+    local setup_token
+    setup_token="$(read_setup_token || true)"
 
+    echo -e "${BOLD}Server IP:${NC}  ${server_ip}"
     if [[ -n "$DASHBOARD_DOMAIN" ]]; then
-        dashboard_url="https://${DASHBOARD_DOMAIN}"
+        echo -e "${BOLD}Dashboard:${NC}  ${CYAN}https://${DASHBOARD_DOMAIN}${NC}"
     fi
+    echo ""
 
-    # Get root API key
-    # The key line is a tracing log line (timestamp, level, target); keep only the 64-hex key.
-    local root_key=$(journalctl -u tond-server --no-pager | grep -A 1 "ROOT API KEY" | tail -1 | grep -oE '[0-9a-f]{64}')
-    if [[ -n "$root_key" ]]; then
-        echo -e "${YELLOW}${BOLD}Root API Key (advanced / automation access):${NC}"
-        echo "  $root_key"
-        echo "  Recover later with: journalctl -u tond-server --no-pager | grep \"ROOT API KEY\" -A 1"
+    if [[ -n "$setup_token" ]]; then
+        echo -e "${YELLOW}${BOLD}Create your admin account${NC}"
+        echo "  Only someone with this one-time link can create the admin account, so keep it"
+        echo "  private until you have used it:"
+        echo ""
+        if [[ -n "$DASHBOARD_DOMAIN" ]]; then
+            echo -e "  ${CYAN}https://${DASHBOARD_DOMAIN}/setup?token=${setup_token}${NC}"
+        else
+            echo "  1. Point a DNS A record for your dashboard domain at ${server_ip}"
+            echo "  2. sudo tond settings set-dashboard-domain dash.example.com"
+            echo -e "  3. Open ${CYAN}https://dash.example.com/setup?token=${setup_token}${NC}"
+        fi
+        echo ""
+        echo "  No DNS yet? Use an SSH tunnel from your computer instead:"
+        echo "    ssh -L 3001:127.0.0.1:3001 root@${server_ip}"
+        echo -e "    then open ${CYAN}http://localhost:3001/setup?token=${setup_token}${NC}"
+        echo ""
+        echo "  Print the link again any time with: sudo tond setup-link"
+        echo ""
+    elif [[ -n "$DASHBOARD_DOMAIN" ]]; then
+        echo -e "The admin account already exists: sign in at ${CYAN}https://${DASHBOARD_DOMAIN}${NC}"
         echo ""
     fi
 
-    echo -e "${BOLD}Server IP:${NC}  ${server_ip}"
-    echo -e "${BOLD}Dashboard:${NC}  ${CYAN}${dashboard_url}${NC}"
-    echo ""
-
     if [[ -n "$DASHBOARD_DOMAIN" ]]; then
         echo -e "${BOLD}DNS:${NC}        Create an A record: ${DASHBOARD_DOMAIN} -> ${server_ip}"
-        echo -e "${YELLOW}Note:${NC} HTTPS will start working after DNS points at this server."
-        echo -e "${YELLOW}Note:${NC} If DNS is not ready yet, you can still use:"
-        echo "  http://${server_ip}"
+        echo -e "${YELLOW}Note:${NC} HTTPS starts working once DNS points at this server (the certificate"
+        echo "      is issued automatically). The dashboard is only served over HTTPS."
+        echo ""
+    fi
+
+    if [[ -s "$ROOT_KEY_FILE" ]]; then
+        echo -e "${BOLD}Root API key${NC} (advanced / automation access) is stored in ${ROOT_KEY_FILE} (root only)."
+        echo "  Show it with: sudo cat ${ROOT_KEY_FILE}"
         echo ""
     fi
 
     echo "Next steps:"
-    echo "  1. Open the dashboard URL in your browser"
-    echo "  2. Create your admin account"
-    echo "  3. Configure your dashboard domain in Settings if needed"
-    echo "  4. Deploy your first app"
+    echo "  1. Open the setup link above and create your admin account"
+    echo "  2. Deploy your first app"
     echo ""
 
     echo "If the dashboard is unreachable, confirm your cloud firewall allows ports 80 and 443."
@@ -595,6 +631,7 @@ print_summary() {
     echo -e "${BOLD}CLI Commands:${NC}"
     echo "  tond --help          Show all commands (run as root: the CLI uses the root-only socket)"
     echo "  tond apps create my-app --source https://github.com/you/your-app"
+    echo "  tond settings host-terminal on   Allow a shell on this server from the dashboard (off by default)"
     echo ""
 
     echo -e "${BOLD}Update Tond:${NC}"

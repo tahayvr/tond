@@ -1,14 +1,19 @@
 // cron.rs — Background cron job scheduler (Phase 6.4 + 6.5)
 //
 // Exports:
-//   run_cron_scheduler(state)        — long-running Tokio task, wakes every 30 s,
-//                                      finds all enabled jobs whose next_run_at <= now,
+//   run_cron_scheduler(state)        — long-running Tokio task. On start it closes out
+//                                      runs a previous process left 'running' (see
+//                                      reconcile_interrupted_runs). Then it wakes every
+//                                      30 s, finds enabled jobs whose next_run_at <= now,
+//                                      advances next_run_at to the next slot (a
+//                                      compare-and-set, *before* the run starts, so a
+//                                      long 'allow' run is never re-started every tick)
 //                                      and runs each one's Docker container.
 //
 //   run_cron_job(state, job, attempt) — runs a single cron job container (with an
 //                                       internal retry loop), records each run in
 //                                       cron_job_runs, updates the job's
-//                                       last_run_at / next_run_at / last_run_status.
+//                                       last_run_at / last_run_status.
 //
 //   compute_next_run(schedule, tz)   — parses a 5-field cron expression and returns
 //                                      the next datetime (in the given IANA tz, or UTC)
@@ -27,8 +32,10 @@
 //   • last_run_status: updated on the cron_jobs row at the end of each run (final attempt).
 
 use anyhow::Result;
+use bollard::query_parameters::{ListContainersOptionsBuilder, RemoveContainerOptionsBuilder};
 use chrono::Utc;
 use cron::Schedule;
+use std::collections::HashMap;
 use std::str::FromStr;
 use tond_common::{CronJob, CronVolume};
 use uuid::Uuid;
@@ -106,46 +113,213 @@ pub fn compute_next_run(schedule_str: &str, timezone: Option<&str>) -> Result<St
 
 // ── Scheduler loop ────────────────────────────────────────────────────────────
 
+/// What the scheduler does with a job whose `next_run_at` has passed.
+#[derive(Debug, PartialEq, Eq)]
+enum DueAction {
+    /// Advance `next_run_at` and start a run.
+    Run,
+    /// Advance `next_run_at` without running ('skip' policy, previous run
+    /// still going): the missed slot is dropped instead of piling up.
+    SkipSlot,
+}
+
+fn due_action(job: &CronJob) -> DueAction {
+    if should_run_due_job(job) {
+        DueAction::Run
+    } else {
+        DueAction::SkipSlot
+    }
+}
+
 pub async fn run_cron_scheduler(state: AppState) {
+    // Runs left 'running' by a previous process can never finish; close them
+    // out so the jobs are scheduled again.
+    match reconcile_interrupted_runs(&state.db).await {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!("Marked {} interrupted cron run(s) as failed", n),
+        Err(e) => tracing::warn!("Cron startup reconciliation failed: {}", e),
+    }
+    remove_orphaned_cron_containers(&state.docker).await;
+
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        schedule_due_jobs(&state).await;
+    }
+}
 
-        let now = Utc::now().to_rfc3339();
+/// One scheduler tick: claim every due job (advancing `next_run_at` *before*
+/// the run starts, so a long run is never started again on the next tick) and
+/// spawn the runs.
+async fn schedule_due_jobs(state: &AppState) {
+    for job in claim_due_jobs(&state.db).await {
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            run_cron_job(&state_clone, &job, 1).await;
+        });
+    }
+}
 
-        // Jobs that should fire now.
-        // For 'skip' policy we only pick up jobs that are NOT running.
-        // For 'allow' policy we pick them up regardless.
-        // We fetch all due enabled jobs and let the policy check happen here.
-        let due_jobs: Vec<CronJob> = match sqlx::query_as(
-            "SELECT * FROM cron_jobs
-             WHERE enabled = 1
-               AND next_run_at IS NOT NULL
-               AND next_run_at <= ?",
-        )
-        .bind(&now)
-        .fetch_all(&state.db)
-        .await
-        {
-            Ok(jobs) => jobs,
+/// Find due jobs, advance each one's schedule, and return the jobs that
+/// should start a run now.
+async fn claim_due_jobs(db: &sqlx::SqlitePool) -> Vec<CronJob> {
+    let now = Utc::now().to_rfc3339();
+    let due_jobs: Vec<CronJob> = match sqlx::query_as(
+        "SELECT * FROM cron_jobs
+         WHERE enabled = 1
+           AND next_run_at IS NOT NULL
+           AND next_run_at <= ?",
+    )
+    .bind(&now)
+    .fetch_all(db)
+    .await
+    {
+        Ok(jobs) => jobs,
+        Err(e) => {
+            tracing::warn!("Cron scheduler DB query failed: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mut to_run = Vec::new();
+    for job in due_jobs {
+        match claim_due_job(db, &job).await {
+            Ok(true) => {}
+            Ok(false) => continue, // someone else advanced it (edit, disable, ...)
             Err(e) => {
-                tracing::warn!("Cron scheduler DB query failed: {}", e);
+                tracing::warn!("Cron job '{}': could not advance schedule: {}", job.name, e);
                 continue;
             }
-        };
-
-        for job in due_jobs {
-            // Concurrency policy: 'skip' won't start a new container if one is running.
-            if !should_run_due_job(&job) {
-                continue;
+        }
+        match due_action(&job) {
+            DueAction::Run => to_run.push(job),
+            DueAction::SkipSlot => {
+                tracing::debug!("Cron job '{}' still running; skipping this slot", job.name);
             }
-
-            let state_clone = state.clone();
-            let job_clone = job.clone();
-            tokio::spawn(async move {
-                run_cron_job(&state_clone, &job_clone, 1).await;
-            });
         }
     }
+    to_run
+}
+
+/// Advance a due job's `next_run_at` to its next slot after now. The update is
+/// a compare-and-set on the `next_run_at` value we read, so a slot is claimed
+/// at most once. An unparseable schedule clears `next_run_at` (the job stops
+/// firing instead of firing every tick). Returns whether a run may start.
+async fn claim_due_job(db: &sqlx::SqlitePool, job: &CronJob) -> Result<bool> {
+    let next = match compute_next_run(&job.schedule, job.timezone.as_deref()) {
+        Ok(next) => Some(next),
+        Err(e) => {
+            tracing::warn!("Cron job '{}' has an invalid schedule: {}", job.name, e);
+            None
+        }
+    };
+    let claimed = sqlx::query(
+        "UPDATE cron_jobs SET next_run_at = ?, updated_at = datetime('now')
+         WHERE id = ? AND next_run_at = ?",
+    )
+    .bind(&next)
+    .bind(&job.id)
+    .bind(&job.next_run_at)
+    .execute(db)
+    .await?
+    .rows_affected()
+        == 1;
+    Ok(claimed && next.is_some())
+}
+
+/// Close out runs a previous server process left 'running' (the process died
+/// mid-run, so nothing will ever finish them) and reset their jobs so the
+/// scheduler picks them up again. Returns the number of runs closed.
+pub async fn reconcile_interrupted_runs(db: &sqlx::SqlitePool) -> Result<u64> {
+    let now = Utc::now().to_rfc3339();
+    let runs = sqlx::query(
+        "UPDATE cron_job_runs
+         SET status = 'failed', finished_at = ?,
+             output = COALESCE(output || char(10), '') ||
+                      'Interrupted: tond-server restarted while this run was in progress.'
+         WHERE status = 'running'",
+    )
+    .bind(&now)
+    .execute(db)
+    .await?
+    .rows_affected();
+
+    sqlx::query(
+        "UPDATE cron_jobs
+         SET status = 'failed', last_run_status = 'failed', updated_at = datetime('now')
+         WHERE status = 'running'",
+    )
+    .execute(db)
+    .await?;
+
+    // Enabled jobs without a next slot get one now.
+    let unscheduled: Vec<CronJob> =
+        sqlx::query_as("SELECT * FROM cron_jobs WHERE enabled = 1 AND next_run_at IS NULL")
+            .fetch_all(db)
+            .await?;
+    for job in unscheduled {
+        if let Ok(next) = compute_next_run(&job.schedule, job.timezone.as_deref()) {
+            sqlx::query("UPDATE cron_jobs SET next_run_at = ? WHERE id = ?")
+                .bind(next)
+                .bind(&job.id)
+                .execute(db)
+                .await?;
+        }
+    }
+
+    Ok(runs)
+}
+
+/// Best-effort removal of cron containers orphaned by a restart (their runs
+/// were just marked interrupted; nothing tracks them any more).
+async fn remove_orphaned_cron_containers(docker: &bollard::Docker) {
+    let filters: HashMap<&str, Vec<&str>> = HashMap::from([("label", vec!["tond-type=cron"])]);
+    let Ok(containers) = docker
+        .list_containers(Some(
+            ListContainersOptionsBuilder::default()
+                .all(true)
+                .filters(&filters)
+                .build(),
+        ))
+        .await
+    else {
+        return;
+    };
+    for id in containers.into_iter().filter_map(|c| c.id) {
+        let _ = docker
+            .remove_container(
+                &id,
+                Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+            )
+            .await;
+    }
+}
+
+/// Set a job's status after one of its runs ends: 'running' while another run
+/// of the same job ('allow' policy) is still in progress, else `status`.
+/// `last_run_status` is only written when given (final attempt).
+async fn finish_job_run(
+    db: &sqlx::SqlitePool,
+    job_id: &str,
+    status: &str,
+    finished_at: &str,
+    last_run_status: Option<&str>,
+) {
+    let _ = sqlx::query(
+        "UPDATE cron_jobs
+         SET status = CASE WHEN EXISTS (
+                 SELECT 1 FROM cron_job_runs WHERE cron_job_id = ?1 AND status = 'running'
+             ) THEN 'running' ELSE ?2 END,
+             last_run_at = ?3,
+             last_run_status = COALESCE(?4, last_run_status),
+             updated_at = datetime('now')
+         WHERE id = ?1",
+    )
+    .bind(job_id)
+    .bind(status)
+    .bind(finished_at)
+    .bind(last_run_status)
+    .execute(db)
+    .await;
 }
 
 // ── Single job execution ──────────────────────────────────────────────────────
@@ -229,22 +403,9 @@ pub async fn run_cron_job(state: &AppState, job: &CronJob, _initial_attempt: i64
         }
 
         if succeeded {
-            // Success — compute next run and persist final state
-            let next_run = compute_next_run(&job.schedule, job.timezone.as_deref())
-                .unwrap_or_else(|_| finished_at.clone());
-
-            let _ = sqlx::query(
-                "UPDATE cron_jobs
-                 SET status = 'idle', last_run_at = ?, next_run_at = ?,
-                     last_run_status = 'success',
-                     updated_at = datetime('now')
-                 WHERE id = ?",
-            )
-            .bind(&finished_at)
-            .bind(&next_run)
-            .bind(&job.id)
-            .execute(&state.db)
-            .await;
+            // Success. next_run_at was already advanced when the scheduler
+            // claimed the slot.
+            finish_job_run(&state.db, &job.id, "idle", &finished_at, Some("success")).await;
 
             tracing::info!("Cron job '{}' succeeded on attempt {}", job.name, attempt);
 
@@ -268,36 +429,14 @@ pub async fn run_cron_job(state: &AppState, job: &CronJob, _initial_attempt: i64
                 max_attempts,
                 job.retry_delay_seconds
             );
-            let _ = sqlx::query(
-                "UPDATE cron_jobs
-                 SET status = 'failed', last_run_at = ?, updated_at = datetime('now')
-                 WHERE id = ?",
-            )
-            .bind(&finished_at)
-            .bind(&job.id)
-            .execute(&state.db)
-            .await;
+            finish_job_run(&state.db, &job.id, "failed", &finished_at, None).await;
 
             tokio::time::sleep(delay).await;
             continue;
         }
 
         // All attempts exhausted — final failure
-        let next_run = compute_next_run(&job.schedule, job.timezone.as_deref())
-            .unwrap_or_else(|_| finished_at.clone());
-
-        let _ = sqlx::query(
-            "UPDATE cron_jobs
-             SET status = 'failed', last_run_at = ?, next_run_at = ?,
-                 last_run_status = 'failed',
-                 updated_at = datetime('now')
-             WHERE id = ?",
-        )
-        .bind(&finished_at)
-        .bind(&next_run)
-        .bind(&job.id)
-        .execute(&state.db)
-        .await;
+        finish_job_run(&state.db, &job.id, "failed", &finished_at, Some("failed")).await;
 
         tracing::warn!(
             "Cron job '{}' failed on all {} attempt(s)",
@@ -502,6 +641,164 @@ mod tests {
                     .to_string(),
             ),
         )
+    }
+
+    async fn test_db() -> sqlx::SqlitePool {
+        let db = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .unwrap_or_else(|err| panic!("failed to create in-memory SQLite pool: {err}"));
+        crate::db::migrate(&db)
+            .await
+            .unwrap_or_else(|err| panic!("failed to run migrations for cron tests: {err}"));
+        db
+    }
+
+    async fn seed_job(db: &sqlx::SqlitePool, id: &str, policy: &str, status: &str, schedule: &str) {
+        sqlx::query(
+            "INSERT INTO cron_jobs (id, name, schedule, image, status, concurrency_policy, next_run_at)
+             VALUES (?, ?, ?, 'alpine', ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(format!("job-{id}"))
+        .bind(schedule)
+        .bind(status)
+        .bind(policy)
+        .bind((Utc::now() - chrono::Duration::minutes(5)).to_rfc3339())
+        .execute(db)
+        .await
+        .unwrap_or_else(|err| panic!("seed cron job: {err}"));
+    }
+
+    async fn next_run_at(db: &sqlx::SqlitePool, id: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT next_run_at FROM cron_jobs WHERE id = ?")
+            .bind(id)
+            .fetch_one(db)
+            .await
+            .unwrap_or_else(|err| panic!("read next_run_at: {err}"))
+    }
+
+    #[tokio::test]
+    async fn claim_advances_next_run_before_the_run_so_long_allow_runs_are_not_restarted() {
+        let db = test_db().await;
+        // An 'allow' job whose previous run is still going and whose slot is due.
+        seed_job(&db, "allow", "allow", "running", "0 * * * *").await;
+
+        let first = claim_due_jobs(&db).await;
+        assert_eq!(
+            first.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(),
+            vec!["allow"],
+            "a due 'allow' job starts a run even while another is running"
+        );
+        let next = next_run_at(&db, "allow")
+            .await
+            .unwrap_or_else(|| panic!("next_run_at should be set"));
+        assert!(
+            next > Utc::now().to_rfc3339(),
+            "next_run_at must move into the future when the run starts"
+        );
+
+        // The next tick (30 s later) must not start another container.
+        assert!(
+            claim_due_jobs(&db).await.is_empty(),
+            "a claimed slot must not be run again on the next tick"
+        );
+    }
+
+    #[tokio::test]
+    async fn skip_policy_drops_the_slot_while_running_and_invalid_schedules_stop_firing() {
+        let db = test_db().await;
+        seed_job(&db, "skip", "skip", "running", "0 * * * *").await;
+        seed_job(&db, "broken", "skip", "idle", "not a cron").await;
+
+        assert!(
+            claim_due_jobs(&db).await.is_empty(),
+            "neither a running 'skip' job nor an invalid schedule starts a run"
+        );
+        assert!(
+            next_run_at(&db, "skip").await.unwrap_or_default() > Utc::now().to_rfc3339(),
+            "a skipped slot still advances the schedule"
+        );
+        assert_eq!(
+            next_run_at(&db, "broken").await,
+            None,
+            "an invalid schedule clears next_run_at instead of firing every tick"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_marks_interrupted_runs_failed_and_frees_the_job() {
+        let db = test_db().await;
+        seed_job(&db, "j1", "skip", "running", "0 * * * *").await;
+        sqlx::query(
+            "INSERT INTO cron_job_runs (id, cron_job_id, status, started_at) VALUES ('r1', 'j1', 'running', ?)",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .execute(&db)
+        .await
+        .unwrap_or_else(|err| panic!("seed run: {err}"));
+
+        let closed = reconcile_interrupted_runs(&db)
+            .await
+            .unwrap_or_else(|err| panic!("reconcile: {err}"));
+        assert_eq!(closed, 1);
+
+        let (status, finished, output): (String, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT status, finished_at, output FROM cron_job_runs WHERE id = 'r1'")
+                .fetch_one(&db)
+                .await
+                .unwrap_or_else(|err| panic!("read run: {err}"));
+        assert_eq!(status, "failed");
+        assert!(finished.is_some(), "interrupted runs get a finished_at");
+        assert!(output.unwrap_or_default().contains("Interrupted"));
+
+        let job_status: String = sqlx::query_scalar("SELECT status FROM cron_jobs WHERE id = 'j1'")
+            .fetch_one(&db)
+            .await
+            .unwrap_or_else(|err| panic!("read job: {err}"));
+        assert_eq!(job_status, "failed");
+        assert_eq!(
+            claim_due_jobs(&db).await.len(),
+            1,
+            "the 'skip' job runs again once its stale 'running' status is cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn finishing_one_of_two_overlapping_runs_keeps_the_job_running() {
+        let db = test_db().await;
+        seed_job(&db, "j1", "allow", "running", "0 * * * *").await;
+        sqlx::query(
+            "INSERT INTO cron_job_runs (id, cron_job_id, status, started_at) VALUES ('other', 'j1', 'running', 'x')",
+        )
+        .execute(&db)
+        .await
+        .unwrap_or_else(|err| panic!("seed run: {err}"));
+
+        finish_job_run(&db, "j1", "idle", "2026-01-01T00:00:00Z", Some("success")).await;
+        let (status, last): (String, Option<String>) =
+            sqlx::query_as("SELECT status, last_run_status FROM cron_jobs WHERE id = 'j1'")
+                .fetch_one(&db)
+                .await
+                .unwrap_or_else(|err| panic!("read job: {err}"));
+        assert_eq!(status, "running", "another run is still in progress");
+        assert_eq!(last.as_deref(), Some("success"));
+
+        sqlx::query("UPDATE cron_job_runs SET status = 'success' WHERE id = 'other'")
+            .execute(&db)
+            .await
+            .unwrap_or_else(|err| panic!("finish run: {err}"));
+        finish_job_run(&db, "j1", "idle", "2026-01-01T00:01:00Z", None).await;
+        let (status, last): (String, Option<String>) =
+            sqlx::query_as("SELECT status, last_run_status FROM cron_jobs WHERE id = 'j1'")
+                .fetch_one(&db)
+                .await
+                .unwrap_or_else(|err| panic!("read job: {err}"));
+        assert_eq!(status, "idle");
+        assert_eq!(
+            last.as_deref(),
+            Some("success"),
+            "intermediate updates keep the last final status"
+        );
     }
 
     #[test]

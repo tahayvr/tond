@@ -23,7 +23,7 @@
 //      it and checks the api_keys table.
 //
 //   3. Session cookie (dashboard browser)
-//      Reads the Cookie header for a `tond_session` value and calls
+//      Reads the Cookie header for a `__Host-tond_session` value and calls
 //      handlers::auth::validate_session() which joins sessions + users
 //      and checks expiry.
 //
@@ -69,7 +69,7 @@ impl<S: Send + Sync> FromRequestParts<S> for LocalPeer {
 /// Extractor that validates authentication via:
 /// 1. The local Unix socket (`LocalSocket` extension) — CLI on the same machine, no credentials needed
 /// 2. `Authorization: Bearer <api-key>` header
-/// 3. `tond_session` cookie (dashboard browser sessions)
+/// 3. `__Host-tond_session` cookie (dashboard browser sessions)
 ///
 /// Usage in handlers:
 /// ```rust
@@ -328,7 +328,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO sessions (id, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)",
         )
-        .bind(&token)
+        .bind(tond_common::hash_key(&token))
         .bind(&user_id)
         .bind((now + chrono::Duration::hours(1)).to_rfc3339())
         .bind(now.to_rfc3339())
@@ -339,8 +339,11 @@ mod tests {
         let mut parts = request_parts();
         parts.headers.insert(
             header::COOKIE,
-            axum::http::HeaderValue::from_str(&format!("tond_session={token}"))
-                .unwrap_or_else(|err| panic!("invalid cookie header: {err}")),
+            axum::http::HeaderValue::from_str(&format!(
+                "{}={token}",
+                crate::handlers::auth::SESSION_COOKIE
+            ))
+            .unwrap_or_else(|err| panic!("invalid cookie header: {err}")),
         );
         parts
     }
