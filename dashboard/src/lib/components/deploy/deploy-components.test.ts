@@ -62,7 +62,7 @@ describe('DeployResult', () => {
 		expect(screen.getByText('listening on 127.0.0.1:3000')).toBeInTheDocument();
 		expect(screen.getByRole('link', { name: /port and health settings/i })).toHaveAttribute(
 			'href',
-			'/apps/app_1?tab=health'
+			'/apps/app_1?tab=settings&section=health'
 		);
 		await user.click(screen.getByRole('button', { name: /deploy again/i }));
 		expect(onRedeploy).toHaveBeenCalledOnce();

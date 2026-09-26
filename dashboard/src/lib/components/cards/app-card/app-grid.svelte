@@ -34,7 +34,7 @@
 
 {#if apps.length > 0 || searchQuery}
 	<div class="relative">
-		<Search class="absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-muted-foreground/70" />
+		<Search class="absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
 		<Input
 			type="text"
 			placeholder="Search apps..."
@@ -46,7 +46,7 @@
 
 {#if filteredApps.length === 0 && apps.length > 0}
 	<div class="rounded-lg border border-border py-12 text-center">
-		<p class="font-mono text-[11px] tracking-wider text-muted-foreground/70 uppercase">
+		<p class="font-mono text-[11px] tracking-wider text-muted-foreground uppercase">
 			NO_MATCHING_UNITS
 		</p>
 	</div>
@@ -62,8 +62,8 @@
 
 		<div class="relative">
 			<div class="mb-4 flex items-center gap-2">
-				<Rocket class="h-4 w-4 text-muted-foreground/70" />
-				<span class="font-mono text-[10px] tracking-wider text-muted-foreground/70 uppercase">
+				<Rocket class="h-4 w-4 text-muted-foreground" />
+				<span class="font-mono text-[10px] tracking-wider text-muted-foreground uppercase">
 					DEPLOYED_UNITS ({filteredApps.length})
 				</span>
 			</div>

@@ -81,8 +81,23 @@ export interface App {
 	preview_enabled: boolean;
 	/** Phase 4.6: env var keys excluded from preview containers */
 	preview_excluded_keys: string[];
+	/**
+	 * How a deploy decides the new container is ready: `http` (health path, or
+	 * any HTTP answer on the port), `tcp` (the port accepts connections) or
+	 * `none` (background worker: no port, no domain, never routed).
+	 */
+	readiness?: Readiness;
+	/** For `none`: seconds the container must stay up */
+	ready_after_secs?: number;
 	created_at: string;
 	updated_at: string;
+}
+
+export type Readiness = 'http' | 'tcp' | 'none';
+
+/** An app's readiness mode (`http` for apps from before the setting). */
+export function appReadiness(app: Pick<App, 'readiness'>): Readiness {
+	return app.readiness === 'tcp' || app.readiness === 'none' ? app.readiness : 'http';
 }
 
 export interface TemplateProject {
@@ -356,6 +371,10 @@ export async function createApp(data: {
 	base_dir?: string;
 	/** Serve build output as a static site */
 	static_build?: boolean;
+	/** `http` (default) | `tcp` | `none` (background worker: no port, no domain) */
+	readiness?: Readiness;
+	/** For `none`: seconds the container must stay up (default 10) */
+	ready_after_secs?: number;
 }): Promise<App> {
 	return request<App>('/apps', {
 		method: 'POST',
@@ -496,6 +515,21 @@ export async function updateHealth(
 	await request(`/apps/${id}/health`, {
 		method: 'PUT',
 		body: JSON.stringify({ health_check_path, health_check_interval, health_failure_threshold })
+	});
+}
+
+/**
+ * Set how deploys decide the app is ready. Switching to `none` (background
+ * worker) removes the app's domain and health check path.
+ */
+export async function updateReadiness(
+	id: string,
+	readiness: Readiness,
+	ready_after_secs?: number
+): Promise<App> {
+	return request<App>(`/apps/${id}/readiness`, {
+		method: 'PUT',
+		body: JSON.stringify({ readiness, ...(ready_after_secs ? { ready_after_secs } : {}) })
 	});
 }
 
@@ -870,6 +904,16 @@ export interface ServerSettings {
 	session_max_age_days?: number;
 }
 
+export interface LastDeployment {
+	id: string;
+	app_id: string;
+	app_name: string;
+	status: string;
+	trigger_source: string;
+	created_at: string;
+	finished_at: string | null;
+}
+
 export interface OnboardingStatus {
 	dashboard_domain: string;
 	is_fresh_install: boolean;
@@ -877,6 +921,14 @@ export interface OnboardingStatus {
 	has_apps: boolean;
 	has_databases: boolean;
 	has_cron_jobs: boolean;
+	/** A GitHub App is installed, or a GitLab token or registry credential exists. */
+	has_source_integration: boolean;
+	/** At least one deployment succeeded. */
+	has_successful_deploy: boolean;
+	/** At least one notification channel exists. */
+	has_notification_channel: boolean;
+	/** The newest deployment of any app. */
+	last_deployment: LastDeployment | null;
 	server_public_ip: string | null;
 	domain_status: {
 		configured: boolean;
@@ -1119,6 +1171,10 @@ export interface ImageInspection {
 	env_port: number | null;
 	suggested_port: number | null;
 	pulled: boolean;
+	/** Set when the image couldn't be read; says why and what to do */
+	unavailable?: string | null;
+	/** The registry refused the image: it may need registry credentials */
+	needs_credentials?: boolean;
 }
 
 /** Ports an image exposes (pulls it first if it isn't on the server yet). */
@@ -1745,8 +1801,11 @@ export async function createAlertRule(data: {
 	name: string;
 	metric?: AlertMetric;
 	threshold?: number;
-	webhook_url: string;
+	/** Optional webhook ('' = none). A rule needs a webhook or at least one channel. */
+	webhook_url?: string;
 	events?: AlertEvent[];
+	/** Notification channels (integration ids) to link when the rule is created. */
+	integration_ids?: string[];
 }): Promise<AlertRule> {
 	return request<AlertRule>('/alerts', {
 		method: 'POST',
@@ -1774,6 +1833,19 @@ export async function updateAlertRule(
 
 export async function deleteAlertRule(id: string): Promise<void> {
 	await request(`/alerts/${id}`, { method: 'DELETE' });
+}
+
+export interface AlertChannelTestResult {
+	/** "webhook" or the integration kind ("slack", "email", …). */
+	kind: string;
+	name: string;
+	ok: boolean;
+	error: string | null;
+}
+
+/** Send a test message to every channel of a rule; one result per channel. */
+export async function testAlertRule(id: string): Promise<AlertChannelTestResult[]> {
+	return request<AlertChannelTestResult[]>(`/alerts/${id}/test`, { method: 'POST' });
 }
 
 // ── Audit log ──
@@ -2223,6 +2295,64 @@ export async function deleteCronJob(id: string): Promise<void> {
 
 export async function triggerCronJob(id: string): Promise<void> {
 	await request(`/cron/${id}/trigger`, { method: 'POST' });
+}
+
+export interface CronSchedulePreview {
+	/** Next run times as RFC 3339 UTC timestamps (up to `count`). */
+	next_runs: string[];
+	/** Time zone the schedule is evaluated in ("UTC" when none is set). */
+	timezone: string;
+}
+
+/** Validate a schedule and list its next runs, evaluated in `timezone` (IANA, empty = UTC). */
+export async function previewCronSchedule(
+	schedule: string,
+	timezone?: string | null,
+	count = 5
+): Promise<CronSchedulePreview> {
+	const params = new URLSearchParams({ schedule, count: String(count) });
+	if (timezone) params.set('timezone', timezone);
+	return request<CronSchedulePreview>(`/cron/schedule-preview?${params}`);
+}
+
+/**
+ * Wait for a manually triggered cron run to finish, using the run stream (no
+ * polling; the socket reconnects if the server restarts). Calls `onDone` once
+ * a run that started at or after `since` completes, then closes the socket.
+ * Returns a cancel function.
+ */
+export function watchCronRunCompletion(
+	id: string,
+	onDone: () => void,
+	since: Date = new Date(Date.now() - 5000)
+): () => void {
+	let settled = false;
+	const isNewFinishedRun = (run: { status?: string; started_at?: string } | null | undefined) =>
+		!!run &&
+		run.status !== 'running' &&
+		!!run.started_at &&
+		new Date(run.started_at).getTime() >= since.getTime();
+	const socket = connectWithRetry(() => wsUrl(`${BASE}/cron/${id}/runs/stream`), {
+		onMessage(event) {
+			let frame: { type?: string; run?: { status?: string; started_at?: string } | null };
+			try {
+				frame = JSON.parse(event.data as string);
+			} catch {
+				return;
+			}
+			const done =
+				frame.type === 'run' || (frame.type === 'snapshot' && isNewFinishedRun(frame.run));
+			if (done && !settled) {
+				settled = true;
+				socket.close();
+				onDone();
+			}
+		}
+	});
+	return () => {
+		settled = true;
+		socket.close();
+	};
 }
 
 export async function listCronJobRuns(

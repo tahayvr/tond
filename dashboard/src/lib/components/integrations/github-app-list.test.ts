@@ -1,6 +1,7 @@
 import { render, screen } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { confirmDialog, renderConfirmHost } from '../../../test/confirm';
 
 vi.mock('./github-app-card.svelte', async () => ({
 	default: (await import('../../../test/mocks/GitHubAppCardHarness.svelte')).default
@@ -127,7 +128,9 @@ describe('GitHubAppList', () => {
 			}
 		});
 
+		renderConfirmHost();
 		await user.click(screen.getByRole('button', { name: /disconnect app/i }));
+		await confirmDialog(user);
 
 		expect(api.deleteGitHubApp).toHaveBeenCalledWith('gh_1');
 		expect(screen.queryByText(/tond github app/i)).not.toBeInTheDocument();

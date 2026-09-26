@@ -1,4 +1,5 @@
 <script lang="ts">
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { inviteUser, type PasswordLink, type Role } from '$lib/api';
 	import { ROLE_LABELS, ROLE_SUMMARIES } from '$lib/access';
 	import { cn } from '$lib/utils';
@@ -101,11 +102,7 @@
 						</button>
 					{/each}
 				</fieldset>
-				{#if error}
-					<div class="rounded-md bg-destructive/10 p-3 text-sm text-destructive" role="alert">
-						{error}
-					</div>
-				{/if}
+				<InlineError message={error} />
 				<Dialog.Footer>
 					<Button type="button" variant="outline" onclick={() => (open = false)}>Cancel</Button>
 					<Button type="submit" disabled={saving}

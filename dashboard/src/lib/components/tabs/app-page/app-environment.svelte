@@ -1,4 +1,5 @@
 <script lang="ts">
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Separator } from '$lib/components/ui/separator/index.js';
 	import { Skeleton } from '$lib/components/ui/skeleton/index.js';
@@ -527,11 +528,7 @@
 					: 'Preview deployments fall back to the app value (if any) from their next deploy.'}
 			</Dialog.Description>
 		</Dialog.Header>
-		{#if deleteError}
-			<p class="rounded bg-destructive/10 px-3 py-2 text-xs text-destructive" role="alert">
-				{deleteError}
-			</p>
-		{/if}
+		<InlineError message={deleteError} />
 		<Dialog.Footer>
 			<Button variant="outline" onclick={() => (deleteOpen = false)} disabled={deleting}>
 				Cancel

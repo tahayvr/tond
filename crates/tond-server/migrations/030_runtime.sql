@@ -24,6 +24,10 @@ CREATE INDEX deployments_unfinished_idx ON deployments(status, created_at)
 -- update hook) nudges the proxy over its control socket and waits for the
 -- acknowledgement. The triggers keep the counter correct no matter which
 -- code path writes.
+-- Folding note: apps.readiness (051) also decides routing; this migration runs
+-- before it exists, so add readiness to route_apps_update when migrations are
+-- folded into the baseline. Until then a readiness change reaches the proxy with
+-- the next routed-column change or its 60 s fallback check.
 CREATE TABLE route_state(
   id INTEGER PRIMARY KEY CHECK(id = 1),
   version INTEGER NOT NULL DEFAULT 0

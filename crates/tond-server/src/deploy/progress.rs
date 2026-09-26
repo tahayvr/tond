@@ -18,7 +18,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{LazyLock, Mutex};
 
-use tond_common::{DeployFailure, DeployPhase, PhaseRecord, PhaseStatus};
+use tond_common::{App, DeployFailure, DeployPhase, PhaseRecord, PhaseStatus, Readiness};
 
 use crate::log_bus;
 use crate::state::AppState;
@@ -38,6 +38,46 @@ static ACTIVE: LazyLock<Mutex<HashMap<String, Active>>> =
 fn with_active<R>(app_id: &str, f: impl FnOnce(&mut Active) -> R) -> Option<R> {
     let mut map = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
     map.get_mut(app_id).map(f)
+}
+
+/// Label of the health step for an app's readiness mode.
+pub fn health_label(
+    readiness: Readiness,
+    health_path: Option<&str>,
+    ready_after_secs: i64,
+) -> String {
+    match readiness {
+        Readiness::Http if health_path.is_some() => "Health check".to_string(),
+        Readiness::Http => "Wait for the app to listen".to_string(),
+        Readiness::Tcp => "Wait for the port to accept connections".to_string(),
+        Readiness::None => format!("Stay up for {ready_after_secs}s"),
+    }
+}
+
+/// The phase plan for an app: [`plan_for`] with the health and release steps
+/// named after its readiness mode (workers have no traffic to switch).
+pub fn plan_for_app(plan_source: &str, app: &App) -> Vec<PhaseRecord> {
+    let readiness = app.readiness();
+    let mut phases = plan_for(plan_source, app.health_check_path.as_deref());
+    for p in phases.iter_mut() {
+        if p.status == PhaseStatus::Skipped {
+            continue;
+        }
+        match p.phase {
+            DeployPhase::Health => {
+                p.label = Some(health_label(
+                    readiness,
+                    app.health_check_path.as_deref(),
+                    app.ready_after_secs,
+                ))
+            }
+            DeployPhase::Release if !readiness.serves_traffic() => {
+                p.label = Some("Replace the old container".to_string())
+            }
+            _ => {}
+        }
+    }
+    phases
 }
 
 /// The phase plan for a source type (`rollback` for image rollbacks).
@@ -453,6 +493,26 @@ mod tests {
         assert_eq!(rollback[1].status, Skipped);
         let compose = plan_for("compose", None);
         assert_eq!(compose[3].status, Skipped);
+    }
+
+    #[test]
+    fn plans_name_the_health_step_after_the_readiness_mode() {
+        let mut app = App::new("w".into(), "image".into(), None, None, 80);
+        assert_eq!(
+            plan_for_app("image", &app)[3].label.as_deref(),
+            Some("Wait for the app to listen")
+        );
+        app.readiness = "tcp".into();
+        assert_eq!(
+            plan_for_app("image", &app)[3].label.as_deref(),
+            Some("Wait for the port to accept connections")
+        );
+        app.readiness = "none".into();
+        app.ready_after_secs = 15;
+        let plan = plan_for_app("image", &app);
+        assert_eq!(plan[3].label.as_deref(), Some("Stay up for 15s"));
+        assert_eq!(plan[4].label.as_deref(), Some("Replace the old container"));
+        assert_eq!(plan[1].status, PhaseStatus::Skipped);
     }
 
     #[test]

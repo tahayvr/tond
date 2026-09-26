@@ -50,6 +50,6 @@ describe('alerts page', () => {
 		});
 
 		expect(screen.queryByText(/loading_monitors/i)).not.toBeInTheDocument();
-		expect(screen.getByText(/1\/1 monitors active/i)).toBeInTheDocument();
+		expect(screen.getByText(/1 of 1 rules enabled/i)).toBeInTheDocument();
 	});
 });

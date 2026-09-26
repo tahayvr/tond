@@ -1,6 +1,6 @@
 import { render, screen } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { verify2FA, setAuthenticated } = vi.hoisted(() => ({
 	verify2FA: vi.fn(),
@@ -20,6 +20,10 @@ vi.mock('$app/state', () => ({
 }));
 
 import TwoFactorPage from '../../routes/login/2fa/+page.svelte';
+
+// bits-ui's PIN input re-dispatches input events on 0/10/50 ms timers; let them
+// finish before the DOM is torn down, or they fire into a disposed document.
+afterEach(() => new Promise((resolve) => setTimeout(resolve, 60)));
 
 describe('2fa login page', () => {
 	beforeEach(() => {

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import {
 		createPasswordLink,
 		deleteUser,
@@ -21,7 +22,8 @@
 	import * as Select from '$lib/components/ui/select/index.js';
 	import * as Dialog from '$lib/components/ui/dialog/index.js';
 	import * as AlertDialog from '$lib/components/ui/alert-dialog/index.js';
-	import ConfirmDeleteDialog from '$lib/components/dialogs/confirm-delete-dialog.svelte';
+	import ConfirmDialog from '$lib/components/dialogs/confirm-dialog.svelte';
+	import PageTitle from '$lib/components/nav/page-title.svelte';
 	import InviteUserDialog from '$lib/components/users/invite-user-dialog.svelte';
 	import PasswordLinkView from '$lib/components/users/password-link-view.svelte';
 	import UserAddIcon from '~icons/ri/user-add-line';
@@ -194,10 +196,12 @@
 	});
 </script>
 
+<PageTitle title="Users" />
+
 <div class="space-y-6">
 	<div class="flex flex-wrap items-center justify-between gap-3">
 		<div>
-			<h2 class="text-3xl font-extrabold uppercase">Users</h2>
+			<h1 class="text-2xl font-extrabold sm:text-3xl">Users</h1>
 			<p class="text-sm text-muted-foreground">
 				Who can sign in, and what they can do. Admins can do everything; deployers ship code;
 				viewers look.
@@ -210,15 +214,11 @@
 		{/if}
 	</div>
 
-	{#if error}
-		<div class="rounded-md bg-destructive/10 p-3 text-sm text-destructive" role="alert">
-			{error}
-		</div>
-	{/if}
+	<InlineError message={error} />
 
 	{#if users.length === 0}
 		<div class="rounded-lg border border-dashed border-border py-16 text-center">
-			<TeamIcon class="mx-auto mb-2 size-10 text-muted-foreground/40" />
+			<TeamIcon class="mx-auto mb-2 size-10 text-muted-foreground" />
 			<p class="font-medium">No users yet</p>
 		</div>
 	{:else}
@@ -313,11 +313,7 @@
 			<AlertDialog.Title>{pending?.title}</AlertDialog.Title>
 			<AlertDialog.Description>{pending?.description}</AlertDialog.Description>
 		</AlertDialog.Header>
-		{#if pendingError}
-			<div class="rounded-md bg-destructive/10 p-3 text-sm text-destructive" role="alert">
-				{pendingError}
-			</div>
-		{/if}
+		<InlineError message={pendingError} />
 		<AlertDialog.Footer>
 			<AlertDialog.Cancel disabled={pendingBusy}>Cancel</AlertDialog.Cancel>
 			<Button
@@ -332,11 +328,13 @@
 </AlertDialog.Root>
 
 {#if deleteTarget}
-	<ConfirmDeleteDialog
+	<ConfirmDialog
 		bind:open={deleteOpen}
 		title={`Delete ${deleteTarget.email}?`}
-		description="They lose access immediately, their sessions end and their API tokens are deleted. Their past activity stays in the log. Type the email to confirm."
-		confirmation={deleteTarget.email}
+		description="They lose access immediately, their sessions end and their API tokens are deleted. Their past activity stays in the log."
+		confirmLabel="Delete user"
+		pendingLabel="Deleting…"
+		typedConfirmation={deleteTarget.email}
 		onconfirm={async () => {
 			if (!deleteTarget) return;
 			await deleteUser(deleteTarget.id);
@@ -383,11 +381,7 @@
 			<Dialog.Title>Sessions of {sessionsUser?.email}</Dialog.Title>
 			<Dialog.Description>Browsers signed in to this account right now.</Dialog.Description>
 		</Dialog.Header>
-		{#if sessionsError}
-			<div class="rounded-md bg-destructive/10 p-3 text-sm text-destructive" role="alert">
-				{sessionsError}
-			</div>
-		{/if}
+		<InlineError message={sessionsError} />
 		{#if sessionsLoading}
 			<p class="py-6 text-center text-sm text-muted-foreground">Loading…</p>
 		{:else if sessions.length === 0}

@@ -975,8 +975,6 @@ pub async fn restore_database(
 pub async fn backup_scheduler(state: AppState) {
     use crate::runtime::changes::{Table, Watch};
     use crate::runtime::loops::{self, Wake};
-    use cron::Schedule;
-    use std::str::FromStr;
 
     const IDLE: std::time::Duration = std::time::Duration::from_secs(3600);
     let lp = loops::register("backup-scheduler");
@@ -998,7 +996,7 @@ pub async fn backup_scheduler(state: AppState) {
             continue;
         }
 
-        let schedule = match Schedule::from_str(&cfg.full_schedule_cron) {
+        let schedule = match crate::cron::parse_schedule(&cfg.full_schedule_cron) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(

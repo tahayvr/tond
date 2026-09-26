@@ -84,13 +84,13 @@
 					{#if entry.outcome === 'failure'}
 						<Badge variant="destructive" class="text-[10px]">failed</Badge>
 					{:else if isSecurityAction(entry.action)}
-						<ShieldIcon class="size-3.5 text-muted-foreground/70" aria-label="Security event" />
+						<ShieldIcon class="size-3.5 text-muted-foreground" aria-label="Security event" />
 					{/if}
 				</p>
 				{#if entry.detail || entry.ip}
 					<p class="truncate font-mono text-xs text-muted-foreground" title={entry.detail ?? ''}>
 						{#if entry.detail}{entry.detail}{/if}
-						{#if entry.ip}<span class="text-muted-foreground/60">
+						{#if entry.ip}<span class="text-muted-foreground">
 								{entry.detail ? ' · ' : ''}from {entry.ip}</span
 							>{/if}
 					</p>

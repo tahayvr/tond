@@ -10,6 +10,8 @@
 //   DELETE /api/cron/{id}                 — delete cron job
 //   POST   /api/cron/{id}/trigger         — manually trigger a run immediately
 //   GET    /api/cron/{id}/runs            — get execution history (supports ?limit=&offset=)
+//   GET    /api/cron/schedule-preview     — validate a schedule, list its next runs
+//                                           (?schedule=&timezone=&count=)
 
 use std::collections::BTreeMap;
 
@@ -85,6 +87,39 @@ fn validate_env_keys<'a>(keys: impl IntoIterator<Item = &'a String>) -> Result<(
     Ok(())
 }
 
+// ── Schedule preview ──
+
+#[derive(Debug, Deserialize)]
+pub struct SchedulePreviewQuery {
+    pub schedule: String,
+    pub timezone: Option<String>,
+    pub count: Option<usize>,
+}
+
+/// Validate a schedule and return its next runs, so the dashboard can show
+/// exactly what the scheduler will do (same parser, same time zone rules).
+pub async fn preview_schedule(
+    _rate: RateLimit,
+    _auth: Authz<scope::CronRead>,
+    Query(query): Query<SchedulePreviewQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let count = query.count.unwrap_or(5).clamp(1, 20);
+    let timezone = query
+        .timezone
+        .as_deref()
+        .map(str::trim)
+        .filter(|tz| !tz.is_empty());
+    let next_runs = cron::upcoming_runs(&query.schedule, timezone, count)
+        .map_err(|e| AppError(TondError::InvalidInput(e.to_string())))?;
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(serde_json::json!({
+            "next_runs": next_runs,
+            "timezone": timezone.unwrap_or("UTC"),
+        }))),
+    ))
+}
+
 // ── List cron jobs ──
 
 pub async fn list_cron_jobs(
@@ -120,7 +155,7 @@ pub async fn create_cron_job(
     _rate: RateLimit,
     auth: Authz<scope::CronWrite>,
     State(state): State<AppState>,
-    Json(req): Json<CreateCronJobRequest>,
+    Json(mut req): Json<CreateCronJobRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     // Validate name
     if !req.name.chars().all(|c| c.is_alphanumeric() || c == '-') {
@@ -137,10 +172,18 @@ pub async fn create_cron_job(
         )));
     }
 
-    // Validate cron expression by attempting to compute the next run time
-    let next_run = compute_next_run(&req.schedule, req.timezone.as_deref()).map_err(|_| {
+    // Validate the time zone (an unknown name used to fall back to UTC silently)
+    // and the cron expression, by computing the next run time.
+    cron::parse_timezone(req.timezone.as_deref())
+        .map_err(|e| AppError(TondError::InvalidInput(e.to_string())))?;
+    req.timezone = req
+        .timezone
+        .take()
+        .map(|tz| tz.trim().to_string())
+        .filter(|tz| !tz.is_empty());
+    let next_run = compute_next_run(&req.schedule, req.timezone.as_deref()).map_err(|e| {
         AppError(TondError::InvalidInput(format!(
-            "Invalid cron expression: '{}'",
+            "Invalid cron expression '{}': {e}",
             req.schedule
         )))
     })?;
@@ -269,10 +312,9 @@ pub async fn update_cron_job(
 
     // ── schedule ──────────────────────────────────────────────────────────────
     if let Some(ref schedule) = req.schedule {
-        let next_run = compute_next_run(schedule, job.timezone.as_deref()).map_err(|_| {
+        let next_run = compute_next_run(schedule, job.timezone.as_deref()).map_err(|e| {
             AppError(TondError::InvalidInput(format!(
-                "Invalid cron expression: '{}'",
-                schedule
+                "Invalid cron expression '{schedule}': {e}"
             )))
         })?;
         job.schedule = schedule.clone();
@@ -361,7 +403,11 @@ pub async fn update_cron_job(
 
     // ── timezone: Option<Option<String>> — Some(None) reverts to UTC ─────────
     if let Some(new_tz) = req.timezone {
-        job.timezone = new_tz;
+        cron::parse_timezone(new_tz.as_deref())
+            .map_err(|e| AppError(TondError::InvalidInput(e.to_string())))?;
+        job.timezone = new_tz
+            .map(|tz| tz.trim().to_string())
+            .filter(|tz| !tz.is_empty());
         // Recompute next_run with the new timezone if job is enabled
         if job.enabled != 0
             && let Ok(next) = compute_next_run(&job.schedule, job.timezone.as_deref())
@@ -767,9 +813,87 @@ mod tests {
 
         assert_eq!(
             error.0.to_string(),
-            "Invalid input: Invalid cron expression: 'not a cron'",
+            "Invalid input: Invalid cron expression 'not a cron': a schedule needs 5 fields (minute hour day-of-month month day-of-week), got 3",
             "create_cron_job should reject invalid cron expressions"
         );
+    }
+
+    #[tokio::test]
+    async fn create_cron_job_rejects_unknown_time_zones() {
+        let state = test_state().await;
+
+        let error = create_cron_job(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            State(state),
+            Json(CreateCronJobRequest {
+                name: "nightly".to_string(),
+                schedule: "0 3 * * *".to_string(),
+                image: "alpine:latest".to_string(),
+                command: None,
+                project_id: None,
+                timeout_seconds: None,
+                env: None,
+                concurrency_policy: None,
+                memory_mb: None,
+                cpu_shares: None,
+                timezone: Some("Europe/Atlantis".to_string()),
+                max_retries: None,
+                retry_delay_seconds: None,
+                volumes: None,
+            }),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("an unknown time zone must be rejected, not silently UTC"));
+        assert!(
+            error.0.to_string().contains("not a known IANA time zone"),
+            "{}",
+            error.0
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_preview_lists_next_runs_and_rejects_bad_input() {
+        let ok = preview_schedule(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            Query(SchedulePreviewQuery {
+                schedule: "0 9 * * 1-5".to_string(),
+                timezone: Some("Europe/Berlin".to_string()),
+                count: Some(3),
+            }),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("valid preview should succeed: {}", err.0))
+        .into_response();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let body = response_json(ok).await;
+        assert_eq!(body["data"]["timezone"], "Europe/Berlin");
+        assert_eq!(
+            body["data"]["next_runs"]
+                .as_array()
+                .map(|runs| runs.len())
+                .unwrap_or_default(),
+            3
+        );
+
+        for (schedule, timezone) in [("61 * * * *", None), ("0 9 * * *", Some("Nowhere/City"))] {
+            assert!(
+                preview_schedule(
+                    RateLimit,
+                    Authz::unchecked(Principal::test_user(Role::Admin)),
+                    Query(SchedulePreviewQuery {
+                        schedule: schedule.to_string(),
+                        timezone: timezone.map(str::to_string),
+                        count: None,
+                    }),
+                )
+                .await
+                .is_err(),
+                "{schedule} / {timezone:?} should be rejected"
+            );
+        }
     }
 
     #[tokio::test]
@@ -991,7 +1115,7 @@ mod tests {
         .unwrap_or_else(|| panic!("expected update_cron_job to reject invalid schedules"));
         assert_eq!(
             bad_schedule.0.to_string(),
-            "Invalid input: Invalid cron expression: 'not a cron'",
+            "Invalid input: Invalid cron expression 'not a cron': a schedule needs 5 fields (minute hour day-of-month month day-of-week), got 3",
             "update_cron_job should reject invalid cron expressions"
         );
 

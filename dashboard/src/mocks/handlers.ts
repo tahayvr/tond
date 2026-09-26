@@ -290,6 +290,50 @@ function mockHostTerminalEnabled(): boolean {
 		return false;
 	}
 }
+/** Tiny cron evaluator for the mock schedule preview (UTC, minute resolution). */
+function mockNextRuns(schedule: string, count: number): string[] | null {
+	const fields = schedule.trim().split(/\s+/);
+	if (fields.length !== 5) return null;
+	const ranges: [number, number][] = [
+		[0, 59],
+		[0, 23],
+		[1, 31],
+		[1, 12],
+		[0, 7]
+	];
+	const sets: Set<number>[] = [];
+	for (let i = 0; i < 5; i++) {
+		const [min, max] = ranges[i];
+		const set = new Set<number>();
+		for (const part of fields[i].split(',')) {
+			const [range, stepStr] = part.split('/');
+			const step = stepStr ? Number(stepStr) : 1;
+			if (!Number.isInteger(step) || step < 1) return null;
+			const [a, rawB] = range === '*' ? [min, max] : range.split('-').map(Number);
+			const b = rawB === undefined ? (stepStr ? max : a) : rawB;
+			if (!Number.isInteger(a) || !Number.isInteger(b) || a < min || b > max || a > b) return null;
+			for (let v = a; v <= b; v += step) set.add(i === 4 ? v % 7 : v);
+		}
+		sets.push(set);
+	}
+	const runs: string[] = [];
+	const t = new Date();
+	t.setUTCSeconds(0, 0);
+	for (let n = 0; n < 60 * 24 * 400 && runs.length < count; n++) {
+		t.setUTCMinutes(t.getUTCMinutes() + 1);
+		if (
+			sets[0].has(t.getUTCMinutes()) &&
+			sets[1].has(t.getUTCHours()) &&
+			sets[2].has(t.getUTCDate()) &&
+			sets[3].has(t.getUTCMonth() + 1) &&
+			sets[4].has(t.getUTCDay())
+		) {
+			runs.push(t.toISOString());
+		}
+	}
+	return runs;
+}
+
 const MOCK_STEP_UP_PASSWORD = 'ValidPass123!';
 // ticket → target, consumed by the terminal WebSocket mock
 const terminalTickets = new Map<string, { kind: string; id: string }>();
@@ -633,7 +677,15 @@ function startMockDeploy(
 		finished_at: null,
 		created_at: now,
 		duration_secs: null,
-		phases: mockPhasePlan(plan, app.health_check_path),
+		phases: mockPhasePlan(plan, app.health_check_path).map((p) =>
+			p.phase === 'health' && p.status !== 'skipped' && app.readiness === 'none'
+				? { ...p, label: `Stay up for ${app.ready_after_secs ?? 10}s` }
+				: p.phase === 'health' && p.status !== 'skipped' && app.readiness === 'tcp'
+					? { ...p, label: 'Wait for the port to accept connections' }
+					: p.phase === 'release' && app.readiness === 'none'
+						? { ...p, label: 'Replace the old container' }
+						: p
+		),
 		failure: null,
 		image_pruned: false,
 		is_current: false,
@@ -775,9 +827,11 @@ function startMockDeploy(
 			() =>
 				log(
 					'info',
-					app.health_check_path
-						? `Waiting up to 30s for the health check on port ${app.container_port}${app.health_check_path} to pass`
-						: `Waiting up to 60s for the app to answer on port ${app.container_port}`
+					app.readiness === 'none'
+						? `Background worker: waiting ${app.ready_after_secs ?? 10}s to make sure it stays up`
+						: app.health_check_path
+							? `Waiting up to 30s for the health check on port ${app.container_port}${app.health_check_path} to pass`
+							: `Waiting up to 60s for the app to answer on port ${app.container_port}`
 				)
 		]
 	);
@@ -785,11 +839,22 @@ function startMockDeploy(
 		script.push([4000, finish]);
 	} else {
 		script.push(
-			[2000, () => log('info', 'New container is ready — cutting over traffic')],
+			[
+				2000,
+				() =>
+					log(
+						'info',
+						app.readiness === 'none'
+							? 'The worker stayed up — replacing the old container'
+							: 'New container is ready — cutting over traffic'
+					)
+			],
 			[200, () => phase('release')],
 			[
 				300,
-				() => log('info', 'Waiting 3s for proxy to pick up new port before stopping old container')
+				() =>
+					app.readiness !== 'none' &&
+					log('info', 'Waiting 3s for proxy to pick up new port before stopping old container')
 			],
 			[1500, () => log('info', 'Draining old container 4be1c2a9d0f3 (30s grace)')],
 			[800, finish]
@@ -1567,6 +1632,11 @@ export const handlers = [
 			const problem = mockVolumeError(v, `${MOCK_VOLUMES_DIR}/${appName}`);
 			if (problem) return err(problem, 400);
 		}
+		if (body.readiness === 'none' && body.domain) {
+			return err(
+				'Invalid input: Background workers have no domain: they serve no traffic. Leave the domain empty.'
+			);
+		}
 		const newApp: App = {
 			id: `app_${Date.now()}`,
 			name: body.name ?? 'new-app',
@@ -1600,6 +1670,8 @@ export const handlers = [
 			static_build: body.static_build ?? false,
 			preview_enabled: false,
 			preview_excluded_keys: [],
+			readiness: body.readiness ?? 'http',
+			ready_after_secs: body.ready_after_secs ?? 10,
 			created_at: new Date().toISOString(),
 			updated_at: new Date().toISOString()
 		};
@@ -1643,6 +1715,25 @@ export const handlers = [
 		);
 	}),
 
+	http.put('/api/apps/:id/readiness', async ({ params, request }) => {
+		await delay(LATENCY);
+		const idx = apps.findIndex((a) => a.id === params.id);
+		if (idx === -1) return err('App not found', 404);
+		const body = (await request.json()) as { readiness: string; ready_after_secs?: number };
+		if (!['http', 'tcp', 'none'].includes(body.readiness)) {
+			return err('Invalid input: readiness must be one of: http, tcp, none');
+		}
+		const readiness = body.readiness as 'http' | 'tcp' | 'none';
+		apps[idx] = {
+			...apps[idx],
+			readiness,
+			ready_after_secs: body.ready_after_secs ?? apps[idx].ready_after_secs ?? 10,
+			...(readiness === 'none' ? { domain: null, health_check_path: null } : {}),
+			updated_at: new Date().toISOString()
+		};
+		return ok(apps[idx]);
+	}),
+
 	http.put('/api/apps/:id/port', async ({ params, request }) => {
 		await delay(LATENCY);
 		const idx = apps.findIndex((a) => a.id === params.id);
@@ -1681,17 +1772,24 @@ export const handlers = [
 
 	http.post('/api/images/inspect', async ({ request }) => {
 		await delay(LATENCY * 4);
-		const body = (await request.json()) as { image: string };
+		const body = (await request.json()) as { image: string; registry_credential_id?: string };
 		const image = (body.image ?? '').trim();
 		if (!image || /\s/.test(image)) {
 			return err(
 				'Invalid input: Enter an image reference like nginx:alpine or ghcr.io/org/app:1.2'
 			);
 		}
-		if (/does-not-exist/.test(image)) {
-			return err(
-				`Invalid input: Couldn't pull ${image}: manifest unknown. Check the name and tag; private images need registry credentials.`
-			);
+		if (/does-not-exist|private/.test(image) && !body.registry_credential_id) {
+			// Soft failure, as the server does for a pull the registry refuses.
+			return ok({
+				image,
+				exposed_ports: [],
+				env_port: null,
+				suggested_port: null,
+				pulled: false,
+				unavailable: `Tond couldn't read ${image}. If it's private, choose registry credentials on the Environment step and Tond reads its port then; otherwise check the name and tag.`,
+				needs_credentials: true
+			});
 		}
 		const { exposed, env } = mockImagePorts(image);
 		const suggested =
@@ -2317,6 +2415,27 @@ export const handlers = [
 		MOCK_ONBOARDING_STATUS.has_apps = apps.length > 0;
 		MOCK_ONBOARDING_STATUS.has_databases = databases.length > 0;
 		MOCK_ONBOARDING_STATUS.has_cron_jobs = cronJobs.length > 0;
+		MOCK_ONBOARDING_STATUS.has_source_integration =
+			githubApps.some((g) => g.installed) || registryCredentials.length > 0;
+		const allDeployments = Object.values(deployments)
+			.flat()
+			.sort((a, b) => b.created_at.localeCompare(a.created_at));
+		MOCK_ONBOARDING_STATUS.has_successful_deploy = allDeployments.some(
+			(d) => d.status === 'succeeded'
+		);
+		MOCK_ONBOARDING_STATUS.has_notification_channel = integrations.length > 0;
+		const latest = allDeployments[0];
+		MOCK_ONBOARDING_STATUS.last_deployment = latest
+			? {
+					id: latest.id,
+					app_id: latest.app_id,
+					app_name: apps.find((a) => a.id === latest.app_id)?.name ?? latest.app_id,
+					status: latest.status,
+					trigger_source: latest.trigger_source,
+					created_at: latest.created_at,
+					finished_at: latest.finished_at
+				}
+			: null;
 		MOCK_ONBOARDING_STATUS.is_fresh_install =
 			!MOCK_ONBOARDING_STATUS.has_projects &&
 			!MOCK_ONBOARDING_STATUS.has_apps &&
@@ -2393,7 +2512,7 @@ export const handlers = [
 			| 'updated_at'
 			| 'has_webhook_url'
 			| 'webhook_host'
-		> & { webhook_url?: string };
+		> & { webhook_url?: string; integration_ids?: string[] };
 		const validMetrics = ['cpu', 'memory', 'app_down', 'disk_usage'];
 		const validEvents = [
 			'deployment_success',
@@ -2414,6 +2533,18 @@ export const handlers = [
 		if (!body.metric && (!body.events || body.events.length === 0)) {
 			return err('At least one metric or event is required', 400);
 		}
+		const channelIds = [...new Set(body.integration_ids ?? [])];
+		if (!(body.webhook_url ?? '').trim() && channelIds.length === 0) {
+			return err(
+				'Choose at least one notification channel or add a webhook URL, so this rule notifies someone.',
+				400
+			);
+		}
+		for (const id of channelIds) {
+			if (!integrations.some((i) => i.id === id)) {
+				return err(`Notification channel ${id} doesn't exist`, 400);
+			}
+		}
 		const newRule: AlertRule = {
 			id: `alert_${Date.now()}`,
 			app_id: body.app_id ?? null,
@@ -2429,6 +2560,20 @@ export const handlers = [
 			updated_at: new Date().toISOString()
 		};
 		alertRules = [...alertRules, newRule];
+		alertIntegrationLinks = {
+			...alertIntegrationLinks,
+			[newRule.id]: channelIds.map((id, i) => {
+				const integration = integrations.find((x) => x.id === id)!;
+				return {
+					id: `link_${Date.now()}_${i}`,
+					rule_id: newRule.id,
+					integration_id: id,
+					integration_name: integration.name,
+					integration_kind: integration.kind,
+					created_at: new Date().toISOString()
+				};
+			})
+		};
 		return HttpResponse.json({ success: true, data: newRule, error: null }, { status: 201 });
 	}),
 
@@ -2441,6 +2586,16 @@ export const handlers = [
 				webhook_url: string;
 			}
 		>;
+		if (
+			webhook_url !== undefined &&
+			!webhook_url.trim() &&
+			(alertIntegrationLinks[params.id as string] ?? []).length === 0
+		) {
+			return err(
+				'Choose at least one notification channel or add a webhook URL, so this rule notifies someone.',
+				400
+			);
+		}
 		if (webhook_url !== undefined) {
 			alertRules[idx] = {
 				...alertRules[idx],
@@ -2469,6 +2624,34 @@ export const handlers = [
 		}
 		alertRules[idx] = { ...alertRules[idx], ...body, updated_at: new Date().toISOString() };
 		return ok(alertRules[idx]);
+	}),
+
+	http.post('/api/alerts/:id/test', async ({ params }) => {
+		await delay(LATENCY * 3);
+		const rule = alertRules.find((r) => r.id === params.id);
+		if (!rule) return err('Alert rule not found', 404);
+		const results = [
+			...(rule.has_webhook_url
+				? [{ kind: 'webhook', name: rule.webhook_host ?? 'Webhook', ok: true, error: null }]
+				: []),
+			...(alertIntegrationLinks[rule.id] ?? []).map((link) => {
+				const integration = integrations.find((i) => i.id === link.integration_id);
+				const enabled = integration?.enabled ?? false;
+				return {
+					kind: link.integration_kind,
+					name: link.integration_name,
+					ok: enabled,
+					error: enabled ? null : 'This channel is switched off on the Integrations page'
+				};
+			})
+		];
+		if (results.length === 0) {
+			return err(
+				'Choose at least one notification channel or add a webhook URL, so this rule notifies someone.',
+				400
+			);
+		}
+		return ok(results);
 	}),
 
 	http.delete('/api/alerts/:id', async ({ params }) => {
@@ -2802,6 +2985,17 @@ export const handlers = [
 	http.get('/api/cron', async () => {
 		await delay(LATENCY);
 		return ok(cronJobs);
+	}),
+
+	http.get('/api/cron/schedule-preview', async ({ request }) => {
+		await delay(LATENCY);
+		const url = new URL(request.url);
+		const schedule = url.searchParams.get('schedule') ?? '';
+		const timezone = url.searchParams.get('timezone') || 'UTC';
+		const count = Number(url.searchParams.get('count') ?? 5);
+		const runs = mockNextRuns(schedule, count);
+		if (!runs) return err(`Invalid cron expression '${schedule}'`, 400);
+		return ok({ next_runs: runs, timezone });
 	}),
 
 	http.post('/api/cron', async ({ request }) => {
@@ -3361,6 +3555,12 @@ export const handlers = [
 		const links = alertIntegrationLinks[ruleId] ?? [];
 		const exists = links.some((l) => l.integration_id === params.integrationId);
 		if (!exists) return err('Integration link not found', 404);
+		if (links.length + (rule.has_webhook_url ? 1 : 0) <= 1) {
+			return err(
+				"This is the rule's only notification channel. Add another channel or a webhook URL first, or delete the rule.",
+				400
+			);
+		}
 		alertIntegrationLinks = {
 			...alertIntegrationLinks,
 			[ruleId]: links.filter((l) => l.integration_id !== params.integrationId)

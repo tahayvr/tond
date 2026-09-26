@@ -37,7 +37,7 @@
 							step.status === 'succeeded' && 'text-success',
 							step.status === 'failed' && 'text-destructive',
 							step.status === 'running' && 'text-foreground',
-							step.status === 'pending' && 'text-muted-foreground/60'
+							step.status === 'pending' && 'text-muted-foreground'
 						)}
 					>
 						{#if step.status === 'succeeded'}

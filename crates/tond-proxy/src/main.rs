@@ -522,8 +522,11 @@ impl TondProxy {
         };
 
         let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            // Background workers (readiness 'none') serve nothing: never routed,
+            // even if a domain lingers on the row.
             "SELECT name, domain, host_port FROM apps
-             WHERE status = 'running' AND domain IS NOT NULL AND host_port IS NOT NULL",
+             WHERE status = 'running' AND domain IS NOT NULL AND host_port IS NOT NULL
+               AND readiness != 'none'",
         )
         .fetch_all(&mut *tx)
         .await?;
@@ -1060,7 +1063,8 @@ mod tests {
                 domain TEXT,
                 container_port INTEGER NOT NULL DEFAULT 3000,
                 status TEXT NOT NULL DEFAULT 'pending',
-                host_port INTEGER
+                host_port INTEGER,
+                readiness TEXT NOT NULL DEFAULT 'http'
             )",
         )
         .execute(&pool)
@@ -1646,6 +1650,21 @@ mod tests {
         )
         .await;
 
+        insert_app(
+            &pool,
+            "app-worker",
+            "queue-worker",
+            Some("queue-worker.example.com"),
+            "running",
+            3003,
+            Some(4400),
+        )
+        .await;
+        sqlx::query("UPDATE apps SET readiness = 'none' WHERE id = 'app-worker'")
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|err| panic!("failed to mark worker: {err}"));
+
         insert_preview(
             &pool,
             "preview-running",
@@ -1702,6 +1721,10 @@ mod tests {
         assert!(
             !routes.contains_key("worker.example.com"),
             "refresh_routes should ignore apps that are not running"
+        );
+        assert!(
+            !routes.contains_key("queue-worker.example.com"),
+            "background workers are never routed"
         );
         assert!(
             !routes.contains_key("expired-frontend.previews.test"),
@@ -1960,9 +1983,9 @@ mod tests {
             "CREATE TABLE route_state (id INTEGER PRIMARY KEY, version INTEGER NOT NULL)",
             "INSERT INTO route_state VALUES (1, 1)",
             "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-            "CREATE TABLE apps (id TEXT PRIMARY KEY, name TEXT, domain TEXT, status TEXT, host_port INTEGER)",
+            "CREATE TABLE apps (id TEXT PRIMARY KEY, name TEXT, domain TEXT, status TEXT, host_port INTEGER, readiness TEXT NOT NULL DEFAULT 'http')",
             "CREATE TABLE preview_deployments (id TEXT PRIMARY KEY, subdomain TEXT, host_port INTEGER, status TEXT, expires_at TEXT)",
-            "INSERT INTO apps VALUES ('a', 'web', 'web.example.com', 'running', 4100)",
+            "INSERT INTO apps (id, name, domain, status, host_port) VALUES ('a', 'web', 'web.example.com', 'running', 4100)",
         ] {
             sqlx::query(stmt)
                 .execute(&writer)
@@ -1994,7 +2017,7 @@ mod tests {
             "the proxy's connection must not be able to write"
         );
 
-        sqlx::query("INSERT INTO apps VALUES ('b', 'api', 'api.example.com', 'running', 4200)")
+        sqlx::query("INSERT INTO apps (id, name, domain, status, host_port) VALUES ('b', 'api', 'api.example.com', 'running', 4200)")
             .execute(&writer)
             .await
             .unwrap_or_else(|err| panic!("insert: {err}"));

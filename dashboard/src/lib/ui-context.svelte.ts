@@ -95,6 +95,29 @@ export function openFeedPanel() {
 	_feedOpen = true;
 }
 
+// ── Command palette and shortcuts overlay ────────────────────────────────────
+
+let _paletteOpen = $state(false);
+let _shortcutsOpen = $state(false);
+
+export function getPaletteOpen(): boolean {
+	return _paletteOpen;
+}
+
+export function setPaletteOpen(value: boolean) {
+	_paletteOpen = value;
+	if (value) _shortcutsOpen = false;
+}
+
+export function getShortcutsOpen(): boolean {
+	return _shortcutsOpen;
+}
+
+export function setShortcutsOpen(value: boolean) {
+	_shortcutsOpen = value;
+	if (value) _paletteOpen = false;
+}
+
 export function getTerminalState(): TerminalState {
 	return {
 		open: _terminalOpen,

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { listTokens, revokeToken, type ApiToken } from '$lib/api';
 	import { relativeTime, tokenState, type TokenState } from '$lib/access';
 	import { can } from '$lib/auth.svelte';
@@ -87,7 +88,7 @@
 <section class="space-y-4">
 	<div class="flex flex-wrap items-start justify-between gap-3">
 		<div class="max-w-xl">
-			<h3 class="font-semibold">API tokens</h3>
+			<h2 class="font-semibold">API tokens</h2>
 			<p class="text-sm text-muted-foreground">
 				For CI, scripts and agents. Each token has its own scopes, apps and expiry, and can be
 				revoked on its own.
@@ -117,17 +118,13 @@
 		</label>
 	</div>
 
-	{#if error}
-		<div class="rounded-md bg-destructive/10 p-3 text-sm text-destructive" role="alert">
-			{error}
-		</div>
-	{/if}
+	<InlineError message={error} />
 
 	{#if loading}
 		<p class="py-6 text-center text-sm text-muted-foreground">Loading…</p>
 	{:else if visible.length === 0}
 		<div class="rounded-lg border border-dashed border-border py-10 text-center">
-			<KeyIcon class="mx-auto mb-2 size-8 text-muted-foreground/40" />
+			<KeyIcon class="mx-auto mb-2 size-8 text-muted-foreground" />
 			<p class="font-medium">No active tokens</p>
 			<p class="mt-1 text-sm text-muted-foreground">
 				Create one for a CI pipeline, a script or an AI agent.
@@ -207,11 +204,7 @@
 				new token later.
 			</AlertDialog.Description>
 		</AlertDialog.Header>
-		{#if revokeError}
-			<div class="rounded-md bg-destructive/10 p-3 text-sm text-destructive" role="alert">
-				{revokeError}
-			</div>
-		{/if}
+		<InlineError message={revokeError} />
 		<AlertDialog.Footer>
 			<AlertDialog.Cancel disabled={revoking}>Keep it</AlertDialog.Cancel>
 			<Button variant="destructive" onclick={handleRevoke} disabled={revoking}>

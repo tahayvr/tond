@@ -5,6 +5,7 @@
 	import type { Deployment } from '$lib/api';
 	import { failureFix, formatDuration, statusView } from '$lib/deploy-view';
 	import { safeUrl } from '$lib/utils';
+	import { appTabHref } from '$lib/tabs';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import DoneIcon from '~icons/ri/checkbox-circle-fill';
 	import FailedIcon from '~icons/ri/close-circle-fill';
@@ -94,7 +95,7 @@
 		{/if}
 		<div class="flex flex-wrap gap-2">
 			{#if fix}
-				<Button href="/apps/{appId}?tab={fix.tab}" variant="outline" size="sm">
+				<Button href={appTabHref(appId, 'settings', fix.section)} variant="outline" size="sm">
 					{fix.label}
 					<ArrowRightIcon />
 				</Button>

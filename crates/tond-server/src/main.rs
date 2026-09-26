@@ -335,6 +335,7 @@ async fn run() -> Result<()> {
         .route("/api/apps/{id}/domain", put(handlers::update_domain))
         .route("/api/apps/{id}/health", put(handlers::update_health))
         .route("/api/apps/{id}/port", put(handlers::update_port))
+        .route("/api/apps/{id}/readiness", put(handlers::update_readiness))
         .route("/api/compose/validate", post(handlers::validate_compose))
         .route("/api/apps/{id}/volumes", post(handlers::add_volume))
         .route("/api/apps/{id}/volumes", delete(handlers::remove_volume))
@@ -577,6 +578,7 @@ async fn run() -> Result<()> {
             axum::routing::patch(handlers::alerts::update_alert),
         )
         .route("/api/alerts/{id}", delete(handlers::alerts::delete_alert))
+        .route("/api/alerts/{id}/test", post(handlers::alerts::test_alert))
         // Alert ↔ integration links
         .route(
             "/api/alerts/{id}/integrations",
@@ -699,6 +701,10 @@ async fn run() -> Result<()> {
         // Cron Jobs (Phase 6.4)
         .route("/api/cron", get(handlers::cron::list_cron_jobs))
         .route("/api/cron", post(handlers::cron::create_cron_job))
+        .route(
+            "/api/cron/schedule-preview",
+            get(handlers::cron::preview_schedule),
+        )
         .route("/api/cron/{id}", get(handlers::cron::get_cron_job))
         .route(
             "/api/cron/{id}",

@@ -182,6 +182,8 @@ impl TondClient {
             compose_content: None,
             base_dir: None,
             static_build: false,
+            readiness: None,
+            ready_after_secs: None,
         };
 
         let req = self

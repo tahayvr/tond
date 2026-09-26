@@ -8,6 +8,7 @@
 </script>
 
 <script lang="ts">
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import * as Dialog from '$lib/components/ui/dialog/index.js';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
@@ -167,11 +168,7 @@
 					</p>
 				{/if}
 			</div>
-			{#if error}
-				<p class="rounded bg-destructive/10 px-3 py-2 text-xs text-destructive" role="alert">
-					{error}
-				</p>
-			{/if}
+			<InlineError message={error} />
 		</div>
 		<Dialog.Footer class="gap-2 sm:gap-2">
 			<Button variant="outline" onclick={() => (open = false)} disabled={saving}>Cancel</Button>

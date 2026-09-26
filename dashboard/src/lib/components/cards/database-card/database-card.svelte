@@ -1,86 +1,46 @@
 <script lang="ts">
-	import { goto } from '$app/navigation';
 	import { type ManagedDatabase } from '$lib/api';
-	import {
-		getUiContext,
-		setUiContext,
-		databasesContext,
-		databaseContext
-	} from '$lib/ui-context.svelte';
 	import * as Card from '$lib/components/ui/card/index.js';
+	import StatusBadge from '$lib/components/feedback/status-badge.svelte';
 	import { dbLogoUrl } from '$lib/components/brand-logos/db-logos.svelte';
 	import DatabaseIcon from '~icons/ri/database-2-line';
 
 	let { db }: { db: ManagedDatabase } = $props();
 
-	let ctx = $derived(getUiContext());
-	let selected = $derived(ctx.type === 'database' && ctx.database.id === db.id);
-
 	let logoUrl = $derived(dbLogoUrl(db.db_type));
 	let imgError = $state(false);
-
-	function handleSelect() {
-		if (selected) {
-			setUiContext(databasesContext());
-		} else {
-			setUiContext(databaseContext(db));
-		}
-		goto(`/databases/${db.id}`);
-	}
 </script>
 
-<button
-	type="button"
-	class="block h-full w-full text-left hover:cursor-pointer"
-	onclick={handleSelect}
->
+<a href={`/databases/${db.id}`} class="block h-full rounded-sm" data-sveltekit-preload-data="hover">
 	<Card.Root
-		class="flex h-full w-full flex-col rounded-sm border-none p-6 transition-colors hover:border {selected
-			? 'invert'
-			: ''}"
+		class="flex h-full w-full flex-col gap-3 rounded-sm border p-5 transition-colors hover:border-foreground/40"
 	>
-		<Card.Header class="p-0">
-			<Card.Description class="text-xs uppercase">id: {db.id.slice(0, 8)}</Card.Description>
-			<Card.Title class="text-base uppercase">{db.name}</Card.Title>
-		</Card.Header>
-		<Card.Content class="grow p-0">
-			<div class="flex h-full flex-col justify-center gap-3 py-6">
-				<!-- Engine logo / fallback badge -->
-				<div class="flex items-center justify-center">
+		<Card.Header class="gap-2 p-0">
+			<div class="flex items-start justify-between gap-2">
+				<div class="flex min-w-0 items-center gap-2">
 					{#if logoUrl && !imgError}
 						<img
 							src={logoUrl}
-							alt={db.db_type}
-							class="h-10 w-10 object-contain opacity-80"
+							alt=""
+							class="h-6 w-6 shrink-0 object-contain"
 							onerror={() => (imgError = true)}
 						/>
 					{:else}
-						<DatabaseIcon class="h-10 w-10 text-muted-foreground/40" />
+						<DatabaseIcon aria-hidden="true" class="h-6 w-6 shrink-0 text-muted-foreground" />
 					{/if}
+					<Card.Title class="min-w-0 truncate text-base">{db.name}</Card.Title>
 				</div>
-				<!-- Status row -->
-				<div class="flex items-center justify-center gap-2">
-					<span
-						class="inline-block size-2 rounded-full {db.status === 'running'
-							? 'bg-accent'
-							: 'bg-muted-foreground/40'}"
-					></span>
-					<span class="font-mono text-[10px] tracking-wider text-muted-foreground uppercase">
-						{db.status}
-					</span>
-				</div>
-				{#if db.host_port}
-					<p class="text-center font-mono text-[10px] text-muted-foreground/70 uppercase">
-						PORT: {db.host_port}
-					</p>
-				{/if}
+				<StatusBadge status={db.status} kind="database" size="sm" />
 			</div>
+			<Card.Description class="text-xs">
+				{db.db_type}
+			</Card.Description>
+		</Card.Header>
+		<Card.Content
+			class="flex grow items-end justify-between gap-2 p-0 text-xs text-muted-foreground"
+		>
+			<span>{db.host_port ? `Port ${db.host_port}` : 'Internal only'}</span>
+			<span>Created {new Date(db.created_at).toLocaleDateString()}</span>
 		</Card.Content>
-		<Card.Footer class="w-full flex-col gap-3 p-0">
-			<div class="flex w-full items-center justify-between text-xs text-muted-foreground">
-				<span>Created</span>
-				<span>{new Date(db.created_at).toLocaleDateString()}</span>
-			</div>
-		</Card.Footer>
 	</Card.Root>
-</button>
+</a>

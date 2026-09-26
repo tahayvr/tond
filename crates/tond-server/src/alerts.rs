@@ -416,6 +416,135 @@ async fn dispatch_integrations(
     }
 }
 
+// ── Test notifications ──────────────────────────────────────────────────────
+
+/// Outcome of sending a test notification to one of a rule's channels.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ChannelTestResult {
+    /// "webhook" or the integration kind ("slack", "email", …).
+    pub kind: String,
+    /// Human-readable channel name (the webhook URL's host for webhooks).
+    pub name: String,
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+/// Number of places a rule notifies: its webhook (if set) plus linked integrations.
+pub async fn channel_count(db: &sqlx::SqlitePool, rule_id: &str, webhook_url: &str) -> i64 {
+    let linked: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM alert_rule_notifications arn
+         JOIN integrations i ON i.id = arn.integration_id
+         WHERE arn.rule_id = ?",
+    )
+    .bind(rule_id)
+    .fetch_one(db)
+    .await
+    .unwrap_or(0);
+    linked + i64::from(!webhook_url.trim().is_empty())
+}
+
+/// Send a clearly-labelled test message to every channel of `rule` and report
+/// each result. Does not touch `last_fired_at`.
+pub async fn send_test_notifications(state: &AppState, rule: &AlertRule) -> Vec<ChannelTestResult> {
+    let message = format!(
+        "Test notification for alert rule '{}'. If you can read this, the channel works.",
+        rule.name
+    );
+    let mut results = Vec::new();
+
+    if !rule.webhook_url.trim().is_empty() {
+        let (name, outcome) = match secrets::alert_webhook_url(&rule.webhook_url) {
+            Ok(url) => {
+                let name = reqwest::Url::parse(&url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(str::to_string))
+                    .unwrap_or_else(|| "Webhook".to_string());
+                (
+                    name,
+                    post_webhook_checked(rule, &url, "test", &message).await,
+                )
+            }
+            Err(e) => (
+                "Webhook".to_string(),
+                Err(anyhow::anyhow!("The saved webhook URL can't be read: {e}")),
+            ),
+        };
+        results.push(ChannelTestResult {
+            kind: "webhook".to_string(),
+            name,
+            ok: outcome.is_ok(),
+            error: outcome.err().map(|e| e.to_string()),
+        });
+    }
+
+    let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
+        "SELECT i.name, i.kind, i.config, i.enabled
+         FROM alert_rule_notifications arn
+         JOIN integrations i ON i.id = arn.integration_id
+         WHERE arn.rule_id = ?
+         ORDER BY i.name",
+    )
+    .bind(&rule.id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    let payload = notifications::NotificationPayload {
+        rule_name: rule.name.clone(),
+        event_or_metric: "test".to_string(),
+        app_name: None,
+        detail: Some(message),
+        fired_at: chrono::Utc::now().to_rfc3339(),
+    };
+    for (name, kind, config_json, enabled) in rows {
+        let outcome = if enabled == 0 {
+            Err(anyhow::anyhow!(
+                "This channel is switched off on the Integrations page"
+            ))
+        } else {
+            match secrets::open_integration_config(&kind, &config_json) {
+                Ok(config) => notifications::dispatch(&config, &payload).await,
+                Err(e) => Err(anyhow::anyhow!("Invalid channel settings: {e}")),
+            }
+        };
+        results.push(ChannelTestResult {
+            kind,
+            name,
+            ok: outcome.is_ok(),
+            error: outcome.err().map(|e| e.to_string()),
+        });
+    }
+    results
+}
+
+async fn post_webhook_checked(
+    rule: &AlertRule,
+    url: &str,
+    event: &str,
+    message: &str,
+) -> anyhow::Result<()> {
+    let payload = serde_json::json!({
+        "rule_id":   rule.id,
+        "alert":     rule.name,
+        "event":     event,
+        "value":     0.0,
+        "threshold": 0.0,
+        "app_id":    rule.app_id,
+        "message":   message,
+        "fired_at":  chrono::Utc::now().to_rfc3339(),
+    });
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&payload)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        anyhow::bail!("Webhook answered HTTP {}", response.status().as_u16());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
