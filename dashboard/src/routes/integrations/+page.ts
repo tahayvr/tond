@@ -1,11 +1,17 @@
-import { listGitHubApps, listIntegrations, listRegistryCredentials } from '$lib/api';
+import {
+	listDnsProviders,
+	listGitHubApps,
+	listIntegrations,
+	listRegistryCredentials
+} from '$lib/api';
 
 export async function load() {
-	const [githubApps, credentials, integrations] = await Promise.all([
+	const [githubApps, credentials, integrations, dnsProviders] = await Promise.all([
 		listGitHubApps(),
 		listRegistryCredentials(),
-		listIntegrations()
+		listIntegrations(),
+		listDnsProviders().catch(() => [])
 	]);
 
-	return { githubApps, credentials, integrations };
+	return { githubApps, credentials, integrations, dnsProviders };
 }

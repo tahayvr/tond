@@ -1,6 +1,7 @@
 <script lang="ts">
 	import PageTitle from '$lib/components/nav/page-title.svelte';
 	import {
+		type DnsProvider,
 		type GitHubApp,
 		type RegistryCredential,
 		type Integration,
@@ -17,6 +18,7 @@
 	import PhoneIcon from '~icons/ri/smartphone-line';
 	import GotifyIcon from '~icons/ri/notification-2-line';
 	import CodeIcon from '~icons/ri/code-s-slash-line';
+	import DnsIcon from '~icons/ri/server-line';
 	import { setUiContext, clearUiContext, integrationsContext } from '$lib/ui-context.svelte';
 	import type { PageProps } from './$types';
 
@@ -30,6 +32,18 @@
 
 	// ── Notification integrations ─────────────────────────────────────────────
 	let integrations = $derived(data.integrations as Integration[]);
+
+	// ── DNS providers (ACME DNS-01) ───────────────────────────────────────────
+	let dnsProviders = $derived((data.dnsProviders ?? []) as DnsProvider[]);
+	function dnsDetails() {
+		if (dnsProviders.length === 0) return [];
+		const zones = dnsProviders.flatMap((p) => p.zones);
+		const failing = dnsProviders.filter((p) => p.last_error).length;
+		return [
+			{ label: 'Zones', value: zones.length > 2 ? `${zones.length} zones` : zones.join(', ') },
+			...(failing ? [{ label: 'Failing', value: String(failing) }] : [])
+		];
+	}
 
 	$effect(() => {
 		setUiContext(integrationsContext());
@@ -145,6 +159,22 @@
 				status={channelStatus('webhook')}
 				details={channelDetails('webhook')}
 				href="/integrations/webhook"
+			/>
+		</div>
+	</section>
+
+	<!-- ── DNS Providers ──────────────────────────────────────────────────────── -->
+	<section class="space-y-4">
+		<h2 class="text-xs font-semibold tracking-widest text-muted-foreground uppercase">
+			DNS Providers
+		</h2>
+		<div class="grid grid-cols-1 items-stretch gap-4 sm:grid-cols-2 lg:grid-cols-3">
+			<IntegrationCard
+				name="DNS providers (wildcard certificates)"
+				icon={DnsIcon}
+				status={dnsProviders.length > 0 ? 'connected' : 'disconnected'}
+				details={dnsDetails()}
+				href="/integrations/dns"
 			/>
 		</div>
 	</section>
