@@ -9,7 +9,8 @@ vi.mock('./github-app-card.svelte', async () => ({
 const api = vi.hoisted(() => ({
 	listGitHubApps: vi.fn(),
 	getGitHubAppManifestUrl: vi.fn(),
-	deleteGitHubApp: vi.fn()
+	deleteGitHubApp: vi.fn(),
+	getGitHubAppInstallUrl: vi.fn()
 }));
 
 vi.mock('$lib/api', async () => {
@@ -46,7 +47,6 @@ describe('GitHubAppList', () => {
 						slug: 'tond-github-app',
 						installation_id: 456,
 						installed: true,
-						install_url: 'https://github.com/apps/tond-github-app/installations/new',
 						created_at: '2026-01-01T00:00:00.000Z',
 						updated_at: '2026-01-01T00:00:00.000Z'
 					}
@@ -79,6 +79,34 @@ describe('GitHubAppList', () => {
 		expect(submit).toHaveBeenCalledOnce();
 	});
 
+	it('starts an install flow through the API instead of a static URL', async () => {
+		api.getGitHubAppInstallUrl.mockResolvedValue('javascript:alert(1)');
+		const user = userEvent.setup();
+		render(GitHubAppList, {
+			props: {
+				initialApps: [
+					{
+						id: 'gh_1',
+						name: 'Tond GitHub App',
+						app_id: 123,
+						client_id: 'Iv1.test',
+						slug: 'tond-github-app',
+						installation_id: null,
+						installed: false,
+						created_at: '2026-01-01T00:00:00.000Z',
+						updated_at: '2026-01-01T00:00:00.000Z'
+					}
+				]
+			}
+		});
+
+		await user.click(screen.getByRole('button', { name: /install app/i }));
+
+		expect(api.getGitHubAppInstallUrl).toHaveBeenCalledWith('gh_1');
+		// A non-https URL is never navigated to.
+		expect(await screen.findByText(/unexpected installation url/i)).toBeInTheDocument();
+	});
+
 	it('disconnects a github app from the list', async () => {
 		const user = userEvent.setup();
 		render(GitHubAppList, {
@@ -92,7 +120,6 @@ describe('GitHubAppList', () => {
 						slug: 'tond-github-app',
 						installation_id: 456,
 						installed: true,
-						install_url: 'https://github.com/apps/tond-github-app/installations/new',
 						created_at: '2026-01-01T00:00:00.000Z',
 						updated_at: '2026-01-01T00:00:00.000Z'
 					}

@@ -505,11 +505,40 @@ export async function getDeployKey(id: string): Promise<DeployKey> {
 	return request<DeployKey>(`/apps/${id}/deploy-key`);
 }
 
-export async function setWebhookSecret(id: string, secret: string | null): Promise<App> {
-	return request<App>(`/apps/${id}/webhook-secret`, {
+export interface WebhookUrls {
+	github: string;
+	gitlab: string;
+	gitea: string;
+	generic: string;
+}
+
+export interface WebhookConfig {
+	app_id: string;
+	/** Paths relative to the server origin, e.g. `/api/webhooks/github/<uuid>` */
+	paths: WebhookUrls;
+	/** Absolute URLs when the dashboard domain is configured, else null */
+	urls: WebhookUrls | null;
+	/** Shared secret: HMAC key for GitHub/Gitea/generic, token for GitLab */
+	secret: string;
+	auto_deploy: boolean;
+	watch_branch: string | null;
+}
+
+export async function getWebhookConfig(id: string): Promise<WebhookConfig> {
+	return request<WebhookConfig>(`/apps/${id}/webhook`);
+}
+
+/** Replace the webhook secret with a custom value (min. 16 characters). */
+export async function setWebhookSecret(id: string, secret: string): Promise<WebhookConfig> {
+	return request<WebhookConfig>(`/apps/${id}/webhook-secret`, {
 		method: 'PUT',
 		body: JSON.stringify({ secret })
 	});
+}
+
+/** Generate a new webhook secret; the old one stops working immediately. */
+export async function rotateWebhookSecret(id: string): Promise<WebhookConfig> {
+	return request<WebhookConfig>(`/apps/${id}/webhook-secret/rotate`, { method: 'POST' });
 }
 
 export async function setAutoDeploy(
@@ -556,8 +585,6 @@ export interface GitHubApp {
 	installation_id: number | null;
 	/** True when installation_id is set — pre-computed by the server */
 	installed: boolean;
-	/** Direct URL to install the App on repos — pre-computed by the server */
-	install_url: string;
 	created_at: string;
 	updated_at: string;
 }
@@ -575,6 +602,15 @@ export interface GitHubAppManifestForm {
 
 export async function getGitHubAppManifestUrl(): Promise<GitHubAppManifestForm> {
 	return request<GitHubAppManifestForm>('/github-apps/manifest', { method: 'POST' });
+}
+
+/**
+ * Start an installation flow for the logged-in admin and return the GitHub
+ * installation URL (it carries a single-use state; do not cache it).
+ */
+export async function getGitHubAppInstallUrl(id: string): Promise<string> {
+	const res = await request<{ url: string }>(`/github-apps/${id}/install`, { method: 'POST' });
+	return res.url;
 }
 
 export async function deleteGitHubApp(id: string): Promise<void> {

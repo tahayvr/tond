@@ -51,6 +51,32 @@
 		}
 	});
 
+	// Errors reported by the GitHub App callbacks (/api/github-apps/callback and
+	// /webhooks/source/github/install redirect here with ?error=<code>).
+	const GITHUB_FLOW_ERRORS: Record<string, string> = {
+		missing_state:
+			'GitHub returned without a setup state. Start again with “Create GitHub App” from this page.',
+		invalid_state:
+			'This GitHub setup link is unknown, expired (1 hour) or was already used. Start again from this page.',
+		not_logged_in:
+			'You must be logged in to the dashboard as an admin in this browser to finish connecting GitHub.',
+		missing_code: 'GitHub did not return a valid registration code. Please try again.',
+		exchange_failed: 'GitHub rejected the registration. Please try again.',
+		internal: 'Something went wrong while saving the GitHub App. Check the server logs.'
+	};
+
+	let githubFlowError = $state('');
+
+	$effect(() => {
+		if (source !== 'github') return;
+		const code = page.url.searchParams.get('error');
+		if (!code) return;
+		githubFlowError = GITHUB_FLOW_ERRORS[code] ?? 'Connecting GitHub failed. Please try again.';
+		const url = new URL(window.location.href);
+		url.searchParams.delete('error');
+		window.history.replaceState({}, '', url.toString());
+	});
+
 	$effect(() => {
 		setUiContext(projectsContext());
 		return () => clearUiContext();
@@ -68,6 +94,18 @@
 			<h2 class="text-3xl font-extrabold uppercase">{meta.title}</h2>
 		</div>
 	</div>
+
+	{#if source === 'github' && githubFlowError}
+		<div
+			class="flex items-start justify-between gap-3 rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive"
+			role="alert"
+		>
+			<span>{githubFlowError}</span>
+			<button type="button" class="text-xs underline" onclick={() => (githubFlowError = '')}>
+				Dismiss
+			</button>
+		</div>
+	{/if}
 
 	{#if source === 'github'}
 		<GitHubAppList bind:this={githubList} initialApps={sourceData?.githubApps ?? []} />
