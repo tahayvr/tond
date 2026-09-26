@@ -48,6 +48,7 @@ pub mod env;
 pub mod git;
 pub mod github_apps;
 pub mod gitlab_tokens;
+pub mod host;
 pub mod images;
 pub mod integrations;
 pub mod logs;
@@ -63,6 +64,7 @@ pub mod system_self;
 pub mod templates;
 pub mod terminal;
 pub mod tokens;
+pub mod uptime;
 pub mod users;
 pub mod webhooks;
 

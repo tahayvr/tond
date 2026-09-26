@@ -194,16 +194,6 @@ async fn insert(db: &SqlitePool, table: &str, r: &HostRow) -> sqlx::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-pub async fn insert_minute(db: &SqlitePool, r: &HostRow) -> sqlx::Result<()> {
-    insert(db, "host_1m", r).await
-}
-
-#[cfg(test)]
-pub async fn insert_hour(db: &SqlitePool, r: &HostRow) -> sqlx::Result<()> {
-    insert(db, "host_1h", r).await
-}
-
 async fn latest(db: &SqlitePool, table: &str) -> sqlx::Result<Option<i64>> {
     let sql = format!("SELECT MAX(ts) FROM {table}");
     sqlx::query_scalar(AssertSqlSafe(sql.as_str()))

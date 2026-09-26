@@ -64,6 +64,8 @@ impl Cause {
         }
     }
 
+    /// Decode uptime_1m.result (for readers of the table, e.g. alerts).
+    #[allow(dead_code)]
     pub fn from_code(code: i64) -> Option<Self> {
         Some(match code {
             1 => Cause::Dns,

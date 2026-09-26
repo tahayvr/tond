@@ -146,24 +146,6 @@ pub async fn insert_results(db: &SqlitePool, rows: &[ResultRow]) -> sqlx::Result
     Ok(())
 }
 
-/// Latest stored probe of a check.
-pub async fn last_result(db: &SqlitePool, check_id: i64) -> sqlx::Result<Option<ResultRow>> {
-    let row: Option<(i64, i64, Option<i64>, Option<i64>)> = sqlx::query_as(
-        "SELECT ts, result, status, latency_ms FROM uptime_1m WHERE check_id = ?
-         ORDER BY ts DESC LIMIT 1",
-    )
-    .bind(check_id)
-    .fetch_optional(db)
-    .await?;
-    Ok(row.map(|(ts, result, status, latency_ms)| ResultRow {
-        check_id,
-        ts,
-        result,
-        status,
-        latency_ms,
-    }))
-}
-
 // ── Incidents ──
 
 /// A down period.

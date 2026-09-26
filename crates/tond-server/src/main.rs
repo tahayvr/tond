@@ -594,6 +594,9 @@ async fn run() -> Result<()> {
             get(handlers::metrics::get_system_metrics),
         )
         .route("/api/system/self", get(handlers::system_self::get_self))
+        // Host history, disk, Docker, heartbeat; uptime checks
+        .merge(handlers::host::routes())
+        .merge(handlers::uptime::routes())
         .route("/metrics", get(handlers::system_self::metrics))
         // Alert rules
         .route("/api/alerts", get(handlers::alerts::list_alerts))

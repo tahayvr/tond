@@ -24,7 +24,7 @@ use std::sync::RwLock;
 
 use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
 
-pub use super::host_history::{DiskForecast, disk_full_eta};
+pub use super::host_history::{DiskEta, disk_full_eta};
 
 /// Blocks and inodes of one filesystem (df-style: total = used + available
 /// to unprivileged users).
@@ -107,13 +107,8 @@ fn store(snapshot: HostSnapshot) {
     }
 }
 
-/// Disk usage of the filesystem containing `path`, df-style:
+/// Blocks and inodes of the filesystem containing `path`, df-style:
 /// used = blocks − free, total = used + available-to-unprivileged.
-pub fn disk_usage(path: &Path) -> Option<(u64, u64)> {
-    fs_usage(path).map(|f| (f.used, f.total))
-}
-
-/// Blocks and inodes of the filesystem containing `path`.
 pub fn fs_usage(path: &Path) -> Option<FsUsage> {
     let st = rustix::fs::statvfs(path).ok()?;
     let frsize = if st.f_frsize > 0 {
@@ -261,9 +256,8 @@ mod tests {
     #[test]
     fn disk_usage_and_mount_point_describe_a_real_filesystem() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
-        let (used, total) = disk_usage(dir.path()).unwrap_or_else(|| panic!("statvfs failed"));
-        assert!(total > 0 && used <= total);
         let fs = fs_usage(dir.path()).unwrap_or_else(|| panic!("statvfs failed"));
+        assert!(fs.total > 0 && fs.used <= fs.total);
         assert!(fs.inodes_used <= fs.inodes_total);
         let mount = mount_point(dir.path());
         assert!(

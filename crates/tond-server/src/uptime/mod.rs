@@ -65,7 +65,6 @@ const RETRY_AFTER: Duration = Duration::from_secs(3);
 /// Re-read the configuration at least this often (writes behind tond-server's
 /// back, e.g. sqlite3 by hand).
 const MAX_SLEEP: i64 = 3600;
-pub const DEFAULT_INTERVAL_SECS: i64 = 60;
 pub const MIN_INTERVAL_SECS: i64 = 60;
 pub const MAX_INTERVAL_SECS: i64 = 3600;
 
@@ -101,7 +100,8 @@ pub struct UptimeEvent {
 static EVENTS: LazyLock<broadcast::Sender<UptimeEvent>> =
     LazyLock::new(|| broadcast::channel(64).0);
 
-/// Receive every future down / up event.
+/// Receive every future down / up event (the alert engine's hook).
+#[allow(dead_code)]
 pub fn subscribe() -> broadcast::Receiver<UptimeEvent> {
     EVENTS.subscribe()
 }
@@ -128,6 +128,8 @@ struct Live {
 static LIVE: LazyLock<RwLock<HashMap<i64, Live>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
 /// Probes before this are in uptime_1h (the rollup cursor).
 static ROLLED_UNTIL: AtomicI64 = AtomicI64::new(0);
+/// When the next heartbeat is due (0 = none).
+static NEXT_BEAT: AtomicI64 = AtomicI64::new(0);
 /// Serialises recording (a round and "check now" never interleave).
 static RECORD: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -151,6 +153,14 @@ pub fn live_status(check_id: i64) -> LiveStatus {
             last: l.last,
         },
         None => LiveStatus::default(),
+    }
+}
+
+/// When the next heartbeat will be sent (None when it is off).
+pub fn next_heartbeat() -> Option<i64> {
+    match NEXT_BEAT.load(Ordering::Relaxed) {
+        0 => None,
+        t => Some(t),
     }
 }
 
@@ -512,6 +522,7 @@ pub async fn run(state: AppState) {
             }
         }
 
+        NEXT_BEAT.store(beat_due.unwrap_or(0), Ordering::Relaxed);
         let next_check = LIVE
             .read()
             .ok()
@@ -609,4 +620,4 @@ pub fn dns_label(dns: DnsState) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
