@@ -6,7 +6,8 @@ import type { Snapshot } from '$lib/api';
 const api = vi.hoisted(() => ({
 	listDatabaseBackups: vi.fn(),
 	createDatabaseBackup: vi.fn(),
-	restoreDatabase: vi.fn()
+	restoreDatabase: vi.fn(),
+	getDatabaseBackupSchedule: vi.fn(() => new Promise(() => {}))
 }));
 
 vi.mock('$lib/api', async () => {
@@ -55,6 +56,7 @@ describe('database backup helpers', () => {
 describe('DatabaseBackups', () => {
 	beforeEach(() => {
 		for (const fn of Object.values(api)) fn.mockReset();
+		api.getDatabaseBackupSchedule.mockReturnValue(new Promise(() => {}));
 		document.body.style.pointerEvents = '';
 		api.listDatabaseBackups.mockResolvedValue([
 			snap({}),

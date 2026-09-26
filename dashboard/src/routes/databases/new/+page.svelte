@@ -3,7 +3,7 @@
 	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { createDatabase, type Project } from '$lib/api';
+	import { createDatabase, type DbCatalogEntry, type Project } from '$lib/api';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { setUiContext, clearUiContext, projectsContext } from '$lib/ui-context.svelte';
 	import Database from '~icons/ri/database-2-line';
@@ -23,6 +23,10 @@
 	let name = $state('');
 	let dbType = $state<DbType>('postgres');
 	let selectedProjectId = $state<string>('');
+	let version = $state('');
+	let variant = $state('');
+	let backupSchedule = $state('0 3 * * *');
+	let catalog = $derived((data.catalog ?? []) as DbCatalogEntry[]);
 
 	$effect(() => {
 		setUiContext(projectsContext());
@@ -43,7 +47,10 @@
 			const db = await createDatabase({
 				name: name.trim(),
 				db_type: dbType,
-				...(selectedProjectId ? { project_id: selectedProjectId } : {})
+				...(selectedProjectId ? { project_id: selectedProjectId } : {}),
+				...(version ? { version } : {}),
+				...(variant ? { variant } : {}),
+				...(backupSchedule ? { backup_schedule: backupSchedule } : {})
 			});
 			goto(`/databases/${db.id}`);
 		} catch (e: any) {
@@ -61,7 +68,16 @@
 
 	<InlineError message={error} />
 
-	<DbWizardConfig bind:name bind:dbType bind:selectedProjectId {projects} />
+	<DbWizardConfig
+		bind:name
+		bind:dbType
+		bind:selectedProjectId
+		bind:version
+		bind:variant
+		bind:backupSchedule
+		{projects}
+		{catalog}
+	/>
 
 	<div>
 		<Button

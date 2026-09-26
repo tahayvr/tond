@@ -96,6 +96,8 @@ pub struct App {
     // ── Phase 4.5: GitLab PAT Integration ──
     /// GitLab token ID used to clone private GitLab repos
     pub gitlab_token_id: Option<String>,
+    /// Gitea/Forgejo token used for commit statuses, PR comments and clones
+    pub gitea_token_id: Option<String>,
     // ── Phase 4.6: PR Preview Deployments ──
     /// 1 = automatically create a preview deployment when a GitHub pull_request
     /// webhook event is received for this app; 0 = opt-out (default).
@@ -226,6 +228,7 @@ impl App {
             registry_credential_id: None,
             github_app_id: None,
             gitlab_token_id: None,
+            gitea_token_id: None,
             preview_enabled: 0,
             preview_shared_keys: "[]".to_string(),
             preview_env_vars: "{}".to_string(),
@@ -361,6 +364,9 @@ pub struct AppResponse {
     // ── Phase 4.5: GitLab PAT Integration ──
     /// GitLab token ID used to clone this app's repo
     pub gitlab_token_id: Option<String>,
+    /// Gitea/Forgejo token linked to this app
+    #[serde(default)]
+    pub gitea_token_id: Option<String>,
     // ── Phase 4.6: PR Preview Deployments ──
     /// Whether PR preview deployments are enabled for this app
     pub preview_enabled: bool,
@@ -423,6 +429,7 @@ impl From<App> for AppResponse {
             registry_credential_id: app.registry_credential_id,
             github_app_id: app.github_app_id,
             gitlab_token_id: app.gitlab_token_id,
+            gitea_token_id: app.gitea_token_id,
             preview_enabled: app.preview_enabled != 0,
             preview_shared_keys,
             dockerfile_content: app.dockerfile_content,

@@ -50,6 +50,8 @@ describe('integrations page', () => {
 							updated_at: '2026-01-01T00:00:00.000Z'
 						}
 					],
+					gitlabTokens: [],
+					giteaTokens: [],
 					integrations: [
 						{
 							id: 'int_1',

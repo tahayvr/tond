@@ -348,6 +348,7 @@ pub async fn finish_ok(state: &AppState, app_id: &str, deployment_id: &str) {
     .execute(&state.db)
     .await;
     log_bus::publish_deployment(app_id, deployment_id);
+    crate::forge::announce_deploy(state, app_id, deployment_id);
 }
 
 /// Record a failure (with its classified cause) and unregister.
@@ -375,6 +376,7 @@ pub async fn finish_failed(
     .execute(&state.db)
     .await;
     log_bus::publish_deployment(app_id, deployment_id);
+    crate::forge::announce_deploy(state, app_id, deployment_id);
 }
 
 /// Store the commit a git deploy built.
@@ -394,6 +396,7 @@ pub async fn record_commit(
     .execute(&state.db)
     .await;
     log_bus::publish_deployment(app_id, deployment_id);
+    crate::forge::announce_deploy(state, app_id, deployment_id);
 }
 
 /// At startup: deployments still "running" were cut off by a restart. Mark

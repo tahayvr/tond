@@ -79,11 +79,17 @@ mod compose;
 mod compose_policy;
 mod cron;
 mod db;
+mod db_access;
 mod db_credentials;
+#[cfg(test)]
+mod db_docker_tests;
+mod db_exec;
+mod db_upgrade;
 mod deploy;
 mod docker;
 mod domains;
 mod error;
+mod forge;
 mod handlers;
 mod health;
 mod idempotency;
@@ -218,9 +224,11 @@ async fn run() -> Result<()> {
     // drift while the server is down). Once, in the background.
     {
         let state = state.clone();
-        runtime::shutdown::spawn_tracked(
-            async move { networks::reconcile_all_databases(&state).await },
-        );
+        runtime::shutdown::spawn_tracked(async move {
+            // An upgrade cut off by a restart puts the old version back first.
+            db_upgrade::recover_interrupted(&state).await;
+            networks::reconcile_all_databases(&state).await
+        });
     }
 
     // Finish what a previous process left behind (and resume queued deploys)
@@ -236,6 +244,7 @@ async fn run() -> Result<()> {
     tokio::spawn(janitor::run_janitor(state.clone()));
     tokio::spawn(audit_ship::run(state.clone()));
     tokio::spawn(backup::backup_scheduler(state.clone()));
+    tokio::spawn(db_access::run_access_loop(state.clone()));
     tokio::spawn(run_preview_cleanup_loop(state.clone()));
     tokio::spawn(uptime::run(state.clone()));
 
