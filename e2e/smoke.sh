@@ -324,7 +324,7 @@ pass "non-root user is refused by the CLI socket"
 
 # Automation gets scoped tokens from the root CLI socket; the secret is printed once.
 for name in e2e-readonly e2e-admin e2e-ci e2e-env e2e-revoked e2e-expired e2e-ip-ok e2e-ip-other; do
-    tond token revoke "$name" > /dev/null 2>&1 || true # re-runs on a long-lived VM
+    tond token revoke "$name" -y > /dev/null 2>&1 || true # re-runs on a long-lived VM
 done
 RO_TOKEN=$(tond token create --name e2e-readonly --preset readonly --expires 1d 2> /dev/null)
 [[ "$RO_TOKEN" =~ ^tond_pat_[0-9a-f]{64}$ ]] || fail "tond token create must print a tond_pat_ token, got: ${RO_TOKEN}"
@@ -547,7 +547,7 @@ viewer_code() {
 }
 [[ "$(viewer_code GET /api/v1/apps)" == 200 ]] || fail "viewers can read apps"
 code=$(viewer_code PUT /api/v1/settings '{"server_name":"viewer-was-here"}')
-[[ "$code" == 403 && "$(jq -r '.code' "$API_BODY")" == SCOPE_DENIED ]] || fail "viewers must get 403 SCOPE_DENIED for settings, got ${code}"
+[[ "$code" == 403 && "$(jq -r '.error.code' "$API_BODY")" == SCOPE_DENIED ]] || fail "viewers must get 403 SCOPE_DENIED for settings, got ${code}"
 [[ "$(viewer_code GET /api/v1/users)" == 403 ]] || fail "viewers can't list users"
 pass "a viewer can read but gets 403 SCOPE_DENIED for writes"
 code=$(api_req PATCH "/api/v1/users/${VIEWER_ID}" '{"disabled":true}')
@@ -716,11 +716,11 @@ callback=$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' \
     || fail "the GitHub App callback must hand off to the dashboard (got: ${callback})"
 completion=$(curl -s -X POST -H 'Content-Type: application/json' \
     -d '{"kind":"manifest","code":"e2eattackercode"}' "${API_TCP}/api/v1/github-apps/complete")
-[[ "$(jq -r .error <<< "$completion")" == missing_state ]] \
+[[ "$(jq -r .error.message <<< "$completion")" == missing_state ]] \
     || fail "completing a GitHub App flow without state must be refused (got: ${completion})"
 completion=$(curl -s -X POST -H 'Content-Type: application/json' \
     -d '{"kind":"manifest","code":"e2eattackercode","state":"forged"}' "${API_TCP}/api/v1/github-apps/complete")
-[[ "$(jq -r .error <<< "$completion")" == not_logged_in ]] \
+[[ "$(jq -r .error.message <<< "$completion")" == not_logged_in ]] \
     || fail "completing a GitHub App flow without an admin session must be refused (got: ${completion})"
 [[ "$(api /api/v1/github-apps | jq '.data | length')" == "$GH_APPS_BEFORE" ]] \
     || fail "a refused GitHub App callback must not store an App"
@@ -743,7 +743,7 @@ api_as() {
     curl -s -o "$API_BODY" -w '%{http_code}' -X "$2" -H "Authorization: Bearer $1" \
         -H 'Content-Type: application/json' ${4:+-d "$4"} "http://127.0.0.1:3001$3"
 }
-body_code() { jq -r '.code // empty' "$API_BODY"; }
+body_code() { jq -r '.error.code // empty' "$API_BODY"; }
 CI_TOKEN=$(tond token create --name e2e-ci --kind ci --preset deployer --app e2e-whoami --expires 1d 2> /dev/null)
 [[ "$(api_as "$CI_TOKEN" GET /api/v1/apps/e2e-whoami)" == 200 ]] || fail "the CI token must read its own app"
 api_as "$CI_TOKEN" GET /api/v1/apps > /dev/null
@@ -764,10 +764,76 @@ pass "missing scopes → 403 with the stable code SCOPE_DENIED"
 
 REVOKED=$(tond token create --name e2e-revoked --preset readonly --expires 1d 2> /dev/null)
 [[ "$(api_as "$REVOKED" GET /api/v1/apps)" == 200 ]] || fail "a fresh token must work"
-tond token revoke e2e-revoked > /dev/null
+tond token revoke e2e-revoked -y > /dev/null
 code=$(api_as "$REVOKED" GET /api/v1/apps)
 [[ "$code" == 401 && "$(body_code)" == TOKEN_REVOKED ]] || fail "a revoked token must get 401 TOKEN_REVOKED, got ${code}"
 pass "revoked token → 401 TOKEN_REVOKED"
+
+step "Stable API: /api/v1, OpenAPI, structured errors, idempotency, CLI contract"
+spec=$(curl -sf "${API_TCP}/api/v1/openapi.json") || fail "GET /api/v1/openapi.json must be public"
+jq -e '.openapi == "3.1.0"
+    and .paths["/api/v1/apps/{id}/deploy"].post["x-tond-scopes"] == ["apps:deploy"]
+    and (.components.securitySchemes | has("bearerAuth"))
+    and ([.components.schemas.ErrorCode.enum[]] | index("DEPLOY_IN_PROGRESS") != null)' <<< "$spec" > /dev/null \
+    || fail "the OpenAPI document must describe the v1 routes, their scopes and the error codes"
+pass "OpenAPI 3.1 served at /api/v1/openapi.json ($(jq '[.paths[] | keys[]] | length' <<< "$spec") operations)"
+
+code=$(curl -s -o "$API_BODY" -w '%{http_code}' --unix-socket "$SOCK" http://localhost/api/apps)
+[[ "$code" == 404 && "$(jq -r .error.code "$API_BODY")" == ROUTE_NOT_FOUND ]] \
+    || fail "unversioned /api paths must answer 404 ROUTE_NOT_FOUND, got ${code} $(cat "$API_BODY")"
+jq -e '.error.hint | contains("/api/v1/apps")' "$API_BODY" > /dev/null \
+    || fail "the ROUTE_NOT_FOUND hint must point at /api/v1: $(cat "$API_BODY")"
+code=$(curl -s -o "$API_BODY" -w '%{http_code}' --unix-socket "$SOCK" http://localhost/api/v1/apps/e2e-no-such-app)
+[[ "$code" == 404 && "$(jq -r .error.code "$API_BODY")" == APP_NOT_FOUND ]] \
+    && jq -e '.success == false and (.error.message | length > 0) and (.error.hint | length > 0)' "$API_BODY" > /dev/null \
+    || fail "an unknown app must answer 404 {code: APP_NOT_FOUND, message, hint}, got ${code} $(cat "$API_BODY")"
+code=$(api_req POST /api/v1/apps '{"name":"e2e-bad","source_type":"image","container_port":"eighty"}')
+[[ "$code" =~ ^4 && "$(jq -r .error.code "$API_BODY")" == INVALID_JSON && "$(jq -r .error.field "$API_BODY")" == container_port ]] \
+    || fail "a mistyped field must answer INVALID_JSON naming the field, got ${code} $(cat "$API_BODY")"
+code=$(api_req POST /api/v1/apps '{"name":"bad name!","source_type":"image","source_url":"traefik/whoami:v1.10"}')
+[[ "$code" == 400 && "$(jq -r .error.code "$API_BODY")" == INVALID_INPUT && "$(jq -r .error.field "$API_BODY")" == name ]] \
+    || fail "an invalid app name must answer 400 INVALID_INPUT with field=name, got ${code} $(cat "$API_BODY")"
+pass "errors are {success:false, error:{code, message, hint, field}} with stable codes"
+
+# Idempotency-Key: the repeat replays the first response, a different body is refused.
+IDEM_KEY="e2e-$(date +%s)-$RANDOM"
+idem_post() {
+    curl -s -D "$1" -o "$API_BODY" -w '%{http_code}' --unix-socket "$SOCK" -X POST \
+        -H 'Content-Type: application/json' -H "Idempotency-Key: ${IDEM_KEY}" -d "$2" \
+        http://localhost/api/v1/projects
+}
+IDEM_HDRS=$(mktemp)
+[[ "$(idem_post "$IDEM_HDRS" '{"name":"e2e-idem"}')" == 201 ]] || fail "creating a project with an Idempotency-Key must work: $(cat "$API_BODY")"
+first_id=$(jq -r .data.id "$API_BODY")
+[[ "$(idem_post "$IDEM_HDRS" '{"name":"e2e-idem"}')" == 201 ]] || fail "the repeat must replay 201: $(cat "$API_BODY")"
+[[ "$(jq -r .data.id "$API_BODY")" == "$first_id" ]] || fail "the repeat must return the same project, not create another"
+grep -qi '^idempotent-replayed: true' "$IDEM_HDRS" || fail "a replay must carry Idempotent-Replayed: true"
+[[ "$(api /api/v1/projects | jq '[.data[] | select(.name == "e2e-idem")] | length')" == 1 ]] \
+    || fail "a replayed create must not create a second project"
+code=$(idem_post "$IDEM_HDRS" '{"name":"e2e-idem-2"}')
+[[ "$code" == 422 && "$(jq -r .error.code "$API_BODY")" == IDEMPOTENCY_KEY_REUSED ]] \
+    || fail "the same key with another body must answer 422 IDEMPOTENCY_KEY_REUSED, got ${code}"
+curl -s -o /dev/null --unix-socket "$SOCK" -X DELETE "http://localhost/api/v1/projects/${first_id}"
+rm -f "$IDEM_HDRS"
+pass "Idempotency-Key replays the first response and refuses a different body (422)"
+
+# CLI: JSON output, documented exit codes, --yes.
+tond --json apps list | jq -e 'type == "array" and any(.[]; .name == "e2e-whoami")' > /dev/null \
+    || fail "tond --json apps list must print a JSON array"
+set +e
+cli_err=$(tond --json apps info e2e-no-such-app 2>&1 > /dev/null); cli_rc=$?
+set -e
+[[ "$cli_rc" == 3 && "$(jq -r .error.code <<< "$cli_err")" == APP_NOT_FOUND ]] \
+    || fail "tond --json apps info <missing> must exit 3 with APP_NOT_FOUND on stderr, got ${cli_rc}: ${cli_err}"
+set +e
+tond apps delete e2e-whoami < /dev/null > /dev/null 2>&1; cli_rc=$?
+set -e
+[[ "$cli_rc" == 2 ]] || fail "a destructive command without --yes and without a terminal must exit 2, got ${cli_rc}"
+[[ "$(app_field e2e-whoami name)" == e2e-whoami ]] || fail "a refused delete must not delete the app"
+tond help exit-codes --json | jq -e '.exit_codes | map(.exit_code) | contains([0,1,2,3,4,5,6,7,8])' > /dev/null \
+    || fail "tond help exit-codes --json must list exit codes 0-8"
+[[ "$(tond completions bash)" == *_tond* ]] || fail "tond completions bash must print a completion script"
+pass "CLI: --json output, exit codes (3 not found, 2 refused without --yes), completions"
 EXPIRED=$(tond token create --name e2e-expired --preset readonly --expires 1h 2> /dev/null)
 expire_sql="UPDATE api_tokens SET expires_at = '2000-01-01T00:00:00Z' WHERE name = 'e2e-expired'"
 if command -v sqlite3 > /dev/null; then
@@ -1574,7 +1640,7 @@ jq -e '.data.window >= 2 and .data.success_rate != null and .data.median_duratio
     || fail "deploy stats must report a success rate and median duration: $(jq -c .data <<<"$stats")"
 pass "deploy trend: $(jq '.data.success_rate * 100 | floor' <<<"$stats")% of the last $(jq .data.window <<<"$stats") deploys succeeded"
 
-tond token revoke e2e-prometheus > /dev/null 2>&1 || true
+tond token revoke e2e-prometheus -y > /dev/null 2>&1 || true
 PROM_TOKEN=$(tond token create --name e2e-prometheus --scope metrics:read --expires 1d 2> /dev/null)
 prom=$(curl -sf -H "Authorization: Bearer ${PROM_TOKEN}" http://127.0.0.1:3001/metrics) \
     || fail "/metrics over TCP must accept a metrics:read token"

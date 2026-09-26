@@ -42,7 +42,9 @@ use axum::{
 };
 use chrono::Utc;
 use sqlx::SqlitePool;
-use tond_common::{ApiResponse, Role, Scope, ScopeGroup, ScopeSet, TokenKind, TondError, User};
+use tond_common::{
+    ApiErrorBody, ApiResponse, Role, Scope, ScopeGroup, ScopeSet, TokenKind, TondError, User,
+};
 
 use super::LocalSocket;
 use super::rate_limit::client_ip;
@@ -357,7 +359,14 @@ impl IntoResponse for AuthFailure {
     fn into_response(self) -> Response {
         (
             self.status,
-            Json(ApiResponse::<()>::err(self.code, self.message)),
+            Json(ApiResponse::<()>::error(ApiErrorBody {
+                code: self.code.to_string(),
+                message: self.message,
+                hint: tond_common::error_code_info(self.code)
+                    .and_then(|c| c.hint)
+                    .map(str::to_string),
+                field: None,
+            })),
         )
             .into_response()
     }
