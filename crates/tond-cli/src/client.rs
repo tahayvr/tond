@@ -37,14 +37,15 @@ use futures::StreamExt;
 use serde_json::{Map, Value};
 use tokio_tungstenite::tungstenite::Message;
 use tond_common::{
-    ApiResponse, AppResponse, AuditLogPage, AuditVerifyReport, BackupConfigResponse,
-    CreateAppRequest, CreateCronJobRequest, CreateDatabaseRequest, CreateTokenRequest,
-    CreatedDatabaseResponse, CreatedTokenResponse, CronJobResponse, CronJobRun,
-    DatabaseCredentialsResponse, DeployKeyResponse, DeploymentResponse, IntegrationResponse,
-    ManagedDatabaseDetail, ManagedDatabaseResponse, PasswordLinkResponse,
-    PreviewDeploymentResponse, ProjectPreviewResponse, ProjectResponse, ServerSettings,
-    SnapshotResponse, StorageProviderResponse, TokenResponse, UpdateCronJobRequest,
-    UpdateSettingsRequest, UserResponse, WebhookConfigResponse, WebhookSecretResponse,
+    AddAppDomainRequest, ApiResponse, AppDomainResponse, AppResponse, AuditLogPage,
+    AuditVerifyReport, BackupConfigResponse, CreateAppRequest, CreateCronJobRequest,
+    CreateDatabaseRequest, CreateTokenRequest, CreatedDatabaseResponse, CreatedTokenResponse,
+    CronJobResponse, CronJobRun, DatabaseCredentialsResponse, DeployKeyResponse,
+    DeploymentResponse, IntegrationResponse, ManagedDatabaseDetail, ManagedDatabaseResponse,
+    PasswordLinkResponse, PreviewDeploymentResponse, ProjectPreviewResponse, ProjectResponse,
+    ServerSettings, SnapshotResponse, StorageProviderResponse, TokenResponse,
+    UpdateAppDomainRequest, UpdateCronJobRequest, UpdateSettingsRequest, UserResponse,
+    WebhookConfigResponse, WebhookSecretResponse, WwwPairRequest,
 };
 
 /// Body and response of `/api/settings/host-terminal`.
@@ -491,6 +492,81 @@ impl TondClient {
             anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
         }
         Ok(())
+    }
+
+    /// Send a request and unwrap the API envelope.
+    async fn call<T: serde::de::DeserializeOwned + serde::Serialize>(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> Result<T> {
+        let resp: ApiResponse<T> = self.auth_header(req).send().await?.json().await?;
+        if resp.success {
+            resp.data.context("No data returned")
+        } else {
+            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
+        }
+    }
+
+    pub async fn list_domains(&self, app: &str) -> Result<Vec<AppDomainResponse>> {
+        self.call(
+            self.client
+                .get(format!("{}/api/apps/{}/domains", self.base_url, app)),
+        )
+        .await
+    }
+
+    pub async fn add_domain(
+        &self,
+        app: &str,
+        req: &AddAppDomainRequest,
+    ) -> Result<Vec<AppDomainResponse>> {
+        self.call(
+            self.client
+                .post(format!("{}/api/apps/{}/domains", self.base_url, app))
+                .json(req),
+        )
+        .await
+    }
+
+    pub async fn add_www_pair(
+        &self,
+        app: &str,
+        req: &WwwPairRequest,
+    ) -> Result<Vec<AppDomainResponse>> {
+        self.call(
+            self.client
+                .post(format!(
+                    "{}/api/apps/{}/domains/www-pair",
+                    self.base_url, app
+                ))
+                .json(req),
+        )
+        .await
+    }
+
+    pub async fn update_app_domain(
+        &self,
+        app: &str,
+        domain: &str,
+        req: &UpdateAppDomainRequest,
+    ) -> Result<Vec<AppDomainResponse>> {
+        self.call(
+            self.client
+                .patch(format!(
+                    "{}/api/apps/{}/domains/{}",
+                    self.base_url, app, domain
+                ))
+                .json(req),
+        )
+        .await
+    }
+
+    pub async fn remove_domain(&self, app: &str, domain: &str) -> Result<Vec<AppDomainResponse>> {
+        self.call(self.client.delete(format!(
+            "{}/api/apps/{}/domains/{}",
+            self.base_url, app, domain
+        )))
+        .await
     }
 
     pub async fn update_health(

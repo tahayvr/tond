@@ -513,6 +513,114 @@ mod tests {
         assert_eq!(domains, sorted);
     }
     #[tokio::test]
+    async fn uploads_need_pem_and_a_running_proxy() {
+        let state = AppState::for_tests().await;
+        let upload = |cert: &str, key: &str| UploadCertificateRequest {
+            domain: "*.corp.example.com".into(),
+            cert_pem: cert.into(),
+            key_pem: key.into(),
+        };
+        let not_pem = upload_cert(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            State(state.clone()),
+            Json(upload("hello", "key")),
+        )
+        .await;
+        assert!(
+            matches!(&not_pem, Err(AppError(TondError::InvalidInput(m))) if m.contains("PEM")),
+            "PEM is checked before anything else"
+        );
+        let no_proxy = upload_cert(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            State(state.clone()),
+            Json(upload(
+                "-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----",
+                "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----",
+            )),
+        )
+        .await;
+        assert!(
+            matches!(&no_proxy, Err(AppError(TondError::InvalidInput(m))) if m.contains("tond-proxy isn't running")),
+            "the proxy validates and stores uploads"
+        );
+        let bad_domain = upload_cert(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            State(state),
+            Json(UploadCertificateRequest {
+                domain: "not a domain".into(),
+                ..upload("", "")
+            }),
+        )
+        .await;
+        assert!(bad_domain.is_err());
+    }
+
+    #[tokio::test]
+    async fn wildcards_are_listed_and_cover_their_hosts() {
+        let db = db().await;
+        let now = "2026-05-01T00:00:00Z";
+        exec(
+            &db,
+            &format!(
+                "INSERT INTO apps (id, name, domain, status, host_port, created_at, updated_at)
+                 VALUES ('a1', 'web', 'web.apps.test', 'running', 4000, '{now}', '{now}'),
+                        ('a2', 'shop', 'shop.example.com', 'running', 4001, '{now}', '{now}')"
+            ),
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO dns_providers (id, name, kind, zones, token_enc, created_at, updated_at)
+             VALUES ('p1', 'cf', 'cloudflare', '[\"apps.test\"]', 'x', 'now', 'now')",
+        )
+        .await;
+        let ctx = CertContext {
+            dashboard: String::new(),
+            apps: "apps.test".into(),
+            preview: "previews.test".into(),
+        };
+        let list = certificate_list(&db, &ctx)
+            .await
+            .unwrap_or_else(|e| panic!("list: {e}"));
+        let domains: Vec<&str> = list.iter().map(|c| c.domain.as_str()).collect();
+        assert_eq!(
+            domains,
+            vec!["*.apps.test", "shop.example.com", "web.apps.test"],
+            "the wildcard is waiting; hosts still wait too until it is issued"
+        );
+        assert_eq!(
+            list[0].serves,
+            CertificateTarget::Wildcard {
+                purpose: "apps".into(),
+                hosts: 1
+            }
+        );
+
+        exec(
+            &db,
+            "INSERT INTO certificates (id, domain, cert_path, key_path, issued_at, expires_at, status, challenge)
+             VALUES ('w', '*.apps.test', '/c', '/k', 'i', '2030-01-01T00:00:00Z', 'active', 'dns-01'),
+                    ('u', 'shop.example.com', '/c', '/k', 'i', '2030-01-01T00:00:00Z', 'active', NULL)",
+        )
+        .await;
+        exec(
+            &db,
+            "UPDATE certificates SET cert_type = 'custom' WHERE id = 'u'",
+        )
+        .await;
+        let list = certificate_list(&db, &ctx)
+            .await
+            .unwrap_or_else(|e| panic!("list: {e}"));
+        let domains: Vec<&str> = list.iter().map(|c| c.domain.as_str()).collect();
+        assert_eq!(domains, vec!["*.apps.test", "shop.example.com"]);
+        assert_eq!(list[0].challenge.as_deref(), Some("dns-01"));
+        assert_eq!(list[1].issuer_kind, IssuerKind::Uploaded);
+    }
+
+    #[tokio::test]
     async fn retry_cert_clears_next_retry_but_keeps_the_failure_count() {
         let state = AppState::for_tests().await;
         sqlx::query(

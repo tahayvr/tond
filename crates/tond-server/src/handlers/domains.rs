@@ -10,7 +10,9 @@
 //       every app;
 //     - the DNS status: ok | mismatch | missing | inconclusive, with the
 //       resolved and expected addresses and a readable message;
-//     - the certificate row for the domain, if any.
+//     - the certificate that serves the domain, if any: its own row, else an
+//       active wildcard (or uploaded wildcard) one label up (`covered_by`);
+//     - the DNS provider that publishes its DNS-01 records, if one covers it.
 //
 // The server's public addresses come from the routing table
 // (dns::server_addresses); behind NAT, where those are private, a public-IP
@@ -79,6 +81,13 @@ pub struct DnsStatus {
 /// The certificate fields the domain card shows.
 #[derive(Debug, Serialize)]
 pub struct CertificateSummary {
+    /// The certificate's own domain (`*.apps.example.com` for a wildcard).
+    pub domain: String,
+    /// "acme" | "custom"
+    pub cert_type: String,
+    /// "http-01" | "dns-01"
+    pub challenge: Option<String>,
+    pub issuer: Option<String>,
     pub status: String,
     pub issued_at: String,
     pub expires_at: String,
@@ -91,6 +100,10 @@ pub struct CertificateSummary {
 impl From<Certificate> for CertificateSummary {
     fn from(c: Certificate) -> Self {
         Self {
+            domain: c.domain,
+            cert_type: c.cert_type,
+            challenge: c.challenge,
+            issuer: c.issuer,
             status: c.status,
             issued_at: c.issued_at,
             expires_at: c.expires_at,
@@ -119,6 +132,10 @@ pub struct DomainCheckResponse {
     pub server_ips: Vec<String>,
     pub dns: DnsStatus,
     pub certificate: Option<CertificateSummary>,
+    /// Set when a wildcard certificate serves the domain (its name).
+    pub covered_by: Option<String>,
+    /// Name of the DNS provider that validates this domain with DNS-01.
+    pub dns_provider: Option<String>,
     pub checked_at: String,
     /// Set when the domain is on the same site as the dashboard (allowed,
     /// but shown as a warning)
@@ -285,12 +302,27 @@ pub async fn check_domain(
     let dashboard = state.settings.read().await.dashboard_domain.clone();
     let warning = same_site(&domain, &dashboard).then(|| same_site_warning(&domain, &dashboard));
 
-    let certificate =
+    let own =
         sqlx::query_as::<_, Certificate>("SELECT * FROM certificates WHERE domain = ? LIMIT 1")
             .bind(&domain)
             .fetch_optional(&state.db)
+            .await?;
+    let wildcard = match (&own, tond_common::dns::wildcard_for(&domain)) {
+        (None, Some(w)) => {
+            sqlx::query_as::<_, Certificate>(
+                "SELECT * FROM certificates WHERE domain = ? AND status = 'active' LIMIT 1",
+            )
+            .bind(&w)
+            .fetch_optional(&state.db)
             .await?
-            .map(CertificateSummary::from);
+        }
+        _ => None,
+    };
+    let covered_by = wildcard.as_ref().map(|c| c.domain.clone());
+    let certificate = own.or(wildcard).map(CertificateSummary::from);
+    let providers = crate::dns_providers::list(&state.db).await?;
+    let dns_provider =
+        crate::dns_providers::provider_for(&providers, &domain).map(|(p, _)| p.name.clone());
 
     Ok((
         StatusCode::OK,
@@ -304,6 +336,8 @@ pub async fn check_domain(
             wildcard_records,
             server_ips: server_ips.iter().map(ToString::to_string).collect(),
             certificate,
+            covered_by,
+            dns_provider,
             checked_at: chrono::Utc::now().to_rfc3339(),
             warning,
         })),

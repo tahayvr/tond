@@ -278,3 +278,99 @@ pub async fn test_dns_provider(
         Json(ApiResponse::ok(DnsProviderTestResult { ok, zones })),
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use axum::body::to_bytes;
+
+    use super::*;
+    use crate::auth::Principal;
+
+    fn admin<R: crate::auth::principal::ScopeReq>() -> Authz<R> {
+        Authz::unchecked(Principal::test_user(Role::Admin))
+    }
+
+    fn cloudflare(zones: &[&str]) -> CreateDnsProviderRequest {
+        CreateDnsProviderRequest {
+            name: "Cloudflare".into(),
+            kind: DnsProviderKind::Cloudflare,
+            zones: zones.iter().map(|z| z.to_string()).collect(),
+            token: "cf-secret-token".into(),
+            config: DnsProviderConfig::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn tokens_are_encrypted_and_never_returned() {
+        let state = AppState::for_tests().await;
+        let resp = create_dns_provider(
+            RateLimit,
+            admin(),
+            State(state.clone()),
+            Json(cloudflare(&["Example.com"])),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create: {}", e.0))
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap_or_default();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("cf-secret-token"), "{text}");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        assert_eq!(json["data"]["token_set"], true);
+        assert_eq!(json["data"]["zones"][0], "example.com");
+
+        let stored: String = sqlx::query_scalar("SELECT token_enc FROM dns_providers")
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_default();
+        assert!(!stored.contains("cf-secret-token"));
+        assert_eq!(
+            secret_key::decrypt(Purpose::DnsProviderToken, &stored)
+                .ok()
+                .as_deref(),
+            Some("cf-secret-token")
+        );
+        let version: i64 = sqlx::query_scalar("SELECT version FROM route_state")
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_default();
+        assert!(version > 0, "tond-proxy reloads the zone list");
+    }
+
+    #[tokio::test]
+    async fn a_zone_belongs_to_one_provider_and_route53_needs_its_key_id() {
+        let state = AppState::for_tests().await;
+        let _ = create_dns_provider(
+            RateLimit,
+            admin(),
+            State(state.clone()),
+            Json(cloudflare(&["example.com"])),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create: {}", e.0));
+        let dup = create_dns_provider(
+            RateLimit,
+            admin(),
+            State(state.clone()),
+            Json(cloudflare(&["example.com"])),
+        )
+        .await;
+        assert!(dup.is_err(), "the zone is taken");
+        let r53 = create_dns_provider(
+            RateLimit,
+            admin(),
+            State(state),
+            Json(CreateDnsProviderRequest {
+                kind: DnsProviderKind::Route53,
+                ..cloudflare(&["other.com"])
+            }),
+        )
+        .await;
+        assert!(
+            matches!(&r53, Err(AppError(TondError::InvalidInput(m))) if m.contains("access key id"))
+        );
+    }
+}

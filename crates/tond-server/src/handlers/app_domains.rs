@@ -179,3 +179,115 @@ pub async fn remove_domain(
         Json(ApiResponse::ok(domain_list(&state, &app.id).await?)),
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use axum::body::to_bytes;
+
+    use super::*;
+    use crate::auth::Principal;
+
+    async fn seed(state: &AppState, readiness: &str) -> String {
+        sqlx::query(
+            "INSERT INTO apps (id, name, readiness, created_at, updated_at)
+             VALUES ('a1', 'web', ?, 'now', 'now')",
+        )
+        .bind(readiness)
+        .execute(&state.db)
+        .await
+        .unwrap_or_else(|e| panic!("seed: {e}"));
+        "a1".into()
+    }
+
+    fn admin<R: crate::auth::principal::ScopeReq>() -> Authz<R> {
+        Authz::unchecked(Principal::test_user(Role::Admin))
+    }
+
+    async fn body(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap_or_default();
+        serde_json::from_slice(&bytes).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn adding_domains_returns_the_list_and_audits_it() {
+        let state = AppState::for_tests().await;
+        let id = seed(&state, "http").await;
+        let resp = add_domain(
+            RateLimit,
+            admin(),
+            State(state.clone()),
+            Path(id.clone()),
+            Json(AddAppDomainRequest {
+                domain: "shop.example.org".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("add: {}", e.0))
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let resp = add_www_pair(
+            RateLimit,
+            admin(),
+            State(state.clone()),
+            Path(id.clone()),
+            Json(WwwPairRequest {
+                domain: "example.org".into(),
+                canonical: CanonicalHost::Www,
+                primary: Some(false),
+            }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("pair: {}", e.0))
+        .into_response();
+        let json = body(resp).await;
+        let list: Vec<(String, String)> = json["data"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|d| {
+                (
+                    d["domain"].as_str().unwrap_or_default().to_string(),
+                    d["kind"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            list,
+            vec![
+                ("shop.example.org".into(), "primary".into()),
+                ("www.example.org".into(), "alias".into()),
+                ("example.org".into(), "redirect".into()),
+            ]
+        );
+        let audited: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE action = 'domain_add'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap_or_default();
+        assert_eq!(audited, 2);
+    }
+
+    #[tokio::test]
+    async fn background_workers_get_no_domains() {
+        let state = AppState::for_tests().await;
+        let id = seed(&state, "none").await;
+        let refused = add_domain(
+            RateLimit,
+            admin(),
+            State(state),
+            Path(id),
+            Json(AddAppDomainRequest {
+                domain: "jobs.example.org".into(),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert!(
+            matches!(&refused, Err(AppError(TondError::InvalidInput(m))) if m.contains("background worker"))
+        );
+    }
+}
