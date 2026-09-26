@@ -1,20 +1,8 @@
-import { listApps, listAuditLog } from '$lib/api';
+import { listAuditLog } from '$lib/api';
+import { filtersFromUrl, filtersToQuery } from '$lib/activity-filters';
 
-export async function load() {
-	const initialFilterAppId = '';
-	const initialFilterAction = '';
-	const initialFilterLimit = 50;
-
-	const [entries, apps] = await Promise.all([
-		listAuditLog({ app_id: undefined, limit: initialFilterLimit }),
-		listApps()
-	]);
-
-	return {
-		entries,
-		apps,
-		initialFilterAppId,
-		initialFilterAction,
-		initialFilterLimit
-	};
+export async function load({ url }: { url: URL }) {
+	const filters = filtersFromUrl(url);
+	const page = await listAuditLog(filtersToQuery(filters));
+	return { filters, entries: page.entries, nextBefore: page.next_before };
 }
