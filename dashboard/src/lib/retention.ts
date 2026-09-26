@@ -54,6 +54,21 @@ export const RETENTION_COPY: Record<string, RetentionCopy> = {
 		help: 'Alert history on the Alerts page and in Recent events.',
 		group: 'events'
 	},
+	retention_uptime_days: {
+		label: 'Hourly uptime history and incidents for',
+		help: 'Each probe is kept 48 hours; the hourly summaries behind the 7- and 30-day uptime and the 90-day bars are kept this long.',
+		group: 'events'
+	},
+	retention_request_metrics_days: {
+		label: 'Hourly request metrics for',
+		help: 'Requests, errors, latency and bandwidth per app behind the 7- to 90-day charts. Minute-level rows are kept 48 hours.',
+		group: 'events'
+	},
+	retention_host_history_days: {
+		label: 'Hourly host history for',
+		help: 'CPU, load, memory and disk on the System page. Minute-level rows are kept 48 hours.',
+		group: 'events'
+	},
 	retention_audit_log_days: {
 		label: 'Activity (audit) log for',
 		help: 'Removing old entries keeps the hash chain verifiable. At least 30 days.',

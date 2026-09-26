@@ -73,6 +73,9 @@ pub enum Purpose {
     /// SMTP passwords, ntfy topics/tokens, Pushover/Gotify tokens, webhook
     /// signing secrets; see INTEGRATION_SECRET_FIELDS)
     IntegrationSecret,
+    /// heartbeat_config.url_enc (a heartbeat URL is a bearer secret: anyone
+    /// holding it can report the server healthy)
+    HeartbeatUrl,
     /// audit_shipping.webhook_secret (HMAC key for shipped audit entries)
     AuditWebhookSecret,
 }
@@ -97,6 +100,7 @@ impl Purpose {
             Purpose::GithubWebhookSecret => b"tond:github_apps.webhook_secret",
             Purpose::GithubPrivateKey => b"tond:github_apps.private_key",
             Purpose::IntegrationSecret => b"tond:integrations.config",
+            Purpose::HeartbeatUrl => b"tond:heartbeat_config.url_enc",
             Purpose::AuditWebhookSecret => b"tond:audit_shipping.webhook_secret",
         }
     }
@@ -456,6 +460,7 @@ pub async fn reencrypt_stored_secrets(
 /// counts as one value). Key rotation walks this list: a new secret column
 /// must be added here.
 pub const SCALAR_SECRET_COLUMNS: &[(&str, &str, Purpose)] = &[
+    ("heartbeat_config", "url_enc", Purpose::HeartbeatUrl),
     (
         "registry_credentials",
         "password_enc",

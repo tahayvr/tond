@@ -102,6 +102,7 @@ mod state;
 mod static_files;
 mod storage;
 mod upload;
+mod uptime;
 mod volumes;
 
 use std::future::IntoFuture;
@@ -234,6 +235,7 @@ async fn run() -> Result<()> {
     tokio::spawn(audit_ship::run(state.clone()));
     tokio::spawn(backup::backup_scheduler(state.clone()));
     tokio::spawn(run_preview_cleanup_loop(state.clone()));
+    tokio::spawn(uptime::run(state.clone()));
 
     // Control connection to tond-proxy: route nudges, cutover acks, cert results.
     tokio::spawn(proxy_link::run(state.clone()));
@@ -635,6 +637,9 @@ async fn run() -> Result<()> {
             get(handlers::access_log::download_access_log),
         )
         .route("/api/system/self", get(handlers::system_self::get_self))
+        // Host history, disk, Docker, heartbeat; uptime checks
+        .merge(handlers::host::routes())
+        .merge(handlers::uptime::routes())
         .route("/metrics", get(handlers::system_self::metrics))
         // Alerts: rules, live alerts, history, snooze, quiet hours
         .route("/api/alerts", get(handlers::alerts::list_alerts))

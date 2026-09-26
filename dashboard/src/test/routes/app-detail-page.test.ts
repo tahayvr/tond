@@ -396,7 +396,7 @@ describe('apps/[id] page', () => {
 			within(tabs)
 				.getAllByRole('link')
 				.map((a) => a.textContent?.trim())
-		).toEqual(['Overview', 'Deployments', 'Logs', 'Metrics', 'Events', 'Settings']);
+		).toEqual(['Overview', 'Deployments', 'Logs', 'Metrics', 'Uptime', 'Events', 'Settings']);
 		expect(within(tabs).getByRole('link', { name: 'Logs' })).toHaveAttribute(
 			'href',
 			'/apps/app_1?tab=logs'

@@ -92,6 +92,17 @@ case "$ACME" in
     *) echo "Unknown --acme mode: $ACME" >&2; exit 1 ;;
 esac
 
+# Uptime checks probe each app's public URL. The test domains have no public
+# DNS and the test CA is not publicly trusted, so point tond-server's probes at
+# the target IP and trust the ACME CA (test-only variables, see
+# crates/tond-server/src/uptime/probe.rs). Must exist before the first start.
+mkdir -p /etc/systemd/system/tond-server.service.d
+{
+    printf '[Service]\nEnvironment=TOND_UPTIME_RESOLVE=%s\n' "$IP"
+    if [[ -n "$CA_FILE" ]]; then printf 'Environment=TOND_UPTIME_CA_FILE=%s\n' "$CA_FILE"; fi
+} > /etc/systemd/system/tond-server.service.d/e2e-uptime.conf
+systemctl daemon-reload
+
 INSTALL_ARGS=(--non-interactive --dashboard-domain "dash.${BASE_DOMAIN}")
 [[ -n "$PREVIEW_DOMAIN" ]] && INSTALL_ARGS+=(--preview-domain "$PREVIEW_DOMAIN")
 # Always pass --apps-domain so the install never guesses one from the host's IP.

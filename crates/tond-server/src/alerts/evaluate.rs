@@ -43,6 +43,8 @@ pub struct Inputs {
     pub app_samples: HashMap<String, (f64, i64)>,
     pub disk_percent: Option<f64>,
     pub disk_forecast: Option<Forecast>,
+    /// Apps whose uptime check is down.
+    pub uptime_down: HashSet<String>,
 }
 
 /// Where live readings come from.
@@ -83,10 +85,18 @@ impl Source {
         }
     }
 
-    fn disk_forecast(&self) -> Forecast {
+    async fn disk_forecast(&self, db: &SqlitePool, now: i64) -> Forecast {
         match self {
-            Source::Live => sources::disk_forecast(),
+            Source::Live => sources::disk_forecast(db, now).await,
             Source::Fixed(i) => i.disk_forecast.unwrap_or(Forecast::Unknown),
+        }
+    }
+
+    /// The app's uptime check is down (probed through DNS, TLS and the proxy).
+    fn uptime_down(&self, app_id: &str) -> bool {
+        match self {
+            Source::Live => crate::uptime::app_is_down(app_id),
+            Source::Fixed(i) => i.uptime_down.contains(app_id),
         }
     }
 }
@@ -258,7 +268,10 @@ async fn observe(
                 }
                 "app_down" => {
                     for app in &apps {
-                        let down = matches!(app.status.as_str(), "failed" | "unhealthy");
+                        // Not running (crashed, failed to start), or running
+                        // but unreachable from outside (uptime check down).
+                        let down = matches!(app.status.as_str(), "failed" | "unhealthy")
+                            || (app.status != "stopped" && ctx.source.uptime_down(&app.id));
                         out.push(obs(app, Some(f64::from(u8::from(down))), Some(down)));
                     }
                 }
@@ -326,7 +339,7 @@ async fn observe(
                     let v = ctx.source.disk_percent(now);
                     (v, v.map(|v| holds(info, v, thr)))
                 }
-                "disk_forecast" => match ctx.source.disk_forecast() {
+                "disk_forecast" => match ctx.source.disk_forecast(ctx.db, now).await {
                     Forecast::Unknown => (None, None),
                     Forecast::NotFilling => (None, Some(false)),
                     Forecast::HoursLeft(h) => (Some(h), Some(holds(info, h, thr))),

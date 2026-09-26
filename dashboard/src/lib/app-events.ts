@@ -25,6 +25,8 @@ export function eventCategory(kind: AppEventKind): EventCategory {
 		case 'cert_failed':
 		case 'alert_fired':
 		case 'alert_resolved':
+		case 'uptime_down':
+		case 'uptime_up':
 			return 'runtime';
 		default:
 			return 'changes';

@@ -12,7 +12,9 @@
 //      (targets with requests only) to requests_1m and roll finished hours up
 //      into requests_1h — all in one transaction, about once a minute.
 //
-// Retention (janitor, store::prune): requests_1m 48 h, requests_1h 90 days.
+// Retention (janitor, `prune`): requests_1m 48 h, requests_1h
+// `retention_request_metrics_days` (90 by default). Rows of deleted apps and
+// previews go with their target in store::prune.
 //
 // Queries return at most ~480 buckets:
 //   1h → 1m (60)   6h → 1m (360)   24h → 3 min (480)
@@ -28,9 +30,8 @@ use tond_common::traffic::{
 };
 use tond_common::{RequestCurrent, RequestSeries, RequestSummary};
 
-/// Kept for requests_1m / requests_1h.
+/// Kept for requests_1m (requests_1h: `retention_request_metrics_days`).
 pub const M1_KEEP_SECS: i64 = 48 * 3600;
-pub const H1_KEEP_SECS: i64 = 90 * 86_400;
 /// Deltas kept in memory per route (10 ticks = 5 minutes).
 const LIVE_LEN: usize = 10;
 /// "Right now" covers deltas newer than this.
@@ -414,6 +415,37 @@ pub async fn write_minute(
 
 // ── Queries ──
 
+/// Drop minute rows older than 48 h and hourly rows older than
+/// `hour_keep_secs`, in batches along the (target, ts) key.
+pub async fn prune(db: &SqlitePool, now: i64, hour_keep_secs: i64) -> sqlx::Result<u64> {
+    const BATCH: i64 = 2_000;
+    let mut deleted = 0;
+    for (table, keep) in [
+        ("requests_1m", M1_KEEP_SECS),
+        ("requests_1h", hour_keep_secs),
+    ] {
+        let sql = format!(
+            "DELETE FROM {table} WHERE (target, ts) IN (
+                SELECT target, ts FROM {table}
+                WHERE target IN (SELECT id FROM metric_targets) AND ts < ? LIMIT ?)"
+        );
+        loop {
+            let n = sqlx::query(AssertSqlSafe(sql.as_str()))
+                .bind(now.saturating_sub(keep))
+                .bind(BATCH)
+                .execute(db)
+                .await?
+                .rows_affected();
+            deleted += n;
+            if n < BATCH as u64 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+    Ok(deleted)
+}
+
 /// A supported request-metrics window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Range {
@@ -721,6 +753,38 @@ mod tests {
         // A late tick for an older minute joins the pending one.
         assert!(t.accumulate(200, &d).is_none());
         assert_eq!(t.pending_minute, Some(240));
+    }
+
+    #[tokio::test]
+    async fn prune_keeps_48_hours_of_minutes_and_the_configured_hours() {
+        let db = db().await;
+        let a = ensure_target(&db, &app("a"))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let now = 1_900_000_000;
+        for ts in [now - M1_KEEP_SECS - 60, now - 60] {
+            write_minute(&db, ts, &[(a, counters(1, 0, 0))], None)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let mut conn = db.acquire().await.unwrap_or_else(|e| panic!("{e}"));
+        for ts in [now - 10 * 86_400, now - 3600] {
+            insert_row(&mut conn, "requests_1h", a, ts, &counters(1, 0, 0))
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        drop(conn);
+        let deleted = prune(&db, now, 7 * 86_400)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(deleted, 2);
+        let left: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM requests_1m), (SELECT COUNT(*) FROM requests_1h)",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(left, (1, 1));
     }
 
     #[test]

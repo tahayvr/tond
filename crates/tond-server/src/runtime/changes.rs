@@ -43,10 +43,12 @@ pub enum Table {
     /// Not a table: the alert engine queued deliveries to send now
     /// (`alerts::kick`). Only published through `notify`.
     AlertKick,
+    /// uptime_checks rows; the heartbeat settings handler notifies it too.
+    Uptime,
 }
 
 impl Table {
-    const ALL: [Table; 13] = [
+    const ALL: [Table; 14] = [
         Table::Apps,
         Table::PreviewDeployments,
         Table::CronJobs,
@@ -60,6 +62,7 @@ impl Table {
         Table::Certificates,
         Table::Snapshots,
         Table::AlertKick,
+        Table::Uptime,
     ];
 
     fn index(self) -> usize {
@@ -84,6 +87,7 @@ impl Table {
             "audit_shipping" => Table::AuditShipping,
             "certificates" => Table::Certificates,
             "snapshots" => Table::Snapshots,
+            "uptime_checks" => Table::Uptime,
             _ => return None,
         })
     }

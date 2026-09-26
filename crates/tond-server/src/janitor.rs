@@ -22,7 +22,11 @@
 //   metrics        — tiered retention (raw 25 h, 5-minute rollups 8 days,
 //                    hourly rollups 90 days; restart/crash/OOM events for
 //                    `retention_app_events_days`) plus targets whose owner
-//                    is gone; see metrics::store::prune.
+//                    is gone; see metrics::store::prune. Host history
+//                    (1-minute 48 h, hourly `retention_host_history_days`;
+//                    metrics::host_history) and uptime results (1-minute
+//                    48 h, hourly and incidents `retention_uptime_days`;
+//                    uptime::store) are counted here too.
 //   alert_history  — drop episodes resolved more than N days ago (default 90;
 //                    their deliveries go with them) and close episodes whose
 //                    rule disappeared with its app.
@@ -86,6 +90,12 @@ pub struct RetentionPolicy {
     pub app_events_days: i64,
     /// `retention_alert_history_days` — how long resolved alerts are kept.
     pub alert_history_days: i64,
+    /// `retention_uptime_days` — hourly uptime rollups and ended incidents.
+    pub uptime_days: i64,
+    /// `retention_host_history_days` — hourly host history.
+    pub host_history_days: i64,
+    /// `retention_request_metrics_days` — hourly request metrics.
+    pub request_metrics_days: i64,
 }
 
 fn rule_default(key: &str) -> i64 {
@@ -103,6 +113,9 @@ impl Default for RetentionPolicy {
             audit_log_days: rule_default("retention_audit_log_days"),
             app_events_days: rule_default("retention_app_events_days"),
             alert_history_days: rule_default("retention_alert_history_days"),
+            uptime_days: rule_default("retention_uptime_days"),
+            host_history_days: rule_default("retention_host_history_days"),
+            request_metrics_days: rule_default("retention_request_metrics_days"),
         }
     }
 }
@@ -142,6 +155,9 @@ impl RetentionPolicy {
             "retention_audit_log_days" => &mut self.audit_log_days,
             "retention_app_events_days" => &mut self.app_events_days,
             "retention_alert_history_days" => &mut self.alert_history_days,
+            "retention_uptime_days" => &mut self.uptime_days,
+            "retention_host_history_days" => &mut self.host_history_days,
+            "retention_request_metrics_days" => &mut self.request_metrics_days,
             _ => return None,
         })
     }
@@ -364,6 +380,19 @@ pub async fn run_once(db: &SqlitePool, policy: &RetentionPolicy) -> Result<Janit
         i64::MAX / 2
     };
     report.metrics += metrics::store::prune(db, now.timestamp(), event_keep_secs).await?;
+    let days = |d: i64| {
+        if d > 0 {
+            d.saturating_mul(86_400)
+        } else {
+            i64::MAX / 2
+        }
+    };
+    report.metrics +=
+        metrics::host_history::prune(db, now.timestamp(), days(policy.host_history_days)).await?;
+    report.metrics +=
+        crate::uptime::store::prune(db, now.timestamp(), days(policy.uptime_days)).await?;
+    report.metrics +=
+        metrics::requests::prune(db, now.timestamp(), days(policy.request_metrics_days)).await?;
 
     // ── alert history (unix seconds; deliveries cascade) ──
     let _ = alerts::evaluate::close_orphans(db, now.timestamp()).await;

@@ -1,10 +1,8 @@
 <script lang="ts">
 	// Last 24 hours at a glance on the app's Overview: requests per second,
-	// 5xx rate, p95 latency, CPU and memory as sparklines, plus an `uptime`
-	// slot. UPTIME SLOT: the uptime-checks workstream renders its tile by
-	// passing `{#snippet uptime()}…{/snippet}` (a <Sparkline> fits the grid);
-	// nothing is shown until then.
-	import { untrack, type Snippet } from 'svelte';
+	// 5xx rate, p95 latency, CPU and memory as sparklines (uptime has its own
+	// summary above, UptimeBadge).
+	import { untrack } from 'svelte';
 	import {
 		getMetrics,
 		getRequestMetrics,
@@ -21,17 +19,14 @@
 		formatRps
 	} from '$lib/metrics-format';
 	import { appTabHref } from '$lib/tabs';
-	import { cn } from '$lib/utils';
 	import { Skeleton } from '$lib/components/ui/skeleton/index.js';
 	import Sparkline from '$lib/components/metrics/sparkline.svelte';
 
 	interface Props {
 		appId: string;
-		/** Uptime tile (filled by the uptime-checks feature). */
-		uptime?: Snippet;
 	}
 
-	let { appId, uptime }: Props = $props();
+	let { appId }: Props = $props();
 
 	let requests = $state<RequestMetricsResponse | null>(null);
 	let resources = $state<MetricsResponse | null>(null);
@@ -84,12 +79,7 @@
 			Metrics are unavailable right now. They refresh every minute.
 		</p>
 	{:else}
-		<div
-			class={cn(
-				'grid grid-cols-2 gap-3 sm:grid-cols-3',
-				uptime ? 'lg:grid-cols-6' : 'lg:grid-cols-5'
-			)}
-		>
+		<div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
 			<Sparkline
 				label="Requests"
 				value={requests?.current
@@ -129,7 +119,6 @@
 				values={rs?.mem ?? []}
 				color="var(--chart-4)"
 			/>
-			{@render uptime?.()}
 		</div>
 	{/if}
 </section>

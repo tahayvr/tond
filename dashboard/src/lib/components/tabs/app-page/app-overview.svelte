@@ -1,18 +1,18 @@
 <script lang="ts">
-	import type { Snippet } from 'svelte';
 	import { safeUrl } from '$lib/utils';
 	import { can } from '$lib/auth.svelte';
 	import StatusBadge from '$lib/components/feedback/status-badge.svelte';
 	import AppOverviewMetrics from './app-overview-metrics.svelte';
+	import UptimeBadge from '$lib/components/uptime/UptimeBadge.svelte';
 	import type { App } from '$lib/api';
 
 	interface Props {
 		app: App;
-		/** Uptime tile for the metrics row (see app-overview-metrics.svelte). */
-		uptime?: Snippet;
+		/** Link to the Uptime tab; the uptime summary shows when set. */
+		uptimeHref?: string | null;
 	}
 
-	let { app, uptime }: Props = $props();
+	let { app, uptimeHref = null }: Props = $props();
 
 	const SOURCE_LABELS: Record<string, string> = {
 		git: 'Git — Public Repo',
@@ -50,8 +50,11 @@
 </script>
 
 <div class="space-y-4 pt-4">
+	{#if uptimeHref && app.domain}
+		<UptimeBadge appId={app.id} href={uptimeHref} />
+	{/if}
 	{#if can('metrics:read')}
-		<AppOverviewMetrics appId={app.id} {uptime} />
+		<AppOverviewMetrics appId={app.id} />
 	{/if}
 	<div class="grid grid-cols-1 gap-4 sm:grid-cols-2 [&>*]:min-w-0">
 		<!-- Status -->

@@ -103,6 +103,7 @@ import {
 	MOCK_ALERT_RULES,
 	MOCK_ALERT_SETTINGS
 } from './fixtures';
+import { observeHandlers } from './observe';
 
 // Simulated network latency (ms). Set to 0 for instant responses.
 const LATENCY = 200;
@@ -1077,6 +1078,9 @@ function mockImagePorts(image: string): { exposed: number[]; env: number | null 
 }
 
 export const handlers = [
+	// Host history, disk, Docker, heartbeat, uptime (./observe.ts)
+	...observeHandlers,
+
 	// Scenario gate: runs first and falls through (returns undefined) when idle.
 	http.all('/api/*', ({ request }) => {
 		const scenario = mockScenario();

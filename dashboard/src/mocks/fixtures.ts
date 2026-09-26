@@ -671,6 +671,23 @@ export const MOCK_RETENTION: RetentionSettings = {
 			min: 7,
 			max: 365,
 			unit: 'days'
+		},
+		{ key: 'retention_uptime_days', value: 90, default: 90, min: 7, max: 365, unit: 'days' },
+		{
+			key: 'retention_request_metrics_days',
+			value: 90,
+			default: 90,
+			min: 7,
+			max: 365,
+			unit: 'days'
+		},
+		{
+			key: 'retention_host_history_days',
+			value: 365,
+			default: 365,
+			min: 30,
+			max: 1095,
+			unit: 'days'
 		}
 	],
 	database: {
@@ -1718,7 +1735,7 @@ export const MOCK_ALERT_KINDS: AlertKindInfo[] = [
 		kind: 'app_down',
 		label: 'App down',
 		description:
-			"The app is not running (it crashed or failed to start). Apps you stopped don't count.",
+			"The app is not running (it crashed or failed to start), or its public URL fails the uptime check. Apps you stopped don't count.",
 		scope: 'app',
 		unit: '',
 		comparison: 'none',
@@ -3052,7 +3069,12 @@ export function makeMockSystemSelf(): SystemSelf {
 			loop('backup-scheduler', { next_wake_at: new Date(now + 9 * 3_600_000).toISOString() }),
 			loop('preview-cleanup'),
 			loop('proxy-link', { next_wake_at: null }),
-			loop('route-nudge', { last_duration_ms: 11.3, next_wake_at: null })
+			loop('route-nudge', { last_duration_ms: 11.3, next_wake_at: null }),
+			loop('uptime', {
+				last_run_at: new Date(now - 23_000).toISOString(),
+				last_duration_ms: 212.4,
+				next_wake_at: new Date(now + 37_000).toISOString()
+			})
 		],
 		db: {
 			size_bytes: 1.8 * 1024 * 1024,

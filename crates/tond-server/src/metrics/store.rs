@@ -6,7 +6,7 @@
 //   metrics_5m      5-minute rollups             kept M5_KEEP_SECS   (8 days)
 //   metrics_1h      1-hour rollups               kept H1_KEEP_SECS   (90 days)
 //   metric_events   restarts / crashes / OOMs    kept retention_app_events_days (90)
-//   requests_1m/1h  request metrics (requests.rs) kept 48 h / 90 days
+//   requests_1m/1h  request metrics (requests.rs; pruned there, orphans here)
 //
 // Each tick writes all samples in one transaction. Rollups are computed when a
 // bucket closes (every 5 minutes / every hour) with INSERT OR REPLACE, so a
@@ -293,8 +293,6 @@ pub async fn prune(db: &SqlitePool, now: i64, event_keep_secs: i64) -> anyhow::R
         ("metrics_5m", M5_KEEP_SECS, "target, ts"),
         ("metrics_1h", H1_KEEP_SECS, "target, ts"),
         ("metric_events", event_keep_secs, "target, ts, kind"),
-        ("requests_1m", super::requests::M1_KEEP_SECS, "target, ts"),
-        ("requests_1h", super::requests::H1_KEEP_SECS, "target, ts"),
     ] {
         let sql = format!(
             "DELETE FROM {table} WHERE ({key}) IN (

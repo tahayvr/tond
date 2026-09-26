@@ -841,3 +841,41 @@ async fn disabling_a_rule_closes_its_alerts_without_notifying() {
         "no resolve message for a disabled rule"
     );
 }
+
+#[tokio::test]
+async fn app_down_follows_the_uptime_check_of_a_running_app() {
+    let state = test_state().await;
+    let db = &state.db;
+    seed_app(db, "a1", "api", "running").await;
+    seed_app(db, "a2", "web", "stopped").await;
+    seed_webhook(db, "hook", "http://127.0.0.1:1/hook", None).await;
+    seed_rule(
+        db,
+        Rule {
+            id: "down",
+            kind: "app_down",
+            threshold: 0.0,
+            window: 0,
+            ..Rule::default()
+        },
+    )
+    .await;
+    let mut i = Inputs::default();
+    i.uptime_down.insert("a1".to_string());
+    i.uptime_down.insert("a2".to_string());
+    eval(&state, T0, &Source::Fixed(i)).await;
+    assert!(
+        state_of(db, "down", "app:a1").await.is_some(),
+        "a running app whose public URL fails is down"
+    );
+    assert_eq!(
+        state_of(db, "down", "app:a2").await,
+        None,
+        "a stopped app never counts"
+    );
+    eval(&state, T0 + 60, &Source::Fixed(Inputs::default())).await;
+    assert_ne!(
+        state_of(db, "down", "app:a1").await.as_deref(),
+        Some("firing")
+    );
+}

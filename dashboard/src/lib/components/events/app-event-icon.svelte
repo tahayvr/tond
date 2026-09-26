@@ -17,6 +17,7 @@
 	import PowerIcon from '~icons/ri/shut-down-line';
 	import AlarmIcon from '~icons/ri/alarm-warning-line';
 	import BellIcon from '~icons/ri/notification-off-line';
+	import PulseIcon from '~icons/ri/pulse-line';
 
 	let { event, class: className }: { event: AppEvent; class?: string } = $props();
 
@@ -35,7 +36,9 @@
 		config_changed: SettingsIcon,
 		control: PowerIcon,
 		alert_fired: AlarmIcon,
-		alert_resolved: BellIcon
+		alert_resolved: BellIcon,
+		uptime_down: PulseIcon,
+		uptime_up: PulseIcon
 	} as const;
 
 	const TONES = {

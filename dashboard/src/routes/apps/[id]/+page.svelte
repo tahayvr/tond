@@ -74,6 +74,7 @@
 	import * as Select from '$lib/components/ui/select/index.js';
 	import Breadcrumb from '$lib/components/nav/breadcrumb.svelte';
 	import AppOverview from '$lib/components/tabs/app-page/app-overview.svelte';
+	import UptimePanel from '$lib/components/uptime/UptimePanel.svelte';
 	import AppEventsStrip from '$lib/components/events/app-events-strip.svelte';
 	import AppEventsList from '$lib/components/events/app-events-list.svelte';
 	import AppLogs from '$lib/components/tabs/app-page/app-logs.svelte';
@@ -1016,7 +1017,17 @@
 					<div class="pt-4">
 						<AppEventsStrip appId={app.id} />
 					</div>
-					<AppOverview {app} />
+					<AppOverview
+						{app}
+						uptimeHref={can('metrics:read') ? appTabHref(appId, 'uptime') : null}
+					/>
+				{/if}
+
+				<!-- Uptime tab -->
+				{#if viewAllowed && activeTab === 'uptime'}
+					{#key appId}
+						<UptimePanel target={appId} canEdit={can('apps:write')} />
+					{/key}
 				{/if}
 
 				<!-- Logs tab -->

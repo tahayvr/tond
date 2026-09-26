@@ -83,7 +83,7 @@ pub const ALERT_KINDS: &[AlertKindInfo] = &[
     AlertKindInfo {
         kind: "app_down",
         label: "App down",
-        description: "The app is not running (it crashed or failed to start). Apps you stopped don't count.",
+        description: "The app is not running (it crashed or failed to start), or its public URL fails the uptime check. Apps you stopped don't count.",
         scope: AlertScope::App,
         unit: "",
         comparison: AlertComparison::None,
