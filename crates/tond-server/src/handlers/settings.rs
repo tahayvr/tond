@@ -37,7 +37,8 @@ async fn queue_dashboard_certificate(
     let _ = sqlx::query(
         "INSERT INTO certificates (id, domain, cert_type, cert_path, key_path, issued_at, expires_at, status, created_at, updated_at)
          VALUES (?, ?, 'acme', ?, ?, ?, ?, 'pending', ?, ?)
-         ON CONFLICT(domain) DO UPDATE SET status = 'pending', updated_at = excluded.updated_at",
+         ON CONFLICT(domain) DO UPDATE SET status = 'pending', updated_at = excluded.updated_at,
+            last_error = NULL, next_retry_at = NULL, failure_count = 0",
     )
     .bind(Uuid::new_v4().to_string())
     .bind(dashboard_domain)

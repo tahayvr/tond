@@ -16,6 +16,10 @@ use tond_common::App;
 use crate::state::AppState;
 
 use super::core::log_deploy;
+use super::git::{
+    GIT_ALLOW_PROTOCOL, GitHttpAuth, clone_args, ensure_known_hosts, git_auth_env,
+    known_hosts_path, redact_url_credentials, ssh_command,
+};
 
 fn build_image_tag(app_name: &str) -> String {
     format!("tond-{}", app_name)
@@ -53,18 +57,58 @@ fn docker_build_args<'a>(
     args
 }
 
+/// Validate an app's `base_dir`: a relative path inside the checkout, without
+/// `..`, absolute/root components, backslashes or control characters.
+/// Returns the normalised form (no leading `./`, no trailing `/`).
+pub fn validate_base_dir(base_dir: &str) -> Result<String> {
+    use std::path::Component;
+
+    let trimmed = base_dir.trim();
+    if trimmed.len() > 512 {
+        anyhow::bail!("base_dir is too long");
+    }
+    if trimmed.contains('\\') || trimmed.chars().any(char::is_control) {
+        anyhow::bail!("base_dir must be a plain relative path");
+    }
+    let mut parts = Vec::new();
+    for component in std::path::Path::new(trimmed).components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            Component::ParentDir => anyhow::bail!("base_dir must not contain '..'"),
+            Component::RootDir | Component::Prefix(_) => {
+                anyhow::bail!("base_dir must be relative to the repository root")
+            }
+        }
+    }
+    Ok(parts.join("/"))
+}
+
+/// Resolve the build root for `base_dir` inside the checkout at `dir`, and
+/// make sure it really is inside it (symlinks included).
 fn resolve_build_root(dir: &str, base_dir: Option<&str>) -> Result<std::path::PathBuf> {
     let root = std::path::Path::new(dir);
-    let build_root = match base_dir {
-        Some(base) if !base.is_empty() => root.join(base),
-        _ => root.to_path_buf(),
+    let base = match base_dir {
+        Some(base) => validate_base_dir(base)?,
+        None => String::new(),
+    };
+    let build_root = if base.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(&base)
     };
 
     if !build_root.exists() {
-        anyhow::bail!(
-            "base_dir '{}' does not exist inside the repository",
-            base_dir.unwrap_or_default()
-        );
+        anyhow::bail!("base_dir '{}' does not exist inside the repository", base);
+    }
+
+    let canonical_root = root.canonicalize()?;
+    let canonical_build_root = build_root.canonicalize()?;
+    if !canonical_build_root.starts_with(&canonical_root) {
+        anyhow::bail!("base_dir '{}' resolves outside the repository", base);
+    }
+    if !canonical_build_root.is_dir() {
+        anyhow::bail!("base_dir '{}' is not a directory", base);
     }
 
     Ok(build_root)
@@ -175,14 +219,17 @@ pub async fn build_from_dir(state: &AppState, app: &App, dir: &str) -> Result<St
 ///                  build with Docker.
 ///
 /// If a deploy key exists on disk at `$TOND_DATA_DIR/keys/<app_id>/id_ed25519`,
-/// it is injected via `GIT_SSH_COMMAND` to enable cloning private repositories
-/// over SSH without modifying the system-wide SSH configuration.
+/// it is injected via `GIT_SSH_COMMAND` (with a per-app known_hosts file) to
+/// enable cloning private repositories over SSH. HTTPS credentials in `auth`
+/// are passed as a header via git's environment config — see deploy/git.rs.
+/// `git_url` must not contain credentials.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn build_from_git(
     state: &AppState,
     app_id: &str,
     app_name: &str,
     git_url: &str,
+    auth: Option<&GitHttpAuth>,
     branch: &str,
     build_opts: &BuildOptions<'_>,
     deployment_id: Option<&str>,
@@ -212,18 +259,18 @@ pub(super) async fn build_from_git(
     .await?;
 
     let mut cmd = tokio::process::Command::new("git");
-    cmd.args([
-        "clone", "--depth", "1", "--branch", branch, git_url, &work_dir,
-    ]);
+    cmd.args(clone_args(branch, git_url, &work_dir))
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ALLOW_PROTOCOL", GIT_ALLOW_PROTOCOL);
+
+    if let Some(auth) = auth {
+        cmd.envs(git_auth_env(git_url, auth));
+    }
 
     if key_exists {
-        // Disable host-key checking so the first clone doesn't hang waiting
-        // for user input on an unrecognised host fingerprint.
-        let ssh_cmd = format!(
-            "ssh -i {} -o StrictHostKeyChecking=no -o BatchMode=yes",
-            key_path
-        );
-        cmd.env("GIT_SSH_COMMAND", &ssh_cmd);
+        let known_hosts = known_hosts_path(&data_dir, app_id);
+        ensure_known_hosts(&known_hosts).await?;
+        cmd.env("GIT_SSH_COMMAND", ssh_command(&key_path, &known_hosts));
         log_deploy(
             state,
             app_id,
@@ -238,8 +285,15 @@ pub(super) async fn build_from_git(
 
     if !clone_output.status.success() {
         let stderr = String::from_utf8_lossy(&clone_output.stderr);
-        anyhow::bail!("Git clone failed: {}", stderr);
+        anyhow::bail!(
+            "Git clone failed: {}",
+            redact_url_credentials(stderr.trim())
+        );
     }
+
+    // Drop the repository metadata before building: .git/config and history
+    // must never end up in the build context or an image.
+    tokio::fs::remove_dir_all(std::path::Path::new(&work_dir).join(".git")).await?;
 
     let image_tag = build_from_dir_with_method(
         state,
@@ -639,6 +693,49 @@ mod tests {
             repo.path().join("apps").join("web"),
             "resolve_build_root should append base_dir beneath the repository root"
         );
+    }
+
+    #[test]
+    fn validate_base_dir_accepts_relative_paths_and_rejects_traversal() {
+        for (input, expected) in [
+            ("apps/web", "apps/web"),
+            ("./apps/web/", "apps/web"),
+            ("", ""),
+            (".", ""),
+        ] {
+            assert_eq!(
+                validate_base_dir(input).unwrap_or_else(|err| panic!("{input}: {err}")),
+                expected
+            );
+        }
+        for input in [
+            "../etc",
+            "apps/../../etc",
+            "/etc",
+            "apps\\..\\etc",
+            "apps/\u{0}x",
+        ] {
+            assert!(
+                validate_base_dir(input).is_err(),
+                "base_dir {input:?} must be rejected"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_build_root_refuses_symlinks_that_leave_the_checkout() {
+        let repo = TempDir::new()
+            .unwrap_or_else(|err| panic!("failed to create temp repo directory: {err}"));
+        let outside = TempDir::new()
+            .unwrap_or_else(|err| panic!("failed to create outside directory: {err}"));
+        std::os::unix::fs::symlink(outside.path(), repo.path().join("escape"))
+            .unwrap_or_else(|err| panic!("failed to create symlink: {err}"));
+
+        let repo_dir = repo.path().to_string_lossy().to_string();
+        assert!(resolve_build_root(&repo_dir, Some("escape")).is_err());
+        assert!(resolve_build_root(&repo_dir, Some("../")).is_err());
+        assert!(resolve_build_root(&repo_dir, None).is_ok());
     }
 
     #[test]

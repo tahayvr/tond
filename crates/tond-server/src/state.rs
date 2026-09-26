@@ -46,8 +46,7 @@ impl AppState {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let db = SqlitePool::connect(&format!("sqlite:{}?mode=rwc", db_path)).await?;
-        db::share_with_proxy(Path::new(&db_path));
+        let db = db::open_pool(&db_path).await?;
 
         let docker = Docker::connect_with_local_defaults()?;
 

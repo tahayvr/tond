@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { safeUrl } from '$lib/utils';
 	import {
 		listGitHubRepos,
 		listGitHubBranches,
@@ -209,7 +210,7 @@
 				variant="ghost"
 				size="sm"
 				class="h-7 text-xs text-muted-foreground uppercase"
-				href="https://github.com/settings/apps/{app.slug}"
+				href={safeUrl(`https://github.com/settings/apps/${encodeURIComponent(app.slug)}`)}
 				target="_blank"
 				rel="noopener noreferrer"
 				title="View app settings on GitHub"
@@ -222,7 +223,9 @@
 					variant="outline"
 					size="sm"
 					class="h-7 text-xs uppercase"
-					href={app.install_url}
+					href={safeUrl(
+						`https://github.com/apps/${encodeURIComponent(app.slug)}/installations/new`
+					)}
 					target="_blank"
 					rel="noopener noreferrer"
 				>

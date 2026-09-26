@@ -14,7 +14,6 @@ describe('auth state', () => {
 
 	it('sets authenticated state when auth status returns a user', async () => {
 		getAuthStatus.mockResolvedValue({
-			needs_setup: false,
 			authenticated: true,
 			user: {
 				id: 'usr_1',
@@ -32,9 +31,8 @@ describe('auth state', () => {
 		expect(auth.getUser()).toMatchObject({ email: 'admin@example.com' });
 	});
 
-	it('sets setup state when initial admin setup is required', async () => {
+	it('sets login state for unauthenticated callers (setup state is never inferred)', async () => {
 		getAuthStatus.mockResolvedValue({
-			needs_setup: true,
 			authenticated: false,
 			user: null
 		});
@@ -44,7 +42,7 @@ describe('auth state', () => {
 		auth.clearAuth();
 		await auth.checkAuth();
 
-		expect(auth.getStatus()).toBe('setup');
+		expect(auth.getStatus()).toBe('login');
 		expect(auth.getUser()).toBeNull();
 	});
 

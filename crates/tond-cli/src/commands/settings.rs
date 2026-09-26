@@ -34,6 +34,22 @@ pub enum SettingsAction {
         /// Domain name (e.g. example-previews.com). Pass an empty string to clear.
         domain: String,
     },
+    /// Turn the dashboard's host terminal (a shell on this server) on or off
+    ///
+    /// Off by default. It can only be switched from the server itself (this
+    /// command, run as root), never from the dashboard or with an API key. When
+    /// on, only admins can use it and every session asks for their password
+    /// (and 2FA code).
+    HostTerminal {
+        #[arg(value_enum)]
+        state: OnOff,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum OnOff {
+    On,
+    Off,
 }
 
 /// Handle `tond settings [subcommand]`.
@@ -58,6 +74,24 @@ pub async fn handle(client: &TondClient, action: Option<SettingsAction>) -> Resu
                 println!("preview-domain    (not set — previews disabled)");
             } else {
                 println!("preview-domain    {}", s.preview_domain);
+            }
+            match client.get_host_terminal().await {
+                Ok(true) => println!("host-terminal     on"),
+                Ok(false) => println!("host-terminal     off"),
+                Err(_) => {}
+            }
+        }
+        Some(SettingsAction::HostTerminal { state }) => {
+            let enabled = client.set_host_terminal(state == OnOff::On).await?;
+            if enabled {
+                println!("host-terminal is on.");
+                println!(
+                    "Admins can now open a shell on this server from the dashboard terminal; \
+                     each session asks for their password (and 2FA code)."
+                );
+                println!("Turn it off again with: sudo tond settings host-terminal off");
+            } else {
+                println!("host-terminal is off. Container terminals are still available.");
             }
         }
         Some(SettingsAction::SetServerName { name }) => {

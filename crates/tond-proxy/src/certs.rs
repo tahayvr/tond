@@ -206,6 +206,7 @@ impl CertStore {
     }
 
     /// List all cached domains.
+    #[cfg(test)]
     pub async fn domains(&self) -> Vec<String> {
         let cache = self.cache.read().await;
         cache.keys().cloned().collect()

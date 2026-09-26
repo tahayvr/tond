@@ -1,40 +1,40 @@
-// handlers/webhooks.rs — Webhook endpoints for GitHub, GitLab, and Generic providers
+// handlers/webhooks.rs — Webhook endpoints for GitHub, GitLab, Gitea/Forgejo and generic callers
 //
-// Three webhook endpoints, all under /api/webhooks/{provider}/{app_id}:
+// Per-app endpoints, addressed by app UUID only (never by name):
 //
-//   POST /api/webhooks/github/{app_id}
-//     - Validates the X-Hub-Signature-256 HMAC header (if webhook_secret is set)
-//     - Parses the X-GitHub-Event header; only "push" events trigger a deploy
-//     - Checks that the pushed ref matches the app's watch_branch (if set)
-//     - Only deploys when auto_deploy = true on the app
+//   POST /api/webhooks/github/{app_id}   X-Hub-Signature-256: sha256=HMAC-SHA256(secret, body)
+//   POST /api/webhooks/gitlab/{app_id}   X-Gitlab-Token: <secret>   (constant-time compare)
+//   POST /api/webhooks/gitea/{app_id}    X-Gitea-Signature / X-Forgejo-Signature: hex HMAC
+//   POST /api/webhooks/generic/{app_id}  X-Tond-Signature-256: sha256=<hex HMAC>
+//                                        or Authorization: Bearer <secret>
 //
-//   POST /api/webhooks/gitlab/{app_id}
-//     - Validates the X-Gitlab-Token header (if webhook_secret is set)
-//     - Parses event type from X-Gitlab-Event; only "Push Hook" triggers a deploy
-//     - Same branch filter and auto_deploy guard as GitHub
+// GitHub App endpoint (all repos the App is installed on):
 //
-//   POST /api/webhooks/generic/{app_id}
-//     - Any POST triggers a deploy when auto_deploy = true
-//     - Requires a valid Tond API key in the Authorization: Bearer header.
-//       The key is verified against the api_keys table (same as RequireAuth).
-//       Returns 401 if the header is missing or the key is invalid.
+//   POST /webhooks/source/github/events  X-Hub-Signature-256 with the App's webhook secret
 //
-// Security notes:
-//   - Signature validation uses a constant-time comparison (subtle crate via
-//     hmac::Mac::verify_slice) to prevent timing attacks.
-//   - GitHub/GitLab webhook endpoints are public (no RequireAuth extractor) —
-//     they must be callable by external services. The HMAC/token secret and
-//     auto_deploy flag together gate the actual deploy.
-//   - The generic webhook requires a Tond API key (Bearer token) to prevent
-//     anyone who discovers the URL from triggering arbitrary deploys.
-//   - If auto_deploy = false, all webhooks return 200 but do nothing.
+// Every app gets a random webhook secret at creation (`App::new`) and the
+// secret can only be replaced or rotated, never cleared: a request without a
+// valid signature/token is rejected with 401 before anything else happens.
 //
-// Deploy trigger:
-//   All three handlers call the shared trigger_webhook_deploy() helper which:
-//     1. Fetches the app from DB (404 if not found)
-//     2. Checks auto_deploy flag (200 + "auto_deploy not enabled" if false)
-//     3. Spawns a background deploy task (same as POST /api/apps/{id}/deploy)
-//     4. Returns 202 Accepted
+// Replay protection: after verification, the provider's delivery ID
+// (X-GitHub-Delivery, Idempotency-Key / X-Gitlab-Event-UUID, X-Gitea-Delivery,
+// X-Forgejo-Delivery, X-Tond-Delivery) and — for provider webhooks — a SHA-256
+// digest of the body are remembered in `webhook_deliveries` for
+// REPLAY_WINDOW_HOURS (capped at MAX_REMEMBERED_DELIVERIES rows). A repeat is
+// answered with 409. The digest matters because delivery headers are not
+// covered by the signature: an attacker replaying a captured body could
+// otherwise just change the header. Generic webhooks skip the digest (CI jobs
+// legitimately send identical bodies) and should send X-Tond-Delivery.
+// Note that provider "redeliver" buttons reuse the delivery ID and are
+// therefore rejected as replays; trigger a manual deploy instead.
+//
+// Rate limiting: webhook-triggered deploys and previews share a per-app token
+// bucket (WEBHOOK_BURST, one token per WEBHOOK_REFILL_SECS), and an app can
+// have at most MAX_ACTIVE_PREVIEWS_PER_APP live previews.
+//
+// If auto_deploy = false, verified push webhooks return 200 but do nothing.
+
+use std::sync::LazyLock;
 
 use axum::{
     Json,
@@ -44,40 +44,270 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use hmac::{Hmac, KeyInit, Mac};
-use sha2::Sha256;
-use tond_common::{ApiResponse, App, GitHubApp, GitLabToken, PreviewDeployment};
+use sha2::{Digest, Sha256};
+use tond_common::{ApiResponse, App, GitHubApp, GitLabToken, PreviewDeployment, TondError};
 
 use crate::{
-    alerts, auth, deploy, docker,
+    alerts,
+    auth::RateLimiter,
+    deploy, docker,
     domains::preview_host,
     error::AppError,
     handlers::{github_apps, gitlab_tokens},
     state::AppState,
 };
 
+/// How long delivery IDs and payload digests are remembered.
+const REPLAY_WINDOW_HOURS: i64 = 72;
+/// Upper bound on remembered deliveries (oldest are dropped first).
+const MAX_REMEMBERED_DELIVERIES: i64 = 10_000;
+/// Burst of webhook-triggered deploys/previews per app.
+const WEBHOOK_BURST: u32 = 10;
+/// Seconds per refilled deploy token (sustained rate: 2 per minute).
+const WEBHOOK_REFILL_SECS: f64 = 30.0;
+/// Live (non-expired) preview deployments allowed per app.
+const MAX_ACTIVE_PREVIEWS_PER_APP: i64 = 10;
+
+/// Per-app limiter for webhook-triggered deploys and previews, keyed by app id.
+static WEBHOOK_DEPLOY_LIMITER: LazyLock<RateLimiter> =
+    LazyLock::new(|| RateLimiter::new(WEBHOOK_BURST, 1.0 / WEBHOOK_REFILL_SECS));
+
+// ── Response helpers ───────────────────────────────────────────────────────
+
+fn ok_response() -> Response {
+    (StatusCode::OK, Json(ApiResponse::<()>::ok(()))).into_response()
+}
+
+fn info_response(message: &str) -> Response {
+    (StatusCode::OK, Json(ApiResponse::<()>::ok_info(message))).into_response()
+}
+
+fn error_response(status: StatusCode, message: &str) -> Response {
+    (status, Json(ApiResponse::<()>::err(message))).into_response()
+}
+
+// ── Verification ───────────────────────────────────────────────────────────
+
+/// Which kind of per-app webhook a request arrived on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Provider {
+    GitHub,
+    GitLab,
+    Gitea,
+    Generic,
+}
+
+impl Provider {
+    fn as_str(self) -> &'static str {
+        match self {
+            Provider::GitHub => "github",
+            Provider::GitLab => "gitlab",
+            Provider::Gitea => "gitea",
+            Provider::Generic => "generic",
+        }
+    }
+}
+
+fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+}
+
+/// Constant-time byte comparison (length is not secret).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let diff = a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y));
+    std::hint::black_box(diff) == 0
+}
+
+/// Verify a hex-encoded HMAC-SHA256 of `body` (constant time via `verify_slice`).
+fn verify_hmac_hex(hex_digest: &str, body: &[u8], secret: &str) -> bool {
+    let Ok(expected) = hex::decode(hex_digest) else {
+        return false;
+    };
+    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
+        return false;
+    };
+    mac.update(body);
+    mac.verify_slice(&expected).is_ok()
+}
+
+/// Validate a GitHub-style `sha256=<hex_digest>` signature header.
+fn verify_github_signature(header: &str, body: &[u8], secret: &str) -> bool {
+    header
+        .strip_prefix("sha256=")
+        .is_some_and(|hex_digest| verify_hmac_hex(hex_digest, body, secret))
+}
+
+/// Check the provider-specific signature or token against the app's secret.
+fn verify_request(provider: Provider, headers: &HeaderMap, body: &[u8], secret: &str) -> bool {
+    if secret.is_empty() {
+        return false;
+    }
+    match provider {
+        Provider::GitHub => header(headers, "x-hub-signature-256")
+            .is_some_and(|sig| verify_github_signature(sig, body, secret)),
+        Provider::GitLab => header(headers, "x-gitlab-token")
+            .is_some_and(|token| constant_time_eq(token.as_bytes(), secret.as_bytes())),
+        Provider::Gitea => {
+            if let Some(sig) =
+                header(headers, "x-gitea-signature").or(header(headers, "x-forgejo-signature"))
+            {
+                verify_hmac_hex(sig, body, secret)
+            } else {
+                header(headers, "x-hub-signature-256")
+                    .is_some_and(|sig| verify_github_signature(sig, body, secret))
+            }
+        }
+        Provider::Generic => {
+            if let Some(sig) = header(headers, "x-tond-signature-256") {
+                verify_github_signature(sig, body, secret)
+            } else {
+                header(headers, "authorization")
+                    .and_then(|v| v.strip_prefix("Bearer "))
+                    .is_some_and(|token| {
+                        constant_time_eq(token.trim().as_bytes(), secret.as_bytes())
+                    })
+            }
+        }
+    }
+}
+
+/// The provider's per-delivery identifier, if it sent one.
+fn delivery_id(provider: Provider, headers: &HeaderMap) -> Option<String> {
+    let value = match provider {
+        Provider::GitHub => header(headers, "x-github-delivery"),
+        Provider::GitLab => {
+            header(headers, "idempotency-key").or(header(headers, "x-gitlab-event-uuid"))
+        }
+        Provider::Gitea => {
+            header(headers, "x-gitea-delivery").or(header(headers, "x-forgejo-delivery"))
+        }
+        Provider::Generic => header(headers, "x-tond-delivery"),
+    }?;
+    // Bound what we store; real delivery IDs are UUIDs.
+    Some(value.chars().take(128).collect())
+}
+
+// ── Replay protection ──────────────────────────────────────────────────────
+
+/// Remember `key`; returns false if it was already seen within the window.
+/// Also prunes expired entries and enforces the row cap.
+async fn remember_delivery(db: &sqlx::SqlitePool, key: &str) -> Result<bool, sqlx::Error> {
+    let now = chrono::Utc::now();
+    let cutoff = (now - chrono::Duration::hours(REPLAY_WINDOW_HOURS)).to_rfc3339();
+
+    sqlx::query("DELETE FROM webhook_deliveries WHERE received_at < ?")
+        .bind(&cutoff)
+        .execute(db)
+        .await?;
+
+    let inserted =
+        sqlx::query("INSERT OR IGNORE INTO webhook_deliveries (key, received_at) VALUES (?, ?)")
+            .bind(key)
+            .bind(now.to_rfc3339())
+            .execute(db)
+            .await?
+            .rows_affected()
+            == 1;
+
+    if inserted {
+        sqlx::query(
+            "DELETE FROM webhook_deliveries WHERE key IN (
+                 SELECT key FROM webhook_deliveries
+                 ORDER BY received_at DESC LIMIT -1 OFFSET ?
+             )",
+        )
+        .bind(MAX_REMEMBERED_DELIVERIES)
+        .execute(db)
+        .await?;
+    }
+
+    Ok(inserted)
+}
+
+/// Record the delivery ID and (optionally) the body digest under `scope`.
+/// Returns false when either was already seen, i.e. the request is a replay.
+async fn check_replay(
+    db: &sqlx::SqlitePool,
+    scope: &str,
+    delivery: Option<&str>,
+    body: Option<&[u8]>,
+) -> Result<bool, sqlx::Error> {
+    let mut fresh = true;
+    if let Some(id) = delivery {
+        fresh &= remember_delivery(db, &format!("{scope}:id:{id}")).await?;
+    }
+    if let Some(body) = body {
+        let digest = hex::encode(Sha256::digest(body));
+        fresh &= remember_delivery(db, &format!("{scope}:body:{digest}")).await?;
+    }
+    Ok(fresh)
+}
+
+// ── Per-app limits ─────────────────────────────────────────────────────────
+
+/// Consume one webhook deploy token for `app_id`.
+async fn take_deploy_token(app_id: &str) -> bool {
+    WEBHOOK_DEPLOY_LIMITER.check(app_id).await
+}
+
+/// Check the per-app limits before creating a webhook-triggered preview.
+/// Returns an error message when the preview must not be created.
+async fn preview_allowed(db: &sqlx::SqlitePool, app_id: &str) -> Result<(), &'static str> {
+    let active: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM preview_deployments WHERE app_id = ? AND status != 'expired'",
+    )
+    .bind(app_id)
+    .fetch_one(db)
+    .await
+    .unwrap_or(0);
+    if active >= MAX_ACTIVE_PREVIEWS_PER_APP {
+        return Err("too many active previews for this app");
+    }
+    if !take_deploy_token(app_id).await {
+        return Err("webhook rate limit exceeded for this app");
+    }
+    Ok(())
+}
+
+/// Accept only `https://` URLs with a host and no embedded credentials.
+/// Used for PR/MR links from webhook payloads before they are stored and
+/// rendered as links in the dashboard.
+pub fn sanitize_provider_url(raw: Option<&str>) -> Option<String> {
+    let url = reqwest::Url::parse(raw?.trim()).ok()?;
+    if url.scheme() != "https"
+        || url.host_str().is_none_or(str::is_empty)
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    Some(url.to_string())
+}
+
 // ── Shared deploy trigger ──────────────────────────────────────────────────
 
-/// Fetch the app, check auto_deploy, and spawn a background deploy.
-/// Returns a concrete Response to avoid Rust 2024 impl-Trait lifetime issues.
+/// Check auto_deploy, the branch filter and the per-app rate limit, then spawn
+/// a background deploy.
 async fn trigger_webhook_deploy(
     state: &AppState,
-    app_id: &str,
+    mut app: App,
     provider: &str,
     branch: Option<&str>,
-) -> Result<Response, AppError> {
-    let mut app = fetch_app_for_webhook(&state.db, app_id).await?;
-
+) -> Response {
     if app.auto_deploy == 0 {
         tracing::debug!(
             "[webhook/{}/{}] auto_deploy not enabled — skipping",
             provider,
-            app_id
+            app.id
         );
-        return Ok((
-            StatusCode::OK,
-            Json(ApiResponse::<()>::ok_info("auto_deploy not enabled")),
-        )
-            .into_response());
+        return info_response("auto_deploy not enabled");
     }
 
     // Branch filter: if watch_branch is set, only deploy when the pushed branch matches.
@@ -88,21 +318,25 @@ async fn trigger_webhook_deploy(
         tracing::debug!(
             "[webhook/{}/{}] branch '{}' != watch_branch '{}' — skipping",
             provider,
-            app_id,
+            app.id,
             pushed,
             watch
         );
-        return Ok((
-            StatusCode::OK,
-            Json(ApiResponse::<()>::ok_info("branch not watched")),
-        )
-            .into_response());
+        return info_response("branch not watched");
+    }
+
+    if !take_deploy_token(&app.id).await {
+        tracing::warn!("[webhook/{}/{}] rate limit exceeded", provider, app.id);
+        return error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "webhook rate limit exceeded for this app",
+        );
     }
 
     tracing::info!(
         "[webhook/{}/{}] triggering deploy (branch: {:?})",
         provider,
-        app_id,
+        app.id,
         branch
     );
 
@@ -136,145 +370,176 @@ async fn trigger_webhook_deploy(
         }
     });
 
-    Ok((StatusCode::ACCEPTED, Json(ApiResponse::<()>::ok(()))).into_response())
+    (StatusCode::ACCEPTED, Json(ApiResponse::<()>::ok(()))).into_response()
 }
 
-/// Fetch an app by id or name for webhook use. Returns a plain AppError (404) if not found.
-async fn fetch_app_for_webhook(db: &sqlx::SqlitePool, id_or_name: &str) -> Result<App, AppError> {
-    use tond_common::TondError;
-
-    let app = sqlx::query_as::<_, App>("SELECT * FROM apps WHERE id = ? OR name = ? LIMIT 1")
-        .bind(id_or_name)
-        .bind(id_or_name)
+/// Fetch an app by UUID for webhook use. Names are not accepted: webhook URLs
+/// must not be guessable from an app's (public) name.
+async fn fetch_app_for_webhook(db: &sqlx::SqlitePool, id: &str) -> Result<App, AppError> {
+    if uuid::Uuid::parse_str(id).is_err() {
+        return Err(AppError(TondError::AppNotFound(id.to_string())));
+    }
+    sqlx::query_as::<_, App>("SELECT * FROM apps WHERE id = ?")
+        .bind(id)
         .fetch_optional(db)
-        .await?;
+        .await?
+        .ok_or_else(|| AppError(TondError::AppNotFound(id.to_string())))
+}
 
-    app.ok_or_else(|| AppError(TondError::AppNotFound(id_or_name.to_string())))
+/// Load the app, verify the request against its secret and reject replays.
+/// Returns the app, or the response to send back.
+async fn authenticate_webhook(
+    state: &AppState,
+    provider: Provider,
+    app_id: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<Result<App, Response>, AppError> {
+    let app = fetch_app_for_webhook(&state.db, app_id).await?;
+    let secret = app.webhook_secret.as_deref().unwrap_or("");
+
+    if !verify_request(provider, headers, body, secret) {
+        tracing::warn!(
+            "[webhook/{}/{}] rejected: missing or invalid signature",
+            provider.as_str(),
+            app.id
+        );
+        return Ok(Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid or missing webhook signature",
+        )));
+    }
+
+    let scope = format!("{}:{}", provider.as_str(), app.id);
+    let body_digest = (provider != Provider::Generic).then_some(body);
+    let delivery = delivery_id(provider, headers);
+    if !check_replay(&state.db, &scope, delivery.as_deref(), body_digest).await? {
+        tracing::warn!(
+            "[webhook/{}/{}] rejected replayed delivery {:?}",
+            provider.as_str(),
+            app.id,
+            delivery
+        );
+        return Ok(Err(error_response(
+            StatusCode::CONFLICT,
+            "duplicate webhook delivery",
+        )));
+    }
+
+    Ok(Ok(app))
+}
+
+/// Extract the short branch name from a push payload (`ref` = "refs/heads/<branch>").
+/// Used for GitHub, GitLab and Gitea, which share the field.
+fn extract_push_branch(body: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let r = v.get("ref")?.as_str()?;
+    Some(r.strip_prefix("refs/heads/").unwrap_or(r).to_string())
 }
 
 // ── GitHub ─────────────────────────────────────────────────────────────────
 
 /// POST /api/webhooks/github/{app_id}
 ///
-/// Validates X-Hub-Signature-256 (if webhook_secret set), filters to "push"
-/// events, extracts the branch from `ref`, then triggers a deploy.
+/// Requires a valid X-Hub-Signature-256; only "push" events trigger a deploy.
 pub async fn github_webhook(
     State(state): State<AppState>,
     Path(app_id): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    // ── Fetch app for secret validation ──
-    let app = fetch_app_for_webhook(&state.db, &app_id).await?;
+    let app = match authenticate_webhook(&state, Provider::GitHub, &app_id, &headers, &body).await?
+    {
+        Ok(app) => app,
+        Err(response) => return Ok(response),
+    };
 
-    // ── Validate HMAC-SHA256 signature ──
-    if let Some(ref secret) = app.webhook_secret {
-        let sig_header = headers
-            .get("x-hub-signature-256")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-
-        if !verify_github_signature(sig_header, &body, secret) {
-            return Ok((
-                StatusCode::UNAUTHORIZED,
-                Json(ApiResponse::<()>::err("invalid signature")),
-            )
-                .into_response());
-        }
+    if header(&headers, "x-github-event") != Some("push") {
+        // Non-push events (e.g. ping) are accepted without action.
+        return Ok(ok_response());
     }
 
-    // ── Event type filter ──
-    let event = headers
-        .get("x-github-event")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    if event != "push" {
-        // Non-push events (e.g. ping, pull_request) are silently accepted.
-        return Ok((StatusCode::OK, Json(ApiResponse::<()>::ok(()))).into_response());
-    }
-
-    // ── Extract branch from payload ──
-    let branch = extract_github_branch(&body);
-
-    trigger_webhook_deploy(&state, &app_id, "github", branch.as_deref()).await
-}
-
-/// Validate a GitHub X-Hub-Signature-256 header.
-/// Format: "sha256=<hex_digest>"
-fn verify_github_signature(header: &str, body: &[u8], secret: &str) -> bool {
-    let Some(hex_digest) = header.strip_prefix("sha256=") else {
-        return false;
-    };
-    let Ok(expected) = hex::decode(hex_digest) else {
-        return false;
-    };
-
-    let mut mac = match Hmac::<Sha256>::new_from_slice(secret.as_bytes()) {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-    mac.update(body);
-    mac.verify_slice(&expected).is_ok()
-}
-
-/// Extract the short branch name from a GitHub push payload.
-/// `ref` field is "refs/heads/<branch>".
-fn extract_github_branch(body: &[u8]) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let r = v.get("ref")?.as_str()?;
-    // Strip "refs/heads/" prefix
-    Some(r.strip_prefix("refs/heads/").unwrap_or(r).to_string())
+    let branch = extract_push_branch(&body);
+    Ok(trigger_webhook_deploy(&state, app, "github", branch.as_deref()).await)
 }
 
 // ── GitLab ─────────────────────────────────────────────────────────────────
 
 /// POST /api/webhooks/gitlab/{app_id}
 ///
-/// Validates X-Gitlab-Token (if webhook_secret set), filters to "Push Hook"
-/// events, extracts the branch, then triggers a deploy.
+/// Requires X-Gitlab-Token to equal the app's secret. "Push Hook" triggers a
+/// deploy; "Merge Request Hook" drives preview deployments.
 pub async fn gitlab_webhook(
     State(state): State<AppState>,
     Path(app_id): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    let app = fetch_app_for_webhook(&state.db, &app_id).await?;
+    let app = match authenticate_webhook(&state, Provider::GitLab, &app_id, &headers, &body).await?
+    {
+        Ok(app) => app,
+        Err(response) => return Ok(response),
+    };
 
-    // ── Validate secret token ──
-    if let Some(ref secret) = app.webhook_secret {
-        let token = headers
-            .get("x-gitlab-token")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-
-        if token != secret {
-            return Ok((
-                StatusCode::UNAUTHORIZED,
-                Json(ApiResponse::<()>::err("invalid token")),
-            )
-                .into_response());
+    match header(&headers, "x-gitlab-event") {
+        Some("Push Hook") => {
+            let branch = extract_push_branch(&body);
+            Ok(trigger_webhook_deploy(&state, app, "gitlab", branch.as_deref()).await)
         }
+        Some("Merge Request Hook") => handle_gitlab_merge_request(&state, &app.id, &body).await,
+        // All other GitLab events are accepted without action.
+        _ => Ok(ok_response()),
+    }
+}
+
+// ── Gitea / Forgejo ────────────────────────────────────────────────────────
+
+/// POST /api/webhooks/gitea/{app_id}
+///
+/// Requires a valid X-Gitea-Signature (or X-Forgejo-Signature); "push" events
+/// trigger a deploy.
+pub async fn gitea_webhook(
+    State(state): State<AppState>,
+    Path(app_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let app = match authenticate_webhook(&state, Provider::Gitea, &app_id, &headers, &body).await? {
+        Ok(app) => app,
+        Err(response) => return Ok(response),
+    };
+
+    let event = header(&headers, "x-gitea-event").or(header(&headers, "x-forgejo-event"));
+    if event != Some("push") {
+        return Ok(ok_response());
     }
 
-    // ── Event type filter ──
-    let event = headers
-        .get("x-gitlab-event")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    let branch = extract_push_branch(&body);
+    Ok(trigger_webhook_deploy(&state, app, "gitea", branch.as_deref()).await)
+}
 
-    if event != "Push Hook" {
-        if event == "Merge Request Hook" {
-            return handle_gitlab_merge_request(&state, &app_id, &body).await;
-        }
-        // All other GitLab events are silently accepted.
-        return Ok((StatusCode::OK, Json(ApiResponse::<()>::ok(()))).into_response());
-    }
+// ── Generic ────────────────────────────────────────────────────────────────
 
-    // ── Extract branch from payload ──
-    let branch = extract_gitlab_branch(&body);
+/// POST /api/webhooks/generic/{app_id}
+///
+/// For CI pipelines and scripts. Authenticate with
+/// `X-Tond-Signature-256: sha256=<HMAC-SHA256(secret, body)>` or
+/// `Authorization: Bearer <secret>`. Send a unique `X-Tond-Delivery` header to
+/// get replay protection. Any authenticated POST triggers a deploy when
+/// auto_deploy is enabled.
+pub async fn generic_webhook(
+    State(state): State<AppState>,
+    Path(app_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let app =
+        match authenticate_webhook(&state, Provider::Generic, &app_id, &headers, &body).await? {
+            Ok(app) => app,
+            Err(response) => return Ok(response),
+        };
 
-    trigger_webhook_deploy(&state, &app_id, "gitlab", branch.as_deref()).await
+    Ok(trigger_webhook_deploy(&state, app, "generic", None).await)
 }
 
 /// Handle a Merge Request Hook event from a GitLab webhook.
@@ -315,9 +580,7 @@ async fn handle_gitlab_merge_request(
     let head_ref = payload["object_attributes"]["source_branch"]
         .as_str()
         .map(|s| s.to_string());
-    let mr_url = payload["object_attributes"]["url"]
-        .as_str()
-        .map(|s| s.to_string());
+    let mr_url = sanitize_provider_url(payload["object_attributes"]["url"].as_str());
     let repo_http_url = payload["project"]["http_url_to_repo"]
         .as_str()
         .or_else(|| payload["repository"]["homepage"].as_str())
@@ -393,6 +656,11 @@ async fn handle_gitlab_merge_request(
                 );
                 return Ok((StatusCode::OK, Json(ApiResponse::<()>::ok(()))).into_response());
             };
+
+            if let Err(reason) = preview_allowed(&state.db, &app.id).await {
+                tracing::warn!("[webhook/gitlab-mr/{}] {}", app_id, reason);
+                return Ok(error_response(StatusCode::TOO_MANY_REQUESTS, reason));
+            }
 
             // Expire any existing previews for this app+MR (best-effort).
             let existing: Vec<PreviewDeployment> = sqlx::query_as(
@@ -617,69 +885,54 @@ async fn handle_gitlab_merge_request(
     Ok((StatusCode::OK, Json(ApiResponse::<()>::ok(()))).into_response())
 }
 
-/// Extract the short branch name from a GitLab push payload.
-/// `ref` field is "refs/heads/<branch>".
-fn extract_gitlab_branch(body: &[u8]) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let r = v.get("ref")?.as_str()?;
-    Some(r.strip_prefix("refs/heads/").unwrap_or(r).to_string())
-}
-
-// ── Generic ────────────────────────────────────────────────────────────────
-
-/// POST /api/webhooks/generic/{app_id}
-///
-/// Requires `Authorization: Bearer <tond-api-key>` validated against the
-/// api_keys table. Any authenticated POST triggers a deploy when auto_deploy
-/// is true on the app.
-pub async fn generic_webhook(
-    State(state): State<AppState>,
-    Path(app_id): Path<String>,
-    headers: HeaderMap,
-) -> Result<Response, AppError> {
-    // ── Require a valid Tond API key ──
-    let raw_key = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or("");
-
-    if raw_key.is_empty() {
-        return Ok((
-            StatusCode::UNAUTHORIZED,
-            Json(ApiResponse::<()>::err("Authorization header required")),
-        )
-            .into_response());
-    }
-
-    let valid = auth::validate_key(&state.db, raw_key)
-        .await
-        .map_err(|e| AppError(tond_common::TondError::Internal(e.to_string())))?;
-
-    if valid.is_none() {
-        return Ok((
-            StatusCode::UNAUTHORIZED,
-            Json(ApiResponse::<()>::err("invalid API key")),
-        )
-            .into_response());
-    }
-
-    trigger_webhook_deploy(&state, &app_id, "generic", None).await
-}
-
 // ── GitHub App Events ──────────────────────────────────────────────────────
 //
 // POST /webhooks/source/github/events
 //
-// Receives ALL webhook events from a registered GitHub App (push +
-// pull_request). Validates the X-Hub-Signature-256 HMAC using the stored
-// `webhook_secret` from the github_apps table (not a per-app secret).
+// Receives webhook events from a registered GitHub App (push + pull_request),
+// signed with that App's `webhook_secret` (github_apps table). The App is
+// identified by the X-GitHub-Hook-Installation-Target-ID header (its numeric
+// App ID); when that header is absent the signature is tried against each
+// registered App. There is no "newest App" fallback: a request that does not
+// verify against a registered App is rejected.
 //
 // Event routing:
-//   push        → find the app(s) whose source_url matches the repo HTTPS URL
-//                 and trigger_webhook_deploy for each matching one
-//   pull_request → future: route to preview deploy handler (Phase 4.6)
-//   everything else → accept silently (200)
+//   push         → deploy the apps linked to this App whose source_url matches
+//   pull_request → preview deployments for the linked apps
+//   everything else → accepted without action
+
+/// Find the registered GitHub App whose webhook secret signed this request.
+async fn find_signing_github_app(
+    db: &sqlx::SqlitePool,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<Option<GitHubApp>, sqlx::Error> {
+    let Some(signature) = header(headers, "x-hub-signature-256") else {
+        return Ok(None);
+    };
+
+    let target_app_id: Option<i64> =
+        header(headers, "x-github-hook-installation-target-id").and_then(|s| s.parse().ok());
+
+    let candidates: Vec<GitHubApp> = match target_app_id {
+        Some(id) => {
+            sqlx::query_as("SELECT * FROM github_apps WHERE app_id = ?")
+                .bind(id)
+                .fetch_all(db)
+                .await?
+        }
+        None => {
+            sqlx::query_as("SELECT * FROM github_apps")
+                .fetch_all(db)
+                .await?
+        }
+    };
+
+    Ok(candidates.into_iter().find(|gh_app| {
+        !gh_app.webhook_secret.is_empty()
+            && verify_github_signature(signature, body, &gh_app.webhook_secret)
+    }))
+}
 
 /// POST /webhooks/source/github/events
 pub async fn github_app_events(
@@ -687,81 +940,60 @@ pub async fn github_app_events(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let event = headers
-        .get("x-github-event")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let event = header(&headers, "x-github-event").unwrap_or("").to_string();
+    let delivery = header(&headers, "x-github-delivery").map(str::to_string);
 
-    let delivery = headers
-        .get("x-github-delivery")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-")
-        .to_string();
+    tracing::debug!(
+        "[github-app-events] delivery={:?} event={}",
+        delivery,
+        event
+    );
 
-    tracing::debug!("[github-app-events] delivery={} event={}", delivery, event);
-
-    // ── Find the registered GitHub App and validate the HMAC ──
-    // GitHub sends X-GitHub-App-ID with the numeric app_id; use it to find the
-    // exact row. Falls back to the most-recently-created confirmed row if the
-    // header is absent (older GitHub Enterprise or edge cases).
-    let github_app_id_header: Option<i64> = headers
-        .get("x-github-app-id")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse().ok());
-
-    let gh_app: Option<tond_common::GitHubApp> = if let Some(app_id) = github_app_id_header {
-        sqlx::query_as("SELECT * FROM github_apps WHERE app_id = ? LIMIT 1")
-            .bind(app_id)
-            .fetch_optional(&state.db)
-            .await
-            .unwrap_or(None)
-    } else {
-        sqlx::query_as(
-            "SELECT * FROM github_apps WHERE app_id != 0 ORDER BY created_at DESC LIMIT 1",
-        )
-        .fetch_optional(&state.db)
-        .await
-        .unwrap_or(None)
+    let gh_app = match find_signing_github_app(&state.db, &headers, &body).await {
+        Ok(Some(gh_app)) => gh_app,
+        Ok(None) => {
+            tracing::warn!(
+                "[github-app-events] rejected: no registered App verifies the signature"
+            );
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                "invalid or missing webhook signature",
+            );
+        }
+        Err(e) => {
+            tracing::error!("[github-app-events] database error: {}", e);
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error");
+        }
     };
 
-    let Some(gh_app) = gh_app else {
-        // No GitHub App registered — silently accept
-        return (StatusCode::OK, Json(ApiResponse::<()>::ok(()))).into_response();
-    };
-
-    // Validate HMAC signature
-    let sig_header = headers
-        .get("x-hub-signature-256")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    if !verify_github_signature(sig_header, &body, &gh_app.webhook_secret) {
-        tracing::warn!("[github-app-events] invalid HMAC signature");
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(ApiResponse::<()>::err("invalid signature")),
-        )
-            .into_response();
+    let scope = format!("github-app:{}", gh_app.id);
+    match check_replay(&state.db, &scope, delivery.as_deref(), Some(&body)).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                "[github-app-events] rejected replayed delivery {:?}",
+                delivery
+            );
+            return error_response(StatusCode::CONFLICT, "duplicate webhook delivery");
+        }
+        Err(e) => {
+            tracing::error!("[github-app-events] database error: {}", e);
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error");
+        }
     }
 
     match event.as_str() {
-        "push" => handle_github_app_push(&state, &body).await,
+        "push" => handle_github_app_push(&state, &gh_app, &body).await,
         "pull_request" => handle_github_app_pull_request(&state, &gh_app, &body).await,
-        _ => (StatusCode::OK, Json(ApiResponse::<()>::ok(()))).into_response(),
+        _ => ok_response(),
     }
 }
 
-/// Handle a push event from a GitHub App webhook.
-/// Finds all apps whose source_url matches the repo's HTTPS clone URL and
-/// auto_deploy is enabled, then triggers a deploy for each.
-async fn handle_github_app_push(state: &AppState, body: &Bytes) -> Response {
+/// Handle a push event from a GitHub App webhook: deploy every app linked to
+/// this App whose source_url matches the pushed repository.
+async fn handle_github_app_push(state: &AppState, gh_app: &GitHubApp, body: &Bytes) -> Response {
     let Ok(payload) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<()>::err("invalid JSON")),
-        )
-            .into_response();
+        return error_response(StatusCode::BAD_REQUEST, "invalid JSON");
     };
 
     // Extract branch from "refs/heads/<branch>"
@@ -778,28 +1010,28 @@ async fn handle_github_app_push(state: &AppState, body: &Bytes) -> Response {
 
     let Some(repo_url) = repo_url else {
         tracing::warn!("[github-app-push] no repository.clone_url in payload");
-        return (StatusCode::OK, Json(ApiResponse::<()>::ok(()))).into_response();
+        return ok_response();
     };
 
-    // Find all apps that match this repo URL
-    let apps: Vec<tond_common::App> =
-        sqlx::query_as("SELECT * FROM apps WHERE source_url = ? AND source_type = 'git'")
-            .bind(&repo_url)
-            .fetch_all(&state.db)
-            .await
-            .unwrap_or_default();
+    let apps: Vec<App> = sqlx::query_as(
+        "SELECT * FROM apps WHERE source_url = ? AND source_type = 'git' AND github_app_id = ?",
+    )
+    .bind(&repo_url)
+    .bind(&gh_app.id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
 
     if apps.is_empty() {
         tracing::debug!("[github-app-push] no apps matched repo {}", repo_url);
-        return (StatusCode::OK, Json(ApiResponse::<()>::ok(()))).into_response();
+        return ok_response();
     }
 
     let mut triggered = 0usize;
     for app in apps {
-        // Re-use trigger_webhook_deploy to get branch filtering + auto_deploy check
-        match trigger_webhook_deploy(state, &app.id, "github-app", branch.as_deref()).await {
-            Ok(resp) if resp.status() == StatusCode::ACCEPTED => triggered += 1,
-            _ => {}
+        let resp = trigger_webhook_deploy(state, app, "github-app", branch.as_deref()).await;
+        if resp.status() == StatusCode::ACCEPTED {
+            triggered += 1;
         }
     }
 
@@ -849,9 +1081,7 @@ async fn handle_github_app_pull_request(
     let head_ref = payload["pull_request"]["head"]["ref"]
         .as_str()
         .map(|s| s.to_string());
-    let pr_url = payload["pull_request"]["html_url"]
-        .as_str()
-        .map(|s| s.to_string());
+    let pr_url = sanitize_provider_url(payload["pull_request"]["html_url"].as_str());
     let repo_clone_url = payload["repository"]["clone_url"]
         .as_str()
         .or_else(|| payload["repository"]["html_url"].as_str())
@@ -865,13 +1095,16 @@ async fn handle_github_app_pull_request(
         return (StatusCode::OK, Json(ApiResponse::<()>::ok(()))).into_response();
     };
 
-    // Find all apps linked to this repo
-    let apps: Vec<App> =
-        sqlx::query_as("SELECT * FROM apps WHERE source_url = ? AND source_type = 'git'")
-            .bind(&repo_url)
-            .fetch_all(&state.db)
-            .await
-            .unwrap_or_default();
+    // Find the apps linked to this GitHub App that deploy this repo. The App's
+    // signature only vouches for apps that use this App.
+    let apps: Vec<App> = sqlx::query_as(
+        "SELECT * FROM apps WHERE source_url = ? AND source_type = 'git' AND github_app_id = ?",
+    )
+    .bind(&repo_url)
+    .bind(&gh_app.id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
 
     if apps.is_empty() {
         tracing::debug!("[github-app-pr] no apps matched repo {}", repo_url);
@@ -917,6 +1150,11 @@ async fn handle_github_app_pull_request(
                     );
                     continue;
                 };
+
+                if let Err(reason) = preview_allowed(&state.db, &app.id).await {
+                    tracing::warn!("[github-app-pr] skipping app {}: {}", app.name, reason);
+                    continue;
+                }
 
                 // Expire any existing previews for this app+PR (best-effort).
                 // Save the most recent comment_id so it can be carried over to the
@@ -1104,9 +1342,11 @@ async fn handle_github_app_pull_request(
             let existing: Vec<PreviewDeployment> = sqlx::query_as(
                 "SELECT pd.* FROM preview_deployments pd
                  JOIN apps a ON pd.app_id = a.id
-                 WHERE a.source_url = ? AND pd.pr_number = ? AND pd.status != 'expired'",
+                 WHERE a.source_url = ? AND a.github_app_id = ?
+                   AND pd.pr_number = ? AND pd.status != 'expired'",
             )
             .bind(&repo_url)
+            .bind(&gh_app.id)
             .bind(pr_number)
             .fetch_all(&state.db)
             .await
@@ -1156,10 +1396,12 @@ mod tests {
     use sha2::Sha256;
     use sqlx::SqlitePool;
     use tokio::sync::RwLock;
-    use tond_common::{ApiKey, ServerSettings};
+    use tond_common::ServerSettings;
 
     use super::*;
     use crate::{auth::RateLimiter, state::AppState};
+
+    const PUSH_MAIN: &[u8] = br#"{"ref":"refs/heads/main","after":"abc"}"#;
 
     async fn test_state() -> AppState {
         let db = SqlitePool::connect("sqlite::memory:")
@@ -1186,55 +1428,29 @@ mod tests {
             .unwrap_or_else(|err| panic!("failed to decode JSON response body: {err}"))
     }
 
+    /// Seed a git app. auto_deploy is off so a verified push never spawns a
+    /// real deploy in tests; it answers "auto_deploy not enabled" instead.
     async fn seed_git_app(state: &AppState, name: &str) -> App {
-        let mut app = App::new(
+        let app = App::new(
             name.to_string(),
             "git".to_string(),
-            Some("https://example.com/repo.git".to_string()),
+            Some("https://github.com/org/repo.git".to_string()),
             Some("main".to_string()),
             3000,
         );
-        app.auto_deploy = 1;
 
         sqlx::query(
-            "INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, host_port, memory_limit, cpu_limit, status, env_vars, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, deploy_key_pub, project_id, registry_credential_id, github_app_id, gitlab_token_id, preview_enabled, preview_excluded_keys, preview_env_vars, dockerfile_content, compose_content, base_dir, static_build, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO apps (id, name, source_type, source_url, branch, container_port, status, webhook_secret, auto_deploy, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
         )
         .bind(&app.id)
         .bind(&app.name)
-        .bind(&app.domain)
         .bind(&app.source_type)
         .bind(&app.source_url)
         .bind(&app.branch)
         .bind(app.container_port)
-        .bind(&app.container_id)
-        .bind(app.host_port)
-        .bind(app.memory_limit)
-        .bind(app.cpu_limit)
         .bind(&app.status)
-        .bind(&app.env_vars)
-        .bind(&app.health_check_path)
-        .bind(app.health_check_interval)
-        .bind(app.health_failure_threshold)
-        .bind(app.health_consecutive_failures)
-        .bind(&app.volumes)
-        .bind(app.drain_timeout)
-        .bind(&app.build_method)
         .bind(&app.webhook_secret)
-        .bind(app.auto_deploy)
-        .bind(&app.watch_branch)
-        .bind(&app.deploy_key_pub)
-        .bind(&app.project_id)
-        .bind(&app.registry_credential_id)
-        .bind(&app.github_app_id)
-        .bind(&app.gitlab_token_id)
-        .bind(app.preview_enabled)
-        .bind(&app.preview_excluded_keys)
-        .bind(&app.preview_env_vars)
-        .bind(&app.dockerfile_content)
-        .bind(&app.compose_content)
-        .bind(&app.base_dir)
-        .bind(app.static_build)
         .bind(&app.created_at)
         .bind(&app.updated_at)
         .execute(&state.db)
@@ -1244,20 +1460,10 @@ mod tests {
         app
     }
 
-    async fn insert_api_key(state: &AppState) -> String {
-        let (api_key, raw_key) = ApiKey::generate("webhook");
-        sqlx::query(
-            "INSERT INTO api_keys (id, name, key_hash, created_at, last_used_at) VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(&api_key.id)
-        .bind(&api_key.name)
-        .bind(&api_key.key_hash)
-        .bind(&api_key.created_at)
-        .bind(&api_key.last_used_at)
-        .execute(&state.db)
-        .await
-        .unwrap_or_else(|err| panic!("failed to seed API key: {err}"));
-        raw_key
+    fn secret_of(app: &App) -> String {
+        app.webhook_secret
+            .clone()
+            .unwrap_or_else(|| panic!("App::new must generate a webhook secret"))
     }
 
     fn github_signature(secret: &str, body: &[u8]) -> String {
@@ -1267,303 +1473,702 @@ mod tests {
         format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
     }
 
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                *name,
+                HeaderValue::from_str(value)
+                    .unwrap_or_else(|err| panic!("invalid test header value: {err}")),
+            );
+        }
+        map
+    }
+
+    async fn call_github(state: &AppState, app_id: &str, h: HeaderMap, body: &[u8]) -> Response {
+        github_webhook(
+            State(state.clone()),
+            Path(app_id.to_string()),
+            h,
+            Bytes::copy_from_slice(body),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("github_webhook should return a response: {}", err.0))
+    }
+
+    // ── Pure helpers ──
+
     #[test]
     fn verify_github_signature_accepts_valid_signature_and_rejects_invalid_formats() {
         let body = br#"{"ref":"refs/heads/main"}"#;
         let secret = "topsecret";
         let signature = github_signature(secret, body);
 
-        assert!(
-            verify_github_signature(&signature, body, secret),
-            "verify_github_signature should accept a correctly computed HMAC signature"
-        );
-        assert!(
-            !verify_github_signature("sha1=deadbeef", body, secret),
-            "verify_github_signature should reject headers with the wrong prefix"
-        );
-        assert!(
-            !verify_github_signature("sha256=not-hex", body, secret),
-            "verify_github_signature should reject non-hex digests"
-        );
+        assert!(verify_github_signature(&signature, body, secret));
+        assert!(!verify_github_signature(&signature, body, "other-secret"));
+        assert!(!verify_github_signature("sha1=deadbeef", body, secret));
+        assert!(!verify_github_signature("sha256=not-hex", body, secret));
+        assert!(!verify_github_signature("", body, secret));
     }
 
     #[test]
-    fn branch_extractors_parse_refs_and_handle_invalid_payloads() {
-        assert_eq!(
-            extract_github_branch(br#"{"ref":"refs/heads/feature/login"}"#),
-            Some("feature/login".to_string()),
-            "extract_github_branch should strip refs/heads/ from GitHub push payloads"
-        );
-        assert_eq!(
-            extract_gitlab_branch(br#"{"ref":"refs/heads/main"}"#),
-            Some("main".to_string()),
-            "extract_gitlab_branch should strip refs/heads/ from GitLab push payloads"
-        );
-        assert_eq!(
-            extract_github_branch(br#"{"unexpected":true}"#),
-            None,
-            "extract_github_branch should return None when the payload lacks a ref"
-        );
-        assert_eq!(
-            extract_gitlab_branch(b"not json"),
-            None,
-            "extract_gitlab_branch should return None for malformed JSON payloads"
-        );
+    fn constant_time_eq_compares_contents_and_lengths() {
+        assert!(constant_time_eq(b"secret-token", b"secret-token"));
+        assert!(!constant_time_eq(b"secret-token", b"secret-tokeN"));
+        assert!(!constant_time_eq(b"secret", b"secret-token"));
+        assert!(constant_time_eq(b"", b""));
     }
 
-    #[tokio::test]
-    async fn generic_webhook_requires_authorization_header() {
-        let state = test_state().await;
-        let app = seed_git_app(&state, "demo").await;
+    #[test]
+    fn verify_request_enforces_each_provider_scheme() {
+        let secret = "s3cret-s3cret-s3cret";
+        let body = br#"{"ref":"refs/heads/main"}"#;
+        let sig = github_signature(secret, body);
+        let hex_sig = sig.trim_start_matches("sha256=").to_string();
 
-        let response = generic_webhook(State(state), Path(app.id), HeaderMap::new())
-            .await
-            .unwrap_or_else(|err| panic!("generic_webhook should return a response: {}", err.0));
+        // Nothing is accepted without credentials, for any provider.
+        for provider in [
+            Provider::GitHub,
+            Provider::GitLab,
+            Provider::Gitea,
+            Provider::Generic,
+        ] {
+            assert!(
+                !verify_request(provider, &HeaderMap::new(), body, secret),
+                "{provider:?} must reject unsigned requests"
+            );
+            // An app without a secret rejects everything.
+            assert!(!verify_request(
+                provider,
+                &headers(&[
+                    ("x-hub-signature-256", &github_signature("", body)),
+                    ("x-gitlab-token", ""),
+                    ("authorization", "Bearer "),
+                ]),
+                body,
+                ""
+            ));
+        }
 
-        assert_eq!(
-            response.status(),
-            StatusCode::UNAUTHORIZED,
-            "generic_webhook should require a bearer token"
-        );
-        let body = response_json(response).await;
-        assert_eq!(
-            body["error"],
-            serde_json::json!("Authorization header required"),
-            "generic_webhook should explain that the Authorization header is required"
-        );
+        assert!(verify_request(
+            Provider::GitHub,
+            &headers(&[("x-hub-signature-256", &sig)]),
+            body,
+            secret
+        ));
+        assert!(verify_request(
+            Provider::GitLab,
+            &headers(&[("x-gitlab-token", secret)]),
+            body,
+            secret
+        ));
+        assert!(!verify_request(
+            Provider::GitLab,
+            &headers(&[("x-gitlab-token", "wrong")]),
+            body,
+            secret
+        ));
+        assert!(verify_request(
+            Provider::Gitea,
+            &headers(&[("x-gitea-signature", &hex_sig)]),
+            body,
+            secret
+        ));
+        assert!(verify_request(
+            Provider::Gitea,
+            &headers(&[("x-forgejo-signature", &hex_sig)]),
+            body,
+            secret
+        ));
+        assert!(!verify_request(
+            Provider::Gitea,
+            &headers(&[("x-gitea-signature", &hex_sig)]),
+            b"tampered",
+            secret
+        ));
+        assert!(verify_request(
+            Provider::Generic,
+            &headers(&[("x-tond-signature-256", &sig)]),
+            body,
+            secret
+        ));
+        assert!(verify_request(
+            Provider::Generic,
+            &headers(&[("authorization", &format!("Bearer {secret}"))]),
+            body,
+            secret
+        ));
+        assert!(!verify_request(
+            Provider::Generic,
+            &headers(&[("authorization", "Bearer not-the-secret")]),
+            body,
+            secret
+        ));
     }
 
-    #[tokio::test]
-    async fn generic_webhook_rejects_invalid_api_key() {
-        let state = test_state().await;
-        let app = seed_git_app(&state, "demo").await;
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "authorization",
-            HeaderValue::from_static("Bearer invalid-key"),
-        );
-
-        let response = generic_webhook(State(state), Path(app.id), headers)
-            .await
-            .unwrap_or_else(|err| panic!("generic_webhook should return a response: {}", err.0));
-
+    #[test]
+    fn delivery_ids_are_read_per_provider_and_bounded() {
+        let long = "x".repeat(500);
         assert_eq!(
-            response.status(),
-            StatusCode::UNAUTHORIZED,
-            "generic_webhook should reject invalid bearer tokens"
+            delivery_id(Provider::GitHub, &headers(&[("x-github-delivery", "abc")])),
+            Some("abc".to_string())
         );
-        let body = response_json(response).await;
         assert_eq!(
-            body["error"],
-            serde_json::json!("invalid API key"),
-            "generic_webhook should report invalid API keys"
+            delivery_id(
+                Provider::GitLab,
+                &headers(&[("x-gitlab-event-uuid", "evt"), ("idempotency-key", "idem")])
+            ),
+            Some("idem".to_string())
         );
+        assert_eq!(
+            delivery_id(Provider::Gitea, &headers(&[("x-forgejo-delivery", "f")])),
+            Some("f".to_string())
+        );
+        assert_eq!(
+            delivery_id(Provider::Generic, &headers(&[("x-tond-delivery", &long)]))
+                .map(|id| id.len()),
+            Some(128)
+        );
+        assert_eq!(delivery_id(Provider::GitHub, &HeaderMap::new()), None);
     }
 
+    #[test]
+    fn push_branch_extractor_parses_refs_and_handles_invalid_payloads() {
+        assert_eq!(
+            extract_push_branch(br#"{"ref":"refs/heads/feature/login"}"#),
+            Some("feature/login".to_string())
+        );
+        assert_eq!(extract_push_branch(br#"{"unexpected":true}"#), None);
+        assert_eq!(extract_push_branch(b"not json"), None);
+    }
+
+    #[test]
+    fn sanitize_provider_url_only_accepts_plain_https_links() {
+        assert_eq!(
+            sanitize_provider_url(Some("https://github.com/org/repo/pull/7")),
+            Some("https://github.com/org/repo/pull/7".to_string())
+        );
+        assert_eq!(sanitize_provider_url(Some("javascript:alert(1)")), None);
+        assert_eq!(
+            sanitize_provider_url(Some("JavaScript://github.com/%0aalert(1)")),
+            None
+        );
+        assert_eq!(sanitize_provider_url(Some("data:text/html,hi")), None);
+        assert_eq!(sanitize_provider_url(Some("http://github.com/x")), None);
+        assert_eq!(
+            sanitize_provider_url(Some("https://user:pass@github.com/x")),
+            None
+        );
+        assert_eq!(sanitize_provider_url(Some("not a url")), None);
+        assert_eq!(sanitize_provider_url(None), None);
+    }
+
+    // ── Replay protection and limits ──
+
     #[tokio::test]
-    async fn generic_webhook_returns_ok_info_when_auto_deploy_is_disabled() {
+    async fn remember_delivery_rejects_repeats_and_prunes_expired_rows() {
         let state = test_state().await;
-        let app = seed_git_app(&state, "demo").await;
-        sqlx::query("UPDATE apps SET auto_deploy = 0 WHERE id = ?")
-            .bind(&app.id)
+        let old =
+            (chrono::Utc::now() - chrono::Duration::hours(REPLAY_WINDOW_HOURS + 1)).to_rfc3339();
+        sqlx::query("INSERT INTO webhook_deliveries (key, received_at) VALUES ('stale', ?)")
+            .bind(&old)
             .execute(&state.db)
             .await
-            .unwrap_or_else(|err| panic!("failed to disable auto_deploy: {err}"));
-        let raw_key = insert_api_key(&state).await;
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "authorization",
-            HeaderValue::from_str(&format!("Bearer {raw_key}"))
-                .unwrap_or_else(|err| panic!("failed to build authorization header: {err}")),
-        );
+            .unwrap_or_else(|err| panic!("failed to seed stale delivery: {err}"));
 
-        let response = generic_webhook(State(state), Path(app.id), headers)
-            .await
-            .unwrap_or_else(|err| panic!("generic_webhook should return a response: {}", err.0));
+        assert!(matches!(remember_delivery(&state.db, "k1").await, Ok(true)));
+        assert!(matches!(
+            remember_delivery(&state.db, "k1").await,
+            Ok(false)
+        ));
 
-        assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "generic_webhook should accept authenticated requests even when auto_deploy is disabled"
-        );
-        let body = response_json(response).await;
-        assert_eq!(
-            body["error"],
-            serde_json::json!("auto_deploy not enabled"),
-            "generic_webhook should return the documented informational message when auto_deploy is off"
-        );
+        let stale: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries WHERE key = 'stale'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap_or_else(|err| panic!("failed to count deliveries: {err}"));
+        assert_eq!(stale, 0, "expired deliveries should be pruned");
+
+        // An expired key can be used again.
+        assert!(matches!(
+            remember_delivery(&state.db, "stale").await,
+            Ok(true)
+        ));
     }
 
     #[tokio::test]
-    async fn github_webhook_rejects_invalid_signature_when_secret_is_configured() {
-        let state = test_state().await;
-        let app = seed_git_app(&state, "demo").await;
-        sqlx::query("UPDATE apps SET webhook_secret = ? WHERE id = ?")
-            .bind("topsecret")
-            .bind(&app.id)
-            .execute(&state.db)
-            .await
-            .unwrap_or_else(|err| panic!("failed to set webhook_secret: {err}"));
-        let mut headers = HeaderMap::new();
-        headers.insert("x-github-event", HeaderValue::from_static("push"));
-        headers.insert(
-            "x-hub-signature-256",
-            HeaderValue::from_static("sha256=deadbeef"),
-        );
-
-        let response = github_webhook(
-            State(state),
-            Path(app.id),
-            headers,
-            Bytes::from_static(br#"{"ref":"refs/heads/main"}"#),
-        )
-        .await
-        .unwrap_or_else(|err| panic!("github_webhook should return a response: {}", err.0));
-
-        assert_eq!(
-            response.status(),
-            StatusCode::UNAUTHORIZED,
-            "github_webhook should reject requests with invalid signatures when a secret is configured"
-        );
-        let body = response_json(response).await;
-        assert_eq!(
-            body["error"],
-            serde_json::json!("invalid signature"),
-            "github_webhook should report invalid signature errors"
-        );
-    }
-
-    #[tokio::test]
-    async fn github_webhook_ignores_non_push_events() {
-        let state = test_state().await;
-        let app = seed_git_app(&state, "demo").await;
-        let mut headers = HeaderMap::new();
-        headers.insert("x-github-event", HeaderValue::from_static("ping"));
-
-        let response = github_webhook(
-            State(state),
-            Path(app.id),
-            headers,
-            Bytes::from_static(br#"{}"#),
-        )
-        .await
-        .unwrap_or_else(|err| panic!("github_webhook should return a response: {}", err.0));
-
-        assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "github_webhook should silently accept non-push events"
-        );
-        let body = response_json(response).await;
+    async fn webhook_deploy_limiter_caps_bursts_per_app() {
+        let app_id = uuid::Uuid::new_v4().to_string();
+        for _ in 0..WEBHOOK_BURST {
+            assert!(take_deploy_token(&app_id).await);
+        }
         assert!(
-            body["success"].as_bool().unwrap_or(false),
-            "non-push events should still return a success envelope"
+            !take_deploy_token(&app_id).await,
+            "the burst after {WEBHOOK_BURST} webhook deploys should be refused"
         );
+        assert!(
+            take_deploy_token(&uuid::Uuid::new_v4().to_string()).await,
+            "limits are per app"
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_allowed_caps_active_previews_per_app() {
+        let state = test_state().await;
+        let app = seed_git_app(&state, "previews").await;
+        assert!(preview_allowed(&state.db, &app.id).await.is_ok());
+
+        for i in 0..MAX_ACTIVE_PREVIEWS_PER_APP {
+            sqlx::query(
+                "INSERT INTO preview_deployments (id, app_id, slug, status, expires_at) VALUES (?, ?, ?, 'running', ?)",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&app.id)
+            .bind(format!("slug{i}"))
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&state.db)
+            .await
+            .unwrap_or_else(|err| panic!("failed to seed preview: {err}"));
+        }
+
+        assert_eq!(
+            preview_allowed(&state.db, &app.id).await,
+            Err("too many active previews for this app")
+        );
+    }
+
+    // ── Per-app endpoints ──
+
+    #[tokio::test]
+    async fn app_creation_generates_unique_webhook_secrets() {
+        let a = App::new("a".into(), "git".into(), None, None, 3000);
+        let b = App::new("b".into(), "git".into(), None, None, 3000);
+        assert_eq!(secret_of(&a).len(), 64);
+        assert_ne!(secret_of(&a), secret_of(&b));
+    }
+
+    #[tokio::test]
+    async fn github_webhook_rejects_unsigned_and_invalid_requests() {
+        let state = test_state().await;
+        let app = seed_git_app(&state, "demo").await;
+
+        let unsigned = call_github(
+            &state,
+            &app.id,
+            headers(&[("x-github-event", "push")]),
+            PUSH_MAIN,
+        )
+        .await;
+        assert_eq!(unsigned.status(), StatusCode::UNAUTHORIZED);
+
+        let bad = call_github(
+            &state,
+            &app.id,
+            headers(&[
+                ("x-github-event", "push"),
+                ("x-hub-signature-256", "sha256=deadbeef"),
+            ]),
+            PUSH_MAIN,
+        )
+        .await;
+        assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
+        let body = response_json(bad).await;
+        assert_eq!(body["error"], "invalid or missing webhook signature");
+
+        // Even a ping must be signed.
+        let ping = call_github(
+            &state,
+            &app.id,
+            headers(&[("x-github-event", "ping")]),
+            b"{}",
+        )
+        .await;
+        assert_eq!(ping.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn github_webhook_accepts_signed_push_and_rejects_replays() {
+        let state = test_state().await;
+        let app = seed_git_app(&state, "demo").await;
+        let sig = github_signature(&secret_of(&app), PUSH_MAIN);
+
+        let first = call_github(
+            &state,
+            &app.id,
+            headers(&[
+                ("x-github-event", "push"),
+                ("x-github-delivery", "d-1"),
+                ("x-hub-signature-256", &sig),
+            ]),
+            PUSH_MAIN,
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(first).await["error"],
+            "auto_deploy not enabled"
+        );
+
+        // Same body under a new delivery ID: the body digest catches it.
+        let same_body = call_github(
+            &state,
+            &app.id,
+            headers(&[
+                ("x-github-event", "push"),
+                ("x-github-delivery", "d-2"),
+                ("x-hub-signature-256", &sig),
+            ]),
+            PUSH_MAIN,
+        )
+        .await;
+        assert_eq!(same_body.status(), StatusCode::CONFLICT);
+
+        // New body, reused delivery ID: the delivery ID catches it.
+        let other_body = br#"{"ref":"refs/heads/main","after":"def"}"#;
+        let reused_id = call_github(
+            &state,
+            &app.id,
+            headers(&[
+                ("x-github-event", "push"),
+                ("x-github-delivery", "d-1"),
+                (
+                    "x-hub-signature-256",
+                    &github_signature(&secret_of(&app), other_body),
+                ),
+            ]),
+            other_body,
+        )
+        .await;
+        assert_eq!(reused_id.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
     async fn github_webhook_returns_branch_not_watched_for_mismatched_branch() {
         let state = test_state().await;
         let app = seed_git_app(&state, "demo").await;
-        sqlx::query("UPDATE apps SET watch_branch = ? WHERE id = ?")
-            .bind("main")
+        sqlx::query("UPDATE apps SET auto_deploy = 1, watch_branch = 'main' WHERE id = ?")
             .bind(&app.id)
             .execute(&state.db)
             .await
             .unwrap_or_else(|err| panic!("failed to set watch_branch: {err}"));
-        let mut headers = HeaderMap::new();
-        headers.insert("x-github-event", HeaderValue::from_static("push"));
+        let body = br#"{"ref":"refs/heads/feature-branch"}"#;
 
-        let response = github_webhook(
-            State(state),
-            Path(app.id),
-            headers,
-            Bytes::from_static(br#"{"ref":"refs/heads/feature-branch"}"#),
+        let response = call_github(
+            &state,
+            &app.id,
+            headers(&[
+                ("x-github-event", "push"),
+                (
+                    "x-hub-signature-256",
+                    &github_signature(&secret_of(&app), body),
+                ),
+            ]),
+            body,
         )
-        .await
-        .unwrap_or_else(|err| panic!("github_webhook should return a response: {}", err.0));
+        .await;
 
-        assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "github_webhook should not fail when the pushed branch is not watched"
-        );
-        let body = response_json(response).await;
-        assert_eq!(
-            body["error"],
-            serde_json::json!("branch not watched"),
-            "github_webhook should return an informational response for non-watched branches"
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["error"], "branch not watched");
+    }
+
+    #[tokio::test]
+    async fn webhooks_are_addressed_by_uuid_not_name() {
+        let state = test_state().await;
+        let app = seed_git_app(&state, "demo").await;
+        let result = github_webhook(
+            State(state.clone()),
+            Path(app.name.clone()),
+            headers(&[(
+                "x-hub-signature-256",
+                &github_signature(&secret_of(&app), PUSH_MAIN),
+            )]),
+            Bytes::from_static(PUSH_MAIN),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(AppError(TondError::AppNotFound(_)))),
+            "an app name must not resolve to a webhook endpoint"
         );
     }
 
     #[tokio::test]
-    async fn gitlab_webhook_rejects_invalid_token_when_secret_is_configured() {
+    async fn gitlab_webhook_requires_the_secret_token() {
         let state = test_state().await;
         let app = seed_git_app(&state, "demo").await;
-        sqlx::query("UPDATE apps SET webhook_secret = ? WHERE id = ?")
-            .bind("secret-token")
-            .bind(&app.id)
-            .execute(&state.db)
+
+        for token in [None, Some("wrong-token")] {
+            let mut h = headers(&[("x-gitlab-event", "Push Hook")]);
+            if let Some(t) = token {
+                h.insert("x-gitlab-token", HeaderValue::from_static(t));
+            }
+            let response = gitlab_webhook(
+                State(state.clone()),
+                Path(app.id.clone()),
+                h,
+                Bytes::from_static(PUSH_MAIN),
+            )
             .await
-            .unwrap_or_else(|err| panic!("failed to set webhook_secret: {err}"));
-        let mut headers = HeaderMap::new();
-        headers.insert("x-gitlab-event", HeaderValue::from_static("Push Hook"));
-        headers.insert("x-gitlab-token", HeaderValue::from_static("wrong-token"));
+            .unwrap_or_else(|err| panic!("gitlab_webhook should return a response: {}", err.0));
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
 
         let response = gitlab_webhook(
-            State(state),
-            Path(app.id),
-            headers,
-            Bytes::from_static(br#"{"ref":"refs/heads/main"}"#),
+            State(state.clone()),
+            Path(app.id.clone()),
+            headers(&[
+                ("x-gitlab-event", "Push Hook"),
+                ("x-gitlab-token", &secret_of(&app)),
+            ]),
+            Bytes::from_static(PUSH_MAIN),
         )
         .await
         .unwrap_or_else(|err| panic!("gitlab_webhook should return a response: {}", err.0));
-
+        assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            response.status(),
-            StatusCode::UNAUTHORIZED,
-            "gitlab_webhook should reject requests with the wrong X-Gitlab-Token when a secret is configured"
-        );
-        let body = response_json(response).await;
-        assert_eq!(
-            body["error"],
-            serde_json::json!("invalid token"),
-            "gitlab_webhook should report invalid token errors"
+            response_json(response).await["error"],
+            "auto_deploy not enabled"
         );
     }
 
     #[tokio::test]
-    async fn gitlab_webhook_returns_branch_not_watched_for_mismatched_branch() {
+    async fn gitea_webhook_requires_a_valid_signature() {
         let state = test_state().await;
         let app = seed_git_app(&state, "demo").await;
-        sqlx::query("UPDATE apps SET watch_branch = ? WHERE id = ?")
-            .bind("main")
-            .bind(&app.id)
-            .execute(&state.db)
-            .await
-            .unwrap_or_else(|err| panic!("failed to set watch_branch: {err}"));
-        let mut headers = HeaderMap::new();
-        headers.insert("x-gitlab-event", HeaderValue::from_static("Push Hook"));
+        let sig = github_signature(&secret_of(&app), PUSH_MAIN);
+        let hex_sig = sig.trim_start_matches("sha256=");
 
-        let response = gitlab_webhook(
-            State(state),
-            Path(app.id),
-            headers,
-            Bytes::from_static(br#"{"ref":"refs/heads/release"}"#),
+        let unsigned = gitea_webhook(
+            State(state.clone()),
+            Path(app.id.clone()),
+            headers(&[("x-gitea-event", "push")]),
+            Bytes::from_static(PUSH_MAIN),
         )
         .await
-        .unwrap_or_else(|err| panic!("gitlab_webhook should return a response: {}", err.0));
+        .unwrap_or_else(|err| panic!("gitea_webhook should return a response: {}", err.0));
+        assert_eq!(unsigned.status(), StatusCode::UNAUTHORIZED);
 
+        let signed = gitea_webhook(
+            State(state.clone()),
+            Path(app.id.clone()),
+            headers(&[
+                ("x-gitea-event", "push"),
+                ("x-gitea-delivery", "g-1"),
+                ("x-gitea-signature", hex_sig),
+            ]),
+            Bytes::from_static(PUSH_MAIN),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("gitea_webhook should return a response: {}", err.0));
+        assert_eq!(signed.status(), StatusCode::OK);
         assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "gitlab_webhook should not fail when the pushed branch is not watched"
+            response_json(signed).await["error"],
+            "auto_deploy not enabled"
         );
-        let body = response_json(response).await;
+    }
+
+    #[tokio::test]
+    async fn generic_webhook_requires_the_app_secret() {
+        let state = test_state().await;
+        let app = seed_git_app(&state, "demo").await;
+
+        for h in [
+            HeaderMap::new(),
+            headers(&[("authorization", "Bearer invalid-key")]),
+        ] {
+            let response =
+                generic_webhook(State(state.clone()), Path(app.id.clone()), h, Bytes::new())
+                    .await
+                    .unwrap_or_else(|err| {
+                        panic!("generic_webhook should return a response: {}", err.0)
+                    });
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        // Repeated identical CI calls are fine without a delivery header...
+        for _ in 0..2 {
+            let response = generic_webhook(
+                State(state.clone()),
+                Path(app.id.clone()),
+                headers(&[("authorization", &format!("Bearer {}", secret_of(&app)))]),
+                Bytes::new(),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("generic_webhook should return a response: {}", err.0));
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response_json(response).await["error"],
+                "auto_deploy not enabled"
+            );
+        }
+
+        // ...but a repeated X-Tond-Delivery is a replay.
+        let mut statuses = Vec::new();
+        for _ in 0..2 {
+            let response = generic_webhook(
+                State(state.clone()),
+                Path(app.id.clone()),
+                headers(&[
+                    ("authorization", &format!("Bearer {}", secret_of(&app))),
+                    ("x-tond-delivery", "ci-run-42"),
+                ]),
+                Bytes::new(),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("generic_webhook should return a response: {}", err.0));
+            statuses.push(response.status());
+        }
+        assert_eq!(statuses, vec![StatusCode::OK, StatusCode::CONFLICT]);
+    }
+
+    // ── GitHub App events ──
+
+    async fn seed_github_app(state: &AppState, id: &str, app_id: i64, secret: &str) {
+        sqlx::query(
+            "INSERT INTO github_apps (id, name, app_id, client_id, client_secret, webhook_secret, private_key, slug)
+             VALUES (?, 'gh', ?, 'cid', 'csecret', ?, 'pem', 'slug')",
+        )
+        .bind(id)
+        .bind(app_id)
+        .bind(secret)
+        .execute(&state.db)
+        .await
+        .unwrap_or_else(|err| panic!("failed to seed GitHub App: {err}"));
+    }
+
+    async fn call_app_events(state: &AppState, h: HeaderMap, body: &[u8]) -> StatusCode {
+        github_app_events(State(state.clone()), h, Bytes::copy_from_slice(body))
+            .await
+            .status()
+    }
+
+    #[tokio::test]
+    async fn github_app_events_require_a_registered_apps_signature() {
+        let state = test_state().await;
+        let body = br#"{"zen":"hi"}"#;
+
+        // No App registered: nothing verifies, so the request is rejected
+        // (previously it was silently accepted).
         assert_eq!(
-            body["error"],
-            serde_json::json!("branch not watched"),
-            "gitlab_webhook should return an informational response for non-watched branches"
+            call_app_events(
+                &state,
+                headers(&[
+                    ("x-github-event", "ping"),
+                    ("x-hub-signature-256", &github_signature("x", body))
+                ]),
+                body
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
         );
+
+        seed_github_app(&state, "gh-old", 1, "old-secret").await;
+        seed_github_app(&state, "gh-new", 2, "new-secret").await;
+
+        // Unsigned and wrongly signed requests are rejected.
+        assert_eq!(
+            call_app_events(&state, headers(&[("x-github-event", "ping")]), body).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call_app_events(
+                &state,
+                headers(&[
+                    ("x-github-event", "ping"),
+                    ("x-hub-signature-256", &github_signature("attacker", body))
+                ]),
+                body
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // The target-ID header selects the App; a signature from another App fails.
+        assert_eq!(
+            call_app_events(
+                &state,
+                headers(&[
+                    ("x-github-event", "ping"),
+                    ("x-github-hook-installation-target-id", "2"),
+                    ("x-hub-signature-256", &github_signature("old-secret", body))
+                ]),
+                body
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // Without the header, the older App's signature is still found (no
+        // "newest row" assumption).
+        assert_eq!(
+            call_app_events(
+                &state,
+                headers(&[
+                    ("x-github-event", "ping"),
+                    ("x-github-delivery", "gh-d-1"),
+                    ("x-hub-signature-256", &github_signature("old-secret", body))
+                ]),
+                body
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        // And the same delivery again is a replay.
+        assert_eq!(
+            call_app_events(
+                &state,
+                headers(&[
+                    ("x-github-event", "ping"),
+                    ("x-github-delivery", "gh-d-1"),
+                    ("x-hub-signature-256", &github_signature("old-secret", body))
+                ]),
+                body
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn github_app_push_only_targets_apps_linked_to_that_app() {
+        let state = test_state().await;
+        seed_github_app(&state, "gh-1", 1, "gh-secret").await;
+        // Linked app with auto_deploy on but a watch branch that does not match,
+        // so nothing is actually deployed; an unlinked app with the same repo.
+        let linked = seed_git_app(&state, "linked").await;
+        let unlinked = seed_git_app(&state, "unlinked").await;
+        sqlx::query(
+            "UPDATE apps SET github_app_id = 'gh-1', auto_deploy = 1, watch_branch = 'release' WHERE id = ?",
+        )
+        .bind(&linked.id)
+        .execute(&state.db)
+        .await
+        .unwrap_or_else(|err| panic!("failed to link app: {err}"));
+        sqlx::query("UPDATE apps SET auto_deploy = 1 WHERE id = ?")
+            .bind(&unlinked.id)
+            .execute(&state.db)
+            .await
+            .unwrap_or_else(|err| panic!("failed to update app: {err}"));
+
+        let body = br#"{"ref":"refs/heads/main","repository":{"clone_url":"https://github.com/org/repo.git"}}"#;
+        let status = call_app_events(
+            &state,
+            headers(&[
+                ("x-github-event", "push"),
+                ("x-hub-signature-256", &github_signature("gh-secret", body)),
+            ]),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        // Had the unlinked app been matched, its deploy would have consumed a
+        // webhook token; its full burst must still be available.
+        for _ in 0..WEBHOOK_BURST {
+            assert!(
+                take_deploy_token(&unlinked.id).await,
+                "the unlinked app must not be deployed by another GitHub App's webhook"
+            );
+        }
     }
 }

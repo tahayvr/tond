@@ -2,7 +2,7 @@
 //
 // Background task that collects per-container CPU, memory, network, and
 // restart stats from Docker every 30 seconds and stores them in the
-// `metrics` table. Rows older than 7 days are automatically pruned.
+// `metrics` table. Old rows are pruned by the janitor (janitor.rs).
 //
 // Docker stats are read with a single non-streaming call per container
 // (one_shot=true) to avoid holding a long-lived stream open. Each sample
@@ -25,19 +25,12 @@ use uuid::Uuid;
 /// How often we sample container stats (seconds).
 const COLLECT_INTERVAL_SECS: u64 = 30;
 
-/// How many days of metrics to retain.
-const RETAIN_DAYS: i64 = 7;
-
 pub async fn run_metrics_collector(state: AppState) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(COLLECT_INTERVAL_SECS)).await;
 
         if let Err(e) = collect_and_store(&state).await {
             tracing::warn!("Metrics collection error: {}", e);
-        }
-
-        if let Err(e) = prune_old_metrics(&state).await {
-            tracing::warn!("Metrics pruning error: {}", e);
         }
     }
 }
@@ -172,21 +165,6 @@ async fn collect_container_stats(
     .bind(sample.restarts)
     .execute(&state.db)
     .await?;
-
-    Ok(())
-}
-
-async fn prune_old_metrics(state: &AppState) -> anyhow::Result<()> {
-    let cutoff = format!("-{} days", RETAIN_DAYS);
-    let deleted = sqlx::query("DELETE FROM metrics WHERE collected_at < datetime('now', ?)")
-        .bind(&cutoff)
-        .execute(&state.db)
-        .await?
-        .rows_affected();
-
-    if deleted > 0 {
-        tracing::debug!("Pruned {} old metric rows", deleted);
-    }
 
     Ok(())
 }
@@ -425,57 +403,6 @@ mod tests {
                 restarts: 0,
             },
             "build_metric_sample should combine CPU, memory, network, and restart fields into a persistable sample"
-        );
-    }
-
-    #[tokio::test]
-    async fn prune_old_metrics_deletes_rows_older_than_retention_window_only() {
-        let state = test_state().await;
-
-        sqlx::query(
-            "INSERT INTO metrics (id, app_id, cpu_percent, mem_used, mem_limit, net_rx, net_tx, restarts, collected_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '-8 days'))",
-        )
-        .bind("old-metric")
-        .bind("app-1")
-        .bind(1.0)
-        .bind(1_i64)
-        .bind(1_i64)
-        .bind(1_i64)
-        .bind(1_i64)
-        .bind(0_i64)
-        .execute(&state.db)
-        .await
-        .unwrap_or_else(|err| panic!("failed to insert old metric row: {err}"));
-        sqlx::query(
-            "INSERT INTO metrics (id, app_id, cpu_percent, mem_used, mem_limit, net_rx, net_tx, restarts, collected_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '-1 day'))",
-        )
-        .bind("recent-metric")
-        .bind("app-1")
-        .bind(2.0)
-        .bind(2_i64)
-        .bind(2_i64)
-        .bind(2_i64)
-        .bind(2_i64)
-        .bind(0_i64)
-        .execute(&state.db)
-        .await
-        .unwrap_or_else(|err| panic!("failed to insert recent metric row: {err}"));
-
-        prune_old_metrics(&state)
-            .await
-            .unwrap_or_else(|err| panic!("prune_old_metrics should succeed: {err}"));
-
-        let remaining_ids: Vec<String> = sqlx::query_scalar("SELECT id FROM metrics ORDER BY id")
-            .fetch_all(&state.db)
-            .await
-            .unwrap_or_else(|err| panic!("failed to load remaining metric ids: {err}"));
-
-        assert_eq!(
-            remaining_ids,
-            vec!["recent-metric".to_string()],
-            "prune_old_metrics should delete only rows older than the retention cutoff"
         );
     }
 

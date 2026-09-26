@@ -271,9 +271,13 @@ restart-proxy:
 restart-server:
     ssh {{ server }} "systemctl restart tond-server && echo Done"
 
-# Print the root API key from the server journal (first-run only)
+# Print the root API key (written once to a root-only file on first start)
 root-key:
-    ssh {{ server }} "journalctl -u tond-server --no-pager | grep 'ROOT API KEY' -A 1 | grep -oE '[0-9a-f]{64}' | tail -1"
+    ssh {{ server }} "cat /opt/tond/data/root-api-key"
+
+# Print the one-time admin setup link (until the admin account exists)
+setup-link:
+    ssh {{ server }} "tond setup-link"
 
 # SSH into the server
 ssh:

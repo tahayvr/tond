@@ -325,7 +325,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO sessions (id, user_id, user_agent, ip_address, created_at, last_used_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
-        .bind(&session_id)
+        .bind(tond_common::hash_key(&session_id))
         .bind("user-1")
         .bind("curl/8.0")
         .bind("127.0.0.1")
@@ -358,7 +358,7 @@ mod tests {
             .0;
         parts.headers.insert(
             header::COOKIE,
-            HeaderValue::from_str(&format!("tond_session={session_token}"))
+            HeaderValue::from_str(&format!("__Host-tond_session={session_token}"))
                 .unwrap_or_else(|err| panic!("failed to build session cookie header: {err}")),
         );
 

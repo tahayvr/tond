@@ -12,6 +12,9 @@
 	let serverName = $state('');
 	let dashboardDomain = $state('');
 	let previewDomain = $state('');
+	// Last saved dashboard domain (drives the certificate status line)
+	let savedDashboardDomain = $state('');
+	let certRefreshKey = $state(0);
 
 	// Per-section save state
 	let savingAccess = $state(false);
@@ -31,6 +34,8 @@
 			serverName = updated.server_name;
 			dashboardDomain = updated.dashboard_domain;
 			previewDomain = updated.preview_domain;
+			savedDashboardDomain = updated.dashboard_domain;
+			certRefreshKey += 1;
 			accessSaved = true;
 			setTimeout(() => (accessSaved = false), 3000);
 		} catch (e: any) {
@@ -44,6 +49,7 @@
 		serverName = data.settings.server_name;
 		dashboardDomain = data.settings.dashboard_domain;
 		previewDomain = data.settings.preview_domain ?? '';
+		savedDashboardDomain = data.settings.dashboard_domain;
 	});
 
 	$effect(() => {
@@ -71,6 +77,8 @@
 		bind:serverName
 		bind:dashboardDomain
 		bind:previewDomain
+		{savedDashboardDomain}
+		{certRefreshKey}
 		isSaving={savingAccess}
 		saved={accessSaved}
 		error={accessError}
