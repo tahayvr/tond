@@ -63,6 +63,14 @@ trap diagnostics EXIT
 # GET an API path over the CLI's Unix socket (trusted, no credentials).
 api() { curl -sf --unix-socket "$SOCK" "http://localhost$1"; }
 
+# api_send <METHOD> <path> <json>: send JSON over the socket, print the HTTP
+# status; the response body lands in $API_BODY.
+API_BODY=$(mktemp)
+api_send() {
+    curl -s -o "$API_BODY" -w '%{http_code}' --unix-socket "$SOCK" -X "$1" \
+        -H 'Content-Type: application/json' -d "$3" "http://localhost$2"
+}
+
 # HTTP status code of an HTTPS request to <domain><path> through tond-proxy.
 # -k: before ACME finishes, the proxy serves a self-signed fallback cert.
 proxied_status() {
@@ -102,7 +110,9 @@ wait_for_app_running() {
 }
 
 delete_e2e_resources() {
-    for app in e2e-whoami e2e-static; do tond apps delete "$app" -y > /dev/null 2>&1 || true; done
+    for app in e2e-whoami e2e-static e2e-rooted e2e-compose; do
+        tond apps delete "$app" -y > /dev/null 2>&1 || true
+    done
     tond db delete e2e-redis -y > /dev/null 2>&1 || true
     tond cron delete e2e-cron -y > /dev/null 2>&1 || true
 }
@@ -205,6 +215,84 @@ tond cron trigger e2e-cron > /dev/null
 wait_for 180 "a successful e2e-cron run" \
     bash -c "curl -sf --unix-socket '$SOCK' 'http://localhost/api/cron/${CRON_ID}/runs' | jq -e '.data[] | select(.status == \"success\" and (.output // \"\" | contains(\"tond-e2e-cron-ok\")))'"
 pass "manual cron run succeeded with the expected output"
+
+step "Container confinement"
+# Every container Tond starts: ports on 127.0.0.1 only (Docker's iptables rules
+# bypass UFW), no-new-privileges, trimmed capabilities, pids + memory limits,
+# rotated json-file logs.
+assert_hardened() { # <container> <label>
+    local hc
+    hc=$(docker inspect "$1" | jq '.[0].HostConfig')
+    jq -e '[(.PortBindings // {})[][]?.HostIp] | length > 0 and all(. == "127.0.0.1")' <<<"$hc" > /dev/null \
+        || fail "$2: published ports must bind 127.0.0.1, got $(jq -c '.PortBindings' <<<"$hc")"
+    jq -e '(.SecurityOpt // []) | any(.[]; . == "no-new-privileges:true")' <<<"$hc" > /dev/null \
+        || fail "$2: missing no-new-privileges, got $(jq -c '.SecurityOpt' <<<"$hc")"
+    jq -e '(.CapDrop // []) | any(.[]; . == "NET_RAW")' <<<"$hc" > /dev/null \
+        || fail "$2: NET_RAW must be dropped, got $(jq -c '.CapDrop' <<<"$hc")"
+    jq -e '(.PidsLimit // 0) > 0 and (.Memory // 0) > 0' <<<"$hc" > /dev/null \
+        || fail "$2: pids and memory limits must be set, got pids=$(jq '.PidsLimit' <<<"$hc") memory=$(jq '.Memory' <<<"$hc")"
+    jq -e '.LogConfig.Type == "json-file" and .LogConfig.Config["max-size"] == "10m" and .LogConfig.Config["max-file"] == "3"' <<<"$hc" > /dev/null \
+        || fail "$2: logs must rotate, got $(jq -c '.LogConfig' <<<"$hc")"
+    pass "$2: loopback ports, no-new-privileges, NET_RAW dropped, limits, log rotation"
+}
+assert_hardened "$(app_field e2e-whoami container_id)" "app e2e-whoami"
+assert_hardened "tond-db-e2e-redis" "database e2e-redis"
+
+WHOAMI_PORT=$(app_field e2e-whoami host_port)
+REDIS_PORT=$(api /api/databases | jq -r '.data[] | select(.name == "e2e-redis") | .host_port')
+for port in "$WHOAMI_PORT" "$REDIS_PORT"; do
+    if ss -Hltn "sport = :${port}" | awk '{print $4}' | grep -vqE '^127\.0\.0\.1:'; then
+        ss -ltn "sport = :${port}" >&2
+        fail "port ${port} is listening on a public interface"
+    fi
+done
+pass "published ports ${WHOAMI_PORT} and ${REDIS_PORT} only listen on 127.0.0.1"
+[[ "$(api /api/databases | jq -r '.data[] | select(.name == "e2e-redis") | .public_access')" == false ]] \
+    || fail "managed databases must be private by default"
+pass "managed databases are private by default"
+
+jq -e '.["log-opts"]["max-size"] and .["log-opts"]["max-file"]' /etc/docker/daemon.json > /dev/null \
+    || fail "install.sh must set default log rotation in /etc/docker/daemon.json"
+pass "daemon.json sets default container log rotation"
+
+code=$(api_send POST /api/apps '{"name":"e2e-rooted","source_type":"image","source_url":"alpine:3","container_port":80,"volumes":[{"container_path":"/host","host_path":"/"}]}')
+[[ "$code" == 400 ]] && grep -q "is not allowed" "$API_BODY" \
+    || fail "a host_path of / must be rejected with 400, got ${code}: $(cat "$API_BODY")"
+[[ -z "$(app_field e2e-rooted id)" ]] || fail "no app may be created for a rejected volume"
+pass "POST /api/apps with host_path \"/\" → 400, nothing created"
+code=$(api_send POST /api/apps/e2e-whoami/volumes '{"container_path":"/sock","host_path":"/var/run/docker.sock"}')
+[[ "$code" == 400 ]] || fail "binding docker.sock into an app must be rejected, got ${code}: $(cat "$API_BODY")"
+pass "POST /api/apps/{id}/volumes with docker.sock → 400"
+code=$(api_send POST /api/apps '{"name":"e2e-compose","source_type":"compose","container_port":80,"compose_content":"services:\n  web:\n    image: nginx:alpine\n    privileged: true\n    network_mode: host\n"}')
+[[ "$code" == 400 ]] && grep -q "privileged" "$API_BODY" && grep -q "network_mode: host" "$API_BODY" \
+    || fail "a privileged compose file must be rejected with every problem listed, got ${code}: $(cat "$API_BODY")"
+pass "compose with privileged + network_mode: host → 400 listing both problems"
+
+step "Per-deployment images and rollback"
+deployments() { api /api/apps/e2e-whoami/deployments; }
+FIRST_ID=$(deployments | jq -r '[.data[] | select(.status == "succeeded")][0].id')
+FIRST_TAG=$(deployments | jq -r '[.data[] | select(.status == "succeeded")][0].image_tag')
+[[ "$FIRST_TAG" =~ ^tond-e2e-whoami:[0-9a-f]{12}$ ]] || fail "deployments must run a per-deployment tag, got ${FIRST_TAG}"
+docker image inspect "$FIRST_TAG" > /dev/null || fail "image ${FIRST_TAG} must exist on the host"
+pass "deployment runs ${FIRST_TAG}"
+tond apps deploy e2e-whoami > /dev/null
+wait_for 300 "a second successful e2e-whoami deployment" \
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/apps/e2e-whoami/deployments | jq -e '[.data[] | select(.status == \"succeeded\")] | length >= 2'"
+wait_for_app_running e2e-whoami 120
+SECOND_TAG=$(deployments | jq -r '[.data[] | select(.status == "succeeded")][0].image_tag')
+[[ "$SECOND_TAG" != "$FIRST_TAG" ]] || fail "each deployment must get its own tag"
+deployments | jq -e --arg id "$FIRST_ID" '.data[] | select(.id == $id) | .rollback_available' > /dev/null \
+    || fail "the previous deployment must be offered for rollback"
+pass "redeploy ran ${SECOND_TAG}; ${FIRST_TAG} is offered for rollback"
+code=$(api_send POST /api/apps/e2e-whoami/rollback "{\"deployment_id\":\"${FIRST_ID}\"}")
+[[ "$code" == 202 ]] || fail "rollback should be accepted, got ${code}: $(cat "$API_BODY")"
+wait_for 300 "rollback to ${FIRST_TAG}" \
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/apps/e2e-whoami/deployments | jq -e --arg t '${FIRST_TAG}' '.data[0] | select(.trigger_source == \"rollback\" and .status == \"succeeded\" and .image_tag == \$t)'"
+wait_for_app_running e2e-whoami 120
+running_image=$(docker inspect "$(app_field e2e-whoami container_id)" | jq -r '.[0].Config.Image')
+[[ "$running_image" == "$FIRST_TAG" ]] || fail "rollback must run exactly ${FIRST_TAG}, got ${running_image}"
+wait_for 60 "route after rollback" bash -c "curl -sk --resolve '${WHOAMI_DOMAIN}:443:${IP}' 'https://${WHOAMI_DOMAIN}/' | grep -q Hostname:"
+pass "rollback restored the exact previous image and traffic follows"
 
 step "Snapshot"
 tond snapshot create --name e2e-smoke > /dev/null
