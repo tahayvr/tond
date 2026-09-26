@@ -22,6 +22,8 @@
 		baseDir: string;
 		staticBuild: boolean;
 		domain: string;
+		/** Settings' apps domain; null while unknown, '' when none is set */
+		appsDomain?: string | null;
 		healthCheckPath: string;
 		healthCheckInterval: number;
 		healthFailureThreshold: number;
@@ -51,6 +53,7 @@
 		baseDir,
 		staticBuild,
 		domain,
+		appsDomain = null,
 		healthCheckPath,
 		healthCheckInterval,
 		healthFailureThreshold,
@@ -195,7 +198,15 @@
 			<div class="space-y-1 text-sm">
 				<div>
 					<span class="text-muted-foreground">Domain:</span>
-					{domain || 'Auto-generated'}
+					{#if domain}
+						{domain}
+					{:else if appsDomain}
+						<span class="font-mono">{name}.{appsDomain}</span> (automatic)
+					{:else if appsDomain === ''}
+						<span class="text-warn">None — add a custom domain after creating the app</span>
+					{:else}
+						Automatic
+					{/if}
 				</div>
 				<div>
 					<span class="text-muted-foreground">Health Path:</span>

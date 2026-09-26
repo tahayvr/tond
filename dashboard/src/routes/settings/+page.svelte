@@ -7,11 +7,15 @@
 	let { data }: PageProps = $props();
 
 	let error = $state('');
+	const MIB = 1024 * 1024;
 
 	// Form state — mirrors settings fields, populated once loaded
 	let serverName = $state('');
 	let dashboardDomain = $state('');
 	let previewDomain = $state('');
+	let appsDomain = $state('');
+	/** Upload limit in MiB (the API takes bytes) */
+	let uploadLimitMib = $state(1024);
 	// Last saved dashboard domain (drives the certificate status line)
 	let savedDashboardDomain = $state('');
 	let certRefreshKey = $state(0);
@@ -29,11 +33,15 @@
 			const updated = await updateSettings({
 				server_name: serverName,
 				dashboard_domain: dashboardDomain,
-				preview_domain: previewDomain
+				preview_domain: previewDomain,
+				apps_domain: appsDomain,
+				upload_max_bytes: Math.round(uploadLimitMib * MIB)
 			});
 			serverName = updated.server_name;
 			dashboardDomain = updated.dashboard_domain;
 			previewDomain = updated.preview_domain;
+			appsDomain = updated.apps_domain;
+			uploadLimitMib = Math.round(updated.upload_max_bytes / MIB);
 			savedDashboardDomain = updated.dashboard_domain;
 			certRefreshKey += 1;
 			accessSaved = true;
@@ -49,6 +57,8 @@
 		serverName = data.settings.server_name;
 		dashboardDomain = data.settings.dashboard_domain;
 		previewDomain = data.settings.preview_domain ?? '';
+		appsDomain = data.settings.apps_domain ?? '';
+		uploadLimitMib = Math.round((data.settings.upload_max_bytes ?? 1024 * MIB) / MIB);
 		savedDashboardDomain = data.settings.dashboard_domain;
 	});
 
@@ -77,6 +87,8 @@
 		bind:serverName
 		bind:dashboardDomain
 		bind:previewDomain
+		bind:appsDomain
+		bind:uploadLimitMib
 		{savedDashboardDomain}
 		{certRefreshKey}
 		isSaving={savingAccess}

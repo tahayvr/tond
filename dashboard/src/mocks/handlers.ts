@@ -43,6 +43,7 @@ import {
 	MOCK_APP_ENV_VARS,
 	MOCK_PREVIEW_ENV_VARS,
 	MOCK_CERTIFICATES,
+	MOCK_DATABASE_LINKS,
 	makeMockSystemMetrics,
 	makeMockAppMetrics
 } from './fixtures';
@@ -210,6 +211,67 @@ function normalizeDomain(value: string): string {
 	return value.trim().toLowerCase().replace(/\.$/, '');
 }
 
+/** Two hostnames on the same site (approximated by their last two labels). */
+function mockSameSite(a: string, b: string): boolean {
+	if (!a || !b) return false;
+	return a === b || a.endsWith(`.${b}`) || b.endsWith(`.${a}`) || mockSite(a) === mockSite(b);
+}
+
+// Mirrors domains.rs validate_apps_domain.
+function mockAppsDomainError(apps: string, dashboard: string, preview: string): string | null {
+	if (!apps) return null;
+	if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(apps)) {
+		return `'${apps}' is not a valid domain name (expected something like example-apps.com)`;
+	}
+	if (mockSameSite(apps, dashboard)) {
+		return `The apps domain must be a different site from the dashboard (${dashboard}): every app would be same-site with the dashboard. Use a separate domain, such as example-apps.com.`;
+	}
+	if (mockSameSite(apps, preview)) {
+		return `The apps domain must be a different site from the preview domain (${preview}). Previews run pull-request code and must not share a site with your production apps.`;
+	}
+	return null;
+}
+
+function mockDomainWarning(domain: string | null): string | null {
+	const dashboard = MOCK_SETTINGS.dashboard_domain;
+	if (!domain || !mockSameSite(domain, dashboard)) return null;
+	return `${domain} is on the same site as your dashboard (${dashboard}). The app can send same-site requests to the dashboard and set cookies for it; use a domain on a different site for code you don't fully trust.`;
+}
+
+// ── Database links (networks.rs) ──
+let databaseLinks = structuredClone(MOCK_DATABASE_LINKS);
+
+const DB_PORTS: Record<string, number> = {
+	postgres: 5432,
+	mysql: 3306,
+	mariadb: 3306,
+	redis: 6379,
+	keydb: 6379,
+	mongodb: 27017
+};
+
+function mockDatabaseAccess(db: ManagedDatabase) {
+	const ref = (a: App) => ({
+		id: a.id,
+		name: a.name,
+		status: a.status,
+		project_id: a.project_id
+	});
+	const project = db.project_id ? projects.find((p) => p.id === db.project_id) : undefined;
+	return {
+		database_id: db.id,
+		project: project ? { id: project.id, name: project.name } : null,
+		project_apps: db.project_id ? apps.filter((a) => a.project_id === db.project_id).map(ref) : [],
+		linked_apps: databaseLinks
+			.filter((l) => l.database_id === db.id)
+			.map((l) => apps.find((a) => a.id === l.app_id))
+			.filter((a): a is App => !!a)
+			.map(ref),
+		internal_host: db.name,
+		internal_port: DB_PORTS[db.db_type] ?? 0
+	};
+}
+
 const certificates = MOCK_CERTIFICATES.map((c) => ({ ...c }));
 
 /** Mirror the server: saving a domain queues a pending cert and resets retry state. */
@@ -339,7 +401,7 @@ function appEnvResponse(app: App) {
 		vars: maskedEntries(envStore(app.id)),
 		preview: {
 			enabled: app.preview_enabled,
-			excluded_keys: app.preview_excluded_keys,
+			shared_keys: app.preview_shared_keys,
 			overrides: maskedEntries(previewStore(app.id))
 		}
 	};
@@ -860,7 +922,7 @@ export const handlers = [
 			base_dir: body.base_dir ?? null,
 			static_build: body.static_build ?? false,
 			preview_enabled: false,
-			preview_excluded_keys: [],
+			preview_shared_keys: [],
 			created_at: new Date().toISOString(),
 			updated_at: new Date().toISOString()
 		};
@@ -872,12 +934,38 @@ export const handlers = [
 		await delay(LATENCY);
 		const app = apps.find((a) => a.id === params.id);
 		if (!app) return err('App not found', 404);
-		return ok(app);
+		return ok({ ...app, domain_warning: mockDomainWarning(app.domain) });
+	}),
+
+	http.get('/api/apps/:id/databases', async ({ params }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
+		if (!app) return err('App not found', 404);
+		if (app.source_type === 'compose') return ok([]);
+		const toAccess = (db: ManagedDatabase, via: 'project' | 'link') => ({
+			id: db.id,
+			name: db.name,
+			db_type: db.db_type,
+			status: db.status,
+			via,
+			internal_host: db.name,
+			internal_port: DB_PORTS[db.db_type] ?? 0
+		});
+		const viaProject = app.project_id
+			? databases.filter((d) => d.project_id === app.project_id).map((d) => toAccess(d, 'project'))
+			: [];
+		const viaLink = databaseLinks
+			.filter((l) => l.app_id === app.id)
+			.map((l) => databases.find((d) => d.id === l.database_id))
+			.filter((d): d is ManagedDatabase => !!d && !viaProject.some((p) => p.id === d.id))
+			.map((d) => toAccess(d, 'link'));
+		return ok([...viaProject, ...viaLink]);
 	}),
 
 	http.delete('/api/apps/:id', async ({ params }) => {
 		await delay(LATENCY);
 		apps = apps.filter((a) => a.id !== params.id);
+		databaseLinks = databaseLinks.filter((l) => l.app_id !== params.id);
 		return ok(null);
 	}),
 
@@ -963,18 +1051,18 @@ export const handlers = [
 		const body = (await request.json()) as {
 			set?: Record<string, string>;
 			unset?: string[];
-			exclude?: string[];
-			include?: string[];
+			share?: string[];
+			unshare?: string[];
 		};
-		const hasExclusions = (body.exclude?.length ?? 0) + (body.include?.length ?? 0) > 0;
-		const problem = hasExclusions && !body.set && !body.unset ? null : validateEnvPatch(body);
+		const hasSharing = (body.share?.length ?? 0) + (body.unshare?.length ?? 0) > 0;
+		const problem = hasSharing && !body.set && !body.unset ? null : validateEnvPatch(body);
 		if (problem) return err(problem);
 		const app = apps[idx];
 		previewEnvVars[app.id] = applyEnvPatch(previewStore(app.id), body);
-		const excluded = new Set(app.preview_excluded_keys);
-		for (const key of body.exclude ?? []) excluded.add(key);
-		for (const key of body.include ?? []) excluded.delete(key);
-		apps[idx] = { ...app, preview_excluded_keys: [...excluded].sort() };
+		const shared = new Set(app.preview_shared_keys);
+		for (const key of body.share ?? []) shared.add(key);
+		for (const key of body.unshare ?? []) shared.delete(key);
+		apps[idx] = { ...app, preview_shared_keys: [...shared].sort() };
 		return ok(appEnvResponse(apps[idx]));
 	}),
 
@@ -983,9 +1071,30 @@ export const handlers = [
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx === -1) return err('App not found', 404);
 		const body = (await request.json()) as { domain: string };
-		apps[idx] = { ...apps[idx], domain: body.domain, updated_at: new Date().toISOString() };
-		queueMockCertificate(body.domain);
-		return ok(apps[idx]);
+		const domain = normalizeDomain(body.domain);
+		if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(domain)) {
+			return err(
+				`Invalid input: '${domain}' is not a valid domain name (expected something like app.example.com)`
+			);
+		}
+		if (domain === MOCK_SETTINGS.dashboard_domain) {
+			return err(
+				`Invalid input: ${domain} is the dashboard domain; choose another hostname for the app`
+			);
+		}
+		const preview = MOCK_SETTINGS.preview_domain;
+		if (preview && (domain === preview || domain.endsWith(`.${preview}`))) {
+			return err(
+				`Invalid input: ${domain} is under the preview domain (${preview}), which only serves previews; choose a hostname outside it`
+			);
+		}
+		apps[idx] = { ...apps[idx], domain, updated_at: new Date().toISOString() };
+		queueMockCertificate(domain);
+		return ok({
+			message: 'Domain updated, certificate provisioning queued',
+			domain,
+			warning: mockDomainWarning(domain)
+		});
 	}),
 
 	// ── Certificates ──────────────────────────────────────────────────────────
@@ -1480,11 +1589,26 @@ export const handlers = [
 		if (body.preview_domain !== undefined) {
 			body.preview_domain = normalizeDomain(body.preview_domain);
 		}
+		if (body.apps_domain !== undefined) {
+			body.apps_domain = normalizeDomain(body.apps_domain);
+		}
 		const previewError = mockPreviewDomainError(
 			body.preview_domain ?? MOCK_SETTINGS.preview_domain,
 			body.dashboard_domain ?? MOCK_SETTINGS.dashboard_domain
 		);
 		if (previewError) return err(previewError);
+		const appsError = mockAppsDomainError(
+			body.apps_domain ?? MOCK_SETTINGS.apps_domain,
+			body.dashboard_domain ?? MOCK_SETTINGS.dashboard_domain,
+			body.preview_domain ?? MOCK_SETTINGS.preview_domain
+		);
+		if (appsError) return err(appsError);
+		if (
+			body.upload_max_bytes !== undefined &&
+			(body.upload_max_bytes < 1024 * 1024 || body.upload_max_bytes > 64 * 1024 ** 3)
+		) {
+			return err('The upload limit must be between 1.0 MiB and 64.0 GiB');
+		}
 		Object.assign(MOCK_SETTINGS, body);
 		if (body.dashboard_domain) queueMockCertificate(body.dashboard_domain);
 		MOCK_ONBOARDING_STATUS.dashboard_domain = MOCK_SETTINGS.dashboard_domain;
@@ -1702,6 +1826,45 @@ export const handlers = [
 		});
 	}),
 
+	http.get('/api/databases/:id/access', async ({ params }) => {
+		await delay(LATENCY);
+		const db = databases.find((d) => d.id === params.id || d.name === params.id);
+		if (!db) return err('Database not found', 404);
+		return ok(mockDatabaseAccess(db));
+	}),
+
+	http.put('/api/databases/:id/links/:app', async ({ params }) => {
+		await delay(LATENCY);
+		const db = databases.find((d) => d.id === params.id || d.name === params.id);
+		if (!db) return err('Not found: database', 404);
+		const app = apps.find((a) => a.id === params.app || a.name === params.app);
+		if (!app) return err('App not found', 404);
+		if (app.source_type === 'compose') {
+			return err(
+				`Invalid input: '${app.name}' is a compose app: compose apps run on their own compose network and can't be linked.`
+			);
+		}
+		if (db.project_id && db.project_id === app.project_id) {
+			return err(
+				`Invalid input: '${app.name}' is in the same project as '${db.name}' and can already reach it.`
+			);
+		}
+		if (!databaseLinks.some((l) => l.database_id === db.id && l.app_id === app.id)) {
+			databaseLinks = [...databaseLinks, { database_id: db.id, app_id: app.id }];
+		}
+		return ok(mockDatabaseAccess(db));
+	}),
+
+	http.delete('/api/databases/:id/links/:app', async ({ params }) => {
+		await delay(LATENCY);
+		const db = databases.find((d) => d.id === params.id || d.name === params.id);
+		if (!db) return err('Not found: database', 404);
+		const app = apps.find((a) => a.id === params.app || a.name === params.app);
+		if (!app) return err('App not found', 404);
+		databaseLinks = databaseLinks.filter((l) => !(l.database_id === db.id && l.app_id === app.id));
+		return ok(mockDatabaseAccess(db));
+	}),
+
 	http.get('/api/databases/:id', async ({ params }) => {
 		await delay(LATENCY);
 		const db = databases.find((d) => d.id === params.id || d.name === params.id);
@@ -1715,11 +1878,12 @@ export const handlers = [
 					: `redis://localhost:${db.host_port}`
 				: `${db.db_type}://${db.db_user}:${db.db_password}@localhost:${db.host_port}/${db.db_name}`
 			: null;
+		// Apps reach a database by its name (a network alias) — see networks.rs.
 		const computedInternal = isRedisLike
 			? db.db_user && db.db_password
-				? `redis://${db.db_user}:${db.db_password}@tond-db-${db.name}:${redisPort}`
-				: `redis://tond-db-${db.name}:${redisPort}`
-			: `${db.db_type}://${db.db_user}:${db.db_password}@tond-db-${db.name}:${db.db_type === 'mysql' || db.db_type === 'mariadb' ? 3306 : 5432}/${db.db_name}`;
+				? `redis://${db.db_user}:${db.db_password}@${db.name}:${redisPort}`
+				: `redis://${db.name}:${redisPort}`
+			: `${db.db_type}://${db.db_user}:${db.db_password}@${db.name}:${db.db_type === 'mysql' || db.db_type === 'mariadb' ? 3306 : 5432}/${db.db_name}`;
 		return ok({
 			...db,
 			connection_string: db.custom_external_url ?? computedExternal,
@@ -1730,7 +1894,9 @@ export const handlers = [
 
 	http.delete('/api/databases/:id', async ({ params }) => {
 		await delay(LATENCY);
+		const gone = databases.find((d) => d.id === params.id || d.name === params.id);
 		databases = databases.filter((d) => d.id !== params.id && d.name !== params.id);
+		if (gone) databaseLinks = databaseLinks.filter((l) => l.database_id !== gone.id);
 		return ok(null);
 	}),
 

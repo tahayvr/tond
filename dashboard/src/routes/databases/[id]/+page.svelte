@@ -1,5 +1,6 @@
 <script lang="ts">
 	import ConnectionString from '$lib/components/databases/connection-string.svelte';
+	import DatabaseAccess from '$lib/components/databases/database-access.svelte';
 	import { page } from '$app/state';
 	import {
 		getDatabase,
@@ -712,9 +713,7 @@
 						<!-- Internal URL -->
 						<div class="space-y-2">
 							<div class="flex items-center justify-between">
-								<p class="text-xs font-medium text-muted-foreground">
-									Internal (within project network)
-								</p>
+								<p class="text-xs font-medium text-muted-foreground">From apps with access</p>
 								{#if !editingInternal}
 									<Button
 										variant="ghost"
@@ -768,9 +767,7 @@
 									{/if}
 								</div>
 							{:else}
-								<p class="text-xs text-muted-foreground/60">
-									{db.project_id ? 'Not available (database is stopped)' : 'No project assigned'}
-								</p>
+								<p class="text-xs text-muted-foreground/60">Not available</p>
 							{/if}
 						</div>
 					</div>
@@ -912,9 +909,8 @@
 					{:else}
 						<p class="text-sm text-muted-foreground">
 							Only reachable from this server on
-							<span class="font-mono">127.0.0.1:{db.host_port ?? '—'}</span>{db.project_id
-								? ' and from apps in its project'
-								: ''}. To connect from your computer, use an SSH tunnel:
+							<span class="font-mono">127.0.0.1:{db.host_port ?? '—'}</span> and from the apps
+							listed under "Apps with access". To connect from your computer, use an SSH tunnel:
 							<code class="rounded bg-muted px-1 font-mono text-xs"
 								>ssh -L {db.host_port ?? 5432}:localhost:{db.host_port ?? 5432} root@your-server</code
 							>
@@ -955,6 +951,8 @@
 						</p>
 					{/if}
 				</div>
+
+				<DatabaseAccess databaseId={db.id} databaseName={db.name} />
 
 				<Dialog.Root bind:open={publicDialogOpen}>
 					<Dialog.Content class="max-w-md">

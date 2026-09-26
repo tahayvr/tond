@@ -64,6 +64,7 @@
 	import AppDeployments from '$lib/components/tabs/app-page/app-deployments.svelte';
 	import AppEnvironment from '$lib/components/tabs/app-page/app-environment.svelte';
 	import AppDomain from '$lib/components/tabs/app-page/app-domain.svelte';
+	import AppDatabases from '$lib/components/tabs/app-page/app-databases.svelte';
 	import AppHealth from '$lib/components/tabs/app-page/app-health.svelte';
 	import AppVolumes from '$lib/components/tabs/app-page/app-volumes.svelte';
 	import AppPreviews from '$lib/components/tabs/app-page/app-previews.svelte';
@@ -169,6 +170,8 @@
 	let previewConfigError = $state('');
 	// null until settings are loaded; '' when no preview domain is configured
 	let previewDomain = $state<string | null>(null);
+	// Settings' apps domain: apps without a custom domain get <app>.<appsDomain>
+	let appsDomain = $state('');
 	let previewsBlocked = $derived(previewDomain === '');
 
 	// Open PRs state (Load open PRs feature)
@@ -376,15 +379,24 @@
 		statusPollRequested = true;
 	}
 
+	/** Errors propagate to the domain tab, which shows them next to the form. */
 	async function handleUpdateDomain() {
-		try {
-			await updateDomain(appId, domainInput);
-			await loadApp();
-			certRefreshKey += 1;
-		} catch (e: any) {
-			error = e.message;
-		}
+		await updateDomain(appId, domainInput);
+		await loadApp();
+		certRefreshKey += 1;
 	}
+
+	// The apps domain explains where an app without a custom domain is served.
+	$effect(() => {
+		void appId;
+		(async () => {
+			try {
+				appsDomain = (await getSettings()).apps_domain ?? '';
+			} catch {
+				// Unknown: the domain tab then just omits the automatic address.
+			}
+		})();
+	});
 
 	async function handleUpdateHealth() {
 		try {
@@ -954,12 +966,14 @@
 				}
 			}}
 		>
-			<Tabs.List>
+			<!-- 13 tabs don't fit a phone: scroll the list, not the page -->
+			<Tabs.List class="max-w-full justify-start overflow-x-auto">
 				<Tabs.Trigger value="overview">Overview</Tabs.Trigger>
 				<Tabs.Trigger value="logs">Logs</Tabs.Trigger>
 				<Tabs.Trigger value="deployments">Deployments</Tabs.Trigger>
 				<Tabs.Trigger value="env">Environment</Tabs.Trigger>
 				<Tabs.Trigger value="domain">Domain</Tabs.Trigger>
+				<Tabs.Trigger value="databases">Databases</Tabs.Trigger>
 				<Tabs.Trigger value="health">Health</Tabs.Trigger>
 				<Tabs.Trigger value="volumes">Volumes</Tabs.Trigger>
 				<Tabs.Trigger value="resources">Resources</Tabs.Trigger>
@@ -1014,8 +1028,21 @@
 				<AppDomain
 					bind:domainInput
 					savedDomain={app?.domain ?? null}
+					domainWarning={app?.domain_warning ?? null}
+					{appsDomain}
+					appName={app.name}
 					{certRefreshKey}
 					onUpdate={handleUpdateDomain}
+				/>
+			</Tabs.Content>
+
+			<!-- Databases tab: what this app can reach (project + links) -->
+			<Tabs.Content value="databases">
+				<AppDatabases
+					appId={app.id}
+					appName={app.name}
+					sourceType={app.source_type}
+					projectId={app.project_id}
 				/>
 			</Tabs.Content>
 
