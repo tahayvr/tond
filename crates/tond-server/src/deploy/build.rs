@@ -14,6 +14,7 @@ use anyhow::Result;
 use tond_common::App;
 
 use crate::state::AppState;
+use crate::{compose_policy, volumes};
 
 use super::core::log_deploy;
 
@@ -35,6 +36,42 @@ fn compose_work_dir(data_dir: &str, app_name: &str) -> String {
 
 fn compose_file_path(work_dir: &str) -> String {
     format!("{}/docker-compose.yml", work_dir)
+}
+
+/// `docker compose -p <app> -f <file> up --build -d` with a cleared
+/// environment: compose interpolates `${VAR}` from its own environment, and
+/// tond-server's holds TOND_SECRET_KEY. Only what docker needs is passed on.
+fn compose_command(compose_path: &str, app_name: &str) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new("docker");
+    cmd.env_clear();
+    for key in [
+        "PATH",
+        "HOME",
+        "DOCKER_HOST",
+        "DOCKER_CONFIG",
+        "XDG_RUNTIME_DIR",
+    ] {
+        if let Ok(val) = std::env::var(key) {
+            cmd.env(key, val);
+        }
+    }
+    cmd.args([
+        "compose",
+        "-p",
+        &compose_project_name(app_name),
+        "-f",
+        compose_path,
+        "up",
+        "--build",
+        "-d",
+    ]);
+    cmd
+}
+
+/// Compose project names must be lowercase; this is also the label value
+/// `docker::find_compose_host_port` looks up.
+pub(crate) fn compose_project_name(app_name: &str) -> String {
+    app_name.to_ascii_lowercase()
 }
 
 fn docker_build_args<'a>(
@@ -500,23 +537,36 @@ pub(super) async fn run_inline_compose(
     let data_dir = std::env::var("TOND_DATA_DIR").unwrap_or_else(|_| "/opt/tond/data".to_string());
     let work_dir = compose_work_dir(&data_dir, app_name);
 
+    // Validate again at deploy time and rewrite the file: binds pinned inside
+    // <data>/volumes/<app>, ports on 127.0.0.1, container hardening added.
+    let data_path = std::path::Path::new(&data_dir);
+    let volume_dir = volumes::app_volume_dir(data_path, app_name);
+    let hardened = compose_policy::harden(
+        compose_content,
+        &volume_dir,
+        crate::docker::default_memory_limit(),
+    )
+    .map_err(|errors| anyhow::anyhow!(compose_policy::format_errors(&errors)))?;
+    for rel in &hardened.bind_sources {
+        volumes::prepare_host_dir(data_path, &volume_dir, rel, true)?;
+    }
+
     tokio::fs::create_dir_all(&work_dir).await?;
 
-    // Write the inline compose file (overwrite on redeploy)
+    // Write the hardened compose file (overwrite on redeploy)
     let compose_path = compose_file_path(&work_dir);
-    tokio::fs::write(&compose_path, compose_content).await?;
+    tokio::fs::write(&compose_path, &hardened.yaml).await?;
 
     log_deploy(
         state,
         app_id,
         "info",
         trigger_source,
-        "Wrote inline docker-compose.yml; running docker compose up...",
+        "Wrote hardened docker-compose.yml; running docker compose up...",
     )
     .await?;
 
-    let mut child = tokio::process::Command::new("docker")
-        .args(["compose", "-f", &compose_path, "up", "--build", "-d"])
+    let mut child = compose_command(&compose_path, app_name)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()?;

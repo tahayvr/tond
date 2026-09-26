@@ -43,6 +43,7 @@ mod alerts;
 mod audit_log;
 mod auth;
 mod backup;
+mod compose_policy;
 mod cron;
 mod db;
 mod deploy;

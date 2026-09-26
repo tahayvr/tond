@@ -362,12 +362,16 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
     if app.source_type == "compose" {
         let container_port = app.container_port as u16;
 
-        let host_port = docker::find_compose_host_port(&state.docker, &app_name, container_port)
-            .await
-            .map_err(|e| {
-                tracing::error!("[compose] could not discover host port: {}", e);
-                e
-            })?;
+        let host_port = docker::find_compose_host_port(
+            &state.docker,
+            &super::build::compose_project_name(&app_name),
+            container_port,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!("[compose] could not discover host port: {}", e);
+            e
+        })?;
 
         sqlx::query(
             "UPDATE apps SET container_id = ?, host_port = ?, status = 'running', updated_at = datetime('now') WHERE id = ?",

@@ -30,7 +30,7 @@ use tond_common::{
 };
 
 use crate::{
-    auth::{RateLimit, RequireAuth},
+    auth::{AuthRole, RateLimit, RequireAuth},
     error::AppError,
     state::AppState,
 };
@@ -225,7 +225,7 @@ fn generate_ed25519_keypair(comment: &str) -> anyhow::Result<(String, String)> {
 /// Updates the deployment source type and URL for the app.
 pub async fn update_source(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: AuthRole,
     State(state): State<AppState>,
     Path(app_id): Path<String>,
     Json(payload): Json<UpdateSourceRequest>,
@@ -242,6 +242,11 @@ pub async fn update_source(
     }
 
     let app = fetch_app(&state.db, &app_id).await?;
+
+    // Compose files are full container specs; switching to or from one is an admin action.
+    if payload.source_type == "compose" || app.source_type == "compose" {
+        auth.ensure_admin("change a Docker Compose app's source")?;
+    }
 
     sqlx::query(
         "UPDATE apps SET source_type = ?, source_url = ?, updated_at = datetime('now') WHERE id = ?",

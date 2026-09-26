@@ -72,7 +72,7 @@ use crate::{
     alerts::fire_event_alerts,
     audit_log::{AuthActor, write_audit_log},
     auth::{AuthRole, RateLimit, RequireAdmin, RequireAuth},
-    deploy, docker,
+    compose_policy, deploy, docker,
     error::AppError,
     state::AppState,
     volumes,
@@ -203,6 +203,18 @@ pub async fn create_app(
         return Err(AppError(TondError::InvalidInput(
             "compose_content is required when source_type is 'compose'".to_string(),
         )));
+    }
+    // Reject host-level compose options up front (privileged, host binds, …) so
+    // the user sees every problem now instead of at deploy time.
+    if req.source_type == "compose"
+        && let Some(content) = req.compose_content.as_deref()
+    {
+        let volume_dir = volumes::app_volume_dir(&volumes::data_dir(), &req.name);
+        compose_policy::validate(content, &volume_dir).map_err(|errors| {
+            AppError(TondError::InvalidInput(compose_policy::format_errors(
+                &errors,
+            )))
+        })?;
     }
 
     let requested_build_method = req.build_method.clone();
@@ -2248,6 +2260,88 @@ mod tests {
         .err()
         .unwrap_or_else(|| panic!("members must not configure volumes"));
         assert_eq!(error.0.status_code(), 403);
+    }
+
+    fn compose_request(name: &str, content: &str) -> CreateAppRequest {
+        CreateAppRequest {
+            name: name.to_string(),
+            source_type: "compose".to_string(),
+            source_url: None,
+            branch: None,
+            container_port: 80,
+            env_vars: None,
+            domain: None,
+            project_id: None,
+            memory_limit: None,
+            cpu_limit: None,
+            health_check_path: None,
+            health_check_interval: None,
+            health_failure_threshold: None,
+            drain_timeout: None,
+            build_method: None,
+            auto_deploy: false,
+            watch_branch: None,
+            volumes: None,
+            registry_credential_id: None,
+            github_app_id: None,
+            dockerfile_content: None,
+            compose_content: Some(content.to_string()),
+            base_dir: None,
+            static_build: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_app_rejects_privileged_compose_files_with_every_problem_listed() {
+        let state = test_state().await;
+        let error = create_app(
+            RateLimit,
+            AuthRole(Role::Admin),
+            AuthActor("admin@example.com".to_string()),
+            State(state.clone()),
+            Json(compose_request(
+                "evil",
+                "services:\n  web:\n    image: nginx\n    privileged: true\n    volumes:\n      - /var/run/docker.sock:/var/run/docker.sock\n",
+            )),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("a privileged compose file must be rejected"));
+        assert_eq!(error.0.status_code(), 400);
+        let msg = error.0.to_string();
+        assert!(msg.contains("'privileged' is not allowed"), "{msg}");
+        assert!(msg.contains("/var/run/docker.sock"), "{msg}");
+
+        // Members can't deploy compose apps at all; admins can deploy clean ones.
+        let error = create_app(
+            RateLimit,
+            AuthRole(Role::Member),
+            AuthActor("member@example.com".to_string()),
+            State(state.clone()),
+            Json(compose_request(
+                "member-compose",
+                "services:\n  web:\n    image: nginx\n",
+            )),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("members must not create compose apps"));
+        assert_eq!(error.0.status_code(), 403);
+
+        let response = create_app(
+            RateLimit,
+            AuthRole(Role::Admin),
+            AuthActor("admin@example.com".to_string()),
+            State(state),
+            Json(compose_request(
+                "clean",
+                "services:\n  web:\n    image: nginx\n    ports: [\"8080:80\"]\n    volumes: [\"./html:/usr/share/nginx/html\"]\n",
+            )),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("a clean compose file should be accepted: {}", err.0))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CREATED);
     }
 
     #[tokio::test]
