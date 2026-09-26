@@ -12,3 +12,11 @@ services:
       LANGS: en_GB
     volumes:
       - ./configs:/configs
+    # Timings only: the image's own HEALTHCHECK test is kept, but its 30s interval
+    # would keep the deploy waiting.
+    healthcheck:
+      interval: 15s
+      timeout: 15s
+      start_period: 120s
+      start_interval: 2s
+      retries: 5

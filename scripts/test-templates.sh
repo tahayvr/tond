@@ -13,7 +13,11 @@
 # override adds Tond's container hardening (no-new-privileges, the dropped
 # capabilities, a pids limit). The public port is published on 127.0.0.1 and
 # probed at the template's health path until it returns 2xx (redirects are
-# followed). Needs docker (with compose v2.23+) and python3 ≥ 3.11.
+# followed). Then every container with a healthcheck (the image's or the
+# compose file's) must report healthy within HEALTH_GRACE seconds (default
+# 30): Tond waits for Docker's healthchecks too, so a slow one ("starting"
+# for a minute) would hold up a real deploy. Needs docker (with compose
+# v2.23+) and python3 ≥ 3.11.
 #
 # Exit status: 0 when every template tested came up healthy.
 
@@ -22,6 +26,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TEMPLATES="${TEMPLATES:-$ROOT/templates}"
 TIMEOUT="${TIMEOUT:-300}"
+HEALTH_GRACE="${HEALTH_GRACE:-30}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/tond-templates.XXXXXX")"
 
 command -v docker >/dev/null || { echo "docker is required" >&2; exit 2; }
@@ -193,6 +198,24 @@ for id in "${IDS[@]}"; do
 		[ -z "$host_port" ] && host_port="$("${dc[@]}" port "$service" "$port" 2>/dev/null | sed 's/.*://')"
 		sleep 3
 	done
+	# Docker's healthchecks: none may still be starting (or unhealthy).
+	unhealthy=""
+	if [ "$ok" = 1 ]; then
+		grace_end=$(($(date +%s) + HEALTH_GRACE))
+		while :; do
+			unhealthy=""
+			for cid in $("${dc[@]}" ps -q); do
+				h="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$cid" 2>/dev/null)"
+				case "$h" in
+				"" | healthy) ;;
+				*) unhealthy+=" $(docker inspect --format '{{index .Config.Labels "com.docker.compose.service"}}' "$cid"):$h" ;;
+				esac
+			done
+			[ -z "$unhealthy" ] || [ "$(date +%s)" -ge "$grace_end" ] && break
+			sleep 2
+		done
+		[ -z "$unhealthy" ] || ok=2
+	fi
 	elapsed=$(($(date +%s) - started))
 	mem="$(docker stats --no-stream --format '{{.MemUsage}}' $("${dc[@]}" ps -q) 2>/dev/null |
 		python3 -c "
@@ -208,6 +231,9 @@ print(f'{t:.0f} MiB')")"
 	if [ "$ok" = 1 ]; then
 		echo "✓ $id: healthy after ${elapsed}s, using $mem"
 		PASSED+=("$id ($mem)")
+	elif [ "$ok" = 2 ]; then
+		echo "✗ $id: answered, but healthchecks not healthy ${HEALTH_GRACE}s later:$unhealthy (give it a healthcheck with a short interval and start_interval)" >&2
+		FAILED+=("$id")
 	else
 		echo "✗ $id: no 2xx from $health within ${TIMEOUT}s" >&2
 		"${dc[@]}" ps >&2

@@ -17,7 +17,11 @@
 //   health   wait for compose healthchecks (healthy), for every service to
 //            run (one-shot services may exit 0), then probe each published
 //            service like a single-container app (http: health check path or
-//            any answer; tcp: the port accepts connections)
+//            any answer; tcp: the port accepts connections). Each service's
+//            wait covers its effective healthcheck (image HEALTHCHECK merged
+//            with compose's, from docker inspect; see ready_budget), and a
+//            published service whose healthcheck is still "starting" counts
+//            as ready once Tond's own probe answers
 //   release  record the deployment's images and compose file, mark the app
 //            running (routes follow compose_services.host_port and
 //            app_domains), assign the automatic domain to the web service,
@@ -553,6 +557,7 @@ async fn run_with_source(
 
     // ── Health ──
     progress::start(state, &app_id, DeployPhase::Health).await;
+    // Base wait; each service's healthcheck may stretch it (wait_until_ready).
     let timeout = (app.drain_timeout.max(1) as u64).max(READY_MIN_SECS);
     facts.timeout_secs = timeout;
     if let Err(e) = wait_until_ready(
@@ -839,6 +844,64 @@ pub fn plan_host_ports(
     Ok(out)
 }
 
+/// A container's effective healthcheck timings in seconds: the image's
+/// HEALTHCHECK merged with compose's `healthcheck:` (what `docker inspect`
+/// reports under Config.Healthcheck), with Docker's defaults filled in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HealthcheckTiming {
+    pub interval: u64,
+    pub timeout: u64,
+    pub start_period: u64,
+    pub start_interval: u64,
+    pub retries: u64,
+}
+
+impl HealthcheckTiming {
+    /// Timings of a container's healthcheck; `None` when it has none (no
+    /// test, or `NONE`/`disable: true`).
+    pub fn from_config(hc: &bollard::models::HealthConfig) -> Option<Self> {
+        let test = hc.test.as_deref().unwrap_or_default();
+        if test.is_empty() || test[0] == "NONE" {
+            return None;
+        }
+        // Docker's defaults for unset (0) values.
+        let secs = |ns: Option<i64>, default: u64| match ns {
+            Some(n) if n > 0 => (n as u64).div_ceil(1_000_000_000),
+            _ => default,
+        };
+        Some(Self {
+            interval: secs(hc.interval, 30),
+            timeout: secs(hc.timeout, 30),
+            start_period: secs(hc.start_period, 0),
+            start_interval: secs(hc.start_interval, 5),
+            retries: hc.retries.filter(|r| *r > 0).unwrap_or(3) as u64,
+        })
+    }
+
+    /// How long after start a service that boots within its start period is
+    /// first reported healthy, at worst: during the start period Docker
+    /// checks every `start_interval`; once it is over, every `interval`.
+    pub fn first_result_secs(&self) -> u64 {
+        self.start_period + self.interval.max(self.start_interval) + self.timeout
+    }
+}
+
+/// Longest wait a healthcheck's timings can ask for (the app's drain
+/// timeout may still be longer).
+const READY_MAX_SECS: u64 = 300;
+/// Slack on top of a healthcheck's first result.
+const READY_SLACK_SECS: u64 = 15;
+
+/// How long to wait for one service: the base timeout (the app's drain
+/// timeout, at least [`READY_MIN_SECS`]), stretched to cover its
+/// healthcheck's first result, capped at [`READY_MAX_SECS`].
+pub fn ready_budget(base: u64, healthcheck: Option<&HealthcheckTiming>) -> u64 {
+    match healthcheck {
+        Some(hc) => base.max((hc.first_result_secs() + READY_SLACK_SECS).min(READY_MAX_SECS)),
+        None => base,
+    }
+}
+
 /// Readiness of one service as seen in a `discover` pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceReadiness {
@@ -847,10 +910,14 @@ pub enum ServiceReadiness {
     Failed(String),
 }
 
-/// Judge one service from its state. `restarts` counts restarts seen so far.
+/// Judge one service from its state. `probe_ok`: Tond's own probe of the
+/// service (published services: http/tcp) answered, which is enough while
+/// Docker's healthcheck is still starting; it never overrides "unhealthy" or
+/// an exit.
 pub fn judge_service(
     spec: &ComposeServiceSpec,
     state: Option<&compose::ServiceState>,
+    probe_ok: bool,
 ) -> ServiceReadiness {
     let name = &spec.name;
     let Some(st) = state else {
@@ -870,9 +937,11 @@ pub fn judge_service(
             Some("unhealthy") => {
                 ServiceReadiness::Failed(format!("service \"{name}\" is unhealthy"))
             }
-            Some("starting") => {
-                ServiceReadiness::Waiting(format!("service \"{name}\" healthcheck is starting"))
-            }
+            Some("starting") if probe_ok => ServiceReadiness::Ready,
+            Some("starting") => ServiceReadiness::Waiting(format!(
+                "service \"{name}\" healthcheck is still starting"
+            )),
+            None if spec.has_healthcheck && probe_ok => ServiceReadiness::Ready,
             None if spec.has_healthcheck => {
                 ServiceReadiness::Waiting(format!("service \"{name}\" has no health result yet"))
             }
@@ -880,6 +949,64 @@ pub fn judge_service(
         },
         other => ServiceReadiness::Waiting(format!("service \"{name}\" is {other}")),
     }
+}
+
+/// Whether Tond's probe could settle a service `judge_service` is waiting
+/// on: it runs and only its healthcheck result is missing.
+fn awaits_healthcheck(spec: &ComposeServiceSpec, st: &compose::ServiceState) -> bool {
+    st.state == "running"
+        && match st.health.as_deref() {
+            Some("starting") => true,
+            None => spec.has_healthcheck,
+            _ => false,
+        }
+}
+
+/// Why a service still waiting on its healthcheck ran out of time, naming
+/// how often the check runs (appended to the waiting reason).
+pub fn healthcheck_timeout_detail(healthcheck: Option<&HealthcheckTiming>) -> String {
+    match healthcheck {
+        Some(hc) if hc.start_period > 0 => format!(
+            " (its healthcheck runs every {}s, every {}s during a {}s start period)",
+            hc.interval, hc.start_interval, hc.start_period
+        ),
+        Some(hc) => format!(" (its healthcheck runs every {}s)", hc.interval),
+        None => String::new(),
+    }
+}
+
+/// The effective healthcheck of a container, from `docker inspect`.
+async fn container_healthcheck(state: &AppState, container_id: &str) -> Option<HealthcheckTiming> {
+    let info = state
+        .docker
+        .inspect_container(container_id, None)
+        .await
+        .ok()?;
+    HealthcheckTiming::from_config(info.config?.healthcheck.as_ref()?)
+}
+
+/// One attempt of Tond's own readiness probe of a published service.
+async fn probe_once(
+    state: &AppState,
+    app: &App,
+    container_id: &str,
+    (host, container): (u16, u16),
+) -> bool {
+    let probe = match app.readiness() {
+        Readiness::Tcp => probe_tcp_until_ready(&state.docker, container_id, container, 0).await,
+        _ => {
+            let (path, require_2xx) = match app.health_check_path.clone() {
+                Some(p) => (p, true),
+                None => ("/".to_string(), false),
+            };
+            let url = format!("http://127.0.0.1:{host}{path}");
+            match probe_until_ready(&state.docker, container_id, &url, require_2xx, 0).await {
+                Ok(p) => p,
+                Err(_) => return false,
+            }
+        }
+    };
+    probe.result == ProbeResult::Healthy
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -890,16 +1017,54 @@ async fn wait_until_ready(
     project: &str,
     specs: &[ComposeServiceSpec],
     publish: &HashMap<String, (u16, u16)>,
-    timeout: u64,
+    base_timeout: u64,
     facts: &mut HealthFacts,
     trigger: &str,
 ) -> Result<()> {
     let app_id = app.id.as_str();
-    let with_healthcheck: Vec<&str> = specs
-        .iter()
-        .filter(|s| s.has_healthcheck)
-        .map(|s| s.name.as_str())
-        .collect();
+    let started = tokio::time::Instant::now();
+
+    // Each service's budget follows its effective healthcheck (image
+    // HEALTHCHECK + compose healthcheck:), keyed by container.
+    let mut healthchecks: HashMap<String, Option<HealthcheckTiming>> = HashMap::new();
+    let states = compose::discover(&state.docker, project).await?;
+    for st in &states {
+        let hc = container_healthcheck(state, &st.container_id).await;
+        healthchecks.insert(st.container_id.clone(), hc);
+    }
+    let timing_of = |healthchecks: &HashMap<String, Option<HealthcheckTiming>>,
+                     st: Option<&compose::ServiceState>| {
+        st.and_then(|st| healthchecks.get(&st.container_id).copied().flatten())
+    };
+    let budget_of = |healthchecks: &HashMap<String, Option<HealthcheckTiming>>,
+                     st: Option<&compose::ServiceState>| {
+        ready_budget(base_timeout, timing_of(healthchecks, st).as_ref())
+    };
+    let mut with_healthcheck = Vec::new();
+    let mut timeout = base_timeout;
+    for spec in specs {
+        let st = states.iter().find(|s| s.service == spec.name);
+        let hc = timing_of(&healthchecks, st);
+        if hc.is_some() {
+            with_healthcheck.push(spec.name.as_str());
+        }
+        let budget = budget_of(&healthchecks, st);
+        timeout = timeout.max(budget);
+        if let Some(hc) = hc.filter(|_| budget > base_timeout) {
+            log_deploy(
+                state,
+                app_id,
+                "info",
+                trigger,
+                &format!(
+                    "[{}] Its healthcheck runs every {}s (start period {}s): waiting up to {budget}s for it",
+                    spec.name, hc.interval, hc.start_period
+                ),
+            )
+            .await?;
+        }
+    }
+    facts.timeout_secs = timeout;
     log_deploy(
         state,
         app_id,
@@ -915,17 +1080,52 @@ async fn wait_until_ready(
         },
     )
     .await?;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout);
+
     let mut ready: Vec<String> = Vec::new();
+    // Services Tond's own probe answered while their healthcheck starts.
+    let mut probed: Vec<String> = Vec::new();
     loop {
         let states = compose::discover(&state.docker, project).await?;
+        for st in &states {
+            if !healthchecks.contains_key(&st.container_id) {
+                let hc = container_healthcheck(state, &st.container_id).await;
+                healthchecks.insert(st.container_id.clone(), hc);
+            }
+        }
+        let elapsed = started.elapsed().as_secs();
         let mut waiting = Vec::new();
+        let mut expired = Vec::new();
         for spec in specs {
             let st = states.iter().find(|s| s.service == spec.name);
-            match judge_service(spec, st) {
+            let mut probe_ok = probed.contains(&spec.name);
+            let mut verdict = judge_service(spec, st, probe_ok);
+            if !probe_ok
+                && let (ServiceReadiness::Waiting(_), Some(st), Some(port)) =
+                    (&verdict, st, publish.get(&spec.name))
+                && awaits_healthcheck(spec, st)
+                && probe_once(state, app, &st.container_id, *port).await
+            {
+                probed.push(spec.name.clone());
+                probe_ok = true;
+                verdict = judge_service(spec, Some(st), true);
+            }
+            match verdict {
                 ServiceReadiness::Ready => {
                     if !ready.contains(&spec.name) {
                         ready.push(spec.name.clone());
+                        if probe_ok && st.is_some_and(|st| awaits_healthcheck(spec, st)) {
+                            log_deploy(
+                                state,
+                                app_id,
+                                "info",
+                                trigger,
+                                &format!(
+                                    "[{}] Answers Tond's probe; not waiting for Docker's healthcheck, which is still starting",
+                                    spec.name
+                                ),
+                            )
+                            .await?;
+                        }
                         set_services_status(
                             state,
                             app_id,
@@ -936,7 +1136,18 @@ async fn wait_until_ready(
                         .await;
                     }
                 }
-                ServiceReadiness::Waiting(why) => waiting.push(why),
+                ServiceReadiness::Waiting(why) => {
+                    if elapsed >= budget_of(&healthchecks, st) {
+                        let detail = match st {
+                            Some(st) if awaits_healthcheck(spec, st) => healthcheck_timeout_detail(
+                                timing_of(&healthchecks, Some(st)).as_ref(),
+                            ),
+                            _ => String::new(),
+                        };
+                        expired.push(format!("{why}{detail}"));
+                    }
+                    waiting.push(why);
+                }
                 ServiceReadiness::Failed(why) => {
                     set_services_status(
                         state,
@@ -958,11 +1169,11 @@ async fn wait_until_ready(
         if waiting.is_empty() {
             break;
         }
-        if tokio::time::Instant::now() >= deadline {
+        if !expired.is_empty() {
             facts.probe = Some(ProbeResult::Timeout);
             anyhow::bail!(
-                "services did not become ready within {timeout}s: {}",
-                waiting.join("; ")
+                "services did not become ready within {elapsed}s: {}",
+                expired.join("; ")
             );
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -975,6 +1186,7 @@ async fn wait_until_ready(
         let Some(st) = states.iter().find(|s| &s.service == service) else {
             continue;
         };
+        let timeout = budget_of(&healthchecks, Some(st));
         let probe = match readiness {
             Readiness::Tcp => {
                 log_deploy(
@@ -1070,42 +1282,220 @@ mod tests {
         let plain = spec("web", false);
         let checked = spec("db", true);
         assert_eq!(
-            judge_service(&plain, Some(&st("running", None, None))),
+            judge_service(&plain, Some(&st("running", None, None)), false),
             ServiceReadiness::Ready
         );
         assert_eq!(
-            judge_service(&plain, Some(&st("exited", None, Some(0)))),
+            judge_service(&plain, Some(&st("exited", None, Some(0))), false),
             ServiceReadiness::Ready,
             "one-shot services may finish"
         );
         assert!(matches!(
-            judge_service(&plain, Some(&st("exited", None, Some(2)))),
+            judge_service(&plain, Some(&st("exited", None, Some(2))), false),
             ServiceReadiness::Failed(m) if m.contains("code 2")
         ));
         assert!(matches!(
-            judge_service(&plain, Some(&st("restarting", None, None))),
+            judge_service(&plain, Some(&st("restarting", None, None)), false),
             ServiceReadiness::Waiting(_)
         ));
         assert!(matches!(
-            judge_service(&plain, None),
+            judge_service(&plain, None, false),
             ServiceReadiness::Waiting(_)
         ));
         assert!(matches!(
-            judge_service(&checked, Some(&st("running", Some("starting"), None))),
+            judge_service(
+                &checked,
+                Some(&st("running", Some("starting"), None)),
+                false
+            ),
             ServiceReadiness::Waiting(_)
         ));
         assert!(matches!(
-            judge_service(&checked, Some(&st("running", None, None))),
+            judge_service(&checked, Some(&st("running", None, None)), false),
             ServiceReadiness::Waiting(_)
         ));
         assert_eq!(
-            judge_service(&checked, Some(&st("running", Some("healthy"), None))),
+            judge_service(&checked, Some(&st("running", Some("healthy"), None)), false),
             ServiceReadiness::Ready
         );
         assert!(matches!(
-            judge_service(&checked, Some(&st("running", Some("unhealthy"), None))),
+            judge_service(&checked, Some(&st("running", Some("unhealthy"), None)), false),
             ServiceReadiness::Failed(m) if m.contains("unhealthy")
         ));
+    }
+
+    #[test]
+    fn tond_probe_settles_a_starting_healthcheck_but_not_a_failure() {
+        let checked = spec("web", true);
+        let plain = spec("app", false);
+        // Docker says "starting" and Tond's probe answered: ready.
+        assert_eq!(
+            judge_service(&checked, Some(&st("running", Some("starting"), None)), true),
+            ServiceReadiness::Ready
+        );
+        // An image HEALTHCHECK (not in the compose file) starts the same way.
+        assert_eq!(
+            judge_service(&plain, Some(&st("running", Some("starting"), None)), true),
+            ServiceReadiness::Ready
+        );
+        assert_eq!(
+            judge_service(&checked, Some(&st("running", None, None)), true),
+            ServiceReadiness::Ready
+        );
+        // "starting" without a probe: keep waiting, and say why.
+        assert!(matches!(
+            judge_service(&plain, Some(&st("running", Some("starting"), None)), false),
+            ServiceReadiness::Waiting(m) if m.contains("healthcheck is still starting")
+        ));
+        // A probe never overrides unhealthy, an exit, or a restart loop.
+        assert!(matches!(
+            judge_service(&checked, Some(&st("running", Some("unhealthy"), None)), true),
+            ServiceReadiness::Failed(m) if m.contains("unhealthy")
+        ));
+        assert!(matches!(
+            judge_service(&checked, Some(&st("exited", None, Some(1))), true),
+            ServiceReadiness::Failed(_)
+        ));
+        assert!(matches!(
+            judge_service(&checked, Some(&st("restarting", None, None)), true),
+            ServiceReadiness::Waiting(_)
+        ));
+        assert_eq!(
+            judge_service(&plain, Some(&st("exited", None, Some(0))), true),
+            ServiceReadiness::Ready,
+            "one-shot services may still finish"
+        );
+    }
+
+    #[test]
+    fn only_services_waiting_on_their_healthcheck_are_probed() {
+        let checked = spec("web", true);
+        let plain = spec("app", false);
+        assert!(awaits_healthcheck(
+            &plain,
+            &st("running", Some("starting"), None)
+        ));
+        assert!(awaits_healthcheck(&checked, &st("running", None, None)));
+        assert!(!awaits_healthcheck(&plain, &st("running", None, None)));
+        assert!(!awaits_healthcheck(
+            &checked,
+            &st("running", Some("healthy"), None)
+        ));
+        assert!(!awaits_healthcheck(
+            &checked,
+            &st("running", Some("unhealthy"), None)
+        ));
+        assert!(!awaits_healthcheck(
+            &checked,
+            &st("restarting", Some("starting"), None)
+        ));
+    }
+
+    fn health_config(
+        test: &[&str],
+        interval: i64,
+        timeout: i64,
+        start_period: i64,
+        start_interval: i64,
+    ) -> bollard::models::HealthConfig {
+        const S: i64 = 1_000_000_000;
+        bollard::models::HealthConfig {
+            test: Some(test.iter().map(|s| s.to_string()).collect()),
+            interval: Some(interval * S),
+            timeout: Some(timeout * S),
+            start_period: Some(start_period * S),
+            start_interval: Some(start_interval * S),
+            retries: None,
+        }
+    }
+
+    #[test]
+    fn healthcheck_timings_fill_in_docker_defaults() {
+        // vaultwarden/server: HEALTHCHECK --interval=60s --timeout=10s
+        let hc = HealthcheckTiming::from_config(&health_config(
+            &["CMD", "/healthcheck.sh"],
+            60,
+            10,
+            0,
+            0,
+        ))
+        .expect("a healthcheck");
+        assert_eq!(
+            hc,
+            HealthcheckTiming {
+                interval: 60,
+                timeout: 10,
+                start_period: 0,
+                start_interval: 5,
+                retries: 3
+            }
+        );
+        let defaults =
+            HealthcheckTiming::from_config(&health_config(&["CMD-SHELL", "true"], 0, 0, 0, 0))
+                .expect("a healthcheck");
+        assert_eq!((defaults.interval, defaults.timeout), (30, 30));
+        assert_eq!(
+            HealthcheckTiming::from_config(&health_config(&["NONE"], 60, 10, 0, 0)),
+            None
+        );
+        assert_eq!(
+            HealthcheckTiming::from_config(&bollard::models::HealthConfig::default()),
+            None
+        );
+        // Sub-second values round up.
+        let quick = HealthcheckTiming::from_config(&bollard::models::HealthConfig {
+            interval: Some(500_000_000),
+            ..health_config(&["CMD", "x"], 0, 0, 0, 0)
+        })
+        .expect("a healthcheck");
+        assert_eq!(quick.interval, 1);
+    }
+
+    #[test]
+    fn ready_budget_covers_the_first_healthcheck_result() {
+        let timing = |interval, timeout, start_period, start_interval| HealthcheckTiming {
+            interval,
+            timeout,
+            start_period,
+            start_interval,
+            retries: 3,
+        };
+        // No healthcheck, or a quick one: the base timeout.
+        assert_eq!(ready_budget(60, None), 60);
+        assert_eq!(ready_budget(60, Some(&timing(5, 3, 0, 5))), 60);
+        // vaultwarden's image: 60s interval + 10s timeout + slack.
+        assert_eq!(ready_budget(60, Some(&timing(60, 10, 0, 5))), 85);
+        // A start period counts (uptime-kuma's image: 180s + 60s + 30s), capped.
+        assert_eq!(ready_budget(60, Some(&timing(60, 30, 180, 5))), 285);
+        assert_eq!(ready_budget(60, Some(&timing(300, 30, 300, 5))), 300);
+        // A longer drain timeout is still honoured, beyond the cap.
+        assert_eq!(ready_budget(600, Some(&timing(60, 10, 0, 5))), 600);
+        assert_eq!(ready_budget(120, Some(&timing(60, 10, 0, 5))), 120);
+    }
+
+    #[test]
+    fn timeout_detail_names_the_healthcheck_interval() {
+        let hc = HealthcheckTiming {
+            interval: 60,
+            timeout: 10,
+            start_period: 0,
+            start_interval: 5,
+            retries: 3,
+        };
+        assert_eq!(
+            healthcheck_timeout_detail(Some(&hc)),
+            " (its healthcheck runs every 60s)"
+        );
+        let with_start = HealthcheckTiming {
+            start_period: 30,
+            start_interval: 2,
+            ..hc
+        };
+        assert!(
+            healthcheck_timeout_detail(Some(&with_start))
+                .contains("every 2s during a 30s start period")
+        );
+        assert_eq!(healthcheck_timeout_detail(None), "");
     }
 
     #[test]

@@ -8,3 +8,11 @@ services:
     cap_add: [NET_RAW]
     volumes:
       - ./data:/app/data
+    # Timings only: the image's own HEALTHCHECK test is kept, but its 60s interval
+    # would keep the deploy waiting.
+    healthcheck:
+      interval: 20s
+      timeout: 10s
+      start_period: 60s
+      start_interval: 2s
+      retries: 5

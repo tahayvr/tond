@@ -268,6 +268,26 @@ fn classify_inner(ctx: &FailureContext<'_>) -> DeployFailure {
                     "Make sure {service} listens on the published container port (on 0.0.0.0, not 127.0.0.1), or publish the port it really uses."
                 ),
             )
+        } else if contains_any(err, &["healthcheck is still starting"]) {
+            // "… (its healthcheck runs every 60s …)"
+            let interval = err
+                .split_once("runs every ")
+                .and_then(|(_, rest)| rest.split_once('s'))
+                .map(|(n, _)| n)
+                .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+            let how_often = interval
+                .map(|n| {
+                    format!(
+                        " Its healthcheck runs every {n}s, so Docker reports the first result late."
+                    )
+                })
+                .unwrap_or_default();
+            (
+                format!("Service {service}'s healthcheck was still starting"),
+                format!(
+                    "The container runs, but Docker still reported its healthcheck as \"starting\" when Tond stopped waiting.{how_often} Set a shorter interval and a start_interval under the service's healthcheck: in the compose file (e.g. interval: 10s, start_period: 30s, start_interval: 2s), or raise the drain timeout if it is just slow to start."
+                ),
+            )
         } else {
             (
                 format!("Service {service} wasn't ready in time"),
@@ -611,6 +631,22 @@ mod tests {
             &[],
         ));
         assert!(f.hint.contains("0.0.0.0"), "{}", f.hint);
+        let f = classify(&ctx(
+            "services did not become ready within 86s: service \"vaultwarden\" healthcheck is still starting (its healthcheck runs every 60s)",
+            &[],
+        ));
+        assert_eq!(f.code, "compose_service_failed");
+        assert_eq!(
+            f.title,
+            "Service vaultwarden's healthcheck was still starting"
+        );
+        assert!(f.hint.contains("runs every 60s"), "{}", f.hint);
+        assert!(f.hint.contains("start_interval"), "{}", f.hint);
+        let f = classify(&ctx(
+            "services did not become ready within 60s: service \"db\" is restarting",
+            &[],
+        ));
+        assert_eq!(f.title, "Service db wasn't ready in time");
         let f = classify(&ctx(
             "service \"cache\": could not pull redis:9: Failed to pull image: manifest unknown",
             &[],

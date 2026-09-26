@@ -57,7 +57,11 @@
 // service has `restart` and `mem_limit`, only the public service publishes a
 // port and only as "<port>" (Tond picks the loopback host port), data lives in
 // declared `./…` binds (named volumes aren't in backups), every ${VAR} is an
-// input and every input is used.
+// input and every input is used. A service `healthcheck:` sets `interval` (at
+// most 30s) and, with a `start_period`, a `start_interval` of at most 5s, so a
+// deploy is ready in seconds. A service whose image ships a slow HEALTHCHECK
+// (Docker's default interval is 30s) overrides its timings the same way; the
+// image's own test is inherited when `test:` is left out.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -633,6 +637,98 @@ pub fn parse_memory_mb(s: &str) -> Option<u32> {
     (mb >= 1.0 && mb < f64::from(u32::MAX)).then_some(mb.round() as u32)
 }
 
+/// A compose duration ("10s", "1m30s", "500ms", "1h") in seconds.
+pub fn parse_compose_duration(s: &str) -> Option<f64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let mut total = 0.0;
+    let mut rest = s;
+    while !rest.is_empty() {
+        let num_len = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(rest.len());
+        if num_len == 0 {
+            return None;
+        }
+        let n: f64 = rest[..num_len].parse().ok()?;
+        rest = &rest[num_len..];
+        let unit_len = rest
+            .find(|c: char| c.is_ascii_digit() || c == '.')
+            .unwrap_or(rest.len());
+        let factor = match &rest[..unit_len] {
+            "h" => 3600.0,
+            "m" => 60.0,
+            "s" => 1.0,
+            "ms" => 1e-3,
+            "us" | "µs" => 1e-6,
+            "ns" => 1e-9,
+            _ => return None,
+        };
+        total += n * factor;
+        rest = &rest[unit_len..];
+    }
+    Some(total)
+}
+
+/// Longest healthcheck `interval` a template may set.
+pub const TEMPLATE_MAX_HEALTHCHECK_INTERVAL_SECS: f64 = 30.0;
+/// Longest healthcheck `start_interval` a template may set.
+pub const TEMPLATE_MAX_HEALTHCHECK_START_INTERVAL_SECS: f64 = 5.0;
+
+/// A template service's `healthcheck:` keeps deploys fast: an explicit
+/// `interval` of at most 30s and, with a `start_period`, a short
+/// `start_interval` (checks run that often while the service boots).
+fn check_template_healthcheck(name: &str, hc: &Value) -> Result<(), String> {
+    let Some(hc) = hc.as_mapping() else {
+        return Err(format!("service {name}: 'healthcheck' must be a mapping"));
+    };
+    if hc
+        .get("disable")
+        .is_some_and(|d| matches!(d, Value::Bool(true)))
+    {
+        return Ok(());
+    }
+    let duration = |key: &str| -> Result<Option<f64>, String> {
+        match hc.get(key) {
+            None => Ok(None),
+            Some(v) => scalar(v)
+                .as_deref()
+                .and_then(parse_compose_duration)
+                .map(Some)
+                .ok_or_else(|| {
+                    format!("service {name}: healthcheck {key} must be a duration like 10s")
+                }),
+        }
+    };
+    match duration("interval")? {
+        None => {
+            return Err(format!(
+                "service {name}: set healthcheck interval (at most 30s; Docker's default of 30s keeps a deploy waiting)"
+            ));
+        }
+        Some(i) if i > TEMPLATE_MAX_HEALTHCHECK_INTERVAL_SECS => {
+            return Err(format!(
+                "service {name}: healthcheck interval must be at most 30s so a deploy doesn't wait for it"
+            ));
+        }
+        Some(_) => {}
+    }
+    let start_interval = duration("start_interval")?;
+    if start_interval.is_some_and(|s| s > TEMPLATE_MAX_HEALTHCHECK_START_INTERVAL_SECS) {
+        return Err(format!(
+            "service {name}: healthcheck start_interval must be at most 5s"
+        ));
+    }
+    if duration("start_period")?.is_some_and(|p| p > 0.0) && start_interval.is_none() {
+        return Err(format!(
+            "service {name}: a healthcheck start_period needs a start_interval (e.g. 2s) so the service is seen healthy as soon as it is up"
+        ));
+    }
+    Ok(())
+}
+
 /// Whether an image reference is pinned: a digest, or a tag with a version
 /// number that isn't one of the moving tags.
 pub fn image_is_pinned(image: &str) -> bool {
@@ -869,6 +965,10 @@ pub fn validate(
             return fail(format!(
                 "service {name}: 'container_name' clashes between apps; leave it out"
             ));
+        }
+
+        if let Some(hc) = get("healthcheck") {
+            check_template_healthcheck(&name, hc).map_err(|e| invalid(id, e))?;
         }
 
         let public = name == m.public.service;
@@ -1374,6 +1474,104 @@ services:
             "{COMPOSE}  db:\n    image: postgres:16-alpine\n    restart: unless-stopped\n    mem_limit: 128m\n    ports: [\"5432\"]\n"
         );
         assert_err(MANIFEST, &extra, "only the public service publishes");
+    }
+
+    #[test]
+    fn parses_compose_durations() {
+        assert_eq!(parse_compose_duration("10s"), Some(10.0));
+        assert_eq!(parse_compose_duration("1m30s"), Some(90.0));
+        assert_eq!(parse_compose_duration("1h"), Some(3600.0));
+        assert_eq!(parse_compose_duration("500ms"), Some(0.5));
+        assert_eq!(parse_compose_duration("1.5s"), Some(1.5));
+        for bad in ["", "10", "s", "10x", "1m30"] {
+            assert_eq!(parse_compose_duration(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn template_healthchecks_must_be_quick() {
+        let with = |hc: &str| {
+            COMPOSE.replace(
+                "    volumes:\n",
+                &format!("    healthcheck:\n{hc}    volumes:\n"),
+            )
+        };
+        // Short timings pass; so does inheriting the image's test.
+        demo();
+        Template::parse(
+            "demo",
+            MANIFEST,
+            &with("      interval: 10s\n      start_period: 30s\n      start_interval: 2s\n"),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        Template::parse("demo", MANIFEST, &with("      disable: true\n"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_err(
+            MANIFEST,
+            &with("      test: [\"CMD\", \"true\"]\n"),
+            "set healthcheck interval",
+        );
+        assert_err(MANIFEST, &with("      interval: 1m\n"), "at most 30s");
+        assert_err(
+            MANIFEST,
+            &with("      interval: soon\n"),
+            "duration like 10s",
+        );
+        assert_err(
+            MANIFEST,
+            &with("      interval: 10s\n      start_period: 30s\n"),
+            "needs a start_interval",
+        );
+        assert_err(
+            MANIFEST,
+            &with("      interval: 10s\n      start_period: 30s\n      start_interval: 10s\n"),
+            "start_interval must be at most 5s",
+        );
+    }
+
+    /// Images that ship their own HEALTHCHECK with Docker's 30s default
+    /// interval or longer (checked with `docker image inspect`): a template
+    /// using one overrides the timings, or its deploys wait for the first
+    /// check.
+    const IMAGES_WITH_SLOW_HEALTHCHECKS: &[&str] = &[
+        "appsmith/appsmith-ce",
+        "excalidraw/excalidraw",
+        "ghcr.io/immich-app/immich-server",
+        "ghcr.io/immich-app/postgres",
+        "ghcr.io/mealie-recipes/mealie",
+        "ghcr.io/paperless-ngx/paperless-ngx",
+        "gotify/server",
+        "louislam/uptime-kuma",
+        "mattermost/mattermost-team-edition",
+        "sissbruecker/linkding",
+        "stirlingtools/stirling-pdf",
+        "vaultwarden/server",
+    ];
+
+    #[test]
+    fn images_with_slow_healthchecks_get_quick_template_healthchecks() {
+        for t in builtin_templates().unwrap_or_else(|e| panic!("{e}")) {
+            let doc: Value = serde_yaml::from_str(&t.compose).unwrap_or_else(|e| panic!("{e}"));
+            for svc in &t.services {
+                let image = svc.image.split('@').next().unwrap_or_default();
+                let repo = match image.rsplit_once(':') {
+                    Some((repo, tag)) if !tag.contains('/') => repo,
+                    _ => image,
+                };
+                if !IMAGES_WITH_SLOW_HEALTHCHECKS.contains(&repo) {
+                    continue;
+                }
+                assert!(
+                    doc["services"][svc.name.as_str()]
+                        .get("healthcheck")
+                        .is_some(),
+                    "{}: service {} uses {} whose built-in healthcheck is slow; add a healthcheck with a short interval and start_interval",
+                    t.manifest.id,
+                    svc.name,
+                    svc.image
+                );
+            }
+        }
     }
 
     #[test]
