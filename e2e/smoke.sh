@@ -995,33 +995,6 @@ running_image=$(docker inspect tond-e2e-whoami | jq -r '.[0].Config.Image')
 wait_for 60 "route after rollback" bash -c "curl -sk --resolve '${WHOAMI_DOMAIN}:443:${IP}' 'https://${WHOAMI_DOMAIN}/' | grep -q Hostname:"
 pass "rollback restored the exact previous image and traffic follows"
 
-step "Build queue: coalescing, 202 + queue position, acknowledged cutover"
-wait_for_app_running e2e-whoami 120
-# Three deploys back to back: the first runs, the second waits, the third
-# supersedes the second (one deploy in flight per app, newest wins).
-q1=$(api_req POST /api/apps/e2e-whoami/deploy '{}'); b1=$(cat "$API_BODY")
-q2=$(api_req POST /api/apps/e2e-whoami/deploy '{}'); b2=$(cat "$API_BODY")
-q3=$(api_req POST /api/apps/e2e-whoami/deploy '{}'); b3=$(cat "$API_BODY")
-[[ "$q1 $q2 $q3" == "202 202 202" ]] || fail "deploys must be accepted with 202, got ${q1} ${q2} ${q3}"
-for b in "$b1" "$b2" "$b3"; do
-    echo "$b" | jq -e '.data.deployment_id and .data.status == "queued" and .data.queue_position >= 1' > /dev/null \
-        || fail "a queued deploy must return its deployment id and queue position: ${b}"
-done
-D2=$(echo "$b2" | jq -r .data.deployment_id)
-D3=$(echo "$b3" | jq -r .data.deployment_id)
-[[ "$(echo "$b3" | jq -r .data.superseded)" == "$D2" ]] || fail "the third deploy must supersede the second: ${b3}"
-wait_for 300 "the newest deploy to succeed" \
-    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/apps/e2e-whoami/deployments | jq -e --arg id '${D3}' '.data[] | select(.id == \$id and .status == \"succeeded\")'"
-api /api/apps/e2e-whoami/deployments | jq -e --arg id "$D2" --arg by "$D3" \
-    '.data[] | select(.id == $id and .status == "superseded" and .superseded_by == $by)' > /dev/null \
-    || fail "the waiting deploy must be marked superseded by the newest one"
-pass "3 deploys → first ran, second superseded by the third, third succeeded"
-wait_for_app_running e2e-whoami 120
-tond apps logs e2e-whoami 2>/dev/null | grep -q "Proxy confirmed the new route in" \
-    || { tond apps logs e2e-whoami | tail -20 >&2; fail "the cutover must wait for tond-proxy's acknowledgement"; }
-pass "cutover waited for the proxy's acknowledgement ($(tond apps logs e2e-whoami | grep -o 'confirmed the new route in [0-9]* ms' | tail -1))"
-wait_for 30 "route after queued deploys" bash -c "curl -sk --resolve '${WHOAMI_DOMAIN}:443:${IP}' 'https://${WHOAMI_DOMAIN}/' | grep -q Hostname:"
-
 step "Deploy UX: phases, trigger, likely cause, DNS check"
 ROLLBACK_ROW=$(deployments | jq -c '.data[0]')
 [[ "$(jq -r '.rollback_of' <<< "$ROLLBACK_ROW")" == "$FIRST_ID" ]] \
@@ -1075,6 +1048,33 @@ DNS_STATUS=$(jq -r '.data.dns.status' "$API_BODY")
 code=$(api_req GET "/api/domains/check?domain=not_a_domain" '')
 [[ "$code" == 400 ]] || fail "an invalid domain must be rejected with 400, got ${code}"
 pass "domain check reports DNS '${DNS_STATUS}' for ${WHOAMI_DOMAIN}; invalid domains → 400"
+
+step "Build queue: coalescing, 202 + queue position, acknowledged cutover"
+wait_for_app_running e2e-whoami 120
+# Three deploys back to back: the first runs, the second waits, the third
+# supersedes the second (one deploy in flight per app, newest wins).
+q1=$(api_req POST /api/apps/e2e-whoami/deploy '{}'); b1=$(cat "$API_BODY")
+q2=$(api_req POST /api/apps/e2e-whoami/deploy '{}'); b2=$(cat "$API_BODY")
+q3=$(api_req POST /api/apps/e2e-whoami/deploy '{}'); b3=$(cat "$API_BODY")
+[[ "$q1 $q2 $q3" == "202 202 202" ]] || fail "deploys must be accepted with 202, got ${q1} ${q2} ${q3}"
+for b in "$b1" "$b2" "$b3"; do
+    echo "$b" | jq -e '.data.deployment_id and .data.status == "queued" and .data.queue_position >= 1' > /dev/null \
+        || fail "a queued deploy must return its deployment id and queue position: ${b}"
+done
+D2=$(echo "$b2" | jq -r .data.deployment_id)
+D3=$(echo "$b3" | jq -r .data.deployment_id)
+[[ "$(echo "$b3" | jq -r .data.superseded)" == "$D2" ]] || fail "the third deploy must supersede the second: ${b3}"
+wait_for 300 "the newest deploy to succeed" \
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/apps/e2e-whoami/deployments | jq -e --arg id '${D3}' '.data[] | select(.id == \$id and .status == \"succeeded\")'"
+api /api/apps/e2e-whoami/deployments | jq -e --arg id "$D2" --arg by "$D3" \
+    '.data[] | select(.id == $id and .status == "superseded" and .superseded_by == $by)' > /dev/null \
+    || fail "the waiting deploy must be marked superseded by the newest one"
+pass "3 deploys → first ran, second superseded by the third, third succeeded"
+wait_for_app_running e2e-whoami 120
+tond apps logs e2e-whoami 2>/dev/null | grep -q "Proxy confirmed the new route in" \
+    || { tond apps logs e2e-whoami | tail -20 >&2; fail "the cutover must wait for tond-proxy's acknowledgement"; }
+pass "cutover waited for the proxy's acknowledgement ($(tond apps logs e2e-whoami | grep -o 'confirmed the new route in [0-9]* ms' | tail -1))"
+wait_for 30 "route after queued deploys" bash -c "curl -sk --resolve '${WHOAMI_DOMAIN}:443:${IP}' 'https://${WHOAMI_DOMAIN}/' | grep -q Hostname:"
 
 step "Resource metrics (cgroup sampling, restarts, cached host stats)"
 # The collector samples every 30 s; the first reading only primes the rates.
