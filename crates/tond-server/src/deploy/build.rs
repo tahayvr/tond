@@ -26,7 +26,7 @@ use super::git::{
 
 /// The commit checked out in `dir` (best-effort).
 async fn read_commit(dir: &str) -> Option<CommitInfo> {
-    let output = tokio::process::Command::new("git")
+    let output = crate::process::command("git")
         .args(COMMIT_LOG_ARGS)
         .current_dir(dir)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -59,7 +59,7 @@ fn compose_file_path(work_dir: &str) -> String {
 /// environment: compose interpolates `${VAR}` from its own environment, and
 /// tond-server's holds TOND_SECRET_KEY. Only what docker needs is passed on.
 fn compose_command(compose_path: &str, app_name: &str) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new("docker");
+    let mut cmd = crate::process::command("docker");
     cmd.env_clear();
     for key in [
         "PATH",
@@ -322,7 +322,7 @@ pub(super) async fn build_from_git(
     )
     .await?;
 
-    let mut cmd = tokio::process::Command::new("git");
+    let mut cmd = crate::process::command("git");
     cmd.args(clone_args(branch, git_url, &work_dir))
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ALLOW_PROTOCOL", GIT_ALLOW_PROTOCOL);
@@ -540,7 +540,7 @@ pub(super) async fn build_with_dockerfile(
         cgroup_parent.as_deref(),
     );
 
-    let mut child = tokio::process::Command::new("docker")
+    let mut child = crate::process::command("docker")
         .args(&args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

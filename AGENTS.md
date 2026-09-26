@@ -240,3 +240,6 @@ One system for all of these — never hand-roll a pill, banner or `confirm()`:
   (`runtime::changes::Watch`), never on a short fixed tick; register them in
   `runtime::loops` so `/api/system/self` shows their health. `e2e/budget.sh` checks RSS,
   wakeups, DB queries and journal lines at idle.
+- Spawn child processes with `crate::process::command(..)`, not `tokio::process::Command::new`:
+  tond-server runs with `OOMScoreAdjust=-900`, and the helper resets children (git, docker CLI,
+  tar) to a neutral OOM score so they can't hide behind Tond's protection.
