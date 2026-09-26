@@ -36,6 +36,7 @@
 //   The handler returns 202 immediately; the caller polls app status.
 
 pub mod alerts;
+pub mod app_events;
 pub mod audit_log;
 pub mod audit_shipping;
 pub mod auth;

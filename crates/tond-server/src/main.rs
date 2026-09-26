@@ -583,6 +583,10 @@ async fn run() -> Result<()> {
         )
         // Metrics
         .route(
+            "/api/apps/{id}/events",
+            get(handlers::app_events::list_app_events),
+        )
+        .route(
             "/api/apps/{id}/metrics",
             get(handlers::metrics::get_app_metrics),
         )
