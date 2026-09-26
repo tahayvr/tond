@@ -25,8 +25,9 @@
 //   GET /api/audit-log/verify and `tond audit verify`.
 //
 //   Limits: truncating the newest rows can't be detected from inside the
-//   database; shipping entries to a remote sink (a planned follow-up) closes
-//   that gap.
+//   database. Shipping every entry to a remote syslog server or webhook
+//   (audit_ship.rs, Settings → Audit log shipping) closes that gap: the
+//   remote copy shows what the local log should still contain.
 //
 // Writes are serialised by a process-wide mutex (tond-server is the only
 // writer) and each append runs in its own short transaction.

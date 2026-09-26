@@ -69,6 +69,7 @@ fn router(state: AppState, peer: &str) -> Router {
         .route("/api/projects/{id}", get(handlers::projects::get_project))
         .route("/api/databases", get(handlers::databases::list_databases))
         .route("/api/audit-log", get(handlers::audit_log::list_audit_log))
+        .route("/metrics", get(handlers::system_self::metrics))
         .with_state(state)
         .layer(Extension(ConnectInfo(
             peer.parse::<SocketAddr>()
@@ -255,4 +256,48 @@ async fn allowed_ips_are_checked_against_the_client_address() {
             .unwrap_or_else(|err| panic!("load: {err}"));
     assert!(used.0.is_some(), "last use is recorded");
     assert_eq!(used.1.as_deref(), Some("203.0.113.50"));
+}
+
+#[tokio::test]
+async fn prometheus_scrapes_metrics_over_tcp_with_a_metrics_read_token() {
+    let state = test_state().await;
+    let app = router(state.clone(), "203.0.113.9:4000");
+    let (scraper, _) = token(&state, req("prometheus", &["metrics:read"])).await;
+    let (other, _) = token(&state, req("reader", &["apps:read"])).await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .header(header::AUTHORIZATION, format!("Bearer {scraper}"))
+                .body(Body::empty())
+                .unwrap_or_else(|err| panic!("request: {err}")),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("oneshot: {err}"));
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("text/plain; version=0.0.4"))
+    );
+
+    let (status, body) = call(&app, "/metrics", &other).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "SCOPE_DENIED");
+
+    let anonymous = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap_or_else(|err| panic!("request: {err}")),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("oneshot: {err}"));
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
 }

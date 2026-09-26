@@ -70,6 +70,7 @@
 
 mod alerts;
 mod audit_log;
+mod audit_ship;
 mod auth;
 mod backup;
 mod compose_policy;
@@ -113,7 +114,6 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use tower_http::trace::TraceLayer;
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
 use crate::runtime::{dbstats::DbStatsLayer, http_metrics, selfstats, shutdown};
@@ -144,10 +144,9 @@ async fn run() -> Result<()> {
     tond_common::install_crypto_provider();
     // Logging: the journal gets RUST_LOG (default info); DbStatsLayer counts
     // every SQL statement through its own filter (runtime/dbstats.rs).
+    let log_format = tond_common::logging::LogFormat::from_env();
     tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        ))
+        .with(tond_common::logging::fmt_layer(log_format))
         .with(DbStatsLayer.with_filter(DbStatsLayer::filter()))
         .init();
 
@@ -232,6 +231,7 @@ async fn run() -> Result<()> {
     tokio::spawn(alerts::run_alert_engine(state.clone()));
     tokio::spawn(cron::run_cron_scheduler(state.clone()));
     tokio::spawn(janitor::run_janitor(state.clone()));
+    tokio::spawn(audit_ship::run(state.clone()));
     tokio::spawn(backup::backup_scheduler(state.clone()));
     tokio::spawn(run_preview_cleanup_loop(state.clone()));
     tokio::spawn(uptime::run(state.clone()));
@@ -380,6 +380,10 @@ async fn run() -> Result<()> {
             get(handlers::deployments::list_deployments),
         )
         .route(
+            "/api/apps/{id}/deployments/stats",
+            get(handlers::deploy_stats::deploy_stats),
+        )
+        .route(
             "/api/apps/{id}/deployments/{deployment_id}",
             get(handlers::deployments::get_deployment),
         )
@@ -403,11 +407,18 @@ async fn run() -> Result<()> {
             post(handlers::deployments::rollback_app),
         )
         // Certificate management
-        .route("/api/certs", get(handlers::list_certs))
-        .route("/api/certs/{domain}/retry", post(handlers::retry_cert))
+        .route("/api/certs", get(handlers::certificates::list_certs))
+        .route(
+            "/api/certs/{domain}/retry",
+            post(handlers::certificates::retry_cert),
+        )
         // Server settings
         .route("/api/settings", get(handlers::settings::get_settings))
         .route("/api/settings", put(handlers::settings::update_settings))
+        .route(
+            "/api/settings/retention",
+            get(handlers::retention::get_retention).put(handlers::retention::update_retention),
+        )
         // Host terminal switch: readable by any authenticated caller, writable
         // only over the root-only Unix socket (`tond settings host-terminal`)
         .route(
@@ -578,6 +589,10 @@ async fn run() -> Result<()> {
         )
         // Metrics
         .route(
+            "/api/apps/{id}/events",
+            get(handlers::app_events::list_app_events),
+        )
+        .route(
             "/api/apps/{id}/metrics",
             get(handlers::metrics::get_app_metrics),
         )
@@ -653,6 +668,15 @@ async fn run() -> Result<()> {
         )
         // Audit log
         .route("/api/audit-log", get(handlers::audit_log::list_audit_log))
+        .route(
+            "/api/audit-log/shipping",
+            get(handlers::audit_shipping::get_shipping)
+                .put(handlers::audit_shipping::update_shipping),
+        )
+        .route(
+            "/api/audit-log/shipping/test",
+            post(handlers::audit_shipping::test_shipping),
+        )
         .route(
             "/api/audit-log/verify",
             get(handlers::audit_log::verify_audit_log),

@@ -499,7 +499,24 @@ export async function updateDomain(id: string, domain: string): Promise<UpdateDo
 
 // ── Certificates ──
 
+/** Which CA issued a certificate. */
+export type IssuerKind = 'letsencrypt' | 'letsencrypt_staging' | 'custom' | 'unknown';
+
+/** What a certificate's domain is used for right now. */
+export type CertificateTarget =
+	| { kind: 'dashboard' }
+	| { kind: 'app'; app_id: string; app_name: string }
+	| {
+			kind: 'preview';
+			app_id: string;
+			app_name: string;
+			preview_id: string;
+			pr_number: number | null;
+	  }
+	| { kind: 'unused' };
+
 export interface Certificate {
+	/** Empty for a served domain tond-proxy has not reported on yet */
 	id: string;
 	domain: string;
 	cert_type: string;
@@ -513,6 +530,12 @@ export interface Certificate {
 	/** No new attempt before this time (exponential backoff) */
 	next_retry_at: string | null;
 	failure_count: number;
+	/** Issuing CA as named in the certificate, e.g. "Let's Encrypt R11" */
+	issuer: string | null;
+	issuer_kind: IssuerKind;
+	/** Last successful issuance or renewal */
+	last_renewed_at: string | null;
+	serves: CertificateTarget;
 }
 
 export async function listCertificates(): Promise<Certificate[]> {
@@ -972,6 +995,178 @@ export async function updateSettings(data: Partial<ServerSettings>): Promise<Ser
 		method: 'PUT',
 		body: JSON.stringify(data)
 	});
+}
+
+// ── Retention ──
+
+/** One retention rule with its current value and accepted range. */
+export interface RetentionField {
+	/** settings key, e.g. "retention_audit_log_days" */
+	key: string;
+	value: number;
+	default: number;
+	min: number;
+	max: number;
+	/** "deploys" | "days" | "runs" */
+	unit: string;
+}
+
+export interface TableSize {
+	name: string;
+	bytes: number;
+}
+
+export interface DatabaseSize {
+	file_bytes: number;
+	wal_bytes: number;
+	free_bytes: number;
+	/** Largest first; empty when the breakdown is unavailable */
+	tables: TableSize[];
+	measured_at: string;
+}
+
+export interface RetentionSettings {
+	fields: RetentionField[];
+	database: DatabaseSize | null;
+}
+
+export async function getRetention(): Promise<RetentionSettings> {
+	return request<RetentionSettings>('/settings/retention');
+}
+
+/** Change some retention rules: `{ retention_audit_log_days: 365 }`. */
+export async function updateRetention(changes: Record<string, number>): Promise<RetentionSettings> {
+	return request<RetentionSettings>('/settings/retention', {
+		method: 'PUT',
+		body: JSON.stringify(changes)
+	});
+}
+
+// ── Audit log shipping ──
+
+/** Delivery progress of one audit shipping destination. */
+export interface DeliveryStatus {
+	/** Last audit entry the destination accepted */
+	shipped_seq: number;
+	/** Entries waiting to be delivered */
+	pending: number;
+	failures: number;
+	last_attempt_at: string | null;
+	last_success_at: string | null;
+	last_error: string | null;
+	next_attempt_at: string | null;
+	/** Entries removed by retention before they could be delivered */
+	dropped: number;
+}
+
+export interface AuditShipping {
+	syslog: { enabled: boolean; host: string; port: number; tls: boolean; status: DeliveryStatus };
+	webhook: { enabled: boolean; url: string; has_secret: boolean; status: DeliveryStatus };
+	latest_seq: number;
+}
+
+export interface UpdateAuditShipping {
+	syslog?: { enabled: boolean; host: string; port: number; tls: boolean };
+	/** `secret` omitted or null keeps the stored one */
+	webhook?: { enabled: boolean; url: string; secret?: string | null };
+}
+
+export type ShippingDestination = 'syslog' | 'webhook';
+
+export async function getAuditShipping(): Promise<AuditShipping> {
+	return request<AuditShipping>('/audit-log/shipping');
+}
+
+export async function updateAuditShipping(body: UpdateAuditShipping): Promise<AuditShipping> {
+	return request<AuditShipping>('/audit-log/shipping', {
+		method: 'PUT',
+		body: JSON.stringify(body)
+	});
+}
+
+export async function testAuditShipping(
+	destination: ShippingDestination
+): Promise<{ ok: boolean; message: string }> {
+	return request<{ ok: boolean; message: string }>('/audit-log/shipping/test', {
+		method: 'POST',
+		body: JSON.stringify({ destination })
+	});
+}
+
+// ── App events ──
+
+export type AppEventKind =
+	| 'deploy_started'
+	| 'deploy_succeeded'
+	| 'deploy_failed'
+	| 'deploy_cancelled'
+	| 'restart'
+	| 'crash'
+	| 'oom'
+	| 'cert_issued'
+	| 'cert_failed'
+	| 'domain_changed'
+	| 'resources_changed'
+	| 'config_changed'
+	| 'control'
+	| 'alert_fired'
+	| 'alert_resolved'
+	| 'uptime_down'
+	| 'uptime_up';
+
+export interface AppEvent {
+	at: string;
+	kind: AppEventKind;
+	severity: 'info' | 'success' | 'warning' | 'danger';
+	title: string;
+	detail: string | null;
+	actor: string | null;
+	deployment_id: string | null;
+}
+
+export interface AppEventsPage {
+	/** Newest first */
+	events: AppEvent[];
+	/** Pass as `before` for older events; null when there are none */
+	next_before: string | null;
+}
+
+export async function getAppEvents(
+	id: string,
+	opts: { limit?: number; before?: string | null } = {}
+): Promise<AppEventsPage> {
+	const params = new URLSearchParams();
+	if (opts.limit) params.set('limit', String(opts.limit));
+	if (opts.before) params.set('before', opts.before);
+	const query = params.toString();
+	return request<AppEventsPage>(`/apps/${id}/events${query ? `?${query}` : ''}`);
+}
+
+// ── Deploy trend ──
+
+export interface DeployOutcome {
+	id: string;
+	/** "succeeded" | "failed" | "superseded" | "cancelled" */
+	status: string;
+	started_at: string;
+	duration_secs: number | null;
+	commit_sha: string | null;
+}
+
+export interface DeployStats {
+	/** Finished deployments covered (at most 30) */
+	window: number;
+	succeeded: number;
+	failed: number;
+	/** 0–1; null before the first result */
+	success_rate: number | null;
+	median_duration_secs: number | null;
+	/** Oldest first */
+	outcomes: DeployOutcome[];
+}
+
+export async function getDeployStats(id: string): Promise<DeployStats> {
+	return request<DeployStats>(`/apps/${id}/deployments/stats`);
 }
 
 // ── Deployments ──

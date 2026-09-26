@@ -623,6 +623,19 @@ pub async fn run(state: AppState) {
     }
 }
 
+/// Short label for a cause ("TLS certificate", "timeout", …).
+pub fn cause_label(cause: Cause) -> &'static str {
+    match cause {
+        Cause::Dns => "DNS doesn't resolve",
+        Cause::Refused => "connection refused",
+        Cause::Connect => "connection failed",
+        Cause::Timeout => "timeout",
+        Cause::Tls => "TLS certificate",
+        Cause::Http5xx => "server error (5xx)",
+        Cause::HttpStatus => "unexpected status",
+    }
+}
+
 /// Human text for the DNS state (for the API).
 pub fn dns_label(dns: DnsState) -> &'static str {
     match dns {

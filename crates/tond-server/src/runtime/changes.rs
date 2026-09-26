@@ -36,6 +36,8 @@ pub enum Table {
     RouteState,
     Deployments,
     Databases,
+    AuditLog,
+    AuditShipping,
     Certificates,
     Snapshots,
     /// Not a table: the alert engine queued deliveries to send now
@@ -46,7 +48,7 @@ pub enum Table {
 }
 
 impl Table {
-    const ALL: [Table; 12] = [
+    const ALL: [Table; 14] = [
         Table::Apps,
         Table::PreviewDeployments,
         Table::CronJobs,
@@ -55,6 +57,8 @@ impl Table {
         Table::RouteState,
         Table::Deployments,
         Table::Databases,
+        Table::AuditLog,
+        Table::AuditShipping,
         Table::Certificates,
         Table::Snapshots,
         Table::AlertKick,
@@ -79,6 +83,8 @@ impl Table {
             "route_state" => Table::RouteState,
             "deployments" => Table::Deployments,
             "databases" => Table::Databases,
+            "audit_log" => Table::AuditLog,
+            "audit_shipping" => Table::AuditShipping,
             "certificates" => Table::Certificates,
             "snapshots" => Table::Snapshots,
             "uptime_checks" => Table::Uptime,

@@ -660,6 +660,37 @@ configure_docker_daemon() {
     fi
 }
 
+# Cap the systemd journal (tond-server, tond-proxy and everything else log
+# there) at 500 MB. A drop-in, so /etc/systemd/journald.conf stays untouched,
+# and only when no SystemMaxUse is configured anywhere yet: an operator's
+# choice always wins.
+JOURNALD_DROPIN_DIR="/etc/systemd/journald.conf.d"
+JOURNALD_DROPIN="${JOURNALD_DROPIN_DIR}/tond.conf"
+configure_journald() {
+    [[ -d /etc/systemd ]] || return 0
+    if [[ -f "$JOURNALD_DROPIN" ]]; then
+        return 0
+    fi
+    local existing
+    existing=$(grep -lsE '^[[:space:]]*SystemMaxUse[[:space:]]*=' \
+        /etc/systemd/journald.conf "${JOURNALD_DROPIN_DIR}"/*.conf 2>/dev/null | head -n1 || true)
+    if [[ -n "$existing" ]]; then
+        info "Journal size already capped in ${existing}; leaving it"
+        return 0
+    fi
+    mkdir -p "$JOURNALD_DROPIN_DIR"
+    printf '%s\n' \
+        '# Written by the Tond installer: keep the journal under 500 MB.' \
+        '# Delete this file or set SystemMaxUse elsewhere to change it.' \
+        '[Journal]' \
+        'SystemMaxUse=500M' > "$JOURNALD_DROPIN"
+    chmod 0644 "$JOURNALD_DROPIN"
+    if command -v systemctl > /dev/null && systemctl is-active --quiet systemd-journald; then
+        systemctl restart systemd-journald || warn "Could not restart systemd-journald; the cap applies after the next reboot"
+    fi
+    info "Capped the systemd journal at 500 MB (${JOURNALD_DROPIN})"
+}
+
 create_directories() {
     step "Creating directory structure"
 
@@ -1293,6 +1324,7 @@ main() {
     install_dependencies
     install_docker
     configure_docker_daemon
+    configure_journald
     ensure_proxy_user
     ensure_terminal_user
     create_directories

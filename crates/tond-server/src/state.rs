@@ -72,3 +72,28 @@ impl AppState {
         })
     }
 }
+
+#[cfg(test)]
+impl AppState {
+    /// A state over a migrated in-memory database and an unreachable Docker
+    /// client, for handler tests.
+    pub async fn for_tests() -> Self {
+        let db = SqlitePool::connect("sqlite::memory:")
+            .await
+            .unwrap_or_else(|e| panic!("in-memory pool: {e}"));
+        db::migrate(&db)
+            .await
+            .unwrap_or_else(|e| panic!("migrations: {e}"));
+        Self {
+            db,
+            docker: Docker::connect_with_http(
+                "http://127.0.0.1:2375",
+                5,
+                bollard::API_DEFAULT_VERSION,
+            )
+            .unwrap_or_else(|e| panic!("docker client: {e}")),
+            rate_limiter: RateLimiter::new(60, 10.0),
+            settings: Arc::new(RwLock::new(ServerSettings::default())),
+        }
+    }
+}

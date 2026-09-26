@@ -76,6 +76,8 @@ pub enum Purpose {
     /// heartbeat_config.url_enc (a heartbeat URL is a bearer secret: anyone
     /// holding it can report the server healthy)
     HeartbeatUrl,
+    /// audit_shipping.webhook_secret (HMAC key for shipped audit entries)
+    AuditWebhookSecret,
 }
 
 impl Purpose {
@@ -99,6 +101,7 @@ impl Purpose {
             Purpose::GithubPrivateKey => b"tond:github_apps.private_key",
             Purpose::IntegrationSecret => b"tond:integrations.config",
             Purpose::HeartbeatUrl => b"tond:heartbeat_config.url_enc",
+            Purpose::AuditWebhookSecret => b"tond:audit_shipping.webhook_secret",
         }
     }
 }
@@ -489,6 +492,11 @@ pub const SCALAR_SECRET_COLUMNS: &[(&str, &str, Purpose)] = &[
         Purpose::GithubWebhookSecret,
     ),
     ("github_apps", "private_key", Purpose::GithubPrivateKey),
+    (
+        "audit_shipping",
+        "webhook_secret",
+        Purpose::AuditWebhookSecret,
+    ),
 ];
 
 /// Secrets stored as string fields inside a `config` JSON column.

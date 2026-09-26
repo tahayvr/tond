@@ -3,8 +3,8 @@
 // Tables (migrations/030_host_history_uptime.sql):
 //   uptime_checks     one per app with a domain + the dashboard
 //   uptime_1m         one row per probe, kept 48 h
-//   uptime_1h         hourly rollups, kept 90 days
-//   uptime_incidents  down periods, kept 90 days after they end
+//   uptime_1h         hourly rollups, kept `retention_uptime_days` (90)
+//   uptime_incidents  down periods, kept `retention_uptime_days` after they end
 //
 // Every range scan goes through a (check_id, ts) primary key, with
 // `check_id IN (SELECT id FROM uptime_checks)` when all checks are read.
@@ -17,8 +17,8 @@ use sqlx::{AssertSqlSafe, SqlitePool};
 use super::probe::Cause;
 
 pub const M1_KEEP_SECS: i64 = 48 * 3600;
-pub const H1_KEEP_SECS: i64 = 90 * 86_400;
-pub const INCIDENT_KEEP_SECS: i64 = 90 * 86_400;
+#[cfg(test)]
+const INCIDENT_KEEP_SECS: i64 = 90 * 86_400;
 
 /// A check's stored configuration.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
@@ -238,13 +238,12 @@ pub async fn rollup_1h(db: &SqlitePool, from: i64, to: i64) -> sqlx::Result<()> 
     Ok(())
 }
 
-/// Drop rows past retention. Returns the number of rows deleted.
-pub async fn prune(db: &SqlitePool, now: i64) -> sqlx::Result<u64> {
+/// Drop rows past retention (`keep_secs`: hourly rows and ended incidents,
+/// the `retention_uptime_days` setting). Returns the number of rows deleted.
+pub async fn prune(db: &SqlitePool, now: i64, keep_secs: i64) -> sqlx::Result<u64> {
     let mut deleted = 0;
-    for (table, cutoff) in [
-        ("uptime_1m", now - M1_KEEP_SECS),
-        ("uptime_1h", now - H1_KEEP_SECS),
-    ] {
+    let cutoff = now.saturating_sub(keep_secs);
+    for (table, cutoff) in [("uptime_1m", now - M1_KEEP_SECS), ("uptime_1h", cutoff)] {
         let sql = format!(
             "DELETE FROM {table} WHERE (check_id, ts) IN (
                 SELECT check_id, ts FROM {table}
@@ -265,8 +264,8 @@ pub async fn prune(db: &SqlitePool, now: i64) -> sqlx::Result<u64> {
     deleted += sqlx::query(
         "DELETE FROM uptime_incidents WHERE started_at < ? AND ended_at IS NOT NULL AND ended_at < ?",
     )
-    .bind(now - INCIDENT_KEEP_SECS)
-    .bind(now - INCIDENT_KEEP_SECS)
+    .bind(cutoff)
+    .bind(cutoff)
     .execute(db)
     .await?
     .rows_affected();
@@ -599,7 +598,7 @@ mod tests {
         .await
         .unwrap_or_else(|e| panic!("close: {e}"));
         assert!(open_incidents(&db).await.unwrap_or_default().is_empty());
-        let gone = prune(&db, now + INCIDENT_KEEP_SECS + 1)
+        let gone = prune(&db, now + INCIDENT_KEEP_SECS + 1, INCIDENT_KEEP_SECS)
             .await
             .unwrap_or_default();
         assert_eq!(gone, 120 + 1 + 1);

@@ -283,7 +283,7 @@ pub async fn record_success(
 ) -> Result<()> {
     let (cert_file, _) = cert_store.cert_paths(domain);
     let cert_pem = tokio::fs::read(&cert_file).await?;
-    let (issued_at, expires_at) = acme::certificate_timestamps(&cert_pem)?;
+    let details = acme::certificate_details(&cert_pem)?;
     let (cert_path, key_path) = cert_paths(data_dir, domain);
     outbox.push(CertReport {
         domain: domain.to_string(),
@@ -291,8 +291,9 @@ pub async fn record_success(
         key_path,
         attempted_at: Utc::now().to_rfc3339(),
         outcome: CertOutcome::Issued {
-            issued_at,
-            expires_at,
+            issued_at: details.issued_at,
+            expires_at: details.expires_at,
+            issuer: details.issuer,
         },
     });
     Ok(())

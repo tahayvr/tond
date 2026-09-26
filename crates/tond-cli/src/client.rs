@@ -61,6 +61,11 @@ pub struct TondClient {
     socket_path: Option<PathBuf>,
 }
 
+/// Incoming messages of a WebSocket opened with `TondClient::ws_messages`.
+pub type WsMessages = std::pin::Pin<
+    Box<dyn futures::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Send>,
+>;
+
 /// Host used in request URLs sent over the Unix socket (the socket, not DNS, picks the peer).
 const LOCAL_BASE_URL: &str = "http://localhost";
 
@@ -212,7 +217,8 @@ impl TondClient {
         }
     }
 
-    pub async fn deploy_app(&self, id: &str) -> Result<()> {
+    /// Queue a deploy; returns the new deployment's id.
+    pub async fn deploy_app(&self, id: &str) -> Result<Option<String>> {
         let req = self
             .client
             .post(format!("{}/api/apps/{}/deploy", self.base_url, id));
@@ -221,7 +227,53 @@ impl TondClient {
         if !resp.success {
             anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
         }
-        Ok(())
+        Ok(resp
+            .data
+            .as_ref()
+            .and_then(|d| d.get("deployment_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string))
+    }
+
+    /// GET /api/apps/{id}/deployments/{deployment_id} (deployment + log).
+    pub async fn get_deployment(&self, id: &str, deployment_id: &str) -> Result<Value> {
+        let req = self.client.get(format!(
+            "{}/api/apps/{}/deployments/{}",
+            self.base_url, id, deployment_id
+        ));
+        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
+        if resp.success {
+            resp.data.context("No data returned")
+        } else {
+            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
+        }
+    }
+
+    /// Open a WebSocket at `path` (over the Unix socket or TCP) and return its
+    /// incoming messages. The token, if any, travels as `?token=`.
+    pub async fn ws_messages(&self, path: &str) -> Result<WsMessages> {
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let url = match self.api_key.as_deref() {
+            Some(token) => self.ws_url(&format!("{path}{sep}token={token}")),
+            None => self.ws_url(path),
+        };
+        Ok(match &self.socket_path {
+            Some(socket_path) => {
+                let stream = tokio::net::UnixStream::connect(socket_path)
+                    .await
+                    .context("Failed to connect to tond-server")?;
+                let (ws, _) = tokio_tungstenite::client_async(url.as_str(), stream)
+                    .await
+                    .context("Failed to open the stream")?;
+                Box::pin(ws.split().1)
+            }
+            None => {
+                let (ws, _) = tokio_tungstenite::connect_async(&url)
+                    .await
+                    .context("Failed to open the stream")?;
+                Box::pin(ws.split().1)
+            }
+        })
     }
 
     pub async fn push_deploy(&self, id: &str, dir: &str) -> Result<()> {
@@ -343,28 +395,10 @@ impl TondClient {
     /// Stream live logs over WebSocket, printing lines until server closes or Ctrl-C.
     /// The initial snapshot message is rendered first, then live events follow.
     pub async fn stream_logs(&self, id: &str) -> Result<()> {
-        let token = self.api_key.as_deref().unwrap_or("");
-        let url = self.ws_url(&format!("/api/apps/{}/logs/stream?token={}", id, token));
-
-        let ws_stream = match &self.socket_path {
-            Some(socket_path) => {
-                let stream = tokio::net::UnixStream::connect(socket_path)
-                    .await
-                    .context("Failed to connect to log stream")?;
-                let (ws, _) = tokio_tungstenite::client_async(url.as_str(), stream)
-                    .await
-                    .context("Failed to connect to log stream")?;
-                futures::future::Either::Left(ws)
-            }
-            None => {
-                let (ws, _) = tokio_tungstenite::connect_async(&url)
-                    .await
-                    .context("Failed to connect to log stream")?;
-                futures::future::Either::Right(ws)
-            }
-        };
-
-        let (_, mut read) = ws_stream.split();
+        let mut read = self
+            .ws_messages(&format!("/api/apps/{}/logs/stream", id))
+            .await
+            .context("Failed to connect to log stream")?;
 
         while let Some(msg) = read.next().await {
             match msg {

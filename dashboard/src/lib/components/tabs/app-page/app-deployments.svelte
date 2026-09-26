@@ -26,6 +26,9 @@
 	import WaitIcon from '~icons/ri/hourglass-line';
 	import NeutralIcon from '~icons/ri/indeterminate-circle-line';
 	import ChevronIcon from '~icons/ri/arrow-right-s-line';
+	import ExternalIcon from '~icons/ri/external-link-line';
+	import DeployTrend from '$lib/components/deploy/deploy-trend.svelte';
+	import { commitUrl } from '$lib/commit-links';
 
 	interface Props {
 		appId: string;
@@ -38,6 +41,8 @@
 		onViewGeneratedDockerfile: (deploymentId: string) => Promise<string>;
 		/** The user may roll back (apps:rollback). */
 		canRollback?: boolean;
+		/** Repository URL, for links to each commit on the Git host. */
+		sourceUrl?: string | null;
 	}
 
 	let {
@@ -48,7 +53,8 @@
 		error,
 		onRollback,
 		onViewGeneratedDockerfile,
-		canRollback = true
+		canRollback = true,
+		sourceUrl = null
 	}: Props = $props();
 	let dockerfileDialogOpen = $state(false);
 	let dockerfileLoading = $state(false);
@@ -137,6 +143,8 @@
 		</Tooltip.Root>
 	</div>
 
+	<DeployTrend {appId} refreshKey={deployments.map((d) => d.status).join()} />
+
 	<Dialog.Root bind:open={confirmOpen}>
 		<Dialog.Content class="max-w-lg">
 			<Dialog.Header>
@@ -207,6 +215,7 @@
 		<ul class="divide-y rounded-md border" aria-label="Deployments">
 			{#each deployments as d (d.id)}
 				{@const view = statusView(d.status, d.queue_position)}
+				{@const commitHref = commitUrl(sourceUrl, d.commit_sha)}
 				<li class="flex flex-col gap-2 p-3 sm:flex-row sm:items-center sm:gap-4">
 					<a
 						href="/apps/{appId}/deployments/{d.id}"
@@ -260,6 +269,16 @@
 						<ChevronIcon class="mt-0.5 hidden size-4 shrink-0 text-muted-foreground sm:block" />
 					</a>
 					<div class="flex shrink-0 items-center gap-2 pl-8 sm:pl-0">
+						{#if commitHref}
+							<a
+								href={commitHref}
+								target="_blank"
+								rel="noopener noreferrer"
+								class="inline-flex h-7 items-center gap-1 rounded-sm px-2 font-mono text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
+								aria-label="Open commit {shortSha(d.commit_sha)} on the Git host"
+								>{shortSha(d.commit_sha)}<ExternalIcon class="size-3" aria-hidden="true" /></a
+							>
+						{/if}
 						{#if d.has_generated_dockerfile}
 							<Button
 								variant="ghost"

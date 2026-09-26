@@ -2,8 +2,10 @@
 //
 // GET /api/system/self — (metrics:read) process, background loops, database, HTTP latency,
 //                        build queue and tond-proxy stats (any signed-in user)
-// GET /metrics         — the same in the Prometheus text format, only on the
-//                        root-only Unix socket (404 over TCP), e.g.
+// GET /metrics         — the same in the Prometheus text format (metrics:read):
+//                        over TCP with an API token as a bearer token (a
+//                        Prometheus `authorization` credential), or on the
+//                        root-only Unix socket without one, e.g.
 //                        `curl --unix-socket /opt/tond/data/tond.sock http://tond/metrics`
 
 use axum::{
@@ -13,7 +15,7 @@ use axum::{
 };
 use tond_common::ApiResponse;
 
-use crate::auth::{Authz, LocalPeer, RateLimit, scope};
+use crate::auth::{Authz, RateLimit, scope};
 use crate::runtime::selfstats;
 
 pub async fn get_self(_rate: RateLimit, _auth: Authz<scope::MetricsRead>) -> impl IntoResponse {
@@ -23,10 +25,7 @@ pub async fn get_self(_rate: RateLimit, _auth: Authz<scope::MetricsRead>) -> imp
     )
 }
 
-pub async fn metrics(LocalPeer(local): LocalPeer) -> Response {
-    if !local {
-        return StatusCode::NOT_FOUND.into_response();
-    }
+pub async fn metrics(_rate: RateLimit, _auth: Authz<scope::MetricsRead>) -> Response {
     let report = selfstats::collect().await;
     (
         StatusCode::OK,
@@ -42,16 +41,18 @@ pub async fn metrics(LocalPeer(local): LocalPeer) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::Principal;
+    use tond_common::Role;
 
     #[tokio::test]
-    async fn metrics_are_only_served_on_the_local_socket() {
-        assert_eq!(
-            metrics(LocalPeer(false)).await.status(),
-            StatusCode::NOT_FOUND
-        );
-        let local = metrics(LocalPeer(true)).await;
-        assert_eq!(local.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(local.into_body(), 1 << 20)
+    async fn metrics_render_in_the_prometheus_format() {
+        let response = metrics(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Viewer)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
             .await
             .unwrap_or_default();
         let text = String::from_utf8_lossy(&body);

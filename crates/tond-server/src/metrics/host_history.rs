@@ -5,7 +5,8 @@
 // kept; every other number is the minute's last reading) and writes it to
 // host_1m when the minute closes — one INSERT a minute, in the collector's
 // existing tick, no extra wakeup. When an hour closes the hour is rolled up
-// into host_1h. Retention (janitor): host_1m 48 h, host_1h 1 year.
+// into host_1h. Retention (janitor): host_1m 48 h, host_1h
+// `retention_host_history_days` (default 1 year).
 //
 // Queries return ≤ 480 points: 1h / 24h from host_1m, 7d / 30d from host_1h.
 //
@@ -22,7 +23,8 @@ use sqlx::{AssertSqlSafe, SqlitePool};
 use super::host::HostSnapshot;
 
 pub const M1_KEEP_SECS: i64 = 48 * 3600;
-pub const H1_KEEP_SECS: i64 = 365 * 86_400;
+#[cfg(test)]
+const H1_KEEP_SECS: i64 = 365 * 86_400;
 /// Longest series a query returns.
 const MAX_POINTS: i64 = 480;
 /// Slower growth than this is noise, not "filling" (bytes per day).
@@ -224,15 +226,16 @@ pub async fn rollup_1h(db: &SqlitePool, from: i64, to: i64) -> sqlx::Result<()> 
     Ok(())
 }
 
-/// Drop rows past retention. Returns the number of rows deleted.
-pub async fn prune(db: &SqlitePool, now: i64) -> sqlx::Result<u64> {
+/// Drop rows past retention (`h1_keep_secs`: hourly rows, the
+/// `retention_host_history_days` setting). Returns the number of rows deleted.
+pub async fn prune(db: &SqlitePool, now: i64, h1_keep_secs: i64) -> sqlx::Result<u64> {
     let mut deleted = sqlx::query("DELETE FROM host_1m WHERE ts < ?")
         .bind(now - M1_KEEP_SECS)
         .execute(db)
         .await?
         .rows_affected();
     deleted += sqlx::query("DELETE FROM host_1h WHERE ts < ?")
-        .bind(now - H1_KEEP_SECS)
+        .bind(now.saturating_sub(h1_keep_secs))
         .execute(db)
         .await?
         .rows_affected();
@@ -624,7 +627,7 @@ mod tests {
         assert_eq!(eta.day.samples, 120);
         assert_eq!(eta.week.status, "insufficient_data");
 
-        let deleted = prune(&db, base + 7200 + H1_KEEP_SECS + 1)
+        let deleted = prune(&db, base + 7200 + H1_KEEP_SECS + 1, H1_KEEP_SECS)
             .await
             .unwrap_or_else(|e| panic!("prune: {e}"));
         assert_eq!(deleted, 122);

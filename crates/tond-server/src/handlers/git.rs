@@ -430,7 +430,7 @@ pub async fn update_source(
         "Updated source for app {} to type={} url={:?}",
         app.name,
         payload.source_type,
-        payload.source_url
+        payload.source_url.as_deref().map(redact_url_credentials)
     );
     record(
         &state.db,
