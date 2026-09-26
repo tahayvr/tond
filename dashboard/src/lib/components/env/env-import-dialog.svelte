@@ -1,4 +1,5 @@
 <script lang="ts">
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import * as Dialog from '$lib/components/ui/dialog/index.js';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
@@ -115,11 +116,7 @@
 				</div>
 			{/if}
 
-			{#if error}
-				<p class="rounded bg-destructive/10 px-3 py-2 text-xs text-destructive" role="alert">
-					{error}
-				</p>
-			{/if}
+			<InlineError message={error} />
 		</div>
 
 		<Dialog.Footer class="gap-2 sm:gap-2">

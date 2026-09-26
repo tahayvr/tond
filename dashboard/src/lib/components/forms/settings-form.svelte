@@ -8,6 +8,8 @@
 	import AppsIcon from '~icons/ri/apps-2-line';
 	import UploadIcon from '~icons/ri/upload-cloud-2-line';
 	import CertificateStatus from '$lib/components/domains/certificate-status.svelte';
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
+	import SuccessAlert from '$lib/components/feedback/success-alert.svelte';
 
 	interface Props {
 		serverName: string;
@@ -97,16 +99,14 @@
 	<!-- Server Identity -->
 	<div class="rounded-lg border border-border bg-card p-4">
 		<div class="mb-4 flex items-center gap-2">
-			<Server class="h-4 w-4 text-muted-foreground/70" />
-			<span class="font-mono text-[10px] tracking-wider text-muted-foreground/70 uppercase">
+			<Server class="h-4 w-4 text-muted-foreground" />
+			<span class="font-mono text-[10px] tracking-wider text-muted-foreground uppercase">
 				SERVER_IDENTITY
 			</span>
 		</div>
 
 		<div class="grid gap-2">
-			<Label for="server-name" class="font-mono text-[10px] text-muted-foreground uppercase">
-				Server Name
-			</Label>
+			<Label for="server-name" class="text-xs text-muted-foreground">Server Name</Label>
 			<Input
 				id="server-name"
 				type="text"
@@ -114,7 +114,7 @@
 				placeholder="My Tond Server"
 				class="border-border bg-card font-mono text-sm"
 			/>
-			<p class="font-mono text-[10px] text-muted-foreground/60">
+			<p class="font-mono text-[10px] text-muted-foreground">
 				A human-readable name for this server instance.
 			</p>
 		</div>
@@ -123,16 +123,14 @@
 	<!-- Access Configuration -->
 	<div class="rounded-lg border border-border bg-card p-4">
 		<div class="mb-4 flex items-center gap-2">
-			<Settings class="h-4 w-4 text-muted-foreground/70" />
-			<span class="font-mono text-[10px] tracking-wider text-muted-foreground/70 uppercase">
+			<Settings class="h-4 w-4 text-muted-foreground" />
+			<span class="font-mono text-[10px] tracking-wider text-muted-foreground uppercase">
 				ACCESS_CONFIGURATION
 			</span>
 		</div>
 
 		<div class="grid gap-2">
-			<Label for="dashboard-domain" class="font-mono text-[10px] text-muted-foreground uppercase">
-				Dashboard Domain
-			</Label>
+			<Label for="dashboard-domain" class="text-xs text-muted-foreground">Dashboard Domain</Label>
 			<Input
 				id="dashboard-domain"
 				type="text"
@@ -140,7 +138,7 @@
 				placeholder="tond.example.com"
 				class="border-border bg-card font-mono text-sm"
 			/>
-			<p class="font-mono text-[10px] text-muted-foreground/60">
+			<p class="font-mono text-[10px] text-muted-foreground">
 				The HTTPS address of this dashboard. Point the domain's A (and AAAA) record at this server;
 				Tond gets the certificate automatically. Without a domain, reach the dashboard through an
 				SSH tunnel: ssh -L 3001:127.0.0.1:3001 root@&lt;server&gt;, then open http://localhost:3001.
@@ -189,16 +187,14 @@
 	<!-- Preview Domain -->
 	<div class="rounded-lg border border-border bg-card p-4">
 		<div class="mb-4 flex items-center gap-2">
-			<ShieldCheck class="h-4 w-4 text-muted-foreground/70" />
-			<span class="font-mono text-[10px] tracking-wider text-muted-foreground/70 uppercase">
+			<ShieldCheck class="h-4 w-4 text-muted-foreground" />
+			<span class="font-mono text-[10px] tracking-wider text-muted-foreground uppercase">
 				PREVIEW_DOMAIN
 			</span>
 		</div>
 
 		<div class="grid gap-2">
-			<Label for="preview-domain" class="font-mono text-[10px] text-muted-foreground uppercase">
-				Preview Domain
-			</Label>
+			<Label for="preview-domain" class="text-xs text-muted-foreground">Preview Domain</Label>
 			<Input
 				id="preview-domain"
 				type="text"
@@ -209,14 +205,14 @@
 			{#if previewHint}
 				<p class="font-mono text-[10px] text-warn">{previewHint}</p>
 			{/if}
-			<p class="font-mono text-[10px] text-muted-foreground/60">
+			<p class="font-mono text-[10px] text-muted-foreground">
 				Previews are served as <code>&lt;id&gt;-&lt;app&gt;.{wildcardRecord}</code>. They run
 				pull-request code, so this must be a separate domain you own — not the dashboard domain, a
 				subdomain of it, or another name on the same registrable domain. That keeps previews
 				cross-site to the dashboard: they cannot read or set its cookies or make same-site requests
 				to its API. Leave blank to disable previews.
 			</p>
-			<p class="font-mono text-[10px] text-muted-foreground/60">
+			<p class="font-mono text-[10px] text-muted-foreground">
 				DNS: add a wildcard A record <code class="text-foreground">*.{wildcardRecord}</code> pointing
 				at this server's public IP. Certificates are issued per preview automatically.
 			</p>
@@ -257,18 +253,12 @@
 		</div>
 	</div>
 
-	{#if error}
-		<div class="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-destructive">
-			{error}
-		</div>
-	{/if}
+	<InlineError message={error} title="Settings weren't saved" />
+	<SuccessAlert message={saved ? 'Settings saved.' : ''} />
 
 	<div class="flex items-center gap-3">
-		<Button type="submit" disabled={isSaving || uploadLimitInvalid}>
+		<Button type="submit" disabled={isSaving || uploadLimitInvalid} aria-busy={isSaving}>
 			{isSaving ? 'Saving…' : 'Save'}
 		</Button>
-		{#if saved}
-			<span class="font-mono text-[10px] text-success">SAVED</span>
-		{/if}
 	</div>
 </form>

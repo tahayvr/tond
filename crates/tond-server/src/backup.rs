@@ -969,10 +969,7 @@ pub async fn restore_database(
 
 // ── Backup scheduler ──────────────────────────────────────────────────────────
 
-#[allow(dead_code)]
 pub async fn backup_scheduler(state: AppState) {
-    use cron::Schedule;
-    use std::str::FromStr;
 
     loop {
         let cfg = match get_backup_config(&state).await {
@@ -989,7 +986,7 @@ pub async fn backup_scheduler(state: AppState) {
             continue;
         }
 
-        let schedule = match Schedule::from_str(&cfg.full_schedule_cron) {
+        let schedule = match crate::cron::parse_schedule(&cfg.full_schedule_cron) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(

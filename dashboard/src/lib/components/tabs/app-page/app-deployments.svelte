@@ -106,7 +106,7 @@
 			<p class="text-sm text-muted-foreground">
 				The last 20 deployments. Open one to see its steps and log.
 			</p>
-			<p class="text-xs text-muted-foreground/80">
+			<p class="text-xs text-muted-foreground">
 				Images of the last 3 successful deployments stay on the server for rollback; older ones are
 				pruned to save disk space.
 			</p>
@@ -201,7 +201,7 @@
 	{:else if deployments.length === 0}
 		<div class="rounded-lg border border-dashed py-12 text-center">
 			<p class="text-muted-foreground">No deployments yet</p>
-			<p class="mt-1 text-sm text-muted-foreground/60">Deploy this app to see its history here</p>
+			<p class="mt-1 text-sm text-muted-foreground">Deploy this app to see its history here</p>
 		</div>
 	{:else}
 		<ul class="divide-y rounded-md border" aria-label="Deployments">

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
@@ -30,8 +31,8 @@
 
 <div class="rounded-lg border border-border bg-card p-4">
 	<div class="mb-4 flex items-center gap-2">
-		<Database class="h-4 w-4 text-muted-foreground/70" />
-		<span class="font-mono text-[10px] tracking-wider text-muted-foreground/70 uppercase">
+		<Database class="h-4 w-4 text-muted-foreground" />
+		<span class="font-mono text-[10px] tracking-wider text-muted-foreground uppercase">
 			INITIALIZE_DATASTORE
 		</span>
 	</div>
@@ -86,9 +87,7 @@
 			/>
 		</div>
 	</div>
-	{#if error}
-		<p class="mt-3 font-mono text-sm text-destructive">{error}</p>
-	{/if}
+	<InlineError message={error} />
 	<div class="mt-4 flex justify-end gap-2">
 		<Button variant="outline" onclick={onCancel}>Cancel</Button>
 		<Button onclick={onSubmit} disabled={isCreating}>

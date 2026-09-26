@@ -18,6 +18,18 @@ pub struct DomainStatusResponse {
     pub certificate_status: Option<String>,
 }
 
+/// The most recent deployment of any app (home page "last deploy" tile).
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq, Eq)]
+pub struct LastDeploymentResponse {
+    pub id: String,
+    pub app_id: String,
+    pub app_name: String,
+    pub status: String,
+    pub trigger_source: String,
+    pub created_at: String,
+    pub finished_at: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OnboardingStatusResponse {
     pub dashboard_domain: String,
@@ -26,6 +38,13 @@ pub struct OnboardingStatusResponse {
     pub has_apps: bool,
     pub has_databases: bool,
     pub has_cron_jobs: bool,
+    /// A GitHub App is installed, or a GitLab token or registry credential exists.
+    pub has_source_integration: bool,
+    /// At least one deployment finished successfully.
+    pub has_successful_deploy: bool,
+    /// At least one notification channel (Slack, Discord, Telegram, email) exists.
+    pub has_notification_channel: bool,
+    pub last_deployment: Option<LastDeploymentResponse>,
     pub server_public_ip: Option<String>,
     pub domain_status: DomainStatusResponse,
 }
@@ -47,6 +66,29 @@ pub async fn get_status(
     let has_apps = has_any_rows(&state.db, "apps").await;
     let has_databases = has_any_rows(&state.db, "databases").await;
     let has_cron_jobs = has_any_rows(&state.db, "cron_jobs").await;
+    let has_source_integration = has_any_match(
+        &state.db,
+        "SELECT 1 FROM github_apps WHERE installation_id IS NOT NULL
+         UNION ALL SELECT 1 FROM gitlab_tokens
+         UNION ALL SELECT 1 FROM registry_credentials LIMIT 1",
+    )
+    .await;
+    let has_successful_deploy = has_any_match(
+        &state.db,
+        "SELECT 1 FROM deployments WHERE status = 'succeeded' LIMIT 1",
+    )
+    .await;
+    let has_notification_channel = has_any_rows(&state.db, "integrations").await;
+    let last_deployment = sqlx::query_as::<_, LastDeploymentResponse>(
+        "SELECT d.id, d.app_id, a.name AS app_name, d.status, d.trigger_source,
+                d.created_at, d.finished_at
+         FROM deployments d JOIN apps a ON a.id = d.app_id
+         ORDER BY d.created_at DESC LIMIT 1",
+    )
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
     let domain_status = build_domain_status(
         &settings.dashboard_domain,
         server_public_ip,
@@ -61,6 +103,10 @@ pub async fn get_status(
         has_apps,
         has_databases,
         has_cron_jobs,
+        has_source_integration,
+        has_successful_deploy,
+        has_notification_channel,
+        last_deployment,
         server_public_ip: domain_status.expected_target.clone(),
         domain_status,
     };
@@ -72,6 +118,16 @@ async fn has_any_rows(db: &sqlx::SqlitePool, table: &'static str) -> bool {
     // `table` is always a compile-time literal, so interpolating it is injection-safe.
     let query = format!("SELECT 1 FROM {table} LIMIT 1");
     sqlx::query(AssertSqlSafe(query))
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+/// True when `query` (a constant, injection-free statement) returns a row.
+async fn has_any_match(db: &sqlx::SqlitePool, query: &'static str) -> bool {
+    sqlx::query(query)
         .fetch_optional(db)
         .await
         .ok()
@@ -404,6 +460,13 @@ mod tests {
             "fresh installs should report no managed resources"
         );
         assert!(
+            !status.has_source_integration
+                && !status.has_successful_deploy
+                && !status.has_notification_channel,
+            "fresh installs have no checklist items done"
+        );
+        assert_eq!(status.last_deployment, None);
+        assert!(
             status.dashboard_domain.is_empty(),
             "fresh installs should return the current dashboard domain setting"
         );
@@ -505,6 +568,33 @@ mod tests {
         .await
         .unwrap_or_else(|err| panic!("failed to seed certificate: {err}"));
 
+        for (id, status, created_at) in [
+            ("dep-1", "succeeded", "2026-01-02T00:00:00Z"),
+            ("dep-2", "failed", "2026-01-03T00:00:00Z"),
+        ] {
+            sqlx::query(
+                "INSERT INTO deployments (id, app_id, status, started_at, created_at, trigger_source)
+                 VALUES (?, 'app-1', ?, ?, ?, 'manual')",
+            )
+            .bind(id)
+            .bind(status)
+            .bind(created_at)
+            .bind(created_at)
+            .execute(&state.db)
+            .await
+            .unwrap_or_else(|err| panic!("failed to seed deployment: {err}"));
+        }
+        sqlx::query("INSERT INTO integrations (id, name, kind, config) VALUES ('int-1', 'ops', 'slack', '{}')")
+            .execute(&state.db)
+            .await
+            .unwrap_or_else(|err| panic!("failed to seed integration: {err}"));
+        sqlx::query(
+            "INSERT INTO registry_credentials (id, name, server, username, password_enc) VALUES ('rc-1', 'hub', 'docker.io', 'me', 'x')",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap_or_else(|err| panic!("failed to seed registry credential: {err}"));
+
         let response = get_status(RateLimit, auth, State(state))
             .await
             .into_response();
@@ -521,6 +611,31 @@ mod tests {
         assert!(status.has_apps, "seeded app should be reported");
         assert!(status.has_databases, "seeded database should be reported");
         assert!(status.has_cron_jobs, "seeded cron job should be reported");
+        assert!(
+            status.has_source_integration,
+            "a registry credential counts as a source integration"
+        );
+        assert!(
+            status.has_successful_deploy,
+            "a succeeded deployment ticks the first-deploy item"
+        );
+        assert!(
+            status.has_notification_channel,
+            "seeded channel should be reported"
+        );
+        let last = status
+            .last_deployment
+            .clone()
+            .unwrap_or_else(|| panic!("the latest deployment should be reported"));
+        assert_eq!(
+            (
+                last.id.as_str(),
+                last.app_name.as_str(),
+                last.status.as_str()
+            ),
+            ("dep-2", "web", "failed"),
+            "the newest deployment wins, with its app name"
+        );
         assert_eq!(
             status.dashboard_domain, "dash.example.com",
             "current dashboard domain should be included in onboarding status"

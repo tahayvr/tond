@@ -63,7 +63,7 @@
 		/>
 	</div>
 
-	<p class="font-mono text-[10px] text-muted-foreground/60">
+	<p class="font-mono text-[10px] text-muted-foreground">
 		SNAPSHOT: {new Date(metrics.collected_at).toLocaleString()}
 	</p>
 </div>

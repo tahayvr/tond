@@ -1,4 +1,5 @@
 <script lang="ts">
+	import PageTitle from '$lib/components/nav/page-title.svelte';
 	// Live deploy view: step progress, the streaming build/deploy log, elapsed
 	// time and, once finished, the result with the likely cause of a failure.
 	import { goto } from '$app/navigation';
@@ -132,6 +133,8 @@
 		}
 	}
 </script>
+
+<PageTitle title={`Deploy ${deployment.id.slice(0, 8)} · ${app.name}`} />
 
 <div class="space-y-5">
 	<Breadcrumb

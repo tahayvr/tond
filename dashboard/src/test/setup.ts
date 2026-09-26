@@ -70,6 +70,8 @@ beforeAll(() => {
 
 afterEach(() => {
 	cleanup();
+	// A dialog closed mid-animation can leave bits-ui's scroll/pointer lock on <body>.
+	document.body.removeAttribute('style');
 	server.resetHandlers();
 	vi.restoreAllMocks();
 	vi.unstubAllEnvs();

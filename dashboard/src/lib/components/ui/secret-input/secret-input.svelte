@@ -49,7 +49,7 @@
 		data-slot={dataSlot}
 		class={cn(
 			'flex h-9 w-full min-w-0 rounded-sm border border-input bg-background px-3 py-1 font-mono text-sm shadow-xs ring-offset-background transition-[color,box-shadow] outline-none selection:bg-primary selection:text-primary-foreground placeholder:text-muted-foreground disabled:cursor-not-allowed disabled:opacity-50 dark:bg-input/30',
-			'focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50',
+			'focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring',
 			'aria-invalid:border-destructive aria-invalid:ring-destructive/20 dark:aria-invalid:ring-destructive/40',
 			className
 		)}
@@ -68,7 +68,7 @@
 				aria-label="Copy to clipboard"
 			>
 				{#if copied}
-					<Check class="h-3.5 w-3.5 text-green-500" />
+					<Check class="h-3.5 w-3.5 text-success" />
 				{:else}
 					<Copy class="h-3.5 w-3.5" />
 				{/if}

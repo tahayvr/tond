@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { safeUrl } from '$lib/utils';
-	import { Badge } from '$lib/components/ui/badge/index.js';
+	import StatusBadge from '$lib/components/feedback/status-badge.svelte';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import * as Card from '$lib/components/ui/card/index.js';
 	import type { App, ProjectPreview } from '$lib/api';
@@ -24,12 +24,6 @@
 	} = $props();
 
 	let expanded = $state(false);
-
-	function statusVariant(status: string) {
-		if (status === 'running') return 'default';
-		if (status === 'failed' || status === 'partially_failed') return 'destructive';
-		return 'secondary';
-	}
 
 	function formatExpiry(dt: string) {
 		return new Date(dt).toLocaleString();
@@ -66,11 +60,12 @@
 				</div>
 			</div>
 			<div class="flex items-center gap-2">
-				<Badge variant={statusVariant(preview.status)}>{preview.status}</Badge>
+				<StatusBadge status={preview.status} kind="preview" size="sm" />
 				<Button
 					variant="ghost"
 					size="sm"
 					class="text-destructive hover:text-destructive"
+					aria-label={`Delete preview ${preview.slug}`}
 					disabled={deleting}
 					onclick={() => onDelete(preview.id)}
 				>
@@ -101,7 +96,7 @@
 								<tr class="border-b last:border-0">
 									<td class="px-3 py-2 font-mono text-xs">{appName(p.app_id)}</td>
 									<td class="px-3 py-2">
-										<Badge variant={statusVariant(p.status)}>{p.status}</Badge>
+										<StatusBadge status={p.status} kind="preview" size="sm" />
 									</td>
 
 									<!-- PR column -->
@@ -111,7 +106,7 @@
 												href={safeUrl(p.pr_url)}
 												target="_blank"
 												rel="noopener noreferrer"
-												class="inline-flex items-center gap-1 font-mono text-xs text-accent hover:underline"
+												class="inline-flex items-center gap-1 font-mono text-xs text-foreground underline-offset-2 hover:underline"
 											>
 												<Github class="h-3 w-3 shrink-0" />
 												#{p.pr_number}
@@ -156,7 +151,7 @@
 												href={safeUrl(p.url)}
 												target="_blank"
 												rel="noopener noreferrer"
-												class="inline-flex items-center gap-1 font-mono text-xs text-accent hover:underline"
+												class="inline-flex items-center gap-1 font-mono text-xs text-foreground underline-offset-2 hover:underline"
 											>
 												{p.subdomain ?? p.url}
 												<ExternalLink class="h-3 w-3" />

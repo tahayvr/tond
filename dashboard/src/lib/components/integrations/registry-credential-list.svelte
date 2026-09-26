@@ -1,4 +1,6 @@
 <script lang="ts">
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
+	import { confirmAction } from '$lib/confirm.svelte';
 	import {
 		listRegistryCredentials,
 		createRegistryCredential,
@@ -8,7 +10,6 @@
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
-	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import Trash2 from '~icons/ri/delete-bin-line';
 	import Plus from '~icons/ri/add-line';
 
@@ -99,16 +100,24 @@
 	}
 
 	async function handleDelete(id: string) {
-		deletingId = id;
+		const target = credentials.find((c) => c.id === id);
 		error = '';
-		try {
-			await deleteRegistryCredential(id);
-			credentials = credentials.filter((c) => c.id !== id);
-		} catch (e: any) {
-			error = e.message ?? 'Failed to remove credential';
-		} finally {
-			deletingId = null;
-		}
+		await confirmAction({
+			title: `Delete registry credential ${target?.name ?? ''}?`.replace(/ \?$/, '?'),
+			description:
+				'Apps that pull private images with this credential will fail to deploy until you attach another one.',
+			confirmLabel: 'Delete credential',
+			pendingLabel: 'Deleting…',
+			onconfirm: async () => {
+				deletingId = id;
+				try {
+					await deleteRegistryCredential(id);
+					credentials = credentials.filter((c) => c.id !== id);
+				} finally {
+					deletingId = null;
+				}
+			}
+		});
 	}
 
 	function cancelAdd() {
@@ -142,9 +151,7 @@
 	});
 </script>
 
-{#if error}
-	<ErrorAlert title="Registry Error" description={error} />
-{/if}
+<InlineError title="Registry Error" message={error} />
 
 <div class="space-y-3">
 	<div class="flex items-center justify-between">
@@ -167,9 +174,7 @@
 			class="space-y-3 border bg-muted/30 p-4"
 		>
 			<p class="text-xs font-semibold uppercase">New Credential</p>
-			{#if addError}
-				<p class="text-xs text-destructive">{addError}</p>
-			{/if}
+			<InlineError message={addError} />
 			<div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
 				<div class="grid gap-1.5">
 					<Label class="text-xs" for="cred-name">Name</Label>

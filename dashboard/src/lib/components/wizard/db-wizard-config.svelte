@@ -94,7 +94,7 @@
 							/>
 						{:else}
 							<DatabaseIcon
-								class="h-6 w-6 {dbType === opt.value ? 'text-primary' : 'text-muted-foreground/50'}"
+								class="h-6 w-6 {dbType === opt.value ? 'text-primary' : 'text-muted-foreground'}"
 							/>
 						{/if}
 						{#if dbType === opt.value}

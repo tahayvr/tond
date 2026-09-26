@@ -1,4 +1,7 @@
 <script lang="ts">
+	import PageTitle from '$lib/components/nav/page-title.svelte';
+	import ScheduleField from '$lib/components/forms/schedule-field.svelte';
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { createCronJob, type CronVolumeInput, type Project } from '$lib/api';
@@ -13,7 +16,6 @@
 	import { Label } from '$lib/components/ui/label/index.js';
 	import * as Select from '$lib/components/ui/select/index.js';
 	import * as Dialog from '$lib/components/ui/dialog/index.js';
-	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import { isAdmin } from '$lib/auth.svelte';
 	import { setUiContext, clearUiContext, projectsContext } from '$lib/ui-context.svelte';
 	import Clock from '~icons/ri/time-line';
@@ -65,18 +67,6 @@
 	let volName = $state('');
 	let volContainerPath = $state('');
 	let volDialogError = $state('');
-
-	// Common schedule presets
-	const PRESETS = [
-		{ label: 'Every minute', value: '* * * * *' },
-		{ label: 'Every 5 minutes', value: '*/5 * * * *' },
-		{ label: 'Every 15 minutes', value: '*/15 * * * *' },
-		{ label: 'Every hour', value: '0 * * * *' },
-		{ label: 'Every 6 hours', value: '0 */6 * * *' },
-		{ label: 'Every day at midnight', value: '0 0 * * *' },
-		{ label: 'Every day at 2am', value: '0 2 * * *' },
-		{ label: 'Every Sunday at midnight', value: '0 0 * * 0' }
-	];
 
 	$effect(() => {
 		setUiContext(projectsContext());
@@ -135,10 +125,6 @@
 			error = e.message ?? 'Failed to create cron job';
 			loading = false;
 		}
-	}
-
-	function applyPreset(value: string) {
-		schedule = value;
 	}
 
 	function openEnvAdd() {
@@ -226,12 +212,12 @@
 	}
 </script>
 
-<div class="space-y-6 pb-12">
-	<Breadcrumb items={[{ label: 'Cron Jobs', href: '/cron' }, { label: 'New Cron Job' }]} />
+<PageTitle title="New cron job" />
 
-	{#if error}
-		<ErrorAlert title="Error" description={error} />
-	{/if}
+<div class="space-y-6 pb-12">
+	<Breadcrumb items={[{ label: 'Cron jobs', href: '/cron' }, { label: 'New cron job' }]} />
+
+	<InlineError message={error} />
 
 	{#if !isAdmin()}
 		<div class="rounded-md border bg-muted/30 p-3 text-sm text-muted-foreground">
@@ -241,7 +227,7 @@
 	{/if}
 
 	<div class="space-y-1">
-		<h2 class="text-3xl font-extrabold uppercase">New Cron Job</h2>
+		<h1 class="text-2xl font-extrabold sm:text-3xl">New cron job</h1>
 		<p class="text-sm text-muted-foreground">Schedule a recurring Docker container task.</p>
 	</div>
 
@@ -254,55 +240,7 @@
 		</div>
 
 		<!-- Schedule -->
-		<div class="grid gap-2">
-			<Label for="schedule">Schedule</Label>
-			<div class="flex gap-2">
-				<Input
-					id="schedule"
-					type="text"
-					bind:value={schedule}
-					placeholder="0 2 * * *"
-					class="flex-1 font-mono"
-				/>
-				<Select.Root
-					type="single"
-					value=""
-					onValueChange={(v) => {
-						if (v) applyPreset(v);
-					}}
-				>
-					<Select.Trigger class="w-40 text-xs">Presets</Select.Trigger>
-					<Select.Content>
-						{#each PRESETS as preset (preset.value)}
-							<Select.Item value={preset.value} class="text-xs">
-								<span>{preset.label}</span>
-								<span class="ml-2 font-mono text-muted-foreground">{preset.value}</span>
-							</Select.Item>
-						{/each}
-					</Select.Content>
-				</Select.Root>
-			</div>
-			<p class="text-xs text-muted-foreground">
-				5-field cron expression (minute hour day-of-month month day-of-week). Pick a preset or type
-				your own.
-			</p>
-		</div>
-
-		<!-- Timezone -->
-		<div class="grid gap-2">
-			<Label for="timezone">Timezone <span class="text-muted-foreground">(optional)</span></Label>
-			<Input
-				id="timezone"
-				type="text"
-				bind:value={timezone}
-				placeholder="America/New_York"
-				class="font-mono"
-			/>
-			<p class="text-xs text-muted-foreground">
-				IANA timezone for schedule evaluation (e.g. <code class="font-mono">Europe/London</code>).
-				Leave empty to use UTC.
-			</p>
-		</div>
+		<ScheduleField bind:schedule bind:timezone idPrefix="schedule" />
 
 		<!-- Image -->
 		<div class="grid gap-2">
@@ -459,9 +397,7 @@
 							bind:containerPath={volContainerPath}
 							onkeydown={handleVolKeydown}
 						/>
-						{#if volDialogError}
-							<p class="text-xs text-destructive">{volDialogError}</p>
-						{/if}
+						<InlineError message={volDialogError} />
 						<Dialog.Footer>
 							<Button variant="outline" onclick={() => (volDialogOpen = false)}>Cancel</Button>
 							<Button onclick={handleVolConfirm}>
@@ -559,9 +495,7 @@
 									onkeydown={handleEnvKeydown}
 								/>
 							</div>
-							{#if envDialogError}
-								<p class="text-xs text-destructive">{envDialogError}</p>
-							{/if}
+							<InlineError message={envDialogError} />
 						</div>
 						<Dialog.Footer>
 							<Button variant="outline" onclick={() => (envDialogOpen = false)}>Cancel</Button>

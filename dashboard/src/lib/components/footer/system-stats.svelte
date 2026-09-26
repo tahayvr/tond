@@ -90,7 +90,7 @@
 		</Tooltip.Root>
 	</div>
 {:else if loading}
-	<div class="flex items-center gap-3 text-xs text-muted-foreground/50">
+	<div class="flex items-center gap-3 text-xs text-muted-foreground">
 		<span>Loading…</span>
 	</div>
 {:else if error}

@@ -1,7 +1,8 @@
 <script lang="ts">
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import ConnectionString from '$lib/components/databases/connection-string.svelte';
-	import DatabaseAccess from '$lib/components/databases/database-access.svelte';
 	import DatabaseBackups from '$lib/components/databases/database-backups.svelte';
+	import DatabaseAccess from '$lib/components/databases/database-access.svelte';
 	import { page } from '$app/state';
 	import {
 		getDatabase,
@@ -24,17 +25,19 @@
 		databaseContext,
 		openFeedPanel
 	} from '$lib/ui-context.svelte';
-	import { Badge } from '$lib/components/ui/badge/index.js';
+	import StatusBadge from '$lib/components/feedback/status-badge.svelte';
+	import SuccessAlert from '$lib/components/feedback/success-alert.svelte';
+	import PageHeader from '$lib/components/nav/page-header.svelte';
+	import LinkTabs from '$lib/components/nav/link-tabs.svelte';
+	import ConfirmDialog from '$lib/components/dialogs/confirm-dialog.svelte';
+	import { confirmAction } from '$lib/confirm.svelte';
+	import { allowedTabs, DATABASE_TABS, tabFromUrl, tabHref, type DatabaseTab } from '$lib/tabs';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
-	import { Separator } from '$lib/components/ui/separator/index.js';
-	import * as Tabs from '$lib/components/ui/tabs/index.js';
 	import * as Dialog from '$lib/components/ui/dialog/index.js';
 	import * as Select from '$lib/components/ui/select/index.js';
 	import Breadcrumb from '$lib/components/nav/breadcrumb.svelte';
-	import ConfirmDeleteDialog from '$lib/components/dialogs/confirm-delete-dialog.svelte';
-	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import StreamLogViewer from '$lib/components/logs/stream-log-viewer.svelte';
 	import MetricsPanel from '$lib/components/metrics/metrics-panel.svelte';
 	import { SvelteSet } from 'svelte/reactivity';
@@ -57,17 +60,21 @@
 	};
 
 	let db = $state<ManagedDatabaseDetail | null>(null);
-	/** Selected tab; the Logs tab pauses the feed panel's stream (one socket per database). */
-	let activeTab = $state('overview');
+	/** Active tab from `?tab=` (old `?tab=limits` links open Settings). */
+	let tab = $derived<DatabaseTab>(
+		page.url.searchParams.get('tab') === 'limits'
+			? 'settings'
+			: tabFromUrl(page.url, DATABASE_TABS, 'overview')
+	);
 
 	/** UI context for this database, with the feed paused while the Logs tab streams. */
 	function dbContext(d: ManagedDatabaseDetail) {
 		const ctx = databaseContext(d);
-		return activeTab === 'logs' ? { ...ctx, feed: { ...ctx.feed, wsUrl: null } } : ctx;
+		return tab === 'logs' ? { ...ctx, feed: { ...ctx.feed, wsUrl: null } } : ctx;
 	}
 
 	$effect(() => {
-		void activeTab;
+		void tab;
 		untrack(() => {
 			if (db) setUiContext(dbContext(db));
 		});
@@ -150,8 +157,7 @@
 	let memoryUnitDraft = $state<'mb' | 'gb'>('mb');
 	let savingLimits = $state(false);
 	let limitsError = $state('');
-	let limitsSaved = $state(false);
-	let limitsSavedTimeout: ReturnType<typeof setTimeout> | null = null;
+	let limitsSaved = $state('');
 
 	let dbId = $derived(page.params.id || params.id);
 
@@ -182,18 +188,25 @@
 		}
 	}
 
-	async function handleStop() {
-		acting = true;
+	function handleStop() {
 		error = '';
-		openFeedPanel();
-		try {
-			await stopDatabase(dbId);
-			await refreshDatabaseData();
-		} catch (e: any) {
-			error = e.message ?? 'Failed to stop database';
-		} finally {
-			acting = false;
-		}
+		return confirmAction({
+			title: `Stop ${db?.name ?? 'this database'}?`,
+			description:
+				'Apps that use this database lose their connection until you start it again. Data is kept.',
+			confirmLabel: 'Stop database',
+			pendingLabel: 'Stopping…',
+			onconfirm: async () => {
+				acting = true;
+				openFeedPanel();
+				try {
+					await stopDatabase(dbId);
+					await refreshDatabaseData();
+				} finally {
+					acting = false;
+				}
+			}
+		});
 	}
 
 	async function handleStart() {
@@ -210,27 +223,32 @@
 		}
 	}
 
-	async function handleRedeploy() {
-		redeploying = true;
+	function handleRedeploy() {
 		error = '';
-		openFeedPanel();
-		try {
-			db = await redeployDatabase(dbId);
-			if (db) setUiContext(dbContext(db));
-		} catch (e: any) {
-			error = e.message ?? 'Failed to redeploy database';
-		} finally {
-			redeploying = false;
-		}
+		return confirmAction({
+			title: `Redeploy ${db?.name ?? 'this database'}?`,
+			description:
+				'The container is recreated from its image with the current settings. Data on its volume is kept; connections drop for a few seconds.',
+			confirmLabel: 'Redeploy',
+			pendingLabel: 'Redeploying…',
+			destructive: false,
+			onconfirm: async () => {
+				redeploying = true;
+				openFeedPanel();
+				try {
+					db = await redeployDatabase(dbId);
+					if (db) setUiContext(dbContext(db));
+				} finally {
+					redeploying = false;
+				}
+			}
+		});
 	}
 
+	// Throws so ConfirmDialog shows the error inside the dialog.
 	async function handleDelete() {
-		try {
-			await deleteDatabase(dbId);
-			goto('/databases');
-		} catch (e: any) {
-			error = e.message ?? 'Failed to delete database';
-		}
+		await deleteDatabase(dbId);
+		goto('/databases', { invalidateAll: true });
 	}
 
 	// ── URL editing ──
@@ -468,9 +486,7 @@
 			}
 			db = await updateDatabase(dbId, { memory_limit: memoryLimitBytes });
 			if (db) setUiContext(dbContext(db));
-			limitsSaved = true;
-			if (limitsSavedTimeout) clearTimeout(limitsSavedTimeout);
-			limitsSavedTimeout = setTimeout(() => (limitsSaved = false), 2000);
+			limitsSaved = 'Memory limit saved.';
 		} catch (e: any) {
 			limitsError = e.message ?? 'Failed to save limits';
 		} finally {
@@ -588,21 +604,6 @@
 		return vars;
 	});
 
-	function statusVariant(
-		status: string
-	): 'default' | 'secondary' | 'destructive' | 'outline' | undefined {
-		switch (status) {
-			case 'running':
-				return 'default';
-			case 'failed':
-				return 'destructive';
-			case 'stopped':
-				return 'secondary';
-			default:
-				return 'outline';
-		}
-	}
-
 	function formatMemory(bytes: number | null): string {
 		if (bytes === null) return 'Unlimited';
 		const mb = bytes / (1024 * 1024);
@@ -642,712 +643,713 @@
 </script>
 
 {#if db}
+	{@const current = db}
 	<div class="space-y-6">
 		<!-- Breadcrumb -->
 		<Breadcrumb items={[{ label: 'Databases', href: '/databases' }, { label: db.name }]} />
 
-		<!-- Error banner -->
-		{#if error}
-			<ErrorAlert title="Error" description={error} />
-		{/if}
-
-		<!-- Header -->
-		<div class="flex h-14 items-center justify-between">
-			<div>
-				<h2 class="text-3xl font-extrabold uppercase">{db.name}</h2>
-				<div class="mt-2 flex items-center gap-3 text-sm text-muted-foreground">
-					<Badge variant={statusVariant(db.status)}>{db.status}</Badge>
-					<span class="font-mono text-xs uppercase">{db.db_type}</span>
-					{#if db.host_port}
-						<span class="font-mono text-xs">:{db.host_port}</span>
+		<PageHeader title={db.name} section={DATABASE_TABS.find((t) => t.id === tab)?.label}>
+			{#snippet meta()}
+				<StatusBadge status={current.status} kind="database" />
+				<span class="font-mono text-xs">{current.db_type}</span>
+				{#if current.host_port}
+					<span class="font-mono text-xs">:{current.host_port}</span>
+				{/if}
+			{/snippet}
+			{#snippet actions()}
+				{#if can('db:write')}
+					{#if current.status === 'running'}
+						<Button
+							variant="outline"
+							size="sm"
+							disabled={acting || redeploying}
+							onclick={handleStop}
+						>
+							{acting ? 'Stopping…' : 'Stop'}
+						</Button>
+					{:else if current.status === 'stopped' || current.status === 'failed'}
+						<Button
+							variant="outline"
+							size="sm"
+							disabled={acting || redeploying}
+							aria-busy={acting}
+							onclick={handleStart}
+						>
+							{acting ? 'Starting…' : 'Start'}
+						</Button>
 					{/if}
-				</div>
-			</div>
-			<div class="flex gap-2">
-				{#if db.status === 'running'}
-					<Button variant="outline" size="sm" disabled={acting || redeploying} onclick={handleStop}>
-						{acting ? 'Stopping...' : 'Stop'}
-					</Button>
-				{:else if db.status === 'stopped' || db.status === 'failed'}
 					<Button
 						variant="outline"
 						size="sm"
 						disabled={acting || redeploying}
-						onclick={handleStart}
+						onclick={handleRedeploy}
 					>
-						{acting ? 'Starting...' : 'Start'}
+						{redeploying ? 'Redeploying…' : 'Redeploy'}
 					</Button>
 				{/if}
-				<Button
-					variant="outline"
-					size="sm"
-					disabled={acting || redeploying}
-					onclick={handleRedeploy}
-				>
-					{redeploying ? 'Redeploying...' : 'Redeploy'}
-				</Button>
-				<Button variant="destructive" size="sm" onclick={() => (showDeleteDialog = true)}>
-					Delete
-				</Button>
-			</div>
-		</div>
+			{/snippet}
+		</PageHeader>
 
-		<Separator />
+		<InlineError message={error} ondismiss={() => (error = '')} />
 
-		<!-- Tabs -->
-		<Tabs.Root bind:value={activeTab}>
-			<Tabs.List class="max-w-full justify-start overflow-x-auto">
-				<Tabs.Trigger value="overview">Overview</Tabs.Trigger>
-				<Tabs.Trigger value="logs">Logs</Tabs.Trigger>
-				<Tabs.Trigger value="environment">Environment</Tabs.Trigger>
-				<Tabs.Trigger value="backups">Backups</Tabs.Trigger>
-				<Tabs.Trigger value="limits">Limits</Tabs.Trigger>
-				<Tabs.Trigger value="metrics">Metrics</Tabs.Trigger>
-			</Tabs.List>
+		<LinkTabs
+			label="Database sections"
+			tabs={allowedTabs(DATABASE_TABS, can)}
+			active={tab}
+			href={(id) => tabHref(page.url.pathname, id, 'overview')}
+		/>
 
+		<div>
 			<!-- ── Logs tab (streams only while open) ── -->
-			<Tabs.Content value="logs" class="mt-4">
-				{#if activeTab === 'logs' && !can('logs:read')}
-					<p class="text-sm text-muted-foreground">Your role can't read logs.</p>
-				{:else if activeTab === 'logs'}
+			{#if tab === 'logs'}
+				<div class="mt-4">
 					<StreamLogViewer
 						wsUrl="/api/databases/{db.id}/logs/stream"
 						downloadName="{db.name}-logs"
 						label="{db.name} logs"
 						showPrefix={false}
 					/>
-				{/if}
-			</Tabs.Content>
+				</div>
+			{/if}
 
 			<!-- ── Overview tab ── -->
-			<Tabs.Content value="overview" class="mt-4 space-y-4">
-				<!-- Info grid -->
-				<div class="grid gap-4 sm:grid-cols-2">
-					<!-- Connection strings -->
-					<div class="space-y-4 rounded-lg border p-4">
-						<h3 class="text-sm font-semibold tracking-wide text-muted-foreground uppercase">
-							Connection
-						</h3>
+			{#if tab === 'overview'}
+				<div class="mt-4 space-y-4">
+					<!-- Info grid -->
+					<div class="grid gap-4 sm:grid-cols-2">
+						<!-- Connection strings -->
+						<div class="space-y-4 rounded-lg border p-4">
+							<h2 class="text-sm font-semibold tracking-wide text-muted-foreground uppercase">
+								Connection
+							</h2>
 
-						{#if urlError}
-							<p class="rounded bg-destructive/10 px-3 py-2 text-xs text-destructive">{urlError}</p>
-						{/if}
-						{#if credsError}
-							<p class="rounded bg-destructive/10 px-3 py-2 text-xs text-destructive">
-								{credsError}
-							</p>
-						{/if}
+							<InlineError message={urlError} />
+							<InlineError message={credsError} />
 
-						<!-- External URL -->
-						<div class="space-y-2">
-							<div class="flex items-center justify-between">
-								<p class="text-xs font-medium text-muted-foreground">
-									{db.public_access ? 'External' : 'From this server (localhost)'}
-								</p>
-								{#if !editingExternal}
-									<Button
-										variant="ghost"
-										size="sm"
-										class="h-6 px-2 text-xs"
-										onclick={startEditExternal}
-									>
-										Edit
-									</Button>
-								{/if}
-							</div>
-
-							{#if editingExternal}
-								<div class="space-y-2">
-									<Input
-										class="font-mono text-xs"
-										placeholder="e.g. postgres://user:pass@host:5432/db"
-										bind:value={externalDraft}
-										disabled={savingExternal}
-									/>
-									<p class="text-xs text-muted-foreground">
-										Enter the full string, including the password. It is stored encrypted.
-									</p>
-									<div class="flex gap-2">
-										<Button size="sm" disabled={savingExternal} onclick={saveExternal}>
-											{savingExternal ? 'Saving...' : 'Save'}
-										</Button>
-										<Button
-											variant="outline"
-											size="sm"
-											disabled={savingExternal}
-											onclick={cancelEditExternal}
-										>
-											Cancel
-										</Button>
-										{#if db.custom_external_url}
-											<Button
-												variant="ghost"
-												size="sm"
-												class="ml-auto text-muted-foreground"
-												disabled={savingExternal}
-												onclick={clearExternal}
-											>
-												Reset to default
-											</Button>
-										{/if}
-									</div>
-								</div>
-							{:else if db.connection_string}
-								<div>
-									<ConnectionString
-										value={db.connection_string}
-										plain={creds?.connection_string}
-										reveal={revealCreds}
-										canReveal={can('db:credentials')}
-									/>
-									{#if db.custom_external_url}
-										<span class="mt-1 block text-xs text-muted-foreground/60">custom override</span>
-									{/if}
-								</div>
-							{:else}
-								<p class="text-xs text-muted-foreground/60">Not available (database is stopped)</p>
-							{/if}
-						</div>
-
-						<!-- Internal URL -->
-						<div class="space-y-2">
-							<div class="flex items-center justify-between">
-								<p class="text-xs font-medium text-muted-foreground">From apps with access</p>
-								{#if !editingInternal}
-									<Button
-										variant="ghost"
-										size="sm"
-										class="h-6 px-2 text-xs"
-										onclick={startEditInternal}
-									>
-										Edit
-									</Button>
-								{/if}
-							</div>
-
-							{#if editingInternal}
-								<div class="space-y-2">
-									<Input
-										class="font-mono text-xs"
-										placeholder="e.g. postgres://user:pass@db-alias:5432/db"
-										bind:value={internalDraft}
-										disabled={savingInternal}
-									/>
-									<p class="text-xs text-muted-foreground">
-										Enter the full string, including the password. It is stored encrypted.
-									</p>
-									<div class="flex gap-2">
-										<Button size="sm" disabled={savingInternal} onclick={saveInternal}>
-											{savingInternal ? 'Saving...' : 'Save'}
-										</Button>
-										<Button
-											variant="outline"
-											size="sm"
-											disabled={savingInternal}
-											onclick={cancelEditInternal}
-										>
-											Cancel
-										</Button>
-										{#if db.custom_internal_url}
-											<Button
-												variant="ghost"
-												size="sm"
-												class="ml-auto text-muted-foreground"
-												disabled={savingInternal}
-												onclick={clearInternal}
-											>
-												Reset to default
-											</Button>
-										{/if}
-									</div>
-								</div>
-							{:else if db.internal_connection_string}
-								<div>
-									<ConnectionString
-										value={db.internal_connection_string}
-										plain={creds?.internal_connection_string}
-										reveal={revealCreds}
-										canReveal={can('db:credentials')}
-									/>
-									{#if db.custom_internal_url}
-										<span class="mt-1 block text-xs text-muted-foreground/60">custom override</span>
-									{/if}
-								</div>
-							{:else}
-								<p class="text-xs text-muted-foreground/60">Not available</p>
-							{/if}
-						</div>
-					</div>
-
-					<!-- Configuration -->
-					<div class="space-y-3 rounded-lg border p-4">
-						<h3 class="text-sm font-semibold tracking-wide text-muted-foreground uppercase">
-							Configuration
-						</h3>
-
-						<dl class="space-y-2 text-sm">
-							<div class="flex justify-between">
-								<dt class="text-muted-foreground">Engine</dt>
-								<dd class="font-mono font-medium uppercase">{db.db_type}</dd>
-							</div>
-
-							<!-- Docker image row -->
-							<div class="flex flex-col gap-1">
+							<!-- External URL -->
+							<div class="space-y-2">
 								<div class="flex items-center justify-between">
-									<dt class="text-muted-foreground">Image</dt>
-									{#if !editingImage && isAdmin()}
+									<p class="text-xs font-medium text-muted-foreground">
+										{db.public_access ? 'External' : 'From this server (localhost)'}
+									</p>
+									{#if !editingExternal}
 										<Button
 											variant="ghost"
 											size="sm"
 											class="h-6 px-2 text-xs"
-											onclick={startEditImage}
+											onclick={startEditExternal}
 										>
 											Edit
 										</Button>
 									{/if}
 								</div>
-								{#if editingImage}
+
+								{#if editingExternal}
 									<div class="space-y-2">
-										{#if imageError}
-											<p class="rounded bg-destructive/10 px-2 py-1 text-xs text-destructive">
-												{imageError}
-											</p>
-										{/if}
 										<Input
 											class="font-mono text-xs"
-											placeholder="e.g. postgres:15-alpine"
-											bind:value={imageDraft}
-											disabled={savingImage}
+											placeholder="e.g. postgres://user:pass@host:5432/db"
+											bind:value={externalDraft}
+											disabled={savingExternal}
 										/>
+										<p class="text-xs text-muted-foreground">
+											Enter the full string, including the password. It is stored encrypted.
+										</p>
 										<div class="flex gap-2">
-											<Button size="sm" disabled={savingImage} onclick={saveImage}>
-												{savingImage ? 'Saving...' : 'Save'}
+											<Button size="sm" disabled={savingExternal} onclick={saveExternal}>
+												{savingExternal ? 'Saving...' : 'Save'}
 											</Button>
 											<Button
 												variant="outline"
 												size="sm"
-												disabled={savingImage}
-												onclick={cancelEditImage}
+												disabled={savingExternal}
+												onclick={cancelEditExternal}
 											>
 												Cancel
 											</Button>
-											{#if db.custom_image}
+											{#if db.custom_external_url}
 												<Button
 													variant="ghost"
 													size="sm"
 													class="ml-auto text-muted-foreground"
-													disabled={savingImage}
-													onclick={clearImage}
+													disabled={savingExternal}
+													onclick={clearExternal}
 												>
 													Reset to default
 												</Button>
 											{/if}
 										</div>
 									</div>
-								{:else}
-									<dd class="flex items-center gap-2">
-										<span class="font-mono text-xs">{db.custom_image ?? db.image_used ?? '—'}</span>
-										{#if db.custom_image}
-											<span class="text-xs text-muted-foreground/60">(pending redeploy)</span>
+								{:else if db.connection_string}
+									<div>
+										<ConnectionString
+											value={db.connection_string}
+											plain={creds?.connection_string}
+											reveal={revealCreds}
+											canReveal={can('db:credentials')}
+										/>
+										{#if db.custom_external_url}
+											<span class="mt-1 block text-xs text-muted-foreground">custom override</span>
 										{/if}
-									</dd>
+									</div>
+								{:else}
+									<p class="text-xs text-muted-foreground">Not available (database is stopped)</p>
 								{/if}
 							</div>
 
-							<div class="flex justify-between">
-								<dt class="text-muted-foreground">Memory limit</dt>
-								<dd class="font-mono font-medium">{formatMemory(db.memory_limit)}</dd>
-							</div>
-							{#if db.project_id}
-								<div class="flex justify-between">
-									<dt class="text-muted-foreground">Project</dt>
-									<dd>
-										<a href="/projects/{db.project_id}" class="text-sm hover:underline">
-											{projects.find((p) => p.id === db!.project_id)?.name ?? db.project_id}
-										</a>
-									</dd>
+							<!-- Internal URL -->
+							<div class="space-y-2">
+								<div class="flex items-center justify-between">
+									<p class="text-xs font-medium text-muted-foreground">From apps with access</p>
+									{#if !editingInternal}
+										<Button
+											variant="ghost"
+											size="sm"
+											class="h-6 px-2 text-xs"
+											onclick={startEditInternal}
+										>
+											Edit
+										</Button>
+									{/if}
 								</div>
-							{/if}
-							<div class="flex justify-between">
-								<dt class="text-muted-foreground">Created</dt>
-								<dd class="font-mono text-xs">{new Date(db.created_at).toLocaleString()}</dd>
-							</div>
-						</dl>
-					</div>
-				</div>
 
-				<!-- Network access (H6): private by default, explicit opt-in for public -->
-				<div class="space-y-3 rounded-lg border p-4" data-testid="db-network-access">
-					<div class="flex flex-wrap items-center justify-between gap-2">
-						<h3 class="text-sm font-semibold tracking-wide text-muted-foreground uppercase">
-							Network access
-						</h3>
-						{#if db.public_access}
-							<Badge variant="destructive" class="gap-1"><GlobeIcon class="size-3" /> Public</Badge>
-						{:else}
-							<Badge variant="outline" class="gap-1"><LockIcon class="size-3" /> Private</Badge>
-						{/if}
-					</div>
-
-					{#if publicError}
-						<p class="rounded bg-destructive/10 px-3 py-2 text-xs text-destructive">
-							{publicError}
-						</p>
-					{/if}
-
-					{#if db.public_access}
-						<p class="text-sm text-muted-foreground">
-							Port <span class="font-mono">{db.host_port ?? '—'}</span> is open to the internet. Anyone
-							who can reach this server can try to log in, so use a strong password and turn this off
-							when you no longer need it.
-						</p>
-						{#if db.public_connection_string}
-							<div class="space-y-1">
-								<p class="text-xs font-medium text-muted-foreground">Public connection string</p>
-								<ConnectionString
-									value={db.public_connection_string}
-									plain={creds?.public_connection_string}
-									reveal={revealCreds}
-									canReveal={can('db:credentials')}
-								/>
-								{#if db.public_connection_string.includes('<server-ip>')}
-									<p class="text-xs text-muted-foreground/70">
-										Replace <span class="font-mono">&lt;server-ip&gt;</span> with this server's public
-										IP, or set a dashboard domain in Settings.
-									</p>
-								{/if}
-							</div>
-						{/if}
-					{:else}
-						<p class="text-sm text-muted-foreground">
-							Only reachable from this server on
-							<span class="font-mono">127.0.0.1:{db.host_port ?? '—'}</span> and from the apps
-							listed under "Apps with access". To connect from your computer, use an SSH tunnel:
-							<code class="rounded bg-muted px-1 font-mono text-xs"
-								>ssh -L {db.host_port ?? 5432}:localhost:{db.host_port ?? 5432} root@your-server</code
-							>
-						</p>
-					{/if}
-
-					{#if isAdmin()}
-						<div class="flex flex-wrap items-center gap-3">
-							{#if db.public_access}
-								<Button
-									variant="outline"
-									size="sm"
-									disabled={savingPublic}
-									onclick={() => setPublicAccess(false)}
-								>
-									<LockIcon class="size-4" />
-									{savingPublic ? 'Updating…' : 'Make private'}
-								</Button>
-							{:else}
-								<Button
-									variant="outline"
-									size="sm"
-									disabled={savingPublic}
-									onclick={() => (publicDialogOpen = true)}
-								>
-									<GlobeIcon class="size-4" />
-									Enable public access…
-								</Button>
-							{/if}
-							<p class="text-xs text-muted-foreground/70">
-								Changing this restarts the database container (a few seconds of downtime). Data is
-								kept.
-							</p>
-						</div>
-					{:else}
-						<p class="flex items-center gap-1.5 text-xs text-muted-foreground">
-							<LockIcon class="size-3.5" /> Only admins can change network access.
-						</p>
-					{/if}
-				</div>
-
-				<DatabaseAccess databaseId={db.id} databaseName={db.name} />
-
-				<Dialog.Root bind:open={publicDialogOpen}>
-					<Dialog.Content class="max-w-md">
-						<Dialog.Header>
-							<Dialog.Title class="flex items-center gap-2">
-								<AlertIcon class="size-5 text-destructive" /> Expose {db.name} to the internet?
-							</Dialog.Title>
-							<Dialog.Description>
-								Port <span class="font-mono">{db.host_port ?? '—'}</span> will accept connections from
-								any address. Docker opens it directly, so the server firewall (UFW) does not block it.
-								Bots scan these ports constantly: only do this if you must connect from outside and the
-								password is strong. An SSH tunnel is safer.
-							</Dialog.Description>
-						</Dialog.Header>
-						{#if publicError}
-							<p class="rounded bg-destructive/10 px-3 py-2 text-xs text-destructive">
-								{publicError}
-							</p>
-						{/if}
-						<Dialog.Footer>
-							<Button
-								variant="outline"
-								disabled={savingPublic}
-								onclick={() => (publicDialogOpen = false)}>Cancel</Button
-							>
-							<Button
-								variant="destructive"
-								disabled={savingPublic}
-								onclick={() => setPublicAccess(true)}
-							>
-								{savingPublic ? 'Restarting database…' : 'Make public'}
-							</Button>
-						</Dialog.Footer>
-					</Dialog.Content>
-				</Dialog.Root>
-			</Tabs.Content>
-
-			<!-- ── Environment tab ── -->
-			<Tabs.Content value="environment" class="mt-4 space-y-4">
-				{#if envVars.length === 0}
-					<div class="rounded border border-dashed border-border py-8 text-center">
-						<p class="text-sm text-muted-foreground">
-							No credentials are configured for this database engine.
-						</p>
-					</div>
-				{:else}
-					<!-- How credential changes work -->
-					{#if credSuccess}
-						<div
-							class="flex items-start justify-between gap-3 rounded-lg bg-success/10 px-4 py-3 text-sm text-success"
-							role="status"
-						>
-							<p>{credSuccess}</p>
-							<button
-								type="button"
-								class="text-xs underline-offset-2 hover:underline"
-								onclick={() => (credSuccess = '')}
-							>
-								Dismiss
-							</button>
-						</div>
-					{/if}
-					<div
-						class="rounded-lg border border-border bg-muted/30 px-4 py-3 text-xs text-muted-foreground"
-					>
-						<p class="mb-1">
-							Passwords are stored encrypted and stay hidden.
-							{#if can('db:credentials')}
-								Revealing or copying one is recorded in Activity.
-							{:else}
-								Your role can't reveal them.
-							{/if}
-						</p>
-						{#if isRedisLike}
-							Redis and KeyDB passwords can't be changed in place yet.
-						{:else}
-							<p>
-								<span class="font-semibold text-foreground">Changing a password</span> updates it inside
-								the running database right away, then saves it here. Apps that use the old password must
-								be updated and redeployed.
-							</p>
-							<p class="mt-1">
-								The database name and username can't be changed after creation.
-								{#if !dbRunning}
-									<span class="text-warn">Start the database to change a password.</span>
-								{/if}
-							</p>
-						{/if}
-					</div>
-
-					<!-- Credentials table -->
-					<div class="overflow-hidden rounded border border-border">
-						<table class="w-full text-sm">
-							<thead>
-								<tr class="border-b border-border bg-muted/50">
-									<th
-										class="px-3 py-2 text-left font-mono text-xs font-medium text-muted-foreground uppercase"
-										>Key</th
-									>
-									<th
-										class="px-3 py-2 text-left font-mono text-xs font-medium text-muted-foreground uppercase"
-										>Value</th
-									>
-									<th class="w-28 px-3 py-2"></th>
-								</tr>
-							</thead>
-							<tbody>
-								{#each envVars as v, i (v.envKey)}
-									{@const revealed = revealedKeys.has(v.envKey)}
-									<tr class={i < envVars.length - 1 ? 'border-b border-border' : ''}>
-										<td class="px-3 py-2 font-mono text-xs font-medium">{v.envKey}</td>
-										<td class="max-w-0 truncate px-3 py-2 font-mono text-xs text-muted-foreground">
-											{#if !v.secret && !v.value}
-												<span class="italic">empty</span>
-											{:else if revealed && v.value !== null}
-												{v.value}
-											{:else}
-												<span class="tracking-widest">••••••••</span>
+								{#if editingInternal}
+									<div class="space-y-2">
+										<Input
+											class="font-mono text-xs"
+											placeholder="e.g. postgres://user:pass@db-alias:5432/db"
+											bind:value={internalDraft}
+											disabled={savingInternal}
+										/>
+										<p class="text-xs text-muted-foreground">
+											Enter the full string, including the password. It is stored encrypted.
+										</p>
+										<div class="flex gap-2">
+											<Button size="sm" disabled={savingInternal} onclick={saveInternal}>
+												{savingInternal ? 'Saving...' : 'Save'}
+											</Button>
+											<Button
+												variant="outline"
+												size="sm"
+												disabled={savingInternal}
+												onclick={cancelEditInternal}
+											>
+												Cancel
+											</Button>
+											{#if db.custom_internal_url}
+												<Button
+													variant="ghost"
+													size="sm"
+													class="ml-auto text-muted-foreground"
+													disabled={savingInternal}
+													onclick={clearInternal}
+												>
+													Reset to default
+												</Button>
 											{/if}
-										</td>
-										<td class="px-3 py-2">
-											<div class="flex items-center justify-end gap-1">
-												{#if v.value || (v.secret && can('db:credentials'))}
+										</div>
+									</div>
+								{:else if db.internal_connection_string}
+									<div>
+										<ConnectionString
+											value={db.internal_connection_string}
+											plain={creds?.internal_connection_string}
+											reveal={revealCreds}
+											canReveal={can('db:credentials')}
+										/>
+										{#if db.custom_internal_url}
+											<span class="mt-1 block text-xs text-muted-foreground">custom override</span>
+										{/if}
+									</div>
+								{:else}
+									<p class="text-xs text-muted-foreground">Not available</p>
+								{/if}
+							</div>
+						</div>
+
+						<!-- Configuration -->
+						<div class="space-y-3 rounded-lg border p-4">
+							<h2 class="text-sm font-semibold tracking-wide text-muted-foreground uppercase">
+								Configuration
+							</h2>
+
+							<dl class="space-y-2 text-sm">
+								<div class="flex justify-between">
+									<dt class="text-muted-foreground">Engine</dt>
+									<dd class="font-mono font-medium uppercase">{db.db_type}</dd>
+								</div>
+
+								<!-- Docker image row -->
+								<div class="flex flex-col gap-1">
+									<dt class="flex items-center justify-between text-muted-foreground">
+										<span>Image</span>
+										{#if !editingImage && isAdmin()}
+											<Button
+												variant="ghost"
+												size="sm"
+												class="h-6 px-2 text-xs"
+												onclick={startEditImage}
+											>
+												Edit
+											</Button>
+										{/if}
+									</dt>
+									{#if editingImage}
+										<dd class="space-y-2">
+											<InlineError message={imageError} />
+											<Input
+												class="font-mono text-xs"
+												aria-label="Docker image"
+												placeholder="e.g. postgres:15-alpine"
+												bind:value={imageDraft}
+												disabled={savingImage}
+											/>
+											<div class="flex gap-2">
+												<Button size="sm" disabled={savingImage} onclick={saveImage}>
+													{savingImage ? 'Saving...' : 'Save'}
+												</Button>
+												<Button
+													variant="outline"
+													size="sm"
+													disabled={savingImage}
+													onclick={cancelEditImage}
+												>
+													Cancel
+												</Button>
+												{#if db.custom_image}
 													<Button
 														variant="ghost"
-														size="icon"
-														class="h-7 w-7 text-muted-foreground hover:text-foreground"
-														aria-label={`${revealed ? 'Hide' : 'Reveal'} ${v.envKey}`}
-														disabled={revealingCreds}
-														onclick={() => toggleReveal(v.envKey, !!v.secret)}
+														size="sm"
+														class="ml-auto text-muted-foreground"
+														disabled={savingImage}
+														onclick={clearImage}
 													>
-														{#if revealed}
-															<EyeOff class="h-3.5 w-3.5" />
-														{:else}
-															<Eye class="h-3.5 w-3.5" />
-														{/if}
-													</Button>
-													<Button
-														variant="ghost"
-														size="icon"
-														class="h-7 w-7 text-muted-foreground hover:text-foreground"
-														aria-label="Copy value"
-														disabled={revealingCreds}
-														onclick={() =>
-															copyEnvVar(
-																() => envVars.find((e) => e.envKey === v.envKey)?.value ?? '',
-																v.envKey,
-																!!v.secret
-															)}
-													>
-														{#if copiedEnvVar === v.envKey}
-															<Check class="h-3.5 w-3.5 text-green-500" />
-														{:else}
-															<Copy class="h-3.5 w-3.5" />
-														{/if}
-													</Button>
-												{/if}
-												{#if isPasswordField(v.credField) && !isRedisLike}
-													{@const field = v.credField}
-													<Button
-														variant="ghost"
-														size="icon"
-														class="h-7 w-7 text-muted-foreground hover:text-foreground"
-														aria-label={`Change ${credLabel(field).toLowerCase()}`}
-														title={dbRunning
-															? `Change ${credLabel(field).toLowerCase()}`
-															: 'Start the database to change its password'}
-														disabled={!dbRunning}
-														onclick={() => startEditCred(field)}
-													>
-														<Pencil class="h-3.5 w-3.5" />
+														Reset to default
 													</Button>
 												{/if}
 											</div>
-										</td>
-									</tr>
-								{/each}
-							</tbody>
-						</table>
+										</dd>
+									{:else}
+										<dd class="flex items-center gap-2">
+											<span class="font-mono text-xs"
+												>{db.custom_image ?? db.image_used ?? '—'}</span
+											>
+											{#if db.custom_image}
+												<span class="text-xs text-muted-foreground">(pending redeploy)</span>
+											{/if}
+										</dd>
+									{/if}
+								</div>
+
+								<div class="flex justify-between">
+									<dt class="text-muted-foreground">Memory limit</dt>
+									<dd class="font-mono font-medium">{formatMemory(db.memory_limit)}</dd>
+								</div>
+								{#if db.project_id}
+									<div class="flex justify-between">
+										<dt class="text-muted-foreground">Project</dt>
+										<dd>
+											<a href="/projects/{db.project_id}" class="text-sm hover:underline">
+												{projects.find((p) => p.id === db!.project_id)?.name ?? db.project_id}
+											</a>
+										</dd>
+									</div>
+								{/if}
+								<div class="flex justify-between">
+									<dt class="text-muted-foreground">Created</dt>
+									<dd class="font-mono text-xs">{new Date(db.created_at).toLocaleString()}</dd>
+								</div>
+							</dl>
+						</div>
 					</div>
 
-					<!-- Env block copy-all -->
-					<div class="space-y-2 rounded-lg border p-4">
-						<div class="flex items-center justify-between">
-							<p class="text-xs font-semibold tracking-wide text-muted-foreground uppercase">
-								Copy all as env block
+					<!-- Network access (H6): private by default, explicit opt-in for public -->
+					<div class="space-y-3 rounded-lg border p-4" data-testid="db-network-access">
+						<div class="flex flex-wrap items-center justify-between gap-2">
+							<h2 class="text-sm font-semibold tracking-wide text-muted-foreground uppercase">
+								Network access
+							</h2>
+							{#if db.public_access}
+								<StatusBadge status="public" tone="warning" label="Public" />
+							{:else}
+								<StatusBadge status="private" tone="neutral" label="Private" />
+							{/if}
+						</div>
+
+						<InlineError message={publicError} />
+
+						{#if db.public_access}
+							<p class="text-sm text-muted-foreground">
+								Port <span class="font-mono">{db.host_port ?? '—'}</span> is open to the internet. Anyone
+								who can reach this server can try to log in, so use a strong password and turn this off
+								when you no longer need it.
 							</p>
-							<Button
-								variant="ghost"
-								size="sm"
-								class="h-6 px-2 text-xs"
-								disabled={revealingCreds ||
-									(!can('db:credentials') && envVars.some((v) => v.secret))}
-								onclick={() =>
-									copyEnvVar(
-										() => envVars.map((v) => `${v.envKey}=${v.value ?? ''}`).join('\n'),
-										'__all__',
-										envVars.some((v) => v.secret)
-									)}
-							>
-								{copiedEnvVar === '__all__' ? 'Copied!' : 'Copy'}
-							</Button>
-						</div>
-						<!-- Values stay hidden here too unless revealed in the table above;
-						     Copy always copies the real values. -->
-						<pre
-							class="overflow-x-auto rounded bg-muted px-3 py-2 font-mono text-xs leading-relaxed">{envVars
-								.map(
-									(v) =>
-										`${v.envKey}=${revealedKeys.has(v.envKey) || !v.secret ? (v.value ?? '') : '••••••••'}`
-								)
-								.join('\n')}</pre>
-					</div>
-				{/if}
-			</Tabs.Content>
+							{#if db.public_connection_string}
+								<div class="space-y-1">
+									<p class="text-xs font-medium text-muted-foreground">Public connection string</p>
+									<ConnectionString
+										value={db.public_connection_string}
+										plain={creds?.public_connection_string}
+										reveal={revealCreds}
+										canReveal={can('db:credentials')}
+									/>
+									{#if db.public_connection_string.includes('<server-ip>')}
+										<p class="text-xs text-muted-foreground">
+											Replace <span class="font-mono">&lt;server-ip&gt;</span> with this server's public
+											IP, or set a dashboard domain in Settings.
+										</p>
+									{/if}
+								</div>
+							{/if}
+						{:else}
+							<p class="text-sm text-muted-foreground">
+								Only reachable from this server on
+								<span class="font-mono">127.0.0.1:{db.host_port ?? '—'}</span> and from the apps
+								listed under "Apps with access". To connect from your computer, use an SSH tunnel:
+								<code class="rounded bg-muted px-1 font-mono text-xs"
+									>ssh -L {db.host_port ?? 5432}:localhost:{db.host_port ?? 5432} root@your-server</code
+								>
+							</p>
+						{/if}
 
-			<!-- ── Backups tab ── -->
-			<Tabs.Content value="backups" class="mt-4">
-				<DatabaseBackups
-					dbId={db.id}
-					dbName={db.name}
-					canRestore={can('snapshots:restore')}
-					canBackup={can('snapshots:create')}
-				/>
-			</Tabs.Content>
-
-			<!-- ── Limits tab ── -->
-			<Tabs.Content value="limits" class="mt-4 space-y-6 pt-2">
-				<div class="max-w-sm space-y-6">
-					<div class="space-y-2">
-						<Label>Memory Limit</Label>
-						<div class="flex gap-2">
-							<Input
-								type="number"
-								bind:value={memoryLimitDraft}
-								placeholder="Unlimited"
-								min={1}
-								disabled={savingLimits}
-							/>
-							<Select.Root type="single" bind:value={memoryUnitDraft}>
-								<Select.Trigger class="w-24" disabled={savingLimits}>
-									{memoryUnitDraft.toUpperCase()}
-								</Select.Trigger>
-								<Select.Content>
-									<Select.Item value="mb">MB</Select.Item>
-									<Select.Item value="gb">GB</Select.Item>
-								</Select.Content>
-							</Select.Root>
-						</div>
-						<p class="text-xs text-muted-foreground">
-							Leave empty for unlimited memory. Recommended: 256 MB for PostgreSQL/MySQL, 128 MB for
-							Redis.
-						</p>
-					</div>
-
-					{#if limitsError}
-						<p class="rounded bg-destructive/10 px-3 py-2 text-xs text-destructive">
-							{limitsError}
-						</p>
-					{/if}
-
-					<div class="flex items-center gap-3">
-						<Button onclick={saveLimits} disabled={savingLimits}>
-							{savingLimits ? 'Saving...' : 'Save'}
-						</Button>
-						{#if limitsSaved}
-							<span class="flex items-center gap-1 text-xs text-green-600 dark:text-green-400">
-								<Check class="h-3.5 w-3.5" /> Saved
-							</span>
+						{#if isAdmin()}
+							<div class="flex flex-wrap items-center gap-3">
+								{#if db.public_access}
+									<Button
+										variant="outline"
+										size="sm"
+										disabled={savingPublic}
+										onclick={() => setPublicAccess(false)}
+									>
+										<LockIcon class="size-4" />
+										{savingPublic ? 'Updating…' : 'Make private'}
+									</Button>
+								{:else}
+									<Button
+										variant="outline"
+										size="sm"
+										disabled={savingPublic}
+										onclick={() => (publicDialogOpen = true)}
+									>
+										<GlobeIcon class="size-4" />
+										Enable public access…
+									</Button>
+								{/if}
+								<p class="text-xs text-muted-foreground">
+									Changing this restarts the database container (a few seconds of downtime). Data is
+									kept.
+								</p>
+							</div>
+						{:else}
+							<p class="flex items-center gap-1.5 text-xs text-muted-foreground">
+								<LockIcon class="size-3.5" /> Only admins can change network access.
+							</p>
 						{/if}
 					</div>
+
+					<DatabaseAccess databaseId={db.id} databaseName={db.name} />
+
+					<Dialog.Root bind:open={publicDialogOpen}>
+						<Dialog.Content class="max-w-md">
+							<Dialog.Header>
+								<Dialog.Title class="flex items-center gap-2">
+									<AlertIcon class="size-5 text-destructive" /> Expose {db.name} to the internet?
+								</Dialog.Title>
+								<Dialog.Description>
+									Port <span class="font-mono">{db.host_port ?? '—'}</span> will accept connections from
+									any address. Docker opens it directly, so the server firewall (UFW) does not block it.
+									Bots scan these ports constantly: only do this if you must connect from outside and
+									the password is strong. An SSH tunnel is safer.
+								</Dialog.Description>
+							</Dialog.Header>
+							<InlineError message={publicError} />
+							<Dialog.Footer>
+								<Button
+									variant="outline"
+									disabled={savingPublic}
+									onclick={() => (publicDialogOpen = false)}>Cancel</Button
+								>
+								<Button
+									variant="destructive"
+									disabled={savingPublic}
+									onclick={() => setPublicAccess(true)}
+								>
+									{savingPublic ? 'Restarting database…' : 'Make public'}
+								</Button>
+							</Dialog.Footer>
+						</Dialog.Content>
+					</Dialog.Root>
 				</div>
-			</Tabs.Content>
+			{/if}
+
+			<!-- ── Environment tab ── -->
+			{#if tab === 'environment'}
+				<div class="mt-4 space-y-4">
+					{#if envVars.length === 0}
+						<div class="rounded border border-dashed border-border py-8 text-center">
+							<p class="text-sm text-muted-foreground">
+								No credentials are configured for this database engine.
+							</p>
+						</div>
+					{:else}
+						<!-- How credential changes work -->
+						{#if credSuccess}
+							<div
+								class="flex items-start justify-between gap-3 rounded-lg bg-success/10 px-4 py-3 text-sm text-success"
+								role="status"
+							>
+								<p>{credSuccess}</p>
+								<button
+									type="button"
+									class="text-xs underline-offset-2 hover:underline"
+									onclick={() => (credSuccess = '')}
+								>
+									Dismiss
+								</button>
+							</div>
+						{/if}
+						<div
+							class="rounded-lg border border-border bg-muted/30 px-4 py-3 text-xs text-muted-foreground"
+						>
+							<p class="mb-1">
+								Passwords are stored encrypted and stay hidden.
+								{#if can('db:credentials')}
+									Revealing or copying one is recorded in Activity.
+								{:else}
+									Your role can't reveal them.
+								{/if}
+							</p>
+							{#if isRedisLike}
+								Redis and KeyDB passwords can't be changed in place yet.
+							{:else}
+								<p>
+									<span class="font-semibold text-foreground">Changing a password</span> updates it inside
+									the running database right away, then saves it here. Apps that use the old password
+									must be updated and redeployed.
+								</p>
+								<p class="mt-1">
+									The database name and username can't be changed after creation.
+									{#if !dbRunning}
+										<span class="text-warn">Start the database to change a password.</span>
+									{/if}
+								</p>
+							{/if}
+						</div>
+
+						<!-- Credentials table -->
+						<div class="overflow-hidden rounded border border-border">
+							<table class="w-full text-sm">
+								<thead>
+									<tr class="border-b border-border bg-muted/50">
+										<th
+											class="px-3 py-2 text-left font-mono text-xs font-medium text-muted-foreground uppercase"
+											>Key</th
+										>
+										<th
+											class="px-3 py-2 text-left font-mono text-xs font-medium text-muted-foreground uppercase"
+											>Value</th
+										>
+										<th class="w-28 px-3 py-2"><span class="sr-only">Actions</span></th>
+									</tr>
+								</thead>
+								<tbody>
+									{#each envVars as v, i (v.envKey)}
+										{@const revealed = revealedKeys.has(v.envKey)}
+										<tr class={i < envVars.length - 1 ? 'border-b border-border' : ''}>
+											<td class="px-3 py-2 font-mono text-xs font-medium">{v.envKey}</td>
+											<td
+												class="max-w-0 truncate px-3 py-2 font-mono text-xs text-muted-foreground"
+											>
+												{#if !v.secret && !v.value}
+													<span class="italic">empty</span>
+												{:else if revealed && v.value !== null}
+													{v.value}
+												{:else}
+													<span class="tracking-widest">••••••••</span>
+												{/if}
+											</td>
+											<td class="px-3 py-2">
+												<div class="flex items-center justify-end gap-1">
+													{#if v.value || (v.secret && can('db:credentials'))}
+														<Button
+															variant="ghost"
+															size="icon"
+															class="h-7 w-7 text-muted-foreground hover:text-foreground"
+															aria-label={`${revealed ? 'Hide' : 'Reveal'} ${v.envKey}`}
+															disabled={revealingCreds}
+															onclick={() => toggleReveal(v.envKey, !!v.secret)}
+														>
+															{#if revealed}
+																<EyeOff class="h-3.5 w-3.5" />
+															{:else}
+																<Eye class="h-3.5 w-3.5" />
+															{/if}
+														</Button>
+														<Button
+															variant="ghost"
+															size="icon"
+															class="h-7 w-7 text-muted-foreground hover:text-foreground"
+															aria-label="Copy value"
+															disabled={revealingCreds}
+															onclick={() =>
+																copyEnvVar(
+																	() => envVars.find((e) => e.envKey === v.envKey)?.value ?? '',
+																	v.envKey,
+																	!!v.secret
+																)}
+														>
+															{#if copiedEnvVar === v.envKey}
+																<Check class="h-3.5 w-3.5 text-green-500" />
+															{:else}
+																<Copy class="h-3.5 w-3.5" />
+															{/if}
+														</Button>
+													{/if}
+													{#if isPasswordField(v.credField) && !isRedisLike}
+														{@const field = v.credField}
+														<Button
+															variant="ghost"
+															size="icon"
+															class="h-7 w-7 text-muted-foreground hover:text-foreground"
+															aria-label={`Change ${credLabel(field).toLowerCase()}`}
+															title={dbRunning
+																? `Change ${credLabel(field).toLowerCase()}`
+																: 'Start the database to change its password'}
+															disabled={!dbRunning}
+															onclick={() => startEditCred(field)}
+														>
+															<Pencil class="h-3.5 w-3.5" />
+														</Button>
+													{/if}
+												</div>
+											</td>
+										</tr>
+									{/each}
+								</tbody>
+							</table>
+						</div>
+
+						<!-- Env block copy-all -->
+						<div class="space-y-2 rounded-lg border p-4">
+							<div class="flex items-center justify-between">
+								<p class="text-xs font-semibold tracking-wide text-muted-foreground uppercase">
+									Copy all as env block
+								</p>
+								<Button
+									variant="ghost"
+									size="sm"
+									class="h-6 px-2 text-xs"
+									disabled={revealingCreds ||
+										(!can('db:credentials') && envVars.some((v) => v.secret))}
+									onclick={() =>
+										copyEnvVar(
+											() => envVars.map((v) => `${v.envKey}=${v.value ?? ''}`).join('\n'),
+											'__all__',
+											envVars.some((v) => v.secret)
+										)}
+								>
+									{copiedEnvVar === '__all__' ? 'Copied!' : 'Copy'}
+								</Button>
+							</div>
+							<!-- Values stay hidden here too unless revealed in the table above;
+						     Copy always copies the real values. -->
+							<pre
+								class="overflow-x-auto rounded bg-muted px-3 py-2 font-mono text-xs leading-relaxed">{envVars
+									.map(
+										(v) =>
+											`${v.envKey}=${revealedKeys.has(v.envKey) || !v.secret ? (v.value ?? '') : '••••••••'}`
+									)
+									.join('\n')}</pre>
+						</div>
+					{/if}
+				</div>
+			{/if}
+
+			<!-- ── Backups tab ── -->
+			{#if tab === 'backups'}
+				<div class="mt-4">
+					<DatabaseBackups
+						dbId={db.id}
+						dbName={db.name}
+						canRestore={can('snapshots:restore')}
+						canBackup={can('snapshots:create')}
+					/>
+				</div>
+			{/if}
+
+			<!-- ── Limits tab ── -->
+			{#if tab === 'settings'}
+				<div class="mt-4 space-y-8 pt-2">
+					<div class="max-w-sm space-y-6">
+						<div class="space-y-2">
+							<Label for="db-memory-limit">Memory limit</Label>
+							<div class="flex gap-2">
+								<Input
+									id="db-memory-limit"
+									type="number"
+									bind:value={memoryLimitDraft}
+									placeholder="Unlimited"
+									min={1}
+									disabled={savingLimits}
+								/>
+								<Select.Root type="single" bind:value={memoryUnitDraft}>
+									<Select.Trigger class="w-24" disabled={savingLimits} aria-label="Memory unit">
+										{memoryUnitDraft.toUpperCase()}
+									</Select.Trigger>
+									<Select.Content>
+										<Select.Item value="mb">MB</Select.Item>
+										<Select.Item value="gb">GB</Select.Item>
+									</Select.Content>
+								</Select.Root>
+							</div>
+							<p class="text-xs text-muted-foreground">
+								Leave empty for unlimited memory. Recommended: 256 MB for PostgreSQL/MySQL, 128 MB
+								for Redis.
+							</p>
+						</div>
+
+						<InlineError message={limitsError} />
+
+						<div class="flex items-center gap-3">
+							<Button onclick={saveLimits} disabled={savingLimits}>
+								{savingLimits ? 'Saving...' : 'Save'}
+							</Button>
+							<SuccessAlert
+								message={limitsSaved}
+								ondismiss={() => (limitsSaved = '')}
+								timeout={5000}
+							/>
+						</div>
+					</div>
+					{#if can('db:delete')}
+						<section
+							aria-labelledby="db-danger-heading"
+							class="max-w-2xl space-y-4 rounded-sm border border-destructive/40 p-4"
+						>
+							<div>
+								<h2 id="db-danger-heading" class="text-sm font-semibold text-destructive">
+									Delete this database
+								</h2>
+								<p class="mt-1 text-sm text-muted-foreground">
+									Stops the container and permanently deletes all of its data. Snapshots taken
+									earlier are kept.
+								</p>
+							</div>
+							<Button variant="destructive" size="sm" onclick={() => (showDeleteDialog = true)}>
+								Delete database…
+							</Button>
+						</section>
+					{/if}
+				</div>
+			{/if}
 
 			<!-- ── Metrics tab (mounted only while open, so it polls only then) ── -->
-			<Tabs.Content value="metrics">
-				{#if activeTab === 'metrics'}
-					{#key db.id}
-						<MetricsPanel owner="databases" id={db.id} noun="database" />
-					{/key}
-				{/if}
-			</Tabs.Content>
-		</Tabs.Root>
+			{#if tab === 'metrics'}
+				{#key db.id}
+					<MetricsPanel owner="databases" id={db.id} noun="database" />
+				{/key}
+			{/if}
+		</div>
 	</div>
 {:else}
 	<div class="py-12 text-center text-muted-foreground">Database not found</div>
@@ -1408,11 +1410,7 @@
 					</Button>
 				</div>
 			</div>
-			{#if credError}
-				<p class="rounded bg-destructive/10 px-3 py-2 text-xs text-destructive" role="alert">
-					{credError}
-				</p>
-			{/if}
+			<InlineError message={credError} />
 			<Dialog.Footer>
 				<Button type="button" variant="outline" onclick={cancelEditCred} disabled={savingCred}>
 					Cancel
@@ -1426,10 +1424,20 @@
 </Dialog.Root>
 
 <!-- Delete confirmation dialog -->
-<ConfirmDeleteDialog
+<ConfirmDialog
 	bind:open={showDeleteDialog}
-	title={`Delete "${db?.name}"?`}
-	description="This will stop the container and permanently remove all data. This action cannot be undone."
-	confirmation={db?.name ?? ''}
+	title={`Delete ${db?.name ?? 'this database'}?`}
+	description="This permanently deletes the database and all of its data. It can't be undone."
+	confirmLabel="Delete database"
+	pendingLabel="Deleting…"
+	typedConfirmation={db?.name ?? ''}
 	onconfirm={handleDelete}
-/>
+>
+	{#snippet details()}
+		<ul class="list-disc space-y-1 pl-5">
+			<li>The container stops; apps using it lose their connection.</li>
+			<li>Every table, key and file on its volume is deleted.</li>
+			<li>Existing snapshots are kept, so you can restore from one later.</li>
+		</ul>
+	{/snippet}
+</ConfirmDialog>

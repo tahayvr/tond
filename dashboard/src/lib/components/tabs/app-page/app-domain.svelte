@@ -318,7 +318,7 @@
 			{/if}
 		{:else}
 			<div class="space-y-1">
-				<h3 class="font-medium">This app has no address yet</h3>
+				<h2 class="font-medium">This app has no address yet</h2>
 				<p class="text-sm text-muted-foreground">Choose how people reach it.</p>
 			</div>
 			<div class="grid gap-3 md:grid-cols-2">
@@ -452,7 +452,7 @@
 		</section>
 
 		<section class="space-y-2" aria-label="HTTPS certificate">
-			<h3 class="text-sm font-medium">HTTPS</h3>
+			<h2 class="text-sm font-medium">HTTPS</h2>
 			<CertificateStatus {domain} refreshKey={certRefreshKey + certKey} />
 		</section>
 	{/if}

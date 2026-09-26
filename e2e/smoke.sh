@@ -857,6 +857,38 @@ wait_for 180 "a successful e2e-cron run" \
     bash -c "curl -sf --unix-socket '$SOCK' 'http://localhost/api/cron/${CRON_ID}/runs' | jq -e '.data[] | select(.status == \"success\" and (.output // \"\" | contains(\"tond-e2e-cron-ok\")))'"
 pass "manual cron run succeeded with the expected output"
 
+step "Cron schedules, alert channels and first-run checklist (dashboard UX)"
+# Next runs come from the scheduler's own parser: standard day-of-week numbering
+# (1-5 = Monday-Friday) evaluated in the job's time zone.
+PREVIEW=$(api '/api/cron/schedule-preview?schedule=0%209%20*%20*%201-5&timezone=Europe/Berlin&count=5')
+[[ "$(jq -r '.data.next_runs | length' <<<"$PREVIEW")" == 5 ]] || fail "schedule preview should list 5 runs: $PREVIEW"
+for run in $(jq -r '.data.next_runs[]' <<<"$PREVIEW"); do
+    [[ "$(TZ=Europe/Berlin date -d "$run" +%u)" -le 5 ]] || fail "1-5 must mean Monday-Friday, got $run"
+    [[ "$(TZ=Europe/Berlin date -d "$run" +%H:%M)" == "09:00" ]] || fail "runs should be 09:00 Berlin time, got $run"
+done
+[[ "$(api_req GET '/api/cron/schedule-preview?schedule=0%209%20*%20*%20*&timezone=Mars/Olympus' '')" == 400 ]] \
+    || fail "an unknown time zone must be rejected"
+TZ_CODE=$(api_req POST /api/cron '{"name":"e2e-bad-tz","schedule":"0 3 * * *","image":"alpine:3","timezone":"Mars/Olympus"}')
+[[ "$TZ_CODE" == 400 ]] || fail "creating a cron job with an unknown time zone should be 400, got $TZ_CODE"
+pass "schedule preview uses Mon-Fri for 1-5 in the job's time zone; unknown zones are rejected"
+
+NO_CHANNEL=$(api_req POST /api/alerts '{"name":"e2e-nobody","events":["deployment_failure"]}')
+[[ "$NO_CHANNEL" == 400 ]] || fail "an alert rule that notifies nobody should be 400, got $NO_CHANNEL"
+RULE_CODE=$(api_req POST /api/alerts '{"name":"e2e-events","events":["deployment_failure"],"webhook_url":"http://127.0.0.1:9/unreachable"}')
+[[ "$RULE_CODE" == 201 ]] || fail "an event-only rule with a webhook should be created, got $RULE_CODE: $(cat "$API_BODY")"
+RULE_ID=$(jq -r '.data.id' "$API_BODY")
+TEST_CODE=$(api_req POST "/api/alerts/${RULE_ID}/test" '')
+[[ "$TEST_CODE" == 200 ]] || fail "send-test should answer 200, got $TEST_CODE"
+jq -e '.data | length == 1 and .[0].kind == "webhook" and .[0].ok == false and (.[0].error | length > 0)' "$API_BODY" > /dev/null \
+    || fail "send-test should report the unreachable webhook: $(cat "$API_BODY")"
+api_req DELETE "/api/alerts/${RULE_ID}" '' > /dev/null
+pass "alert rules need a channel; event-only rules work; send-test reports each channel"
+
+ONBOARDING=$(api /api/onboarding/status)
+jq -e '.data.has_successful_deploy == true and .data.last_deployment.app_name != null and (.data | has("has_source_integration") and has("has_notification_channel"))' \
+    <<<"$ONBOARDING" > /dev/null || fail "onboarding status should report the checklist and last deploy: $ONBOARDING"
+pass "onboarding status reports the first-run checklist and the latest deployment"
+
 step "Container confinement"
 # Every container Tond starts: ports on 127.0.0.1 only (Docker's iptables rules
 # bypass UFW), no-new-privileges, trimmed capabilities, pids + memory limits,

@@ -25,8 +25,24 @@ vi.mock('$lib/auth.svelte', () => ({
 vi.mock('$lib/ui-context.svelte', () => ({
 	getFeedOpen: () => false,
 	getTerminalOpen: () => false,
+	getPaletteOpen: () => false,
+	getShortcutsOpen: () => false,
 	setFeedOpen: vi.fn(),
-	setTerminalOpen: vi.fn()
+	setTerminalOpen: vi.fn(),
+	setPaletteOpen: vi.fn(),
+	setShortcutsOpen: vi.fn()
+}));
+
+vi.mock('$lib/components/command/command-palette.svelte', async () => ({
+	default: (await import('../mocks/EmptyComponent.svelte')).default
+}));
+
+vi.mock('$lib/components/command/shortcuts-dialog.svelte', async () => ({
+	default: (await import('../mocks/EmptyComponent.svelte')).default
+}));
+
+vi.mock('$lib/components/nav/nav-progress.svelte', async () => ({
+	default: (await import('../mocks/EmptyComponent.svelte')).default
 }));
 
 vi.mock('$lib/api', () => ({

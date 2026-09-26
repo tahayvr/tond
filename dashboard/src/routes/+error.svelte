@@ -1,4 +1,5 @@
 <script lang="ts">
+	import PageTitle from '$lib/components/nav/page-title.svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { Button } from '$lib/components/ui/button/index.js';
@@ -35,10 +36,11 @@
 
 <div class="flex min-h-[60vh] w-full items-center justify-center p-6">
 	<div class="w-full max-w-lg space-y-4 rounded-lg border border-border bg-card p-6" role="alert">
-		<p class="font-mono text-[10px] tracking-[0.35em] text-muted-foreground/70 uppercase">
+		<p class="font-mono text-[10px] tracking-[0.35em] text-muted-foreground uppercase">
 			{status ? `Error ${status}` : 'Connection error'}
 		</p>
-		<h1 class="text-2xl font-extrabold uppercase">{title}</h1>
+		<h1 class="text-2xl font-extrabold">{title}</h1>
+		<PageTitle {title} />
 		<p class="text-sm text-muted-foreground">
 			{#if unavailable}
 				Tond didn't respond. It may be restarting or updating — nothing was lost. Try again in a few
