@@ -74,6 +74,7 @@ mod audit_log;
 mod audit_ship;
 mod auth;
 mod backup;
+mod compose;
 mod compose_policy;
 mod cron;
 mod db;

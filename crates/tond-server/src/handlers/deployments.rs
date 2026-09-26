@@ -594,6 +594,7 @@ mod tests {
             rollback_of: None,
             phases: "[]".to_string(),
             failure: None,
+            compose_source: None,
         }
     }
 

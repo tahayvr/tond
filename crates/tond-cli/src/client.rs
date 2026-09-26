@@ -185,6 +185,8 @@ impl TondClient {
             github_app_id: None,
             dockerfile_content: None,
             compose_content: None,
+            compose_path: None,
+            compose_service: None,
             base_dir: None,
             static_build: false,
             readiness: None,

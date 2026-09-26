@@ -111,6 +111,10 @@ pub struct App {
     pub dockerfile_content: Option<String>,
     /// Raw docker-compose.yml content supplied by the user (used when source_type = "compose")
     pub compose_content: Option<String>,
+    /// Compose apps deployed from a git repository: path of the compose file
+    /// inside the repository (None = inline compose_content)
+    #[sqlx(default)]
+    pub compose_path: Option<String>,
     /// Subdirectory to use as the build root (useful for monorepos); None = repo root
     pub base_dir: Option<String>,
     /// 1 = serve final build output as a static site; 0 = run as a process
@@ -225,6 +229,7 @@ impl App {
             preview_env_vars: "{}".to_string(),
             dockerfile_content: None,
             compose_content: None,
+            compose_path: None,
             base_dir: None,
             static_build: 0,
             readiness: Readiness::Http.as_str().to_string(),
@@ -280,6 +285,14 @@ pub struct CreateAppRequest {
     pub dockerfile_content: Option<String>,
     /// Raw docker-compose.yml content (used when source_type = "compose")
     pub compose_content: Option<String>,
+    /// Compose from a git repository (source_url + branch): path of the
+    /// compose file in the repository (default "docker-compose.yml")
+    #[serde(default)]
+    pub compose_path: Option<String>,
+    /// Compose apps: the service that answers web traffic on
+    /// `container_port` and gets `domain` (default: detected from the file)
+    #[serde(default)]
+    pub compose_service: Option<String>,
     /// Subdirectory to use as the build root (None = repo root)
     pub base_dir: Option<String>,
     /// Serve build output as a static site (default false)
@@ -353,6 +366,9 @@ pub struct AppResponse {
     pub dockerfile_content: Option<String>,
     /// Raw docker-compose.yml content (used when source_type = "compose")
     pub compose_content: Option<String>,
+    /// Git-sourced compose apps: compose file path in the repository
+    #[serde(default)]
+    pub compose_path: Option<String>,
     /// Subdirectory used as build root (None = repo root)
     pub base_dir: Option<String>,
     /// Whether the build output is served as a static site
@@ -403,6 +419,7 @@ impl From<App> for AppResponse {
             preview_shared_keys,
             dockerfile_content: app.dockerfile_content,
             compose_content: app.compose_content,
+            compose_path: app.compose_path,
             base_dir: app.base_dir,
             static_build: app.static_build != 0,
             readiness: Readiness::parse(&app.readiness).as_str().to_string(),
