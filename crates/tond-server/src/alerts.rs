@@ -242,7 +242,7 @@ async fn fire_threshold_alert(
 pub async fn fire_event_alerts(
     state: &AppState,
     event: &str,
-    _app_id: Option<&str>,
+    app_id: Option<&str>,
     app_name: Option<&str>,
     detail: Option<&str>,
 ) {
@@ -263,6 +263,14 @@ pub async fn fire_event_alerts(
     for rule in rules {
         let subscribed = rule.parse_events();
         if !subscribed.iter().any(|e| e == event) {
+            continue;
+        }
+        // Container events carry the id of what crashed; an app-scoped rule
+        // only hears about its own app.
+        if event.starts_with("container_")
+            && let (Some(scope), Some(id)) = (rule.app_id.as_deref(), app_id)
+            && scope != id
+        {
             continue;
         }
 
@@ -791,6 +799,60 @@ mod tests {
                 .unwrap_or_else(|err| panic!("global app_down rule check should succeed: {err}")),
             None,
             "check_app_down_rule should ignore rules that are not scoped to a specific app"
+        );
+    }
+
+    #[tokio::test]
+    async fn container_events_respect_the_rules_app_scope() {
+        let state = test_state().await;
+        seed_app(
+            &state,
+            "app-1",
+            "frontend",
+            "running",
+            "2026-01-01 00:00:00",
+        )
+        .await;
+        seed_app(&state, "app-2", "backend", "running", "2026-01-01 00:00:00").await;
+        for (id, app) in [
+            ("rule-app-1", Some("app-1")),
+            ("rule-app-2", Some("app-2")),
+            ("rule-all", None),
+        ] {
+            seed_alert_rule(
+                &state,
+                TestAlertRule {
+                    id,
+                    name: id,
+                    app_id: app,
+                    metric: Some("cpu"),
+                    threshold: 1000.0,
+                    events: Some(r#"["container_restart"]"#),
+                    last_fired_at: None,
+                },
+            )
+            .await;
+        }
+        fire_event_alerts(
+            &state,
+            "container_restart",
+            Some("app-1"),
+            Some("frontend"),
+            Some("restarted after exiting unexpectedly (exit code 1)"),
+        )
+        .await;
+        assert!(
+            load_rule(&state, "rule-app-1")
+                .await
+                .last_fired_at
+                .is_some()
+        );
+        assert!(load_rule(&state, "rule-all").await.last_fired_at.is_some());
+        assert!(
+            load_rule(&state, "rule-app-2")
+                .await
+                .last_fired_at
+                .is_none()
         );
     }
 
