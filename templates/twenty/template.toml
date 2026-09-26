@@ -4,6 +4,7 @@ description = "Modern open-source CRM for contacts, companies and deals, a Sales
 about = "Twenty is a customisable CRM with a Notion-like interface: people, companies, opportunities, custom objects, views, workflows and an API. It runs a server, a background worker, PostgreSQL and Redis, so plan for 2 GB of memory for it alone."
 category = "productivity"
 tags = ["crm", "sales", "salesforce alternative", "contacts"]
+logo = "twenty"
 version = "2.42"
 website = "https://twenty.com"
 docs = "https://twenty.com/developers/section/self-hosting/docker-compose"

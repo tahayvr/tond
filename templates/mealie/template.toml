@@ -4,6 +4,7 @@ description = "Recipe manager and meal planner that imports recipes from any web
 about = "Mealie scrapes recipes from a URL, organises them with tags and categories, plans meals and builds shopping lists, for your whole household."
 category = "productivity"
 tags = ["recipes", "cooking", "meal planning", "shopping list"]
+logo = "mealie"
 version = "3.28"
 website = "https://mealie.io"
 docs = "https://docs.mealie.io/documentation/getting-started/installation/installation-checklist/"

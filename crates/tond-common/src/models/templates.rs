@@ -1023,6 +1023,24 @@ impl From<Template> for TemplateResponse {
     }
 }
 
+/// Host memory as the catalog shows it, from the host collector's last sample.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TemplateHostMemory {
+    pub total_mb: u64,
+    /// What the kernel reports as available (total minus used).
+    pub available_mb: u64,
+}
+
+/// GET /api/templates
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemplateCatalogResponse {
+    pub templates: Vec<TemplateResponse>,
+    /// None until the host collector's first sample.
+    pub memory: Option<TemplateHostMemory>,
+    /// Apps get `<name>.<apps_domain>` when no domain is given ("" = none).
+    pub apps_domain: String,
+}
+
 /// POST /api/templates/{id}/deploy
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TemplateDeployRequest {
@@ -1407,6 +1425,28 @@ services:
         assert_eq!(
             TemplateContext::new("a", "a.example.com").expand("{app_url}/x {app_name}"),
             "https://a.example.com/x a"
+        );
+    }
+
+    /// The dashboard's mock API serves the real catalog. Regenerate with
+    /// `UPDATE_TEMPLATE_FIXTURE=1 cargo test -p tond-common templates`.
+    #[test]
+    fn dashboard_mock_catalog_matches_the_templates() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../dashboard/src/mocks/templates.json");
+        let catalog: Vec<TemplateResponse> = builtin_templates()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .into_iter()
+            .map(TemplateResponse::from)
+            .collect();
+        let json = serde_json::to_string_pretty(&catalog).unwrap_or_else(|e| panic!("{e}")) + "\n";
+        if std::env::var_os("UPDATE_TEMPLATE_FIXTURE").is_some() {
+            std::fs::write(&path, &json).unwrap_or_else(|e| panic!("{e}"));
+        }
+        let current = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            current == json,
+            "dashboard/src/mocks/templates.json is out of date; run UPDATE_TEMPLATE_FIXTURE=1 cargo test -p tond-common templates"
         );
     }
 }

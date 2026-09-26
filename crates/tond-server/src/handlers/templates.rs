@@ -20,14 +20,14 @@ use axum::{
     response::IntoResponse,
 };
 use tond_common::{
-    ApiResponse, App, CreateAppRequest, Scope, Template, TemplateContext, TemplateCredential,
-    TemplateDeployRequest, TemplateDeployResponse, TemplateResponse, TondError, builtin_template,
-    builtin_templates, resolve_inputs,
+    ApiResponse, App, CreateAppRequest, Scope, Template, TemplateCatalogResponse, TemplateContext,
+    TemplateCredential, TemplateDeployRequest, TemplateDeployResponse, TemplateHostMemory,
+    TemplateResponse, TondError, builtin_template, builtin_templates, resolve_inputs,
 };
 
 use crate::{
     audit_log::write_audit_log,
-    auth::{Authz, RateLimit, scope},
+    auth::{Authz, Principal, RateLimit, scope},
     deploy, domains,
     error::AppError,
     handlers::{deploy_trigger, insert_app},
@@ -47,13 +47,26 @@ fn catalog_error(err: impl std::fmt::Display) -> AppError {
 pub async fn list_templates(
     _rate: RateLimit,
     _auth: Authz<scope::AppsRead>,
+    State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     let templates: Vec<TemplateResponse> = builtin_templates()
         .map_err(catalog_error)?
         .into_iter()
         .map(TemplateResponse::from)
         .collect();
-    Ok((StatusCode::OK, Json(ApiResponse::ok(templates))))
+    let memory = host::snapshot().map(|s| TemplateHostMemory {
+        total_mb: s.mem_total / MIB,
+        available_mb: s.mem_total.saturating_sub(s.mem_used) / MIB,
+    });
+    let apps_domain = state.settings.read().await.apps_domain.clone();
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(TemplateCatalogResponse {
+            templates,
+            memory,
+            apps_domain,
+        })),
+    ))
 }
 
 /// Free memory in bytes (total minus used, i.e. what the kernel reports as
@@ -147,10 +160,22 @@ pub async fn deploy_template(
     Path(id): Path<String>,
     Json(req): Json<TemplateDeployRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    let response = deploy_from_template(&state, &auth, &id, req, &volumes::data_dir()).await?;
+    Ok((StatusCode::ACCEPTED, Json(ApiResponse::ok(response))))
+}
+
+/// The deploy itself, with the data directory passed in (tests use a temp dir).
+async fn deploy_from_template(
+    state: &AppState,
+    auth: &Principal,
+    id: &str,
+    req: TemplateDeployRequest,
+    data_dir: &FsPath,
+) -> Result<TemplateDeployResponse, AppError> {
     // Templates are compose apps (admin scope, checked by insert_app) that
     // are deployed right away.
     auth.require_to(Scope::AppsDeploy, "deploy apps")?;
-    let template = builtin_template(&id)
+    let template = builtin_template(id)
         .map_err(catalog_error)?
         .ok_or_else(|| AppError(TondError::NotFound(format!("No template named {id}"))))?;
 
@@ -187,8 +212,7 @@ pub async fn deploy_template(
     let resolved = resolve_inputs(&template.manifest, &req.inputs, &ctx)
         .map_err(|e| AppError(TondError::InvalidInput(e.to_string())))?;
 
-    let data_dir = volumes::data_dir();
-    check_no_leftover_data(&data_dir, &name)?;
+    check_no_leftover_data(data_dir, &name)?;
 
     let public = &template.manifest.public;
     let env: BTreeMap<&str, &str> = resolved
@@ -231,18 +255,18 @@ pub async fn deploy_template(
         ),
         ready_after_secs: None,
     };
-    let app = insert_app(&state, &auth, create).await?;
+    let app = insert_app(state, auth, create).await?;
 
-    if let Err(e) = prepare_volumes(&template, &data_dir, &name) {
-        remove_app(&state, &app, &data_dir).await;
+    if let Err(e) = prepare_volumes(&template, data_dir, &name) {
+        remove_app(state, &app, data_dir).await;
         return Err(e);
     }
 
     let app_id = app.id.clone();
     let app_domain = app.domain.clone();
-    let (trigger, detail) = deploy_trigger(&auth);
+    let (trigger, detail) = deploy_trigger(auth);
     let queued = match deploy::start(
-        &state,
+        state,
         app.clone(),
         deploy::DeployRequest::source(trigger, detail),
     )
@@ -250,7 +274,7 @@ pub async fn deploy_template(
     {
         Ok(q) => q,
         Err(e) => {
-            remove_app(&state, &app, &data_dir).await;
+            remove_app(state, &app, data_dir).await;
             return Err(AppError(TondError::Internal(format!(
                 "{} was not created: the first deploy couldn't be queued ({e:#})",
                 template.manifest.name
@@ -283,7 +307,7 @@ pub async fn deploy_template(
             .collect(),
         setup_notes: template.manifest.setup_notes.clone(),
     };
-    Ok((StatusCode::ACCEPTED, Json(ApiResponse::ok(response))))
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -291,7 +315,6 @@ mod tests {
     use axum::{body::to_bytes, response::IntoResponse};
 
     use super::*;
-    use crate::auth::Principal;
     use crate::compose_policy;
     use tond_common::Role;
 
@@ -303,17 +326,226 @@ mod tests {
             .unwrap_or_else(|err| panic!("failed to decode JSON response body: {err}"))
     }
 
+    async fn test_state() -> AppState {
+        let db = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .unwrap_or_else(|err| panic!("failed to create in-memory SQLite pool: {err}"));
+        crate::db::migrate(&db)
+            .await
+            .unwrap_or_else(|err| panic!("failed to run migrations: {err}"));
+        AppState {
+            db,
+            docker: bollard::Docker::connect_with_http(
+                "http://127.0.0.1:2375",
+                5,
+                bollard::API_DEFAULT_VERSION,
+            )
+            .unwrap_or_else(|err| panic!("failed to construct Docker client: {err}")),
+            rate_limiter: crate::auth::RateLimiter::new(60, 10.0),
+            settings: std::sync::Arc::new(tokio::sync::RwLock::new(tond_common::ServerSettings {
+                apps_domain: "apps.example.com".into(),
+                ..Default::default()
+            })),
+        }
+    }
+
+    fn deploy_request(name: &str, inputs: &[(&str, &str)]) -> TemplateDeployRequest {
+        TemplateDeployRequest {
+            name: name.into(),
+            domain: None,
+            project_id: None,
+            inputs: inputs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            allow_low_memory: true,
+        }
+    }
+
+    async fn deploy(
+        state: &AppState,
+        data_dir: &FsPath,
+        id: &str,
+        req: TemplateDeployRequest,
+    ) -> Result<serde_json::Value, AppError> {
+        let principal = Principal::test_user(Role::Admin);
+        let response = deploy_from_template(state, &principal, id, req, data_dir).await?;
+        Ok(serde_json::json!({ "data": response }))
+    }
+
+    fn tmp() -> tempfile::TempDir {
+        tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    async fn app_count(state: &AppState) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM apps")
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[tokio::test]
+    async fn deploy_creates_a_compose_app_with_its_inputs_and_queues_a_deploy() {
+        let state = test_state().await;
+        let dir = tmp();
+        let body = deploy(&state, dir.path(), "it-tools", deploy_request("tools", &[]))
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.0));
+        assert_eq!(body["data"]["app_name"], "tools");
+        assert_eq!(body["data"]["domain"], "tools.apps.example.com");
+        assert!(
+            body["data"]["deployment_id"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty())
+        );
+
+        let app: App = sqlx::query_as("SELECT * FROM apps WHERE name = 'tools'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(app.source_type, "compose");
+        assert_eq!(app.container_port, 80);
+        assert!(
+            app.compose_content
+                .as_deref()
+                .is_some_and(|c| c.contains("it-tools"))
+        );
+        assert_eq!(app.health_check_path.as_deref(), Some("/"));
+    }
+
+    #[tokio::test]
+    async fn deploy_returns_generated_credentials_once_and_stores_them_encrypted() {
+        let state = test_state().await;
+        let dir = tmp();
+        let body = deploy(
+            &state,
+            dir.path(),
+            "vaultwarden",
+            deploy_request("vault", &[]),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{}", e.0));
+        let creds = body["data"]["credentials"]
+            .as_array()
+            .unwrap_or_else(|| panic!("credentials"));
+        assert_eq!(creds.len(), 1);
+        assert_eq!(creds[0]["key"], "ADMIN_TOKEN");
+        let token = creds[0]["value"].as_str().unwrap_or_default().to_string();
+        assert_eq!(token.len(), 24);
+        assert!(
+            volumes::app_volume_dir(dir.path(), "vault")
+                .join("data")
+                .is_dir(),
+            "declared volumes are created"
+        );
+        let app: App = sqlx::query_as("SELECT * FROM apps WHERE name = 'vault'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let env = crate::secrets::app_env(&app).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(env["DOMAIN"], "https://vault.apps.example.com");
+        assert_eq!(env["ADMIN_TOKEN"], token);
+        assert!(
+            !app.env_vars.as_deref().unwrap_or("").contains(&token),
+            "env vars are stored encrypted"
+        );
+
+        // A second app of the same name would reuse the first one's data.
+        sqlx::query("DELETE FROM apps")
+            .execute(&state.db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(
+            volumes::app_volume_dir(dir.path(), "vault").join("data/db.sqlite3"),
+            "x",
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let err = deploy(
+            &state,
+            dir.path(),
+            "vaultwarden",
+            deploy_request("vault", &[]),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("leftover data is refused"));
+        assert!(
+            err.0.to_string().contains("earlier app named vault"),
+            "{}",
+            err.0
+        );
+        assert_eq!(app_count(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn deploy_refuses_bad_names_unknown_templates_and_missing_inputs() {
+        let state = test_state().await;
+        let dir = tmp();
+        let err = deploy(
+            &state,
+            dir.path(),
+            "it-tools",
+            deploy_request("Bad Name", &[]),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("bad names are refused"));
+        assert_eq!(err.0.status_code(), 400);
+        let err = deploy(&state, dir.path(), "nope", deploy_request("x", &[]))
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("unknown templates are refused"));
+        assert_eq!(err.0.status_code(), 404);
+        let err = deploy(&state, dir.path(), "pocketbase", deploy_request("pb", &[]))
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("a missing required input is refused"));
+        assert!(err.0.to_string().contains("Superuser email"), "{}", err.0);
+        let err = deploy(
+            &state,
+            dir.path(),
+            "pocketbase",
+            deploy_request("pb", &[("SUPERUSER_EMAIL", "nope")]),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("an invalid email is refused"));
+        assert!(err.0.to_string().contains("email address"), "{}", err.0);
+        assert_eq!(app_count(&state).await, 0, "nothing is created on refusal");
+    }
+
+    #[tokio::test]
+    async fn deploy_needs_the_compose_and_deploy_scopes() {
+        let state = test_state().await;
+        let result = deploy_template(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Viewer)),
+            State(state.clone()),
+            Path("it-tools".to_string()),
+            Json(deploy_request("tools", &[])),
+        )
+        .await
+        .map(|_| ());
+        let Err(err) = result else {
+            panic!("a viewer can't deploy templates");
+        };
+        assert_eq!(err.0.status_code(), 403);
+        assert_eq!(app_count(&state).await, 0);
+    }
+
     #[tokio::test]
     async fn list_templates_returns_the_catalog() {
         let response = list_templates(
             RateLimit,
             Authz::unchecked(Principal::test_user(Role::Admin)),
+            State(test_state().await),
         )
         .await
         .unwrap_or_else(|_| panic!("expected list_templates to succeed"))
         .into_response();
         let body = response_json(response).await;
-        let templates = body["data"]
+        assert_eq!(body["data"]["apps_domain"], "apps.example.com");
+        let templates = body["data"]["templates"]
             .as_array()
             .unwrap_or_else(|| panic!("expected templates payload to be an array"));
         assert!(templates.len() >= 25);

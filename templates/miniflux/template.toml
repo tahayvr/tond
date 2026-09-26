@@ -4,7 +4,6 @@ description = "Minimalist, fast RSS and Atom feed reader."
 about = "Miniflux is an opinionated feed reader: a clean, keyboard-friendly web UI, readability extraction, integrations with read-later services and a Fever/Google Reader API for mobile apps. It uses a few dozen megabytes of memory."
 category = "productivity"
 tags = ["rss", "feeds", "reader", "news"]
-logo = "miniflux"
 version = "2.3"
 website = "https://miniflux.app"
 docs = "https://miniflux.app/docs/docker.html"

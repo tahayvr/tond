@@ -845,6 +845,7 @@ async fn create_from_template(
     let template = client
         .list_templates()
         .await?
+        .templates
         .into_iter()
         .find(|t| t.id == template_id)
         .ok_or_else(|| {
@@ -1048,9 +1049,11 @@ mod tests {
             .route(
                 "/api/templates",
                 axum::routing::get(|| async {
-                    axum::Json(
-                        json!({"success": true, "data": [sample_template_json()], "error": null}),
-                    )
+                    axum::Json(json!({
+                        "success": true,
+                        "data": {"templates": [sample_template_json()], "memory": null, "apps_domain": ""},
+                        "error": null
+                    }))
                 }),
             )
             .route(

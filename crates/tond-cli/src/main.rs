@@ -42,7 +42,7 @@ use commands::{
     apps::AppsAction, audit::AuditAction, cron::CronAction, db::DbAction,
     integrations::IntegrationsAction, projects::ProjectsAction, scanner::ScannerAction,
     settings::SettingsAction, snapshots::SnapshotAction, storage_providers::StorageProviderAction,
-    tokens::TokenAction, users::UsersAction,
+    templates::TemplatesAction, tokens::TokenAction, users::UsersAction,
 };
 
 #[derive(Parser)]
@@ -75,6 +75,12 @@ enum Commands {
     Apps {
         #[command(subcommand)]
         action: AppsAction,
+    },
+
+    /// Browse the one-click template catalog
+    Templates {
+        #[command(subcommand)]
+        action: TemplatesAction,
     },
 
     /// Manage projects (app groups)
@@ -191,6 +197,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Apps { action } => commands::apps::handle(&connect()?, action).await?,
+        Commands::Templates { action } => commands::templates::handle(&connect()?, action).await?,
         Commands::Projects { action } => commands::projects::handle(&connect()?, action).await?,
         Commands::Db { action } => commands::db::handle(&connect()?, action).await?,
         Commands::Cron { action } => commands::cron::handle(&connect()?, action).await?,

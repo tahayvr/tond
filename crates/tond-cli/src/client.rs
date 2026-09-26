@@ -43,9 +43,9 @@ use tond_common::{
     DatabaseCredentialsResponse, DeployKeyResponse, DeploymentResponse, IntegrationResponse,
     ManagedDatabaseDetail, ManagedDatabaseResponse, PasswordLinkResponse,
     PreviewDeploymentResponse, ProjectPreviewResponse, ProjectResponse, ServerSettings,
-    SnapshotResponse, StorageProviderResponse, TemplateDeployRequest, TemplateDeployResponse,
-    TemplateResponse, TokenResponse, UpdateCronJobRequest, UpdateSettingsRequest, UserResponse,
-    WebhookConfigResponse, WebhookSecretResponse,
+    SnapshotResponse, StorageProviderResponse, TemplateCatalogResponse, TemplateDeployRequest,
+    TemplateDeployResponse, TokenResponse, UpdateCronJobRequest, UpdateSettingsRequest,
+    UserResponse, WebhookConfigResponse, WebhookSecretResponse,
 };
 
 /// Body and response of `/api/settings/host-terminal`.
@@ -219,12 +219,12 @@ impl TondClient {
     }
 
     /// GET /api/templates — the one-click catalog.
-    pub async fn list_templates(&self) -> Result<Vec<TemplateResponse>> {
+    pub async fn list_templates(&self) -> Result<TemplateCatalogResponse> {
         let req = self.client.get(format!("{}/api/templates", self.base_url));
-        let resp: ApiResponse<Vec<TemplateResponse>> =
+        let resp: ApiResponse<TemplateCatalogResponse> =
             self.auth_header(req).send().await?.json().await?;
         if resp.success {
-            Ok(resp.data.unwrap_or_default())
+            resp.data.context("No data returned")
         } else {
             anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
         }
