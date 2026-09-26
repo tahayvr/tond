@@ -7,6 +7,7 @@
 	import { Input } from '$lib/components/ui/input/index.js';
 	import Search from '~icons/ri/search-line';
 	import Plus from '~icons/ri/add-line';
+	import LayoutTemplate from '~icons/ri/layout-masonry-line';
 	import PageHeader from '$lib/components/nav/page-header.svelte';
 	import type { PageProps } from './$types';
 
@@ -41,6 +42,10 @@
 <div class="space-y-6">
 	<PageHeader title="Projects">
 		{#snippet actions()}
+			<Button variant="outline" size="sm" href="/templates">
+				<LayoutTemplate class="mr-1 h-4 w-4" />
+				From a template
+			</Button>
 			<Button variant="outline" size="sm" href="/apps/new">
 				<Plus class="mr-1 h-4 w-4" />
 				New app

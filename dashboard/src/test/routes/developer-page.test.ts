@@ -15,7 +15,6 @@ import DeveloperPage from '../../routes/developer/+page.svelte';
 
 function renderPage() {
 	const reference = buildReference(MOCK_OPENAPI);
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	render(DeveloperPage, { props: { data: { reference } } as any });
 	return reference;
 }

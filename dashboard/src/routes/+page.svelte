@@ -26,6 +26,7 @@
 	import { appTabHref } from '$lib/tabs';
 	import { formatRelativePast } from '$lib/time';
 	import Plus from '~icons/ri/add-line';
+	import LayoutTemplate from '~icons/ri/layout-masonry-line';
 	import CheckIcon from '~icons/ri/checkbox-circle-fill';
 	import TodoIcon from '~icons/ri/checkbox-blank-circle-line';
 	import Rocket from '~icons/ri/rocket-line';
@@ -103,6 +104,10 @@
 				<Button variant="outline" size="sm" href="/projects">
 					<Plus class="mr-1 h-4 w-4" />
 					New project
+				</Button>
+				<Button variant="outline" size="sm" href="/templates">
+					<LayoutTemplate class="mr-1 h-4 w-4" />
+					From a template
 				</Button>
 				<Button size="sm" href="/apps/new">
 					<Plus class="mr-1 h-4 w-4" />

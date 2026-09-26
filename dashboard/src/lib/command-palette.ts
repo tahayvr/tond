@@ -70,6 +70,13 @@ export function buildPaletteEntries(
 			href: '/apps/new'
 		},
 		{
+			id: 'new:template',
+			group: 'Actions',
+			label: 'New app from a template',
+			keywords: ['create', 'deploy', 'template', 'one-click', 'catalog'],
+			href: '/templates'
+		},
+		{
 			id: 'new:db',
 			group: 'Actions',
 			label: 'New database',
