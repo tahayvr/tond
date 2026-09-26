@@ -50,6 +50,8 @@ mod docker;
 mod error;
 mod handlers;
 mod health;
+mod janitor;
+mod log_bus;
 mod metrics;
 mod notifications;
 mod secret_key;
@@ -132,6 +134,9 @@ async fn main() -> Result<()> {
 
     // Spawn background cron job scheduler (every 30 s)
     tokio::spawn(cron::run_cron_scheduler(state.clone()));
+
+    // Spawn the janitor (hourly retention for logs, runs, audit, metrics, sessions)
+    tokio::spawn(janitor::run_janitor(state.clone()));
 
     // Spawn backup scheduler (checks cron expression, runs scheduled full snapshots)
     tokio::spawn(backup::backup_scheduler(state.clone()));
@@ -235,6 +240,7 @@ async fn main() -> Result<()> {
         )
         // Certificate management
         .route("/api/certs", get(handlers::list_certs))
+        .route("/api/certs/{domain}/retry", post(handlers::retry_cert))
         // Server settings
         .route("/api/settings", get(handlers::settings::get_settings))
         .route("/api/settings", put(handlers::settings::update_settings))

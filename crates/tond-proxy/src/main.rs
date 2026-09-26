@@ -21,9 +21,13 @@
 //     Falls back to a self-signed cert for unknown domains.
 //
 //   Port 80 — run_http_server() (raw Tokio TCP)
-//     A hand-rolled HTTP/1.1 server. Two behaviours:
+//     A hand-rolled HTTP/1.1 server. Three behaviours:
 //       /.well-known/acme-challenge/{token} — serves ACME HTTP-01 responses
-//       everything else                     — 301 redirect to https://
+//       a host Tond serves                  — 301 redirect to https://
+//       anything else                       — 404 (no open redirect)
+//     Hardened against slow clients: the request head must arrive within
+//     HTTP_REQUEST_TIMEOUT, at most HTTP_MAX_CONNECTIONS are served at once,
+//     and accept() errors never stop the listener (renewals depend on it).
 //
 //   Background thread (native OS thread + Tokio runtime):
 //     - Route refresh loop: every 5 s opens a read-only SQLite connection,
@@ -32,8 +36,14 @@
 //       settings table so changes made via the dashboard or CLI are picked
 //       up without a proxy restart. Falls back to Docker inspect for apps
 //       that were deployed before migration 006 (host_port IS NULL).
-//     - ACME renewal loop: waits 10 s then runs every 6 h. For any domain
-//       without a cert in CertStore, calls acme::provision_cert().
+//     - Certificate loop (issuance.rs): every 30 s, issues or renews certs
+//       for routed domains and the dashboard domain, with per-domain
+//       exponential backoff and a DNS pre-check; results (including the last
+//       error and next retry time) are written to the certificates table.
+//
+// Logging: nothing is logged per request at info (routing decisions are at
+// debug), and the route refresh only logs when a route is added, removed or
+// changed. Set RUST_LOG=tond_proxy=debug to trace routing.
 //
 // Environment variables consumed here:
 //   TOND_DB_PATH          — SQLite database path
@@ -48,6 +58,7 @@
 
 mod acme;
 mod certs;
+mod issuance;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -62,10 +73,12 @@ use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::time::{Duration, Instant};
+use tokio::sync::{RwLock, Semaphore};
 
 use crate::acme::ChallengeMap;
 use crate::certs::CertStore;
+use crate::issuance::IssuanceLoop;
 
 /// Route map: domain -> upstream (host:port)
 type RouteMap = Arc<RwLock<HashMap<String, String>>>;
@@ -171,30 +184,110 @@ fn parse_http_request_line_and_host(request: &str) -> (&str, &str) {
     (path, host)
 }
 
-async fn build_http_redirect_or_challenge_response(
-    request: &str,
-    challenges: &ChallengeMap,
-) -> String {
-    let (path, host) = parse_http_request_line_and_host(request);
+/// Escape text for inclusion in HTML.
+fn html_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
 
-    if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
-        let map = challenges.read().await;
-        if let Some(key_auth) = map.get(token) {
-            return format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n{}",
-                key_auth.len(),
-                key_auth
-            );
+/// A syntactically valid DNS hostname (what we are willing to put in a
+/// Location header).
+fn is_valid_hostname(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+}
+
+const HTTP_NOT_FOUND: &str =
+    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const HTTP_BAD_REQUEST: &str =
+    "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+/// Shared state for the port-80 server.
+#[derive(Clone)]
+struct HttpContext {
+    challenges: ChallengeMap,
+    routes: RouteMap,
+    dashboard_domain: DashboardDomain,
+}
+
+impl HttpContext {
+    /// Build the response for one request head: an ACME challenge answer, a
+    /// redirect to HTTPS for hosts Tond serves, or 404/400 for anything else
+    /// (redirecting arbitrary Host headers would be an open redirect).
+    async fn respond(&self, request: &str) -> String {
+        let (path, host) = parse_http_request_line_and_host(request);
+
+        if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
+            let map = self.challenges.read().await;
+            if let Some(key_auth) = map.get(token) {
+                return format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    key_auth.len(),
+                    key_auth
+                );
+            }
+            return HTTP_NOT_FOUND.to_string();
         }
 
-        return "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string();
-    }
+        let host = normalize_host(Some(host));
+        if !is_valid_hostname(&host) {
+            return HTTP_BAD_REQUEST.to_string();
+        }
+        let known = {
+            let dd = self.dashboard_domain.read().await;
+            let routes = self.routes.read().await;
+            resolve_route(&host, dd.as_deref(), &routes) != RouteTarget::Missing
+        };
+        if !known {
+            return HTTP_NOT_FOUND.to_string();
+        }
 
-    let redirect_url = format!("https://{}{}", host, path);
-    format!(
-        "HTTP/1.1 301 Moved Permanently\r\nLocation: {}\r\nContent-Length: 0\r\n\r\n",
-        redirect_url
-    )
+        // Only an origin-form path goes into the Location header.
+        let path = if path.starts_with('/') && !path.starts_with("//") {
+            path
+        } else {
+            "/"
+        };
+        format!(
+            "HTTP/1.1 301 Moved Permanently\r\nLocation: https://{host}{path}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+    }
+}
+
+/// Human-readable differences between two route maps, sorted by domain:
+/// "added a -> b", "removed a", "changed a: b -> c". Empty when identical.
+fn route_changes(old: &HashMap<String, String>, new: &HashMap<String, String>) -> Vec<String> {
+    let mut changes: Vec<(String, String)> = Vec::new();
+    for (domain, upstream) in new {
+        match old.get(domain) {
+            None => changes.push((domain.clone(), format!("added {domain} -> {upstream}"))),
+            Some(prev) if prev != upstream => changes.push((
+                domain.clone(),
+                format!("changed {domain}: {prev} -> {upstream}"),
+            )),
+            Some(_) => {}
+        }
+    }
+    for domain in old.keys() {
+        if !new.contains_key(domain) {
+            changes.push((domain.clone(), format!("removed {domain}")));
+        }
+    }
+    changes.sort();
+    changes.into_iter().map(|(_, c)| c).collect()
 }
 
 impl TondProxy {
@@ -243,8 +336,6 @@ impl TondProxy {
         .fetch_all(&pool)
         .await?;
 
-        tracing::info!("Route refresh: {} running app(s) with a domain", rows.len());
-
         let mut new_routes = HashMap::new();
 
         // Only open the Docker socket if at least one row needs a fallback lookup.
@@ -287,7 +378,7 @@ impl TondProxy {
                             .and_then(|ns| ns.ports.as_ref())
                             .map(|p| format!("{:?}", p))
                             .unwrap_or_else(|| "<none>".to_string());
-                        tracing::info!(
+                        tracing::debug!(
                             "Container {} port map (fallback): {}",
                             container_name,
                             raw_ports
@@ -333,8 +424,7 @@ impl TondProxy {
             };
 
             let upstream = format!("127.0.0.1:{}", host_port);
-            new_routes.insert(domain.clone(), upstream.clone());
-            tracing::info!("Route added: {} -> {}", domain, upstream);
+            new_routes.insert(domain.clone(), upstream);
         }
 
         // Also load active preview deployments (subdomain routing).
@@ -350,19 +440,21 @@ impl TondProxy {
         .await
         .unwrap_or_default();
 
-        tracing::info!("Route refresh: {} active preview(s)", preview_rows.len());
-
         for (subdomain, host_port) in preview_rows {
             if let Some(sub) = subdomain {
-                let upstream = format!("127.0.0.1:{}", host_port);
-                new_routes.insert(sub.clone(), upstream.clone());
-                tracing::info!("Preview route added: {} -> {}", sub, upstream);
+                new_routes.insert(sub, format!("127.0.0.1:{}", host_port));
             }
         }
 
         let mut routes = self.routes.write().await;
+        let changes = route_changes(&routes, &new_routes);
+        if !changes.is_empty() {
+            for change in &changes {
+                tracing::info!("Route {}", change);
+            }
+            tracing::info!("Routing table now has {} route(s)", new_routes.len());
+        }
         *routes = new_routes;
-        tracing::info!("Refreshed {} routes", routes.len());
 
         pool.close().await;
         Ok(())
@@ -400,8 +492,9 @@ impl ProxyHttp for TondProxy {
             return Ok(false);
         }
 
-        // No route found — return a friendly HTML 502 page
-        tracing::warn!("No route found for host '{}', returning 502 page", host);
+        // No route found — return a friendly HTML 502 page. Debug only:
+        // scanners hit unknown hosts constantly.
+        tracing::debug!("No route found for host '{}', returning 502 page", host);
 
         let body = format!(
             r#"<!DOCTYPE html>
@@ -429,7 +522,7 @@ impl ProxyHttp for TondProxy {
   </div>
 </body>
 </html>"#,
-            host = host
+            host = html_escape(&host)
         );
 
         let mut resp = pingora::http::ResponseHeader::build(502, None)?;
@@ -464,11 +557,7 @@ impl ProxyHttp for TondProxy {
             resolve_route(&host, dd.as_deref(), &routes)
         };
 
-        tracing::info!(
-            "Routing request for host: {:?} (route map has {} entries)",
-            host,
-            self.routes.read().await.len(),
-        );
+        tracing::debug!("Routing request for host {:?} -> {:?}", host, route_target);
 
         match route_target {
             RouteTarget::Dashboard => {
@@ -611,131 +700,35 @@ fn main() {
             };
             let db_url = format!("sqlite:{}", proxy_for_refresh.db_path);
             let db_pool = SqlitePool::connect(&db_url).await.unwrap_or_else(|err| {
-                panic!("failed to open SQLite database for ACME loop: {err}")
+                panic!("failed to open SQLite database for the certificate loop: {err}")
             });
 
             // Spawn the HTTP server for port 80 (ACME challenges + redirect)
-            let challenges_http = challenges_bg.clone();
+            let http_ctx = HttpContext {
+                challenges: challenges_bg.clone(),
+                routes: routes.clone(),
+                dashboard_domain: dashboard_domain_shared.clone(),
+            };
             tokio::spawn(async move {
-                if let Err(e) = run_http_server(challenges_http).await {
-                    tracing::error!("HTTP server (port 80) failed: {}", e);
+                if let Err(e) = run_http_server(http_ctx).await {
+                    tracing::error!("HTTP server (port 80) failed to start: {}", e);
                 }
             });
 
-            // Spawn ACME renewal loop (every 6 h) — handles cert renewal for
-            // domains already in the CertStore plus the dashboard domain.
-            let cert_store_acme = cert_store_bg.clone();
-            let challenges_acme = challenges_bg.clone();
-            let data_dir_acme = data_dir_bg.clone();
-            let dashboard_domain_acme = dashboard_domain_shared.clone();
-            let db_pool_acme = db_pool.clone();
-            tokio::spawn(async move {
-                // Initial delay to let routes populate
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-
-                loop {
-                    let mut domains = cert_store_acme.domains().await;
-                    // Include the dashboard domain so it gets a cert too
-                    {
-                        let dd = dashboard_domain_acme.read().await;
-                        if let Some(ref d) = *dd
-                            && !domains.contains(d)
-                        {
-                            domains.push(d.clone());
-                        }
-                    }
-                    if let Err(e) = acme::renewal_check(
-                        &domains,
-                        &data_dir_acme,
-                        Some(&db_pool_acme),
-                        &cert_store_acme,
-                        &challenges_acme,
-                        acme_staging,
-                    )
-                    .await
-                    {
-                        tracing::error!("ACME renewal check failed: {}", e);
-                    }
-
-                    // Check every 6 hours
-                    tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
+            // Certificate issuance/renewal loop (per-domain backoff, DNS
+            // pre-check, state persisted for the dashboard).
+            tokio::spawn(
+                IssuanceLoop {
+                    routes: routes.clone(),
+                    dashboard_domain: dashboard_domain_shared.clone(),
+                    cert_store: cert_store_bg,
+                    challenges: challenges_bg,
+                    data_dir: data_dir_bg,
+                    db: db_pool,
+                    staging: acme_staging,
                 }
-            });
-
-            // Spawn preview cert provisioning loop (every 30 s) — provisions
-            // TLS certs for preview subdomains that appear in the route map but
-            // don't yet have a cert. Runs more frequently than the 6-hour renewal
-            // loop so new previews get a valid cert within ~30 s of being routed.
-            let cert_store_preview = cert_store_bg;
-            let challenges_preview = challenges_bg;
-            let data_dir_preview = data_dir_bg;
-            let routes_preview = routes.clone();
-            let db_pool_preview = db_pool.clone();
-            tokio::spawn(async move {
-                // Initial delay to let the first route refresh complete.
-                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-
-                loop {
-                    let route_keys: Vec<String> = {
-                        let map = routes_preview.read().await;
-                        map.keys().cloned().collect()
-                    };
-
-                    for domain in route_keys {
-                        if !cert_store_preview.has_cert(&domain).await {
-                            tracing::info!(
-                                "[preview-cert] No cert for preview domain {}, provisioning…",
-                                domain
-                            );
-                            if let Err(e) = acme::provision_cert(
-                                &domain,
-                                &data_dir_preview,
-                                &cert_store_preview,
-                                &challenges_preview,
-                                acme_staging,
-                            )
-                            .await
-                            {
-                                tracing::warn!(
-                                    "[preview-cert] Failed to provision cert for {}: {}",
-                                    domain,
-                                    e
-                                );
-                                let _ = acme::persist_certificate_status(
-                                    &db_pool_preview,
-                                    &data_dir_preview,
-                                    &domain,
-                                    "failed",
-                                    None,
-                                    None,
-                                )
-                                .await;
-                            } else {
-                                let cert_path = data_dir_preview
-                                    .join("certs")
-                                    .join(&domain)
-                                    .join("cert.pem");
-                                if let Ok(cert_pem) = tokio::fs::read(&cert_path).await
-                                    && let Ok((issued_at, expires_at)) =
-                                        acme::certificate_timestamps(&cert_pem)
-                                {
-                                    let _ = acme::persist_certificate_status(
-                                        &db_pool_preview,
-                                        &data_dir_preview,
-                                        &domain,
-                                        "active",
-                                        Some(issued_at),
-                                        Some(expires_at),
-                                    )
-                                    .await;
-                                }
-                            }
-                        }
-                    }
-
-                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                }
-            });
+                .run(),
+            );
 
             // Route refresh loop — also refreshes dashboard_domain from DB
             loop {
@@ -765,32 +758,83 @@ fn main() {
     server.run_forever();
 }
 
-/// Simple HTTP server on port 80 that:
+/// Most port-80 connections served at once; extra connections are closed.
+const HTTP_MAX_CONNECTIONS: usize = 512;
+/// A client must send its whole request head within this time.
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Largest request head we read.
+const HTTP_MAX_HEAD_BYTES: usize = 8 * 1024;
+
+/// HTTP server on port 80 that:
 /// - Serves ACME HTTP-01 challenge responses at `/.well-known/acme-challenge/{token}`
-/// - Redirects all other traffic to HTTPS (301)
-async fn run_http_server(challenges: ChallengeMap) -> Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+/// - Redirects requests for hosts Tond serves to HTTPS (301); 404 otherwise
+///
+/// Only a bind failure returns an error: accept errors (e.g. out of file
+/// descriptors) are logged and the loop keeps going, since certificate
+/// issuance and renewal depend on this listener.
+async fn run_http_server(ctx: HttpContext) -> Result<()> {
     use tokio::net::TcpListener;
 
     let listener = TcpListener::bind("0.0.0.0:80").await?;
     tracing::info!("HTTP redirect server listening on :80");
 
+    let permits = Arc::new(Semaphore::new(HTTP_MAX_CONNECTIONS));
+    let mut last_accept_warning: Option<Instant> = None;
+
     loop {
-        let (mut stream, _addr) = listener.accept().await?;
-        let challenges = challenges.clone();
-
+        let stream = match listener.accept().await {
+            Ok((stream, _addr)) => stream,
+            Err(e) => {
+                if last_accept_warning.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+                    tracing::warn!("HTTP server (port 80) accept error: {}", e);
+                    last_accept_warning = Some(Instant::now());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let Ok(permit) = permits.clone().try_acquire_owned() else {
+            // At capacity: shed the connection instead of queueing it.
+            drop(stream);
+            continue;
+        };
+        let ctx = ctx.clone();
         tokio::spawn(async move {
-            let mut buf = vec![0u8; 4096];
-            let n = match stream.read(&mut buf).await {
-                Ok(n) if n > 0 => n,
-                _ => return,
-            };
-
-            let request = String::from_utf8_lossy(&buf[..n]);
-            let response = build_http_redirect_or_challenge_response(&request, &challenges).await;
-            let _ = stream.write_all(response.as_bytes()).await;
+            let _permit = permit;
+            let _ = tokio::time::timeout(HTTP_REQUEST_TIMEOUT, serve_http_connection(stream, &ctx))
+                .await;
         });
     }
+}
+
+/// Read one request head (up to the blank line or HTTP_MAX_HEAD_BYTES) and
+/// write the response. The caller bounds the total time.
+async fn serve_http_connection<S>(mut stream: S, ctx: &HttpContext)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    loop {
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() >= HTTP_MAX_HEAD_BYTES {
+                    break;
+                }
+            }
+        }
+    }
+    if buf.is_empty() {
+        return;
+    }
+    let request = String::from_utf8_lossy(&buf);
+    let response = ctx.respond(&request).await;
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
 }
 
 #[cfg(test)]
@@ -965,22 +1009,33 @@ mod tests {
         );
     }
 
+    fn http_ctx(routes: &[(&str, &str)], dashboard: Option<&str>) -> HttpContext {
+        HttpContext {
+            challenges: acme::new_challenge_map(),
+            routes: Arc::new(RwLock::new(
+                routes
+                    .iter()
+                    .map(|(d, u)| (d.to_string(), u.to_string()))
+                    .collect(),
+            )),
+            dashboard_domain: Arc::new(RwLock::new(dashboard.map(str::to_string))),
+        }
+    }
+
     #[tokio::test]
     async fn build_http_redirect_or_challenge_response_returns_acme_body_for_known_token() {
-        let challenges = acme::new_challenge_map();
-        challenges
+        let ctx = http_ctx(&[], None);
+        ctx.challenges
             .write()
             .await
             .insert("token-123".to_string(), "token-123.key-auth".to_string());
 
-        let response = build_http_redirect_or_challenge_response(
-            &sample_http_request(
+        let response = ctx
+            .respond(&sample_http_request(
                 "/.well-known/acme-challenge/token-123",
                 Some("app.example.com"),
-            ),
-            &challenges,
-        )
-        .await;
+            ))
+            .await;
 
         assert!(
             response.starts_with("HTTP/1.1 200 OK\r\n"),
@@ -998,37 +1053,140 @@ mod tests {
 
     #[tokio::test]
     async fn build_http_redirect_or_challenge_response_returns_404_for_unknown_acme_token() {
-        let challenges = acme::new_challenge_map();
+        let ctx = http_ctx(&[], None);
 
-        let response = build_http_redirect_or_challenge_response(
-            &sample_http_request(
+        let response = ctx
+            .respond(&sample_http_request(
                 "/.well-known/acme-challenge/missing-token",
                 Some("app.example.com"),
-            ),
-            &challenges,
-        )
-        .await;
+            ))
+            .await;
 
         assert_eq!(
-            response, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+            response, HTTP_NOT_FOUND,
             "unknown ACME challenge tokens should return a 404 without a response body"
         );
     }
 
     #[tokio::test]
     async fn build_http_redirect_or_challenge_response_redirects_other_requests_to_https() {
-        let challenges = acme::new_challenge_map();
+        let ctx = http_ctx(
+            &[("app.example.com", "127.0.0.1:4100")],
+            Some("dashboard.example.com"),
+        );
 
-        let response = build_http_redirect_or_challenge_response(
-            &sample_http_request("/dashboard", Some("dashboard.example.com")),
-            &challenges,
-        )
-        .await;
-
+        let response = ctx
+            .respond(&sample_http_request(
+                "/dashboard",
+                Some("dashboard.example.com:80"),
+            ))
+            .await;
         assert_eq!(
             response,
-            "HTTP/1.1 301 Moved Permanently\r\nLocation: https://dashboard.example.com/dashboard\r\nContent-Length: 0\r\n\r\n",
-            "non-ACME HTTP requests should be redirected to the equivalent HTTPS URL"
+            "HTTP/1.1 301 Moved Permanently\r\nLocation: https://dashboard.example.com/dashboard\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "requests for the dashboard domain should be redirected to the equivalent HTTPS URL"
+        );
+
+        let response = ctx
+            .respond(&sample_http_request("/x?y=1", Some("app.example.com")))
+            .await;
+        assert!(
+            response.contains("Location: https://app.example.com/x?y=1\r\n"),
+            "requests for routed apps should be redirected to HTTPS"
+        );
+    }
+
+    #[tokio::test]
+    async fn port_80_refuses_to_redirect_unknown_or_malformed_hosts() {
+        let ctx = http_ctx(&[("app.example.com", "127.0.0.1:4100")], None);
+
+        for host in [Some("evil.example.net"), None] {
+            assert_eq!(
+                ctx.respond(&sample_http_request("/", host)).await,
+                HTTP_NOT_FOUND,
+                "unknown hosts must not be redirected (open redirect)"
+            );
+        }
+        assert_eq!(
+            ctx.respond(&sample_http_request("/", Some("bad host<script>")))
+                .await,
+            HTTP_BAD_REQUEST
+        );
+        // Protocol-relative paths must not turn into another host.
+        assert!(
+            ctx.respond(&sample_http_request(
+                "//evil.example.net/x",
+                Some("app.example.com")
+            ))
+            .await
+            .contains("Location: https://app.example.com/\r\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn port_80_connection_answers_a_complete_request_head() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let ctx = http_ctx(&[("app.example.com", "127.0.0.1:4100")], None);
+        let (mut client, server) = tokio::io::duplex(4096);
+        let handle = tokio::spawn(async move { serve_http_connection(server, &ctx).await });
+
+        // Send the head in two pieces, as a slow client would.
+        let _ = client.write_all(b"GET /a HTTP/1.1\r\nHost: app.exa").await;
+        let _ = client.write_all(b"mple.com\r\n\r\n").await;
+        let mut response = String::new();
+        let _ = client.read_to_string(&mut response).await;
+        let _ = handle.await;
+        assert!(response.starts_with("HTTP/1.1 301"), "got {response:?}");
+    }
+
+    #[tokio::test]
+    async fn port_80_slow_client_is_cut_off_by_the_request_timeout() {
+        let ctx = http_ctx(&[], None);
+        let (_client, server) = tokio::io::duplex(64);
+        // The client never sends anything; the timeout must end the task.
+        let result = tokio::time::timeout(
+            Duration::from_millis(50),
+            serve_http_connection(server, &ctx),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a silent client keeps the handler waiting until the timeout"
+        );
+    }
+
+    #[test]
+    fn html_escape_neutralises_markup() {
+        assert_eq!(
+            html_escape(r#"<img src=x onerror="a">&'"#),
+            "&lt;img src=x onerror=&quot;a&quot;&gt;&amp;&#39;"
+        );
+    }
+
+    #[test]
+    fn route_changes_reports_only_differences() {
+        let old = HashMap::from([
+            ("a.com".to_string(), "127.0.0.1:1".to_string()),
+            ("b.com".to_string(), "127.0.0.1:2".to_string()),
+            ("c.com".to_string(), "127.0.0.1:3".to_string()),
+        ]);
+        assert!(
+            route_changes(&old, &old.clone()).is_empty(),
+            "no change, no log lines"
+        );
+
+        let mut new = old.clone();
+        new.remove("b.com");
+        new.insert("c.com".to_string(), "127.0.0.1:30".to_string());
+        new.insert("d.com".to_string(), "127.0.0.1:4".to_string());
+        assert_eq!(
+            route_changes(&old, &new),
+            vec![
+                "removed b.com".to_string(),
+                "changed c.com: 127.0.0.1:3 -> 127.0.0.1:30".to_string(),
+                "added d.com -> 127.0.0.1:4".to_string(),
+            ]
         );
     }
 

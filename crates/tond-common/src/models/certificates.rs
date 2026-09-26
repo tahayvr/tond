@@ -20,6 +20,15 @@ pub struct Certificate {
     pub status: String,
     pub created_at: String,
     pub updated_at: String,
+    /// Why the last issuance attempt failed (or was skipped), written by
+    /// tond-proxy; NULL after a success.
+    pub last_error: Option<String>,
+    /// RFC 3339 time of the last issuance attempt.
+    pub last_attempt_at: Option<String>,
+    /// RFC 3339 time before which tond-proxy will not try again (backoff).
+    pub next_retry_at: Option<String>,
+    /// Consecutive failed attempts.
+    pub failure_count: i64,
 }
 
 impl Certificate {
@@ -43,6 +52,10 @@ impl Certificate {
             status: "active".to_string(),
             created_at: now.clone(),
             updated_at: now,
+            last_error: None,
+            last_attempt_at: None,
+            next_retry_at: None,
+            failure_count: 0,
         }
     }
 }
@@ -55,6 +68,10 @@ pub struct CertificateResponse {
     pub status: String,
     pub issued_at: String,
     pub expires_at: String,
+    pub last_error: Option<String>,
+    pub last_attempt_at: Option<String>,
+    pub next_retry_at: Option<String>,
+    pub failure_count: i64,
 }
 
 impl From<Certificate> for CertificateResponse {
@@ -66,6 +83,10 @@ impl From<Certificate> for CertificateResponse {
             status: c.status,
             issued_at: c.issued_at,
             expires_at: c.expires_at,
+            last_error: c.last_error,
+            last_attempt_at: c.last_attempt_at,
+            next_retry_at: c.next_retry_at,
+            failure_count: c.failure_count,
         }
     }
 }

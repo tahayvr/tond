@@ -235,6 +235,32 @@ export async function updateDomain(id: string, domain: string): Promise<void> {
 	});
 }
 
+// ── Certificates ──
+
+export interface Certificate {
+	id: string;
+	domain: string;
+	cert_type: string;
+	/** "active" | "pending" | "expired" | "failed" */
+	status: string;
+	issued_at: string;
+	expires_at: string;
+	/** Why the last issuance attempt failed or was skipped (null after success) */
+	last_error: string | null;
+	last_attempt_at: string | null;
+	/** No new attempt before this time (exponential backoff) */
+	next_retry_at: string | null;
+	failure_count: number;
+}
+
+export async function listCertificates(): Promise<Certificate[]> {
+	return request<Certificate[]>('/certs');
+}
+
+export async function retryCertificate(domain: string): Promise<void> {
+	await request(`/certs/${encodeURIComponent(domain)}/retry`, { method: 'POST' });
+}
+
 export async function updateHealth(
 	id: string,
 	health_check_path: string | null,
