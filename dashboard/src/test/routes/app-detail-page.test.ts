@@ -226,6 +226,27 @@ describe('apps/[id] page', () => {
 		expect(api.getApp).toHaveBeenCalledWith('app_1');
 	});
 
+	it('follows a queued deploy and shows its place in line', async () => {
+		api.deployApp.mockResolvedValue({
+			message: 'Deployment queued (position 2)',
+			app_id: 'app_1',
+			deployment_id: 'dep_new',
+			status: 'queued',
+			queue_position: 2,
+			superseded: null
+		});
+		api.getApp.mockResolvedValue({ ...app });
+
+		const user = userEvent.setup();
+		renderPage();
+
+		await user.click(screen.getByRole('button', { name: /re-deploy/i }));
+
+		const progress = await screen.findByTestId('deploy-progress');
+		expect(progress).toHaveTextContent('Deploy queued: 2nd in line');
+		expect(screen.getByRole('button', { name: /re-deploy/i })).toBeEnabled();
+	});
+
 	it('stops a running app and refreshes its data', async () => {
 		api.stopApp.mockResolvedValue(undefined);
 		api.getApp.mockResolvedValue({ ...app, status: 'stopped' });

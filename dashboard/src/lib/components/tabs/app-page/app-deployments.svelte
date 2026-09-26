@@ -6,7 +6,9 @@
 	import * as Dialog from '$lib/components/ui/dialog/index.js';
 	import * as Tooltip from '$lib/components/ui/tooltip/index.js';
 	import { Textarea } from '$lib/components/ui/textarea/index.js';
+	import { deploymentStatusView } from '$lib/deploymentStatus';
 	import HistoryIcon from '~icons/ri/history-line';
+	import LoaderIcon from '~icons/ri/loader-4-line';
 
 	interface Props {
 		deployments: Deployment[];
@@ -77,6 +79,7 @@
 		<div class="space-y-1">
 			<p class="text-sm text-muted-foreground">Last 20 deployments for this app.</p>
 			<p class="text-xs text-muted-foreground/80">
+				Deploys run one at a time per app; a newer deploy replaces one that is still waiting.
 				Rolling back restores the exact image a deployment ran. Current environment variables,
 				volumes and resource limits are kept. Images of the last 3 successful deployments stay on
 				the server; older ones are pruned to save disk space.
@@ -172,20 +175,30 @@
 				</thead>
 				<tbody>
 					{#each deployments as d (d.id)}
-						<tr class="border-b last:border-0">
+						{@const view = deploymentStatusView(d)}
+						<tr class="border-b last:border-0" data-status={d.status}>
 							<td class="px-4 py-2">
 								<div class="flex items-center gap-1.5">
-									<Badge
-										variant={d.status === 'succeeded'
-											? 'default'
-											: d.status === 'failed'
-												? 'destructive'
-												: 'outline'}>{d.status}</Badge
-									>
+									<Badge variant={view.variant} class={view.active ? 'gap-1' : ''}>
+										{#if view.active}
+											<LoaderIcon class="size-3 animate-spin" aria-hidden="true" />
+										{/if}
+										{view.label}
+									</Badge>
 									{#if d.is_current}
 										<Badge variant="outline" class="text-xs">current</Badge>
 									{/if}
 								</div>
+								{#if view.detail}
+									<p
+										class="mt-1 max-w-64 text-xs {d.status === 'failed'
+											? 'text-destructive'
+											: 'text-muted-foreground'}"
+										title={view.detail}
+									>
+										{view.detail}
+									</p>
+								{/if}
 							</td>
 							<td class="px-4 py-2">
 								<Badge variant="outline" class="font-mono text-xs"
@@ -213,9 +226,15 @@
 									<span class="text-xs text-muted-foreground">-</span>
 								{/if}
 							</td>
-							<td class="px-4 py-2 text-muted-foreground"
-								>{new Date(d.started_at).toLocaleString()}</td
-							>
+							<td class="px-4 py-2 text-muted-foreground">
+								{#if d.status === 'queued'}
+									<span title="Queued at {new Date(d.created_at).toLocaleString()}">Waiting</span>
+								{:else if d.status === 'superseded'}
+									-
+								{:else}
+									{new Date(d.started_at).toLocaleString()}
+								{/if}
+							</td>
 							<td class="px-4 py-2 text-muted-foreground"
 								>{d.finished_at ? new Date(d.finished_at).toLocaleString() : '-'}</td
 							>

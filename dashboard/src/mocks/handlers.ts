@@ -44,6 +44,7 @@ import {
 	MOCK_PREVIEW_ENV_VARS,
 	MOCK_CERTIFICATES,
 	makeMockSystemMetrics,
+	makeMockSystemSelf,
 	makeMockAppMetrics
 } from './fixtures';
 import type {
@@ -266,6 +267,112 @@ let projects: Project[] = structuredClone(MOCK_PROJECTS);
 const templates: TemplateCatalogEntry[] = structuredClone(MOCK_TEMPLATES);
 let alertRules: AlertRule[] = structuredClone(MOCK_ALERT_RULES);
 const deployments: Record<string, Deployment[]> = structuredClone(MOCK_DEPLOYMENTS);
+
+// Deploys started in the mock walk through the build queue on a clock, so the
+// dashboard's queue position and progress can be seen:
+// queued → building → deploying → succeeded. Deploys of one app run one at a
+// time; a newer request supersedes one that is still queued.
+const QUEUE_MS = 2500;
+const BUILD_MS = 6000;
+const CUTOVER_MS = 2500;
+const TOTAL_MS = QUEUE_MS + BUILD_MS + CUTOVER_MS;
+/** deployment id → when it may start (its queue wait ends) */
+const deployClock = new Map<string, number>();
+const UNFINISHED = ['queued', 'building', 'deploying'];
+
+function advanceDeployments(appId: string) {
+	const now = Date.now();
+	const list = deployments[appId] ?? [];
+	const queuedIds = list
+		.filter((d) => d.status === 'queued')
+		.map((d) => d.id)
+		.reverse();
+	deployments[appId] = list.map((d) => {
+		const start = deployClock.get(d.id);
+		if (start === undefined || !UNFINISHED.includes(d.status)) return d;
+		const age = now - start;
+		if (age < QUEUE_MS) {
+			return { ...d, status: 'queued', queue_position: queuedIds.indexOf(d.id) + 1 };
+		}
+		if (age < QUEUE_MS + BUILD_MS) {
+			return {
+				...d,
+				status: 'building',
+				queue_position: null,
+				started_at: new Date(start + QUEUE_MS).toISOString()
+			};
+		}
+		if (age < TOTAL_MS) return { ...d, status: 'deploying', queue_position: null };
+		deployClock.delete(d.id);
+		return {
+			...d,
+			status: 'succeeded',
+			queue_position: null,
+			finished_at: new Date(start + TOTAL_MS).toISOString(),
+			image_tag: d.image_tag ?? `tond-${appId}:${d.id.slice(-12)}`
+		};
+	});
+}
+
+function enqueueMockDeployment(appId: string, kind: string, imageTag: string | null = null) {
+	advanceDeployments(appId);
+	const list = deployments[appId] ?? [];
+	const id = `dep_${crypto.randomUUID().replaceAll('-', '').slice(0, 16)}`;
+	const now = Date.now();
+	// Supersede a deploy that has not started yet.
+	const waiting = list.find((d) => d.status === 'queued');
+	const running = list.find((d) => d.status === 'building' || d.status === 'deploying');
+	const runningStart = running ? (deployClock.get(running.id) ?? now) : now;
+	if (waiting) deployClock.delete(waiting.id);
+	const startAt = running ? runningStart + TOTAL_MS - QUEUE_MS : now;
+	deployClock.set(id, startAt);
+	const created = new Date(now).toISOString();
+	const deployment: Deployment = {
+		id,
+		app_id: appId,
+		image_tag: imageTag,
+		status: 'queued',
+		trigger_source: kind === 'rollback' ? 'rollback' : 'manual',
+		kind,
+		error: null,
+		superseded_by: null,
+		queue_position: running ? 2 : 1,
+		has_generated_dockerfile: false,
+		started_at: created,
+		finished_at: null,
+		created_at: created,
+		image_pruned: false,
+		is_current: false,
+		rollback_available: false,
+		rollback_unavailable_reason: 'Only successful deployments can be restored'
+	};
+	deployments[appId] = [
+		deployment,
+		...list.map((d) =>
+			d.id === waiting?.id
+				? {
+						...d,
+						status: 'superseded' as const,
+						superseded_by: id,
+						finished_at: created,
+						queue_position: null,
+						error: 'Replaced by a newer deploy before it started'
+					}
+				: d
+		)
+	];
+	return {
+		message:
+			deployment.queue_position! > 1
+				? `Deployment queued (position ${deployment.queue_position})`
+				: 'Deployment queued',
+		app_id: appId,
+		deployment_id: id,
+		status: 'queued' as const,
+		queue_position: deployment.queue_position!,
+		superseded: waiting?.id ?? null
+	};
+}
 let previews: Record<string, PreviewDeployment[]> = structuredClone(MOCK_PREVIEWS);
 let projectPreviews: Record<string, ProjectPreview[]> = structuredClone(MOCK_PROJECT_PREVIEWS);
 let databases: ManagedDatabase[] = structuredClone(MOCK_DATABASES);
@@ -882,11 +989,14 @@ export const handlers = [
 	}),
 
 	http.post('/api/apps/:id/deploy', async ({ params }) => {
-		await delay(LATENCY * 3);
+		await delay(LATENCY);
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx === -1) return err('App not found', 404);
-		apps[idx] = { ...apps[idx], status: 'running', updated_at: new Date().toISOString() };
-		return ok(null);
+		apps[idx] = { ...apps[idx], updated_at: new Date().toISOString() };
+		return HttpResponse.json(
+			{ success: true, data: enqueueMockDeployment(params.id as string, 'deploy'), error: null },
+			{ status: 202 }
+		);
 	}),
 
 	http.post('/api/apps/:id/stop', async ({ params }) => {
@@ -1081,6 +1191,7 @@ export const handlers = [
 	// ── Deployments ───────────────────────────────────────────────────────────
 
 	http.get('/api/apps/:id/deployments', async ({ params }) => {
+		advanceDeployments(params.id as string);
 		await delay(LATENCY);
 		return ok(deployments[params.id as string] ?? []);
 	}),
@@ -1136,11 +1247,20 @@ export const handlers = [
 			rollback_unavailable_reason:
 				d.id === target.id ? 'This image is already running' : d.rollback_unavailable_reason
 		}));
-		return ok({
-			message: 'Rollback started',
-			image_tag: target.image_tag,
-			deployment_id: target.id
-		});
+		const queued = enqueueMockDeployment(params.id as string, 'rollback', target.image_tag);
+		return HttpResponse.json(
+			{
+				success: true,
+				data: {
+					...queued,
+					message: 'Rollback queued',
+					image_tag: target.image_tag,
+					target_deployment_id: target.id
+				},
+				error: null
+			},
+			{ status: 202 }
+		);
 	}),
 
 	http.post('/api/compose/validate', async ({ request }) => {
@@ -1435,6 +1555,18 @@ export const handlers = [
 	http.get('/api/system/metrics', async () => {
 		await delay(LATENCY);
 		return ok(makeMockSystemMetrics());
+	}),
+
+	http.get('/api/system/self', async () => {
+		await delay(LATENCY);
+		const self = makeMockSystemSelf();
+		const queued = Object.values(deployments)
+			.flat()
+			.filter((d) => d.status === 'queued').length;
+		const active = Object.values(deployments)
+			.flat()
+			.filter((d) => d.status === 'building' || d.status === 'deploying').length;
+		return ok({ ...self, build_queue: { ...self.build_queue, queued, active } });
 	}),
 
 	// ── Settings ──────────────────────────────────────────────────────────────

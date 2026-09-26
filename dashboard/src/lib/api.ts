@@ -335,8 +335,24 @@ export async function deleteApp(id: string): Promise<void> {
 	await request(`/apps/${id}`, { method: 'DELETE' });
 }
 
-export async function deployApp(id: string): Promise<void> {
-	await request(`/apps/${id}/deploy`, { method: 'POST' });
+/**
+ * Answer to a deploy or rollback request (202): the deployment waits in the
+ * build queue — one deploy per app at a time, builds share the server's build
+ * slots. A newer request replaces one that has not started yet.
+ */
+export interface QueuedDeployment {
+	message: string;
+	app_id: string;
+	deployment_id: string;
+	status: 'queued';
+	/** 1-based place in line across all apps */
+	queue_position: number;
+	/** The waiting deployment this one replaced, if any */
+	superseded: string | null;
+}
+
+export async function deployApp(id: string): Promise<QueuedDeployment> {
+	return request<QueuedDeployment>(`/apps/${id}/deploy`, { method: 'POST' });
 }
 
 export async function stopApp(id: string): Promise<void> {
@@ -692,12 +708,24 @@ export async function updateSettings(data: Partial<ServerSettings>): Promise<Ser
 
 // ── Deployments ──
 
+/** Where a deployment is in its life. */
+export type DeploymentStatus =
+	'queued' | 'building' | 'deploying' | 'succeeded' | 'failed' | 'superseded';
+
 export interface Deployment {
 	id: string;
 	app_id: string;
 	image_tag: string | null;
-	status: string;
+	status: DeploymentStatus;
 	trigger_source: string;
+	/** "deploy" | "rollback" | "upload" */
+	kind: string;
+	/** Why it failed, was superseded or was interrupted */
+	error: string | null;
+	/** The deployment that replaced this one while it was queued */
+	superseded_by: string | null;
+	/** Place in the build queue while queued */
+	queue_position: number | null;
 	has_generated_dockerfile: boolean;
 	started_at: string;
 	finished_at: string | null;
@@ -730,8 +758,8 @@ export async function getDeploymentGeneratedDockerfile(
  * Redeploy the exact image of an earlier deployment. Without `deploymentId`
  * the server restores the previous distinct image.
  */
-export async function rollbackApp(id: string, deploymentId?: string): Promise<void> {
-	await request(`/apps/${id}/rollback`, {
+export async function rollbackApp(id: string, deploymentId?: string): Promise<QueuedDeployment> {
+	return request<QueuedDeployment>(`/apps/${id}/rollback`, {
 		method: 'POST',
 		...(deploymentId ? { body: JSON.stringify({ deployment_id: deploymentId }) } : {})
 	});
@@ -1057,6 +1085,82 @@ export async function getAppMetrics(
 
 export async function getSystemMetrics(): Promise<SystemMetrics> {
 	return request<SystemMetrics>('/system/metrics');
+}
+
+// ── Tond measuring itself (GET /api/system/self) ──
+
+/** Health of one background loop of tond-server or tond-proxy. */
+export interface LoopStats {
+	name: string;
+	/** Times the loop woke up since the process started */
+	wakeups: number;
+	runs: number;
+	errors: number;
+	last_run_at: string | null;
+	last_duration_ms: number | null;
+	/** Most recent failure; cleared by a later success */
+	last_error: string | null;
+	/** Largest delay of a timer past its deadline, ms */
+	max_lag_ms: number;
+	/** Next timed wake-up; null while waiting only for an event */
+	next_wake_at: string | null;
+}
+
+export interface ProcessSample {
+	rss_bytes: number | null;
+	cpu_seconds: number | null;
+	open_fds: number | null;
+	threads: number | null;
+	context_switches: number | null;
+}
+
+export interface ServerProcessStats extends ProcessSample {
+	cpu_percent: number | null;
+	uptime_secs: number;
+	tokio_alive_tasks: number;
+	tokio_workers: number;
+	tokio_parks: number;
+}
+
+export interface ProxyStats extends ProcessSample {
+	pid: number;
+	uptime_secs: number;
+	route_version: number;
+	routes: number;
+	reloads: number;
+	loops: LoopStats[];
+}
+
+export interface SystemSelf {
+	version: string;
+	server: ServerProcessStats;
+	loops: LoopStats[];
+	db: {
+		size_bytes: number | null;
+		wal_bytes: number | null;
+		queries_total: number;
+		slow_total: number;
+		slow_threshold_ms: number;
+		recent_slow: { sql: string; elapsed_ms: number; at: string }[];
+		top_statements: { sql: string; count: number }[];
+	};
+	http_bucket_bounds_ms: number[];
+	http: {
+		method: string;
+		route: string;
+		count: number;
+		errors: number;
+		sum_ms: number;
+		buckets: number[];
+		p50_ms: number;
+		p95_ms: number;
+	}[];
+	build_queue: { build_slots: number; active: number; queued: number };
+	proxy: { connected: boolean; stats: ProxyStats | null; cpu_percent: number | null };
+}
+
+export async function getSystemSelf(): Promise<SystemSelf> {
+	return request<SystemSelf>('/system/self');
 }
 
 // ── Alert Rules ──

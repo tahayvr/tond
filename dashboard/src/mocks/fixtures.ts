@@ -17,7 +17,9 @@ import type {
 	GitHubRepo,
 	GitHubBranch,
 	Integration,
+	LoopStats,
 	ManagedDatabase,
+	SystemSelf,
 	TemplateCatalogEntry,
 	MetricPoint,
 	OnboardingStatus,
@@ -469,6 +471,10 @@ export const MOCK_DEPLOYMENTS: Record<string, Deployment[]> = {
 			finished_at: '2025-03-01T09:02:00.000Z',
 			created_at: '2025-03-01T08:55:00.000Z',
 			image_pruned: false,
+			kind: 'deploy',
+			error: null,
+			superseded_by: null,
+			queue_position: null,
 			is_current: true,
 			rollback_available: false,
 			rollback_unavailable_reason: 'This image is already running'
@@ -484,6 +490,10 @@ export const MOCK_DEPLOYMENTS: Record<string, Deployment[]> = {
 			finished_at: '2025-02-15T14:17:00.000Z',
 			created_at: '2025-02-15T14:10:00.000Z',
 			image_pruned: false,
+			kind: 'deploy',
+			error: null,
+			superseded_by: null,
+			queue_position: null,
 			is_current: false,
 			rollback_available: true,
 			rollback_unavailable_reason: null
@@ -499,6 +509,10 @@ export const MOCK_DEPLOYMENTS: Record<string, Deployment[]> = {
 			finished_at: '2025-02-12T09:05:00.000Z',
 			created_at: '2025-02-12T09:00:00.000Z',
 			image_pruned: true,
+			kind: 'deploy',
+			error: null,
+			superseded_by: null,
+			queue_position: null,
 			is_current: false,
 			rollback_available: false,
 			rollback_unavailable_reason: "This deployment's image was pruned to save disk space"
@@ -514,12 +528,160 @@ export const MOCK_DEPLOYMENTS: Record<string, Deployment[]> = {
 			finished_at: '2025-02-10T10:03:00.000Z',
 			created_at: '2025-02-10T10:00:00.000Z',
 			image_pruned: true,
+			kind: 'deploy',
+			error: 'Interrupted: Tond restarted while this was in progress. Deploy again to retry.',
+			superseded_by: null,
+			queue_position: null,
 			is_current: false,
 			rollback_available: false,
 			rollback_unavailable_reason: 'Only successful deployments can be restored'
 		}
 	]
 };
+
+// Deployment dep_3 superseded a webhook deploy that was still waiting.
+MOCK_DEPLOYMENTS.app_running.splice(1, 0, {
+	id: 'dep_2b',
+	app_id: 'app_running',
+	image_tag: null,
+	status: 'superseded',
+	trigger_source: 'webhook',
+	has_generated_dockerfile: false,
+	started_at: '2025-03-01T08:54:30.000Z',
+	finished_at: '2025-03-01T08:55:00.000Z',
+	created_at: '2025-03-01T08:54:30.000Z',
+	image_pruned: false,
+	kind: 'deploy',
+	error: 'Replaced by a newer deploy before it started',
+	superseded_by: 'dep_3',
+	queue_position: null,
+	is_current: false,
+	rollback_available: false,
+	rollback_unavailable_reason: 'Only successful deployments can be restored'
+});
+
+// ── Tond measuring itself ──────────────────────────────────────────────────
+
+const loop = (name: string, extra: Partial<LoopStats> = {}): LoopStats => ({
+	name,
+	wakeups: 12,
+	runs: 12,
+	errors: 0,
+	last_run_at: new Date(Date.now() - 4 * 60_000).toISOString(),
+	last_duration_ms: 3.2,
+	last_error: null,
+	max_lag_ms: 1.4,
+	next_wake_at: new Date(Date.now() + 56 * 60_000).toISOString(),
+	...extra
+});
+
+export function makeMockSystemSelf(): SystemSelf {
+	const now = Date.now();
+	return {
+		version: '0.1.0',
+		server: {
+			rss_bytes: 13.4 * 1024 * 1024,
+			cpu_seconds: 41.2,
+			open_fds: 23,
+			threads: 6,
+			context_switches: 48210,
+			cpu_percent: 0.05,
+			uptime_secs: 3 * 86_400 + 4 * 3600,
+			tokio_alive_tasks: 14,
+			tokio_workers: 2,
+			tokio_parks: 9120
+		},
+		loops: [
+			loop('health', {
+				wakeups: 412,
+				runs: 412,
+				last_run_at: new Date(now - 12_000).toISOString(),
+				last_duration_ms: 18.5,
+				next_wake_at: new Date(now + 18_000).toISOString()
+			}),
+			loop('metrics', {
+				last_run_at: new Date(now - 21_000).toISOString(),
+				last_duration_ms: 42.1,
+				next_wake_at: new Date(now + 9_000).toISOString()
+			}),
+			loop('alerts', { next_wake_at: null }),
+			loop('cron', { next_wake_at: new Date(now + 26 * 60_000).toISOString() }),
+			loop('janitor', {
+				last_run_at: new Date(now - 38 * 60_000).toISOString(),
+				last_duration_ms: 64.8,
+				next_wake_at: new Date(now + 22 * 60_000).toISOString()
+			}),
+			loop('backup-scheduler', { next_wake_at: new Date(now + 9 * 3_600_000).toISOString() }),
+			loop('preview-cleanup'),
+			loop('proxy-link', { next_wake_at: null }),
+			loop('route-nudge', { last_duration_ms: 11.3, next_wake_at: null })
+		],
+		db: {
+			size_bytes: 1.8 * 1024 * 1024,
+			wal_bytes: 96 * 1024,
+			queries_total: 18342,
+			slow_total: 1,
+			slow_threshold_ms: 100,
+			recent_slow: [
+				{
+					sql: 'DELETE FROM deploy_logs WHERE rowid IN (SELECT rowid FROM deploy_logs WHERE app_id = ? AND created_at < ? LIMIT ?)',
+					elapsed_ms: 131.2,
+					at: new Date(now - 38 * 60_000).toISOString()
+				}
+			],
+			top_statements: [
+				{
+					sql: 'SELECT * FROM apps WHERE status IN (?, ?) AND health_check_path IS NOT NULL',
+					count: 412
+				}
+			]
+		},
+		http_bucket_bounds_ms: [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000],
+		http: [
+			{
+				method: 'GET',
+				route: '/api/apps',
+				count: 120,
+				errors: 0,
+				sum_ms: 240,
+				buckets: [60, 55, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+				p50_ms: 5,
+				p95_ms: 5
+			}
+		],
+		build_queue: { build_slots: 1, active: 0, queued: 0 },
+		proxy: {
+			connected: true,
+			cpu_percent: 0.02,
+			stats: {
+				pid: 812,
+				rss_bytes: 9.6 * 1024 * 1024,
+				cpu_seconds: 12.7,
+				open_fds: 31,
+				threads: 5,
+				context_switches: 90111,
+				uptime_secs: 3 * 86_400 + 4 * 3600,
+				route_version: 57,
+				routes: 6,
+				reloads: 57,
+				loops: [
+					loop('route-sync', { wakeups: 0, runs: 58, last_duration_ms: 1.1, next_wake_at: null }),
+					loop('route-poll', {
+						wakeups: 4560,
+						last_run_at: new Date(now - 31_000).toISOString(),
+						last_duration_ms: 0.4,
+						next_wake_at: new Date(now + 29_000).toISOString()
+					}),
+					loop('certificates', {
+						last_run_at: new Date(now - 2 * 3_600_000).toISOString(),
+						last_duration_ms: 2.3,
+						next_wake_at: new Date(now + 10 * 3_600_000).toISOString()
+					})
+				]
+			}
+		}
+	};
+}
 
 export const MOCK_GENERATED_DOCKERFILES: Record<string, string> = {
 	dep_3: `FROM node:20-alpine AS builder

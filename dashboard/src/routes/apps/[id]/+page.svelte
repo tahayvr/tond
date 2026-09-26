@@ -37,6 +37,7 @@
 		setAppGitHubApp,
 		type App,
 		type Deployment,
+		type QueuedDeployment,
 		type DeployKey,
 		type PreviewDeployment,
 		type GithubPR,
@@ -82,6 +83,8 @@
 	import type { LogLine } from '$lib/components/tabs/app-page/app-logs.svelte';
 	import { createLogBuffer } from '$lib/log-buffer';
 	import { pollWhileVisible } from '$lib/polling';
+	import { deployProgressMessage, isUnfinished } from '$lib/deploymentStatus';
+	import LoaderIcon from '~icons/ri/loader-4-line';
 	import { untrack } from 'svelte';
 
 	let { data, params }: PageProps = $props();
@@ -90,9 +93,16 @@
 	let error = $state('');
 	let showDeleteDialog = $state(false);
 
-	// Status polling runs while the app is building (or right after a deploy
-	// request) and stops on a terminal status. See the effects at the bottom.
+	// Status polling runs while the app is building (or while a queued deploy
+	// is on its way) and stops on a terminal status. See the effects at the bottom.
 	let statusPollRequested = $state(false);
+	/** The deploy/rollback this page started and follows until it finishes. */
+	let pendingDeployment = $state<Pick<
+		Deployment,
+		'id' | 'status' | 'queue_position' | 'kind'
+	> | null>(null);
+	/** A deploy request is in flight (button pending state). */
+	let deploying = $state(false);
 	let appStatus = $derived(app?.status);
 	/** Selected tab; drives the log stream, metrics polling and feed context. */
 	let activeTab = $state('overview');
@@ -226,8 +236,45 @@
 		}
 	}
 
+	/** Follow a deployment the build queue accepted. */
+	function trackDeployment(queued: QueuedDeployment | undefined, kind = 'deploy') {
+		if (queued?.deployment_id) {
+			pendingDeployment = {
+				id: queued.deployment_id,
+				status: queued.status,
+				queue_position: queued.queue_position,
+				kind
+			};
+		}
+		statusPollRequested = true;
+	}
+
+	/** Poll the followed deployment; returns true while it is still on its way. */
+	async function pollPendingDeployment(): Promise<boolean> {
+		if (!pendingDeployment) return false;
+		const list = await listDeployments(appId);
+		if (activeTab === 'deployments') deployments = list;
+		const latest = list.find((d) => d.id === pendingDeployment?.id);
+		if (latest && isUnfinished(latest.status)) {
+			pendingDeployment = {
+				id: latest.id,
+				status: latest.status,
+				queue_position: latest.queue_position,
+				kind: latest.kind
+			};
+			return true;
+		}
+		pendingDeployment = null;
+		return false;
+	}
+
 	async function pollStatus() {
 		try {
+			if (await pollPendingDeployment()) {
+				const current = await getApp(appId);
+				if (app && app.status !== current.status) app = { ...app, status: current.status };
+				return;
+			}
 			const latest = await getApp(appId);
 			if (latest.status !== 'building') {
 				// Terminal state: reload everything once; the polling effect stops.
@@ -313,14 +360,18 @@
 	}
 
 	async function handleDeploy() {
+		deploying = true;
+		error = '';
 		try {
 			openFeedPanel();
-			await deployApp(appId);
+			const queued = await deployApp(appId);
 			await loadApp();
-			// Poll to reflect the building → running transition
-			statusPollRequested = true;
+			// Follow it through the queue: queued → building → deploying → done
+			trackDeployment(queued);
 		} catch (e: any) {
 			error = e.message;
+		} finally {
+			deploying = false;
 		}
 	}
 
@@ -371,9 +422,9 @@
 
 	async function handleEnvRedeploy() {
 		openFeedPanel();
-		await deployApp(appId);
+		const queued = await deployApp(appId);
 		await loadApp();
-		statusPollRequested = true;
+		trackDeployment(queued);
 	}
 
 	async function handleUpdateDomain() {
@@ -456,9 +507,10 @@
 	async function handleRollback(deploymentId?: string) {
 		rollbackError = '';
 		try {
-			await rollbackApp(appId, deploymentId);
+			const queued = await rollbackApp(appId, deploymentId);
 			await loadApp();
 			await loadDeployments();
+			trackDeployment(queued, 'rollback');
 		} catch (e: any) {
 			rollbackError = e.message;
 		}
@@ -912,6 +964,16 @@
 				<h2 class="text-3xl font-extrabold uppercase">{app.name}</h2>
 				<div class="mt-2 flex items-center gap-3 text-sm text-muted-foreground">
 					<Badge variant={statusVariant(app.status)}>{app.status}</Badge>
+					{#if pendingDeployment}
+						<span
+							class="inline-flex items-center gap-1 text-xs text-foreground"
+							role="status"
+							data-testid="deploy-progress"
+						>
+							<LoaderIcon class="size-3.5 animate-spin" aria-hidden="true" />
+							{deployProgressMessage(pendingDeployment)}
+						</span>
+					{/if}
 					<span>Source: {app.source_type}</span>
 					{#if app.source_url}
 						<span class="max-w-xs truncate">{app.source_url}</span>
@@ -925,7 +987,9 @@
 				{:else if app.status === 'stopped'}
 					<Button variant="outline" size="sm" onclick={handleStart}>Start</Button>
 				{/if}
-				<Button size="sm" onclick={handleDeploy}>Re-deploy</Button>
+				<Button size="sm" onclick={handleDeploy} disabled={deploying}>
+					{deploying ? 'Queuing…' : 'Re-deploy'}
+				</Button>
 				<Button variant="destructive" size="sm" onclick={() => (showDeleteDialog = true)}>
 					Delete
 				</Button>

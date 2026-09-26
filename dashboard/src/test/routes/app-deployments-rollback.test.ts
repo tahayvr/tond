@@ -17,6 +17,10 @@ function deployment(overrides: Partial<Deployment>): Deployment {
 		finished_at: '2026-01-01T00:01:00.000Z',
 		created_at: '2026-01-01T00:00:00.000Z',
 		image_pruned: false,
+		kind: 'deploy',
+		error: null,
+		superseded_by: null,
+		queue_position: null,
 		is_current: false,
 		rollback_available: false,
 		rollback_unavailable_reason: null,
@@ -63,6 +67,40 @@ describe('app deployments rollback', () => {
 		await user.click(screen.getByRole('button', { name: /restore image/i }));
 
 		expect(onRollback).toHaveBeenCalledWith('dep_prev');
+	});
+
+	it('shows queue position, progress and why a deploy was superseded or failed', () => {
+		render(AppDeploymentsHarness, {
+			props: {
+				deployments: [
+					deployment({ id: 'dep_q', status: 'queued', queue_position: 2, image_tag: null }),
+					deployment({ id: 'dep_b', status: 'building', image_tag: null }),
+					deployment({
+						id: 'dep_s',
+						status: 'superseded',
+						superseded_by: 'dep_q',
+						image_tag: null
+					}),
+					deployment({
+						id: 'dep_f',
+						status: 'failed',
+						error: 'Interrupted: Tond restarted while this was in progress. Deploy again to retry.'
+					})
+				],
+				onRollback: vi.fn()
+			}
+		});
+
+		const rows = screen.getAllByRole('row').slice(1);
+		expect(within(rows[0]).getByText('Queued')).toBeInTheDocument();
+		expect(within(rows[0]).getByText('2nd in line')).toBeInTheDocument();
+		expect(within(rows[0]).getByText('Waiting')).toBeInTheDocument();
+		expect(within(rows[1]).getByText('Building')).toBeInTheDocument();
+		expect(within(rows[2]).getByText('Superseded')).toBeInTheDocument();
+		expect(
+			within(rows[2]).getByText('Replaced by a newer deploy before it started')
+		).toBeInTheDocument();
+		expect(within(rows[3]).getByText(/Deploy again to retry/)).toBeInTheDocument();
 	});
 
 	it('disables the roll back button when nothing can be restored', () => {
