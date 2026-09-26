@@ -272,9 +272,10 @@ if runuser -u tond-proxy -- bash -c ": >> '${DATA_DIR}/tond.db'" 2>/dev/null; th
     fail "tond-proxy must not be able to write tond.db"
 fi
 pass "tond-proxy cannot write tond.db"
+# The link reconnects with backoff after install starts the proxy; give it a moment.
+wait_for 30 "tond-server holding a control connection to tond-proxy" \
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/system/self | jq -e '.data.proxy.connected == true'"
 self=$(api /api/system/self)
-echo "$self" | jq -e '.data.proxy.connected == true' > /dev/null \
-    || fail "tond-server must hold a control connection to tond-proxy: $(echo "$self" | jq -c .data.proxy)"
 echo "$self" | jq -e '.data.proxy.stats.route_version >= 0 and .data.proxy.stats.pid > 0' > /dev/null \
     || fail "tond-proxy must report its stats over the control socket"
 pass "tond-server ↔ tond-proxy control link is up (proxy pid $(echo "$self" | jq -r .data.proxy.stats.pid))"
