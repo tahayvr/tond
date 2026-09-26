@@ -112,7 +112,6 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use tower_http::trace::TraceLayer;
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
 use crate::runtime::{dbstats::DbStatsLayer, http_metrics, selfstats, shutdown};
@@ -143,10 +142,9 @@ async fn run() -> Result<()> {
     tond_common::install_crypto_provider();
     // Logging: the journal gets RUST_LOG (default info); DbStatsLayer counts
     // every SQL statement through its own filter (runtime/dbstats.rs).
+    let log_format = tond_common::logging::LogFormat::from_env();
     tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        ))
+        .with(tond_common::logging::fmt_layer(log_format))
         .with(DbStatsLayer.with_filter(DbStatsLayer::filter()))
         .init();
 

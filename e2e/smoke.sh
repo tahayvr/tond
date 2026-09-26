@@ -294,9 +294,9 @@ for m in tond_process_resident_memory_bytes tond_loop_wakeups_total tond_db_quer
     grep -q "^${m}" <<<"$metrics" || fail "/metrics must expose ${m}"
 done
 pass "/metrics on the root-only socket exposes Prometheus metrics"
-[[ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3001/metrics)" == 404 ]] \
-    || fail "/metrics must not be served over TCP"
-pass "/metrics over TCP → 404"
+[[ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3001/metrics)" == 401 ]] \
+    || fail "/metrics over TCP must require a metrics:read token"
+pass "/metrics over TCP without a token → 401"
 
 id -u tond > /dev/null 2>&1 || fail "install.sh must create the host terminal user 'tond'"
 for group in docker sudo; do
