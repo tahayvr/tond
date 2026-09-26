@@ -48,7 +48,8 @@
 	<p class="text-sm text-muted-foreground">
 		Persistent volumes keep data between deploys. Each volume is a directory inside this app's
 		volume folder <span class="font-mono">{volumeDir}</span>; containers can't mount any other host
-		path. Changes take effect on the next deploy.
+		path. Changes take effect on the next deploy. Preview deployments get their own empty copies of
+		these folders, never this app's data.
 	</p>
 
 	<InlineError title="Volume not saved" message={volumeError} />
