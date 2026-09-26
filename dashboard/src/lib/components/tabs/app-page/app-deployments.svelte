@@ -75,7 +75,7 @@
 		<ErrorAlert title="Rollback failed" description={error} />
 	{/if}
 
-	<div class="flex items-start justify-between gap-4">
+	<div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
 		<div class="space-y-1">
 			<p class="text-sm text-muted-foreground">Last 20 deployments for this app.</p>
 			<p class="text-xs text-muted-foreground/80">
