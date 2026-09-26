@@ -71,6 +71,7 @@ mod notifications;
 mod secret_key;
 mod security_headers;
 mod state;
+mod static_files;
 mod storage;
 mod volumes;
 
@@ -82,7 +83,6 @@ use axum::{
     Extension, Router,
     routing::{delete, get, post, put},
 };
-use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
@@ -682,9 +682,7 @@ async fn main() -> Result<()> {
     {
         tracing::info!("Serving dashboard from {}", dashboard_dir);
         security_headers::init_from_dashboard(Path::new(&dashboard_dir));
-        let serve_dir = ServeDir::new(&dashboard_dir)
-            .not_found_service(ServeFile::new(format!("{}/index.html", dashboard_dir)));
-        api.fallback_service(serve_dir)
+        api.fallback_service(static_files::dashboard_router(Path::new(&dashboard_dir)))
     } else {
         tracing::info!("No dashboard found at {}, running API-only", dashboard_dir);
         api
