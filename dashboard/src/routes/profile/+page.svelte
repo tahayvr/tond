@@ -61,8 +61,9 @@
 	}
 
 	// ── TOTP 2FA ──────────────────────────────────────────────────────────────
-	let totpPhase = $state<'idle' | 'setup' | 'done' | 'disable'>('idle');
+	let totpPhase = $state<'idle' | 'password' | 'setup' | 'done' | 'disable'>('idle');
 	let totpSetup = $state<TotpSetup | null>(null);
+	let totpSetupPassword = $state('');
 	let totpCode = $state('');
 	let totpDisablePassword = $state('');
 	let totpDisableCode = $state('');
@@ -71,11 +72,18 @@
 	let backupCodes = $state<string[]>([]);
 	let twoFaEnabled = $state(false);
 
+	function handleStart2FA() {
+		totpError = '';
+		totpSetupPassword = '';
+		totpPhase = 'password';
+	}
+
 	async function handleEnable2FA() {
 		totpError = '';
 		totpSaving = true;
 		try {
-			totpSetup = await setup2FA();
+			totpSetup = await setup2FA(totpSetupPassword);
+			totpSetupPassword = '';
 			totpPhase = 'setup';
 		} catch (e: any) {
 			totpError = e.message;
@@ -120,6 +128,7 @@
 	function cancelSetup() {
 		totpPhase = 'idle';
 		totpSetup = null;
+		totpSetupPassword = '';
 		totpCode = '';
 		totpError = '';
 	}
@@ -225,12 +234,14 @@
 				phase={totpPhase}
 				enabled={twoFaEnabled}
 				setup={totpSetup}
+				bind:setupPassword={totpSetupPassword}
 				bind:totpCode
 				bind:disablePassword={totpDisablePassword}
 				bind:disableCode={totpDisableCode}
 				{backupCodes}
 				saving={totpSaving}
 				error={totpError}
+				onStart={handleStart2FA}
 				onEnable={handleEnable2FA}
 				onConfirm={handleConfirm2FA}
 				onCancelSetup={cancelSetup}

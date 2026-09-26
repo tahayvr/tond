@@ -33,6 +33,10 @@
 		checkAuth();
 	});
 
+	function isAuthPath(path: string): boolean {
+		return path === '/login' || path === '/login/2fa' || path === '/setup';
+	}
+
 	// Redirect based on auth status + current path
 	$effect(() => {
 		if (typeof window === 'undefined') return;
@@ -42,18 +46,18 @@
 
 		if (status === 'loading') return;
 
-		if (status === 'setup' && path !== '/setup') {
-			goto('/setup');
-		} else if (status === 'login' && path !== '/login') {
+		// Unauthenticated visitors may stay on /setup: it is reached through the
+		// one-time setup link and validates its token itself.
+		if (status === 'login' && !isAuthPath(path)) {
 			goto('/login');
-		} else if (status === 'authenticated' && (path === '/login' || path === '/setup')) {
+		} else if (status === 'authenticated' && isAuthPath(path)) {
 			goto('/');
 		}
 	});
 
 	// True when we know what to show: auth boot completed.
 	let ready = $derived(getStatus() !== 'loading');
-	let isAuthRoute = $derived(page.url.pathname === '/setup' || page.url.pathname === '/login');
+	let isAuthRoute = $derived(isAuthPath(page.url.pathname));
 	let terminalOpen = $derived(getTerminalOpen());
 	let showBootShell = $state(false);
 

@@ -76,9 +76,26 @@ function err(message: string, status = 400) {
 }
 
 // In-memory mutable state (mutations survive page navigation within the session)
-// Starts as true so that running `pnpm dev:setup` drops straight into the wizard.
-// Flips to false once POST /api/auth/setup is called, matching real server behaviour.
+// Starts as true so that `pnpm dev:setup` begins signed out with setup open.
+// Like the real server, /api/auth/status doesn't reveal it: open the setup link
+// /setup?token=mock-setup-token (MOCK_SETUP_TOKEN) to reach the form.
+// Flips to false once POST /api/auth/setup succeeds.
 let needsSetup = true;
+export const MOCK_SETUP_TOKEN = 'mock-setup-token';
+
+// The host terminal is off by default, as on a real server (where only
+// `sudo tond settings host-terminal on` can enable it). To preview the step-up
+// flow in the mock, run `localStorage.setItem('tond-mock-host-terminal', 'on')`.
+function mockHostTerminalEnabled(): boolean {
+	try {
+		return globalThis.localStorage?.getItem('tond-mock-host-terminal') === 'on';
+	} catch {
+		return false;
+	}
+}
+const MOCK_STEP_UP_PASSWORD = 'ValidPass123!';
+// ticket → target, consumed by the terminal WebSocket mock
+const terminalTickets = new Map<string, { kind: string; id: string }>();
 let apps: App[] = structuredClone(MOCK_APPS);
 let projects: Project[] = structuredClone(MOCK_PROJECTS);
 const templates: TemplateCatalogEntry[] = structuredClone(MOCK_TEMPLATES);
@@ -116,9 +133,21 @@ export const handlers = [
 	http.get('/api/auth/status', async () => {
 		await delay(LATENCY);
 		if (needsSetup) {
-			return ok({ needs_setup: true, authenticated: false, user: null });
+			return ok({ authenticated: false, user: null });
 		}
-		return ok({ needs_setup: false, authenticated: true, user: MOCK_USER });
+		return ok({ authenticated: true, user: MOCK_USER });
+	}),
+
+	http.post('/api/auth/setup/check', async ({ request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as { token?: string };
+		if (!needsSetup || body.token !== MOCK_SETUP_TOKEN) {
+			return err(
+				'This setup link is invalid or has already been used. If the admin account already exists, sign in instead.',
+				403
+			);
+		}
+		return ok({ valid: true });
 	}),
 
 	http.post('/api/auth/login', async () => {
@@ -136,8 +165,15 @@ export const handlers = [
 		return ok(MOCK_USER);
 	}),
 
-	http.post('/api/auth/setup', async () => {
+	http.post('/api/auth/setup', async ({ request }) => {
 		await delay(LATENCY);
+		const body = (await request.json()) as { token?: string };
+		if (!needsSetup || body.token !== MOCK_SETUP_TOKEN) {
+			return err(
+				'This setup link is invalid or has already been used. If the admin account already exists, sign in instead.',
+				403
+			);
+		}
 		needsSetup = false;
 		return ok({ user: MOCK_USER });
 	}),
@@ -150,7 +186,14 @@ export const handlers = [
 	http.get('/api/terminal/targets', async () => {
 		await delay(LATENCY);
 		return ok([
-			{ id: 'server', kind: 'server', label: 'Server', shell_user: 'tond' },
+			{
+				id: 'server',
+				kind: 'server',
+				label: 'Server',
+				shell_user: 'tond',
+				enabled: mockHostTerminalEnabled(),
+				requires_step_up: true
+			},
 			...apps
 				.filter((app) => app.status === 'running')
 				.slice(0, 4)
@@ -158,7 +201,9 @@ export const handlers = [
 					id: app.id,
 					kind: 'app',
 					label: `App: ${app.name}`,
-					shell_user: null
+					shell_user: null,
+					enabled: true,
+					requires_step_up: false
 				})),
 			...databases
 				.filter((db) => db.status === 'running')
@@ -167,9 +212,55 @@ export const handlers = [
 					id: db.id,
 					kind: 'database',
 					label: `Database: ${db.name}`,
-					shell_user: null
+					shell_user: null,
+					enabled: true,
+					requires_step_up: false
 				}))
 		]);
+	}),
+
+	http.post('/api/terminal/tickets', async ({ request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as {
+			target_kind: string;
+			target_id: string;
+			password?: string;
+			code?: string;
+		};
+		if (body.target_kind === 'server') {
+			if (!mockHostTerminalEnabled()) {
+				return err(
+					'The host terminal is turned off. To turn it on, run `sudo tond settings host-terminal on` on the server.',
+					403
+				);
+			}
+			if (!body.password) {
+				return err('Confirm your password to open the host terminal', 401);
+			}
+			if (body.password !== MOCK_STEP_UP_PASSWORD) {
+				return err('Password is incorrect', 401);
+			}
+		}
+		const ticket = `mock-ticket-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+		terminalTickets.set(ticket, { kind: body.target_kind, id: body.target_id });
+		return HttpResponse.json(
+			{ success: true, data: { ticket, expires_in: 30 }, error: null },
+			{ status: 201 }
+		);
+	}),
+
+	http.get('/api/settings/host-terminal', async () => {
+		await delay(LATENCY);
+		return ok({ enabled: mockHostTerminalEnabled() });
+	}),
+
+	http.put('/api/settings/host-terminal', async ({ request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as { enabled?: boolean };
+		return err(
+			`The host terminal can only be switched on or off on the server itself: run \`sudo tond settings host-terminal ${body.enabled ? 'on' : 'off'}\`.`,
+			403
+		);
 	}),
 
 	http.post('/api/auth/users', async ({ request }) => {
@@ -238,8 +329,12 @@ export const handlers = [
 
 	// ── Phase 7.1 — TOTP 2FA ────────────────────────────────────────────────
 
-	http.post('/api/auth/2fa/setup', async () => {
+	http.post('/api/auth/2fa/setup', async ({ request }) => {
 		await delay(LATENCY);
+		const body = (await request.json()) as { password?: string };
+		if (!body.password || body.password === 'wrong') {
+			return err('Password is incorrect', 401);
+		}
 		const secret = 'JBSWY3DPEHPK3PXP';
 		// Minimal 1×1 white PNG as a stand-in for the real server-generated QR code
 		const qr_code =
@@ -1875,8 +1970,21 @@ export const handlers = [
 
 	terminalStream.addEventListener('connection', ({ client }) => {
 		const url = new URL(client.url);
-		const targetKind = url.searchParams.get('target_kind') ?? 'server';
-		const targetId = url.searchParams.get('target_id') ?? 'server';
+		const ticket = url.searchParams.get('ticket') ?? '';
+		const grant = terminalTickets.get(ticket);
+		terminalTickets.delete(ticket);
+		if (!grant) {
+			client.send(
+				JSON.stringify({
+					type: 'error',
+					message: 'Terminal ticket is invalid, expired or already used'
+				})
+			);
+			client.close();
+			return;
+		}
+		const targetKind = grant.kind;
+		const targetId = grant.id;
 		const label =
 			targetKind === 'server'
 				? 'server'

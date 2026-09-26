@@ -120,7 +120,6 @@ export interface User {
 }
 
 export interface AuthStatus {
-	needs_setup: boolean;
 	authenticated: boolean;
 	user: User | null;
 }
@@ -133,13 +132,29 @@ interface ApiResponse<T> {
 
 const BASE = '/api';
 
+/**
+ * Sent on every API request. The server requires it on cookie-authenticated
+ * mutations: browsers only let a page add a custom header to a cross-origin
+ * request after a CORS preflight, which tond-server never grants, so its
+ * presence proves the request came from the dashboard itself.
+ */
+export const CSRF_HEADER = 'X-Tond-CSRF';
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
+	const headers = new Headers(options?.headers);
+	if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+	headers.set(CSRF_HEADER, '1');
 	const res = await fetch(`${BASE}${path}`, {
-		headers: { 'Content-Type': 'application/json' },
 		credentials: 'same-origin',
-		...options
+		...options,
+		headers
 	});
-	const json: ApiResponse<T> = await res.json();
+	let json: ApiResponse<T>;
+	try {
+		json = await res.json();
+	} catch {
+		throw new Error(`Request failed (HTTP ${res.status})`);
+	}
 	if (!json.success) {
 		throw new Error(json.error || 'Unknown error');
 	}
@@ -285,10 +300,23 @@ export async function getAuthStatus(): Promise<AuthStatus> {
 	return request<AuthStatus>('/auth/status');
 }
 
-export async function setupAdmin(email: string, password: string): Promise<{ user: User }> {
+/** Create the first admin account. `token` is the one-time setup token from the installer. */
+export async function setupAdmin(
+	token: string,
+	email: string,
+	password: string
+): Promise<{ user: User }> {
 	return request<{ user: User }>('/auth/setup', {
 		method: 'POST',
-		body: JSON.stringify({ email, password })
+		body: JSON.stringify({ token, email, password })
+	});
+}
+
+/** Check a setup token before showing the setup form. Throws if it is invalid or used. */
+export async function checkSetupToken(token: string): Promise<{ valid: boolean }> {
+	return request<{ valid: boolean }>('/auth/setup/check', {
+		method: 'POST',
+		body: JSON.stringify({ token })
 	});
 }
 
@@ -365,8 +393,12 @@ export interface TotpSetup {
 	qr_code: string;
 }
 
-export async function setup2FA(): Promise<TotpSetup> {
-	return request<TotpSetup>('/auth/2fa/setup', { method: 'POST' });
+/** Start 2FA enrollment. Requires the current password; refused while 2FA is on. */
+export async function setup2FA(password: string): Promise<TotpSetup> {
+	return request<TotpSetup>('/auth/2fa/setup', {
+		method: 'POST',
+		body: JSON.stringify({ password })
+	});
 }
 
 export async function confirm2FA(
@@ -1256,6 +1288,24 @@ export interface TerminalTarget {
 	kind: TerminalTargetKind;
 	label: string;
 	shell_user: string | null;
+	/** False for the host shell while it is switched off on the server. */
+	enabled: boolean;
+	/** Opening a session needs the password (and 2FA code). */
+	requires_step_up: boolean;
+}
+
+/** Command that switches the host terminal on (only works on the server itself). */
+export const HOST_TERMINAL_ENABLE_COMMAND = 'sudo tond settings host-terminal on';
+
+export interface TerminalStepUp {
+	password: string;
+	/** TOTP or backup code, when 2FA is enabled. */
+	code?: string;
+}
+
+export interface TerminalTicket {
+	ticket: string;
+	expires_in: number;
 }
 
 export interface TerminalSessionCallbacks {
@@ -1375,15 +1425,32 @@ export async function listTerminalTargets(): Promise<TerminalTarget[]> {
 	return request<TerminalTarget[]>('/terminal/targets');
 }
 
-export function openTerminalSession(
+/**
+ * Get a single-use, 30-second ticket for one terminal WebSocket. The host shell
+ * needs step-up credentials (password, plus a 2FA code when enabled).
+ */
+export async function createTerminalTicket(
 	target: Pick<TerminalTarget, 'id' | 'kind'>,
+	stepUp?: TerminalStepUp
+): Promise<TerminalTicket> {
+	return request<TerminalTicket>('/terminal/tickets', {
+		method: 'POST',
+		body: JSON.stringify({
+			target_kind: target.kind,
+			target_id: target.id,
+			password: stepUp?.password,
+			code: stepUp?.code || undefined
+		})
+	});
+}
+
+/** Open a terminal WebSocket with a ticket from `createTerminalTicket`. */
+export function openTerminalSession(
+	ticket: string,
 	callbacks: TerminalSessionCallbacks
 ): TerminalSessionHandle {
 	const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-	const query = new URLSearchParams({
-		target_kind: target.kind,
-		target_id: target.id
-	});
+	const query = new URLSearchParams({ ticket });
 	const ws = new WebSocket(
 		`${protocol}://${window.location.host}${BASE}/terminal/ws?${query.toString()}`
 	);

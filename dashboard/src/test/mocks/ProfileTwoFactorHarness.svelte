@@ -2,15 +2,17 @@
 	import { Button } from '$lib/components/ui/button/index.js';
 
 	interface Props {
-		phase: 'idle' | 'setup' | 'done' | 'disable';
+		phase: 'idle' | 'password' | 'setup' | 'done' | 'disable';
 		enabled: boolean;
 		setup: { qr_code: string; secret: string } | null;
+		setupPassword: string;
 		totpCode: string;
 		disablePassword: string;
 		disableCode: string;
 		backupCodes: string[];
 		saving: boolean;
 		error: string;
+		onStart: () => void;
 		onEnable: () => void;
 		onConfirm: () => void;
 		onCancelSetup: () => void;
@@ -23,12 +25,14 @@
 		phase,
 		enabled,
 		setup,
+		setupPassword = $bindable(''),
 		totpCode = $bindable(''),
 		disablePassword = $bindable(''),
 		disableCode = $bindable(''),
 		backupCodes,
 		saving,
 		error,
+		onStart,
 		onEnable,
 		onConfirm,
 		onCancelSetup,
@@ -43,7 +47,13 @@
 {/if}
 
 {#if phase === 'idle' && !enabled}
-	<Button onclick={onEnable} disabled={saving}>Enable Two-Factor Auth</Button>
+	<Button onclick={onStart} disabled={saving}>Enable Two-Factor Auth</Button>
+{:else if phase === 'password'}
+	<label>
+		Confirm password
+		<input type="password" bind:value={setupPassword} />
+	</label>
+	<Button onclick={onEnable} disabled={saving}>Continue</Button>
 {:else if phase === 'setup' && setup}
 	<img alt="TOTP QR code" src="data:image/png;base64,{setup.qr_code}" />
 	<p>{setup.secret}</p>
