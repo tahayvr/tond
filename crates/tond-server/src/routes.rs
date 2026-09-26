@@ -129,6 +129,11 @@ api_routes! {
     PATCH "/api/v1/apps/{id}/preview-env" => handlers::env::patch_preview_env;
     GET "/api/v1/apps/{id}/preview-env/{key}" => handlers::env::reveal_preview_env_var;
     PUT "/api/v1/apps/{id}/domain" => handlers::update_domain;
+    GET "/api/v1/apps/{id}/domains" => handlers::app_domains::list_domains;
+    POST "/api/v1/apps/{id}/domains" => handlers::app_domains::add_domain;
+    POST "/api/v1/apps/{id}/domains/www-pair" => handlers::app_domains::add_www_pair;
+    PATCH "/api/v1/apps/{id}/domains/{domain}" => handlers::app_domains::update_domain;
+    DELETE "/api/v1/apps/{id}/domains/{domain}" => handlers::app_domains::remove_domain;
     PUT "/api/v1/apps/{id}/health" => handlers::update_health;
     PUT "/api/v1/apps/{id}/port" => handlers::update_port;
     PUT "/api/v1/apps/{id}/readiness" => handlers::update_readiness;
@@ -154,6 +159,13 @@ api_routes! {
     // Certificate management
     GET "/api/v1/certs" => handlers::certificates::list_certs;
     POST "/api/v1/certs/{domain}/retry" => handlers::certificates::retry_cert;
+    POST "/api/v1/certs/custom" => handlers::certificates::upload_cert;
+    DELETE "/api/v1/certs/custom/{domain}" => handlers::certificates::delete_custom_cert;
+    GET "/api/v1/dns-providers" => handlers::dns_providers::list_dns_providers;
+    POST "/api/v1/dns-providers" => handlers::dns_providers::create_dns_provider;
+    PATCH "/api/v1/dns-providers/{id}" => handlers::dns_providers::update_dns_provider;
+    DELETE "/api/v1/dns-providers/{id}" => handlers::dns_providers::delete_dns_provider;
+    POST "/api/v1/dns-providers/{id}/test" => handlers::dns_providers::test_dns_provider;
     // Server settings
     GET "/api/v1/settings" => handlers::settings::get_settings;
     PUT "/api/v1/settings" => handlers::settings::update_settings;

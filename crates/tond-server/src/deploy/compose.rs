@@ -33,6 +33,7 @@ use anyhow::{Context, Result};
 use tond_common::{App, ComposeServiceSpec, DeployPhase, DeploymentService, Readiness};
 
 use crate::compose::{self, Pin};
+use crate::runtime::shutdown;
 use crate::state::AppState;
 use crate::{compose_policy, docker, volumes};
 
@@ -633,7 +634,9 @@ async fn ensure_web_service(
             }
         }
     };
-    if let (Some(domain), Some(service)) = (app.domain.clone(), web) {
+    // Domains that name no service (the address given at creation, or one
+    // added before the services were known) belong to the web service.
+    if let Some(service) = web {
         let port: Option<i64> = sqlx::query_scalar(
             "SELECT published_port FROM compose_services WHERE app_id = ? AND name = ?",
         )
@@ -642,23 +645,9 @@ async fn ensure_web_service(
         .fetch_optional(&state.db)
         .await?
         .flatten();
-        let mut tx = state.db.begin().await?;
-        sqlx::query(
-            "INSERT INTO app_domains (domain, app_id, service, port) VALUES (?, ?, ?, ?)
-             ON CONFLICT(domain) DO NOTHING",
-        )
-        .bind(&domain)
-        .bind(&app.id)
-        .bind(&service)
-        .bind(port)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query("UPDATE apps SET domain = NULL WHERE id = ?")
-            .bind(&app.id)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        app.domain = None;
+        if let Some(port) = port {
+            crate::app_domains::attach_to_service(&state.db, &app.id, &service, port).await?;
+        }
     }
     Ok(())
 }
@@ -698,17 +687,12 @@ async fn assign_service_domain(state: &AppState, app: &App, trigger: &str) -> Re
         .await?;
         return Ok(());
     };
-    if compose::domain_owner(&state.db, &domain).await?.is_some() {
-        return Ok(());
+    if !crate::app_domains::assign_automatic_to_service(&state.db, &app.id, &domain, &service, port)
+        .await?
+    {
+        return Ok(()); // the name is taken by another app
     }
-    sqlx::query("INSERT INTO app_domains (domain, app_id, service, port) VALUES (?, ?, ?, ?)")
-        .bind(&domain)
-        .bind(&app.id)
-        .bind(&service)
-        .bind(port)
-        .execute(&state.db)
-        .await?;
-    compose::queue_certificate(&state.db, &domain).await;
+    shutdown::spawn_tracked(crate::proxy_link::request_certs(Some(domain.clone())));
     log_deploy(
         state,
         &app.id,

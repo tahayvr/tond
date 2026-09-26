@@ -13,6 +13,7 @@
 		daysLeftLabel,
 		expiryTone,
 		hasIssuedCertificate,
+		isUploaded,
 		issuerLabel,
 		targetLabel
 	} from '$lib/certificates';
@@ -32,14 +33,23 @@
 		now,
 		canWrite,
 		retrying,
-		onRetry
+		onRetry,
+		canManageUploads = false,
+		onReplace,
+		onRemoveUpload
 	}: {
 		cert: Certificate;
 		now: number;
 		canWrite: boolean;
 		retrying: boolean;
 		onRetry: (domain: string) => void;
+		/** settings:write — upload, replace and remove uploaded certificates */
+		canManageUploads?: boolean;
+		onReplace?: (domain: string) => void;
+		onRemoveUpload?: (domain: string) => void;
 	} = $props();
+
+	let uploaded = $derived(isUploaded(cert));
 
 	let badge = $derived(certificateBadge(cert, now));
 	let problem = $derived(certificateProblem(cert, now));
@@ -74,6 +84,9 @@
 				{#if cert.issuer_kind !== 'unknown'}
 					<span aria-hidden="true">&nbsp;·&nbsp;</span>{issuerLabel(cert.issuer_kind, cert.issuer)}
 				{/if}
+				{#if cert.challenge === 'dns-01'}
+					<span aria-hidden="true">&nbsp;·&nbsp;</span>DNS-01
+				{/if}
 			</p>
 		</div>
 
@@ -86,7 +99,9 @@
 				<p class={cn('font-medium tabular-nums', TONE_TEXT[tone])}>{daysLeftLabel(days)}</p>
 				<p class="text-xs text-muted-foreground">
 					{new Date(cert.expires_at).toLocaleDateString(undefined, { dateStyle: 'medium' })}
-					{#if cert.last_renewed_at}
+					{#if uploaded}
+						<span aria-hidden="true">&nbsp;·&nbsp;</span>renew manually
+					{:else if cert.last_renewed_at}
 						<span aria-hidden="true">&nbsp;·&nbsp;</span>renewed {formatRelativePast(
 							cert.last_renewed_at,
 							now
@@ -103,7 +118,21 @@
 			{/if}
 		</div>
 
-		<div class="col-span-2 empty:hidden md:col-span-1 md:text-right">
+		<div class="col-span-2 flex flex-wrap gap-1 empty:hidden md:col-span-1 md:justify-end">
+			{#if uploaded && canManageUploads}
+				<Button
+					variant="outline"
+					size="sm"
+					onclick={() => onReplace?.(cert.domain)}
+					aria-label={`Replace the uploaded certificate for ${cert.domain}`}>Replace</Button
+				>
+				<Button
+					variant="ghost"
+					size="sm"
+					onclick={() => onRemoveUpload?.(cert.domain)}
+					aria-label={`Remove the uploaded certificate for ${cert.domain}`}>Remove</Button
+				>
+			{/if}
 			{#if canWrite && canRetry(cert, now)}
 				<Button
 					variant="outline"
@@ -156,6 +185,11 @@
 				{/if}
 			</p>
 		</div>
+	{:else if problem === 'expiring' && uploaded}
+		<p class="rounded-md border border-warn/40 bg-warn/10 p-3 text-sm">
+			Tond doesn't renew uploaded certificates. Upload the renewed certificate from your CA before
+			it expires, or remove this one and Tond requests one from Let's Encrypt.
+		</p>
 	{:else if problem === 'expiring'}
 		<p class="rounded-md border border-warn/40 bg-warn/10 p-3 text-sm">
 			Tond renews certificates 30 days before they expire, so this one should have been renewed

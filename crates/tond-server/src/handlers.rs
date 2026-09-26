@@ -37,6 +37,7 @@
 
 pub mod access_log;
 pub mod alerts;
+pub mod app_domains;
 pub mod app_events;
 pub mod audit_log;
 pub mod audit_shipping;
@@ -50,6 +51,7 @@ pub mod database_ops;
 pub mod databases;
 pub mod deploy_stats;
 pub mod deployments;
+pub mod dns_providers;
 pub mod domains;
 pub mod env;
 pub mod git;
@@ -174,40 +176,21 @@ pub async fn list_apps(
         if !auth.can_see_app(&app.id, app.project_id.as_deref()) {
             return Err(AppError(TondError::AppNotFound(name)));
         }
-        let primary = crate::compose::primary_domains(&state.db).await?;
-        let responses = vec![app_response(app, &primary)];
+        let responses = vec![AppResponse::from(app)];
         return Ok((StatusCode::OK, Json(ApiResponse::ok(responses))));
     }
 
     let apps = sqlx::query_as::<_, App>("SELECT * FROM apps ORDER BY created_at DESC")
         .fetch_all(&state.db)
         .await?;
-    let primary = crate::compose::primary_domains(&state.db).await?;
 
     // Tokens limited to some apps only see those.
     let responses: Vec<AppResponse> = apps
         .into_iter()
         .filter(|a| auth.can_see_app(&a.id, a.project_id.as_deref()))
-        .map(|a| app_response(a, &primary))
+        .map(AppResponse::from)
         .collect();
     Ok((StatusCode::OK, Json(ApiResponse::ok(responses))))
-}
-
-/// The API view of an app. A compose app shows the first domain of its
-/// services (its web service's) as `domain`, for display: its domains are
-/// managed per service.
-fn app_response(
-    app: App,
-    compose_domains: &std::collections::HashMap<String, String>,
-) -> AppResponse {
-    let domain = (app.source_type == "compose")
-        .then(|| compose_domains.get(&app.id).cloned())
-        .flatten();
-    let mut response = AppResponse::from(app);
-    if domain.is_some() {
-        response.domain = domain;
-    }
-    response
 }
 
 // ── Get App ──
@@ -219,8 +202,7 @@ pub async fn get_app(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let app = fetch_app(&state.db, &id).await?;
-    let primary = crate::compose::primary_domains(&state.db).await?;
-    let mut response = app_response(app, &primary);
+    let mut response = AppResponse::from(app);
     response.domain_warning = domain_warning(&state, response.domain.as_deref()).await;
     Ok((StatusCode::OK, Json(ApiResponse::ok(response))))
 }
@@ -386,9 +368,15 @@ pub async fn create_app(
 
     if let Some(domain) = req.domain.filter(|d| !d.trim().is_empty()) {
         let domain = check_app_domain(&state, &domain).await?.0;
-        if let Some((_, owner)) = crate::compose::domain_owner(&state.db, &domain).await? {
+        let taken: Option<String> = sqlx::query_scalar(
+            "SELECT a.name FROM app_domains d JOIN apps a ON a.id = d.app_id WHERE d.domain = ?",
+        )
+        .bind(&domain)
+        .fetch_optional(&state.db)
+        .await?;
+        if let Some(other) = taken {
             return Err(AppError(TondError::InvalidInput(format!(
-                "{domain} is already used by the app '{owner}'"
+                "{domain} is already used by the app '{other}'"
             ))));
         }
         app.domain = Some(domain);
@@ -610,21 +598,10 @@ async fn apply_compose_plan(
         .bind(&service)
         .execute(&state.db)
         .await?;
-    if from_file && let Some(domain) = app.domain.take() {
-        let mut tx = state.db.begin().await?;
-        sqlx::query("INSERT INTO app_domains (domain, app_id, service, port) VALUES (?, ?, ?, ?)")
-            .bind(&domain)
-            .bind(&app.id)
-            .bind(&service)
-            .bind(port as i64)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("UPDATE apps SET domain = NULL WHERE id = ?")
-            .bind(&app.id)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        crate::compose::queue_certificate(&state.db, &domain).await;
+    // The domain given at creation was seeded as the app's primary domain
+    // (apps_domain_seed): it belongs to the web service.
+    if from_file {
+        crate::app_domains::attach_to_service(&state.db, &app.id, &service, port as i64).await?;
     }
     Ok(())
 }
@@ -1028,6 +1005,10 @@ pub async fn app_logs(
 }
 
 // ── Update Domain ──
+//
+// PUT /api/apps/{id}/domain {"domain": "..."}: make a domain the app's
+// primary domain, adding it if needed (the previous primary stays as an
+// alias). The full list lives under /api/apps/{id}/domains (handlers/app_domains.rs).
 
 pub async fn update_domain(
     _rate: RateLimit,
@@ -1042,60 +1023,10 @@ pub async fn update_domain(
             "Compose apps route domains per service: add the domain to a service in the app's Services list".to_string(),
         )));
     }
-    let (domain, warning) = check_app_domain(&state, &req.domain).await?;
-    let req = UpdateDomainRequest { domain };
-
-    let taken: Option<String> = crate::compose::domain_owner(&state.db, &req.domain)
-        .await?
-        .filter(|(owner_id, _)| owner_id != &app.id)
-        .map(|(_, name)| name);
-    if let Some(other) = taken {
-        return Err(AppError(TondError::InvalidInput(format!(
-            "{} is already used by the app '{other}'",
-            req.domain
-        ))));
-    }
-
-    sqlx::query("UPDATE apps SET domain = ?, updated_at = datetime('now') WHERE id = ?")
-        .bind(&req.domain)
-        .bind(&app.id)
-        .execute(&state.db)
-        .await?;
-
-    // Create a pending certificate record for ACME provisioning
-    let data_dir = std::env::var("TOND_DATA_DIR").unwrap_or_else(|_| "/opt/tond/data".to_string());
-    let certs_dir = format!("{}/certs", data_dir);
-    let cert_path = format!("{}/{}/cert.pem", certs_dir, req.domain);
-    let key_path = format!("{}/{}/key.pem", certs_dir, req.domain);
-
-    let cert_id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-    // Placeholder expiry — updated when cert is actually provisioned
-    let expires_at = (chrono::Utc::now() + chrono::Duration::days(90)).to_rfc3339();
-
-    // Insert or update certificate record (best-effort; don't fail the domain update)
-    let _ = sqlx::query(
-		"INSERT INTO certificates (id, domain, cert_type, cert_path, key_path, issued_at, expires_at, status, created_at, updated_at)
-         VALUES (?, ?, 'acme', ?, ?, ?, ?, 'pending', ?, ?)
-         ON CONFLICT(domain) DO UPDATE SET status = 'pending', updated_at = ?,
-            last_error = NULL, next_retry_at = NULL, failure_count = 0",
-	)
-	.bind(&cert_id)
-	.bind(&req.domain)
-	.bind(&cert_path)
-	.bind(&key_path)
-	.bind(&now)
-	.bind(&expires_at)
-	.bind(&now)
-	.bind(&now)
-	.bind(&now)
-	.execute(&state.db)
-	.await;
-
-    tracing::info!(
-        "Domain set to {}, certificate provisioning queued",
-        req.domain
-    );
+    let (_, warning) = check_app_domain(&state, &req.domain).await?;
+    let ctx = crate::app_domains::DomainContext::load(&state).await;
+    let row = crate::app_domains::set_primary(&state.db, &ctx, &app.id, &req.domain).await?;
+    tokio::spawn(crate::proxy_link::request_certs(Some(row.domain.clone())));
 
     write_audit_log(
         &state.db,
@@ -1103,7 +1034,7 @@ pub async fn update_domain(
         Some(&app.name),
         "domain_update",
         &auth.audit_actor(),
-        Some(&format!("domain={}", req.domain)),
+        Some(&format!("domain={}", row.domain)),
     )
     .await;
 
@@ -1111,7 +1042,7 @@ pub async fn update_domain(
         StatusCode::OK,
         Json(ApiResponse::ok(json!({
             "message": "Domain updated, certificate provisioning queued",
-            "domain": req.domain,
+            "domain": row.domain,
             "warning": warning,
         }))),
     ))
@@ -1501,18 +1432,24 @@ pub async fn update_readiness(
         ReadinessChange::Update,
     )?;
     sqlx::query(
-        "UPDATE apps SET readiness = ?, ready_after_secs = ?, domain = ?, health_check_path = ?,
+        "UPDATE apps SET readiness = ?, ready_after_secs = ?, health_check_path = ?,
                 updated_at = datetime('now') WHERE id = ?",
     )
     .bind(&app.readiness)
     .bind(app.ready_after_secs)
-    .bind(&app.domain)
     .bind(&app.health_check_path)
     .bind(&app.id)
     .execute(&state.db)
     .await?;
-    let removed = match (&had_domain, &app.domain) {
-        (Some(d), None) => format!(" domain_removed={d}"),
+    // A background worker serves nothing: all of its domains go
+    // (apps.domain follows through the app_domains triggers).
+    let removed = if app.domain.is_none() {
+        crate::app_domains::clear(&state.db, &app.id).await?
+    } else {
+        Vec::new()
+    };
+    let removed = match (&had_domain, removed.is_empty()) {
+        (Some(_), false) => format!(" domain_removed={}", removed.join(",")),
         _ => String::new(),
     };
     write_audit_log(
@@ -2515,11 +2452,18 @@ mod tests {
     async fn update_readiness_switches_to_a_worker_and_drops_the_domain() {
         let state = test_state().await;
         let app = seed_app(&state, "jobs").await;
-        sqlx::query("UPDATE apps SET domain = 'jobs.example.com' WHERE id = ?")
-            .bind(&app.id)
-            .execute(&state.db)
-            .await
-            .unwrap_or_else(|err| panic!("seed domain: {err}"));
+        for (domain, kind) in [
+            ("jobs.example.com", "primary"),
+            ("jobs2.example.com", "alias"),
+        ] {
+            sqlx::query("INSERT INTO app_domains (domain, app_id, kind) VALUES (?, ?, ?)")
+                .bind(domain)
+                .bind(&app.id)
+                .bind(kind)
+                .execute(&state.db)
+                .await
+                .unwrap_or_else(|err| panic!("seed domain: {err}"));
+        }
         update_readiness(
             RateLimit,
             Authz::unchecked(Principal::test_user(Role::Admin)),
@@ -2539,6 +2483,12 @@ mod tests {
                 .await
                 .unwrap_or_else(|err| panic!("read: {err}"));
         assert_eq!((readiness.as_str(), secs, domain), ("none", 15, None));
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app_domains WHERE app_id = ?")
+            .bind(&app.id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_default();
+        assert_eq!(left, 0, "a worker keeps none of its domains");
     }
 
     #[test]

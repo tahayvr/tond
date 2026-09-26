@@ -742,11 +742,7 @@ pub async fn sync_specs(
         .iter()
         .filter(|n| !specs.iter().any(|s| &s.name == *n))
     {
-        sqlx::query("DELETE FROM app_domains WHERE app_id = ? AND service = ?")
-            .bind(app_id)
-            .bind(gone)
-            .execute(&mut *tx)
-            .await?;
+        crate::app_domains::remove_service(&mut tx, app_id, gone).await?;
         sqlx::query("DELETE FROM compose_services WHERE app_id = ? AND name = ?")
             .bind(app_id)
             .bind(gone)
@@ -820,62 +816,6 @@ pub async fn refresh(state: &crate::state::AppState, app_id: &str, app_name: &st
     Ok(())
 }
 
-/// Name of the app that uses `domain` (its own domain or a service domain).
-pub async fn domain_owner(
-    db: &sqlx::SqlitePool,
-    domain: &str,
-) -> sqlx::Result<Option<(String, String)>> {
-    sqlx::query_as(
-        "SELECT id, name FROM apps WHERE domain = ?
-         UNION ALL
-         SELECT a.id, a.name FROM app_domains d JOIN apps a ON a.id = d.app_id WHERE d.domain = ?
-         LIMIT 1",
-    )
-    .bind(domain)
-    .bind(domain)
-    .fetch_optional(db)
-    .await
-}
-
-/// Create (or reset) the pending certificate row of a newly routed domain;
-/// tond-proxy issues it (see the Certificates page for its status).
-pub async fn queue_certificate(db: &sqlx::SqlitePool, domain: &str) {
-    let data_dir = crate::volumes::data_dir();
-    let certs_dir = data_dir.join("certs").join(domain);
-    let now = chrono::Utc::now().to_rfc3339();
-    let expires_at = (chrono::Utc::now() + chrono::Duration::days(90)).to_rfc3339();
-    let _ = sqlx::query(
-        "INSERT INTO certificates (id, domain, cert_type, cert_path, key_path, issued_at, expires_at, status, created_at, updated_at)
-         VALUES (?, ?, 'acme', ?, ?, ?, ?, 'pending', ?, ?)
-         ON CONFLICT(domain) DO UPDATE SET status = 'pending', updated_at = excluded.updated_at,
-            last_error = NULL, next_retry_at = NULL, failure_count = 0",
-    )
-    .bind(uuid::Uuid::new_v4().to_string())
-    .bind(domain)
-    .bind(certs_dir.join("cert.pem").to_string_lossy().into_owned())
-    .bind(certs_dir.join("key.pem").to_string_lossy().into_owned())
-    .bind(&now)
-    .bind(&expires_at)
-    .bind(&now)
-    .bind(&now)
-    .execute(db)
-    .await;
-}
-
-/// The first domain of each compose app (its first service with a domain,
-/// in file order): `app id -> domain`.
-pub async fn primary_domains(db: &sqlx::SqlitePool) -> sqlx::Result<HashMap<String, String>> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT d.app_id, d.domain FROM app_domains d
-         JOIN compose_services s ON s.app_id = d.app_id AND s.name = d.service
-         ORDER BY s.position DESC, d.created_at DESC, d.domain DESC",
-    )
-    .fetch_all(db)
-    .await?;
-    // Later rows overwrite earlier ones: the first in order wins.
-    Ok(rows.into_iter().collect())
-}
-
 /// Domains routed to each service of an app.
 pub async fn domains_by_service(
     db: &sqlx::SqlitePool,
@@ -883,7 +823,8 @@ pub async fn domains_by_service(
 ) -> sqlx::Result<HashMap<String, Vec<String>>> {
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT service, domain FROM app_domains
-         WHERE app_id = ? AND service IS NOT NULL ORDER BY created_at, domain",
+         WHERE app_id = ? AND service IS NOT NULL AND kind != 'redirect'
+         ORDER BY CASE kind WHEN 'primary' THEN 0 ELSE 1 END, created_at, domain",
     )
     .bind(app_id)
     .fetch_all(db)

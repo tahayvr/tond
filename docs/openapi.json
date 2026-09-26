@@ -396,6 +396,65 @@
         ],
         "type": "object"
       },
+      "AddAppDomainRequest": {
+        "description": "POST /api/apps/{id}/domains",
+        "properties": {
+          "domain": {
+            "type": "string"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DomainKind"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "\"primary\" | \"alias\" (default; primary when the app has none) | \"redirect\""
+          },
+          "port": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "redirect_code": {
+            "default": null,
+            "description": "301 or 308 (default 308).",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "redirect_to": {
+            "default": null,
+            "description": "Required for redirects: another domain of this app.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "service": {
+            "default": null,
+            "description": "Compose apps: the service this domain routes to.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "domain"
+        ],
+        "type": "object"
+      },
       "AdminUserResponse": {
         "description": "A user as the admin Users page shows it.",
         "properties": {
@@ -979,6 +1038,68 @@
           "via",
           "internal_host",
           "internal_port"
+        ],
+        "type": "object"
+      },
+      "AppDomainResponse": {
+        "description": "One domain of an app, as the API returns it.",
+        "properties": {
+          "automatic": {
+            "description": "The domain is under the apps domain (the automatic address).",
+            "type": "boolean"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "domain": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/DomainKind"
+          },
+          "port": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "redirect_code": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "redirect_to": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "service": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "warning": {
+            "description": "Set when the domain is on the same site as the dashboard.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "domain",
+          "kind",
+          "redirect_to",
+          "redirect_code",
+          "service",
+          "port",
+          "created_at",
+          "automatic",
+          "warning"
         ],
         "type": "object"
       },
@@ -1783,6 +1904,21 @@
         ],
         "type": "object"
       },
+      "CanonicalHost": {
+        "description": "Which of the two names a www/apex pair serves.",
+        "oneOf": [
+          {
+            "const": "apex",
+            "description": "example.com serves, www.example.com redirects to it.",
+            "type": "string"
+          },
+          {
+            "const": "www",
+            "description": "www.example.com serves, example.com redirects to it.",
+            "type": "string"
+          }
+        ]
+      },
       "Cause": {
         "description": "Why a probe failed.",
         "enum": [
@@ -1800,6 +1936,13 @@
         "properties": {
           "cert_type": {
             "type": "string"
+          },
+          "challenge": {
+            "description": "\"http-01\" | \"dns-01\" for ACME certificates.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "domain": {
             "type": "string"
@@ -1872,6 +2015,7 @@
           "issuer",
           "issuer_kind",
           "last_renewed_at",
+          "challenge",
           "serves"
         ],
         "type": "object"
@@ -1879,6 +2023,21 @@
       "CertificateSummary": {
         "description": "The certificate fields the domain card shows.",
         "properties": {
+          "cert_type": {
+            "description": "\"acme\" | \"custom\"",
+            "type": "string"
+          },
+          "challenge": {
+            "description": "\"http-01\" | \"dns-01\"",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "domain": {
+            "description": "The certificate's own domain (`*.apps.example.com` for a wildcard).",
+            "type": "string"
+          },
           "expires_at": {
             "type": "string"
           },
@@ -1888,6 +2047,12 @@
           },
           "issued_at": {
             "type": "string"
+          },
+          "issuer": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "last_attempt_at": {
             "type": [
@@ -1912,6 +2077,10 @@
           }
         },
         "required": [
+          "domain",
+          "cert_type",
+          "challenge",
+          "issuer",
           "status",
           "issued_at",
           "expires_at",
@@ -1989,6 +2158,29 @@
               "app_name",
               "preview_id",
               "pr_number"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A wildcard certificate: `purpose` is \"apps\" (the apps domain),\n\"previews\" (the preview domain) or \"custom\" (any other wildcard);\n`hosts` is how many served hosts it covers.",
+            "properties": {
+              "hosts": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "wildcard",
+                "type": "string"
+              },
+              "purpose": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "purpose",
+              "hosts"
             ],
             "type": "object"
           },
@@ -2790,6 +2982,38 @@
         "required": [
           "name",
           "db_type"
+        ],
+        "type": "object"
+      },
+      "CreateDnsProviderRequest": {
+        "description": "POST /api/dns-providers",
+        "properties": {
+          "config": {
+            "$ref": "#/components/schemas/DnsProviderConfig",
+            "default": {}
+          },
+          "kind": {
+            "$ref": "#/components/schemas/DnsProviderKind"
+          },
+          "name": {
+            "type": "string"
+          },
+          "token": {
+            "description": "API token (Route 53: the secret access key).",
+            "type": "string"
+          },
+          "zones": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "kind",
+          "zones",
+          "token"
         ],
         "type": "object"
       },
@@ -5003,6 +5227,123 @@
         ],
         "type": "object"
       },
+      "DnsProviderConfig": {
+        "description": "Non-secret provider settings.",
+        "properties": {
+          "access_key_id": {
+            "description": "Route 53: the IAM access key id (the secret key is the token).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "url": {
+            "description": "challtestsrv: management API URL (default http://127.0.0.1:8055).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "DnsProviderKind": {
+        "description": "A DNS hosting API Tond can publish `_acme-challenge` TXT records with.",
+        "oneOf": [
+          {
+            "enum": [
+              "cloudflare",
+              "hetzner",
+              "digitalocean",
+              "route53"
+            ],
+            "type": "string"
+          },
+          {
+            "const": "challtestsrv",
+            "description": "Test only: Pebble's challtestsrv management API. Refused unless\ntond-server runs with TOND_DNS_TEST_PROVIDER=1 (the installer never\nsets it) or is a debug build.",
+            "type": "string"
+          }
+        ]
+      },
+      "DnsProviderResponse": {
+        "description": "A provider as the API returns it: never the token.",
+        "properties": {
+          "config": {
+            "$ref": "#/components/schemas/DnsProviderConfig"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/DnsProviderKind"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_used_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "token_set": {
+            "description": "A token is stored (always true; it is required).",
+            "type": "boolean"
+          },
+          "updated_at": {
+            "type": "string"
+          },
+          "zones": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "kind",
+          "zones",
+          "config",
+          "token_set",
+          "created_at",
+          "updated_at",
+          "last_used_at",
+          "last_error"
+        ],
+        "type": "object"
+      },
+      "DnsProviderTestResult": {
+        "description": "Result of POST /api/dns-providers/{id}/test.",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "zones": {
+            "description": "One line per zone: found, or why not.",
+            "items": {
+              "$ref": "#/components/schemas/DnsZoneCheck"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "ok",
+          "zones"
+        ],
+        "type": "object"
+      },
       "DnsRecord": {
         "description": "A DNS record to create.",
         "properties": {
@@ -5094,6 +5435,25 @@
           "resolved",
           "expected",
           "stray",
+          "message"
+        ],
+        "type": "object"
+      },
+      "DnsZoneCheck": {
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "zone": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "zone",
+          "ok",
           "message"
         ],
         "type": "object"
@@ -5232,8 +5592,22 @@
           "checked_at": {
             "type": "string"
           },
+          "covered_by": {
+            "description": "Set when a wildcard certificate serves the domain (its name).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "dns": {
             "$ref": "#/components/schemas/DnsStatus"
+          },
+          "dns_provider": {
+            "description": "Name of the DNS provider that validates this domain with DNS-01.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "domain": {
             "type": "string"
@@ -5288,10 +5662,21 @@
           "server_ips",
           "dns",
           "certificate",
+          "covered_by",
+          "dns_provider",
           "checked_at",
           "warning"
         ],
         "type": "object"
+      },
+      "DomainKind": {
+        "description": "What a domain does for its app.",
+        "enum": [
+          "primary",
+          "alias",
+          "redirect"
+        ],
+        "type": "string"
       },
       "DomainStatusResponse": {
         "properties": {
@@ -6619,6 +7004,11 @@
           {
             "const": "custom",
             "description": "Any other CA (a custom `TOND_ACME_DIRECTORY`, e.g. a private ACME CA).",
+            "type": "string"
+          },
+          {
+            "const": "uploaded",
+            "description": "Uploaded by an admin (cert_type 'custom'): Tond does not renew it.",
             "type": "string"
           },
           {
@@ -10440,6 +10830,40 @@
         },
         "type": "object"
       },
+      "UpdateAppDomainRequest": {
+        "description": "PATCH /api/apps/{id}/domains/{domain}",
+        "properties": {
+          "kind": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DomainKind"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "redirect_code": {
+            "default": null,
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "redirect_to": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "UpdateAppResourcesRequest": {
         "description": "PATCH /api/v1/apps/{id}/resources — update memory and CPU limits",
         "properties": {
@@ -10911,6 +11335,47 @@
         },
         "type": "object"
       },
+      "UpdateDnsProviderRequest": {
+        "description": "PATCH /api/dns-providers/{id}: omitted fields are unchanged; `token` is\nreplaced only when sent (it is never returned).",
+        "properties": {
+          "config": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DnsProviderConfig"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "name": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "token": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "zones": {
+            "default": null,
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "UpdateDomainRequest": {
         "properties": {
           "domain": {
@@ -11295,6 +11760,29 @@
         },
         "required": [
           "version"
+        ],
+        "type": "object"
+      },
+      "UploadCertificateRequest": {
+        "description": "POST /api/certs/custom",
+        "properties": {
+          "cert_pem": {
+            "description": "PEM: the leaf certificate first, then its intermediates.",
+            "type": "string"
+          },
+          "domain": {
+            "description": "The domain the certificate serves (may be a wildcard `*.example.com`).",
+            "type": "string"
+          },
+          "key_pem": {
+            "description": "PEM private key of the leaf.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "domain",
+          "cert_pem",
+          "key_pem"
         ],
         "type": "object"
       },
@@ -11810,6 +12298,31 @@
           "scopes",
           "app_ids",
           "project_ids"
+        ],
+        "type": "object"
+      },
+      "WwwPairRequest": {
+        "description": "POST /api/apps/{id}/domains/www-pair: add `example.com` and\n`www.example.com` in one go, one redirecting to the other.",
+        "properties": {
+          "canonical": {
+            "$ref": "#/components/schemas/CanonicalHost"
+          },
+          "domain": {
+            "description": "Either name of the pair (with or without `www.`).",
+            "type": "string"
+          },
+          "primary": {
+            "default": null,
+            "description": "Make the canonical name the app's primary domain (default true).",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "domain",
+          "canonical"
         ],
         "type": "object"
       }
@@ -14671,7 +15184,7 @@
     },
     "/api/v1/apps/{id}/domain": {
       "put": {
-        "operationId": "update_domain",
+        "operationId": "handlers_update_domain",
         "parameters": [
           {
             "description": "App id or name.",
@@ -14703,7 +15216,7 @@
                 "schema": {
                   "properties": {
                     "data": {
-                      "description": "`{message, warning?}`; certificate provisioning is queued."
+                      "description": "`{message, domain, warning?}`; the domain is added if needed, the previous primary stays as an alias, and certificate provisioning is queued."
                     },
                     "message": {
                       "description": "Informational note, when there is one.",
@@ -14757,7 +15270,489 @@
             "sessionCookie": []
           }
         ],
-        "summary": "Set an app's custom domain",
+        "summary": "Make a domain the app's primary domain",
+        "tags": [
+          "Apps"
+        ],
+        "x-tond-scopes": [
+          "apps:write"
+        ]
+      }
+    },
+    "/api/v1/apps/{id}/domains": {
+      "get": {
+        "operationId": "list_domains",
+        "parameters": [
+          {
+            "description": "App id or name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "items": {
+                        "$ref": "#/components/schemas/AppDomainResponse"
+                      },
+                      "type": "array"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "List an app's domains (primary, aliases, redirects)",
+        "tags": [
+          "Apps"
+        ],
+        "x-tond-scopes": [
+          "apps:read"
+        ]
+      },
+      "post": {
+        "operationId": "add_domain",
+        "parameters": [
+          {
+            "description": "App id or name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddAppDomainRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "items": {
+                        "$ref": "#/components/schemas/AppDomainResponse"
+                      },
+                      "type": "array"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Created."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Add a domain to an app",
+        "tags": [
+          "Apps"
+        ],
+        "x-tond-scopes": [
+          "apps:write"
+        ]
+      }
+    },
+    "/api/v1/apps/{id}/domains/www-pair": {
+      "post": {
+        "operationId": "add_www_pair",
+        "parameters": [
+          {
+            "description": "App id or name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WwwPairRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "items": {
+                        "$ref": "#/components/schemas/AppDomainResponse"
+                      },
+                      "type": "array"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Created."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Add a www/apex pair, one redirecting to the other",
+        "tags": [
+          "Apps"
+        ],
+        "x-tond-scopes": [
+          "apps:write"
+        ]
+      }
+    },
+    "/api/v1/apps/{id}/domains/{domain}": {
+      "delete": {
+        "operationId": "remove_domain",
+        "parameters": [
+          {
+            "description": "App id or name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "items": {
+                        "$ref": "#/components/schemas/AppDomainResponse"
+                      },
+                      "type": "array"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Remove a domain from an app",
+        "tags": [
+          "Apps"
+        ],
+        "x-tond-scopes": [
+          "apps:write"
+        ]
+      },
+      "patch": {
+        "operationId": "app_domains_update_domain",
+        "parameters": [
+          {
+            "description": "App id or name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateAppDomainRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "items": {
+                        "$ref": "#/components/schemas/AppDomainResponse"
+                      },
+                      "type": "array"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Change a domain's kind, redirect target or code",
         "tags": [
           "Apps"
         ],
@@ -20202,6 +21197,184 @@
         ]
       }
     },
+    "/api/v1/certs/custom": {
+      "post": {
+        "operationId": "upload_cert",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UploadCertificateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/CertificateResponse"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Created."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Upload a certificate for a domain",
+        "tags": [
+          "Certificates"
+        ],
+        "x-tond-scopes": [
+          "settings:write"
+        ]
+      }
+    },
+    "/api/v1/certs/custom/{domain}": {
+      "delete": {
+        "operationId": "delete_custom_cert",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "description": "`{\"deleted\": \"<domain>\"}`"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Remove an uploaded certificate",
+        "tags": [
+          "Certificates"
+        ],
+        "x-tond-scopes": [
+          "settings:write"
+        ]
+      }
+    },
     "/api/v1/certs/{domain}/retry": {
       "post": {
         "operationId": "retry_cert",
@@ -23424,6 +24597,418 @@
         ],
         "x-tond-scopes": [
           "db:write"
+        ]
+      }
+    },
+    "/api/v1/dns-providers": {
+      "get": {
+        "operationId": "list_dns_providers",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "items": {
+                        "$ref": "#/components/schemas/DnsProviderResponse"
+                      },
+                      "type": "array"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "List DNS providers (ACME DNS-01)",
+        "tags": [
+          "Meta"
+        ],
+        "x-tond-scopes": [
+          "apps:read"
+        ]
+      },
+      "post": {
+        "operationId": "create_dns_provider",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateDnsProviderRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/DnsProviderResponse"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Created."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Add a DNS provider",
+        "tags": [
+          "Meta"
+        ],
+        "x-tond-scopes": [
+          "settings:write"
+        ]
+      }
+    },
+    "/api/v1/dns-providers/{id}": {
+      "delete": {
+        "operationId": "delete_dns_provider",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "description": "`{\"deleted\": \"<id>\"}`"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Delete a DNS provider",
+        "tags": [
+          "Meta"
+        ],
+        "x-tond-scopes": [
+          "settings:write"
+        ]
+      },
+      "patch": {
+        "operationId": "update_dns_provider",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateDnsProviderRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/DnsProviderResponse"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Update a DNS provider",
+        "tags": [
+          "Meta"
+        ],
+        "x-tond-scopes": [
+          "settings:write"
+        ]
+      }
+    },
+    "/api/v1/dns-providers/{id}/test": {
+      "post": {
+        "operationId": "test_dns_provider",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/DnsProviderTestResult"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Check a DNS provider can manage its zones",
+        "tags": [
+          "Meta"
+        ],
+        "x-tond-scopes": [
+          "settings:write"
         ]
       }
     },

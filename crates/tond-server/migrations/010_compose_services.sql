@@ -2,7 +2,8 @@
 --
 -- compose_services: one row per service of a compose app, synced from the
 -- compose file on save and on every deploy. User intent (the container port
--- Tond publishes for routing) survives redeploys; what Docker reports
+-- Tond publishes for routing; its domains are app_domains rows with this
+-- service set, see 030_domains.sql) survives redeploys; what Docker reports
 -- (container, state, health) is refreshed on deploy, on service actions and
 -- when the dashboard lists the services.
 CREATE TABLE compose_services(
@@ -41,19 +42,6 @@ CREATE TABLE compose_services(
   PRIMARY KEY(app_id, name)
 ) WITHOUT ROWID;
 
--- Domains routed by tond-proxy. Generic on purpose: a row maps a domain to
--- an app, and for compose apps to one of its services and the container port
--- Tond publishes for it. `service` is NULL for single-container apps (the
--- app's own domain and port).
-CREATE TABLE app_domains(
-  domain TEXT PRIMARY KEY NOT NULL,
-  app_id TEXT NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
-  service TEXT,
-  port INTEGER,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE INDEX app_domains_app_idx ON app_domains(app_id, service);
-
 -- What a compose deployment ran, per service: the image it was built or
 -- pulled as and the pinned local tag (tond-<app>/<service>:<deployment>) with
 -- its image id, so a rollback restores exactly that set.
@@ -81,18 +69,6 @@ ALTER TABLE deployments ADD COLUMN compose_source TEXT;
 -- Git-sourced compose apps: path of the compose file inside the repository.
 ALTER TABLE apps ADD COLUMN compose_path TEXT;
 
-CREATE TRIGGER route_app_domains_insert AFTER INSERT ON app_domains
-BEGIN
-  UPDATE route_state SET version = version + 1 WHERE id = 1;
-END;
-CREATE TRIGGER route_app_domains_delete AFTER DELETE ON app_domains
-BEGIN
-  UPDATE route_state SET version = version + 1 WHERE id = 1;
-END;
-CREATE TRIGGER route_app_domains_update AFTER UPDATE ON app_domains
-BEGIN
-  UPDATE route_state SET version = version + 1 WHERE id = 1;
-END;
 CREATE TRIGGER route_compose_services_delete AFTER DELETE ON compose_services
 BEGIN
   UPDATE route_state SET version = version + 1 WHERE id = 1;

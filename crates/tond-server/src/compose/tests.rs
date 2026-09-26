@@ -279,8 +279,9 @@ async fn syncing_keeps_user_choices_and_drops_services_that_left_the_file() {
     .await
     .unwrap_or_else(|e| panic!("{e}"));
     sqlx::query(
-        "INSERT INTO app_domains (domain, app_id, service, port) VALUES
-         ('shop.example.com', 'a1', 'web', 80), ('cache.example.com', 'a1', 'cache', 6379)",
+        "INSERT INTO app_domains (domain, app_id, service, port, kind) VALUES
+         ('shop.example.com', 'a1', 'web', 80, 'primary'),
+         ('cache.example.com', 'a1', 'cache', 6379, 'alias')",
     )
     .execute(&db)
     .await
@@ -308,10 +309,14 @@ async fn syncing_keeps_user_choices_and_drops_services_that_left_the_file() {
         !domains.contains_key("cache"),
         "domains of a removed service go too"
     );
-    let primary = primary_domains(&db).await.unwrap_or_else(|e| panic!("{e}"));
+    let primary: Option<String> = sqlx::query_scalar("SELECT domain FROM apps WHERE id = 'a1'")
+        .fetch_one(&db)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(
-        primary.get("a1").map(String::as_str),
-        Some("shop.example.com")
+        primary.as_deref(),
+        Some("shop.example.com"),
+        "apps.domain mirrors the primary domain, whichever service it is on"
     );
 
     // Docker reports web running and api missing.

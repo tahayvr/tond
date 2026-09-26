@@ -80,7 +80,22 @@ async fn creating_a_compose_app_publishes_the_web_service_with_its_domain() {
     let app = fetch_app(&state.db, "shop")
         .await
         .unwrap_or_else(|e| panic!("{}", e.0));
-    assert_eq!(app.domain, None, "the domain moved to the web service");
+    assert_eq!(
+        app.domain.as_deref(),
+        Some("shop.example.com"),
+        "apps.domain mirrors the primary domain"
+    );
+    let row: (Option<String>, Option<i64>, String) = sqlx::query_as(
+        "SELECT service, port, kind FROM app_domains WHERE domain = 'shop.example.com'",
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        row,
+        (Some("web".into()), Some(80), "primary".into()),
+        "the seeded primary row belongs to the web service"
+    );
     let services = services_response(&state, &app, true)
         .await
         .unwrap_or_else(|e| panic!("{}", e.0));

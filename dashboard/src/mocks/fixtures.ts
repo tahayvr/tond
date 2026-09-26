@@ -12,8 +12,10 @@ import type {
 	AlertRule,
 	AlertSettings,
 	AuditLogEntry,
+	AppDomain,
 	BackupConfig,
 	Certificate,
+	DnsProvider,
 	RetentionSettings,
 	AuditShipping,
 	AppEvent,
@@ -860,6 +862,7 @@ export const MOCK_CERTIFICATES: Certificate[] = [
 		issuer: "Let's Encrypt R11",
 		issuer_kind: 'letsencrypt',
 		last_renewed_at: daysFromNow(-24),
+		challenge: 'http-01',
 		serves: { kind: 'app', app_id: 'app_running', app_name: 'api-service' }
 	},
 	{
@@ -877,6 +880,7 @@ export const MOCK_CERTIFICATES: Certificate[] = [
 		issuer: null,
 		issuer_kind: 'unknown',
 		last_renewed_at: null,
+		challenge: 'http-01',
 		serves: { kind: 'app', app_id: 'app_stopped', app_name: 'web-frontend' }
 	},
 	{
@@ -894,6 +898,7 @@ export const MOCK_CERTIFICATES: Certificate[] = [
 		issuer: null,
 		issuer_kind: 'unknown',
 		last_renewed_at: null,
+		challenge: 'http-01',
 		serves: { kind: 'dashboard' }
 	},
 	{
@@ -911,6 +916,7 @@ export const MOCK_CERTIFICATES: Certificate[] = [
 		issuer: "Let's Encrypt R10",
 		issuer_kind: 'letsencrypt',
 		last_renewed_at: daysFromNow(-80),
+		challenge: 'http-01',
 		serves: { kind: 'app', app_id: 'app_running', app_name: 'api-service' }
 	},
 	{
@@ -927,6 +933,7 @@ export const MOCK_CERTIFICATES: Certificate[] = [
 		issuer: "(STAGING) Let's Encrypt (STAGING) Riddling Rhubarb R12",
 		issuer_kind: 'letsencrypt_staging',
 		last_renewed_at: daysFromNow(-2),
+		challenge: 'http-01',
 		serves: {
 			kind: 'preview',
 			app_id: 'app_running',
@@ -949,7 +956,93 @@ export const MOCK_CERTIFICATES: Certificate[] = [
 		issuer: "Let's Encrypt R11",
 		issuer_kind: 'letsencrypt',
 		last_renewed_at: daysFromNow(-50),
+		challenge: 'http-01',
 		serves: { kind: 'unused' }
+	},
+	{
+		id: 'cert-007',
+		domain: '*.example-apps.com',
+		cert_type: 'acme',
+		status: 'active',
+		issued_at: daysFromNow(-12),
+		expires_at: daysFromNow(78),
+		last_error: null,
+		last_attempt_at: daysFromNow(-12),
+		next_retry_at: null,
+		failure_count: 0,
+		issuer: "Let's Encrypt R11",
+		issuer_kind: 'letsencrypt',
+		last_renewed_at: daysFromNow(-12),
+		challenge: 'dns-01',
+		serves: { kind: 'wildcard', purpose: 'apps', hosts: 2 }
+	},
+	{
+		id: 'cert-008',
+		domain: 'intranet.example.org',
+		cert_type: 'custom',
+		status: 'active',
+		issued_at: daysFromNow(-340),
+		expires_at: daysFromNow(25),
+		last_error: null,
+		last_attempt_at: daysFromNow(-5),
+		next_retry_at: null,
+		failure_count: 0,
+		issuer: 'Example Corp Issuing CA',
+		issuer_kind: 'uploaded',
+		last_renewed_at: daysFromNow(-5),
+		challenge: null,
+		serves: { kind: 'app', app_id: 'app_unhealthy', app_name: 'postgres-proxy' }
+	}
+];
+
+// ── App domains ──────────────────────────────────────────────────────────────
+
+const domainRow = (
+	domain: string,
+	kind: AppDomain['kind'],
+	extra: Partial<AppDomain> = {}
+): AppDomain => ({
+	domain,
+	kind,
+	redirect_to: null,
+	redirect_code: 308,
+	service: null,
+	port: null,
+	created_at: daysFromNow(-30),
+	automatic: domain.endsWith('.example-apps.com'),
+	warning: null,
+	...extra
+});
+
+/** Domains per app id; the primary mirrors `App.domain`. */
+export const MOCK_APP_DOMAINS: Record<string, AppDomain[]> = {
+	app_running: [
+		domainRow('api.example.com', 'primary'),
+		domainRow('shop.example.com', 'alias'),
+		domainRow('api-service.example-apps.com', 'alias'),
+		domainRow('www.api.example.com', 'redirect', { redirect_to: 'api.example.com' })
+	],
+	app_stopped: [domainRow('app.example.com', 'primary')],
+	app_unhealthy: [
+		domainRow('db.example.com', 'primary'),
+		domainRow('intranet.example.org', 'alias')
+	]
+};
+
+// ── DNS providers ───────────────────────────────────────────────────────────
+
+export const MOCK_DNS_PROVIDERS: DnsProvider[] = [
+	{
+		id: 'dns_cf',
+		name: 'Cloudflare',
+		kind: 'cloudflare',
+		zones: ['example-apps.com'],
+		config: {},
+		token_set: true,
+		created_at: daysFromNow(-12),
+		updated_at: daysFromNow(-12),
+		last_used_at: daysFromNow(-12),
+		last_error: null
 	}
 ];
 

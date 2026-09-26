@@ -666,6 +666,19 @@ async fn event_style_rules_follow_their_tables() {
     .execute(db)
     .await
     .unwrap_or_else(|e| panic!("{e}"));
+    // Uploaded certificates are never renewed: their expiry alerts matter most.
+    sqlx::query(
+        "INSERT INTO certificates (id, domain, cert_type, cert_path, key_path, issued_at, expires_at, status)
+         VALUES ('c3', 'upload.example.com', 'custom', 'c', 'k', 'x', ?, 'active')",
+    )
+    .bind(
+        chrono::DateTime::from_timestamp(T0 + 3 * 86_400, 0)
+            .map(|t| t.to_rfc3339())
+            .unwrap_or_default(),
+    )
+    .execute(db)
+    .await
+    .unwrap_or_else(|e| panic!("{e}"));
     exec(db, "INSERT INTO cron_jobs (id, name, schedule, image, last_run_status) VALUES ('j1', 'nightly', '* * * * *', 'alpine', 'failed')").await;
 
     let r = eval(&state, T0, &none).await;
@@ -678,6 +691,7 @@ async fn event_style_rules_follow_their_tables() {
     let expected: Vec<(String, String)> = [
         ("backup", "backup"),
         ("cert", "cert:soon.example.com"),
+        ("cert", "cert:upload.example.com"),
         ("cron", "cron:j1"),
         ("deploy", "app:a1"),
         ("down", "app:a2"),
@@ -688,7 +702,7 @@ async fn event_style_rules_follow_their_tables() {
     .map(|(a, b)| (a.to_string(), b.to_string()))
     .collect();
     assert_eq!(firing, expected);
-    assert_eq!(r.fired, 7);
+    assert_eq!(r.fired, 8);
 
     // Recovery: a successful deploy, backup and cron run; events age out.
     exec(db, "INSERT INTO deployments (id, app_id, status, started_at, created_at) VALUES ('d5', 'a1', 'succeeded', '2026-01-03T00:00:00Z', '2026-01-03T00:00:00Z')").await;
@@ -701,7 +715,7 @@ async fn event_style_rules_follow_their_tables() {
         .fetch_all(db)
         .await
         .unwrap_or_else(|e| panic!("{e}"));
-    assert_eq!(left, vec!["cert"]);
+    assert_eq!(left, vec!["cert", "cert"]);
 }
 
 #[tokio::test]

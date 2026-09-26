@@ -161,36 +161,25 @@ pub async fn update_service(
             format!("Publish a container port of service '{service}' before routing domains to it"),
         ));
     }
-    let mut domains: Vec<String> = Vec::new();
+    // Same-site warnings (the domain rules themselves are app_domains.rs').
     let mut warnings: Vec<String> = Vec::new();
     for d in &req.domains {
-        let (domain, warning) = check_app_domain(&state, d).await?;
-        if domains.contains(&domain) {
-            continue;
-        }
-        if let Some((owner_id, owner)) = compose::domain_owner(&state.db, &domain).await? {
-            let own_service: Option<String> = sqlx::query_scalar(
-                "SELECT service FROM app_domains WHERE domain = ? AND app_id = ?",
-            )
-            .bind(&domain)
-            .bind(&app.id)
-            .fetch_optional(&state.db)
-            .await?
-            .flatten();
-            if owner_id != app.id || own_service.is_none() {
-                return Err(invalid_field(
-                    "domains",
-                    format!("{domain} is already used by the app '{owner}'"),
-                ));
-            }
-        }
+        let (_, warning) = check_app_domain(&state, d).await?;
         warnings.extend(warning);
-        domains.push(domain);
     }
 
     let published = req.published_port.map(i64::from);
     let port_changed = row.published_port != published;
-    let mut tx = state.db.begin().await?;
+    let ctx = crate::app_domains::DomainContext::load(&state).await;
+    let added = crate::app_domains::set_service_domains(
+        &state.db,
+        &ctx,
+        &app.id,
+        &service,
+        published,
+        &req.domains,
+    )
+    .await?;
     sqlx::query(
         "UPDATE compose_services SET published_port = ?,
            host_port = CASE WHEN ? IS NULL THEN NULL ELSE host_port END,
@@ -201,36 +190,15 @@ pub async fn update_service(
     .bind(published)
     .bind(&app.id)
     .bind(&service)
-    .execute(&mut *tx)
+    .execute(&state.db)
     .await?;
-    let old: Vec<String> =
-        sqlx::query_scalar("SELECT domain FROM app_domains WHERE app_id = ? AND service = ?")
-            .bind(&app.id)
-            .bind(&service)
-            .fetch_all(&mut *tx)
-            .await?;
-    for gone in old.iter().filter(|d| !domains.contains(d)) {
-        sqlx::query("DELETE FROM app_domains WHERE domain = ?")
-            .bind(gone)
-            .execute(&mut *tx)
-            .await?;
+    for domain in added {
+        tokio::spawn(proxy_link::request_certs(Some(domain)));
     }
-    for domain in &domains {
-        sqlx::query(
-            "INSERT INTO app_domains (domain, app_id, service, port) VALUES (?, ?, ?, ?)
-             ON CONFLICT(domain) DO UPDATE SET port = excluded.port",
-        )
-        .bind(domain)
-        .bind(&app.id)
-        .bind(&service)
-        .bind(published)
-        .execute(&mut *tx)
-        .await?;
-    }
-    tx.commit().await?;
-    for domain in domains.iter().filter(|d| !old.contains(d)) {
-        compose::queue_certificate(&state.db, domain).await;
-    }
+    let domains = compose::domains_by_service(&state.db, &app.id)
+        .await?
+        .remove(&service)
+        .unwrap_or_default();
     // Routes changed (triggers bumped route_state): have the proxy reload.
     let _ = proxy_link::sync_routes(&state).await;
 
