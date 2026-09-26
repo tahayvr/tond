@@ -59,7 +59,8 @@ import {
 	makeMockRequestMetrics,
 	makeMockTrafficOverview,
 	makeMockAccessLog,
-	MOCK_DATABASE_SECRETS
+	MOCK_DATABASE_SECRETS,
+	MOCK_DB_CATALOG
 } from './fixtures';
 import type {
 	UpdateAuditShipping,
@@ -93,7 +94,12 @@ import type {
 	Snapshot,
 	StorageProvider,
 	EnvVarEntry,
-	DatabaseCredentials
+	DatabaseCredentials,
+	DatabaseBackupStatus,
+	DatabaseExtension,
+	DbUpgradeState,
+	GiteaToken,
+	GitLabToken
 } from '$lib/api';
 import {
 	MOCK_ACTIVE_ALERTS,
@@ -229,9 +235,47 @@ function mockComposeProblems(content: string): string[] {
 function mockPublicUrl(db: ManagedDatabase, password: string | null): string | null {
 	if (!db.public_access || !db.host_port) return null;
 	const isRedisLike = db.db_type === 'redis' || db.db_type === 'keydb';
-	return isRedisLike
+	const url = isRedisLike
 		? `redis://${db.db_user}:${password}@tond.example.com:${db.host_port}`
 		: `${db.db_type}://${db.db_user}:${password}@tond.example.com:${db.host_port}/${db.db_name}`;
+	if (!db.tls) return url;
+	if (db.db_type === 'postgres') return `${url}?sslmode=require`;
+	if (db.db_type === 'mysql' || db.db_type === 'mariadb') return `${url}?ssl-mode=REQUIRED`;
+	return url;
+}
+
+/** The catalog entry of a database's engine and variant. */
+function mockCatalogEntry(dbType: string, variant: string) {
+	return MOCK_DB_CATALOG.find((e) => e.db_type === dbType && e.variant === variant);
+}
+
+function mockVersionKey(v: string): number[] {
+	return v === 'latest' ? [Infinity] : v.split('.').map(Number);
+}
+
+function mockNewer(a: string, b: string): boolean {
+	const ka = mockVersionKey(a);
+	const kb = mockVersionKey(b);
+	for (let i = 0; i < Math.max(ka.length, kb.length); i++) {
+		const x = ka[i] ?? 0;
+		const y = kb[i] ?? 0;
+		if (x !== y) return x > y;
+	}
+	return false;
+}
+
+function mockImage(dbType: string, variant: string, version: string): string {
+	if (variant === 'pgvector') return `pgvector/pgvector:0.8.1-pg${version}`;
+	if (variant === 'postgis') return `postgis/postgis:${version}-3.5-alpine`;
+	const images: Record<string, string> = {
+		postgres: `postgres:${version}-alpine`,
+		mysql: `mysql:${version}`,
+		mariadb: `mariadb:${version}`,
+		redis: `redis:${version}-alpine`,
+		keydb: 'eqalpha/keydb:latest',
+		mongodb: `mongo:${version}`
+	};
+	return images[dbType] ?? `${dbType}:${version}`;
 }
 
 // Mirrors tond-server's domains.rs: previews need a preview domain on a different
@@ -530,13 +574,131 @@ function dbCredentials(db: ManagedDatabase): DatabaseCredentials {
 function dbDetail(db: ManagedDatabase) {
 	const creds = dbCredentials(db);
 	const mask = (url: string | null) => (url ? maskUrlPassword(url) : null);
+	const entry = mockCatalogEntry(db.db_type, db.variant);
+	const upgrade_targets =
+		db.custom_image || db.upgrade || !entry?.supports_upgrade
+			? []
+			: entry.versions.filter((v) => mockNewer(v, db.version));
+	let access_warning: string | null = null;
+	if (db.public_access && db.allowlist.length === 0) {
+		access_warning =
+			'Open to every address on the internet. Add the addresses that need to connect to the allowlist, or make the database private and use an SSH tunnel.';
+	}
 	return {
 		...db,
 		connection_string: mask(creds.connection_string),
 		public_connection_string: mask(creds.public_connection_string),
-		internal_connection_string: mask(creds.internal_connection_string)
+		internal_connection_string: mask(creds.internal_connection_string),
+		upgrade_targets,
+		access_warning,
+		allowlist_enforced: db.public_access && db.allowlist.length > 0,
+		supports_tls: entry?.supports_tls ?? false,
+		backup_warning:
+			db.backup_schedule || backupConfig.enabled
+				? null
+				: `Nothing backs up ${db.name} automatically. Add a schedule, or turn on scheduled snapshots on the Snapshots page.`
 	};
 }
+
+/** Next run of a (mock) cron expression: "m h * * *" daily, else in an hour. */
+function mockNextRun(schedule: string): string {
+	const [m, h] = schedule.split(/\s+/);
+	const next = new Date();
+	if (/^\d+$/.test(m) && /^\d+$/.test(h)) {
+		next.setUTCHours(Number(h), Number(m), 0, 0);
+		if (next.getTime() <= Date.now()) next.setUTCDate(next.getUTCDate() + 1);
+	} else {
+		next.setTime(Date.now() + 3600_000);
+	}
+	return next.toISOString();
+}
+
+function mockBackupStatus(db: ManagedDatabase): DatabaseBackupStatus {
+	const own = snapshots.filter((s) => s.scope === `database:${db.name}`);
+	const held = snapshots.filter(
+		(s) => s.status === 'completed' && (s.scope === 'full' || s.scope === `database:${db.name}`)
+	);
+	const last = own.find((s) => s.status === 'completed' || s.status === 'failed');
+	return {
+		schedule: db.backup_schedule,
+		retention: db.backup_retention,
+		next_run_at: db.backup_schedule ? mockNextRun(db.backup_schedule) : null,
+		full_snapshots_enabled: backupConfig.enabled,
+		full_schedule: backupConfig.enabled ? backupConfig.full_schedule_cron : null,
+		last_backup_at: held.map((s) => s.created_at).sort().at(-1) ?? null,
+		last_status: (last?.status as 'completed' | 'failed' | undefined) ?? null,
+		last_error: last?.error_message ?? null,
+		warning:
+			db.backup_schedule || backupConfig.enabled
+				? null
+				: `Nothing backs up ${db.name} automatically. Add a schedule, or turn on scheduled snapshots on the Snapshots page.`
+	};
+}
+
+/** Installed extensions per database (mock state). */
+const dbExtensions: Record<string, Record<string, string>> = {
+	db_pg1: { vector: '0.8.1', pg_trgm: '1.6' }
+};
+
+/** Walk a mock upgrade through its steps, then wait for confirmation. */
+function runMockUpgrade(id: string) {
+	const steps = [
+		'Disconnecting apps',
+		'Backing up the current data',
+		'Starting the new version next to the current one',
+		'Copying the data into the new version',
+		'Switching to the new version'
+	];
+	steps.forEach((step, i) => {
+		setTimeout(() => {
+			const idx = databases.findIndex((d) => d.id === id);
+			const u = databases[idx]?.upgrade;
+			if (!u || u.status !== 'running') return;
+			databases[idx] = { ...databases[idx], upgrade: { ...u, step } };
+		}, 700 * (i + 1));
+	});
+	setTimeout(
+		() => {
+			const idx = databases.findIndex((d) => d.id === id);
+			const db = databases[idx];
+			const u = db?.upgrade;
+			if (!u || u.status !== 'running') return;
+			databases[idx] = {
+				...db,
+				version: u.to_version,
+				image_used: u.to_image,
+				upgrade: {
+					...u,
+					status: 'awaiting_confirmation',
+					step: `Running version ${u.to_version}. Check your apps, then confirm or roll back.`,
+					finished_at: new Date().toISOString(),
+					rollback_dir: `/opt/tond/data/db-upgrades/${db.name}/previous`
+				}
+			};
+		},
+		700 * (steps.length + 1)
+	);
+}
+
+/** Mock Git tokens (the token value is never returned). */
+let gitlabTokens: GitLabToken[] = [
+	{
+		id: 'gl_1',
+		name: 'Work GitLab',
+		gitlab_url: 'https://gitlab.com',
+		username: 'dev',
+		created_at: '2025-03-01T10:00:00.000Z'
+	}
+];
+let giteaTokens: GiteaToken[] = [
+	{
+		id: 'gt_1',
+		name: 'Codeberg',
+		base_url: 'https://codeberg.org',
+		username: 'dev',
+		created_at: '2025-03-02T10:00:00.000Z'
+	}
+];
 
 function mockDatabaseSnapshot(dbName: string, trigger: 'manual' | 'pre_restore'): Snapshot {
 	const now = new Date().toISOString();
@@ -3172,6 +3334,297 @@ export const handlers = [
 		return ok(databases);
 	}),
 
+	http.get('/api/databases/catalog', async () => {
+		await delay(LATENCY);
+		return ok(MOCK_DB_CATALOG);
+	}),
+
+	http.get('/api/databases/:id/backup-schedule', async ({ params }) => {
+		await delay(LATENCY);
+		const db = databases.find((d) => d.id === params.id || d.name === params.id);
+		if (!db) return err(`Not found: database '${params.id}'`, 404);
+		return ok(mockBackupStatus(db));
+	}),
+
+	http.put('/api/databases/:id/backup-schedule', async ({ params, request }) => {
+		await delay(LATENCY);
+		const idx = databases.findIndex((d) => d.id === params.id || d.name === params.id);
+		if (idx === -1) return err(`Not found: database '${params.id}'`, 404);
+		const body = (await request.json()) as { schedule: string | null; retention?: number };
+		const schedule = body.schedule?.trim() || null;
+		if (schedule && schedule.split(/\s+/).length !== 5 && !schedule.startsWith('@')) {
+			return err(
+				`Invalid input: Invalid backup schedule: a schedule needs 5 fields (minute hour day-of-month month day-of-week), got ${schedule.split(/\s+/).length}`
+			);
+		}
+		const retention = body.retention ?? databases[idx].backup_retention;
+		if (retention < 1 || retention > 365) {
+			return err(
+				'Invalid input: Keep between 1 and 365 backups. A schedule that keeps none would delete each backup right after taking it.'
+			);
+		}
+		databases[idx] = { ...databases[idx], backup_schedule: schedule, backup_retention: retention };
+		return ok(mockBackupStatus(databases[idx]));
+	}),
+
+	http.get('/api/databases/:id/extensions', async ({ params }) => {
+		await delay(LATENCY);
+		const db = databases.find((d) => d.id === params.id || d.name === params.id);
+		if (!db) return err('Database not found', 404);
+		if (db.db_type !== 'postgres') return err('Invalid input: Extensions are a PostgreSQL feature.');
+		if (db.status !== 'running') {
+			return err(
+				`Invalid input: Start '${db.name}' first: extensions are read from the running database.`
+			);
+		}
+		const entry = mockCatalogEntry(db.db_type, db.variant);
+		const installed = dbExtensions[db.id] ?? {};
+		const comments: Record<string, string> = {
+			vector: 'vector data type and ivfflat and hnsw access methods',
+			postgis: 'PostGIS geometry and geography spatial types and functions',
+			pg_stat_statements: 'track planning and execution statistics of all SQL statements executed',
+			pg_trgm: 'text similarity measurement and index searching based on trigrams',
+			pgcrypto: 'cryptographic functions',
+			'uuid-ossp': 'generate universally unique identifiers (UUIDs)',
+			citext: 'data type for case-insensitive character strings'
+		};
+		const list: DatabaseExtension[] = (entry?.extensions ?? []).map((name) => ({
+			name,
+			available: true,
+			installed_version: installed[name] ?? null,
+			default_version: name === 'vector' ? '0.8.1' : '1.6',
+			comment: comments[name] ?? null
+		}));
+		return ok(list);
+	}),
+
+	http.post('/api/databases/:id/extensions', async ({ params, request }) => {
+		await delay(LATENCY * 2);
+		const db = databases.find((d) => d.id === params.id || d.name === params.id);
+		if (!db) return err('Database not found', 404);
+		const { name } = (await request.json()) as { name: string };
+		const offered = mockCatalogEntry(db.db_type, db.variant)?.extensions ?? [];
+		if (!offered.includes(name)) {
+			return err(
+				`Invalid input: '${name}' isn't one of the extensions offered for this database: ${offered.join(', ')}`
+			);
+		}
+		(dbExtensions[db.id] ??= {})[name] = name === 'vector' ? '0.8.1' : '1.6';
+		return ok({ message: `${name} is enabled in ${db.name}.` });
+	}),
+
+	http.post('/api/databases/:id/upgrade', async ({ params, request }) => {
+		await delay(LATENCY);
+		const idx = databases.findIndex((d) => d.id === params.id || d.name === params.id);
+		if (idx === -1) return err('Database not found', 404);
+		if (currentMockUser().role !== 'admin') {
+			return err('Forbidden: only admins can upgrade a database to a new version', 403);
+		}
+		const db = databases[idx];
+		const { version } = (await request.json()) as { version: string };
+		if (db.upgrade?.status === 'running') return err('Invalid input: An upgrade is already running.');
+		if (db.status !== 'running') {
+			return err('Invalid input: Start the database first: the upgrade copies its data while it runs.');
+		}
+		if (!mockNewer(version, db.version)) {
+			return err(
+				`Invalid input: Downgrades aren't possible: version ${version} can't read data written by ${db.version}. Restore a backup taken before the upgrade into a new database instead.`
+			);
+		}
+		const upgrade: DbUpgradeState = {
+			status: 'running',
+			from_version: db.version,
+			to_version: version,
+			from_image: db.image_used ?? '',
+			to_image: mockImage(db.db_type, db.variant, version),
+			step: 'Starting',
+			backup_id: null,
+			started_at: new Date().toISOString(),
+			finished_at: null,
+			error: null
+		};
+		databases[idx] = { ...db, upgrade };
+		runMockUpgrade(db.id);
+		return HttpResponse.json({ success: true, data: upgrade, error: null }, { status: 202 });
+	}),
+
+	http.post('/api/databases/:id/upgrade/confirm', async ({ params }) => {
+		await delay(LATENCY);
+		const idx = databases.findIndex((d) => d.id === params.id || d.name === params.id);
+		if (idx === -1) return err('Database not found', 404);
+		const db = databases[idx];
+		if (db.upgrade?.status !== 'awaiting_confirmation') {
+			return err('Invalid input: No upgrade is waiting for confirmation.');
+		}
+		databases[idx] = { ...db, upgrade: null };
+		return ok({ message: `${db.name} stays on version ${db.version}. The old data was deleted.` });
+	}),
+
+	http.post('/api/databases/:id/upgrade/rollback', async ({ params }) => {
+		await delay(LATENCY * 3);
+		const idx = databases.findIndex((d) => d.id === params.id || d.name === params.id);
+		if (idx === -1) return err('Database not found', 404);
+		const db = databases[idx];
+		const u = db.upgrade;
+		if (u?.status !== 'awaiting_confirmation') {
+			return err('Invalid input: No upgrade is waiting for confirmation.');
+		}
+		databases[idx] = { ...db, version: u.from_version, image_used: u.from_image, upgrade: null };
+		return ok({
+			message: `${db.name} runs version ${u.from_version} again, with its data from before the upgrade.`
+		});
+	}),
+
+	http.post('/api/databases/:id/upgrade/dismiss', async ({ params }) => {
+		await delay(LATENCY);
+		const idx = databases.findIndex((d) => d.id === params.id || d.name === params.id);
+		if (idx === -1) return err('Database not found', 404);
+		if (databases[idx].upgrade?.status === 'failed') {
+			databases[idx] = { ...databases[idx], upgrade: null };
+		}
+		return ok(null);
+	}),
+
+	http.post('/api/snapshots/:id/restore-new-database', async ({ params, request }) => {
+		await delay(LATENCY * 5);
+		const snap = snapshots.find((s) => s.id === params.id);
+		if (!snap) return err('Snapshot not found', 404);
+		const body = (await request.json()) as { source: string; name: string };
+		const source = databases.find((d) => d.name === body.source);
+		if (!source) {
+			return err(
+				`Invalid input: This snapshot predates restoring into a new database and '${body.source}' no longer exists`
+			);
+		}
+		const name = body.name.trim();
+		if (!/^[A-Za-z0-9][A-Za-z0-9-]*$/.test(name)) {
+			return err('Invalid input: Database name must be alphanumeric (hyphens allowed)');
+		}
+		if (databases.some((d) => d.name === name)) {
+			return err(`Invalid input: A database named '${name}' already exists. Choose another name.`);
+		}
+		const isRedisLike = source.db_type === 'redis' || source.db_type === 'keydb';
+		const copy: ManagedDatabase = {
+			...source,
+			id: `db_${Date.now()}`,
+			name,
+			host_port: 5400 + databases.length + 1,
+			status: 'running',
+			db_name: isRedisLike ? null : `tond_${name.replace(/-/g, '_')}`,
+			db_user: isRedisLike ? 'default' : `tond_${name.replace(/-/g, '_')}`,
+			public_access: false,
+			allowlist: [],
+			tls: false,
+			backup_schedule: null,
+			upgrade: null,
+			custom_external_url: null,
+			custom_internal_url: null,
+			created_at: new Date().toISOString(),
+			updated_at: new Date().toISOString()
+		};
+		dbSecrets[copy.id] = { db_password: randomHex(12), root_password: null };
+		databases = [...databases, copy];
+		return HttpResponse.json(
+			{
+				success: true,
+				data: {
+					message: `Restored ${source.name} into the new database ${name}. ${source.name} was not changed.`,
+					database: copy
+				},
+				error: null
+			},
+			{ status: 201 }
+		);
+	}),
+
+	// ── Git tokens (GitLab, Gitea/Forgejo) ──
+	http.get('/api/gitlab-tokens', async () => {
+		await delay(LATENCY);
+		return ok(gitlabTokens);
+	}),
+
+	http.post('/api/gitlab-tokens', async ({ request }) => {
+		await delay(LATENCY * 2);
+		const body = (await request.json()) as { name: string; token: string; gitlab_url?: string };
+		if (!body.name?.trim() || !body.token?.trim()) return err('Invalid input: name is required');
+		if (body.token.trim() === 'bad') {
+			return err('Invalid input: GitLab token validation failed (HTTP 401 Unauthorized)');
+		}
+		const token: GitLabToken = {
+			id: `gl_${Date.now()}`,
+			name: body.name.trim(),
+			gitlab_url: (body.gitlab_url || 'https://gitlab.com').replace(/\/+$/, ''),
+			username: 'dev',
+			created_at: new Date().toISOString()
+		};
+		gitlabTokens = [...gitlabTokens, token];
+		return HttpResponse.json({ success: true, data: token, error: null }, { status: 201 });
+	}),
+
+	http.delete('/api/gitlab-tokens/:id', async ({ params }) => {
+		await delay(LATENCY);
+		gitlabTokens = gitlabTokens.filter((t) => t.id !== params.id);
+		apps = apps.map((a) => (a.gitlab_token_id === params.id ? { ...a, gitlab_token_id: null } : a));
+		return ok(null);
+	}),
+
+	http.get('/api/gitea-tokens', async () => {
+		await delay(LATENCY);
+		return ok(giteaTokens);
+	}),
+
+	http.post('/api/gitea-tokens', async ({ request }) => {
+		await delay(LATENCY * 2);
+		const body = (await request.json()) as { name: string; token: string; base_url: string };
+		if (!body.name?.trim() || !body.token?.trim()) {
+			return err('Invalid input: A name and a token are required');
+		}
+		if (!/^https?:\/\/[^/@\s]+/.test(body.base_url?.trim() ?? '')) {
+			return err(
+				`Invalid input: The instance URL must start with https:// (or http://)`
+			);
+		}
+		if (body.token.trim() === 'bad') {
+			return err(
+				`Invalid input: ${body.base_url} refused the token (HTTP 401). Create one under Settings → Applications with repository and issue write access.`
+			);
+		}
+		const token: GiteaToken = {
+			id: `gt_${Date.now()}`,
+			name: body.name.trim(),
+			base_url: body.base_url.trim().replace(/\/+$/, ''),
+			username: 'dev',
+			created_at: new Date().toISOString()
+		};
+		giteaTokens = [...giteaTokens, token];
+		return HttpResponse.json({ success: true, data: token, error: null }, { status: 201 });
+	}),
+
+	http.delete('/api/gitea-tokens/:id', async ({ params }) => {
+		await delay(LATENCY);
+		giteaTokens = giteaTokens.filter((t) => t.id !== params.id);
+		apps = apps.map((a) => (a.gitea_token_id === params.id ? { ...a, gitea_token_id: null } : a));
+		return ok(null);
+	}),
+
+	http.put('/api/apps/:id/gitlab-token', async ({ params, request }) => {
+		await delay(LATENCY);
+		const idx = apps.findIndex((a) => a.id === params.id || a.name === params.id);
+		if (idx === -1) return err('App not found', 404);
+		const { gitlab_token_id } = (await request.json()) as { gitlab_token_id: string | null };
+		apps[idx] = { ...apps[idx], gitlab_token_id };
+		return ok(apps[idx]);
+	}),
+
+	http.put('/api/apps/:id/gitea-token', async ({ params, request }) => {
+		await delay(LATENCY);
+		const idx = apps.findIndex((a) => a.id === params.id || a.name === params.id);
+		if (idx === -1) return err('App not found', 404);
+		const { gitea_token_id } = (await request.json()) as { gitea_token_id: string | null };
+		apps[idx] = { ...apps[idx], gitea_token_id };
+		return ok(apps[idx]);
+	}),
+
 	http.post('/api/databases', async ({ request }) => {
 		await delay(LATENCY * 2);
 		const body = (await request.json()) as {
@@ -3180,15 +3633,19 @@ export const handlers = [
 			project_id?: string;
 			memory_limit?: number;
 			public_access?: boolean;
+			version?: string;
+			variant?: string;
+			backup_schedule?: string;
 		};
-		const defaultImages: Record<string, string> = {
-			postgres: 'postgres:16-alpine',
-			mysql: 'mysql:8',
-			redis: 'redis:7-alpine',
-			mariadb: 'mariadb:11',
-			keydb: 'eqalpha/keydb:latest',
-			mongodb: 'mongo:7'
-		};
+		const variant = body.variant ?? '';
+		const entry = mockCatalogEntry(body.db_type, variant);
+		if (!entry) return err(`Invalid input: Unknown variant '${variant}' for ${body.db_type}`);
+		const version = body.version || entry.default_version;
+		if (!entry.versions.includes(version)) {
+			return err(
+				`Invalid input: Version ${version} isn't available. Choose one of: ${entry.versions.join(', ')}.`
+			);
+		}
 		const isRedisLike = body.db_type === 'redis' || body.db_type === 'keydb';
 		const isMysqlLike = body.db_type === 'mysql' || body.db_type === 'mariadb';
 		const newDb: ManagedDatabase = {
@@ -3205,11 +3662,18 @@ export const handlers = [
 			memory_limit: body.memory_limit ?? null,
 			custom_external_url: null,
 			custom_internal_url: null,
-			image_used: defaultImages[body.db_type] ?? `${body.db_type}:latest`,
+			image_used: mockImage(body.db_type, variant, version),
 			custom_image: null,
 			created_at: new Date().toISOString(),
 			updated_at: new Date().toISOString(),
-			public_access: body.public_access ?? false
+			public_access: body.public_access ?? false,
+			version,
+			variant,
+			backup_schedule: body.backup_schedule?.trim() || null,
+			backup_retention: 7,
+			allowlist: [],
+			tls: false,
+			upgrade: null
 		};
 		dbSecrets[newDb.id] = {
 			db_password: randomHex(12),
@@ -3310,6 +3774,8 @@ export const handlers = [
 			custom_image?: string | null;
 			memory_limit?: number | null;
 			public_access?: boolean;
+			allowlist?: string[];
+			tls?: boolean;
 		};
 		// Apply updates — empty string clears the override (mirrors backend behaviour)
 		const updated = { ...databases[idx] };
@@ -3332,6 +3798,39 @@ export const handlers = [
 		}
 		if (body.public_access !== undefined) {
 			updated.public_access = body.public_access;
+		}
+		if (body.allowlist !== undefined) {
+			const cleaned: string[] = [];
+			for (const raw of body.allowlist) {
+				const entry = raw.trim();
+				if (!entry) continue;
+				const [addr, prefix] = entry.split('/');
+				const octets = addr.split('.');
+				const validIp =
+					octets.length === 4 && octets.every((o) => /^\d+$/.test(o) && Number(o) <= 255);
+				const validPrefix = prefix === undefined || (/^\d+$/.test(prefix) && Number(prefix) <= 32);
+				if (addr.includes(':')) {
+					return err(
+						`Invalid input: '${entry}' is IPv6. Public databases are published on IPv4 only; allow IPv4 addresses.`
+					);
+				}
+				if (!validIp || !validPrefix) {
+					return err(
+						`Invalid input: '${entry}' isn't an IP address or a CIDR range like 203.0.113.0/24`
+					);
+				}
+				const canonical = prefix === '32' ? addr : entry;
+				if (!cleaned.includes(canonical)) cleaned.push(canonical);
+			}
+			updated.allowlist = cleaned;
+		}
+		if (body.tls !== undefined) {
+			if (body.tls && !mockCatalogEntry(updated.db_type, updated.variant)?.supports_tls) {
+				return err(
+					`Invalid input: ${updated.db_type} doesn't support TLS in Tond; use an SSH tunnel to encrypt connections.`
+				);
+			}
+			updated.tls = body.tls;
 		}
 		updated.updated_at = new Date().toISOString();
 		databases[idx] = updated;

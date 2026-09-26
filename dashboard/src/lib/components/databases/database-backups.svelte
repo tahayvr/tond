@@ -26,10 +26,19 @@
 
 <script lang="ts">
 	import InlineError from '$lib/components/feedback/inline-error.svelte';
-	// Backups of one managed database: back up now, list the backups that hold
-	// it (its own and full-server snapshots), restore one with a typed
-	// confirmation. A restore first backs up the current data.
-	import { createDatabaseBackup, listDatabaseBackups, restoreDatabase } from '$lib/api';
+	// Backups of one managed database: its automatic schedule, back up now,
+	// the backups that hold it (its own and full-server snapshots), restore one
+	// in place with a typed confirmation (the current data is backed up first)
+	// or into a new database (the original is not touched).
+	import {
+		createDatabaseBackup,
+		listDatabaseBackups,
+		restoreDatabase,
+		type RestoredDatabase
+	} from '$lib/api';
+	import DatabaseBackupSchedule from './database-backup-schedule.svelte';
+	import RestoreToNewDialog from './restore-to-new-dialog.svelte';
+	import CopyIcon from '~icons/ri/file-copy-2-line';
 	import { Badge } from '$lib/components/ui/badge/index.js';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
@@ -47,9 +56,31 @@
 		canRestore: boolean;
 		/** snapshots:create */
 		canBackup?: boolean;
+		/** db:write — edit the schedule, create databases from backups */
+		canWrite?: boolean;
+		/** Names of existing databases (a restored copy needs a free name) */
+		takenNames?: string[];
 	}
 
-	let { dbId, dbName, canRestore, canBackup = true }: Props = $props();
+	let {
+		dbId,
+		dbName,
+		canRestore,
+		canBackup = true,
+		canWrite = true,
+		takenNames = []
+	}: Props = $props();
+
+	let scheduleRefresh = $state(0);
+	let restoreNewTarget = $state<Snapshot | null>(null);
+	let restoreNewOpen = $state(false);
+	let restored = $state<RestoredDatabase | null>(null);
+
+	function openRestoreNew(snap: Snapshot) {
+		restoreNewTarget = snap;
+		restored = null;
+		restoreNewOpen = true;
+	}
 
 	let backups = $state<Snapshot[]>([]);
 	let loading = $state(true);
@@ -95,6 +126,7 @@
 					? `Backed up ${dbName}. An encrypted copy is uploading to remote storage.`
 					: `Backed up ${dbName}.`;
 			await load();
+			scheduleRefresh++;
 		} catch (e: any) {
 			backupError = e.message ?? 'The backup failed';
 		} finally {
@@ -135,17 +167,22 @@
 	function kindLabel(s: Snapshot): string {
 		if (s.scope === 'full') return 'Full server snapshot';
 		if (s.trigger === 'pre_restore') return 'Before a restore';
+		if (s.trigger === 'pre_upgrade') return 'Before an upgrade';
+		if (s.trigger === 'scheduled') return 'Scheduled';
 		return 'Database backup';
 	}
 </script>
 
-<div class="space-y-4" data-testid="database-backups">
+<div class="space-y-6" data-testid="database-backups">
+	<DatabaseBackupSchedule {dbId} {dbName} canEdit={canWrite} refreshKey={scheduleRefresh} />
+
 	<div class="flex flex-wrap items-start justify-between gap-3">
 		<div class="space-y-1">
 			<h2 class="text-sm font-semibold tracking-wide text-muted-foreground uppercase">Backups</h2>
 			<p class="max-w-prose text-sm text-muted-foreground">
-				A backup holds a dump of {dbName} and a copy of its data directory. Restoring one replaces the
-				data in {dbName}; the current data is backed up first, so a restore can be undone.
+				A backup holds a dump of {dbName} and a copy of its data directory. Restore one into a new database
+				to check it or copy data out, or restore it over {dbName} (the current data is backed up first, so
+				that can be undone).
 			</p>
 		</div>
 		<Button size="sm" disabled={backingUp || !canBackup} onclick={handleBackup}>
@@ -174,6 +211,23 @@
 			>
 		</div>
 	{/if}
+	{#if restored}
+		<div
+			class="flex flex-wrap items-start justify-between gap-3 rounded-md bg-success/10 px-3 py-2 text-sm text-success"
+			role="status"
+			data-testid="restored-database"
+		>
+			<span>
+				{restored.message}
+				<a class="font-medium underline" href="/databases/{restored.database.id}">
+					Open {restored.database.name}
+				</a>
+			</span>
+			<button type="button" class="text-xs underline" onclick={() => (restored = null)}>
+				Dismiss
+			</button>
+		</div>
+	{/if}
 
 	{#if loading}
 		<p class="text-xs text-muted-foreground">Loading backups…</p>
@@ -185,7 +239,7 @@
 	{:else if completed.length === 0}
 		<div class="rounded border border-dashed border-border px-4 py-8 text-center">
 			<p class="text-sm text-muted-foreground">
-				No backups of {dbName} yet. Back it up now, or turn on scheduled snapshots in Snapshots.
+				No backups of {dbName} yet. Back it up now, or schedule automatic backups above.
 			</p>
 		</div>
 	{:else}
@@ -208,15 +262,18 @@
 						</p>
 					</div>
 					{#if canRestore}
-						<Button
-							variant="outline"
-							size="sm"
-							class="shrink-0 self-start sm:self-auto"
-							onclick={() => openRestore(snap)}
-						>
-							<HistoryIcon class="size-4" />
-							Restore…
-						</Button>
+						<div class="flex shrink-0 flex-wrap gap-2 self-start sm:self-auto">
+							{#if canWrite}
+								<Button variant="outline" size="sm" onclick={() => openRestoreNew(snap)}>
+									<CopyIcon class="size-4" />
+									Restore to new…
+								</Button>
+							{/if}
+							<Button variant="outline" size="sm" onclick={() => openRestore(snap)}>
+								<HistoryIcon class="size-4" />
+								Restore…
+							</Button>
+						</div>
 					{/if}
 				</li>
 			{/each}
@@ -237,6 +294,14 @@
 		</span>
 	</p>
 </div>
+
+<RestoreToNewDialog
+	bind:open={restoreNewOpen}
+	snapshot={restoreNewTarget}
+	source={dbName}
+	taken={takenNames}
+	onrestored={(r) => (restored = r)}
+/>
 
 <Dialog.Root bind:open={restoreOpen}>
 	<Dialog.Content class="sm:max-w-md">
