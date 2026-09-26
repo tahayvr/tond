@@ -67,7 +67,7 @@ use crate::{
     auth::{self, LocalPeer},
     docker,
     handlers::auth::{extract_session_token, validate_session},
-    log_bus::{self, DeployLogEvent},
+    log_bus::{self, DeployEvent},
     state::AppState,
 };
 use tond_common::{CronJobRun, DeployLog, ManagedDatabase};
@@ -112,7 +112,7 @@ pub struct LogStreamQuery {
 
 // ── Socket plumbing ───────────────────────────────────────────────────────────
 
-async fn close_with(socket: &mut WebSocket, code: u16, reason: &'static str) {
+pub(crate) async fn close_with(socket: &mut WebSocket, code: u16, reason: &'static str) {
     let _ = socket
         .send(Message::Close(Some(axum::extract::ws::CloseFrame {
             code,
@@ -174,7 +174,7 @@ enum DeployLogScope {
 /// snapshot rows (the subscription starts before the snapshot query, so a
 /// line may be in both).
 async fn forward_deploy_logs(
-    mut bus: broadcast::Receiver<Arc<DeployLogEvent>>,
+    mut bus: broadcast::Receiver<Arc<DeployEvent>>,
     tx: mpsc::Sender<String>,
     db: sqlx::SqlitePool,
     scope: DeployLogScope,
@@ -197,6 +197,9 @@ async fn forward_deploy_logs(
                 continue;
             }
             Err(broadcast::error::RecvError::Closed) => return,
+        };
+        let DeployEvent::Log(event) = event.as_ref() else {
+            continue;
         };
         if already_sent.contains(&event.id) {
             continue;
@@ -817,7 +820,7 @@ async fn handle_database_socket(
 
 /// Returns true if the request carries valid authentication. `local` is true for
 /// requests accepted on the trusted local Unix socket (the CLI on the host).
-async fn authenticate(
+pub(crate) async fn authenticate(
     state: &AppState,
     query: &LogStreamQuery,
     headers: &HeaderMap,
@@ -981,6 +984,7 @@ async fn poll_cron_runs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log_bus::DeployLogEvent;
 
     fn target(key: &str, cid: &str) -> FollowTarget {
         FollowTarget {
@@ -1050,6 +1054,7 @@ mod tests {
         DeployLogEvent {
             id: id.to_string(),
             app_id: app_id.to_string(),
+            deployment_id: None,
             level: "info".to_string(),
             message: format!("line {id}"),
             created_at: chrono::Utc::now().to_rfc3339(),
@@ -1085,7 +1090,7 @@ mod tests {
             event("other-app", "app-b"),
             event("new", "app-a"),
         ] {
-            let _ = bus_tx.send(Arc::new(ev));
+            let _ = bus_tx.send(Arc::new(DeployEvent::Log(ev)));
         }
 
         let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())

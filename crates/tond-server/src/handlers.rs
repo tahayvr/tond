@@ -41,10 +41,12 @@ pub mod backups;
 pub mod cron;
 pub mod databases;
 pub mod deployments;
+pub mod domains;
 pub mod env;
 pub mod git;
 pub mod github_apps;
 pub mod gitlab_tokens;
+pub mod images;
 pub mod integrations;
 pub mod logs;
 pub mod metrics;
@@ -70,9 +72,8 @@ use serde_json::json;
 use tond_common::*;
 
 use crate::{
-    alerts::fire_event_alerts,
     audit_log::{AuthActor, write_audit_log},
-    auth::{AuthRole, RateLimit, RequireAdmin, RequireAuth},
+    auth::{AuthRole, LocalPeer, RateLimit, RequireAdmin, RequireAuth},
     compose_policy, deploy, docker,
     error::AppError,
     state::AppState,
@@ -478,64 +479,66 @@ pub async fn delete_app(
 
 // ── Deploy App ──
 
+/// How a deploy request was triggered, for the deployment row:
+/// `(trigger_source, trigger_detail)`.
+pub(crate) fn deploy_trigger(local: bool, actor: &str) -> (&'static str, Option<String>) {
+    if local {
+        ("cli", Some("tond CLI on the server".to_string()))
+    } else if actor == "api-key" {
+        ("api", Some("API key".to_string()))
+    } else {
+        ("manual", (actor != "unknown").then(|| actor.to_string()))
+    }
+}
+
+/// 202 body for a started deployment.
+pub(crate) fn deployment_started(
+    message: &str,
+    app_id: &str,
+    deployment_id: &str,
+) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiResponse::ok(json!({
+            "message": message,
+            "app_id": app_id,
+            "deployment_id": deployment_id,
+            "status": "running",
+        }))),
+    )
+}
+
 pub async fn deploy_app(
     _rate: RateLimit,
     _auth: RequireAuth,
     actor: AuthActor,
+    LocalPeer(local): LocalPeer,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
-    let mut app = fetch_app(&state.db, &id).await?;
+    let app = fetch_app(&state.db, &id).await?;
     let app_id = app.id.clone();
+    let app_name = app.name.clone();
 
-    // Deploy in background
-    let state_clone = state.clone();
-    let app_name_clone = app.name.clone();
-    let actor_str = actor.0.clone();
-    tokio::spawn(async move {
-        if let Err(e) = deploy::deploy(&state_clone, &mut app, "manual").await {
-            tracing::error!("Deploy failed for {}: {}", app.name, e);
-            let _ = sqlx::query(
-                "UPDATE apps SET status = 'failed', updated_at = datetime('now') WHERE id = ?",
-            )
-            .bind(&app.id)
-            .execute(&state_clone.db)
-            .await;
-            fire_event_alerts(
-                &state_clone,
-                "deployment_failure",
-                Some(app.id.as_str()),
-                Some(app.name.as_str()),
-                Some(&e.to_string()),
-            )
-            .await;
-        } else {
-            fire_event_alerts(
-                &state_clone,
-                "deployment_success",
-                Some(app.id.as_str()),
-                Some(app.name.as_str()),
-                None,
-            )
-            .await;
-        }
-    });
+    let (trigger, detail) = deploy_trigger(local, &actor.0);
+    let deployment_id = deploy::start(&state, app, deploy::DeployRequest::source(trigger, detail))
+        .await
+        .map_err(|e| AppError(TondError::Internal(e.to_string())))?;
 
     write_audit_log(
         &state.db,
         Some(&app_id),
-        Some(&app_name_clone),
+        Some(&app_name),
         "deploy",
-        &actor_str,
-        None,
+        &actor.0,
+        Some(&format!("deployment={deployment_id}")),
     )
     .await;
 
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(ApiResponse::ok(
-            json!({ "message": "Deployment started", "app_id": app_id }),
-        )),
+    Ok(deployment_started(
+        "Deployment started",
+        &app_id,
+        &deployment_id,
     ))
 }
 
@@ -1017,6 +1020,7 @@ pub async fn upload_deploy(
     _rate: RateLimit,
     _auth: RequireAuth,
     actor: AuthActor,
+    LocalPeer(local): LocalPeer,
     State(state): State<AppState>,
     Path(id): Path<String>,
     mut multipart: Multipart,
@@ -1078,81 +1082,36 @@ pub async fn upload_deploy(
     app.source_type = "tarball".to_string();
 
     let app_id = app.id.clone();
-    let app_name_clone = app.name.clone();
-    let actor_str = actor.0.clone();
+    let app_name = app.name.clone();
 
-    // Build and deploy in background
-    let state_clone = state.clone();
-    let extract_dir_clone = extract_dir.clone();
-    tokio::spawn(async move {
-        // Build with the configured method.
-        match deploy::build_from_dir(&state_clone, &app, &extract_dir_clone).await {
-            Ok(_image_tag) => {
-                if let Err(e) = deploy::deploy(&state_clone, &mut app, "upload").await {
-                    tracing::error!("Deploy failed for {}: {}", app.name, e);
-                    let _ = sqlx::query(
-						"UPDATE apps SET status = 'failed', updated_at = datetime('now') WHERE id = ?",
-					)
-					.bind(&app.id)
-					.execute(&state_clone.db)
-					.await;
-                    fire_event_alerts(
-                        &state_clone,
-                        "deployment_failure",
-                        Some(app.id.as_str()),
-                        Some(app.name.as_str()),
-                        Some(&e.to_string()),
-                    )
-                    .await;
-                } else {
-                    fire_event_alerts(
-                        &state_clone,
-                        "deployment_success",
-                        Some(app.id.as_str()),
-                        Some(app.name.as_str()),
-                        None,
-                    )
-                    .await;
-                }
-            }
-            Err(e) => {
-                tracing::error!("Build failed for {}: {}", app.name, e);
-                let _ = sqlx::query(
-                    "UPDATE apps SET status = 'failed', updated_at = datetime('now') WHERE id = ?",
-                )
-                .bind(&app.id)
-                .execute(&state_clone.db)
-                .await;
-                fire_event_alerts(
-                    &state_clone,
-                    "deployment_failure",
-                    Some(app.id.as_str()),
-                    Some(app.name.as_str()),
-                    Some(&e.to_string()),
-                )
-                .await;
-            }
-        }
-
-        // Clean up
-        let _ = tokio::fs::remove_dir_all(&extract_dir_clone).await;
-    });
+    // Build and deploy in the background as one deployment (build phase
+    // included), so its log and progress show in the live deploy view.
+    let deployment_id = deploy::start(
+        &state,
+        app,
+        deploy::DeployRequest {
+            kind: deploy::DeployKind::Upload { dir: extract_dir },
+            trigger_source: "upload".to_string(),
+            trigger_detail: deploy_trigger(local, &actor.0).1,
+        },
+    )
+    .await
+    .map_err(|e| AppError(TondError::Internal(e.to_string())))?;
 
     write_audit_log(
         &state.db,
         Some(&app_id),
-        Some(&app_name_clone),
+        Some(&app_name),
         "deploy",
-        &actor_str,
+        &actor.0,
         Some("source=upload"),
     )
     .await;
 
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(ApiResponse::ok(
-            json!({ "message": "Upload received, building & deploying...", "app_id": app_id }),
-        )),
+    Ok(deployment_started(
+        "Upload received, building & deploying...",
+        &app_id,
+        &deployment_id,
     ))
 }
 

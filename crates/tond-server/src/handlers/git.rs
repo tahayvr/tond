@@ -25,6 +25,12 @@
 //
 //   GET  /api/apps/{id}/deploy-key
 //     Returns the current public deploy key (or 404 if none generated yet).
+//
+//   POST /api/git/branches
+//     List a repository's branches and default branch (`git ls-remote`) for
+//     the new-app wizard's branch picker.
+
+use std::time::Duration;
 
 use axum::{
     Json,
@@ -32,15 +38,21 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
+use serde::{Deserialize, Serialize};
 use tond_common::{
-    ApiResponse, AppResponse, DeployKeyResponse, MIN_WEBHOOK_SECRET_LEN, TondError,
-    UpdateAutoDeployRequest, UpdateSourceRequest, UpdateWebhookSecretRequest,
+    ApiResponse, AppResponse, DeployKeyResponse, GitHubApp, GitLabToken, MIN_WEBHOOK_SECRET_LEN,
+    TondError, UpdateAutoDeployRequest, UpdateSourceRequest, UpdateWebhookSecretRequest,
     WebhookConfigResponse, WebhookUrls, generate_raw_key,
 };
 
 use crate::{
     auth::{AuthRole, RateLimit, RequireAuth},
+    deploy::git::{
+        GIT_ALLOW_PROTOCOL, GitHttpAuth, git_auth_env, ls_remote_args, parse_ls_remote,
+        redact_url_credentials, split_url_credentials,
+    },
     error::AppError,
+    handlers::{github_apps, gitlab_tokens},
     state::AppState,
 };
 
@@ -364,4 +376,150 @@ pub async fn update_source(
         StatusCode::OK,
         Json(ApiResponse::ok(AppResponse::from(updated))),
     ))
+}
+
+// ── Remote branches (new-app wizard) ────────────────────────────────────────
+
+/// POST /api/git/branches request body.
+#[derive(Debug, Deserialize)]
+pub struct RemoteBranchesRequest {
+    /// Repository URL (http/https; credentials in the URL are used, not echoed)
+    pub url: String,
+    /// GitHub App whose installation token to use for private repos
+    pub github_app_id: Option<String>,
+    /// GitLab token to use for private repos
+    pub gitlab_token_id: Option<String>,
+}
+
+/// POST /api/git/branches response.
+#[derive(Debug, Serialize)]
+pub struct RemoteBranchesResponse {
+    /// The repository's default branch (its HEAD), when the server says
+    pub default_branch: Option<String>,
+    /// Branch names, default first (at most MAX_BRANCHES)
+    pub branches: Vec<String>,
+    /// More branches exist than were returned
+    pub truncated: bool,
+}
+
+/// Branches returned to the picker.
+const MAX_BRANCHES: usize = 200;
+/// `git ls-remote` gives up after this long.
+const LS_REMOTE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// POST /api/git/branches
+///
+/// Body: { "url": "https://github.com/o/r.git", "github_app_id"?: "...", "gitlab_token_id"?: "..." }
+/// Lists a repository's branches and its default branch with
+/// `git ls-remote`, so the new-app wizard can offer a branch picker instead
+/// of assuming `main`. Only http(s) URLs: SSH needs a deploy key, which an
+/// app gets after it is created.
+pub async fn list_remote_branches(
+    _rate: RateLimit,
+    _auth: RequireAuth,
+    State(state): State<AppState>,
+    Json(req): Json<RemoteBranchesRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let raw = req.url.trim();
+    if !(raw.starts_with("https://") || raw.starts_with("http://")) {
+        return Err(AppError(TondError::InvalidInput(
+            "Branches can only be listed for http(s) Git URLs; type the branch name instead"
+                .to_string(),
+        )));
+    }
+    let (url, mut auth) = split_url_credentials(raw);
+
+    if let Some(id) = req.github_app_id.as_deref()
+        && let Some(gh_app) =
+            sqlx::query_as::<_, GitHubApp>("SELECT * FROM github_apps WHERE id = ? LIMIT 1")
+                .bind(id)
+                .fetch_optional(&state.db)
+                .await?
+    {
+        let token = github_apps::generate_installation_token(&gh_app)
+            .await
+            .map_err(|e| AppError(TondError::InvalidInput(format!("GitHub App token: {e}"))))?;
+        auth = Some(GitHttpAuth {
+            username: "x-access-token".to_string(),
+            password: token,
+        });
+    } else if let Some(id) = req.gitlab_token_id.as_deref()
+        && let Some(gl) =
+            sqlx::query_as::<_, GitLabToken>("SELECT * FROM gitlab_tokens WHERE id = ? LIMIT 1")
+                .bind(id)
+                .fetch_optional(&state.db)
+                .await?
+    {
+        auth = Some(
+            gitlab_tokens::gitlab_git_credentials(&gl)
+                .map_err(|e| AppError(TondError::InvalidInput(e.to_string())))?,
+        );
+    }
+
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(ls_remote_args(&url))
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ALLOW_PROTOCOL", GIT_ALLOW_PROTOCOL)
+        .kill_on_drop(true);
+    if let Some(auth) = &auth {
+        cmd.envs(git_auth_env(&url, auth));
+    }
+    let output = tokio::time::timeout(LS_REMOTE_TIMEOUT, cmd.output())
+        .await
+        .map_err(|_| {
+            AppError(TondError::InvalidInput(
+                "The Git host didn't answer in time; type the branch name instead".to_string(),
+            ))
+        })?
+        .map_err(|e| AppError(TondError::Internal(format!("could not run git: {e}"))))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError(TondError::InvalidInput(ls_remote_error(&stderr))));
+    }
+
+    let mut parsed = parse_ls_remote(&String::from_utf8_lossy(&output.stdout));
+    let truncated = parsed.branches.len() > MAX_BRANCHES;
+    parsed.branches.truncate(MAX_BRANCHES);
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(RemoteBranchesResponse {
+            default_branch: parsed.default_branch,
+            branches: parsed.branches,
+            truncated,
+        })),
+    ))
+}
+
+/// A readable message for a failed `git ls-remote`.
+fn ls_remote_error(stderr: &str) -> String {
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("could not read username")
+        || lower.contains("authentication failed")
+        || lower.contains("not found")
+        || lower.contains("403")
+    {
+        "Tond couldn't read this repository. If it's private, pick a connected GitHub App or add credentials; you can also type the branch name.".to_string()
+    } else {
+        format!(
+            "Couldn't list branches: {}",
+            redact_url_credentials(stderr.trim())
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ls_remote_errors_are_readable_and_redacted() {
+        assert!(
+            ls_remote_error("fatal: could not read Username for 'https://github.com'")
+                .contains("private")
+        );
+        let msg = ls_remote_error("fatal: unable to access 'https://u:secret@host/r.git/'");
+        assert!(msg.starts_with("Couldn't list branches"));
+        assert!(!msg.contains("secret"));
+    }
 }
