@@ -302,7 +302,7 @@ mod tests {
         let err = result
             .err()
             .unwrap_or_else(|| panic!("viewers can't mint deploy tokens"));
-        assert_eq!(err.0.code(), Some("SCOPE_DENIED"));
+        assert_eq!(err.0.code(), "SCOPE_DENIED");
         assert!(err.0.to_string().contains("apps:deploy"));
     }
 

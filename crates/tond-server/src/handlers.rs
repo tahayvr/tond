@@ -243,8 +243,9 @@ pub async fn create_app(
 
     // Validate name (alphanumeric + hyphens)
     if !req.name.chars().all(|c| c.is_alphanumeric() || c == '-') {
-        return Err(AppError(TondError::InvalidInput(
-            "App name must be alphanumeric (hyphens allowed)".to_string(),
+        return Err(AppError(TondError::invalid_field(
+            "name",
+            "App name must be alphanumeric (hyphens allowed)",
         )));
     }
 
@@ -253,8 +254,9 @@ pub async fn create_app(
         req.source_type.as_str(),
         "git" | "image" | "tarball" | "dockerfile" | "compose"
     ) {
-        return Err(AppError(TondError::InvalidInput(
-            "source_type must be one of: git, image, tarball, dockerfile, compose".to_string(),
+        return Err(AppError(TondError::invalid_field(
+            "source_type",
+            "source_type must be one of: git, image, tarball, dockerfile, compose",
         )));
     }
 
@@ -267,8 +269,9 @@ pub async fn create_app(
             .trim()
             .is_empty()
     {
-        return Err(AppError(TondError::InvalidInput(
-            "dockerfile_content is required when source_type is 'dockerfile'".to_string(),
+        return Err(AppError(TondError::invalid_field(
+            "dockerfile_content",
+            "dockerfile_content is required when source_type is 'dockerfile'",
         )));
     }
     if req.source_type == "compose"
@@ -279,8 +282,9 @@ pub async fn create_app(
             .trim()
             .is_empty()
     {
-        return Err(AppError(TondError::InvalidInput(
-            "compose_content is required when source_type is 'compose'".to_string(),
+        return Err(AppError(TondError::invalid_field(
+            "compose_content",
+            "compose_content is required when source_type is 'compose'",
         )));
     }
     // Reject host-level compose options up front (privileged, host binds, …) so
@@ -290,9 +294,10 @@ pub async fn create_app(
     {
         let volume_dir = volumes::app_volume_dir(&volumes::data_dir(), &req.name);
         compose_policy::validate(content, &volume_dir).map_err(|errors| {
-            AppError(TondError::InvalidInput(compose_policy::format_errors(
-                &errors,
-            )))
+            AppError(TondError::invalid_field(
+                "compose_content",
+                compose_policy::format_errors(&errors),
+            ))
         })?;
     }
 
@@ -300,8 +305,9 @@ pub async fn create_app(
     if let Some(build_method) = requested_build_method.as_deref()
         && !matches!(build_method, "dockerfile" | "tbuild")
     {
-        return Err(AppError(TondError::InvalidInput(
-            "build_method must be one of: tbuild, dockerfile".to_string(),
+        return Err(AppError(TondError::invalid_field(
+            "build_method",
+            "build_method must be one of: tbuild, dockerfile",
         )));
     }
 
@@ -310,18 +316,18 @@ pub async fn create_app(
             if let Some(build_method) = requested_build_method.as_deref()
                 && build_method != "dockerfile"
             {
-                return Err(AppError(TondError::InvalidInput(
-                    "build_method must be 'dockerfile' when source_type is 'dockerfile'"
-                        .to_string(),
+                return Err(AppError(TondError::invalid_field(
+                    "build_method",
+                    "build_method must be 'dockerfile' when source_type is 'dockerfile'",
                 )));
             }
         }
         "git" | "tarball" => {}
         _ => {
             if requested_build_method.is_some() {
-                return Err(AppError(TondError::InvalidInput(
-                    "build_method is only supported for git, tarball, and dockerfile sources"
-                        .to_string(),
+                return Err(AppError(TondError::invalid_field(
+                    "build_method",
+                    "build_method is only supported for git, tarball, and dockerfile sources",
                 )));
             }
         }

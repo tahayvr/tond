@@ -368,7 +368,10 @@ pub fn retry_after_secs(wait: Duration) -> u64 {
 pub fn too_many_requests(message: &str, wait: Duration) -> Response {
     let mut response = (
         StatusCode::TOO_MANY_REQUESTS,
-        Json(ApiResponse::<()>::err(message)),
+        Json(ApiResponse::<()>::err(
+            tond_common::code::RATE_LIMITED,
+            message,
+        )),
     )
         .into_response();
     if let Ok(value) = HeaderValue::from_str(&retry_after_secs(wait).to_string()) {

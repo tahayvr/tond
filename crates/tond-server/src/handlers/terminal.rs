@@ -192,7 +192,7 @@ pub async fn list_targets(
 }
 
 fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
-    (status, Json(ApiResponse::<()>::err(message.into()))).into_response()
+    crate::error::status_error(status, message)
 }
 
 fn reject(status: StatusCode, message: impl Into<String>) -> Rejection {
@@ -1467,7 +1467,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(
-            body["error"]
+            body["error"]["message"]
                 .as_str()
                 .unwrap_or_default()
                 .contains(HOST_TERMINAL_ENABLE_COMMAND),

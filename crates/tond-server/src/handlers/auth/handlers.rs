@@ -40,8 +40,14 @@ use super::session::{MFA_PENDING_COOKIE, extract_cookie, extract_session_token, 
 
 // ── Response helpers ──
 
+/// A 401 from an auth endpoint means a wrong password, code or link, not a
+/// missing session.
 fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
-    (status, Json(ApiResponse::<()>::err(message.into()))).into_response()
+    let code = match status {
+        StatusCode::UNAUTHORIZED => tond_common::code::INVALID_CREDENTIALS,
+        _ => crate::error::code_for_status(status),
+    };
+    (status, Json(ApiResponse::<()>::err(code, message))).into_response()
 }
 
 fn internal_error(e: impl std::fmt::Display) -> Response {
@@ -1546,7 +1552,10 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = response_json(response).await;
-        assert_eq!(body["error"], serde_json::json!("Invalid email address"));
+        assert_eq!(
+            body["error"]["message"],
+            serde_json::json!("Invalid email address")
+        );
     }
 
     #[tokio::test]

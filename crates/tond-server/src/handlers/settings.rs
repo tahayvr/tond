@@ -58,7 +58,7 @@ async fn queue_dashboard_certificate(
 }
 
 fn invalid(msg: String) -> axum::response::Response {
-    (StatusCode::BAD_REQUEST, Json(ApiResponse::<()>::err(msg))).into_response()
+    crate::error::AppError(tond_common::TondError::InvalidInput(msg)).into_response()
 }
 
 // ── Get Settings ──
@@ -175,11 +175,7 @@ pub async fn update_settings(
         .await;
 
         if let Err(e) = result {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::<()>::err(e.to_string())),
-            )
-                .into_response();
+            return crate::error::AppError(e.into()).into_response();
         }
     }
 

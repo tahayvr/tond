@@ -138,7 +138,10 @@ pub async fn create_preview(
     if let Err(e) = insert_result {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::<()>::err(format!("DB error: {}", e))),
+            Json(ApiResponse::<()>::err(
+                tond_common::code::INTERNAL,
+                format!("DB error: {}", e),
+            )),
         )
             .into_response();
     }
@@ -155,10 +158,10 @@ pub async fn create_preview(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::<()>::err(format!(
-                    "Failed to fetch preview: {}",
-                    e
-                ))),
+                Json(ApiResponse::<()>::err(
+                    tond_common::code::INTERNAL,
+                    format!("Failed to fetch preview: {}", e),
+                )),
             )
                 .into_response();
         }
@@ -222,7 +225,10 @@ pub async fn list_previews(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::<()>::err(format!("DB error: {}", e))),
+                Json(ApiResponse::<()>::err(
+                    tond_common::code::INTERNAL,
+                    format!("DB error: {}", e),
+                )),
             )
                 .into_response();
         }
@@ -262,14 +268,20 @@ pub async fn delete_preview(
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(ApiResponse::<()>::err("Preview not found")),
+                Json(ApiResponse::<()>::err(
+                    tond_common::code::NOT_FOUND,
+                    "Preview not found",
+                )),
             )
                 .into_response();
         }
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::<()>::err(format!("DB error: {}", e))),
+                Json(ApiResponse::<()>::err(
+                    tond_common::code::INTERNAL,
+                    format!("DB error: {}", e),
+                )),
             )
                 .into_response();
         }
@@ -350,7 +362,10 @@ pub async fn update_preview_config(
     {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::<()>::err(format!("DB error: {}", e))),
+            Json(ApiResponse::<()>::err(
+                tond_common::code::INTERNAL,
+                format!("DB error: {}", e),
+            )),
         )
             .into_response();
     }
@@ -743,7 +758,7 @@ mod tests {
         );
         let body = response_json(response).await;
         assert!(
-            body["error"]
+            body["error"]["message"]
                 .as_str()
                 .is_some_and(|e| e.contains("preview domain")),
             "the error should explain that a preview domain is required, got: {body}"

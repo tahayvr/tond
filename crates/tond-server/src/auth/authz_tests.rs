@@ -125,9 +125,9 @@ async fn missing_scopes_get_403_scope_denied() {
     assert_eq!(status, StatusCode::OK);
     let (status, body) = call(&app, "/api/databases", &secret).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(body["code"], "SCOPE_DENIED");
+    assert_eq!(body["error"]["code"], "SCOPE_DENIED");
     assert!(
-        body["error"]
+        body["error"]["message"]
             .as_str()
             .unwrap_or_default()
             .contains("db:read")
@@ -161,16 +161,16 @@ async fn resource_filters_limit_tokens_to_their_apps() {
     assert_eq!(status, StatusCode::OK, "by id");
     let (status, body) = call(&app, "/api/apps/api", &secret).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(body["code"], "RESOURCE_DENIED");
+    assert_eq!(body["error"]["code"], "RESOURCE_DENIED");
     let (status, body) = call(&app, "/api/apps/does-not-exist", &secret).await;
     assert_eq!(
-        (status, body["code"].as_str()),
+        (status, body["error"]["code"].as_str()),
         (StatusCode::FORBIDDEN, Some("RESOURCE_DENIED")),
         "unknown apps look the same as foreign ones"
     );
     let (status, body) = call(&app, "/api/databases", &secret).await;
     assert_eq!(
-        (status, body["code"].as_str()),
+        (status, body["error"]["code"].as_str()),
         (StatusCode::FORBIDDEN, Some("RESOURCE_DENIED")),
         "routes outside the filter are refused even with the scope"
     );
@@ -211,7 +211,7 @@ async fn revoked_and_expired_tokens_get_401() {
         .unwrap_or_else(|err| panic!("revoke: {err}"));
     let (status, body) = call(&app, "/api/apps", &secret).await;
     assert_eq!(
-        (status, body["code"].as_str()),
+        (status, body["error"]["code"].as_str()),
         (StatusCode::UNAUTHORIZED, Some("TOKEN_REVOKED"))
     );
 
@@ -223,7 +223,7 @@ async fn revoked_and_expired_tokens_get_401() {
         .unwrap_or_else(|err| panic!("expire: {err}"));
     let (status, body) = call(&app, "/api/apps", &secret).await;
     assert_eq!(
-        (status, body["code"].as_str()),
+        (status, body["error"]["code"].as_str()),
         (StatusCode::UNAUTHORIZED, Some("TOKEN_EXPIRED"))
     );
 }
@@ -244,7 +244,7 @@ async fn allowed_ips_are_checked_against_the_client_address() {
     let outside = router(state.clone(), "198.51.100.7:4000");
     let (status, body) = call(&outside, "/api/apps", &secret).await;
     assert_eq!(
-        (status, body["code"].as_str()),
+        (status, body["error"]["code"].as_str()),
         (StatusCode::FORBIDDEN, Some("IP_NOT_ALLOWED"))
     );
 
@@ -287,7 +287,7 @@ async fn prometheus_scrapes_metrics_over_tcp_with_a_metrics_read_token() {
 
     let (status, body) = call(&app, "/metrics", &other).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(body["code"], "SCOPE_DENIED");
+    assert_eq!(body["error"]["code"], "SCOPE_DENIED");
 
     let anonymous = app
         .clone()

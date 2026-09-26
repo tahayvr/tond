@@ -83,7 +83,7 @@ fn info_response(message: &str) -> Response {
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response {
-    (status, Json(ApiResponse::<()>::err(message))).into_response()
+    crate::error::status_error(status, message)
 }
 
 // ── Verification ───────────────────────────────────────────────────────────
@@ -581,7 +581,10 @@ async fn handle_gitlab_merge_request(
     let Ok(payload) = serde_json::from_slice::<serde_json::Value>(body) else {
         return Ok((
             StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<()>::err("invalid JSON")),
+            Json(ApiResponse::<()>::err(
+                tond_common::code::INVALID_JSON,
+                "invalid JSON",
+            )),
         )
             .into_response());
     };
@@ -1089,7 +1092,10 @@ async fn handle_github_app_pull_request(
     let Ok(payload) = serde_json::from_slice::<serde_json::Value>(body) else {
         return (
             StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<()>::err("invalid JSON")),
+            Json(ApiResponse::<()>::err(
+                tond_common::code::INVALID_JSON,
+                "invalid JSON",
+            )),
         )
             .into_response();
     };
@@ -1806,7 +1812,10 @@ mod tests {
         .await;
         assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
         let body = response_json(bad).await;
-        assert_eq!(body["error"], "invalid or missing webhook signature");
+        assert_eq!(
+            body["error"]["message"],
+            "invalid or missing webhook signature"
+        );
 
         // Even a ping must be signed.
         let ping = call_github(
@@ -1838,7 +1847,7 @@ mod tests {
         .await;
         assert_eq!(first.status(), StatusCode::OK);
         assert_eq!(
-            response_json(first).await["error"],
+            response_json(first).await["message"],
             "auto_deploy not enabled"
         );
 
@@ -1901,7 +1910,10 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response_json(response).await["error"], "branch not watched");
+        assert_eq!(
+            response_json(response).await["message"],
+            "branch not watched"
+        );
     }
 
     #[tokio::test]
@@ -1958,7 +1970,7 @@ mod tests {
         .unwrap_or_else(|err| panic!("gitlab_webhook should return a response: {}", err.0));
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            response_json(response).await["error"],
+            response_json(response).await["message"],
             "auto_deploy not enabled"
         );
     }
@@ -1994,7 +2006,7 @@ mod tests {
         .unwrap_or_else(|err| panic!("gitea_webhook should return a response: {}", err.0));
         assert_eq!(signed.status(), StatusCode::OK);
         assert_eq!(
-            response_json(signed).await["error"],
+            response_json(signed).await["message"],
             "auto_deploy not enabled"
         );
     }
@@ -2029,7 +2041,7 @@ mod tests {
             .unwrap_or_else(|err| panic!("generic_webhook should return a response: {}", err.0));
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(
-                response_json(response).await["error"],
+                response_json(response).await["message"],
                 "auto_deploy not enabled"
             );
         }

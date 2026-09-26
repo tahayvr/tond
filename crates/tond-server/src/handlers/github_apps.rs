@@ -578,7 +578,10 @@ pub async fn complete_github_flow(
             .into_response(),
         Err(code) => (
             StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<()>::err(code.to_string())),
+            Json(ApiResponse::<()>::err(
+                tond_common::code::INVALID_INPUT,
+                code.to_string(),
+            )),
         )
             .into_response(),
     }

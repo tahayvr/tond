@@ -357,7 +357,7 @@ impl IntoResponse for AuthFailure {
     fn into_response(self) -> Response {
         (
             self.status,
-            Json(ApiResponse::<()>::err_code(self.code, self.message)),
+            Json(ApiResponse::<()>::err(self.code, self.message)),
         )
             .into_response()
     }
@@ -828,7 +828,7 @@ mod tests {
             .err()
             .unwrap_or_else(|| panic!("viewers can't deploy"));
         assert_eq!(err.0.status_code(), 403);
-        assert_eq!(err.0.code(), Some("SCOPE_DENIED"));
+        assert_eq!(err.0.code(), "SCOPE_DENIED");
         assert!(err.0.to_string().contains("apps:deploy"));
         assert!(
             Authz::<(scope::AppsRead, scope::EnvReadValues)>::check(viewer).is_err(),
