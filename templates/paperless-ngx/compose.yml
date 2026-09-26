@@ -21,6 +21,14 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    # Timings only: the image's own HEALTHCHECK test is kept, but its 30s interval
+    # would keep the deploy waiting.
+    healthcheck:
+      interval: 10s
+      timeout: 10s
+      start_period: 120s
+      start_interval: 2s
+      retries: 5
 
   redis:
     image: valkey/valkey:8-alpine

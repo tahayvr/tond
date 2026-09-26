@@ -11,3 +11,10 @@ services:
       WEBSOCKET_ENABLED: "true"
     volumes:
       - ./data:/data
+    # Timings only: the image's own HEALTHCHECK test is kept, but its 60s interval
+    # would keep the deploy waiting.
+    healthcheck:
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      start_interval: 1s

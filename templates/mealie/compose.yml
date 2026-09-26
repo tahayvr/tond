@@ -12,3 +12,10 @@ services:
       WEB_CONCURRENCY: "1"
     volumes:
       - ./data:/app/data
+    # Timings only: the image's own HEALTHCHECK test is kept, but its 30s default interval
+    # would keep the deploy waiting.
+    healthcheck:
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+      start_interval: 2s
