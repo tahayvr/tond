@@ -6,6 +6,8 @@ use tond_common::UpdateSettingsRequest;
 
 use crate::client::TondClient;
 
+// Variant names are the subcommand names (`tond settings set-...`).
+#[allow(clippy::enum_variant_names)]
 #[derive(Subcommand)]
 pub enum SettingsAction {
     /// Set the human-readable name for this Tond server instance
