@@ -508,14 +508,14 @@
 			<!-- Overview tab -->
 			{#if tab === 'overview'}
 				<div class="space-y-4 pt-4">
-					<div class="grid gap-4 sm:grid-cols-2">
+					<div class="grid grid-cols-1 gap-4 sm:grid-cols-2 [&>*]:min-w-0">
 						<!-- Status -->
 						<div class="space-y-3 rounded border border-dotted p-4">
-							<h4
+							<h2
 								class="font-mono text-xs font-medium tracking-wider text-muted-foreground uppercase"
 							>
 								Status
-							</h4>
+							</h2>
 							<div class="space-y-1 text-sm">
 								<div class="flex items-center gap-2">
 									<span class="text-muted-foreground">State:</span>
@@ -556,11 +556,11 @@
 
 						<!-- Schedule -->
 						<div class="space-y-3 rounded border border-dotted p-4">
-							<h4
+							<h2
 								class="font-mono text-xs font-medium tracking-wider text-muted-foreground uppercase"
 							>
 								Schedule
-							</h4>
+							</h2>
 							<div class="space-y-1 text-sm">
 								<div>
 									<span class="text-muted-foreground">Cron:</span>
@@ -593,11 +593,11 @@
 
 						<!-- Container -->
 						<div class="space-y-3 rounded border border-dotted p-4">
-							<h4
+							<h2
 								class="font-mono text-xs font-medium tracking-wider text-muted-foreground uppercase"
 							>
 								Container
-							</h4>
+							</h2>
 							<div class="space-y-1 text-sm">
 								<div class="truncate">
 									<span class="text-muted-foreground">Image:</span>
@@ -648,11 +648,11 @@
 
 						<!-- Retry & Volumes -->
 						<div class="space-y-3 rounded border border-dotted p-4">
-							<h4
+							<h2
 								class="font-mono text-xs font-medium tracking-wider text-muted-foreground uppercase"
 							>
 								Retry & Volumes
-							</h4>
+							</h2>
 							<div class="space-y-1 text-sm">
 								<div>
 									<span class="text-muted-foreground">Max retries:</span>
@@ -688,7 +688,7 @@
 			{#if tab === 'runs'}
 				<div class="space-y-4 pt-4">
 					<div class="flex items-center justify-between">
-						<h3 class="text-sm font-medium">Run History</h3>
+						<h2 class="text-sm font-medium">Run History</h2>
 						<Button variant="outline" size="sm" onclick={() => loadRuns()} disabled={runsLoading}>
 							{#if runsLoading}
 								<RotateCw class="mr-1 h-3 w-3 animate-spin" />
@@ -1039,7 +1039,7 @@
 													class="px-3 py-2 text-left font-mono text-xs font-medium text-muted-foreground uppercase"
 													>Value</th
 												>
-												<th class="w-16 px-3 py-2"></th>
+												<th class="w-16 px-3 py-2"><span class="sr-only">Actions</span></th>
 											</tr>
 										</thead>
 										<tbody>
@@ -1145,7 +1145,7 @@
 													class="px-3 py-2 text-left font-mono text-xs font-medium text-muted-foreground uppercase"
 													>Container Path</th
 												>
-												<th class="w-16 px-3 py-2"></th>
+												<th class="w-16 px-3 py-2"><span class="sr-only">Actions</span></th>
 											</tr>
 										</thead>
 										<tbody>
@@ -1196,7 +1196,7 @@
 
 					<!-- Danger zone -->
 					<div class="grid gap-3">
-						<h3 class="text-sm font-medium text-destructive">Danger zone</h3>
+						<h2 class="text-sm font-medium text-destructive">Danger zone</h2>
 						<div
 							class="flex items-center justify-between rounded-md border border-destructive/30 p-4"
 						>

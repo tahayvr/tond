@@ -633,12 +633,12 @@
 			{#if tab === 'overview'}
 				<div class="mt-4 space-y-4">
 					<!-- Info grid -->
-					<div class="grid gap-4 sm:grid-cols-2">
+					<div class="grid grid-cols-1 gap-4 sm:grid-cols-2 [&>*]:min-w-0">
 						<!-- Connection strings -->
 						<div class="space-y-4 rounded-lg border p-4">
-							<h3 class="text-sm font-semibold tracking-wide text-muted-foreground uppercase">
+							<h2 class="text-sm font-semibold tracking-wide text-muted-foreground uppercase">
 								Connection
-							</h3>
+							</h2>
 
 							<InlineError message={urlError} />
 
@@ -773,9 +773,9 @@
 
 						<!-- Configuration -->
 						<div class="space-y-3 rounded-lg border p-4">
-							<h3 class="text-sm font-semibold tracking-wide text-muted-foreground uppercase">
+							<h2 class="text-sm font-semibold tracking-wide text-muted-foreground uppercase">
 								Configuration
-							</h3>
+							</h2>
 
 							<dl class="space-y-2 text-sm">
 								<div class="flex justify-between">
@@ -785,8 +785,8 @@
 
 								<!-- Docker image row -->
 								<div class="flex flex-col gap-1">
-									<div class="flex items-center justify-between">
-										<dt class="text-muted-foreground">Image</dt>
+									<dt class="flex items-center justify-between text-muted-foreground">
+										<span>Image</span>
 										{#if !editingImage && isAdmin()}
 											<Button
 												variant="ghost"
@@ -797,12 +797,13 @@
 												Edit
 											</Button>
 										{/if}
-									</div>
+									</dt>
 									{#if editingImage}
-										<div class="space-y-2">
+										<dd class="space-y-2">
 											<InlineError message={imageError} />
 											<Input
 												class="font-mono text-xs"
+												aria-label="Docker image"
 												placeholder="e.g. postgres:15-alpine"
 												bind:value={imageDraft}
 												disabled={savingImage}
@@ -831,7 +832,7 @@
 													</Button>
 												{/if}
 											</div>
-										</div>
+										</dd>
 									{:else}
 										<dd class="flex items-center gap-2">
 											<span class="font-mono text-xs"
@@ -869,9 +870,9 @@
 					<!-- Network access (H6): private by default, explicit opt-in for public -->
 					<div class="space-y-3 rounded-lg border p-4" data-testid="db-network-access">
 						<div class="flex flex-wrap items-center justify-between gap-2">
-							<h3 class="text-sm font-semibold tracking-wide text-muted-foreground uppercase">
+							<h2 class="text-sm font-semibold tracking-wide text-muted-foreground uppercase">
 								Network access
-							</h3>
+							</h2>
 							{#if db.public_access}
 								<StatusBadge status="public" tone="warning" label="Public" />
 							{:else}
@@ -1038,7 +1039,7 @@
 											class="px-3 py-2 text-left font-mono text-xs font-medium text-muted-foreground uppercase"
 											>Value</th
 										>
-										<th class="w-24 px-3 py-2"></th>
+										<th class="w-24 px-3 py-2"><span class="sr-only">Actions</span></th>
 									</tr>
 								</thead>
 								<tbody>

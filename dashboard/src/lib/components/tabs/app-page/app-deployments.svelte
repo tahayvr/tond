@@ -193,7 +193,7 @@
 								>
 							</td>
 							<td class="px-4 py-2 font-mono text-muted-foreground">
-								<span class={d.image_pruned ? 'line-through opacity-60' : ''}
+								<span class={d.image_pruned ? 'text-muted-foreground line-through' : ''}
 									>{shortImage(d.image_tag)}</span
 								>
 								{#if d.image_pruned}

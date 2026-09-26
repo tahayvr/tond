@@ -30,6 +30,7 @@ vi.mock('$lib/ui-context.svelte', () => ({
 
 import DatabasePage from '../../routes/databases/[id]/+page.svelte';
 import { setPageUrl } from '../mocks/page-state.svelte';
+import { confirmDialog, renderConfirmHost } from '../confirm';
 
 const pg: ManagedDatabaseDetail = {
 	id: 'db_pg1',
@@ -124,5 +125,44 @@ describe('databases/[id] credentials', () => {
 
 		expect(screen.queryByRole('button', { name: /^change /i })).not.toBeInTheDocument();
 		expect(screen.getByText(/can't be changed in place yet/i)).toBeInTheDocument();
+	});
+});
+
+describe('databases/[id] destructive actions', () => {
+	beforeEach(() => {
+		for (const fn of Object.values(api)) fn.mockReset();
+	});
+
+	it('stops only after confirmation', async () => {
+		api.stopDatabase.mockResolvedValue(undefined);
+		api.getDatabase.mockResolvedValue({ ...pg, status: 'stopped' });
+		api.listProjects.mockResolvedValue([]);
+		const user = userEvent.setup();
+		setPageUrl('http://localhost/databases/db_pg1', { id: 'db_pg1' });
+		renderConfirmHost();
+		render(DatabasePage, { props: { params: { id: pg.id }, data: { db: pg, projects: [] } } });
+
+		await user.click(screen.getByRole('button', { name: /^stop$/i }));
+		expect(api.stopDatabase).not.toHaveBeenCalled();
+		await confirmDialog(user);
+		expect(api.stopDatabase).toHaveBeenCalledWith('db_pg1');
+	});
+
+	it('deletes from the danger zone after typing the name', async () => {
+		api.deleteDatabase.mockResolvedValue(undefined);
+		const user = userEvent.setup();
+		setPageUrl('http://localhost/databases/db_pg1?tab=settings', { id: 'db_pg1' });
+		render(DatabasePage, { props: { params: { id: pg.id }, data: { db: pg, projects: [] } } });
+
+		expect(
+			within(screen.getByRole('navigation', { name: 'Database sections' })).getByRole('link', {
+				name: 'Settings'
+			})
+		).toHaveAttribute('aria-current', 'page');
+		await user.click(screen.getByRole('button', { name: /delete database/i }));
+		const dialog = await screen.findByRole('alertdialog');
+		expect(dialog).toHaveTextContent(/every table, key and file/i);
+		await confirmDialog(user, { typed: 'app-postgres' });
+		expect(api.deleteDatabase).toHaveBeenCalledWith('db_pg1');
 	});
 });

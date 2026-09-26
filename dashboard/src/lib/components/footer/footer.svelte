@@ -17,7 +17,7 @@
 	}
 </script>
 
-<div class="flex h-8 w-full items-center justify-between gap-2 border-t px-2 sm:px-6">
+<footer class="flex h-8 w-full items-center justify-between gap-2 border-t px-2 sm:px-6">
 	<div class="flex items-center gap-1">
 		<Tooltip.Root>
 			<Tooltip.Trigger>
@@ -54,4 +54,4 @@
 		{/if}
 	</div>
 	<SystemStats />
-</div>
+</footer>

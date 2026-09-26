@@ -459,8 +459,9 @@
 <div class="min-h-screen space-y-6 pb-12">
 	<!-- Header -->
 	<div class="flex items-center gap-4">
-		<Breadcrumb items={[{ label: 'Applications', href: '/apps' }, { label: 'New App' }]} />
+		<Breadcrumb items={[{ label: 'Apps', href: '/apps' }, { label: 'New app' }]} />
 	</div>
+	<h1 class="text-2xl font-extrabold sm:text-3xl">New app</h1>
 
 	{#if error}
 		<ErrorAlert title="Configuration Error" description={error} />

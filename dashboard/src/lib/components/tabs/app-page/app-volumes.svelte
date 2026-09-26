@@ -62,7 +62,7 @@
 						<th class="px-4 py-2 text-left font-medium text-muted-foreground">Container path</th>
 						<th class="px-4 py-2 text-left font-medium text-muted-foreground">Name</th>
 						<th class="px-4 py-2 text-left font-medium text-muted-foreground">Host path</th>
-						<th class="w-16 px-4 py-2"></th>
+						<th class="w-16 px-4 py-2"><span class="sr-only">Actions</span></th>
 					</tr>
 				</thead>
 				<tbody>

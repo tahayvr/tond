@@ -926,7 +926,9 @@
 				<StatusBadge status={current.status} kind="app" />
 				<span>Source: {current.source_type}</span>
 				{#if current.source_url}
-					<span class="max-w-xs truncate font-mono text-xs">{current.source_url}</span>
+					<span class="max-w-full min-w-0 truncate font-mono text-xs sm:max-w-md"
+						>{current.source_url}</span
+					>
 				{/if}
 			{/snippet}
 			{#snippet actions()}
@@ -968,7 +970,11 @@
 			href={(id) => appTabHref(current.id, id, id === 'settings' ? view.section : undefined)}
 		/>
 
-		<div class={view.tab === 'settings' ? 'grid gap-6 md:grid-cols-[11rem_minmax(0,1fr)]' : ''}>
+		<div
+			class={view.tab === 'settings'
+				? 'grid grid-cols-1 gap-6 md:grid-cols-[11rem_minmax(0,1fr)]'
+				: ''}
+		>
 			{#if view.tab === 'settings'}
 				<LinkTabs
 					label="Settings sections"
@@ -1121,12 +1127,12 @@
 						<SuccessAlert message={gitSuccess} ondismiss={() => (gitSuccess = '')} />
 
 						<!-- Source type & URL -->
-						<div class="grid gap-3">
-							<h3 class="text-sm font-medium">Source</h3>
+						<div class="grid grid-cols-1 gap-3">
+							<h2 class="text-sm font-medium">Source</h2>
 							<p class="text-sm text-muted-foreground">
 								How this app's deployable artifact is provided.
 							</p>
-							<div class="flex gap-3">
+							<div class="flex flex-wrap gap-3">
 								<div class="grid gap-2">
 									<Label for="source-type">Type</Label>
 									<Select.Root
@@ -1338,8 +1344,8 @@
 							<Separator />
 
 							<!-- Registry Credentials -->
-							<div class="grid gap-3">
-								<h3 class="text-sm font-medium">Registry Credential</h3>
+							<div class="grid grid-cols-1 gap-3">
+								<h2 class="text-sm font-medium">Registry Credential</h2>
 								<p class="text-sm text-muted-foreground">
 									Attach a stored credential to authenticate pulls from a private registry.
 								</p>
@@ -1414,7 +1420,7 @@
 								<!-- Add credential form -->
 								{#if addCredOpen}
 									<div class="grid gap-3 rounded-md border p-4">
-										<h4 class="text-sm font-medium">Add credential</h4>
+										<h3 class="text-sm font-medium">Add credential</h3>
 										<InlineError message={addCredError} ondismiss={() => (addCredError = '')} />
 										<div class="grid gap-2">
 											<Label for="cred-name">Name</Label>
@@ -1486,10 +1492,10 @@
 						<Separator />
 
 						<!-- Auto-deploy toggle -->
-						<div class="grid gap-3">
+						<div class="grid grid-cols-1 gap-3">
 							<div class="flex items-center justify-between">
 								<div>
-									<h3 class="text-sm font-medium">Auto-deploy</h3>
+									<h2 class="text-sm font-medium">Auto-deploy</h2>
 									<p class="mt-1 text-sm text-muted-foreground">
 										Automatically deploy when a webhook push event is received.
 									</p>
@@ -1510,8 +1516,8 @@
 						</div>
 
 						<!-- Watch branch -->
-						<div class="grid gap-3">
-							<h3 class="text-sm font-medium">Watch Branch</h3>
+						<div class="grid grid-cols-1 gap-3">
+							<h2 class="text-sm font-medium">Watch Branch</h2>
 							<p class="text-sm text-muted-foreground">
 								Only trigger deploys for pushes to this branch. Leave empty to deploy on any branch
 								push.
@@ -1541,10 +1547,10 @@
 						<Separator />
 
 						<!-- Deploy key -->
-						<div class="grid gap-3">
+						<div class="grid grid-cols-1 gap-3">
 							<div class="flex items-center justify-between">
 								<div>
-									<h3 class="text-sm font-medium">SSH Deploy Key</h3>
+									<h2 class="text-sm font-medium">SSH Deploy Key</h2>
 									<p class="mt-1 text-sm text-muted-foreground">
 										Add this Ed25519 public key to your repository's deploy keys (read-only access).
 									</p>
@@ -1564,7 +1570,11 @@
 							{#if deployKeyLoading}
 								<div class="py-4 text-center text-sm text-muted-foreground">Loading...</div>
 							{:else if deployKey}
-								<SecretInput value={deployKey.public_key} readonly />
+								<SecretInput
+									value={deployKey.public_key}
+									readonly
+									aria-label="Deploy key (public)"
+								/>
 								<p class="text-xs text-muted-foreground">
 									Copy this key and add it to your repository under Settings &rarr; Deploy Keys.
 								</p>
@@ -1581,10 +1591,10 @@
 				{#if activeTab === 'previews'}
 					<div class="space-y-6 pt-4">
 						<!-- PR Preview config -->
-						<div class="grid gap-3">
+						<div class="grid grid-cols-1 gap-3">
 							<div class="flex items-center justify-between">
 								<div>
-									<h3 class="text-sm font-medium">PR Preview Deployments</h3>
+									<h2 class="text-sm font-medium">PR Preview Deployments</h2>
 									<p class="mt-1 text-sm text-muted-foreground">
 										Automatically deploy a preview environment for every pull request opened on the
 										linked GitHub repository.
@@ -1654,10 +1664,10 @@
 
 						<!-- Load open PRs section (only when preview enabled and GitHub App linked) -->
 						{#if app.preview_enabled && app.github_app_id}
-							<div class="grid gap-3">
+							<div class="grid grid-cols-1 gap-3">
 								<div class="flex items-center justify-between">
 									<div>
-										<h3 class="text-sm font-medium">Open Pull Requests</h3>
+										<h2 class="text-sm font-medium">Open Pull Requests</h2>
 										<p class="text-sm text-muted-foreground">
 											Load open PRs from the linked repository and deploy previews for them.
 										</p>
@@ -1691,7 +1701,7 @@
 														class="px-3 py-2 text-left font-mono text-xs font-medium text-muted-foreground uppercase"
 														>Branch</th
 													>
-													<th class="w-36 px-3 py-2"></th>
+													<th class="w-36 px-3 py-2"><span class="sr-only">Actions</span></th>
 												</tr>
 											</thead>
 											<tbody>
@@ -1737,8 +1747,8 @@
 						{/if}
 
 						<!-- Create preview form -->
-						<div class="grid gap-3">
-							<h3 class="text-sm font-medium">New Preview Deployment</h3>
+						<div class="grid grid-cols-1 gap-3">
+							<h2 class="text-sm font-medium">New Preview Deployment</h2>
 							<p class="text-sm text-muted-foreground">
 								Creates a temporary deployment from the current image with a unique subdomain.
 								Useful for PR review workflows.

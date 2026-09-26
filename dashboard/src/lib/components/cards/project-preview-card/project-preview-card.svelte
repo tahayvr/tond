@@ -65,6 +65,7 @@
 					variant="ghost"
 					size="sm"
 					class="text-destructive hover:text-destructive"
+					aria-label={`Delete preview ${preview.slug}`}
 					disabled={deleting}
 					onclick={() => onDelete(preview.id)}
 				>
@@ -105,7 +106,7 @@
 												href={safeUrl(p.pr_url)}
 												target="_blank"
 												rel="noopener noreferrer"
-												class="inline-flex items-center gap-1 font-mono text-xs text-accent hover:underline"
+												class="inline-flex items-center gap-1 font-mono text-xs text-foreground underline-offset-2 hover:underline"
 											>
 												<Github class="h-3 w-3 shrink-0" />
 												#{p.pr_number}
@@ -150,7 +151,7 @@
 												href={safeUrl(p.url)}
 												target="_blank"
 												rel="noopener noreferrer"
-												class="inline-flex items-center gap-1 font-mono text-xs text-accent hover:underline"
+												class="inline-flex items-center gap-1 font-mono text-xs text-foreground underline-offset-2 hover:underline"
 											>
 												{p.subdomain ?? p.url}
 												<ExternalLink class="h-3 w-3" />

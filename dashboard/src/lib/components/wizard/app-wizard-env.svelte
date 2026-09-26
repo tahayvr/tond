@@ -188,7 +188,7 @@
 								class="px-3 py-2 text-left font-mono text-xs font-medium text-muted-foreground uppercase"
 								>Value</th
 							>
-							<th class="w-28 px-3 py-2"></th>
+							<th class="w-28 px-3 py-2"><span class="sr-only">Actions</span></th>
 						</tr>
 					</thead>
 					<tbody>

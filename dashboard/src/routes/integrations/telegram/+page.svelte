@@ -50,7 +50,11 @@
 
 <div class="space-y-8">
 	<div class="flex h-14 items-center gap-4">
-		<a href="/integrations" class="text-muted-foreground hover:text-foreground">
+		<a
+			href="/integrations"
+			class="text-muted-foreground hover:text-foreground"
+			aria-label="Back to integrations"
+		>
 			<ChevronLeft class="h-5 w-5" />
 		</a>
 		<div class="flex items-center gap-3">

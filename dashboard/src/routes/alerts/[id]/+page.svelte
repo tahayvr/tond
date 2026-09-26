@@ -273,14 +273,14 @@
 			<!-- ── Overview tab ── -->
 			{#if tab === 'overview'}
 				<div class="space-y-4 pt-4">
-					<div class="grid gap-4 sm:grid-cols-2">
+					<div class="grid grid-cols-1 gap-4 sm:grid-cols-2 [&>*]:min-w-0">
 						<!-- Status card -->
 						<div class="space-y-3 rounded border border-dotted p-4">
-							<h4
+							<h2
 								class="font-mono text-xs font-medium tracking-wider text-muted-foreground uppercase"
 							>
 								Status
-							</h4>
+							</h2>
 							<div class="space-y-1 text-sm">
 								<div class="flex items-center gap-2">
 									<span class="text-muted-foreground">State:</span>
@@ -312,11 +312,11 @@
 
 						<!-- Condition card -->
 						<div class="space-y-3 rounded border border-dotted p-4">
-							<h4
+							<h2
 								class="font-mono text-xs font-medium tracking-wider text-muted-foreground uppercase"
 							>
 								Condition
-							</h4>
+							</h2>
 							<div class="space-y-1 text-sm">
 								{#if rule.metric}
 									<div>
@@ -355,11 +355,11 @@
 
 						<!-- Notifications card -->
 						<div class="space-y-3 rounded border border-dotted p-4 sm:col-span-2">
-							<h4
+							<h2
 								class="font-mono text-xs font-medium tracking-wider text-muted-foreground uppercase"
 							>
 								Notifications
-							</h4>
+							</h2>
 							<div class="space-y-3 text-sm">
 								{#if rule.webhook_url}
 									<div class="flex items-start gap-2">

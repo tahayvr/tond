@@ -34,7 +34,7 @@
 			<p class="mt-1 text-sm text-muted-foreground">Create a preview deployment below</p>
 		</div>
 	{:else}
-		<div class="rounded-md border">
+		<div class="overflow-x-auto rounded-md border">
 			<table class="w-full text-sm">
 				<thead>
 					<tr class="border-b bg-muted/50">
@@ -44,7 +44,7 @@
 						<th class="px-4 py-2 text-left font-medium text-muted-foreground">URL</th>
 						<th class="px-4 py-2 text-left font-medium text-muted-foreground">Image</th>
 						<th class="px-4 py-2 text-left font-medium text-muted-foreground">Expires</th>
-						<th class="w-20 px-4 py-2"></th>
+						<th class="w-20 px-4 py-2"><span class="sr-only">Actions</span></th>
 					</tr>
 				</thead>
 				<tbody>
@@ -61,7 +61,7 @@
 										href={safeUrl(p.pr_url)}
 										target="_blank"
 										rel="noopener noreferrer"
-										class="inline-flex items-center gap-1 font-mono text-xs text-accent hover:underline"
+										class="inline-flex items-center gap-1 font-mono text-xs text-foreground underline-offset-2 hover:underline"
 									>
 										<Github class="h-3 w-3 shrink-0" />
 										#{p.pr_number}
@@ -104,7 +104,7 @@
 										href={safeUrl(`https://${p.subdomain}`)}
 										target="_blank"
 										rel="noopener noreferrer"
-										class="inline-flex items-center gap-1 font-mono text-xs text-accent hover:underline"
+										class="inline-flex items-center gap-1 font-mono text-xs text-foreground underline-offset-2 hover:underline"
 									>
 										{p.subdomain}
 										<ExternalLink class="h-3 w-3 shrink-0" />

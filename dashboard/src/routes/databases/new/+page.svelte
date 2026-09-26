@@ -56,7 +56,8 @@
 <PageTitle title="New database" />
 
 <div class="space-y-6 pb-12">
-	<Breadcrumb items={[{ label: 'Databases', href: '/databases' }, { label: 'New Database' }]} />
+	<Breadcrumb items={[{ label: 'Databases', href: '/databases' }, { label: 'New database' }]} />
+	<h1 class="text-2xl font-extrabold sm:text-3xl">New database</h1>
 
 	<InlineError message={error} />
 
