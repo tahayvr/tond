@@ -169,3 +169,29 @@ export function curlExample(op: ApiOperation, origin: string): string {
 	parts.push(`"${url}"`);
 	return parts.join(' ');
 }
+
+/** A run of API description text: plain, or `inline code`. */
+export interface TextSegment {
+	text: string;
+	code: boolean;
+}
+
+/**
+ * Split description text on backtick pairs (`like this`) into plain and code
+ * segments. Render the segments as text nodes (never as HTML): a description
+ * can't inject markup. An unpaired backtick stays as it is.
+ */
+export function inlineCodeSegments(text: string): TextSegment[] {
+	const segments: TextSegment[] = [];
+	let rest = text;
+	for (;;) {
+		const open = rest.indexOf('`');
+		const close = open === -1 ? -1 : rest.indexOf('`', open + 1);
+		if (close === -1) break;
+		if (open > 0) segments.push({ text: rest.slice(0, open), code: false });
+		if (close > open + 1) segments.push({ text: rest.slice(open + 1, close), code: true });
+		rest = rest.slice(close + 1);
+	}
+	if (rest) segments.push({ text: rest, code: false });
+	return segments;
+}

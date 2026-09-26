@@ -6,6 +6,7 @@
 <script lang="ts">
 	import { curlExample, type ApiOperation } from '$lib/api-reference';
 	import { cn } from '$lib/utils';
+	import InlineCodeText from './InlineCodeText.svelte';
 	import ArrowRight from '~icons/ri/arrow-right-s-line';
 
 	let { op, origin }: { op: ApiOperation; origin: string } = $props();
@@ -35,7 +36,7 @@
 		>
 		<span class="min-w-0 flex-1 space-y-1">
 			<span class="block font-mono text-sm break-all">{op.path}</span>
-			<span class="block text-sm text-muted-foreground">{op.summary}</span>
+			<span class="block text-sm text-muted-foreground"><InlineCodeText text={op.summary} /></span>
 			<span class="flex flex-wrap gap-1.5">
 				{#if op.public}
 					<span class="rounded-sm bg-muted px-1.5 py-px text-xs text-muted-foreground"
@@ -65,7 +66,7 @@
 	</summary>
 	<div class="min-w-0 space-y-3 px-3 pt-1 pb-4 text-sm sm:pl-[5.75rem]">
 		{#if op.description}
-			<p class="wrap-anywhere text-muted-foreground">{op.description}</p>
+			<p class="wrap-anywhere text-muted-foreground"><InlineCodeText text={op.description} /></p>
 		{/if}
 		<pre
 			class="overflow-x-auto rounded-md border bg-muted/40 px-3 py-2 font-mono text-xs break-all whitespace-pre-wrap">{curlExample(
