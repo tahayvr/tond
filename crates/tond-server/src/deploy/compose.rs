@@ -332,12 +332,15 @@ async fn run_with_source(
     for rel in &hardened.bind_sources {
         volumes::prepare_host_dir(&data_dir, &volume_dir, rel, true)?;
     }
-    // The app's environment variables are what `${VAR}` in the file resolves
-    // against (Tond's own environment never reaches compose).
+    // The app's environment variables (its project's shared env with the
+    // app's own on top) are what `${VAR}` in the file resolves against
+    // (Tond's own environment never reaches compose).
     // (compose_policy::interpolation_env picks the variables the file uses
     // and never reserved names; the same set reaches `docker compose`.)
-    let interpolation =
-        compose_policy::interpolation_env(&source.content, &crate::secrets::app_env(app)?);
+    let interpolation = compose_policy::interpolation_env(
+        &source.content,
+        &crate::secrets::effective_app_env(&state.db, app).await?,
+    );
     let app_env: std::collections::BTreeMap<String, String> =
         interpolation.iter().cloned().collect();
     let specs =

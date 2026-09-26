@@ -4,7 +4,7 @@ A project groups related apps, databases and cron jobs, for example a frontend, 
 
 ## What a project holds
 
-A project has a unique **name** and an optional **description**. It can contain:
+A project has a unique **name**, an optional **description** and optional **shared environment variables** that every member app and cron job gets, under its own (a member's variable with the same name wins; see [Project variables](/concepts/secrets#project-variables)). It can contain:
 
 - **apps**: each app belongs to at most one project.
 - **managed databases**: you choose the project when you create the database.

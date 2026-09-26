@@ -54,10 +54,15 @@ fn should_run_due_job(job: &CronJob) -> bool {
     !(job.status == "running" && job.concurrency_policy == "skip")
 }
 
-/// Decrypt the stored env into `KEY=value` strings. An env that cannot be
-/// decrypted fails the run instead of silently running without it.
-fn cron_env_vec(stored: Option<&str>) -> Result<Vec<String>> {
-    Ok(secrets::cron_env(stored)?
+/// Decrypt the stored env into `KEY=value` strings, layered over the job's
+/// project env (`project`): the project's variables are the base and the
+/// job's own variable of the same name wins. An env that cannot be decrypted
+/// fails the run instead of silently running without it.
+fn cron_env_vec(
+    project: std::collections::BTreeMap<String, String>,
+    stored: Option<&str>,
+) -> Result<Vec<String>> {
+    Ok(secrets::layer_env(project, secrets::cron_env(stored)?)
         .into_iter()
         .map(|(k, v)| format!("{k}={v}"))
         .collect())
@@ -630,7 +635,9 @@ async fn run_cron_container(
     let docker: &Docker = &state.docker;
 
     // Decrypt the stored env, e.g. {"KEY":"val"} → ["KEY=val"]
-    let env_vec = cron_env_vec(job.env.as_deref())?;
+    // (layered over the project's shared env)
+    let project_env = secrets::project_env_of(&state.db, job.project_id.as_deref()).await?;
+    let env_vec = cron_env_vec(project_env, job.env.as_deref())?;
 
     let cmd_vec: Option<Vec<&str>> = cmd.map(|c| c.iter().map(|s| s.as_str()).collect());
 
@@ -1086,17 +1093,36 @@ mod tests {
     fn cron_env_and_bind_helpers_parse_json_and_tolerate_invalid_input() {
         let job = sample_job();
 
-        let env = cron_env_vec(job.env.as_deref()).unwrap_or_default();
+        let env = cron_env_vec(Default::default(), job.env.as_deref()).unwrap_or_default();
         assert!(
             env.contains(&"RUST_LOG=info".to_string()) && env.contains(&"MODE=prod".to_string()),
             "cron_env_vec should convert the stored JSON object into KEY=value strings"
         );
 
         assert!(
-            cron_env_vec(Some("not-json")).is_err(),
+            cron_env_vec(Default::default(), Some("not-json")).is_err(),
             "cron_env_vec should fail loudly on a value that does not decrypt"
         );
-        assert_eq!(cron_env_vec(None).ok(), Some(Vec::new()));
+        assert_eq!(
+            cron_env_vec(Default::default(), None).ok(),
+            Some(Vec::new())
+        );
+
+        // The project env is the base; the job's own value of a key wins.
+        let project = std::collections::BTreeMap::from([
+            ("MODE".to_string(), "project".to_string()),
+            ("SHARED".to_string(), "from-project".to_string()),
+        ]);
+        let layered = cron_env_vec(project, job.env.as_deref()).unwrap_or_default();
+        assert!(layered.contains(&"MODE=prod".to_string()), "{layered:?}");
+        assert!(
+            layered.contains(&"SHARED=from-project".to_string()),
+            "{layered:?}"
+        );
+        assert!(
+            !layered.contains(&"MODE=project".to_string()),
+            "{layered:?}"
+        );
 
         let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
         let binds = cron_binds(tmp.path(), &job.id, job.volumes.as_deref())

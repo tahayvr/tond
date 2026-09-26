@@ -1636,6 +1636,8 @@ pub async fn assign_project(
         .bind(&app.id)
         .execute(&state.db)
         .await?;
+    // Its logs are scrubbed with the new project's shared env.
+    log_scrub::forget_app(&app.id);
 
     // Move the running container to its new home network (project or own)
     // and re-attach linked databases there; drop the now-unused own network.

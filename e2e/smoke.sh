@@ -170,6 +170,7 @@ delete_e2e_resources() {
         tond db delete "$db" -y > /dev/null 2>&1 || true
     done
     tond cron delete e2e-cron -y > /dev/null 2>&1 || true
+    tond projects delete e2e-envproj -y > /dev/null 2>&1 || true
 }
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1669,7 +1670,12 @@ wait_for 30 "route after queued deploys" bash -c "curl -sk --resolve '${WHOAMI_D
 
 step "Background worker (readiness: none — no port, no domain, never routed)"
 # A worker that serves nothing must deploy (the HTTP release check would fail it).
-code=$(api_req POST /api/v1/apps '{"name":"e2e-worker","source_type":"dockerfile","dockerfile_content":"FROM alpine:3\nCMD [\"sh\", \"-c\", \"while true; do echo tick; sleep 5; done\"]","readiness":"none","ready_after_secs":5}')
+# It lives in a project with shared env vars: the project's are the base, the
+# app's own value of the same key wins.
+code=$(api_req POST /api/v1/projects '{"name":"e2e-envproj","env_vars":{"E2E_SHARED":"from-project","E2E_MODE":"project"}}')
+[[ "$code" == 201 ]] || fail "creating a project with shared env vars should succeed, got ${code}: $(cat "$API_BODY")"
+ENVPROJ_ID=$(jq -r '.data.id' "$API_BODY")
+code=$(api_req POST /api/v1/apps '{"name":"e2e-worker","source_type":"dockerfile","dockerfile_content":"FROM alpine:3\nCMD [\"sh\", \"-c\", \"while true; do echo tick; sleep 5; done\"]","readiness":"none","ready_after_secs":5,"project_id":"'"${ENVPROJ_ID}"'","env_vars":{"E2E_MODE":"app"}}')
 [[ "$code" == 201 ]] || fail "creating a background worker should succeed, got ${code}: $(cat "$API_BODY")"
 code=$(api_req POST /api/v1/apps '{"name":"e2e-worker-domain","source_type":"image","source_url":"alpine:3","readiness":"none","domain":"worker.example.test"}')
 [[ "$code" == 400 ]] || fail "a background worker with a domain must be rejected, got ${code}"
@@ -1686,6 +1692,12 @@ jq -e '.data.phases[] | select(.phase == "health") | .label == "Stay up for 5s" 
 [[ "$(app_field e2e-worker readiness)" == none ]] || fail "the app must report readiness none"
 docker logs tond-e2e-worker 2>&1 | grep -q tick || fail "the worker container should be running its loop"
 pass "a background worker deploys to running with no domain (readiness step: stay up 5s)"
+WORKER_ENV=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' tond-e2e-worker)
+grep -qx 'E2E_SHARED=from-project' <<< "$WORKER_ENV" \
+    || fail "a project's shared env var must reach its member app's container (env: ${WORKER_ENV})"
+grep -qx 'E2E_MODE=app' <<< "$WORKER_ENV" \
+    || fail "the app's own env var must win over the project's of the same name (env: ${WORKER_ENV})"
+pass "project env vars reach member apps; the app's own value of a key wins"
 
 step "One-click templates (catalog, generated credentials, encrypted inputs, volume owners)"
 CATALOG=$(api /api/v1/templates)
