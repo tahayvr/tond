@@ -189,20 +189,36 @@
 
 	let appId = $derived(page.params.id || params.id);
 
+	/** Reset every settings form on the page to the app's saved values. */
+	function initForms(a: App) {
+		domainInput = a.domain || '';
+		healthPath = a.health_check_path || '';
+		healthInterval = a.health_check_interval;
+		healthThreshold = a.health_failure_threshold;
+		drainTimeout = a.drain_timeout;
+		// Git integration init
+		watchBranchInput = a.watch_branch || '';
+		sourceTypeInput = (a.source_type as 'git' | 'image' | 'tarball') || 'git';
+		sourceUrlInput = a.source_url || '';
+		selectedCredentialId = a.registry_credential_id;
+		initResourcesDraft();
+	}
+
+	// Fill the forms when the page's app is loaded or changes (the loader
+	// provides it; without this the forms start empty and a save would
+	// overwrite the real settings with blanks).
+	let formsInitializedFor: string | null = null;
+	$effect(() => {
+		const current = app;
+		if (!current || current.id === formsInitializedFor) return;
+		formsInitializedFor = current.id;
+		untrack(() => initForms(current));
+	});
+
 	async function loadApp() {
 		try {
 			app = await getApp(appId);
-			domainInput = app.domain || '';
-			healthPath = app.health_check_path || '';
-			healthInterval = app.health_check_interval;
-			healthThreshold = app.health_failure_threshold;
-			drainTimeout = app.drain_timeout;
-			// Git integration init
-			watchBranchInput = app.watch_branch || '';
-			sourceTypeInput = (app.source_type as 'git' | 'image' | 'tarball') || 'git';
-			sourceUrlInput = app.source_url || '';
-			selectedCredentialId = app.registry_credential_id;
-			initResourcesDraft();
+			initForms(app);
 		} catch (e: any) {
 			error = e.message;
 		}
