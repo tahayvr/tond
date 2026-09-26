@@ -169,6 +169,12 @@ pub async fn run_janitor(state: AppState) {
         }
         // Refresh planner statistics for tables whose shape changed.
         let _ = sqlx::query("PRAGMA optimize").execute(&state.db).await;
+        // Volume folders of previews that no longer exist.
+        match prune_preview_volumes(&state.db, &crate::volumes::data_dir()).await {
+            Ok(n) if n > 0 => tracing::info!("Janitor: removed {n} preview volume folder(s)"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("Janitor: preview volume prune failed: {e}"),
+        }
         // Networks of finished previews and cron runs, deleted apps, …
         match docker::prune_networks(&state.docker).await {
             Ok(n) if n > 0 => tracing::info!("Janitor: removed {n} unused Docker network(s)"),
@@ -388,6 +394,32 @@ pub async fn run_once(db: &SqlitePool, policy: &RetentionPolicy) -> Result<Janit
     .await?;
 
     Ok(report)
+}
+
+/// Remove `<data>/volumes/_preview/<slug>` folders whose preview is gone or
+/// expired. Returns how many folders were removed.
+pub async fn prune_preview_volumes(db: &SqlitePool, data_dir: &std::path::Path) -> Result<u64> {
+    let root = crate::volumes::preview_volumes_root(data_dir);
+    let Ok(mut entries) = tokio::fs::read_dir(&root).await else {
+        return Ok(0);
+    };
+    let live: std::collections::HashSet<String> =
+        sqlx::query_scalar("SELECT slug FROM preview_deployments WHERE status != 'expired'")
+            .fetch_all(db)
+            .await?
+            .into_iter()
+            .collect();
+    let mut removed = 0;
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name().to_string_lossy().to_string();
+        // Never follow a symlink out of the volumes tree; plain dirs only.
+        if !entry.file_type().await?.is_dir() || live.contains(&name) {
+            continue;
+        }
+        tokio::fs::remove_dir_all(entry.path()).await?;
+        removed += 1;
+    }
+    Ok(removed)
 }
 
 /// The timestamp of the `n`-th newest row (1-based) returned by `sql`, which
@@ -803,6 +835,39 @@ mod tests {
             vec!["p-recent", "p-running"],
             "running previews and recently expired rows stay"
         );
+    }
+
+    #[tokio::test]
+    async fn preview_volume_folders_of_gone_previews_are_removed() {
+        let db = test_db().await;
+        seed_app(&db, "a1").await;
+        for (id, status) in [("live1", "running"), ("gone1", "expired")] {
+            sqlx::query(
+                "INSERT INTO preview_deployments (id, app_id, slug, status, expires_at)
+                 VALUES (?, 'a1', ?, ?, '2099-01-01T00:00:00Z')",
+            )
+            .bind(id)
+            .bind(id)
+            .bind(status)
+            .execute(&db)
+            .await
+            .unwrap_or_else(|err| panic!("seed preview: {err}"));
+        }
+        let dir = tempfile::TempDir::new().unwrap_or_else(|err| panic!("tempdir: {err}"));
+        let root = crate::volumes::preview_volumes_root(dir.path());
+        for slug in ["live1", "gone1", "orphan"] {
+            std::fs::create_dir_all(root.join(slug).join("data"))
+                .unwrap_or_else(|err| panic!("mkdir: {err}"));
+        }
+
+        let removed = prune_preview_volumes(&db, dir.path())
+            .await
+            .unwrap_or_else(|err| panic!("prune: {err}"));
+
+        assert_eq!(removed, 2);
+        assert!(root.join("live1").exists(), "a live preview keeps its data");
+        assert!(!root.join("gone1").exists());
+        assert!(!root.join("orphan").exists());
     }
 
     #[tokio::test]

@@ -1109,7 +1109,7 @@ fn strip_docker_ts(raw: &str) -> &str {
 /// Steps:
 ///   1. Build/pull the image (same as a regular deploy).
 ///   2. Pick a free host port (starting at 8200 to keep separate from main deploys).
-///   3. Start the container as `tond-preview-{slug}` with the same env vars and volumes.
+///   3. Start the container as `tond-preview-{slug}` with preview env vars and its own empty volumes.
 ///   4. Insert a `preview_deployments` row and update it once the container is running.
 ///
 /// The caller must provide the `slug` (short random hex) and the `ttl_hours`.
@@ -1233,10 +1233,11 @@ pub async fn deploy_preview(
         secrets::app_preview_env(app)?,
     );
 
-    // Host paths are re-derived from volume names and verified to stay inside
-    // <data>/volumes/<app> (no symlink escapes) right before the mount.
+    // Previews run pull-request code: they get the app's volume layout but
+    // their own empty directories under <data>/volumes/_preview/<slug>, never
+    // the production data. The janitor removes them once the preview is gone.
     let volumes: Vec<Volume> = serde_json::from_str(&app.volumes).unwrap_or_default();
-    let binds = volumes::app_binds(&volumes::data_dir(), &app_name, &volumes)?;
+    let binds = volumes::preview_binds(&volumes::data_dir(), &slug, &volumes)?;
 
     let container_name = format!("tond-preview-{}", slug);
 
