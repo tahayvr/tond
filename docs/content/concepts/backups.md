@@ -10,7 +10,7 @@ A snapshot is a point-in-time copy of Tond's data on the server: its database, a
 | --- | --- | --- | --- |
 | Full | `full` | By you, or on the schedule | Tond's SQLite database, every app volume, every managed database, SSH deploy keys |
 | Before a Tond update | `full` | Automatically, before Tond updates itself or rolls back an update | Same as a full snapshot |
-| Pre-deploy | `app:<name>` | At the start of each deploy of an app with volumes | That app's volumes |
+| Pre-deploy | `app:<name>` | At the start of each deploy of an app with volumes, while **Enable pre-deploy snapshots** is on (the default) | That app's volumes |
 | Database backup | `database:<name>` | By you (**Back up now** on the database page), or on the database's own schedule | One managed database |
 | Before an upgrade | `database:<name>` | Automatically, before a major-version upgrade of the database | One managed database |
 | Pre-restore (safety net) | `full` or `database:<name>` | Automatically, before a full or database restore | What the restore is about to overwrite |
@@ -47,6 +47,7 @@ Configure backups on the **Snapshots** page (**Backup settings**) or with `tond 
 | Scheduled backups | Off |
 | Schedule (cron) | `0 3 * * *` (03:00 UTC every day) |
 | Retain (full snapshots) | 7 |
+| Pre-deploy snapshots | On |
 | Pre-deploy retain (per app) | 10 |
 | Keep local copy | On |
 | Remote storage provider | None (local only) |
@@ -54,6 +55,7 @@ Configure backups on the **Snapshots** page (**Backup settings**) or with `tond 
 ```sh
 tond snapshot config show
 tond snapshot config set --schedule "0 3 * * *" --retain 14 --pre-deploy-retain 5
+tond snapshot config set --pre-deploy-enabled false   # no snapshot before deploys
 ```
 
 The schedule accepts standard five-field cron expressions, evaluated in UTC, and macros such as `@daily`. Scheduled backups are off until you turn on **Enable scheduled backups** in the dashboard.

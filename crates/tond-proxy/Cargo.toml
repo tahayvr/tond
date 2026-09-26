@@ -26,6 +26,7 @@ instant-acme = { workspace = true }
 rcgen = { workspace = true }
 openssl = { workspace = true }
 rustix = { workspace = true }
+socket2 = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]

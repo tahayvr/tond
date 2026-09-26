@@ -593,6 +593,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn backup_config_refuses_a_retention_below_one() {
+        let state = test_state().await;
+        for body in [
+            r#"{"full_retention_count":0}"#,
+            r#"{"pre_deploy_retention_per_app":0}"#,
+            r#"{"full_retention_count":-1}"#,
+        ] {
+            let req: UpdateBackupConfigRequest =
+                serde_json::from_str(body).unwrap_or_else(|err| panic!("{body}: {err}"));
+            let result = update_backup_config(
+                RateLimit,
+                Authz::unchecked(Principal::test_user(Role::Admin)),
+                State(state.clone()),
+                Json(req),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(AppError(TondError::InvalidInput(_)))),
+                "{body} must be refused"
+            );
+        }
+        let (full, pre): (i64, i64) = sqlx::query_as(
+            "SELECT full_retention_count, pre_deploy_retention_per_app FROM backup_config WHERE id = 1",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or_else(|err| panic!("read: {err}"));
+        assert!(full >= 1 && pre >= 1, "nothing was stored");
+    }
+
+    #[tokio::test]
     async fn database_backups_list_its_own_backups_and_full_snapshots() {
         let state = test_state().await;
         sqlx::query("INSERT INTO databases (id, name, db_type) VALUES ('d1', 'shop', 'postgres')")

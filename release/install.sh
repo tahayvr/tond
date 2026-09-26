@@ -341,6 +341,35 @@ docker_codename_fallback() {
         fi
     done
 }
+# Oldest Docker Engine Tond works with: one-click templates use the compose
+# healthcheck `start_interval`, which needs Docker Engine 25.
+TOND_MIN_DOCKER_MAJOR=25
+
+# docker_major VERSION — the major number of a Docker version string
+# ("27.3.1", "24.0.7-0ubuntu4", "Docker version 24.0.7, build afdd53b");
+# empty when there is none.
+docker_major() {
+    printf '%s\n' "$1" | sed -n 's/^[^0-9]*\([0-9][0-9]*\)\..*/\1/p' | head -n 1
+}
+
+# installed_docker_version — the Docker Engine version (the daemon's, or the
+# client's when the daemon doesn't answer); empty without Docker.
+installed_docker_version() {
+    docker version --format '{{.Server.Version}}' 2>/dev/null \
+        || docker version --format '{{.Client.Version}}' 2>/dev/null \
+        || true
+}
+
+# docker_too_old VERSION — succeeds when VERSION is older than
+# TOND_MIN_DOCKER_MAJOR (an unreadable version is not "too old").
+docker_too_old() {
+    _dm="$(docker_major "$1")"
+    [ -n "$_dm" ] && [ "$_dm" -lt "$TOND_MIN_DOCKER_MAJOR" ]
+}
+
+docker_too_old_message() {
+    echo "Tond needs Docker Engine ${TOND_MIN_DOCKER_MAJOR} or newer, and this server has Docker ${1}. Upgrade Docker Engine (https://docs.docker.com/engine/install/), then run this again."
+}
 # ── end supported systems ──
 
 # Check if we're in bundled mode or need to download
@@ -497,6 +526,17 @@ check_supported_system() {
     error "$(unsupported_system_message | tail -n 1)"
     error "Supported systems: https://tond.io/docs/support-matrix"
     exit 1
+}
+
+# An existing Docker Engine must be new enough (a fresh install gets the
+# current one from Docker's repository).
+check_docker_version() {
+    command -v docker &> /dev/null || return 0
+    local version
+    version="$(installed_docker_version | head -n 1)"
+    if docker_too_old "$version"; then
+        fatal "$(docker_too_old_message "$version")"
+    fi
 }
 
 check_prerequisites() {
@@ -1414,6 +1454,7 @@ main() {
 
     # Refuse an unsupported system before asking anything or downloading.
     check_supported_system
+    check_docker_version
 
     choose_dashboard_domain
 

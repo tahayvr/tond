@@ -4,6 +4,7 @@
 	import { setUiContext, clearUiContext, projectsContext } from '$lib/ui-context.svelte';
 	import PageHeader from '$lib/components/nav/page-header.svelte';
 	import ApiOperationRow from '$lib/components/api/ApiOperationRow.svelte';
+	import InlineCodeText from '$lib/components/api/InlineCodeText.svelte';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import DownloadIcon from '~icons/ri/download-2-line';
@@ -139,7 +140,7 @@
 				<div>
 					<h3 id="tag-{group.name}" class="text-base font-semibold">{group.name}</h3>
 					{#if group.description}
-						<p class="text-sm text-muted-foreground">{group.description}</p>
+						<p class="text-sm text-muted-foreground"><InlineCodeText text={group.description} /></p>
 					{/if}
 				</div>
 				<div class="rounded-md border">
@@ -176,13 +177,13 @@
 								<td class="px-3 py-2">
 									<span class="font-mono text-xs break-all">{row.code}</span>
 									<span class="mt-1 block text-xs text-muted-foreground sm:hidden"
-										>{row.description}</span
+										><InlineCodeText text={row.description} /></span
 									>
 								</td>
 								<td class="px-3 py-2 font-mono text-xs">{row.status}</td>
 								<td class="px-3 py-2 font-mono text-xs">{row.exitCode}</td>
 								<td class="hidden px-3 py-2 text-muted-foreground sm:table-cell"
-									>{row.description}</td
+									><InlineCodeText text={row.description} /></td
 								>
 							</tr>
 						{/each}
@@ -201,7 +202,7 @@
 						<dt class="w-36 shrink-0 font-mono text-xs leading-5 sm:w-44">
 							{row.exitCode} <span class="text-muted-foreground">{row.name}</span>
 						</dt>
-						<dd class="text-muted-foreground">{row.meaning}</dd>
+						<dd class="text-muted-foreground"><InlineCodeText text={row.meaning} /></dd>
 					</div>
 				{/each}
 			</dl>

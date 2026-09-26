@@ -35,6 +35,8 @@
 		onRegistryCredentialChange: (credentialId: string | null) => Promise<void>;
 		/** Whether PR previews are on (from the app, so toggling them elsewhere shows here) */
 		previewEnabled: boolean;
+		/** Whether the app belongs to a project (whose shared variables it also gets) */
+		inProject?: boolean;
 		/** Redeploy the app so saved changes reach the container */
 		onRedeploy: () => Promise<void>;
 	}
@@ -46,6 +48,7 @@
 		registryCredentialId,
 		onRegistryCredentialChange,
 		previewEnabled,
+		inProject = false,
 		onRedeploy
 	}: Props = $props();
 
@@ -364,6 +367,8 @@
 					<p class="mt-0.5 text-xs text-muted-foreground">
 						Values are hidden; reveal one when you need it. Each change is saved on its own and
 						applies on the next deploy.
+						{#if inProject}The project's shared variables are passed too; a variable set here
+							replaces the project's variable of the same name.{/if}
 						{#if previewEnabled}Previews get none of these unless you tick "Previews": they run
 							pull-request code, so share only values that aren't secret.{/if}
 					</p>

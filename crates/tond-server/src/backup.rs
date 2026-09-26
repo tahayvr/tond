@@ -1614,10 +1614,7 @@ async fn enforce_retention(
     .fetch_all(&state.db)
     .await
     {
-        for snap in old_full
-            .iter()
-            .skip(cfg.full_retention_count.max(1) as usize)
-        {
+        for snap in beyond_retention(&old_full, cfg.full_retention_count) {
             delete_snapshot_files_and_row(state, snap).await;
         }
     }
@@ -1657,14 +1654,19 @@ async fn enforce_retention(
         .fetch_all(&state.db)
         .await
         {
-            for snap in old_pre
-                .iter()
-                .skip(cfg.pre_deploy_retention_per_app as usize)
-            {
+            // (never fewer than one either: the newest is the one just taken)
+            for snap in beyond_retention(&old_pre, cfg.pre_deploy_retention_per_app) {
                 delete_snapshot_files_and_row(state, snap).await;
             }
         }
     }
+}
+
+/// The snapshots (newest first) beyond a retention of `keep`. A `keep` below
+/// one (a row written before the API refused it) still keeps the newest, so
+/// retention can never delete the snapshot it runs after.
+fn beyond_retention(snapshots: &[Snapshot], keep: i64) -> impl Iterator<Item = &Snapshot> {
+    snapshots.iter().skip(keep.max(1) as usize)
 }
 
 /// Which of one database's completed backups (newest first) retention
@@ -2636,6 +2638,25 @@ mod tests {
         assert_eq!(ids(retention_victims(&backups, 3, 1)), vec!["m1", "u1"]);
         // A retention of zero still keeps the newest.
         assert_eq!(ids(retention_victims(&backups, 0, 10)), vec!["s4", "s3"]);
+    }
+
+    #[test]
+    fn full_and_pre_deploy_retention_never_delete_the_newest_snapshot() {
+        let snaps = vec![
+            snap("n3", "manual"),
+            snap("n2", "manual"),
+            snap("n1", "manual"),
+        ];
+        let ids = |keep: i64| {
+            beyond_retention(&snaps, keep)
+                .map(|s| s.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(2), vec!["n1"]);
+        assert_eq!(ids(5), Vec::<String>::new());
+        // Zero or negative (stored before validation) behaves like one.
+        assert_eq!(ids(0), vec!["n2", "n1"]);
+        assert_eq!(ids(-3), vec!["n2", "n1"]);
     }
 
     #[test]

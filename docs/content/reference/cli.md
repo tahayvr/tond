@@ -87,16 +87,16 @@ tond apps create [OPTIONS] <NAME>
 
 | Option | Description |
 | --- | --- |
-| `--template <TEMPLATE>` | Create the app from a one-click template (see `tond templates list`) and deploy it. Template inputs are given with --env KEY=VALUE. |
+| `--template <TEMPLATE>` | Create the app from a one-click template (see `tond templates list`) and deploy it. Template inputs are given with --env KEY=VALUE; the template decides the source, port, resource limits and health checks, so those options are refused with it (--domain is allowed). |
 | `--allow-low-memory` | With --template: deploy even if the server has less free memory than the template needs. |
-| `-t, --source-type <SOURCE_TYPE>` | Source type: git, image. Default: `git`. |
-| `-s, --source <SOURCE>` | Git URL or Docker image. |
+| `-t, --source-type <SOURCE_TYPE>` | Source type: git (build a repository), image (run a registry image), tarball (deploy later with `tond apps push`), dockerfile (build the Dockerfile given with --source), compose (a compose file: a git URL or a local file given with --source). One of `git`, `image`, `tarball`, `dockerfile`, `compose`. Default: `git`. |
+| `-s, --source <SOURCE>` | Git URL (git, compose), Docker image (image), or path to a local Dockerfile (dockerfile) or compose file (compose). |
 | `-b, --branch <BRANCH>` | Git branch. Default: `main`. |
 | `-p, --port <PORT>` | Container port. Default: `3000`. |
 | `-d, --domain <DOMAIN>` | Custom domain. |
 | `--env <ENV>` | Environment variable override in KEY=VALUE format. Repeat for multiple values. |
-| `--memory-mb <MEMORY_MB>` | Memory limit in megabytes (default: 256). |
-| `--cpus <CPUS>` | CPU limit as a float (e.g. 0.5 = half a core, 1.0 = one core; default: 0.5). |
+| `--memory-mb <MEMORY_MB>` | Memory limit in megabytes (default: none set; every container is capped at 75% of the server's RAM). |
+| `--cpus <CPUS>` | CPU limit as a float (e.g. 0.5 = half a core, 1.0 = one core; default: no limit). |
 | `--health-path <HEALTH_PATH>` | HTTP path for health checks (e.g. /health); omit to disable. |
 | `--health-interval <HEALTH_INTERVAL>` | Seconds between health check polls (default: 30). |
 | `--health-threshold <HEALTH_THRESHOLD>` | Consecutive failures before marking unhealthy (default: 3). |
@@ -812,9 +812,9 @@ tond db create [OPTIONS] <NAME>
 
 | Option | Description |
 | --- | --- |
-| `-t, --db-type <DB_TYPE>` | Database type: postgres, mysql, redis. Required. |
+| `-t, --db-type <DB_TYPE>` | Database engine. Required. One of `postgres`, `mysql`, `redis`, `keydb`, `mariadb`, `mongodb`. |
 | `--project <PROJECT>` | Project ID to attach to (optional). |
-| `--memory-mb <MEMORY_MB>` | Memory limit in megabytes (default: 256). |
+| `--memory-mb <MEMORY_MB>` | Memory limit in megabytes (default: none set; every container is capped at 75% of the server's RAM). |
 
 ### tond db info
 

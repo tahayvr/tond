@@ -36,6 +36,20 @@ describe('API page', () => {
 		);
 	});
 
+	it('renders `inline code` in descriptions as <code>, never as HTML', () => {
+		const reference = buildReference(MOCK_OPENAPI);
+		const op = reference.groups[0].operations[0];
+		op.summary = 'Run `tond apps list` <img src=x onerror=alert(1)>';
+		const { container } = render(DeveloperPage, { props: { data: { reference } } as any });
+		const code = [...container.querySelectorAll('code')].find(
+			(c) => c.textContent === 'tond apps list'
+		);
+		expect(code).toBeTruthy();
+		const summary = code?.parentElement?.textContent ?? '';
+		expect(summary).toBe('Run tond apps list <img src=x onerror=alert(1)>');
+		expect(container.querySelector('img')).toBeNull();
+	});
+
 	it('filters endpoints as you type and says when nothing matches', async () => {
 		const user = userEvent.setup();
 		renderPage();

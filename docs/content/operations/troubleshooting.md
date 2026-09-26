@@ -42,7 +42,7 @@ DNS for app.example.com points to 198.51.100.4, expected 203.0.113.7. Update the
 Fix the DNS record and retry. Domains behind a CDN or proxy that resolve elsewhere but still forward HTTP-01 requests to the server are attempted anyway once the backoff reaches 6 hours.
 
 > [!NOTE]
-> `tond-proxy` listens on IPv4 only (`0.0.0.0:80` and `0.0.0.0:443`). If a domain has an AAAA record, Let's Encrypt may try IPv6 first and fail to connect. Remove the AAAA record, or point it at something that forwards to the server's IPv4 address.
+> `tond-proxy` listens on ports 80 and 443 over IPv4 and, when the host has IPv6, over IPv6 too (`[::]:80` and `[::]:443`). Let's Encrypt prefers IPv6 when a domain has an AAAA record, so the AAAA record must point at this server and IPv6 must reach it: check the cloud firewall allows inbound 80 and 443 over IPv6 as well. On a host booted with IPv6 disabled the proxy listens on IPv4 only (its log says so at start); remove AAAA records there.
 
 ### Rate limits
 

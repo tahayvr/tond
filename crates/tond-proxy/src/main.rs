@@ -32,6 +32,8 @@
 //     Falls back to a self-signed cert for unknown domains.
 //
 //   Port 80 — run_http_server() (raw Tokio TCP)
+//     Both ports listen on IPv4 (0.0.0.0) and, when the host has IPv6, on
+//     [::] with IPV6_V6ONLY (a host booted without IPv6 gets IPv4 only).
 //     A hand-rolled HTTP/1.1 server. Three behaviours:
 //       /.well-known/acme-challenge/{token} — serves ACME HTTP-01 responses
 //       a host Tond serves                  — 301 redirect to https://
@@ -781,16 +783,9 @@ impl TondProxy {
         // Requests are counted per app (all its services share one bucket).
         #[allow(clippy::type_complexity)]
         let service_rows: Vec<(String, String, String, String, i64, bool, bool)> =
-            sqlx::query_as(
-                "SELECT d.domain, a.id, a.name, d.service, s.host_port, a.access_log, a.access_log_query
-                 FROM app_domains d
-                 JOIN apps a ON a.id = d.app_id
-                 JOIN compose_services s ON s.app_id = d.app_id AND s.name = d.service
-                 WHERE d.service IS NOT NULL AND d.kind != 'redirect'
-                   AND a.status IN ('running', 'building', 'unhealthy') AND s.host_port IS NOT NULL",
-            )
-            .fetch_all(&mut *tx)
-            .await?;
+            sqlx::query_as(tond_common::route_queries::COMPOSE_SERVICE_ROUTES)
+                .fetch_all(&mut *tx)
+                .await?;
         for (domain, id, name, service, host_port, access_log, access_query) in &service_rows {
             if under_preview_domain(domain) {
                 tracing::warn!(
@@ -1240,20 +1235,34 @@ fn main() {
         .expect("failed to start the background thread");
 
     // ── TLS Proxy on port 443 ──
-    let tls_accept = TondTlsAccept {
-        cert_store: cert_store.clone(),
+    let tls_settings = || {
+        let tls_accept = TondTlsAccept {
+            cert_store: cert_store.clone(),
+        };
+        TlsSettings::with_callbacks(Box::new(tls_accept)).expect("Failed to create TLS settings")
     };
-    let tls_settings =
-        TlsSettings::with_callbacks(Box::new(tls_accept)).expect("Failed to create TLS settings");
 
     let mut proxy_service = pingora::proxy::http_proxy_service(&server.configuration, proxy);
 
-    // Add TLS listener on port 443 with SNI-based cert selection
-    proxy_service.add_tls_with_settings("0.0.0.0:443", None, tls_settings);
+    // TLS listeners on port 443 with SNI-based cert selection: IPv4, and
+    // IPv6 (IPv6-only, so it never collides with the IPv4 socket) when the
+    // host has IPv6 at all.
+    proxy_service.add_tls_with_settings("0.0.0.0:443", None, tls_settings());
+    let ipv6 = ipv6_available();
+    if ipv6 {
+        let mut v6only = pingora::listeners::TcpSocketOptions::default();
+        v6only.ipv6_only = Some(true);
+        proxy_service.add_tls_with_settings("[::]:443", Some(v6only), tls_settings());
+    } else {
+        tracing::info!("IPv6 is not available on this host: listening on IPv4 only");
+    }
 
     server.add_service(proxy_service);
 
-    tracing::info!("Tond Proxy listening on :443 (TLS) and :80 (HTTP redirect + ACME)");
+    tracing::info!(
+        "Tond Proxy listening on :443 (TLS) and :80 (HTTP redirect + ACME), {}",
+        if ipv6 { "IPv4 and IPv6" } else { "IPv4 only" }
+    );
     server.run_forever();
 }
 
@@ -1376,6 +1385,29 @@ const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Largest request head we read.
 const HTTP_MAX_HEAD_BYTES: usize = 8 * 1024;
 
+/// Whether this host can open IPv6 sockets at all. A kernel booted with
+/// `ipv6.disable=1` can't (EAFNOSUPPORT), and binding `[::]` there would stop
+/// the proxy from starting; with IPv6 merely unconfigured the listener binds
+/// and simply gets no traffic.
+fn ipv6_available() -> bool {
+    std::net::TcpListener::bind((std::net::Ipv6Addr::UNSPECIFIED, 0)).is_ok()
+}
+
+/// A listening socket on `[::]:port` that accepts IPv6 only (IPV6_V6ONLY),
+/// so it coexists with the `0.0.0.0:port` socket whatever the host's
+/// `net.ipv6.bindv6only` default is.
+fn bind_ipv6_only(port: u16) -> std::io::Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_only_v6(true)?;
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    tokio::net::TcpListener::from_std(socket.into())
+}
+
 /// HTTP server on port 80 that:
 /// - Serves ACME HTTP-01 challenge responses at `/.well-known/acme-challenge/{token}`
 /// - Redirects requests for hosts Tond serves to HTTPS (301); 404 otherwise
@@ -1387,9 +1419,31 @@ async fn run_http_server(ctx: HttpContext) -> Result<()> {
     use tokio::net::TcpListener;
 
     let listener = TcpListener::bind("0.0.0.0:80").await?;
-    tracing::info!("HTTP redirect server listening on :80");
-
     let permits = Arc::new(Semaphore::new(HTTP_MAX_CONNECTIONS));
+    // IPv6 as well when the host has it; a failure there never costs IPv4.
+    if ipv6_available() {
+        match bind_ipv6_only(80) {
+            Ok(v6) => {
+                tokio::spawn(serve_http_listener(v6, ctx.clone(), permits.clone()));
+                tracing::info!("HTTP redirect server listening on :80 (IPv4 and IPv6)");
+            }
+            Err(e) => {
+                tracing::warn!("HTTP server: can't listen on [::]:80 ({e}); IPv4 only");
+            }
+        }
+    } else {
+        tracing::info!("HTTP redirect server listening on :80 (IPv4 only)");
+    }
+    serve_http_listener(listener, ctx, permits).await;
+    Ok(())
+}
+
+/// Accept loop of one port-80 listener; `permits` is shared by all of them.
+async fn serve_http_listener(
+    listener: tokio::net::TcpListener,
+    ctx: HttpContext,
+    permits: Arc<Semaphore>,
+) {
     let mut last_accept_warning: Option<Instant> = None;
 
     loop {
@@ -2157,6 +2211,27 @@ mod tests {
         .execute(pool)
         .await
         .unwrap_or_else(|err| panic!("failed to insert preview {id}: {err}"));
+    }
+
+    #[tokio::test]
+    async fn ipv6_listener_coexists_with_the_ipv4_one_on_the_same_port() {
+        if !ipv6_available() {
+            return; // an IPv4-only host: the proxy skips IPv6 (tested by the smoke run)
+        }
+        let v4 = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+            .unwrap_or_else(|e| panic!("v4: {e}"));
+        let port = v4.local_addr().map(|a| a.port()).unwrap_or_default();
+        let v6 =
+            bind_ipv6_only(port).unwrap_or_else(|e| panic!("[::]:{port} next to 0.0.0.0: {e}"));
+        let accept = tokio::spawn(async move { v6.accept().await.map(|(_, peer)| peer) });
+        let _client = tokio::net::TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, port))
+            .await
+            .unwrap_or_else(|e| panic!("connect [::1]:{port}: {e}"));
+        let peer = accept
+            .await
+            .unwrap_or_else(|e| panic!("join: {e}"))
+            .unwrap_or_else(|e| panic!("accept: {e}"));
+        assert!(peer.is_ipv6(), "{peer}");
     }
 
     #[tokio::test]

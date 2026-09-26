@@ -26,7 +26,7 @@ use crate::{
     deploy, docker,
     error::AppError,
     handlers::{self, env_map_from_json},
-    networks, secrets,
+    log_scrub, networks, secrets,
     state::AppState,
 };
 
@@ -247,6 +247,10 @@ pub async fn update_project(
     .bind(&project.id)
     .execute(&state.db)
     .await?;
+    if req.env_vars.is_some() {
+        // Member apps' logs are scrubbed of the project env too.
+        log_scrub::forget_all();
+    }
 
     write_audit_log(
         &state.db,

@@ -1103,6 +1103,7 @@
 						registryCredentialId={app.registry_credential_id}
 						onRegistryCredentialChange={handleEnvRegistryCredential}
 						previewEnabled={app.preview_enabled}
+						inProject={app.project_id != null}
 						onRedeploy={handleEnvRedeploy}
 					/>
 				{/if}

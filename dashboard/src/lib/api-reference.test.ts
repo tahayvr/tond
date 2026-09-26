@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { OpenApiDocument } from './api';
-import { buildReference, curlExample, filterReference } from './api-reference';
+import { buildReference, curlExample, filterReference, inlineCodeSegments } from './api-reference';
 import { MOCK_OPENAPI } from '../mocks/openapi';
 
 const doc: OpenApiDocument = {
@@ -143,5 +143,26 @@ describe('curlExample', () => {
 		expect(health && curlExample(health, 'https://t.example')).toBe(
 			'curl "https://t.example/health"'
 		);
+	});
+});
+
+describe('inlineCodeSegments', () => {
+	it('splits backtick pairs into code segments', () => {
+		expect(inlineCodeSegments('Keep `retention` (1–365) backups')).toEqual([
+			{ text: 'Keep ', code: false },
+			{ text: 'retention', code: true },
+			{ text: ' (1–365) backups', code: false }
+		]);
+		expect(inlineCodeSegments('`a` and `b`')).toEqual([
+			{ text: 'a', code: true },
+			{ text: ' and ', code: false },
+			{ text: 'b', code: true }
+		]);
+	});
+
+	it('leaves plain text and unpaired backticks alone', () => {
+		expect(inlineCodeSegments('plain')).toEqual([{ text: 'plain', code: false }]);
+		expect(inlineCodeSegments('one ` only')).toEqual([{ text: 'one ` only', code: false }]);
+		expect(inlineCodeSegments('')).toEqual([]);
 	});
 });

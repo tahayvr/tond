@@ -19,6 +19,16 @@ How they behave:
 - **They are runtime only.** Tond passes them to the container when it starts. They aren't passed to the image build.
 - **`PORT` is always set** to the app's container port.
 
+## Project variables
+
+A [project](/concepts/projects) can hold shared variables that every member gets. Tond layers them under each member's own:
+
+1. the project's shared variables are the base;
+2. the app's own variables go on top, so an app variable with the same name replaces the project's;
+3. `PORT` is always the app's container port.
+
+The same order applies to the app container, to `${VAR}` in a compose file and to cron jobs in the project (the job's own variables win). Previews follow their own rules on top of this (see below). Project variables are encrypted and removed from member apps' logs like app variables, and changes apply on each member's next deploy or cron run. Set them with the API (`PUT /api/v1/projects/{id}` with `env_vars`, which replaces the whole set; it needs the `env:write` scope).
+
 Docker Compose apps take their environment from the compose file. Tond runs `docker compose` with a cleared environment, so `${VAR}` in the file can't read tond-server's own environment.
 
 ## Who can see values
@@ -35,14 +45,14 @@ A deployer can set a value but can't read it back. Every reveal is recorded in t
 
 ## Previews
 
-Previews run pull-request code, so they don't inherit the app's environment. In **Settings → Environment** you choose which app variables previews may see, and you can add **preview overrides** that only previews get. Everything else is withheld. See [Previews](/concepts/previews).
+Previews run pull-request code, so they don't inherit the app's environment. In **Settings → Environment** you choose which app variables previews may see, and you can add **preview overrides** that only previews get. Everything else is withheld, project variables included. A shared name is looked up in the same layered environment production gets, so sharing `SENTRY_DSN` passes the project's value when the app doesn't set its own, and a preview override replaces both. See [Previews](/concepts/previews).
 
 ## Secrets in logs
 
 Before a line is stored or shown, Tond removes:
 
 1. credentials in URLs (`https://user:token@host` becomes `https://***@host`);
-2. the app's own secret values of 8 characters or more (environment variables, preview overrides, the webhook secret), including each line of a multi-line value such as a PEM key;
+2. the app's own secret values of 8 characters or more (environment variables, its project's shared variables, preview overrides, the webhook secret), including each line of a multi-line value such as a PEM key;
 3. common token formats: AWS access key IDs, GitHub, GitLab, Slack and Tond tokens, and private key blocks.
 
 Matches are replaced with `[redacted]`. This applies to deploy logs, container logs in the dashboard and API, and the excerpts shown for failed deploys. It lowers the risk of leaks but can't catch a secret the app transforms before printing it. Don't log secrets on purpose.
@@ -51,7 +61,7 @@ Matches are replaced with `[redacted]`. This applies to deploy logs, container l
 
 Every secret Tond stores is encrypted with AES-256-GCM:
 
-- app environment variables and preview overrides, and app webhook secrets;
+- app environment variables and preview overrides, project shared variables, and app webhook secrets;
 - cron job environments;
 - managed database passwords and connection-string overrides;
 - GitHub App credentials, GitLab tokens and registry passwords;

@@ -9,8 +9,10 @@
 //   GET   /api/v1/apps/{id}/preview-env/{key} — reveal one preview override (admin only, audit-logged)
 //   PATCH /api/v1/apps/{id}/preview-env       — {set, unset, share, unshare}
 //
-// Previews never inherit the app's environment: they get their own overrides
-// plus only the app variables an admin explicitly shares (shared_keys).
+// Deploys layer these over the project's shared env (secrets::effective_app_env:
+// the app's own value of a key wins). Previews never inherit that environment:
+// they get their own overrides plus only the variables an admin explicitly
+// shares (shared_keys), looked up in the layered env.
 //
 // Changes are stored immediately and reach the container on the next deploy.
 // Each patch is applied inside one IMMEDIATE transaction so two concurrent

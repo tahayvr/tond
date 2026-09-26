@@ -175,6 +175,55 @@ async fn service_domains_need_a_published_port_and_replace_the_list() {
 }
 
 #[tokio::test]
+async fn service_domains_set_through_the_api_are_what_the_proxy_routes() {
+    let state = test_state().await;
+    create(&state, "shop", None).await;
+    update(
+        &state,
+        "shop",
+        "cache",
+        Some(6379),
+        &["cache.example.com", "redis.example.com"],
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{}", e.0));
+    type Row = (String, String, String, String, i64, bool, bool);
+    let routes = || async {
+        sqlx::query_as::<_, Row>(tond_common::route_queries::COMPOSE_SERVICE_ROUTES)
+            .fetch_all(&state.db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+    };
+    assert!(
+        routes().await.is_empty(),
+        "not deployed yet: no host port, nothing to route"
+    );
+
+    // What a deploy does: the service gets its loopback host port, the app runs.
+    sqlx::query("UPDATE compose_services SET host_port = 8301 WHERE name = 'cache'")
+        .execute(&state.db)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    sqlx::query("UPDATE apps SET status = 'running' WHERE name = 'shop'")
+        .execute(&state.db)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let mut routed: Vec<(String, String, i64)> = routes()
+        .await
+        .into_iter()
+        .map(|(domain, _, _, service, port, _, _)| (domain, service, port))
+        .collect();
+    routed.sort();
+    assert_eq!(
+        routed,
+        vec![
+            ("cache.example.com".to_string(), "cache".to_string(), 8301),
+            ("redis.example.com".to_string(), "cache".to_string(), 8301),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn saving_a_compose_file_validates_and_resyncs_services() {
     let state = test_state().await;
     create(&state, "shop", None).await;

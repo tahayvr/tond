@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
+use sqlx::SqlitePool;
 use tond_common::{App, GitHubApp, INTEGRATION_SECRET_FIELDS, IntegrationConfig, ManagedDatabase};
 
 use crate::secret_key::{self, Purpose};
@@ -66,6 +67,45 @@ pub fn project_env(stored: &str) -> Result<BTreeMap<String, String>> {
 
 pub fn seal_project_env(env: &BTreeMap<String, String>) -> Result<String> {
     secret_key::seal_map(Purpose::ProjectEnv, env)
+}
+
+/// The shared env of project `project_id` (decrypted); empty when there is no
+/// project or it has been deleted.
+pub async fn project_env_of(
+    db: &SqlitePool,
+    project_id: Option<&str>,
+) -> Result<BTreeMap<String, String>> {
+    let Some(id) = project_id else {
+        return Ok(BTreeMap::new());
+    };
+    let stored: Option<String> = sqlx::query_scalar("SELECT env_vars FROM projects WHERE id = ?")
+        .bind(id)
+        .fetch_optional(db)
+        .await
+        .context("cannot load the project environment")?;
+    match stored {
+        Some(stored) => project_env(&stored)
+            .with_context(|| format!("cannot read the environment of project '{id}'")),
+        None => Ok(BTreeMap::new()),
+    }
+}
+
+/// Layer an env over its project's shared env: the project's variables are
+/// the base and a variable of the same name in `own` wins.
+pub fn layer_env(
+    project: BTreeMap<String, String>,
+    own: BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut env = project;
+    env.extend(own);
+    env
+}
+
+/// What an app's containers (and its compose `${VAR}` interpolation) get: its
+/// project's shared env with the app's own variables on top.
+pub async fn effective_app_env(db: &SqlitePool, app: &App) -> Result<BTreeMap<String, String>> {
+    let project = project_env_of(db, app.project_id.as_deref()).await?;
+    Ok(layer_env(project, app_env(app)?))
 }
 
 pub fn cron_env(stored: Option<&str>) -> Result<BTreeMap<String, String>> {
@@ -281,6 +321,47 @@ mod tests {
         );
         assert_eq!(app_env(&app).expect("open"), env);
         assert!(app_webhook_secret(&app).expect("open").is_some());
+    }
+
+    #[tokio::test]
+    async fn app_env_layers_over_its_project_env_and_the_app_wins() {
+        let db = SqlitePool::connect("sqlite::memory:")
+            .await
+            .unwrap_or_else(|e| panic!("pool: {e}"));
+        crate::db::migrate(&db)
+            .await
+            .unwrap_or_else(|e| panic!("migrate: {e}"));
+        let project = BTreeMap::from([
+            ("LOG_LEVEL".to_string(), "info".to_string()),
+            ("SENTRY_DSN".to_string(), "https://project".to_string()),
+        ]);
+        sqlx::query(
+            "INSERT INTO projects (id, name, env_vars, created_at, updated_at)
+             VALUES ('p1', 'shop', ?, 'x', 'x')",
+        )
+        .bind(seal_project_env(&project).unwrap_or_else(|e| panic!("seal: {e}")))
+        .execute(&db)
+        .await
+        .unwrap_or_else(|e| panic!("project: {e}"));
+
+        let mut app = App::new("api".into(), "image".into(), None, None, 3000);
+        let own = BTreeMap::from([("LOG_LEVEL".to_string(), "debug".to_string())]);
+        seal_new_app(&mut app, &own).expect("seal");
+
+        // Not in a project: only its own variables.
+        assert_eq!(effective_app_env(&db, &app).await.expect("env"), own);
+
+        app.project_id = Some("p1".into());
+        let env = effective_app_env(&db, &app).await.expect("env");
+        assert_eq!(env.get("LOG_LEVEL").map(String::as_str), Some("debug"));
+        assert_eq!(
+            env.get("SENTRY_DSN").map(String::as_str),
+            Some("https://project")
+        );
+
+        // A dangling project id (project deleted) is treated as no project.
+        app.project_id = Some("gone".into());
+        assert_eq!(effective_app_env(&db, &app).await.expect("env"), own);
     }
 
     #[test]

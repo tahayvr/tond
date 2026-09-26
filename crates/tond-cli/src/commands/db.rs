@@ -6,6 +6,11 @@ use clap::Subcommand;
 use crate::client::TondClient;
 use crate::output::{Output, outln};
 
+/// `--db-type`'s possible values: every engine the server supports.
+fn db_type_parser() -> clap::builder::PossibleValuesParser {
+    clap::builder::PossibleValuesParser::new(tond_common::ALL_ENGINES.iter().map(|e| e.db_type))
+}
+
 #[derive(Subcommand)]
 pub enum DbAction {
     /// List all managed databases
@@ -17,15 +22,16 @@ pub enum DbAction {
         /// Database name (alphanumeric + hyphens)
         name: String,
 
-        /// Database type: postgres, mysql, redis
-        #[arg(short = 't', long)]
+        /// Database engine
+        #[arg(short = 't', long, value_parser = db_type_parser())]
         db_type: String,
 
         /// Project ID to attach to (optional)
         #[arg(long)]
         project: Option<String>,
 
-        /// Memory limit in megabytes (default: 256)
+        /// Memory limit in megabytes (default: none set; every container is
+        /// capped at 75% of the server's RAM)
         #[arg(long)]
         memory_mb: Option<i64>,
     },

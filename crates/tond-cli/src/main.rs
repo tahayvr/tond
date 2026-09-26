@@ -399,25 +399,33 @@ fn completion_script(shell: clap_complete::Shell) -> String {
 async fn run(cli: Cli, out: &Output) -> Result<()> {
     // Connect lazily: `scanner`, `update`, `help` and `completions` don't use
     // the API, so they must work without a reachable server.
+    //
+    // `client()` doesn't touch the local socket until the first request, so a
+    // destructive command without --yes and a terminal refuses (exit 2)
+    // before a missing server could make it exit 8. `connect()` probes at
+    // once: `update` and `setup-link` fall back when the server is down.
     let idempotency_key = cli.idempotency_key.clone();
-    let connect = || -> Result<TondClient> {
+    let make = |lazy: bool| -> Result<TondClient> {
         let client = match cli.server.as_deref() {
             Some(url) => TondClient::new(url, cli.token.as_deref()),
+            None if lazy => TondClient::local_lazy(&cli.socket)?,
             None => TondClient::local(&cli.socket)?,
         };
         Ok(client.with_idempotency_key(idempotency_key.clone()))
     };
+    let connect = || make(false);
+    let client = || make(true);
 
     match cli.command {
-        Commands::Apps { action } => commands::apps::handle(&connect()?, out, action).await,
+        Commands::Apps { action } => commands::apps::handle(&client()?, out, action).await,
         Commands::Templates { action } => {
-            commands::templates::handle(&connect()?, out, action).await
+            commands::templates::handle(&client()?, out, action).await
         }
-        Commands::Projects { action } => commands::projects::handle(&connect()?, out, action).await,
-        Commands::Db { action } => commands::db::handle(&connect()?, out, action).await,
-        Commands::Cron { action } => commands::cron::handle(&connect()?, out, action).await,
+        Commands::Projects { action } => commands::projects::handle(&client()?, out, action).await,
+        Commands::Db { action } => commands::db::handle(&client()?, out, action).await,
+        Commands::Cron { action } => commands::cron::handle(&client()?, out, action).await,
         Commands::Integrations { action } => {
-            commands::integrations::handle(&connect()?, out, action).await
+            commands::integrations::handle(&client()?, out, action).await
         }
         Commands::Scanner { action } => commands::scanner::handle(out, action).await,
         Commands::Update {
@@ -452,17 +460,15 @@ async fn run(cli: Cli, out: &Output) -> Result<()> {
             )
             .await
         }
-        Commands::Settings { action } => commands::settings::handle(&connect()?, out, action).await,
+        Commands::Settings { action } => commands::settings::handle(&client()?, out, action).await,
         Commands::StorageProvider { action } => {
-            commands::storage_providers::handle(&connect()?, out, action).await
+            commands::storage_providers::handle(&client()?, out, action).await
         }
-        Commands::Snapshot { action } => {
-            commands::snapshots::handle(&connect()?, out, action).await
-        }
-        Commands::Token { action } => commands::tokens::handle(&connect()?, out, action).await,
-        Commands::Audit { action } => commands::audit::handle(&connect()?, out, action).await,
-        Commands::Users { action } => commands::users::handle(&connect()?, out, action).await,
-        Commands::Passwd => commands::settings::handle_passwd(&connect()?, out).await,
+        Commands::Snapshot { action } => commands::snapshots::handle(&client()?, out, action).await,
+        Commands::Token { action } => commands::tokens::handle(&client()?, out, action).await,
+        Commands::Audit { action } => commands::audit::handle(&client()?, out, action).await,
+        Commands::Users { action } => commands::users::handle(&client()?, out, action).await,
+        Commands::Passwd => commands::settings::handle_passwd(&client()?, out).await,
         Commands::SetupLink => {
             let data_dir = cli
                 .socket
@@ -704,6 +710,98 @@ mod tests {
             }
             _ => panic!("expected Settings command"),
         }
+    }
+
+    #[test]
+    fn source_and_db_types_accept_every_server_value_and_nothing_else() {
+        for source_type in tond_common::APP_SOURCE_TYPES {
+            Cli::try_parse_from(["tond", "apps", "create", "x", "-t", source_type])
+                .unwrap_or_else(|err| panic!("--source-type {source_type}: {err}"));
+        }
+        assert!(Cli::try_parse_from(["tond", "apps", "create", "x", "-t", "svn"]).is_err());
+        for engine in tond_common::ALL_ENGINES {
+            Cli::try_parse_from(["tond", "db", "create", "x", "-t", engine.db_type])
+                .unwrap_or_else(|err| panic!("--db-type {}: {err}", engine.db_type));
+        }
+        let err = Cli::try_parse_from(["tond", "db", "create", "x", "-t", "oracle"])
+            .err()
+            .unwrap_or_else(|| panic!("an unknown engine must be refused"));
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn create_help_lists_the_real_values_and_no_stale_defaults() {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let apps = cmd
+            .find_subcommand_mut("apps")
+            .and_then(|c| c.find_subcommand_mut("create"))
+            .unwrap_or_else(|| panic!("apps create"))
+            .render_long_help()
+            .to_string();
+        for value in tond_common::APP_SOURCE_TYPES {
+            assert!(apps.contains(value), "apps create help lacks {value}");
+        }
+        assert!(!apps.contains("default: 256"), "{apps}");
+        assert!(!apps.contains("default: 0.5"), "{apps}");
+        let db = cmd
+            .find_subcommand_mut("db")
+            .and_then(|c| c.find_subcommand_mut("create"))
+            .unwrap_or_else(|| panic!("db create"))
+            .render_long_help()
+            .to_string();
+        for engine in tond_common::ALL_ENGINES {
+            assert!(
+                db.contains(engine.db_type),
+                "db create help lacks {}",
+                engine.db_type
+            );
+        }
+        assert!(!db.contains("default: 256"), "{db}");
+    }
+
+    #[test]
+    fn apps_create_template_refuses_options_the_template_decides() {
+        for extra in [
+            &["--port", "8080"][..],
+            &["--memory-mb", "512"],
+            &["--cpus", "1"],
+            &["--health-path", "/up"],
+            &["--health-interval", "10"],
+            &["--health-threshold", "5"],
+            &["--drain-timeout", "60"],
+            &["--source", "nginx"],
+            &["--branch", "dev"],
+        ] {
+            let mut args = vec![
+                "tond",
+                "apps",
+                "create",
+                "vault",
+                "--template",
+                "vaultwarden",
+            ];
+            args.extend_from_slice(extra);
+            let err = Cli::try_parse_from(&args)
+                .err()
+                .unwrap_or_else(|| panic!("--template with {extra:?} must be refused"));
+            assert_eq!(err.exit_code(), 2, "{extra:?}: usage error");
+        }
+        // What a template does take: a domain, inputs and --yes.
+        Cli::try_parse_from([
+            "tond",
+            "apps",
+            "create",
+            "vault",
+            "--template",
+            "vaultwarden",
+            "--domain",
+            "vault.example.com",
+            "--env",
+            "ADMIN_EMAIL=a@b.c",
+            "--yes",
+        ])
+        .unwrap_or_else(|err| panic!("template with domain and inputs: {err}"));
     }
 
     #[test]
@@ -1149,6 +1247,47 @@ mod tests {
             );
             assert_eq!(stdout, "", "{args:?}: nothing on stdout");
         }
+    }
+
+    #[tokio::test]
+    async fn destructive_commands_refuse_before_connecting_to_a_missing_socket() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let socket = dir.path().join("missing.sock");
+        let socket = socket.to_string_lossy().to_string();
+        for args in [
+            vec!["apps", "delete", "demo"],
+            vec!["apps", "rollback", "demo"],
+            vec!["apps", "volume", "remove", "demo", "/data"],
+            vec!["apps", "previews", "delete", "demo", "p1"],
+            vec!["projects", "delete", "p"],
+            vec!["projects", "preview", "delete", "p", "pp1"],
+            vec!["db", "delete", "d"],
+            vec!["cron", "delete", "nightly"],
+            vec!["integrations", "delete", "i1"],
+            vec!["storage-provider", "delete", "s1"],
+            vec!["snapshot", "delete", "s1"],
+            vec!["snapshot", "restore", "s1"],
+            vec!["snapshot", "rollback", "s1", "--app", "demo"],
+            vec!["token", "revoke", "tok-1"],
+            vec!["apps", "domains", "remove", "demo", "www.example.com"],
+        ] {
+            let mut argv = vec!["tond", "--socket", &socket];
+            argv.extend(args.iter().copied());
+            let (res, _, _) = run_capture(&argv, false).await;
+            let err = res.err().unwrap_or_else(|| panic!("{args:?} must refuse"));
+            assert_eq!(error::exit_code(&err), 2, "{args:?}: {err}");
+        }
+        // With --yes the missing server is reported as before (exit 8).
+        let (res, _, _) = run_capture(
+            &["tond", "--socket", &socket, "apps", "delete", "demo", "-y"],
+            false,
+        )
+        .await;
+        let err = res
+            .err()
+            .unwrap_or_else(|| panic!("a missing server must fail"));
+        assert_eq!(error::exit_code(&err), 8, "{err}");
+        assert!(err.to_string().contains("socket not found"), "{err}");
     }
 
     #[tokio::test]

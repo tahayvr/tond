@@ -170,6 +170,7 @@ delete_e2e_resources() {
         tond db delete "$db" -y > /dev/null 2>&1 || true
     done
     tond cron delete e2e-cron -y > /dev/null 2>&1 || true
+    tond projects delete e2e-envproj -y > /dev/null 2>&1 || true
 }
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
@@ -608,6 +609,18 @@ pass "HTTP redirects to HTTPS"
 [[ "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: not-served.example.net' "http://${IP}/")" == 404 ]] \
     || fail "plain HTTP for a host Tond does not serve must be 404, not an open redirect"
 pass "HTTP for an unknown host → 404 (no open redirect)"
+if [[ -s /proc/net/if_inet6 ]]; then
+    # tond-proxy listens on IPv6 too when the host has it (IPV6_V6ONLY sockets).
+    ss -Htln | grep -q '\[::\]:443 ' || fail "tond-proxy must listen on [::]:443 on a host with IPv6: $(ss -Htln)"
+    ss -Htln | grep -q '\[::\]:80 ' || fail "tond-proxy must listen on [::]:80 on a host with IPv6: $(ss -Htln)"
+    wait_for 30 "https://${WHOAMI_DOMAIN} over IPv6" \
+        bash -c "curl -sk --resolve '${WHOAMI_DOMAIN}:443:[::1]' 'https://${WHOAMI_DOMAIN}/' | grep -q Hostname:"
+    [[ "$(curl -s -o /dev/null -w '%{http_code}' --resolve "${WHOAMI_DOMAIN}:80:[::1]" "http://${WHOAMI_DOMAIN}/")" == 301 ]] \
+        || fail "plain HTTP over IPv6 should redirect to HTTPS"
+    pass "tond-proxy serves ports 80 and 443 over IPv6 as well"
+else
+    echo "  (no IPv6 on this host: skipping the IPv6 listener check)"
+fi
 
 step "Request metrics and access logs (tond-proxy counters, opt-in access log)"
 # The proxy counts every request per route; tond-server scrapes the counters
@@ -863,6 +876,11 @@ tond apps delete e2e-whoami < /dev/null > /dev/null 2>&1; cli_rc=$?
 set -e
 [[ "$cli_rc" == 2 ]] || fail "a destructive command without --yes and without a terminal must exit 2, got ${cli_rc}"
 [[ "$(app_field e2e-whoami name)" == e2e-whoami ]] || fail "a refused delete must not delete the app"
+set +e
+tond --socket /nonexistent/tond.sock apps delete e2e-whoami < /dev/null > /dev/null 2>&1; cli_rc=$?
+set -e
+[[ "$cli_rc" == 2 ]] \
+    || fail "without --yes the refusal (exit 2) must come before connecting, even with no server socket; got ${cli_rc}"
 tond help exit-codes --json | jq -e '.exit_codes | map(.exit_code) | contains([0,1,2,3,4,5,6,7,8])' > /dev/null \
     || fail "tond help exit-codes --json must list exit codes 0-8"
 [[ "$(tond completions bash)" == *_tond* ]] || fail "tond completions bash must print a completion script"
@@ -1071,6 +1089,11 @@ step "Scheduled database backups and restore into a new database"
 [[ "$(api_req PUT /api/v1/databases/e2e-redis/backup-schedule '{"schedule":"0 3 * * *","retention":0}')" == 400 ]] \
     || fail "a backup schedule keeping zero backups must be refused: $(cat "$API_BODY")"
 [[ "$(jq -r '.error.code' "$API_BODY")" == INVALID_INPUT ]] || fail "expected INVALID_INPUT: $(cat "$API_BODY")"
+for body in '{"full_retention_count":0}' '{"pre_deploy_retention_per_app":0}'; do
+    [[ "$(api_req PUT /api/v1/snapshots/config "$body")" == 400 ]] \
+        || fail "a snapshot retention of 0 must be refused (${body}): $(cat "$API_BODY")"
+done
+pass "retention counts below one are refused (database schedule, full and pre-deploy snapshots)"
 # Data to find again in the restored copy.
 docker exec -e REDISCLI_AUTH="${REDIS_PASS}" tond-db-e2e-redis redis-cli --no-auth-warning --user "${REDIS_USER}" \
     SET e2e-restore-key restored-ok > /dev/null
@@ -1669,7 +1692,12 @@ wait_for 30 "route after queued deploys" bash -c "curl -sk --resolve '${WHOAMI_D
 
 step "Background worker (readiness: none — no port, no domain, never routed)"
 # A worker that serves nothing must deploy (the HTTP release check would fail it).
-code=$(api_req POST /api/v1/apps '{"name":"e2e-worker","source_type":"dockerfile","dockerfile_content":"FROM alpine:3\nCMD [\"sh\", \"-c\", \"while true; do echo tick; sleep 5; done\"]","readiness":"none","ready_after_secs":5}')
+# It lives in a project with shared env vars: the project's are the base, the
+# app's own value of the same key wins.
+code=$(api_req POST /api/v1/projects '{"name":"e2e-envproj","env_vars":{"E2E_SHARED":"from-project","E2E_MODE":"project"}}')
+[[ "$code" == 201 ]] || fail "creating a project with shared env vars should succeed, got ${code}: $(cat "$API_BODY")"
+ENVPROJ_ID=$(jq -r '.data.id' "$API_BODY")
+code=$(api_req POST /api/v1/apps '{"name":"e2e-worker","source_type":"dockerfile","dockerfile_content":"FROM alpine:3\nCMD [\"sh\", \"-c\", \"while true; do echo tick; sleep 5; done\"]","readiness":"none","ready_after_secs":5,"project_id":"'"${ENVPROJ_ID}"'","env_vars":{"E2E_MODE":"app"}}')
 [[ "$code" == 201 ]] || fail "creating a background worker should succeed, got ${code}: $(cat "$API_BODY")"
 code=$(api_req POST /api/v1/apps '{"name":"e2e-worker-domain","source_type":"image","source_url":"alpine:3","readiness":"none","domain":"worker.example.test"}')
 [[ "$code" == 400 ]] || fail "a background worker with a domain must be rejected, got ${code}"
@@ -1686,6 +1714,12 @@ jq -e '.data.phases[] | select(.phase == "health") | .label == "Stay up for 5s" 
 [[ "$(app_field e2e-worker readiness)" == none ]] || fail "the app must report readiness none"
 docker logs tond-e2e-worker 2>&1 | grep -q tick || fail "the worker container should be running its loop"
 pass "a background worker deploys to running with no domain (readiness step: stay up 5s)"
+WORKER_ENV=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' tond-e2e-worker)
+grep -qx 'E2E_SHARED=from-project' <<< "$WORKER_ENV" \
+    || fail "a project's shared env var must reach its member app's container (env: ${WORKER_ENV})"
+grep -qx 'E2E_MODE=app' <<< "$WORKER_ENV" \
+    || fail "the app's own env var must win over the project's of the same name (env: ${WORKER_ENV})"
+pass "project env vars reach member apps; the app's own value of a key wins"
 
 step "One-click templates (catalog, generated credentials, encrypted inputs, volume owners)"
 CATALOG=$(api /api/v1/templates)
@@ -1710,6 +1744,10 @@ code=$(api_req POST /api/v1/templates/vaultwarden/deploy '{"name":"Bad Name","in
     || fail "a template deploy with an invalid name must be 400 INVALID_INPUT on field name, got ${code}: $(cat "$API_BODY")"
 code=$(api_req POST /api/v1/templates/nope/deploy '{"name":"e2e-nope","inputs":{}}')
 [[ "$code" == 404 ]] || fail "an unknown template must be 404, got ${code}"
+# The CLI refuses options a template decides itself instead of ignoring them.
+rc=0; tond apps create e2e-nope --template vaultwarden --port 8080 -y > /dev/null 2>&1 || rc=$?
+[[ "$rc" == 2 ]] || fail "tond apps create --template with --port must be a usage error (exit 2), got ${rc}"
+pass "tond apps create --template refuses --port and the other template-decided options (exit 2)"
 code=$(api_req POST /api/v1/templates/vaultwarden/deploy \
     "{\"name\":\"e2e-vault\",\"domain\":\"${VAULT_DOMAIN}\",\"inputs\":{},\"allow_low_memory\":true}")
 [[ "$code" == 202 ]] || fail "deploying the vaultwarden template should be accepted, got ${code}: $(cat "$API_BODY")"
