@@ -16,7 +16,16 @@ function renderStep(props: {
 			healthCheckPath: '/health',
 			healthCheckInterval: 30,
 			healthFailureThreshold: 3,
-			drainTimeout: 30
+			drainTimeout: 30,
+			containerPort: 8080,
+			sourceSubType: 'git-public' as const,
+			sourceUrl: 'https://github.com/example/shop.git',
+			dockerfileContent: '',
+			composeContent: '',
+			registryCredentialId: '',
+			buildMethod: 'tbuild' as const,
+			templatePort: null,
+			portTouched: false
 		}
 	});
 }

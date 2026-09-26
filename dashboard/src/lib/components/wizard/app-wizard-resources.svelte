@@ -6,6 +6,7 @@
 	import { Separator } from '$lib/components/ui/separator/index.js';
 	import LockIcon from '~icons/ri/lock-line';
 	import type { VolumeInput } from '$lib/api';
+	import { defaultMemoryCap, formatBytes } from '$lib/wizard-detect';
 
 	interface Props {
 		appName: string;
@@ -18,10 +19,13 @@
 		newVolumePath: string;
 		onAddVolume: () => void;
 		onRemoveVolume: (index: number) => void;
+		/** The server's total memory, for explaining the default cap (null = unknown). */
+		hostMemoryBytes?: number | null;
 	}
 
 	let {
 		appName,
+		hostMemoryBytes = null,
 		canEditVolumes,
 		memoryLimit = $bindable(null),
 		memoryUnit = $bindable('mb'),
@@ -50,7 +54,12 @@
 		<div class="space-y-2">
 			<Label>Memory Limit</Label>
 			<div class="flex gap-2">
-				<Input type="number" bind:value={memoryLimit} placeholder="Unlimited" min={1} />
+				<Input
+					type="number"
+					bind:value={memoryLimit}
+					placeholder="Default cap (75% of RAM)"
+					min={1}
+				/>
 				<Select.Root type="single" bind:value={memoryUnit}>
 					<Select.Trigger class="w-24">
 						{memoryUnit.toUpperCase()}
@@ -61,7 +70,12 @@
 					</Select.Content>
 				</Select.Root>
 			</div>
-			<p class="text-xs text-muted-foreground">Leave empty for unlimited memory</p>
+			<p class="text-xs text-muted-foreground">
+				Leave empty for no app-specific limit. Tond still caps every container at 75% of the
+				server's memory{hostMemoryBytes
+					? ` (${formatBytes(defaultMemoryCap(hostMemoryBytes))} on this server)`
+					: ''}, so one app can't take the whole server down.
+			</p>
 		</div>
 
 		<div class="space-y-2">
@@ -70,12 +84,14 @@
 				id="cpu-limit"
 				type="number"
 				bind:value={cpuLimit}
-				placeholder="Unlimited"
+				placeholder="All cores"
 				min={0.1}
 				max={32}
 				step={0.1}
 			/>
-			<p class="text-xs text-muted-foreground">CPU cores (e.g., 0.5 = half a core)</p>
+			<p class="text-xs text-muted-foreground">
+				CPU cores (0.5 = half a core). Leave empty to let the app use every core.
+			</p>
 		</div>
 	</div>
 

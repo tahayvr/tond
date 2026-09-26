@@ -21,12 +21,11 @@ use axum::{
 use tond_common::*;
 
 use crate::{
-    alerts,
     audit_log::write_audit_log,
     auth::{Authz, RateLimit, scope},
     deploy, docker,
     error::AppError,
-    handlers::env_map_from_json,
+    handlers::{self, env_map_from_json},
     networks, secrets,
     state::AppState,
 };
@@ -412,33 +411,20 @@ pub async fn deploy_project(
     // allocated". Running them one after another ensures each deploy binds its
     // port before the next one calls find_free_port.
     let state_clone = state.clone();
+    let detail = Some(format!(
+        "project {} ({})",
+        project.name,
+        handlers::deploy_trigger(&auth).1.unwrap_or_default()
+    ));
     tokio::spawn(async move {
         for mut app in apps {
-            if let Err(e) = deploy::deploy(&state_clone, &mut app, "manual").await {
-                tracing::error!("Project deploy error for {}: {}", app.name, e);
-                let _ = sqlx::query(
-                    "UPDATE apps SET status = 'failed', updated_at = datetime('now') WHERE id = ?",
-                )
-                .bind(&app.id)
-                .execute(&state_clone.db)
-                .await;
-                alerts::fire_event_alerts(
-                    &state_clone,
-                    "deployment_failure",
-                    Some(app.id.as_str()),
-                    Some(app.name.as_str()),
-                    Some(&e.to_string()),
-                )
-                .await;
-            } else {
-                alerts::fire_event_alerts(
-                    &state_clone,
-                    "deployment_success",
-                    Some(app.id.as_str()),
-                    Some(app.name.as_str()),
-                    None,
-                )
-                .await;
+            let req = deploy::DeployRequest::source("manual", detail.clone());
+            match deploy::create(&state_clone, &app, &req).await {
+                // run() records the result, updates the app status and alerts.
+                Ok(id) => {
+                    let _ = deploy::run(&state_clone, &mut app, &id, &req).await;
+                }
+                Err(e) => tracing::error!("Project deploy error for {}: {}", app.name, e),
             }
         }
     });

@@ -48,7 +48,6 @@ use sha2::{Digest, Sha256};
 use tond_common::{ApiResponse, App, GitHubApp, GitLabToken, PreviewDeployment, TondError};
 
 use crate::{
-    alerts,
     auth::RateLimiter,
     deploy, docker,
     domains::preview_host,
@@ -294,11 +293,27 @@ pub fn sanitize_provider_url(raw: Option<&str>) -> Option<String> {
 
 // ── Shared deploy trigger ──────────────────────────────────────────────────
 
+/// "GitHub push to main" — the deployment's trigger detail.
+fn webhook_trigger_detail(provider: &str, branch: Option<&str>) -> String {
+    let name = match provider {
+        "github" => "GitHub",
+        "github-app" => "GitHub App",
+        "gitlab" => "GitLab",
+        "gitea" => "Gitea",
+        "generic" => "Generic webhook",
+        other => other,
+    };
+    match branch {
+        Some(b) => format!("{name} push to {b}"),
+        None => name.to_string(),
+    }
+}
+
 /// Check auto_deploy, the branch filter and the per-app rate limit, then spawn
 /// a background deploy.
 async fn trigger_webhook_deploy(
     state: &AppState,
-    mut app: App,
+    app: App,
     provider: &str,
     branch: Option<&str>,
 ) -> Response {
@@ -341,35 +356,20 @@ async fn trigger_webhook_deploy(
         branch
     );
 
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = deploy::deploy(&state_clone, &mut app, "webhook").await {
-            tracing::error!("[webhook] deploy failed for {}: {}", app.id, e);
-            let _ = sqlx::query(
-                "UPDATE apps SET status = 'failed', updated_at = datetime('now') WHERE id = ?",
-            )
-            .bind(&app.id)
-            .execute(&state_clone.db)
-            .await;
-            alerts::fire_event_alerts(
-                &state_clone,
-                "deployment_failure",
-                Some(app.id.as_str()),
-                Some(app.name.as_str()),
-                Some(&e.to_string()),
-            )
-            .await;
-        } else {
-            alerts::fire_event_alerts(
-                &state_clone,
-                "deployment_success",
-                Some(app.id.as_str()),
-                Some(app.name.as_str()),
-                None,
-            )
-            .await;
-        }
-    });
+    let detail = webhook_trigger_detail(provider, branch);
+    if let Err(e) = deploy::start(
+        state,
+        app,
+        deploy::DeployRequest::source("webhook", Some(detail)),
+    )
+    .await
+    {
+        tracing::error!("[webhook/{}] could not start deploy: {}", provider, e);
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not start the deployment",
+        );
+    }
 
     (StatusCode::ACCEPTED, Json(ApiResponse::<()>::ok(()))).into_response()
 }
@@ -1509,6 +1509,15 @@ mod tests {
     }
 
     // ── Pure helpers ──
+
+    #[test]
+    fn webhook_trigger_detail_names_the_provider_and_branch() {
+        assert_eq!(
+            webhook_trigger_detail("github", Some("main")),
+            "GitHub push to main"
+        );
+        assert_eq!(webhook_trigger_detail("generic", None), "Generic webhook");
+    }
 
     #[test]
     fn verify_github_signature_accepts_valid_signature_and_rejects_invalid_formats() {

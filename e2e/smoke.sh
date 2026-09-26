@@ -132,7 +132,7 @@ wait_for_app_running() {
 }
 
 delete_e2e_resources() {
-    for app in e2e-whoami e2e-static e2e-rooted e2e-compose e2e-auto; do
+    for app in e2e-whoami e2e-static e2e-rooted e2e-compose e2e-badport e2e-auto; do
         tond apps delete "$app" -y > /dev/null 2>&1 || true
     done
     tond db delete e2e-redis -y > /dev/null 2>&1 || true
@@ -1058,6 +1058,60 @@ running_image=$(docker inspect tond-e2e-whoami | jq -r '.[0].Config.Image')
 [[ "$running_image" == "$FIRST_TAG" ]] || fail "rollback must run exactly ${FIRST_TAG}, got ${running_image}"
 wait_for 60 "route after rollback" bash -c "curl -sk --resolve '${WHOAMI_DOMAIN}:443:${IP}' 'https://${WHOAMI_DOMAIN}/' | grep -q Hostname:"
 pass "rollback restored the exact previous image and traffic follows"
+
+step "Deploy UX: phases, trigger, likely cause, DNS check"
+ROLLBACK_ROW=$(deployments | jq -c '.data[0]')
+[[ "$(jq -r '.rollback_of' <<< "$ROLLBACK_ROW")" == "$FIRST_ID" ]] \
+    || fail "the rollback deployment must name the deployment it restored: ${ROLLBACK_ROW}"
+jq -e '[.phases[] | select(.status != "skipped")] | length > 0 and all(.status == "succeeded")' <<< "$ROLLBACK_ROW" > /dev/null \
+    || fail "a successful rollback must record every step as succeeded: ${ROLLBACK_ROW}"
+jq -e '.duration_secs >= 0' <<< "$ROLLBACK_ROW" > /dev/null || fail "deployments must record a duration"
+pass "rollback recorded its target, steps and duration"
+
+code=$(api_req POST /api/apps/e2e-whoami/deploy '{}')
+[[ "$code" == 202 ]] || fail "deploy should be accepted, got ${code}: $(cat "$API_BODY")"
+DEP_ID=$(jq -r '.data.deployment_id' "$API_BODY")
+[[ "$DEP_ID" =~ ^[0-9a-f-]{36}$ ]] || fail "deploy must return the new deployment's id, got: $(cat "$API_BODY")"
+wait_for 300 "deployment ${DEP_ID} to succeed" \
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/apps/e2e-whoami/deployments/${DEP_ID} | jq -e '.data.status == \"succeeded\"'"
+DETAIL=$(api "/api/apps/e2e-whoami/deployments/${DEP_ID}")
+jq -e '.data.trigger_source == "cli"' <<< "$DETAIL" > /dev/null \
+    || fail "a deploy over the local socket is triggered by the CLI: $(jq -c '.data | {trigger_source, trigger_detail}' <<< "$DETAIL")"
+jq -e '[.data.phases[] | .phase] == ["clone","build","start","health","release"]' <<< "$DETAIL" > /dev/null \
+    || fail "deployments record the five steps: $(jq -c '.data.phases' <<< "$DETAIL")"
+jq -e '.data.logs | length > 0 and any(.message | test("Pulling image"))' <<< "$DETAIL" > /dev/null \
+    || fail "the deployment's own log must be returned with it"
+pass "deploy returned ${DEP_ID}; its steps, trigger and log are recorded"
+wait_for_app_running e2e-whoami 120
+
+# whoami listens on 80; telling Tond 8081 must fail the first deploy with
+# a clear cause instead of 'running' with nothing behind the route.
+tond apps create e2e-badport --source-type image --source traefik/whoami:v1.10 --port 8081 > /dev/null
+code=$(api_req POST /api/apps/e2e-badport/deploy '{}')
+[[ "$code" == 202 ]] || fail "deploy should be accepted, got ${code}: $(cat "$API_BODY")"
+BAD_ID=$(jq -r '.data.deployment_id' "$API_BODY")
+wait_for 240 "deployment ${BAD_ID} to fail" \
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/apps/e2e-badport/deployments/${BAD_ID} | jq -e '.data.status == \"failed\"'"
+BAD=$(api "/api/apps/e2e-badport/deployments/${BAD_ID}")
+[[ "$(jq -r '.data.failure.code' <<< "$BAD")" == port_not_listening ]] \
+    || fail "a wrong port must be classified as port_not_listening: $(jq -c '.data.failure' <<< "$BAD")"
+jq -e '.data.failure.title | test("8081")' <<< "$BAD" > /dev/null || fail "the cause must name the expected port"
+jq -e '.data.phases[] | select(.phase == "health") | .status == "failed"' <<< "$BAD" > /dev/null \
+    || fail "the health step must be the one that failed"
+[[ "$(app_field e2e-badport status)" == failed ]] || fail "a failed first deploy leaves the app failed"
+[[ -z "$(docker ps -aq --filter name='^tond-e2e-badport$')" ]] || fail "the container of a failed deploy must be removed"
+pass "wrong port → failed with 'port_not_listening' naming port 8081"
+
+code=$(api_req GET "/api/domains/check?domain=${WHOAMI_DOMAIN}" '')
+[[ "$code" == 200 ]] || fail "domain check should answer 200, got ${code}: $(cat "$API_BODY")"
+jq -e '.data.dns.status | IN("ok","mismatch","missing","inconclusive")' "$API_BODY" > /dev/null \
+    || fail "domain check must report a DNS status: $(cat "$API_BODY")"
+jq -e --arg d "$WHOAMI_DOMAIN" '.data.domain == $d and (.data.records | all(.type == "A" or .type == "AAAA"))' "$API_BODY" > /dev/null \
+    || fail "domain check must list A/AAAA records to create: $(cat "$API_BODY")"
+DNS_STATUS=$(jq -r '.data.dns.status' "$API_BODY")
+code=$(api_req GET "/api/domains/check?domain=not_a_domain" '')
+[[ "$code" == 400 ]] || fail "an invalid domain must be rejected with 400, got ${code}"
+pass "domain check reports DNS '${DNS_STATUS}' for ${WHOAMI_DOMAIN}; invalid domains → 400"
 
 step "Resource metrics (cgroup sampling, restarts, cached host stats)"
 # The collector samples every 30 s; the first reading only primes the rates.

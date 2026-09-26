@@ -1,7 +1,7 @@
 // deploy/build.rs — image build helpers
 //
 // Provides everything needed to turn source code into a Docker image:
-//   build_from_dir()             — public entry point for tarball-upload deploys
+//   build_from_dir_with_method() is also the entry point for tarball uploads
 //   build_from_git()             — clone a git repo then call build_from_dir_with_method()
 //   build_from_dir_with_method() — dispatch to the right builder based on build_method
 //   build_with_dockerfile()      — run `docker build` with streaming log output
@@ -11,18 +11,33 @@
 // All builder functions write timestamped log entries via super::core::log_deploy().
 
 use anyhow::Result;
-use tond_common::App;
+use tond_common::DeployPhase;
 
 use crate::state::AppState;
 use crate::{compose_policy, docker, volumes};
 
-use super::images;
+use super::progress;
 
 use super::core::log_deploy;
 use super::git::{
-    GIT_ALLOW_PROTOCOL, GitHttpAuth, clone_args, ensure_known_hosts, git_auth_env,
-    known_hosts_path, redact_url_credentials, ssh_command,
+    COMMIT_LOG_ARGS, CommitInfo, GIT_ALLOW_PROTOCOL, GitHttpAuth, clone_args, ensure_known_hosts,
+    git_auth_env, known_hosts_path, parse_commit_log, redact_url_credentials, ssh_command,
 };
+
+/// The commit checked out in `dir` (best-effort).
+async fn read_commit(dir: &str) -> Option<CommitInfo> {
+    let output = tokio::process::Command::new("git")
+        .args(COMMIT_LOG_ARGS)
+        .current_dir(dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_commit_log(&String::from_utf8_lossy(&output.stdout))
+}
 
 fn build_work_dir(data_dir: &str, app_name: &str) -> String {
     format!("{}/builds/{}", data_dir, app_name)
@@ -232,23 +247,6 @@ pub(super) struct BuildOptions<'a> {
     pub base_dir: Option<&'a str>,
 }
 
-/// Build from a local directory (used for tarball uploads).
-///
-/// Constructs [`BuildOptions`] from the app record and delegates to
-/// [`build_from_dir_with_method`], which contains the single canonical
-/// implementation of the build-method dispatch logic.
-///
-/// The image is tagged `tond-<app>:upload`; `deploy()` re-tags it per deployment.
-pub async fn build_from_dir(state: &AppState, app: &App, dir: &str) -> Result<String> {
-    let build_opts = BuildOptions {
-        method: &app.build_method,
-        static_build: app.static_build != 0,
-        base_dir: app.base_dir.as_deref(),
-    };
-    let image_tag = images::upload_tag(&app.name);
-    build_from_dir_with_method(state, &app.id, &image_tag, dir, &build_opts, None, "upload").await
-}
-
 /// Clone a git repository and build a Docker image from it.
 ///
 /// `build_opts.method` controls which builder is used:
@@ -287,7 +285,7 @@ pub(super) async fn build_from_git(
     let key_path = deploy_key_path(&data_dir, app_id);
     let key_exists = tokio::fs::metadata(&key_path).await.is_ok();
 
-    // Clone the repo
+    // Clone the repo (the caller has started the clone phase)
     log_deploy(
         state,
         app_id,
@@ -330,9 +328,33 @@ pub(super) async fn build_from_git(
         );
     }
 
+    // Record which commit this deployment builds (before .git goes away).
+    if let Some(deployment_id) = deployment_id
+        && let Some(commit) = read_commit(&work_dir).await
+    {
+        log_deploy(
+            state,
+            app_id,
+            "info",
+            trigger_source,
+            &format!(
+                "Commit {} by {}: {}",
+                &commit.sha[..commit.sha.len().min(7)],
+                commit.author,
+                commit.message
+            ),
+        )
+        .await?;
+        progress::record_commit(state, app_id, deployment_id, &commit).await;
+    }
+
     // Drop the repository metadata before building: .git/config and history
     // must never end up in the build context or an image.
     tokio::fs::remove_dir_all(std::path::Path::new(&work_dir).join(".git")).await?;
+
+    if deployment_id.is_some() {
+        progress::start(state, app_id, DeployPhase::Build).await;
+    }
 
     let image_tag = build_from_dir_with_method(
         state,

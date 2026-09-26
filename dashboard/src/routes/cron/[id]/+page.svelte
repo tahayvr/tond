@@ -18,7 +18,7 @@
 		cronVolumeLabel,
 		validateCronVolume
 	} from '$lib/components/forms/cron-volume-fields.svelte';
-	import type { CronVolumeInput } from '$lib/api';
+	import type { CronVolumeInput, LogLine } from '$lib/api';
 	import { intOr, optionalInt } from '$lib/form-numbers';
 	import {
 		draftPatch,
@@ -46,6 +46,7 @@
 	import Breadcrumb from '$lib/components/nav/breadcrumb.svelte';
 	import ConfirmDeleteDialog from '$lib/components/dialogs/confirm-delete-dialog.svelte';
 	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
+	import LogViewer from '$lib/components/logs/log-viewer.svelte';
 	import Play from '~icons/ri/play-line';
 	import RotateCw from '~icons/ri/restart-line';
 	import ChevronDown from '~icons/ri/arrow-down-s-line';
@@ -316,6 +317,20 @@
 		if (s === 'success') return 'default';
 		if (s === 'failed') return 'destructive';
 		return 'outline';
+	}
+
+	/** A run's captured output as log lines for the viewer (cached per output string). */
+	const outputLineCache: Record<string, LogLine[]> = {};
+	function runOutputLines(output: string): LogLine[] {
+		let lines = outputLineCache[output];
+		if (!lines) {
+			lines = output
+				.replace(/\n$/, '')
+				.split('\n')
+				.map((text) => ({ source: 'container' as const, text }));
+			outputLineCache[output] = lines;
+		}
+		return lines;
 	}
 
 	function formatDuration(run: CronJobRun): string {
@@ -756,8 +771,13 @@
 									<!-- Expanded output -->
 									{#if isExpanded && run.output}
 										<div class="bg-muted/20 px-4 pt-1 pb-3">
-											<pre
-												class="max-h-64 overflow-y-auto rounded-sm bg-muted p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap">{run.output}</pre>
+											<LogViewer
+												lines={runOutputLines(run.output)}
+												downloadName="{job?.name ?? 'cron'}-run-{run.id.slice(0, 8)}"
+												label="Run output"
+												heightClass={runOutputLines(run.output).length > 12 ? 'h-64' : ''}
+												timestamps={false}
+											/>
 										</div>
 									{:else if isExpanded}
 										<div class="bg-muted/20 px-4 pt-1 pb-3">

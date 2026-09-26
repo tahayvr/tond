@@ -12,6 +12,9 @@ import type {
 	CronJob,
 	CronJobRun,
 	Deployment,
+	DeploymentLogLine,
+	DeployPhase,
+	PhaseRecord,
 	DeployKey,
 	GitHubApp,
 	GitHubRepo,
@@ -777,6 +780,41 @@ export function makeMockMetrics(range: string, empty = false): MetricsResponse {
 
 // ── Deployments ────────────────────────────────────────────────────────────
 
+/** ISO timestamp `minutes` ago (fixtures read as recent activity). */
+function minutesAgo(minutes: number, plusSeconds = 0): string {
+	return new Date(Date.now() - minutes * 60_000 + plusSeconds * 1000).toISOString();
+}
+
+/** A finished phase list: every visible step succeeded, `seconds` apart. */
+function donePhases(start: string, steps: [DeployPhase, string | null, number][]): PhaseRecord[] {
+	let t = new Date(start).getTime();
+	return steps.map(([phase, label, secs]) => {
+		if (label === null) return { phase, status: 'skipped' as const };
+		const started_at = new Date(t).toISOString();
+		t += secs * 1000;
+		return {
+			phase,
+			status: 'succeeded' as const,
+			label,
+			started_at,
+			finished_at: new Date(t).toISOString()
+		};
+	});
+}
+
+const GIT_STEPS: [DeployPhase, string | null, number][] = [
+	['clone', 'Clone repository', 3],
+	['build', 'Build image', 71],
+	['start', 'Start container', 2],
+	['health', 'Health check', 6],
+	['release', 'Switch traffic', 4]
+];
+
+const DEP3_START = minutesAgo(42);
+const DEP2_START = minutesAgo(60 * 26);
+const DEP1_START = minutesAgo(60 * 50);
+const FAILED_START = minutesAgo(18);
+
 export const MOCK_DEPLOYMENTS: Record<string, Deployment[]> = {
 	app_running: [
 		{
@@ -785,10 +823,17 @@ export const MOCK_DEPLOYMENTS: Record<string, Deployment[]> = {
 			image_tag: 'tond-api-service:3f2a1b9c1234',
 			status: 'succeeded',
 			trigger_source: 'webhook',
+			trigger_detail: 'GitHub push to main',
+			commit_sha: '3f2a1b9c12d4e5f60718293a4b5c6d7e8f901234',
+			commit_message: 'Cache product queries for 60 s',
+			commit_author: 'Ada Lovelace',
 			has_generated_dockerfile: true,
-			started_at: '2025-03-01T08:55:00.000Z',
-			finished_at: '2025-03-01T09:02:00.000Z',
-			created_at: '2025-03-01T08:55:00.000Z',
+			started_at: DEP3_START,
+			finished_at: minutesAgo(42, 86),
+			created_at: DEP3_START,
+			duration_secs: 86,
+			phases: donePhases(DEP3_START, GIT_STEPS),
+			failure: null,
 			image_pruned: false,
 			is_current: true,
 			rollback_available: false,
@@ -800,10 +845,17 @@ export const MOCK_DEPLOYMENTS: Record<string, Deployment[]> = {
 			image_tag: 'tond-api-service:7f3a9b1d0e2c',
 			status: 'succeeded',
 			trigger_source: 'manual',
+			trigger_detail: 'admin@tond.local',
+			commit_sha: '7f3a9b1d0e2c4b5a69788f7e6d5c4b3a29181716',
+			commit_message: 'Add /v2/orders endpoint',
+			commit_author: 'Grace Hopper',
 			has_generated_dockerfile: true,
-			started_at: '2025-02-15T14:10:00.000Z',
-			finished_at: '2025-02-15T14:17:00.000Z',
-			created_at: '2025-02-15T14:10:00.000Z',
+			started_at: DEP2_START,
+			finished_at: minutesAgo(60 * 26, 94),
+			created_at: DEP2_START,
+			duration_secs: 94,
+			phases: donePhases(DEP2_START, GIT_STEPS),
+			failure: null,
 			image_pruned: false,
 			is_current: false,
 			rollback_available: true,
@@ -814,11 +866,14 @@ export const MOCK_DEPLOYMENTS: Record<string, Deployment[]> = {
 			app_id: 'app_running',
 			image_tag: 'tond-api-service:c0ffee123456',
 			status: 'succeeded',
-			trigger_source: 'manual',
+			trigger_source: 'rollback',
+			trigger_detail: 'admin@tond.local',
+			rollback_of: 'dep_0',
 			has_generated_dockerfile: false,
-			started_at: '2025-02-12T09:00:00.000Z',
-			finished_at: '2025-02-12T09:05:00.000Z',
-			created_at: '2025-02-12T09:00:00.000Z',
+			started_at: minutesAgo(60 * 49),
+			finished_at: minutesAgo(60 * 49, 12),
+			created_at: minutesAgo(60 * 49),
+			duration_secs: 12,
 			image_pruned: true,
 			is_current: false,
 			rollback_available: false,
@@ -827,14 +882,97 @@ export const MOCK_DEPLOYMENTS: Record<string, Deployment[]> = {
 		{
 			id: 'dep_1',
 			app_id: 'app_running',
-			image_tag: 'tond-api-service:1a2b3c4d5e6f',
+			image_tag: null,
 			status: 'failed',
 			trigger_source: 'manual',
+			trigger_detail: 'admin@tond.local',
+			commit_sha: '1a2b3c4d5e6f708192a3b4c5d6e7f80910111213',
+			commit_message: 'Upgrade to TypeScript 6',
+			commit_author: 'Ada Lovelace',
+			has_generated_dockerfile: true,
+			started_at: DEP1_START,
+			finished_at: minutesAgo(60 * 50, 48),
+			created_at: DEP1_START,
+			duration_secs: 48,
+			phases: [
+				{
+					phase: 'clone',
+					status: 'succeeded',
+					label: 'Clone repository',
+					started_at: DEP1_START,
+					finished_at: minutesAgo(60 * 50, 3)
+				},
+				{
+					phase: 'build',
+					status: 'failed',
+					label: 'Build image',
+					started_at: minutesAgo(60 * 50, 3),
+					finished_at: minutesAgo(60 * 50, 48)
+				},
+				{ phase: 'start', status: 'pending', label: 'Start container' },
+				{ phase: 'health', status: 'pending', label: 'Health check' },
+				{ phase: 'release', status: 'pending', label: 'Switch traffic' }
+			],
+			failure: {
+				phase: 'build',
+				code: 'build_failed',
+				title: 'The build failed (exit code 1)',
+				hint: 'The lines below are where the build stopped. Fix the error in your code or Dockerfile and deploy again.',
+				detail: 'Docker build failed (exit code: exit status: 1)',
+				excerpt: [
+					'#12 [builder 5/6] RUN npm run build',
+					"#12 4.211 src/orders/total.ts(14,7): error TS2322: Type 'string' is not assignable to type 'number'.",
+					'#12 4.388 npm error Lifecycle script `build` failed with error: code 2',
+					'#12 ERROR: process "/bin/sh -c npm run build" did not complete successfully: exit code: 2'
+				]
+			},
+			image_pruned: false,
+			is_current: false,
+			rollback_available: false,
+			rollback_unavailable_reason: 'Only successful deployments can be restored'
+		}
+	],
+	app_failed: [
+		{
+			id: 'dep_wq_1',
+			app_id: 'app_failed',
+			image_tag: 'tond-worker-queue:9d8c7b6a5f4e',
+			status: 'failed',
+			trigger_source: 'manual',
+			trigger_detail: 'admin@tond.local',
+			commit_sha: '9d8c7b6a5f4e3d2c1b0a99887766554433221100',
+			commit_message: 'Serve the dashboard with nginx',
+			commit_author: 'Grace Hopper',
 			has_generated_dockerfile: false,
-			started_at: '2025-02-10T10:00:00.000Z',
-			finished_at: '2025-02-10T10:03:00.000Z',
-			created_at: '2025-02-10T10:00:00.000Z',
-			image_pruned: true,
+			started_at: FAILED_START,
+			finished_at: minutesAgo(18, 131),
+			created_at: FAILED_START,
+			duration_secs: 131,
+			phases: [
+				...donePhases(FAILED_START, GIT_STEPS.slice(0, 3)),
+				{
+					phase: 'health',
+					status: 'failed',
+					label: 'Wait for the app to listen',
+					started_at: minutesAgo(18, 71),
+					finished_at: minutesAgo(18, 131)
+				},
+				{ phase: 'release', status: 'pending', label: 'Switch traffic' }
+			],
+			failure: {
+				phase: 'health',
+				code: 'port_not_listening',
+				title: 'Nothing answered on port 4000 within 60s',
+				hint: "Tond expected the app to listen on port 4000 inside the container. If it uses another port (nginx listens on 80, many Node apps on 3000), change the app's port; make sure the app binds to 0.0.0.0, not localhost.",
+				detail:
+					'the new container did not become ready within 60s; the previous version keeps serving',
+				excerpt: [
+					'/docker-entrypoint.sh: Configuration complete; ready for start up',
+					'2025/03/05 11:44:02 [notice] 1#1: nginx/1.27.3',
+					'2025/03/05 11:44:02 [notice] 1#1: start worker processes'
+				]
+			},
+			image_pruned: false,
 			is_current: false,
 			rollback_available: false,
 			rollback_unavailable_reason: 'Only successful deployments can be restored'
@@ -842,6 +980,89 @@ export const MOCK_DEPLOYMENTS: Record<string, Deployment[]> = {
 	]
 };
 
+/** Deploy log lines per fixture deployment (live mock deploys add their own). */
+export const MOCK_DEPLOYMENT_LOGS: Record<string, DeploymentLogLine[]> = {
+	dep_3: mockBuildLog(DEP3_START, 'Cache product queries for 60 s', true),
+	dep_2: mockBuildLog(DEP2_START, 'Add /v2/orders endpoint', true),
+	dep_1: mockBuildLog(DEP1_START, 'Upgrade to TypeScript 6', false),
+	dep_wq_1: [
+		{ level: 'info', message: 'Starting deployment...', ts: FAILED_START },
+		{
+			level: 'info',
+			message: 'Commit 9d8c7b6 by Grace Hopper: Serve the dashboard with nginx',
+			ts: minutesAgo(18, 2)
+		},
+		{ level: 'info', message: 'Building with Dockerfile', ts: minutesAgo(18, 3) },
+		{
+			level: 'info',
+			message: '#8 naming to docker.io/library/tond-worker-queue:9d8c7b6a5f4e done',
+			ts: minutesAgo(18, 66)
+		},
+		{ level: 'info', message: 'Starting new container on port 8104:4000', ts: minutesAgo(18, 67) },
+		{
+			level: 'info',
+			message: 'Waiting up to 60s for the app to answer on port 4000',
+			ts: minutesAgo(18, 71)
+		},
+		{
+			level: 'error',
+			message: 'Deployment failed: Nothing answered on port 4000 within 60s',
+			ts: minutesAgo(18, 131)
+		}
+	]
+};
+
+/** A plausible TBuild/docker build log with ANSI colours. */
+export function mockBuildLog(start: string, commit: string, ok: boolean): DeploymentLogLine[] {
+	const t0 = new Date(start).getTime();
+	const at = (s: number) => new Date(t0 + s * 1000).toISOString();
+	const lines: [number, string, string][] = [
+		[0, 'info', 'Starting deployment...'],
+		[0, 'info', 'Using GitHub App installation token for clone'],
+		[1, 'info', 'Cloning https://github.com/example/api-service.git (main)'],
+		[3, 'info', `Commit 3f2a1b9 by Ada Lovelace: ${commit}`],
+		[3, 'info', 'Building with TBuild (tond-scanner)'],
+		[3, 'info', 'TBuild detection: stack=node profile=node-npm confidence=high'],
+		[4, 'info', '#1 [internal] load build definition from Dockerfile'],
+		[4, 'info', '#1 transferring dockerfile: 612B \u001b[32mdone\u001b[0m'],
+		[5, 'info', '#5 [builder 1/6] FROM docker.io/library/node:20-alpine'],
+		[9, 'info', '#9 [builder 3/6] RUN npm ci'],
+		[31, 'info', '#9 21.87 added 412 packages, and audited 413 packages in 21s'],
+		[31, 'info', '#9 21.88 \u001b[33m2 moderate severity vulnerabilities\u001b[0m'],
+		[32, 'info', '#12 [builder 5/6] RUN npm run build'],
+		[33, 'info', '#12 0.412 > api-service@2.3.0 build'],
+		[33, 'info', '#12 0.413 > tsc -p tsconfig.build.json']
+	];
+	if (!ok) {
+		lines.push(
+			[
+				47,
+				'info',
+				"#12 4.211 src/orders/total.ts(14,7): \u001b[31merror\u001b[0m \u001b[90mTS2322\u001b[0m: Type 'string' is not assignable to type 'number'."
+			],
+			[48, 'info', '#12 4.388 npm error Lifecycle script `build` failed with error: code 2'],
+			[
+				48,
+				'info',
+				'#12 \u001b[31mERROR\u001b[0m: process "/bin/sh -c npm run build" did not complete successfully: exit code: 2'
+			],
+			[48, 'error', 'Deployment failed: The build failed (exit code 1)']
+		);
+	} else {
+		lines.push(
+			[70, 'info', '#12 36.02 \u001b[32m✓\u001b[0m compiled 214 files'],
+			[74, 'info', '#15 exporting to image'],
+			[75, 'info', '#15 naming to docker.io/library/tond-api-service:3f2a1b9c1234 done'],
+			[77, 'info', 'Starting new container on port 8107:8080'],
+			[77, 'info', 'Waiting up to 30s for the health check on port 8080/healthz to pass'],
+			[82, 'info', 'New container is ready — cutting over traffic'],
+			[82, 'info', 'Waiting 3s for proxy to pick up new port before stopping old container'],
+			[85, 'info', 'Draining old container 4be1c2a9d0f3 (30s grace)'],
+			[86, 'info', 'Deployed successfully! Container: 9a8b7c6d5e4f']
+		);
+	}
+	return lines.map(([s, level, message]) => ({ level, message, ts: at(s) }));
+}
 export const MOCK_GENERATED_DOCKERFILES: Record<string, string> = {
 	dep_3: `FROM node:20-alpine AS builder
 WORKDIR /app

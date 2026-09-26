@@ -15,6 +15,12 @@ const {
 	createDatabase,
 	createProject,
 	deployApp,
+	deleteApp,
+	deleteDatabase,
+	deleteProject,
+	getSystemMetrics,
+	listRemoteBranches,
+	inspectImage,
 	listTemplates,
 	listProjects,
 	listRegistryCredentials,
@@ -27,6 +33,12 @@ const {
 	createDatabase: vi.fn(),
 	createProject: vi.fn(),
 	deployApp: vi.fn(),
+	deleteApp: vi.fn(),
+	deleteDatabase: vi.fn(),
+	deleteProject: vi.fn(),
+	getSystemMetrics: vi.fn(),
+	listRemoteBranches: vi.fn(),
+	inspectImage: vi.fn(),
 	listTemplates: vi.fn(),
 	listProjects: vi.fn(),
 	listRegistryCredentials: vi.fn(),
@@ -50,6 +62,12 @@ vi.mock('$lib/api', () => ({
 	createDatabase,
 	createProject,
 	deployApp,
+	deleteApp,
+	deleteDatabase,
+	deleteProject,
+	getSystemMetrics,
+	listRemoteBranches,
+	inspectImage,
 	listTemplates,
 	listProjects,
 	listRegistryCredentials
@@ -174,8 +192,32 @@ describe('new app page', () => {
 					'postgres://plausible:secret@tond-db-plausible-db:5432/plausible'
 			}
 		});
-		createApp.mockResolvedValue({ id: 'app_created' });
-		deployApp.mockResolvedValue(undefined);
+		createApp.mockResolvedValue({ id: 'app_created', name: 'plausible-app' });
+		deployApp.mockResolvedValue({
+			message: 'Deployment started',
+			app_id: 'app_created',
+			deployment_id: 'dep_first'
+		});
+		for (const fn of [deleteApp, deleteDatabase, deleteProject]) {
+			fn.mockReset();
+			fn.mockResolvedValue(undefined);
+		}
+		getSystemMetrics.mockReset();
+		getSystemMetrics.mockResolvedValue({ mem_total: 4 * 1024 ** 3 });
+		listRemoteBranches.mockReset();
+		listRemoteBranches.mockResolvedValue({
+			default_branch: 'trunk',
+			branches: ['trunk', 'develop'],
+			truncated: false
+		});
+		inspectImage.mockReset();
+		inspectImage.mockResolvedValue({
+			image: 'nginx:alpine',
+			exposed_ports: [80],
+			env_port: null,
+			suggested_port: 80,
+			pulled: true
+		});
 	});
 
 	it('validates the source step before advancing', async () => {
@@ -189,7 +231,7 @@ describe('new app page', () => {
 		expect(screen.getByText(/configuration error/i)).toBeInTheDocument();
 	});
 
-	it('creates a template app with dependency interpolation and redirects to the app page', async () => {
+	it('creates a template app with dependency interpolation and opens the live deploy view', async () => {
 		const user = userEvent.setup();
 		render(NewAppPage, { props: { data, params: {} } });
 
@@ -234,7 +276,95 @@ describe('new app page', () => {
 			})
 		);
 		expect(deployApp).toHaveBeenCalledWith('app_created');
-		expect(goto).toHaveBeenCalledWith('/apps/app_created');
+		expect(goto).toHaveBeenCalledWith('/apps/app_created/deployments/dep_first');
+		expect(deleteDatabase).not.toHaveBeenCalled();
+	});
+
+	it('removes the project and databases a failed template deploy created', async () => {
+		createApp.mockRejectedValue(new Error('App name already taken'));
+		const user = userEvent.setup();
+		render(NewAppPage, { props: { data, params: {} } });
+
+		await user.type(screen.getByLabelText(/application name/i), 'Plausible App');
+		await user.click(screen.getByRole('button', { name: /templates/i }));
+		await user.click(screen.getByRole('button', { name: /plausible analytics/i }));
+		await user.type(screen.getByLabelText('BASE_URL'), 'https://stats.example.com');
+		for (let i = 0; i < 4; i++) {
+			await user.click(screen.getByRole('button', { name: /^next$/i }));
+		}
+		await user.click(await screen.findByRole('button', { name: /deploy application/i }));
+
+		expect(await screen.findByText(/nothing was left behind/i)).toBeInTheDocument();
+		expect(deleteDatabase).toHaveBeenCalledWith('db_1');
+		expect(deleteProject).toHaveBeenCalledWith('proj_template');
+		expect(deleteApp).not.toHaveBeenCalled();
+		expect(goto).not.toHaveBeenCalled();
+	});
+
+	it('names what it could not clean up', async () => {
+		createApp.mockRejectedValue(new Error('Boom'));
+		deleteProject.mockRejectedValue(new Error('project in use'));
+		const user = userEvent.setup();
+		render(NewAppPage, { props: { data, params: {} } });
+
+		await user.type(screen.getByLabelText(/application name/i), 'Plausible App');
+		await user.click(screen.getByRole('button', { name: /templates/i }));
+		await user.click(screen.getByRole('button', { name: /plausible analytics/i }));
+		await user.type(screen.getByLabelText('BASE_URL'), 'https://stats.example.com');
+		for (let i = 0; i < 4; i++) {
+			await user.click(screen.getByRole('button', { name: /^next$/i }));
+		}
+		await user.click(await screen.findByRole('button', { name: /deploy application/i }));
+
+		expect(
+			await screen.findByText(/couldn't remove what it had created: project plausible/i)
+		).toBeInTheDocument();
+	});
+
+	it('asks for the port of an image app and detects it from the image', async () => {
+		const user = userEvent.setup();
+		render(NewAppPage, { props: { data, params: {} } });
+
+		await user.type(screen.getByLabelText(/application name/i), 'web');
+		await user.click(screen.getByRole('button', { name: /docker/i }));
+		await user.click(screen.getByRole('button', { name: /docker image/i }));
+		await user.type(screen.getByLabelText(/^docker image/i), 'nginx:alpine');
+		await user.click(screen.getByRole('button', { name: /^next$/i }));
+
+		const port = (await screen.findByLabelText(/container port/i)) as HTMLInputElement;
+		await waitFor(() => expect(port.value).toBe('80'));
+		expect(inspectImage).toHaveBeenCalledWith('nginx:alpine', undefined);
+		expect(screen.getByText(/the image exposes 80/i)).toBeInTheDocument();
+	});
+
+	it('picks the repository default branch and deploys it', async () => {
+		const user = userEvent.setup();
+		render(NewAppPage, { props: { data, params: {} } });
+
+		await user.type(screen.getByLabelText(/application name/i), 'my-app');
+		await user.type(
+			screen.getByLabelText(/git repository url/i),
+			'https://github.com/example/repo.git'
+		);
+		await user.click(screen.getByRole('button', { name: /^next$/i }));
+
+		const branch = (await screen.findByLabelText(/branch/i)) as HTMLInputElement;
+		await waitFor(() => expect(branch.value).toBe('trunk'));
+		expect(listRemoteBranches).toHaveBeenCalledWith('https://github.com/example/repo.git', {});
+
+		for (let i = 0; i < 4; i++) {
+			await user.click(screen.getByRole('button', { name: /^next$/i }));
+		}
+		await user.click(await screen.findByRole('button', { name: /deploy application/i }));
+		await waitFor(() =>
+			expect(createApp).toHaveBeenCalledWith(
+				expect.objectContaining({ branch: 'trunk', watch_branch: 'trunk', container_port: 8080 })
+			)
+		);
+		const body = createApp.mock.calls[0][0];
+		expect(body.memory_limit).toBeUndefined();
+		expect(body.cpu_limit).toBeUndefined();
+		expect(body.health_check_path).toBeUndefined();
 	});
 
 	it('shows an inline error when app creation fails', async () => {
