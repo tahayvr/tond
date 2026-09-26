@@ -7,13 +7,15 @@
 import { http, HttpResponse, ws, delay } from 'msw';
 
 // WebSocket links must be declared at module scope so MSW can track clients
-// across the service worker boundary via a stable BroadcastChannel.
-const appLogStream = ws.link('ws://*/api/apps/*/logs/stream');
-const systemLogStream = ws.link('ws://*/api/system/logs/stream');
-const allDatabaseLogStream = ws.link('ws://*/api/databases/logs/stream');
-const databaseLogStream = ws.link('ws://*/api/databases/*/logs/stream');
-const cronRunStream = ws.link('ws://*/api/cron/*/runs/stream');
-const terminalStream = ws.link('ws://*/api/terminal/ws*');
+// across the service worker boundary via a stable BroadcastChannel. Use paths
+// relative to the page origin: a wildcard host ("ws://*/…") never matches.
+const appLogStream = ws.link('/api/apps/:id/logs/stream');
+const systemLogStream = ws.link('/api/system/logs/stream');
+const allDatabaseLogStream = ws.link('/api/databases/logs/stream');
+const databaseLogStream = ws.link('/api/databases/:id/logs/stream');
+const cronRunStream = ws.link('/api/cron/:id/runs/stream');
+const terminalStream = ws.link('/api/terminal/ws');
+const deploymentStream = ws.link('/api/apps/:id/deployments/:deploymentId/stream');
 
 import {
 	MOCK_USER,
@@ -24,6 +26,8 @@ import {
 	MOCK_SETTINGS,
 	MOCK_ONBOARDING_STATUS,
 	MOCK_DEPLOYMENTS,
+	MOCK_DEPLOYMENT_LOGS,
+	mockBuildLog,
 	MOCK_GENERATED_DOCKERFILES,
 	MOCK_DEPLOY_KEYS,
 	MOCK_PREVIEWS,
@@ -54,6 +58,9 @@ import type {
 	CronJob,
 	CronJobRun,
 	Deployment,
+	DeploymentLogLine,
+	DeployPhase,
+	PhaseRecord,
 	GitHubApp,
 	GithubPR,
 	Integration,
@@ -417,6 +424,366 @@ function currentMockUser() {
 }
 
 const CREDENTIAL_PATHS = ['/api/auth/'];
+
+// ── Mock deploy engine ────────────────────────────────────────────────────────
+//
+// POST /api/apps/:id/deploy (and rollback) start a scripted deployment that
+// walks through the phases and writes log lines over ~15 s, so the live deploy
+// view can be developed without a server. Apps named "worker-queue" fail the
+// health step (nothing listening on the port); everything else succeeds.
+
+const deploymentLogs: Record<string, DeploymentLogLine[]> = structuredClone(MOCK_DEPLOYMENT_LOGS);
+type DeployFrame = { type: 'log' | 'deployment'; [key: string]: unknown };
+const deployListeners = new Map<string, Set<(frame: DeployFrame) => void>>();
+
+function emitDeploy(deploymentId: string, frame: DeployFrame) {
+	for (const listener of deployListeners.get(deploymentId) ?? []) listener(frame);
+}
+
+function mockPhasePlan(plan: string, healthPath: string | null): PhaseRecord[] {
+	const health = healthPath ? 'Health check' : 'Wait for the app to listen';
+	const table: Record<string, (string | null)[]> = {
+		git: ['Clone repository', 'Build image', 'Start container', health, 'Switch traffic'],
+		image: ['Pull image', null, 'Start container', health, 'Switch traffic'],
+		tarball: [null, 'Build uploaded source', 'Start container', health, 'Switch traffic'],
+		dockerfile: [null, 'Build image', 'Start container', health, 'Switch traffic'],
+		compose: [null, 'docker compose up', 'Find the service port', null, 'Switch traffic'],
+		rollback: [null, null, 'Start container', health, 'Switch traffic']
+	};
+	const labels = table[plan] ?? table.rollback;
+	const phases: DeployPhase[] = ['clone', 'build', 'start', 'health', 'release'];
+	return phases.map((phase, i) =>
+		labels[i] === null
+			? { phase, status: 'skipped' as const }
+			: { phase, status: 'pending' as const, label: labels[i] as string }
+	);
+}
+
+function updateDeployment(appId: string, id: string, change: (d: Deployment) => Deployment) {
+	const list = deployments[appId] ?? [];
+	const idx = list.findIndex((d) => d.id === id);
+	if (idx === -1) return;
+	list[idx] = change(list[idx]);
+	emitDeploy(id, { type: 'deployment', deployment: list[idx] });
+}
+
+function startMockDeploy(
+	app: App,
+	opts: { trigger_source: string; trigger_detail: string | null; rollbackOf?: Deployment }
+): Deployment {
+	const id = `dep_${Date.now().toString(36)}`;
+	const now = new Date().toISOString();
+	const plan = opts.rollbackOf ? 'rollback' : app.source_type;
+	const deployment: Deployment = {
+		id,
+		app_id: app.id,
+		image_tag: opts.rollbackOf?.image_tag ?? null,
+		status: 'running',
+		trigger_source: opts.trigger_source,
+		trigger_detail: opts.trigger_detail,
+		rollback_of: opts.rollbackOf?.id ?? null,
+		commit_sha: opts.rollbackOf?.commit_sha ?? null,
+		commit_message: opts.rollbackOf?.commit_message ?? null,
+		commit_author: opts.rollbackOf?.commit_author ?? null,
+		has_generated_dockerfile: false,
+		started_at: now,
+		finished_at: null,
+		created_at: now,
+		duration_secs: null,
+		phases: mockPhasePlan(plan, app.health_check_path),
+		failure: null,
+		image_pruned: false,
+		is_current: false,
+		rollback_available: false,
+		rollback_unavailable_reason: null
+	};
+	deployments[app.id] = [deployment, ...(deployments[app.id] ?? [])];
+	deploymentLogs[id] = [];
+	const appIdx = apps.findIndex((a) => a.id === app.id);
+	if (appIdx !== -1) apps[appIdx] = { ...apps[appIdx], status: 'building' };
+
+	const fail = app.name === 'worker-queue';
+	const tag = `tond-${app.name}:${id.slice(4, 16).padEnd(12, '0')}`;
+	const log = (level: string, message: string) => {
+		const line = { level, message, ts: new Date().toISOString() };
+		deploymentLogs[id].push(line);
+		emitDeploy(id, { type: 'log', ...line });
+	};
+	const phase = (name: DeployPhase) =>
+		updateDeployment(app.id, id, (d) => {
+			const ts = new Date().toISOString();
+			return {
+				...d,
+				phases: (d.phases ?? []).map((p) =>
+					p.phase === name
+						? { ...p, status: 'running' as const, started_at: ts }
+						: p.status === 'running'
+							? { ...p, status: 'succeeded' as const, finished_at: ts }
+							: p
+				)
+			};
+		});
+	const finish = () => {
+		const ts = new Date().toISOString();
+		const duration = Math.round((Date.parse(ts) - Date.parse(now)) / 1000);
+		if (fail) {
+			log('error', `Deployment failed: Nothing answered on port ${app.container_port} within 60s`);
+			updateDeployment(app.id, id, (d) => ({
+				...d,
+				status: 'failed',
+				finished_at: ts,
+				duration_secs: duration,
+				phases: (d.phases ?? []).map((p) =>
+					p.status === 'running' ? { ...p, status: 'failed' as const, finished_at: ts } : p
+				),
+				failure: {
+					phase: 'health',
+					code: 'port_not_listening',
+					title: `Nothing answered on port ${app.container_port} within 60s`,
+					hint: `Tond expected the app to listen on port ${app.container_port} inside the container. If it uses another port (nginx listens on 80, many Node apps on 3000), change the app's port; make sure the app binds to 0.0.0.0, not localhost.`,
+					detail:
+						'the new container did not become ready within 60s; the previous version keeps serving',
+					excerpt: [
+						'/docker-entrypoint.sh: Configuration complete; ready for start up',
+						'nginx: [notice] start worker processes'
+					]
+				}
+			}));
+			if (appIdx !== -1) apps[appIdx] = { ...apps[appIdx], status: 'failed' };
+			return;
+		}
+		log('info', `Deployed successfully! Container: ${id.slice(4, 16)}`);
+		deployments[app.id] = (deployments[app.id] ?? []).map((d) =>
+			d.id === id
+				? d
+				: {
+						...d,
+						is_current: false,
+						rollback_available: d.status === 'succeeded' && !d.image_pruned,
+						rollback_unavailable_reason:
+							d.status === 'succeeded' && !d.image_pruned ? null : d.rollback_unavailable_reason
+					}
+		);
+		updateDeployment(app.id, id, (d) => ({
+			...d,
+			status: 'succeeded',
+			finished_at: ts,
+			duration_secs: duration,
+			image_tag: d.image_tag ?? tag,
+			is_current: true,
+			rollback_unavailable_reason: 'This image is already running',
+			phases: (d.phases ?? []).map((p) =>
+				p.status === 'running'
+					? { ...p, status: 'succeeded' as const, finished_at: ts }
+					: p.status === 'pending'
+						? { ...p, status: 'skipped' as const }
+						: p
+			)
+		}));
+		if (appIdx !== -1) apps[appIdx] = { ...apps[appIdx], status: 'running' };
+	};
+
+	const script: [number, () => void][] = [
+		[300, () => log('info', opts.rollbackOf ? 'Starting rollback...' : 'Starting deployment...')]
+	];
+	if (plan === 'git') {
+		script.push(
+			[400, () => phase('clone')],
+			[300, () => log('info', `Cloning ${app.source_url ?? 'repository'} (main)`)],
+			[
+				1200,
+				() => {
+					updateDeployment(app.id, id, (d) => ({
+						...d,
+						commit_sha: '4e5f6a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5',
+						commit_message: 'Tidy up the order totals',
+						commit_author: 'Ada Lovelace'
+					}));
+					log('info', 'Commit 4e5f6a7 by Ada Lovelace: Tidy up the order totals');
+				}
+			],
+			[300, () => phase('build')]
+		);
+		for (const line of mockBuildLog(now, 'Tidy up the order totals', true).slice(4, 15)) {
+			script.push([500, () => log(line.level, line.message)]);
+		}
+		script.push([1500, () => log('info', '#15 exporting to image')]);
+	} else if (plan === 'image') {
+		script.push(
+			[400, () => phase('clone')],
+			[300, () => log('info', `Pulling image: ${app.source_url ?? 'image'}`)],
+			[2000, () => log('info', `Pinned ${app.source_url} as ${tag}`)]
+		);
+	} else if (plan !== 'rollback') {
+		script.push(
+			[400, () => phase('build')],
+			[1500, () => log('info', '#1 [internal] load build definition from Dockerfile')],
+			[1500, () => log('info', `#6 naming to docker.io/library/${tag} \u001b[32mdone\u001b[0m`)]
+		);
+	} else {
+		script.push([300, () => log('info', `Rolling back to image: ${opts.rollbackOf?.image_tag}`)]);
+	}
+	script.push(
+		[500, () => phase('start')],
+		[300, () => log('info', `Starting new container on port 8108:${app.container_port}`)],
+		[800, () => phase('health')],
+		[
+			300,
+			() =>
+				log(
+					'info',
+					app.health_check_path
+						? `Waiting up to 30s for the health check on port ${app.container_port}${app.health_check_path} to pass`
+						: `Waiting up to 60s for the app to answer on port ${app.container_port}`
+				)
+		]
+	);
+	if (fail) {
+		script.push([4000, finish]);
+	} else {
+		script.push(
+			[2000, () => log('info', 'New container is ready — cutting over traffic')],
+			[200, () => phase('release')],
+			[
+				300,
+				() => log('info', 'Waiting 3s for proxy to pick up new port before stopping old container')
+			],
+			[1500, () => log('info', 'Draining old container 4be1c2a9d0f3 (30s grace)')],
+			[800, finish]
+		);
+	}
+
+	let wait = 0;
+	for (const [ms, action] of script) {
+		wait += ms;
+		setTimeout(action, wait);
+	}
+	return deployment;
+}
+
+function deploymentDetail(app: App, d: Deployment) {
+	return {
+		...d,
+		logs: deploymentLogs[d.id] ?? [],
+		logs_truncated: false,
+		container_port: app.container_port,
+		health_check_path: app.health_check_path,
+		source_type: app.source_type
+	};
+}
+
+function isFinishedStatus(status: string) {
+	return ['succeeded', 'failed', 'superseded', 'cancelled'].includes(status);
+}
+
+const deploymentStreamHandler = deploymentStream.addEventListener('connection', ({ client }) => {
+	const match = client.url.pathname.match(/\/api\/apps\/([^/]+)\/deployments\/([^/]+)\/stream/);
+	const app = match ? apps.find((a) => a.id === match[1] || a.name === match[1]) : undefined;
+	const d = app ? (deployments[app.id] ?? []).find((x) => x.id === match?.[2]) : undefined;
+	if (!app || !d) {
+		client.close(4004, 'Deployment not found');
+		return;
+	}
+	const detail = deploymentDetail(app, d);
+	client.send(
+		JSON.stringify({
+			type: 'snapshot',
+			deployment: d,
+			logs: detail.logs,
+			logs_truncated: false,
+			container_port: detail.container_port,
+			health_check_path: detail.health_check_path,
+			source_type: detail.source_type
+		})
+	);
+	if (isFinishedStatus(d.status)) {
+		setTimeout(() => client.close(1000, 'Deployment finished'), 50);
+		return;
+	}
+	const listener = (frame: DeployFrame) => {
+		client.send(JSON.stringify(frame));
+		const dep = frame.deployment as Deployment | undefined;
+		if (frame.type === 'deployment' && dep && isFinishedStatus(dep.status)) {
+			// Let the last frames go out before closing, as a real socket would.
+			setTimeout(() => client.close(1000, 'Deployment finished'), 50);
+		}
+	};
+	const set = deployListeners.get(d.id) ?? new Set();
+	set.add(listener);
+	deployListeners.set(d.id, set);
+	client.addEventListener('close', () => set.delete(listener));
+});
+
+/** Mock of GET /api/domains/check (server: handlers/domains.rs). */
+function mockDomainCheck(domain: string) {
+	const serverIp = '203.0.113.10';
+	const parts = domain.split('.');
+	const zone = parts.length >= 2 ? parts.slice(-2).join('.') : null;
+	const rel = (host: string) =>
+		zone && host === zone ? '@' : zone ? host.slice(0, -(zone.length + 1)) : host;
+	const appsDomain = MOCK_SETTINGS.dashboard_domain;
+	const under = domain.endsWith(`.${appsDomain}`);
+	const record = (host: string) => ({
+		type: 'A' as const,
+		name: rel(host),
+		host,
+		value: serverIp
+	});
+	const resolved: Record<string, string[]> = {
+		'api.example.com': [serverIp],
+		'app.example.com': ['198.51.100.23'],
+		'db.example.com': [serverIp, '198.51.100.23']
+	};
+	const ips = under ? [serverIp] : (resolved[domain] ?? []);
+	const stray = ips.filter((ip) => ip !== serverIp);
+	let status: 'ok' | 'mismatch' | 'missing' | 'inconclusive';
+	let message: string;
+	if (ips.length === 0) {
+		status = 'missing';
+		message = `${domain} has no A or AAAA record yet. Create the record below; DNS changes usually show up within a few minutes.`;
+	} else if (ips.includes(serverIp)) {
+		status = 'ok';
+		message = stray.length
+			? `${domain} points at this server, but also at ${stray.join(', ')}. Remove that record: visitors and Let's Encrypt may reach the other address.`
+			: `${domain} points at this server.`;
+	} else {
+		status = 'mismatch';
+		message = `DNS for ${domain} points to ${ips.join(', ')}, expected ${serverIp}. Update the domain's A/AAAA record to this server.`;
+	}
+	const cert = certificates.find((c) => c.domain === domain) ?? null;
+	return {
+		domain,
+		zone,
+		apps_domain: appsDomain,
+		under_apps_domain: under,
+		records: [record(domain)],
+		wildcard_records: under ? [record(`*.${appsDomain}`)] : [],
+		server_ips: [serverIp],
+		dns: { status, resolved: ips, expected: [serverIp], stray, message },
+		certificate: cert
+			? {
+					status: cert.status,
+					issued_at: cert.issued_at,
+					expires_at: cert.expires_at,
+					last_error: cert.last_error,
+					last_attempt_at: cert.last_attempt_at,
+					next_retry_at: cert.next_retry_at,
+					failure_count: cert.failure_count
+				}
+			: null,
+		checked_at: new Date().toISOString()
+	};
+}
+
+/** Ports a few well-known images expose (mock of POST /api/images/inspect). */
+function mockImagePorts(image: string): { exposed: number[]; env: number | null } {
+	const name = image.toLowerCase();
+	if (/nginx|httpd|caddy|whoami|apache/.test(name)) return { exposed: [80], env: null };
+	if (/grafana|metabase/.test(name)) return { exposed: [3000], env: null };
+	if (/ghost/.test(name)) return { exposed: [2368], env: null };
+	if (/node|next/.test(name)) return { exposed: [], env: 3000 };
+	return { exposed: [], env: null };
+}
 
 export const handlers = [
 	// Scenario gate: runs first and falls through (returns undefined) when idle.
@@ -882,11 +1249,94 @@ export const handlers = [
 	}),
 
 	http.post('/api/apps/:id/deploy', async ({ params }) => {
-		await delay(LATENCY * 3);
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
+		if (!app) return err('App not found', 404);
+		const d = startMockDeploy(app, { trigger_source: 'manual', trigger_detail: MOCK_USER.email });
+		return HttpResponse.json(
+			{
+				success: true,
+				data: {
+					message: 'Deployment started',
+					app_id: app.id,
+					deployment_id: d.id,
+					status: 'running'
+				},
+				error: null
+			},
+			{ status: 202 }
+		);
+	}),
+
+	http.put('/api/apps/:id/port', async ({ params, request }) => {
+		await delay(LATENCY);
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx === -1) return err('App not found', 404);
-		apps[idx] = { ...apps[idx], status: 'running', updated_at: new Date().toISOString() };
-		return ok(null);
+		const body = (await request.json()) as { container_port: number };
+		const port = Number(body.container_port);
+		if (!Number.isInteger(port) || port < 1 || port > 65535) {
+			return err('Invalid input: container_port must be between 1 and 65535');
+		}
+		apps[idx] = { ...apps[idx], container_port: port, updated_at: new Date().toISOString() };
+		return ok(apps[idx]);
+	}),
+
+	// ── Source inspection and domain checks ──
+
+	http.post('/api/git/branches', async ({ request }) => {
+		await delay(LATENCY * 2);
+		const body = (await request.json()) as { url: string; github_app_id?: string };
+		if (!/^https?:\/\//.test(body.url ?? '')) {
+			return err(
+				'Invalid input: Branches can only be listed for http(s) Git URLs; type the branch name instead'
+			);
+		}
+		if (/private/.test(body.url) && !body.github_app_id) {
+			return err(
+				"Invalid input: Tond couldn't read this repository. If it's private, pick a connected GitHub App or add credentials; you can also type the branch name."
+			);
+		}
+		const trunk = /legacy/.test(body.url) ? 'master' : 'main';
+		return ok({
+			default_branch: trunk,
+			branches: [trunk, 'develop', 'feature/checkout', 'release/2.4'],
+			truncated: false
+		});
+	}),
+
+	http.post('/api/images/inspect', async ({ request }) => {
+		await delay(LATENCY * 4);
+		const body = (await request.json()) as { image: string };
+		const image = (body.image ?? '').trim();
+		if (!image || /\s/.test(image)) {
+			return err(
+				'Invalid input: Enter an image reference like nginx:alpine or ghcr.io/org/app:1.2'
+			);
+		}
+		if (/does-not-exist/.test(image)) {
+			return err(
+				`Invalid input: Couldn't pull ${image}: manifest unknown. Check the name and tag; private images need registry credentials.`
+			);
+		}
+		const { exposed, env } = mockImagePorts(image);
+		const suggested =
+			env && (exposed.length === 0 || exposed.includes(env)) ? env : (exposed[0] ?? null);
+		return ok({
+			image,
+			exposed_ports: exposed,
+			env_port: env,
+			suggested_port: suggested,
+			pulled: true
+		});
+	}),
+
+	http.get('/api/domains/check', async ({ request }) => {
+		await delay(LATENCY * 2);
+		const domain = (new URL(request.url).searchParams.get('domain') ?? '').trim().toLowerCase();
+		if (!/^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z][a-z0-9-]*$/.test(domain)) {
+			return err(`Invalid input: '${domain}' isn't a valid domain name`);
+		}
+		return ok(mockDomainCheck(domain));
 	}),
 
 	http.post('/api/apps/:id/stop', async ({ params }) => {
@@ -1124,23 +1574,37 @@ export const handlers = [
 				400
 			);
 		}
-		const idx = apps.findIndex((a) => a.id === params.id);
-		if (idx !== -1) {
-			apps[idx] = { ...apps[idx], status: 'running', updated_at: new Date().toISOString() };
-		}
-		// The restored image becomes current.
-		deployments[params.id as string] = list.map((d) => ({
-			...d,
-			is_current: d.id === target.id,
-			rollback_available: d.id !== target.id && d.status === 'succeeded' && !d.image_pruned,
-			rollback_unavailable_reason:
-				d.id === target.id ? 'This image is already running' : d.rollback_unavailable_reason
-		}));
-		return ok({
-			message: 'Rollback started',
-			image_tag: target.image_tag,
-			deployment_id: target.id
+		const app = apps.find((a) => a.id === params.id);
+		if (!app) return err('App not found', 404);
+		const d = startMockDeploy(app, {
+			trigger_source: 'rollback',
+			trigger_detail: MOCK_USER.email,
+			rollbackOf: target
 		});
+		return HttpResponse.json(
+			{
+				success: true,
+				data: {
+					message: 'Rollback started',
+					app_id: app.id,
+					image_tag: target.image_tag,
+					target_deployment_id: target.id,
+					deployment_id: d.id,
+					status: 'running'
+				},
+				error: null
+			},
+			{ status: 202 }
+		);
+	}),
+
+	http.get('/api/apps/:id/deployments/:deploymentId', async ({ params }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
+		if (!app) return err('App not found', 404);
+		const d = (deployments[app.id] ?? []).find((x) => x.id === params.deploymentId);
+		if (!d) return err(`Not found: deployment '${params.deploymentId}'`, 404);
+		return ok(deploymentDetail(app, d));
 	}),
 
 	http.post('/api/compose/validate', async ({ request }) => {
@@ -2141,6 +2605,9 @@ export const handlers = [
 
 		client.addEventListener('close', () => clearInterval(timer));
 	}),
+
+	// ── WebSocket: live deploy view (see the mock deploy engine above) ─────────
+	deploymentStreamHandler,
 
 	// ── WebSocket: App log stream ─────────────────────────────────────────────
 	//

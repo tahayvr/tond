@@ -5,7 +5,7 @@
 
 	interface Props {
 		deployments: Deployment[];
-		onRollback: (deploymentId?: string) => void | Promise<void>;
+		onRollback: (deploymentId: string) => void | Promise<void>;
 	}
 
 	let { deployments, onRollback }: Props = $props();
@@ -13,6 +13,8 @@
 
 <Tooltip.Provider>
 	<AppDeployments
+		appId="app_1"
+		appName="web"
 		{deployments}
 		loading={false}
 		error=""
