@@ -195,6 +195,7 @@ pub async fn setup(
         id: user_id,
         email: req.email,
         role: "admin".to_string(),
+        totp_enabled: false,
         created_at: now,
     };
 
@@ -511,6 +512,7 @@ pub async fn create_user(
                 id: user_id,
                 email: req.email,
                 role: req.role,
+                totp_enabled: false,
                 created_at: now,
             };
             (
@@ -1786,6 +1788,38 @@ mod tests {
             body["data"]["email"],
             serde_json::json!("admin@example.com"),
             "me should return the current authenticated user's email"
+        );
+        assert_eq!(
+            body["data"]["totp_enabled"],
+            serde_json::json!(false),
+            "me should report whether 2FA is enabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn me_reports_enabled_two_factor_auth() {
+        let state = test_state().await;
+        seed_user(
+            &state,
+            "user-2fa",
+            "mfa@example.com",
+            "ValidPass123!",
+            "admin",
+            true,
+            None,
+        )
+        .await;
+        let token = seed_session(&state, "user-2fa", "current").await;
+
+        let response = me(RateLimit, State(state), session_headers(&token))
+            .await
+            .into_response();
+
+        let body = response_json(response).await;
+        assert_eq!(
+            body["data"]["totp_enabled"],
+            serde_json::json!(true),
+            "me should report 2FA as enabled so the profile can offer to disable it"
         );
     }
 
