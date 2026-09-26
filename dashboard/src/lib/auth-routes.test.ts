@@ -22,10 +22,28 @@ describe('AUTH_ROUTES', () => {
 });
 
 describe('authRedirect', () => {
-	it('lets a signed-out user stay on every auth route except setup', () => {
+	it('lets a signed-out user stay on every auth route, including the setup link', () => {
 		expect(authRedirect('login', url('/login'))).toBeNull();
 		expect(authRedirect('login', url('/login/2fa'))).toBeNull();
-		expect(authRedirect('login', url('/setup'))).toBe('/login');
+		expect(authRedirect('login', url('/setup?token=abc'))).toBeNull();
+	});
+
+	it('returns a signed-out admin to a GitHub App completion page with its query', () => {
+		const target = authRedirect(
+			'login',
+			url('/integrations/github/complete?code=c0de&state=s7ate')
+		);
+		expect(target).toBe(
+			'/login?next=%2Fintegrations%2Fgithub%2Fcomplete%3Fcode%3Dc0de%26state%3Ds7ate'
+		);
+		expect(
+			authRedirect(
+				'authenticated',
+				url(
+					`/login?next=${encodeURIComponent('/integrations/github/complete?code=c0de&state=s7ate')}`
+				)
+			)
+		).toBe('/integrations/github/complete?code=c0de&state=s7ate');
 	});
 
 	it('sends a signed-out user to /login with the page they were on', () => {
@@ -43,9 +61,7 @@ describe('authRedirect', () => {
 		expect(authRedirect('authenticated', url('/apps'))).toBeNull();
 	});
 
-	it('forces first-run setup and waits while loading', () => {
-		expect(authRedirect('setup', url('/login'))).toBe('/setup');
-		expect(authRedirect('setup', url('/setup'))).toBeNull();
+	it('waits while loading', () => {
 		expect(authRedirect('loading', url('/apps'))).toBeNull();
 	});
 });
@@ -86,6 +102,6 @@ describe('showsAppShell', () => {
 		expect(showsAppShell('authenticated', '/login/2fa')).toBe(false);
 		expect(showsAppShell('login', '/apps')).toBe(false);
 		expect(showsAppShell('login', '/login/2fa')).toBe(false);
-		expect(showsAppShell('setup', '/apps')).toBe(false);
+		expect(showsAppShell('loading', '/apps')).toBe(false);
 	});
 });

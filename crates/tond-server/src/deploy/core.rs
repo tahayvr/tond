@@ -18,7 +18,8 @@
 //
 // Helpers private to this module:
 //   update_status()            — update app.status in DB
-//   log_deploy()               — insert timestamped deploy log entry
+//   log_deploy()               — insert timestamped deploy log entry and publish
+//                                it on log_bus for live log streams
 //   wait_for_healthy()         — poll new container health endpoint
 //   fetch_registry_credentials() — look up and decrypt registry credentials
 //   pull_image()               — stream a docker pull with bollard
@@ -31,12 +32,93 @@ use uuid::Uuid;
 use crate::backup::{self, SnapshotTrigger};
 use crate::docker;
 use crate::handlers::{github_apps, gitlab_tokens};
+use crate::log_bus::{self, DeployLogEvent};
 use crate::secret_key::{self, Purpose};
 use crate::state::AppState;
 
 use super::build::{
     BuildOptions, build_from_git, build_from_inline_dockerfile, run_inline_compose,
 };
+use super::git::{GitHttpAuth, redact_url_credentials, split_url_credentials};
+
+/// Work out the clone URL and HTTPS credentials for a git app.
+///
+/// Credentials come from the linked GitHub App (installation token), the
+/// linked GitLab PAT, or userinfo embedded in `source_url`; they are returned
+/// separately so the URL passed to git (and logged) never contains them. When
+/// `log_source` is set, which credential is used — or why it could not be —
+/// is written to the deploy log.
+async fn resolve_git_source(
+    state: &AppState,
+    app: &App,
+    source_url: &str,
+    log_source: Option<&str>,
+) -> Result<(String, Option<GitHttpAuth>)> {
+    let (clean_url, url_auth) = split_url_credentials(source_url);
+    let log = |level: &'static str, message: String| async move {
+        if let Some(trigger_source) = log_source {
+            log_deploy(state, &app.id, level, trigger_source, &message).await
+        } else {
+            Ok(())
+        }
+    };
+
+    if let Some(ref gh_app_id) = app.github_app_id
+        && let Ok(Some(gh_app)) = sqlx::query_as::<_, tond_common::GitHubApp>(
+            "SELECT * FROM github_apps WHERE id = ? LIMIT 1",
+        )
+        .bind(gh_app_id)
+        .fetch_optional(&state.db)
+        .await
+    {
+        match github_apps::generate_installation_token(&gh_app).await {
+            Ok(token) => {
+                log(
+                    "info",
+                    "Using GitHub App installation token for clone".into(),
+                )
+                .await?;
+                return Ok((
+                    clean_url,
+                    Some(GitHttpAuth {
+                        username: "x-access-token".to_string(),
+                        password: token,
+                    }),
+                ));
+            }
+            Err(e) => {
+                log(
+                    "warn",
+                    format!("GitHub App token failed ({e}); cloning without it"),
+                )
+                .await?;
+            }
+        }
+    } else if let Some(ref gl_token_id) = app.gitlab_token_id
+        && let Ok(Some(gl_token)) = sqlx::query_as::<_, tond_common::GitLabToken>(
+            "SELECT * FROM gitlab_tokens WHERE id = ? LIMIT 1",
+        )
+        .bind(gl_token_id)
+        .fetch_optional(&state.db)
+        .await
+    {
+        match gitlab_tokens::gitlab_git_credentials(&gl_token) {
+            Ok(auth) => {
+                log("info", "Using GitLab PAT for clone".into()).await?;
+                return Ok((clean_url, Some(auth)));
+            }
+            Err(e) => {
+                log(
+                    "warn",
+                    format!("GitLab PAT could not be used ({e}); cloning without it"),
+                )
+                .await?;
+            }
+        }
+    }
+
+    Ok((clean_url, url_auth))
+}
 
 async fn persist_generated_dockerfile(
     state: &AppState,
@@ -149,102 +231,15 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
                 .ok_or_else(|| anyhow::anyhow!("Git source URL required"))?;
             let branch = app.branch.as_deref().unwrap_or("main");
 
-            // If this app is linked to a GitHub App registration, generate a
-            // short-lived installation access token and inject it into the URL.
-            // Otherwise, if it is linked to a GitLab PAT, inject oauth2:<pat>@
-            // into the HTTPS URL.
-            let effective_url = if let Some(ref gh_app_id) = app.github_app_id {
-                match sqlx::query_as::<_, tond_common::GitHubApp>(
-                    "SELECT * FROM github_apps WHERE id = ? LIMIT 1",
-                )
-                .bind(gh_app_id)
-                .fetch_optional(&state.db)
-                .await
-                {
-                    Ok(Some(gh_app)) => {
-                        match github_apps::build_clone_url_with_token(&gh_app, source_url).await {
-                            Ok(url) => {
-                                log_deploy(
-                                    state,
-                                    &app_id,
-                                    "info",
-                                    trigger_source,
-                                    "Using GitHub App installation token for clone",
-                                )
-                                .await?;
-                                url
-                            }
-                            Err(e) => {
-                                log_deploy(
-                                    state,
-                                    &app_id,
-                                    "warn",
-                                    trigger_source,
-                                    &format!(
-                                        "GitHub App token failed ({}); falling back to plain URL",
-                                        e
-                                    ),
-                                )
-                                .await?;
-                                source_url.clone()
-                            }
-                        }
-                    }
-                    _ => source_url.clone(),
-                }
-            } else if let Some(ref gl_token_id) = app.gitlab_token_id {
-                match sqlx::query_as::<_, tond_common::GitLabToken>(
-                    "SELECT * FROM gitlab_tokens WHERE id = ? LIMIT 1",
-                )
-                .bind(gl_token_id)
-                .fetch_optional(&state.db)
-                .await
-                {
-                    Ok(Some(gl_token)) => {
-                        match gitlab_tokens::build_clone_url_with_token(
-                            &gl_token, source_url, state,
-                        )
-                        .await
-                        {
-                            Ok(url) => {
-                                log_deploy(
-                                    state,
-                                    &app_id,
-                                    "info",
-                                    trigger_source,
-                                    "Using GitLab PAT for clone",
-                                )
-                                .await?;
-                                url
-                            }
-                            Err(e) => {
-                                log_deploy(
-                                    state,
-                                    &app_id,
-                                    "warn",
-                                    trigger_source,
-                                    &format!(
-                                        "GitLab PAT injection failed ({}); falling back to plain URL",
-                                        e
-                                    ),
-                                )
-                                .await?;
-                                source_url.clone()
-                            }
-                        }
-                    }
-                    _ => source_url.clone(),
-                }
-            } else {
-                source_url.clone()
-            };
+            let (clone_url, git_auth) =
+                resolve_git_source(state, app, source_url, Some(trigger_source)).await?;
 
             log_deploy(
                 state,
                 &app_id,
                 "info",
                 trigger_source,
-                &format!("Building from git: {} ({})", source_url, branch),
+                &format!("Building from git: {} ({})", clone_url, branch),
             )
             .await?;
 
@@ -252,7 +247,8 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
                 state,
                 &app_id,
                 &app_name,
-                &effective_url,
+                &clone_url,
+                git_auth.as_ref(),
                 branch,
                 &BuildOptions {
                     method: &app.build_method,
@@ -972,7 +968,7 @@ pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> R
 ///   4. Insert a `preview_deployments` row and update it once the container is running.
 ///
 /// The caller must provide the `slug` (short random hex) and the `ttl_hours`.
-/// The `subdomain` is set by the caller after reading the dashboard domain from settings.
+/// The `subdomain` (under the preview domain) is set by the caller; see domains::preview_host.
 pub async fn deploy_preview(
     state: &AppState,
     app: &App,
@@ -998,55 +994,20 @@ pub async fn deploy_preview(
                 .or(app.branch.as_deref())
                 .unwrap_or("main");
 
-            tracing::info!("Preview: cloning git {} ({})", source_url, branch);
+            tracing::info!(
+                "Preview: cloning git {} ({})",
+                redact_url_credentials(source_url),
+                branch
+            );
 
-            // Use GitHub App token if the app is linked to one, otherwise
-            // use GitLab PAT if linked.
-            let effective_url = if let Some(ref gh_app_id) = app.github_app_id {
-                match sqlx::query_as::<_, tond_common::GitHubApp>(
-                    "SELECT * FROM github_apps WHERE id = ? LIMIT 1",
-                )
-                .bind(gh_app_id)
-                .fetch_optional(&state.db)
-                .await
-                {
-                    Ok(Some(gh_app)) => {
-                        match github_apps::build_clone_url_with_token(&gh_app, source_url).await {
-                            Ok(url) => url,
-                            Err(_) => source_url.clone(),
-                        }
-                    }
-                    _ => source_url.clone(),
-                }
-            } else if let Some(ref gl_token_id) = app.gitlab_token_id {
-                match sqlx::query_as::<_, tond_common::GitLabToken>(
-                    "SELECT * FROM gitlab_tokens WHERE id = ? LIMIT 1",
-                )
-                .bind(gl_token_id)
-                .fetch_optional(&state.db)
-                .await
-                {
-                    Ok(Some(gl_token)) => {
-                        match gitlab_tokens::build_clone_url_with_token(
-                            &gl_token, source_url, state,
-                        )
-                        .await
-                        {
-                            Ok(url) => url,
-                            Err(_) => source_url.clone(),
-                        }
-                    }
-                    _ => source_url.clone(),
-                }
-            } else {
-                source_url.clone()
-            };
+            let (clone_url, git_auth) = resolve_git_source(state, app, source_url, None).await?;
 
             build_from_git(
                 state,
                 &app_id,
                 &app_name,
-                &effective_url,
+                &clone_url,
+                git_auth.as_ref(),
                 branch,
                 &BuildOptions {
                     method: &app.build_method,
@@ -1410,7 +1371,12 @@ pub(super) async fn update_status(state: &AppState, app_id: &str, status: &str) 
     Ok(())
 }
 
-/// Helper: insert a deploy log entry
+/// Helper: insert a deploy log entry.
+///
+/// Every message is passed through `redact_url_credentials` first: deploy
+/// logs are shown in the dashboard and copied into snapshots, so a URL with
+/// `user:token@` must never reach them, whatever its source (clone output,
+/// docker build output, error messages).
 pub(super) async fn log_deploy(
     state: &AppState,
     app_id: &str,
@@ -1418,6 +1384,8 @@ pub(super) async fn log_deploy(
     trigger_source: &str,
     message: &str,
 ) -> Result<()> {
+    let redacted = redact_url_credentials(message);
+    let message = redacted.as_str();
     let id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
 
@@ -1433,11 +1401,21 @@ pub(super) async fn log_deploy(
     .execute(&state.db)
     .await?;
 
+    // Deploy logs live in the database (and the dashboard); journald only
+    // gets problems. Build output (one call per line) stays at debug.
     match level {
         "error" => tracing::error!("[{}] {}", app_id, message),
         "warn" => tracing::warn!("[{}] {}", app_id, message),
-        _ => tracing::info!("[{}] {}", app_id, message),
+        _ => tracing::debug!("[{}] {}", app_id, message),
     }
+
+    log_bus::publish(DeployLogEvent {
+        id,
+        app_id: app_id.to_string(),
+        level: level.to_string(),
+        message: message.to_string(),
+        created_at: now,
+    });
 
     Ok(())
 }
@@ -1586,6 +1564,55 @@ mod tests {
                 "manual".to_string(),
             ),
             "log_deploy should persist the message, level, and trigger source"
+        );
+
+        log_deploy(
+            &state,
+            "app-1",
+            "error",
+            "manual",
+            "fatal: could not read from https://oauth2:glpat-SECRET@gitlab.com/g/r.git",
+        )
+        .await
+        .unwrap_or_else(|err| panic!("log_deploy should succeed: {err}"));
+        let messages: Vec<String> =
+            sqlx::query_scalar("SELECT message FROM deploy_logs WHERE app_id = ?")
+                .bind("app-1")
+                .fetch_all(&state.db)
+                .await
+                .unwrap_or_else(|err| panic!("failed to load deploy logs: {err}"));
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "fatal: could not read from https://***@gitlab.com/g/r.git"),
+            "log_deploy must redact URL credentials before storing: {messages:?}"
+        );
+        assert!(!messages.iter().any(|m| m.contains("glpat-SECRET")));
+    }
+
+    #[tokio::test]
+    async fn resolve_git_source_moves_url_credentials_out_of_the_clone_url() {
+        let state = test_state().await;
+        let app = App::new(
+            "private".to_string(),
+            "git".to_string(),
+            Some("https://deploy:tok3n@git.example.com/o/r.git".to_string()),
+            None,
+            3000,
+        );
+        let (url, auth) = resolve_git_source(
+            &state,
+            &app,
+            app.source_url.as_deref().unwrap_or_default(),
+            None,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("resolve_git_source should succeed: {err}"));
+        assert_eq!(url, "https://git.example.com/o/r.git");
+        let auth = auth.unwrap_or_else(|| panic!("URL credentials should become header auth"));
+        assert_eq!(
+            (auth.username.as_str(), auth.password.as_str()),
+            ("deploy", "tok3n")
         );
     }
 

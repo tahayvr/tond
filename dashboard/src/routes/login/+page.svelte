@@ -4,6 +4,7 @@
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import TondLogo from '$lib/components/brand/tond-logo.svelte';
+	import InsecureConnectionNotice from '$lib/components/auth/insecure-connection-notice.svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 
@@ -21,7 +22,7 @@
 		try {
 			const result = await login(email, password);
 			if ('mfa_required' in result && result.mfa_required) {
-				// Server issued a tond_mfa_pending cookie — continue on the 2FA page,
+				// Server issued a pending-2FA cookie — continue on the 2FA page,
 				// keeping ?next= so the user still lands where they were headed.
 				await goto(`/login/2fa${page.url.search}`);
 			} else if ('user' in result) {
@@ -42,6 +43,8 @@
 			<TondLogo class="h-8 opacity-80" />
 			<p class="text-xs text-muted-foreground">operator login</p>
 		</div>
+
+		<InsecureConnectionNotice />
 
 		{#if error}
 			<p class="text-sm text-destructive" role="alert">! {error}</p>
@@ -90,5 +93,10 @@
 				{loading ? '_ signing in...' : '_ sign in →'}
 			</Button>
 		</form>
+
+		<p class="text-xs text-muted-foreground">
+			First time here? Create the admin account with the one-time setup link printed by the
+			installer. Lost it? Run <code class="text-foreground">sudo tond setup-link</code> on the server.
+		</p>
 	</div>
 </div>

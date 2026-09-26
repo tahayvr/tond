@@ -8,7 +8,12 @@
 server := "tond-dev"
 bin_dir := "/opt/tond/bin"
 dashboard_dir := "/opt/tond/dashboard"
-target := "x86_64-unknown-linux-gnu"
+# Target CPU architecture for Linux builds, bundles and the local VM:
+# x86_64 (alias amd64) or aarch64 (alias arm64). Override per invocation:
+#   just arch=arm64 package      just arch=arm64 vm-e2e
+arch := "x86_64"
+linux_arch := if arch == "x86_64" { "x86_64" } else if arch == "amd64" { "x86_64" } else if arch == "aarch64" { "aarch64" } else if arch == "arm64" { "aarch64" } else { error("arch must be x86_64|amd64|aarch64|arm64, got: " + arch) }
+target := linux_arch + "-unknown-linux-gnu"
 # Cargo profile for dev deploys. `fast-release` skips LTO for quick rebuilds;
 # override with `just profile=release <recipe>` to build real release artefacts.
 profile := "fast-release"
@@ -59,6 +64,19 @@ check: check-dashboard
     cargo fmt
     cargo check --quiet
     cargo clippy --all-targets --all-features -- -D warnings
+
+# Supply-chain gates: cargo-deny (advisories, licenses, bans, sources) and pnpm audit
+audit: audit-rust audit-dashboard
+
+# cargo-deny against deny.toml (installs cargo-deny on first use)
+audit-rust:
+    @command -v cargo-deny > /dev/null || cargo install --locked cargo-deny
+    cargo deny --all-features check
+
+# Audit the dashboard's production dependencies
+[working-directory('dashboard')]
+audit-dashboard:
+    pnpm audit --prod
 
 # Run dashboard type checks, formatting, and linting
 [working-directory('dashboard')]
@@ -170,37 +188,42 @@ deploy-server: build-server
     scp {{ release_dir }}/tond-server {{ server }}:{{ bin_dir }}/
     ssh {{ server }} "systemctl start tond-server && echo Done"
 
-# Build Linux binaries + dashboard and assemble the install bundle in dist/
+# Build Linux binaries + dashboard and assemble dist/tond-linux-<arch> (just arch=arm64 package for ARM64)
 package: build-rust build-dashboard
-    release/package.sh --bin-dir {{ release_dir }} --version "$(git describe --tags --always --dirty)"
+    release/package.sh --arch {{ linux_arch }} --bin-dir {{ release_dir }} --version "$(git describe --tags --always --dirty)"
+
+# Build and package both architectures (dist/tond-linux-x86_64 and dist/tond-linux-aarch64)
+package-all:
+    just profile={{ profile }} arch=x86_64 package
+    just profile={{ profile }} arch=aarch64 package
 
 # End-to-end smoke test on a throwaway Hetzner server (needs hcloud auth). Args go to e2e/hcloud.sh, e.g. --keep
 e2e-hcloud *args: package
-    e2e/hcloud.sh {{ args }}
+    e2e/hcloud.sh --arch {{ linux_arch }} {{ args }}
 
 # Delete leftover e2e Hetzner servers/keys older than 3 hours
 e2e-hcloud-gc:
     e2e/hcloud.sh --gc
 
-# Create the local OrbStack test VM (x86_64 Ubuntu). Deploy to it with: just server=root@tond-vm@orb deploy
+# Create the local OrbStack test VM ("tond-vm" x86_64, or "tond-vm-arm64" with arch=arm64 — native and faster on Apple Silicon)
 vm-create:
-    scripts/dev-vm.sh create
+    scripts/dev-vm.sh create --arch {{ linux_arch }}
 
-# Install Tond into the local VM from a fresh bundle
+# Install Tond into the local VM from a fresh bundle (just arch=arm64 vm-install for the ARM64 VM)
 vm-install: package
-    scripts/dev-vm.sh install
+    scripts/dev-vm.sh install --arch {{ linux_arch }}
 
-# Run the end-to-end smoke test in the local VM (local Pebble ACME CA)
+# Run the end-to-end smoke test in the local VM (local Pebble ACME CA; just arch=arm64 vm-e2e for ARM64)
 vm-e2e: package
-    scripts/dev-vm.sh e2e
+    scripts/dev-vm.sh e2e --arch {{ linux_arch }}
 
 # Open a root shell in the local VM
 vm-shell:
-    scripts/dev-vm.sh shell
+    scripts/dev-vm.sh shell --arch {{ linux_arch }}
 
 # Delete the local VM
 vm-destroy:
-    scripts/dev-vm.sh destroy
+    scripts/dev-vm.sh destroy --arch {{ linux_arch }}
 
 # Copy systemd service files to the server and reload
 install-services:
@@ -248,9 +271,13 @@ restart-proxy:
 restart-server:
     ssh {{ server }} "systemctl restart tond-server && echo Done"
 
-# Print the root API key from the server journal (first-run only)
+# Print the root API key (written once to a root-only file on first start)
 root-key:
-    ssh {{ server }} "journalctl -u tond-server --no-pager | grep 'ROOT API KEY' -A 1 | grep -oE '[0-9a-f]{64}' | tail -1"
+    ssh {{ server }} "cat /opt/tond/data/root-api-key"
+
+# Print the one-time admin setup link (until the admin account exists)
+setup-link:
+    ssh {{ server }} "tond setup-link"
 
 # SSH into the server
 ssh:

@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/svelte';
+import { render, screen, within } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { App } from '$lib/api';
@@ -36,9 +36,12 @@ const api = vi.hoisted(() => ({
 	generateDeployKey: vi.fn(),
 	getDeployKey: vi.fn(),
 	setWebhookSecret: vi.fn(),
+	getWebhookConfig: vi.fn(),
+	rotateWebhookSecret: vi.fn(),
 	setAutoDeploy: vi.fn(),
 	updateSource: vi.fn(),
 	listPreviews: vi.fn(),
+	getSettings: vi.fn(),
 	createPreview: vi.fn(),
 	deletePreview: vi.fn(),
 	updatePreviewConfig: vi.fn(),
@@ -172,6 +175,11 @@ describe('apps/[id] page', () => {
 		}
 		api.listDeployments.mockResolvedValue([]);
 		api.listPreviews.mockResolvedValue([]);
+		api.getSettings.mockResolvedValue({
+			server_name: 'Tond',
+			dashboard_domain: 'dash.example.com',
+			preview_domain: 'example-previews.com'
+		});
 		api.listOpenPRs.mockResolvedValue([]);
 		api.getAppMetrics.mockResolvedValue([]);
 		api.listRegistryCredentials.mockResolvedValue([]);
@@ -310,18 +318,99 @@ describe('apps/[id] page', () => {
 		expect(await screen.findByText(/saved/i)).toBeInTheDocument();
 	});
 
-	it('updates the webhook secret from the git tab', async () => {
-		api.setWebhookSecret.mockResolvedValue(undefined);
-		api.getApp.mockResolvedValue({ ...app });
+	function webhookConfig(secret: string) {
+		const paths = {
+			github: '/api/webhooks/github/app_1',
+			gitlab: '/api/webhooks/gitlab/app_1',
+			gitea: '/api/webhooks/gitea/app_1',
+			generic: '/api/webhooks/generic/app_1'
+		};
+		return {
+			app_id: 'app_1',
+			paths,
+			urls: {
+				github: 'https://dash.example.com/api/webhooks/github/app_1',
+				gitlab: 'https://dash.example.com/api/webhooks/gitlab/app_1',
+				gitea: 'https://dash.example.com/api/webhooks/gitea/app_1',
+				generic: 'https://dash.example.com/api/webhooks/generic/app_1'
+			},
+			secret,
+			auto_deploy: false,
+			watch_branch: 'main'
+		};
+	}
+
+	it('shows the webhook URL and secret with provider-specific instructions', async () => {
+		api.getWebhookConfig.mockResolvedValue(webhookConfig('generated-secret-0123456789'));
 
 		const user = userEvent.setup();
 		renderPage();
 
 		await user.click(screen.getByRole('tab', { name: /^git$/i }));
-		await user.type(screen.getByLabelText(/new secret/i), 'super-secret');
-		await user.click(screen.getByRole('button', { name: /^update$/i }));
 
-		expect(api.setWebhookSecret).toHaveBeenCalledWith('app_1', 'super-secret');
+		const url = (await screen.findByLabelText(/payload url/i)) as HTMLInputElement;
+		expect(url.value).toBe('https://dash.example.com/api/webhooks/github/app_1');
+		expect((screen.getByLabelText(/^secret$/i) as HTMLInputElement).value).toBe(
+			'generated-secret-0123456789'
+		);
+		expect(screen.getByText(/just the push event/i)).toBeInTheDocument();
+
+		await user.click(screen.getByRole('tab', { name: /^gitlab$/i }));
+		expect((screen.getByLabelText(/^url$/i) as HTMLInputElement).value).toBe(
+			'https://dash.example.com/api/webhooks/gitlab/app_1'
+		);
+		expect(screen.getByLabelText(/secret token/i)).toBeInTheDocument();
+
+		await user.click(screen.getByRole('tab', { name: /gitea/i }));
+		expect((screen.getByLabelText(/target url/i) as HTMLInputElement).value).toBe(
+			'https://dash.example.com/api/webhooks/gitea/app_1'
+		);
+	});
+
+	it('rotates the webhook secret after confirmation', async () => {
+		api.getWebhookConfig.mockResolvedValue(webhookConfig('old-secret-0123456789'));
+		api.rotateWebhookSecret.mockResolvedValue(webhookConfig('new-secret-0123456789'));
+
+		const user = userEvent.setup();
+		renderPage();
+
+		await user.click(screen.getByRole('tab', { name: /^git$/i }));
+		await user.click(await screen.findByRole('button', { name: /rotate secret/i }));
+		expect(api.rotateWebhookSecret).not.toHaveBeenCalled();
+		await user.click(screen.getByRole('button', { name: /rotate now/i }));
+
+		expect(api.rotateWebhookSecret).toHaveBeenCalledWith('app_1');
+		expect(await screen.findByText(/new secret generated/i)).toBeInTheDocument();
+		expect((screen.getByLabelText(/^secret$/i) as HTMLInputElement).value).toBe(
+			'new-secret-0123456789'
+		);
+	});
+
+	it('sets a custom webhook secret and rejects short ones locally', async () => {
+		api.getWebhookConfig.mockResolvedValue(webhookConfig('old-secret-0123456789'));
+		api.setWebhookSecret.mockResolvedValue(webhookConfig('my-own-secret-value-42'));
+
+		const user = userEvent.setup();
+		renderPage();
+
+		await user.click(screen.getByRole('tab', { name: /^git$/i }));
+		await user.click(await screen.findByText(/use your own secret/i));
+
+		const input = screen.getByLabelText(/custom secret/i);
+		await user.type(input, 'short');
+		await user.click(
+			within(screen.getByTestId('app-webhooks')).getByRole('button', { name: /^save$/i })
+		);
+		expect(api.setWebhookSecret).not.toHaveBeenCalled();
+		expect(await screen.findByText(/at least 16 characters/i)).toBeInTheDocument();
+
+		await user.clear(input);
+		await user.type(input, 'my-own-secret-value-42');
+		await user.click(
+			within(screen.getByTestId('app-webhooks')).getByRole('button', { name: /^save$/i })
+		);
+
+		expect(api.setWebhookSecret).toHaveBeenCalledWith('app_1', 'my-own-secret-value-42');
 		expect(await screen.findByText(/webhook secret updated/i)).toBeInTheDocument();
 	});
 
@@ -337,6 +426,23 @@ describe('apps/[id] page', () => {
 
 		expect(api.updatePreviewConfig).toHaveBeenCalledWith('app_1', true);
 		expect(api.getApp).toHaveBeenCalledWith('app_1');
+	});
+
+	it('explains and blocks previews when no preview domain is configured', async () => {
+		api.getSettings.mockResolvedValue({
+			server_name: 'Tond',
+			dashboard_domain: 'dash.example.com',
+			preview_domain: ''
+		});
+
+		const user = userEvent.setup();
+		renderPage({ ...app, github_app_id: 'gh_1', preview_enabled: false });
+
+		await user.click(screen.getByRole('tab', { name: /previews/i }));
+
+		expect(await screen.findByText(/previews need a preview domain/i)).toBeInTheDocument();
+		expect(screen.getByRole('button', { name: /enable pr previews/i })).toBeDisabled();
+		expect(screen.getByRole('button', { name: /create preview/i })).toBeDisabled();
 	});
 
 	it('loads open pull requests for previews', async () => {

@@ -18,10 +18,10 @@
 		rollbackApp,
 		generateDeployKey,
 		getDeployKey,
-		setWebhookSecret,
 		setAutoDeploy,
 		updateSource,
 		listPreviews,
+		getSettings,
 		createPreview,
 		deletePreview,
 		updatePreviewConfig,
@@ -50,7 +50,6 @@
 	import { setUiContext, clearUiContext, appContext, openFeedPanel } from '$lib/ui-context.svelte';
 	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import ConfirmDeleteDialog from '$lib/components/dialogs/confirm-delete-dialog.svelte';
-	import * as Accordion from '$lib/components/ui/accordion/index.js';
 	import { Badge } from '$lib/components/ui/badge/index.js';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
@@ -67,8 +66,11 @@
 	import AppHealth from '$lib/components/tabs/app-page/app-health.svelte';
 	import AppVolumes from '$lib/components/tabs/app-page/app-volumes.svelte';
 	import AppPreviews from '$lib/components/tabs/app-page/app-previews.svelte';
+	import PreviewDomainRequiredAlert from '$lib/components/alerts/preview-domain-required-alert.svelte';
 	import AppMetrics from '$lib/components/tabs/app-page/app-metrics.svelte';
 	import AppHistory from '$lib/components/tabs/app-page/app-history.svelte';
+	import AppWebhooks from '$lib/components/tabs/app-page/app-webhooks.svelte';
+	import { safeUrl } from '$lib/utils';
 	import { SecretInput } from '$lib/components/ui/secret-input/index.js';
 	import Check from '~icons/ri/check-line';
 	import Github from '~icons/ri/github-fill';
@@ -96,6 +98,7 @@
 
 	// Domain form
 	let domainInput = $state('');
+	let certRefreshKey = $state(0);
 
 	// Health form
 	let healthPath = $state('');
@@ -127,12 +130,9 @@
 	let deployKeyError = $state('');
 	let gitError = $state('');
 	let gitSuccess = $state('');
-	let webhookSecretInput = $state('');
 	let watchBranchInput = $state('');
 	let sourceTypeInput = $state<'git' | 'image' | 'tarball'>('git');
 	let sourceUrlInput = $state('');
-	// Track which webhook URL was most recently copied (provider key → timestamp)
-	let copiedWebhook = $state<string | null>(null);
 
 	// Registry credentials state
 	let registryCredentials = $state<RegistryCredential[]>([]);
@@ -165,6 +165,9 @@
 	let previewTtl = $state(24);
 	let previewConfigSaving = $state(false);
 	let previewConfigError = $state('');
+	// null until settings are loaded; '' when no preview domain is configured
+	let previewDomain = $state<string | null>(null);
+	let previewsBlocked = $derived(previewDomain === '');
 
 	// Open PRs state (Load open PRs feature)
 	let openPRs = $state<GithubPR[]>([]);
@@ -359,6 +362,7 @@
 		try {
 			await updateDomain(appId, domainInput);
 			await loadApp();
+			certRefreshKey += 1;
 		} catch (e: any) {
 			error = e.message;
 		}
@@ -465,33 +469,6 @@
 			deployKeyError = e.message;
 		} finally {
 			deployKeyLoading = false;
-		}
-	}
-
-	async function handleCopyWebhookUrl(provider: string, url: string) {
-		try {
-			await navigator.clipboard.writeText(window.location.origin + url);
-			copiedWebhook = provider;
-			setTimeout(() => {
-				if (copiedWebhook === provider) copiedWebhook = null;
-			}, 2000);
-		} catch {
-			// Clipboard API blocked (non-https dev env): select the text instead
-			copiedWebhook = null;
-		}
-	}
-
-	async function handleSetWebhookSecret() {
-		gitError = '';
-		gitSuccess = '';
-		try {
-			const secret = webhookSecretInput.trim() || null;
-			await setWebhookSecret(appId, secret);
-			await loadApp();
-			webhookSecretInput = '';
-			gitSuccess = secret ? 'Webhook secret updated.' : 'Webhook secret cleared.';
-		} catch (e: any) {
-			gitError = e.message;
 		}
 	}
 
@@ -749,6 +726,11 @@
 			previewsError = e.message;
 		} finally {
 			previewsLoading = false;
+		}
+		try {
+			previewDomain = (await getSettings()).preview_domain ?? '';
+		} catch {
+			// Leave the state unknown; the API still refuses previews without a domain.
 		}
 	}
 
@@ -1009,7 +991,12 @@
 
 			<!-- Domain tab -->
 			<Tabs.Content value="domain">
-				<AppDomain bind:domainInput onUpdate={handleUpdateDomain} />
+				<AppDomain
+					bind:domainInput
+					savedDomain={app?.domain ?? null}
+					{certRefreshKey}
+					onUpdate={handleUpdateDomain}
+				/>
 			</Tabs.Content>
 
 			<!-- Health tab -->
@@ -1471,100 +1458,7 @@
 
 					<Separator />
 
-					<!-- Webhook URLs -->
-					<div class="grid gap-3">
-						<h3 class="text-sm font-medium">Webhook URLs</h3>
-						<p class="text-sm text-muted-foreground">
-							Configure your git provider to POST to one of these URLs on push events.
-						</p>
-						<div class="divide-y rounded-md border">
-							{#each [['GitHub', 'github'], ['Generic', 'generic']] as [label, provider] (provider)}
-								{@const webhookPath = `/api/webhooks/${provider}/${app.id}`}
-								<div class="flex items-center gap-2 px-4 py-2">
-									<span class="w-16 shrink-0 text-sm text-muted-foreground">{label}</span>
-									<code class="min-w-0 flex-1 truncate font-mono text-xs">{webhookPath}</code>
-									<Button
-										variant="ghost"
-										size="sm"
-										class="h-7 shrink-0 px-2 text-xs"
-										onclick={() => handleCopyWebhookUrl(provider, webhookPath)}
-									>
-										{#if copiedWebhook === provider}
-											Copied!
-										{:else}
-											Copy
-										{/if}
-									</Button>
-								</div>
-							{/each}
-						</div>
-					</div>
-
-					<!-- Setup instructions -->
-					<Accordion.Root type="single" class="w-full">
-						<Accordion.Item value="github-setup">
-							<Accordion.Trigger class="text-sm font-medium"
-								>GitHub setup instructions</Accordion.Trigger
-							>
-							<Accordion.Content>
-								<div class="space-y-3 pt-1 text-sm text-muted-foreground">
-									<p class="font-medium text-foreground">Method 1 — Public repo (HTTPS webhook)</p>
-									<ol class="list-decimal space-y-1 pl-5">
-										<li>
-											Go to your repository → <strong>Settings → Webhooks → Add webhook</strong>
-										</li>
-										<li>
-											Set <strong>Payload URL</strong> to the <em>GitHub</em> webhook URL above
-										</li>
-										<li>
-											Set <strong>Content type</strong> to
-											<code class="font-mono text-xs">application/json</code>
-										</li>
-										<li>Paste the webhook secret from the <em>Webhook Secret</em> field below</li>
-										<li>
-											Select <strong>Just the push event</strong> and click
-											<strong>Add webhook</strong>
-										</li>
-									</ol>
-									<p class="font-medium text-foreground">
-										Method 2 — Private repo (SSH deploy key)
-									</p>
-									<ol class="list-decimal space-y-1 pl-5">
-										<li>Generate a deploy key using the button below</li>
-										<li>
-											Go to your repository → <strong
-												>Settings → Deploy keys → Add deploy key</strong
-											>
-										</li>
-										<li>
-											Paste the public key; leave <strong>Allow write access</strong> unchecked
-										</li>
-										<li>
-											Set the app's Git URL to SSH format: <code class="font-mono text-xs"
-												>git@github.com:org/repo.git</code
-											>
-										</li>
-										<li>Follow the webhook setup steps above</li>
-									</ol>
-									<p class="font-medium text-foreground">Method 3 — External CI (GitHub Actions)</p>
-									<ol class="list-decimal space-y-1 pl-5">
-										<li>Create a Tond API token (Settings → API Tokens)</li>
-										<li>
-											In the repo → <strong>Settings → Secrets → Actions</strong>, add
-											<code class="font-mono text-xs">TOND_WEBHOOK</code>
-											(Generic URL above) and <code class="font-mono text-xs">TOND_TOKEN</code>
-										</li>
-										<li>In your workflow, after pushing the image, add a deploy step:</li>
-									</ol>
-									<pre
-										class="rounded-md bg-muted p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap">- name: Trigger Tond deploy
-  run: |
-    curl -sf -X POST "&#36;&#123;&#123; secrets.TOND_WEBHOOK }}" \
-      --header "Authorization: Bearer &#36;&#123;&#123; secrets.TOND_TOKEN }}"</pre>
-								</div>
-							</Accordion.Content>
-						</Accordion.Item>
-					</Accordion.Root>
+					<AppWebhooks appId={app.id} />
 
 					<Separator />
 
@@ -1621,29 +1515,6 @@
 						{:else}
 							<p class="text-xs text-muted-foreground">Watching all branches.</p>
 						{/if}
-					</div>
-
-					<Separator />
-
-					<!-- Webhook secret -->
-					<div class="grid gap-3">
-						<h3 class="text-sm font-medium">Webhook Secret</h3>
-						<p class="text-sm text-muted-foreground">
-							Set an HMAC secret to validate incoming webhook payloads. GitHub uses
-							<code class="font-mono text-xs">X-Hub-Signature-256</code>.
-						</p>
-						<div class="flex gap-3">
-							<div class="grid flex-1 gap-2">
-								<Label for="webhook-secret">New secret</Label>
-								<SecretInput
-									id="webhook-secret"
-									bind:value={webhookSecretInput}
-									placeholder="Leave empty to clear"
-									copyable={false}
-								/>
-							</div>
-							<Button onclick={handleSetWebhookSecret} class="self-end">Update</Button>
-						</div>
 					</div>
 
 					<Separator />
@@ -1705,6 +1576,10 @@
 							</Badge>
 						</div>
 
+						{#if previewsBlocked}
+							<PreviewDomainRequiredAlert />
+						{/if}
+
 						{#if previewConfigError}
 							<ErrorAlert title="Error" description={previewConfigError} />
 						{/if}
@@ -1713,7 +1588,7 @@
 							{#if !app.preview_enabled}
 								<Button
 									size="sm"
-									disabled={previewConfigSaving}
+									disabled={previewConfigSaving || previewsBlocked}
 									onclick={() => handleTogglePreviewEnabled(true)}
 								>
 									{previewConfigSaving ? 'Saving…' : 'Enable PR Previews'}
@@ -1737,11 +1612,15 @@
 							</p>
 						{/if}
 
-						<div class="rounded-md border border-dashed px-4 py-3 text-sm text-muted-foreground">
-							<strong class="text-foreground">Wildcard DNS required</strong> — add a
-							<code class="font-mono text-xs">*.yourdomain.com → &lt;server IP&gt;</code> A record so
-							preview subdomains resolve automatically.
-						</div>
+						{#if previewDomain}
+							<div class="rounded-md border border-dashed px-4 py-3 text-sm text-muted-foreground">
+								Previews are served at
+								<code class="font-mono text-xs">&lt;id&gt;-{app.name}.{previewDomain}</code>.
+								<strong class="text-foreground">Wildcard DNS required</strong> — add a
+								<code class="font-mono text-xs">*.{previewDomain} → &lt;server IP&gt;</code> A record
+								so preview hostnames resolve automatically.
+							</div>
+						{/if}
 					</div>
 
 					<Separator />
@@ -1806,7 +1685,7 @@
 													>
 													<td class="px-3 py-2 text-xs">
 														<a
-															href={pr.pr_url}
+															href={safeUrl(pr.pr_url)}
 															target="_blank"
 															rel="noopener noreferrer"
 															class="hover:underline">{pr.title}</a
@@ -1858,7 +1737,9 @@
 									class="w-28"
 								/>
 							</div>
-							<Button onclick={() => handleCreatePreview()}>Create Preview</Button>
+							<Button onclick={() => handleCreatePreview()} disabled={previewsBlocked}>
+								Create Preview
+							</Button>
 						</div>
 						<p class="text-xs text-muted-foreground">
 							The preview will be automatically removed after the TTL expires.

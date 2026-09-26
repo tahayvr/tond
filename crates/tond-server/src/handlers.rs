@@ -308,13 +308,15 @@ pub async fn create_app(
         app.compose_content = Some(content);
     }
     if let Some(dir) = req.base_dir {
-        app.base_dir = Some(dir);
+        let dir = deploy::validate_base_dir(&dir)
+            .map_err(|e| AppError(TondError::InvalidInput(e.to_string())))?;
+        app.base_dir = (!dir.is_empty()).then_some(dir);
     }
     app.static_build = if req.static_build { 1 } else { 0 };
 
     sqlx::query(
-		"INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, status, env_vars, memory_limit, cpu_limit, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, auto_deploy, watch_branch, project_id, github_app_id, registry_credential_id, dockerfile_content, compose_content, base_dir, static_build, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		"INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, status, env_vars, memory_limit, cpu_limit, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, project_id, github_app_id, registry_credential_id, dockerfile_content, compose_content, base_dir, static_build, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 	)
 	.bind(&app.id)
 	.bind(&app.name)
@@ -335,6 +337,7 @@ pub async fn create_app(
 	.bind(&app.volumes)
 	.bind(app.drain_timeout)
 	.bind(&app.build_method)
+	.bind(&app.webhook_secret)
 	.bind(app.auto_deploy)
 	.bind(&app.watch_branch)
 	.bind(&app.project_id)
@@ -668,7 +671,8 @@ pub async fn update_domain(
     let _ = sqlx::query(
 		"INSERT INTO certificates (id, domain, cert_type, cert_path, key_path, issued_at, expires_at, status, created_at, updated_at)
          VALUES (?, ?, 'acme', ?, ?, ?, ?, 'pending', ?, ?)
-         ON CONFLICT(domain) DO UPDATE SET status = 'pending', updated_at = ?",
+         ON CONFLICT(domain) DO UPDATE SET status = 'pending', updated_at = ?,
+            last_error = NULL, next_retry_at = NULL, failure_count = 0",
 	)
 	.bind(&cert_id)
 	.bind(&req.domain)
@@ -720,6 +724,38 @@ pub async fn list_certs(
     let responses: Vec<CertificateResponse> =
         certs.into_iter().map(CertificateResponse::from).collect();
     Ok((StatusCode::OK, Json(ApiResponse::ok(responses))))
+}
+
+// ── Retry a pending certificate now ──
+
+/// POST /api/certs/{domain}/retry — ask tond-proxy to attempt issuance on its
+/// next pass (within ~30 s) instead of waiting for the backoff. The failure
+/// count is kept, so repeated retries of a broken domain still back off.
+pub async fn retry_cert(
+    _rate: RateLimit,
+    _auth: RequireAuth,
+    State(state): State<AppState>,
+    Path(domain): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let updated = sqlx::query(
+        "UPDATE certificates SET next_retry_at = NULL, updated_at = ? WHERE domain = ?",
+    )
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(&domain)
+    .execute(&state.db)
+    .await?
+    .rows_affected();
+
+    if updated == 0 {
+        return Err(TondError::NotFound(format!("No certificate for {domain}")).into());
+    }
+
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(
+            json!({ "message": "Certificate retry queued", "domain": domain }),
+        )),
+    ))
 }
 
 // ── Update Health Check Config ──
@@ -2113,5 +2149,46 @@ mod tests {
             Some("project-1"),
             "assign_project should persist the selected project ID on the app"
         );
+    }
+
+    #[tokio::test]
+    async fn retry_cert_clears_next_retry_but_keeps_the_failure_count() {
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO certificates (id, domain, cert_path, key_path, issued_at, expires_at, status, next_retry_at, failure_count, last_error)
+             VALUES ('c1', 'x.example.com', 'c', 'k', 'now', 'later', 'failed', '2999-01-01T00:00:00Z', 3, 'boom')",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap_or_else(|err| panic!("seed cert: {err}"));
+
+        let response = retry_cert(
+            RateLimit,
+            RequireAuth,
+            State(state.clone()),
+            Path("x.example.com".to_string()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("retry_cert should succeed"))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let (next, count): (Option<String>, i64) = sqlx::query_as(
+            "SELECT next_retry_at, failure_count FROM certificates WHERE domain = 'x.example.com'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or_else(|err| panic!("read cert: {err}"));
+        assert_eq!(next, None, "the proxy retries on its next pass");
+        assert_eq!(count, 3, "backoff history is kept");
+
+        let missing = retry_cert(
+            RateLimit,
+            RequireAuth,
+            State(state),
+            Path("nope.example.com".to_string()),
+        )
+        .await;
+        assert!(missing.is_err(), "unknown domains are a 404");
     }
 }

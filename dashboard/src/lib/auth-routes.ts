@@ -4,7 +4,9 @@
 
 export const AUTH_ROUTES = ['/login', '/login/2fa', '/setup'] as const;
 
-export type AuthStatus = 'loading' | 'setup' | 'login' | 'authenticated';
+// There is no 'setup' status: /setup is reached through the installer's one-time
+// link and validates its token itself, so signed-out visitors may stay on it.
+export type AuthStatus = 'loading' | 'login' | 'authenticated';
 
 export function isAuthRoute(pathname: string): boolean {
 	const path = pathname.length > 1 ? pathname.replace(/\/+$/, '') : pathname;
@@ -49,10 +51,7 @@ export function authRedirect(status: AuthStatus, url: URL): string | null {
 	switch (status) {
 		case 'loading':
 			return null;
-		case 'setup':
-			return path === '/setup' ? null : '/setup';
 		case 'login':
-			if (path === '/setup') return '/login';
 			return isAuthRoute(path) ? null : loginUrl(url);
 		case 'authenticated':
 			return isAuthRoute(path) ? safeNextPath(url.searchParams.get('next')) : null;

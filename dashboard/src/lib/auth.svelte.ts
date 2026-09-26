@@ -3,7 +3,10 @@ import { getAuthStatus, setUnauthorizedHandler, type AuthStatus, type User } fro
 // Auth state -- module-level singletons using Svelte 5 runes via $state
 // These are reactive and can be imported by any component.
 
-let _status = $state<'loading' | 'setup' | 'login' | 'authenticated'>('loading');
+// There is no 'setup' state: the server doesn't tell unauthenticated callers
+// whether first-run setup is open. The /setup page is reached through the
+// one-time link printed by the installer and checks its token itself.
+let _status = $state<'loading' | 'login' | 'authenticated'>('loading');
 let _user = $state<User | null>(null);
 let _sessionExpired = $state(false);
 
@@ -60,10 +63,7 @@ export async function checkAuth(): Promise<void> {
 	try {
 		const authStatus: AuthStatus = await getAuthStatus();
 
-		if (authStatus.needs_setup) {
-			_status = 'setup';
-			_user = null;
-		} else if (authStatus.authenticated && authStatus.user) {
+		if (authStatus.authenticated && authStatus.user) {
 			_status = 'authenticated';
 			_user = authStatus.user;
 		} else {

@@ -54,6 +54,10 @@ export interface TerminalTarget {
 	kind: TerminalTargetKind;
 	label: string;
 	shell_user: string | null;
+	/** False for the host shell while it is switched off on the server. */
+	enabled: boolean;
+	/** Opening a session needs the password (and 2FA code). */
+	requires_step_up: boolean;
 }
 
 interface TerminalState {
@@ -162,7 +166,15 @@ export function getPreferredTerminalTarget(
 		if (dbTarget) return dbTarget;
 	}
 
-	return targets.find((target) => target.kind === 'server') ?? targets[0] ?? null;
+	// Prefer the host shell when it's switched on, otherwise the first usable
+	// container; fall back to the (switched-off) server so its notice explains why.
+	return (
+		targets.find((target) => target.kind === 'server' && target.enabled !== false) ??
+		targets.find((target) => target.enabled !== false) ??
+		targets.find((target) => target.kind === 'server') ??
+		targets[0] ??
+		null
+	);
 }
 
 export function getUiContext(): UiContext {

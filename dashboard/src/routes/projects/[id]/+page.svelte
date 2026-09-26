@@ -33,6 +33,7 @@
 	import Breadcrumb from '$lib/components/nav/breadcrumb.svelte';
 	import ConfirmDeleteDialog from '$lib/components/dialogs/confirm-delete-dialog.svelte';
 	import CreateProjectPreviewDialog from '$lib/components/dialogs/create-project-preview-dialog.svelte';
+	import PreviewDomainRequiredAlert from '$lib/components/alerts/preview-domain-required-alert.svelte';
 	import ProjectPreviewCard from '$lib/components/cards/project-preview-card/project-preview-card.svelte';
 	import Plus from '~icons/ri/add-line';
 	import ChevronUp from '~icons/ri/arrow-up-s-line';
@@ -45,6 +46,7 @@
 		allDatabases: ManagedDatabase[];
 		allApps: App[];
 		projectPreviews: ProjectPreview[];
+		previewDomain: string;
 	};
 
 	let projectId = $derived(page.params.id || params.id);
@@ -79,6 +81,7 @@
 	let previewsLoading = $state(false);
 	let previewsError = $state('');
 	let showCreatePreview = $state(false);
+	let previewDomain = $state('');
 	let deletingPreviewId = $state<string | null>(null);
 
 	async function refreshProjectData() {
@@ -211,6 +214,7 @@
 		allDatabases = routeData.allDatabases;
 		allApps = routeData.allApps;
 		projectPreviews = routeData.projectPreviews;
+		previewDomain = routeData.previewDomain ?? '';
 		if (project) {
 			editName = project.name;
 			editDescription = project.description ?? '';
@@ -340,7 +344,7 @@
 						size="sm"
 						variant="outline"
 						onclick={() => (showCreatePreview = true)}
-						disabled={project.apps.length === 0}
+						disabled={project.apps.length === 0 || !previewDomain}
 					>
 						<Plus class="mr-1 h-4 w-4" />
 						New Preview
@@ -348,6 +352,11 @@
 				</div>
 			</Card.Header>
 			<Card.Content>
+				{#if !previewDomain}
+					<div class="mb-4">
+						<PreviewDomainRequiredAlert />
+					</div>
+				{/if}
 				{#if previewsError}
 					<div
 						class="mb-4 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive"
@@ -365,7 +374,7 @@
 							<p class="mt-1 text-xs text-muted-foreground/60">
 								Add member apps first before creating a preview
 							</p>
-						{:else}
+						{:else if previewDomain}
 							<Button
 								variant="outline"
 								size="sm"

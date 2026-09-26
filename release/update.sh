@@ -14,6 +14,8 @@ DATA_DIR="${INSTALL_DIR}/data"
 BACKUP_DIR="${DATA_DIR}/backups"
 SECRET_ENV_FILE="${DATA_DIR}/tond.env"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Unprivileged user tond-proxy runs as (see tond-proxy.service).
+PROXY_USER="tond-proxy"
 
 # Port tond-server listens on — read from environment or fall back to default.
 # Override via: TOND_PORT=4000 sudo ./update.sh
@@ -95,6 +97,81 @@ Examples:
 EOF
 }
 
+# Host CPU architecture in bundle naming (tond-linux-<arch>): x86_64 or aarch64.
+host_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo "x86_64" ;;
+        aarch64|arm64) echo "aarch64" ;;
+        *) fatal "Unsupported architecture: $(uname -m). Tond supports x86_64 and aarch64." ;;
+    esac
+}
+
+# Same permission scheme as install.sh (keep the two copies in sync): see the
+# comment above secure_data_dir() in install.sh.
+ensure_proxy_user() {
+    if ! getent group "$PROXY_USER" > /dev/null; then
+        groupadd --system "$PROXY_USER"
+    fi
+    if ! id -u "$PROXY_USER" > /dev/null 2>&1; then
+        useradd --system --gid "$PROXY_USER" --no-create-home --home-dir /nonexistent \
+            --shell /usr/sbin/nologin "$PROXY_USER"
+        info "Created system user ${PROXY_USER}"
+    fi
+}
+
+secure_data_dir() {
+    step "Securing ${DATA_DIR}"
+
+    chown root:"$PROXY_USER" "$DATA_DIR"
+    chmod 3770 "$DATA_DIR"
+
+    local dir
+    for dir in builds compose volumes databases keys backups docker-config; do
+        mkdir -p "${DATA_DIR}/${dir}"
+        chown root:root "${DATA_DIR}/${dir}"
+        # Symbolic mode: a numeric mode keeps the setgid bit inherited from DATA_DIR.
+        chmod u=rwx,go=,g-s "${DATA_DIR}/${dir}"
+    done
+    # Secrets: safe to tighten recursively (nothing else reads them).
+    chmod -R go-rwx "${DATA_DIR}/keys" "${DATA_DIR}/backups" "${DATA_DIR}/docker-config"
+
+    # Everything else at the top level: owner only, except the shared DB and
+    # the proxy's own state, handled below.
+    find "$DATA_DIR" -mindepth 1 -maxdepth 1 \
+        ! -name 'tond.db' ! -name 'tond.db-wal' ! -name 'tond.db-shm' \
+        ! -name certs ! -name acme_account.json \
+        -exec chmod go-rwx {} +
+
+    # Pre-create the database so the proxy can open it on first start; an
+    # empty file is a valid new SQLite database.
+    if [[ ! -e "${DATA_DIR}/tond.db" ]]; then
+        install -m 0660 -o root -g "$PROXY_USER" /dev/null "${DATA_DIR}/tond.db"
+    fi
+    local f
+    for f in tond.db tond.db-wal tond.db-shm; do
+        if [[ -e "${DATA_DIR}/${f}" ]]; then
+            chown root:"$PROXY_USER" "${DATA_DIR}/${f}"
+            chmod 0660 "${DATA_DIR}/${f}"
+        fi
+    done
+
+    mkdir -p "${DATA_DIR}/certs"
+    chown -R "$PROXY_USER":"$PROXY_USER" "${DATA_DIR}/certs"
+    find "${DATA_DIR}/certs" -type d -exec chmod u=rwx,go=,g-s {} +
+    find "${DATA_DIR}/certs" -type f -exec chmod 0600 {} +
+    if [[ -e "${DATA_DIR}/acme_account.json" ]]; then
+        chown "$PROXY_USER":"$PROXY_USER" "${DATA_DIR}/acme_account.json"
+        chmod 0600 "${DATA_DIR}/acme_account.json"
+    fi
+
+    if [[ -e "$SECRET_ENV_FILE" ]]; then
+        chown root:root "$SECRET_ENV_FILE"
+        chmod 0600 "$SECRET_ENV_FILE"
+    fi
+
+    info "Data directory locked down (tond.db shared with ${PROXY_USER} via group; secrets root-only)"
+}
+
 # Get current installed version
 get_current_version() {
     if [[ -f "${INSTALL_DIR}/VERSION" ]]; then
@@ -118,18 +195,20 @@ download_version() {
 
     step "Downloading Tond v${version}"
 
-    local url
+    local arch name url
+    arch="$(host_arch)"
+    name="tond-linux-${arch}"
     if [[ "$version" == "latest" ]]; then
-        url="https://github.com/tahayvr/tond/releases/latest/download/tond-linux-x86_64.tar.gz"
+        url="https://github.com/tahayvr/tond/releases/latest/download/${name}.tar.gz"
     else
-        url="https://github.com/tahayvr/tond/releases/download/v${version}/tond-linux-x86_64.tar.gz"
+        url="https://github.com/tahayvr/tond/releases/download/v${version}/${name}.tar.gz"
     fi
 
     info "Downloading from GitHub..."
     if [[ "$DRY_RUN" == true ]]; then
         info "[DRY RUN] Would download: $url"
         # Return a placeholder path so callers don't have to special-case dry-run
-        echo "${tmp_dir}/tond-linux-x86_64"
+        echo "${tmp_dir}/${name}"
         return 0
     fi
 
@@ -145,7 +224,7 @@ download_version() {
     expected_hash=$(awk '{print $1}' "${tmp_dir}/tond.tar.gz.sha256")
     local actual_hash
     actual_hash=$(sha256sum "${tmp_dir}/tond.tar.gz" | awk '{print $1}')
-    if [[ "$expected_hash" != "$actual_hash" ]]; then
+    if [[ ! "$expected_hash" =~ ^[0-9a-f]{64}$ || "$expected_hash" != "$actual_hash" ]]; then
         fatal "Checksum verification failed! Download may be corrupted or tampered with."
     fi
     info "✓ Checksum verified"
@@ -153,7 +232,7 @@ download_version() {
     info "Extracting..."
     tar -xzf "${tmp_dir}/tond.tar.gz" -C "$tmp_dir" || fatal "Failed to extract archive"
 
-    local extracted="${tmp_dir}/tond-linux-x86_64"
+    local extracted="${tmp_dir}/${name}"
     if [[ ! -d "$extracted" ]]; then
         fatal "Expected extracted directory not found: ${extracted}"
     fi
@@ -281,6 +360,7 @@ perform_update() {
         else
             info "     (create encryption key in ${SECRET_ENV_FILE})"
         fi
+        info "     (ensure the ${PROXY_USER} user; lock down ${DATA_DIR} permissions)"
         info "  4. Start tond-server (database migrations and secret re-encryption run)"
         info "  5. Start tond-proxy (traffic resumes)"
         info "  6. Verify services are healthy"
@@ -314,6 +394,11 @@ perform_update() {
     cp "${download_path}/tond-server.service" /etc/systemd/system/tond-server.service
     cp "${download_path}/tond-proxy.service" /etc/systemd/system/tond-proxy.service
     systemctl daemon-reload
+
+    # The new units run tond-proxy as ${PROXY_USER}; fix ownership and modes
+    # before either service starts.
+    ensure_proxy_user
+    secure_data_dir
     
     # Step 4: Start server (runs migrations)
     info "Starting tond-server..."

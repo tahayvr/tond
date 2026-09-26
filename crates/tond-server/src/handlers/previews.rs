@@ -4,6 +4,10 @@
 // an auto-expiry TTL. The proxy reads the `preview_deployments` table every
 // 5 s and routes the assigned subdomain to the container's host port.
 //
+// Previews are served only as <slug>-<app>.<preview_domain>, a separate
+// registrable domain from the dashboard (see domains.rs). Without a preview
+// domain, creating or enabling previews is refused with a 400.
+//
 //   POST   /api/apps/{id}/preview
 //     Build the app's image (same source as a regular deploy) and start a
 //     container named `tond-preview-{slug}`. Returns a PreviewDeploymentResponse
@@ -30,7 +34,9 @@ use tond_common::{
 use crate::{
     auth::{RateLimit, RequireAuth},
     deploy, docker,
+    domains::{preview_host, require_preview_domain},
     error::AppError,
+    handlers::webhooks::sanitize_provider_url,
     state::AppState,
 };
 
@@ -70,6 +76,10 @@ pub async fn create_preview(
         Ok(a) => a,
         Err(e) => return e.into_response(),
     };
+    let preview_domain = match require_preview_domain(&state).await {
+        Ok(d) => d,
+        Err(e) => return e.into_response(),
+    };
 
     let body_ref = body.as_ref();
     let ttl_hours = body_ref
@@ -80,7 +90,18 @@ pub async fn create_preview(
     let pr_number = body_ref.and_then(|b| b.pr_number);
     let head_sha = body_ref.and_then(|b| b.head_sha.clone());
     let head_ref = body_ref.and_then(|b| b.head_ref.clone());
-    let pr_url = body_ref.and_then(|b| b.pr_url.clone());
+    let pr_url = match body_ref.and_then(|b| b.pr_url.as_deref()) {
+        None => None,
+        Some(raw) => match sanitize_provider_url(Some(raw)) {
+            Some(url) => Some(url),
+            None => {
+                return AppError(TondError::InvalidInput(
+                    "pr_url must be an https:// URL".to_string(),
+                ))
+                .into_response();
+            }
+        },
+    };
 
     let ttl_seconds = ttl_hours * 3600;
     let slug = random_slug();
@@ -88,19 +109,7 @@ pub async fn create_preview(
     let expires_at = (now + chrono::Duration::seconds(ttl_seconds)).to_rfc3339();
     let created_at = now.to_rfc3339();
 
-    // Determine the subdomain using the cached dashboard_domain setting
-    let dashboard_domain: Option<String> = {
-        let s = state.settings.read().await;
-        if s.dashboard_domain.is_empty() {
-            None
-        } else {
-            Some(s.dashboard_domain.clone())
-        }
-    };
-
-    let subdomain = dashboard_domain
-        .as_ref()
-        .map(|d| format!("{}-{}.{}", slug, app.name, d));
+    let subdomain = preview_host(&slug, &app.name, &preview_domain);
 
     let preview_id = uuid::Uuid::new_v4().to_string();
 
@@ -296,6 +305,12 @@ pub async fn update_preview_config(
         Err(e) => return e.into_response(),
     };
 
+    if body.preview_enabled
+        && let Err(e) = require_preview_domain(&state).await
+    {
+        return e.into_response();
+    }
+
     let enabled: i64 = if body.preview_enabled { 1 } else { 0 };
     let now = chrono::Utc::now().to_rfc3339();
 
@@ -364,7 +379,8 @@ mod tests {
 
         let settings = ServerSettings {
             server_name: "tond".to_string(),
-            dashboard_domain: "preview.example.com".to_string(),
+            dashboard_domain: "dash.example.com".to_string(),
+            preview_domain: "example-previews.com".to_string(),
         };
 
         AppState {
@@ -443,6 +459,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_preview_rejects_non_https_pr_urls() {
+        let state = test_state().await;
+        let app = seed_preview_app(&state, "frontend", "compose").await;
+
+        let response = create_preview(
+            RateLimit,
+            RequireAuth,
+            State(state.clone()),
+            Path(app.id.clone()),
+            Some(Json(CreatePreviewRequest {
+                ttl_hours: None,
+                pr_number: Some(1),
+                head_sha: None,
+                head_ref: None,
+                pr_url: Some("javascript:alert(document.cookie)".to_string()),
+            })),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM preview_deployments")
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_else(|err| panic!("failed to count previews: {err}"));
+        assert_eq!(rows, 0, "no preview may be stored with a javascript: link");
+    }
+
+    #[tokio::test]
     async fn create_preview_inserts_building_row_and_background_failure_marks_it_failed() {
         let state = test_state().await;
         let app = seed_preview_app(&state, "frontend", "compose").await;
@@ -486,8 +530,8 @@ mod tests {
             .as_str()
             .unwrap_or_else(|| panic!("expected preview response to contain a subdomain"));
         assert!(
-            subdomain.ends_with(".preview.example.com") && subdomain.contains("-frontend."),
-            "create_preview should derive a preview subdomain from slug, app name, and dashboard domain, got: {subdomain}"
+            subdomain.ends_with(".example-previews.com") && subdomain.contains("-frontend."),
+            "create_preview should derive a preview subdomain from slug, app name, and preview domain, got: {subdomain}"
         );
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -641,6 +685,55 @@ mod tests {
             (row.1.as_str(), row.2.as_str()),
             (r#"["TOKEN"]"#, r#"{"MODE":"preview"}"#),
             "toggling previews must leave preview exclusions and overrides untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn previews_are_refused_without_a_preview_domain() {
+        let state = test_state().await;
+        state.settings.write().await.preview_domain = String::new();
+        let app = seed_preview_app(&state, "frontend", "git").await;
+
+        let response = create_preview(
+            RateLimit,
+            RequireAuth,
+            State(state.clone()),
+            Path(app.id.clone()),
+            None,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "create_preview must refuse to run without a preview domain"
+        );
+        let body = response_json(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("preview domain")),
+            "the error should explain that a preview domain is required, got: {body}"
+        );
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM preview_deployments")
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_else(|err| panic!("failed to count previews: {err}"));
+        assert_eq!(count.0, 0, "no preview row should be created");
+
+        let response = update_preview_config(
+            RateLimit,
+            RequireAuth,
+            State(state.clone()),
+            Path(app.id.clone()),
+            Json(UpdatePreviewConfigRequest {
+                preview_enabled: true,
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "enabling PR previews must be refused without a preview domain"
         );
     }
 

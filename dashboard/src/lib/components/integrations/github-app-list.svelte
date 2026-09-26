@@ -3,8 +3,10 @@
 		listGitHubApps,
 		getGitHubAppManifestUrl,
 		deleteGitHubApp,
+		getGitHubAppInstallUrl,
 		type GitHubApp
 	} from '$lib/api';
+	import { safeUrl } from '$lib/utils';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import GitHubAppCard from './github-app-card.svelte';
@@ -78,8 +80,17 @@
 		}
 	}
 
-	function handleInstall(app: GitHubApp) {
-		window.location.href = app.install_url;
+	async function handleInstall(app: GitHubApp) {
+		error = '';
+		try {
+			// The URL carries a single-use state bound to this admin session;
+			// GitHub echoes it back so the installation is stored on this App.
+			const url = safeUrl(await getGitHubAppInstallUrl(app.id));
+			if (!url) throw new Error('Unexpected installation URL');
+			window.location.href = url;
+		} catch (e: any) {
+			error = e.message ?? 'Failed to start GitHub App installation';
+		}
 	}
 
 	function handleRename(updated: GitHubApp) {

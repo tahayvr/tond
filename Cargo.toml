@@ -108,6 +108,9 @@ chrono-tz = "0.10.4"
 # rust_crypto = pure-Rust RustCrypto provider; use_pem = PEM key parsing support
 jsonwebtoken = { version = "11.1.0", features = ["rust_crypto", "use_pem"] }
 
+# Public Suffix List (registrable-domain checks for the preview domain)
+psl = "2.1.238"
+
 # URL percent-encoding helper
 urlencoding = "2.1.3"
 

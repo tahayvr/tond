@@ -61,8 +61,9 @@ pub struct App {
     /// Build method: "tbuild" | "dockerfile"
     pub build_method: String,
     // ── Phase 4: Git Integration & Automation ──
-    /// HMAC-SHA256 secret used to validate GitHub/GitLab webhook signatures.
-    /// None = no signature validation (generic webhooks or not configured).
+    /// Per-app webhook secret: the HMAC-SHA256 key for GitHub/Gitea/generic
+    /// signatures and the GitLab `X-Gitlab-Token`. Generated at creation;
+    /// webhooks are rejected when it is missing.
     pub webhook_secret: Option<String>,
     /// 1 = automatically trigger a deploy when a webhook fires for the
     /// configured branch; 0 = disabled (webhook exists but does not auto-deploy).
@@ -135,7 +136,7 @@ impl App {
             volumes: "[]".to_string(),
             drain_timeout: 30,
             build_method: "tbuild".to_string(),
-            webhook_secret: None,
+            webhook_secret: Some(crate::generate_raw_key()),
             auto_deploy: 0,
             watch_branch: None,
             deploy_key_pub: None,
@@ -461,12 +462,51 @@ pub struct UpdateAutoDeployRequest {
     pub watch_branch: Option<String>,
 }
 
-/// PUT /api/apps/{id}/webhook-secret — set or rotate the HMAC signing secret
+/// PUT /api/apps/{id}/webhook-secret — replace the webhook secret with a
+/// caller-chosen value. Verification cannot be disabled; see
+/// `POST /api/apps/{id}/webhook-secret/rotate` for a server-generated secret.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateWebhookSecretRequest {
-    /// Plain-text secret that GitHub/GitLab will use to sign webhook payloads.
-    /// Set to null to remove signature validation (accept all webhook calls).
-    pub secret: Option<String>,
+    /// New secret (at least `MIN_WEBHOOK_SECRET_LEN` characters).
+    pub secret: String,
+}
+
+/// Minimum length of a caller-chosen webhook secret.
+pub const MIN_WEBHOOK_SECRET_LEN: usize = 16;
+
+/// Per-provider webhook URL paths for an app (relative to the dashboard origin).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookUrls {
+    pub github: String,
+    pub gitlab: String,
+    pub gitea: String,
+    pub generic: String,
+}
+
+impl WebhookUrls {
+    /// Webhook paths are addressed by app UUID only (never by name).
+    pub fn for_app(app_id: &str) -> Self {
+        Self {
+            github: format!("/api/webhooks/github/{app_id}"),
+            gitlab: format!("/api/webhooks/gitlab/{app_id}"),
+            gitea: format!("/api/webhooks/gitea/{app_id}"),
+            generic: format!("/api/webhooks/generic/{app_id}"),
+        }
+    }
+}
+
+/// GET /api/apps/{id}/webhook and POST /api/apps/{id}/webhook-secret/rotate
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookConfigResponse {
+    pub app_id: String,
+    /// Paths relative to the server origin, e.g. `/api/webhooks/github/<uuid>`.
+    pub paths: WebhookUrls,
+    /// Absolute URLs when `dashboard_domain` is configured, else None.
+    pub urls: Option<WebhookUrls>,
+    /// The current webhook secret (shown to authenticated users only).
+    pub secret: String,
+    pub auto_deploy: bool,
+    pub watch_branch: Option<String>,
 }
 
 /// Response returned after generating or fetching a deploy key.

@@ -14,6 +14,12 @@
 //     If no route is found, `request_filter` short-circuits and returns a
 //     friendly HTML 502 error page directly (no upstream connection made).
 //
+//     Preview isolation: hosts under preview_domain (a separate registrable
+//     domain, validated by tond-server) are answered ONLY from preview routes
+//     — never the dashboard/API or an app — and get a plain 404 when no
+//     preview matches. Preview routes are loaded only if they live under
+//     preview_domain, so a preview is never served on the dashboard domain.
+//
 //   TLS — TondTlsAccept (Pingora TlsAccept)
 //     Implements SNI-based certificate selection. On each TLS handshake
 //     it reads the server name from the ClientHello, looks up the cert
@@ -21,19 +27,29 @@
 //     Falls back to a self-signed cert for unknown domains.
 //
 //   Port 80 — run_http_server() (raw Tokio TCP)
-//     A hand-rolled HTTP/1.1 server. Two behaviours:
+//     A hand-rolled HTTP/1.1 server. Three behaviours:
 //       /.well-known/acme-challenge/{token} — serves ACME HTTP-01 responses
-//       everything else                     — 301 redirect to https://
+//       a host Tond serves                  — 301 redirect to https://
+//       anything else                       — 404 (no open redirect)
+//     Hardened against slow clients: the request head must arrive within
+//     HTTP_REQUEST_TIMEOUT, at most HTTP_MAX_CONNECTIONS are served at once,
+//     and accept() errors never stop the listener (renewals depend on it).
 //
 //   Background thread (native OS thread + Tokio runtime):
-//     - Route refresh loop: every 5 s opens a read-only SQLite connection,
-//       queries running apps with a stored host_port, and atomically
-//       replaces the RouteMap. Also reads dashboard_domain from the
-//       settings table so changes made via the dashboard or CLI are picked
-//       up without a proxy restart. Falls back to Docker inspect for apps
-//       that were deployed before migration 006 (host_port IS NULL).
-//     - ACME renewal loop: waits 10 s then runs every 6 h. For any domain
-//       without a cert in CertStore, calls acme::provision_cert().
+//     - Route refresh loop: every 2 s opens a read-only SQLite connection,
+//       queries running apps and previews with a stored host_port, and
+//       atomically replaces the RouteMap. Also reads dashboard_domain and
+//       preview_domain from the settings table so changes made via the
+//       dashboard or CLI are picked up without a proxy restart. The proxy
+//       never talks to Docker (it runs unprivileged, see tond-proxy.service).
+//     - Certificate loop (issuance.rs): every 30 s, issues or renews certs
+//       for routed domains and the dashboard domain, with per-domain
+//       exponential backoff and a DNS pre-check; results (including the last
+//       error and next retry time) are written to the certificates table.
+//
+// Logging: nothing is logged per request at info (routing decisions are at
+// debug), and the route refresh only logs when a route is added, removed or
+// changed. Set RUST_LOG=tond_proxy=debug to trace routing.
 //
 // Environment variables consumed here:
 //   TOND_DB_PATH          — SQLite database path
@@ -48,6 +64,7 @@
 
 mod acme;
 mod certs;
+mod issuance;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -62,16 +79,21 @@ use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::time::{Duration, Instant};
+use tokio::sync::{RwLock, Semaphore};
 
 use crate::acme::ChallengeMap;
 use crate::certs::CertStore;
+use crate::issuance::IssuanceLoop;
 
 /// Route map: domain -> upstream (host:port)
 type RouteMap = Arc<RwLock<HashMap<String, String>>>;
 
 /// Shared, live dashboard domain — updated on every DB poll.
 type DashboardDomain = Arc<RwLock<Option<String>>>;
+
+/// Shared, live preview domain — updated on every DB poll.
+type PreviewDomain = Arc<RwLock<Option<String>>>;
 
 // ── TLS Accept Callback ──
 
@@ -115,6 +137,9 @@ struct TondProxy {
     /// Live dashboard domain — reads from the DB on every 2 s poll.
     /// None means no dashboard domain is configured.
     dashboard_domain: DashboardDomain,
+    /// Live preview domain — previews are served only under it, and nothing
+    /// else is. None means previews are disabled.
+    preview_domain: PreviewDomain,
     /// Address of the tond-server instance (default: 127.0.0.1:3001).
     server_addr: String,
 }
@@ -123,7 +148,18 @@ struct TondProxy {
 enum RouteTarget {
     Dashboard,
     Upstream(String),
+    /// Unknown host: friendly 502 page.
     Missing,
+    /// Host under the preview domain without a matching preview: plain 404.
+    NotFound,
+}
+
+/// `host` equals `domain` or is a subdomain of it.
+fn is_under_domain(host: &str, domain: &str) -> bool {
+    host == domain
+        || host
+            .strip_suffix(domain)
+            .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
 fn normalize_host(host_header: Option<&str>) -> String {
@@ -135,8 +171,22 @@ fn normalize_host(host_header: Option<&str>) -> String {
 fn resolve_route(
     host: &str,
     dashboard_domain: Option<&str>,
+    preview_domain: Option<&str>,
     routes: &HashMap<String, String>,
 ) -> RouteTarget {
+    // Checked first: the preview domain never reaches the dashboard/API.
+    // `routes` only holds hosts under the preview domain that are previews
+    // (refresh_routes drops app domains under it).
+    if let Some(pd) = preview_domain
+        && is_under_domain(host, pd)
+    {
+        return routes
+            .get(host)
+            .cloned()
+            .map(RouteTarget::Upstream)
+            .unwrap_or(RouteTarget::NotFound);
+    }
+
     if dashboard_domain == Some(host) {
         return RouteTarget::Dashboard;
     }
@@ -157,6 +207,26 @@ fn parse_upstream_addr(upstream: &str, fallback_port: u16) -> Option<(&str, u16)
     Some((parts[0], parts[1].parse().unwrap_or(fallback_port)))
 }
 
+/// Set the forwarding headers on a request bound for tond-server.
+///
+/// tond-server attributes requests from a loopback peer (this proxy) to the
+/// address in `X-Forwarded-For` for rate limiting and login backoff, so any
+/// client-supplied value is replaced, never appended to. `X-Forwarded-Proto`
+/// tells it the request arrived over TLS (it sends HSTS only then).
+fn set_dashboard_forwarding_headers(
+    req: &mut pingora::http::RequestHeader,
+    client_ip: Option<std::net::IpAddr>,
+) -> pingora::Result<()> {
+    req.remove_header("x-forwarded-for");
+    req.remove_header("x-real-ip");
+    req.remove_header("forwarded");
+    if let Some(ip) = client_ip {
+        req.insert_header("X-Forwarded-For", ip.to_string())?;
+    }
+    req.insert_header("X-Forwarded-Proto", "https")?;
+    Ok(())
+}
+
 fn parse_http_request_line_and_host(request: &str) -> (&str, &str) {
     let first_line = request.lines().next().unwrap_or("");
     let parts: Vec<&str> = first_line.split_whitespace().collect();
@@ -171,30 +241,117 @@ fn parse_http_request_line_and_host(request: &str) -> (&str, &str) {
     (path, host)
 }
 
-async fn build_http_redirect_or_challenge_response(
-    request: &str,
-    challenges: &ChallengeMap,
-) -> String {
-    let (path, host) = parse_http_request_line_and_host(request);
+/// Escape text for inclusion in HTML.
+fn html_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
 
-    if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
-        let map = challenges.read().await;
-        if let Some(key_auth) = map.get(token) {
-            return format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n{}",
-                key_auth.len(),
-                key_auth
-            );
+/// A syntactically valid DNS hostname (what we are willing to put in a
+/// Location header).
+fn is_valid_hostname(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+}
+
+const HTTP_NOT_FOUND: &str =
+    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const HTTP_BAD_REQUEST: &str =
+    "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+/// Shared state for the port-80 server.
+#[derive(Clone)]
+struct HttpContext {
+    challenges: ChallengeMap,
+    routes: RouteMap,
+    dashboard_domain: DashboardDomain,
+    preview_domain: PreviewDomain,
+}
+
+impl HttpContext {
+    /// Build the response for one request head: an ACME challenge answer, a
+    /// redirect to HTTPS for hosts Tond serves, or 404/400 for anything else
+    /// (redirecting arbitrary Host headers would be an open redirect).
+    async fn respond(&self, request: &str) -> String {
+        let (path, host) = parse_http_request_line_and_host(request);
+
+        if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
+            let map = self.challenges.read().await;
+            if let Some(key_auth) = map.get(token) {
+                return format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    key_auth.len(),
+                    key_auth
+                );
+            }
+            return HTTP_NOT_FOUND.to_string();
         }
 
-        return "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string();
-    }
+        let host = normalize_host(Some(host));
+        if !is_valid_hostname(&host) {
+            return HTTP_BAD_REQUEST.to_string();
+        }
+        // Redirect only hosts that HTTPS would actually serve: unknown hosts
+        // and unmatched hosts under the preview domain get a 404.
+        let known = {
+            let dd = self.dashboard_domain.read().await;
+            let pd = self.preview_domain.read().await;
+            let routes = self.routes.read().await;
+            matches!(
+                resolve_route(&host, dd.as_deref(), pd.as_deref(), &routes),
+                RouteTarget::Dashboard | RouteTarget::Upstream(_)
+            )
+        };
+        if !known {
+            return HTTP_NOT_FOUND.to_string();
+        }
 
-    let redirect_url = format!("https://{}{}", host, path);
-    format!(
-        "HTTP/1.1 301 Moved Permanently\r\nLocation: {}\r\nContent-Length: 0\r\n\r\n",
-        redirect_url
-    )
+        // Only an origin-form path goes into the Location header.
+        let path = if path.starts_with('/') && !path.starts_with("//") {
+            path
+        } else {
+            "/"
+        };
+        format!(
+            "HTTP/1.1 301 Moved Permanently\r\nLocation: https://{host}{path}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+    }
+}
+
+/// Human-readable differences between two route maps, sorted by domain:
+/// "added a -> b", "removed a", "changed a: b -> c". Empty when identical.
+fn route_changes(old: &HashMap<String, String>, new: &HashMap<String, String>) -> Vec<String> {
+    let mut changes: Vec<(String, String)> = Vec::new();
+    for (domain, upstream) in new {
+        match old.get(domain) {
+            None => changes.push((domain.clone(), format!("added {domain} -> {upstream}"))),
+            Some(prev) if prev != upstream => changes.push((
+                domain.clone(),
+                format!("changed {domain}: {prev} -> {upstream}"),
+            )),
+            Some(_) => {}
+        }
+    }
+    for domain in old.keys() {
+        if !new.contains_key(domain) {
+            changes.push((domain.clone(), format!("removed {domain}")));
+        }
+    }
+    changes.sort();
+    changes.into_iter().map(|(_, c)| c).collect()
 }
 
 impl TondProxy {
@@ -203,138 +360,90 @@ impl TondProxy {
             routes: Arc::new(RwLock::new(HashMap::new())),
             db_path: db_path.to_string(),
             dashboard_domain: Arc::new(RwLock::new(initial_dashboard_domain)),
+            preview_domain: Arc::new(RwLock::new(None)),
             server_addr,
         }
+    }
+
+    async fn resolve(&self, host: &str) -> RouteTarget {
+        let dd = self.dashboard_domain.read().await;
+        let pd = self.preview_domain.read().await;
+        let routes = self.routes.read().await;
+        resolve_route(host, dd.as_deref(), pd.as_deref(), &routes)
     }
 
     /// Refresh routes and settings from SQLite.
     ///
     /// Reads the host_port stored in the DB (written by tond-server on every
-    /// deploy). This avoids a Docker API call per container and makes routing
-    /// deterministic across proxy restarts.
+    /// deploy), which makes routing deterministic across proxy restarts and
+    /// keeps the proxy away from the Docker socket. Rows without a host_port
+    /// (a deploy in progress) are skipped until the next refresh.
     ///
-    /// Also reads `dashboard_domain` from the settings table so that changes
-    /// made via the dashboard UI or `tond settings set` CLI command are
-    /// picked up within 5 s without restarting the proxy.
-    ///
-    /// Falls back to Docker inspect for any app that has a NULL host_port
-    /// (rows created before migration 006 or during an in-progress deploy).
+    /// Also reads `dashboard_domain` and `preview_domain` from the settings
+    /// table so that changes made via the dashboard UI or `tond settings`
+    /// CLI commands are picked up without restarting the proxy.
     async fn refresh_routes(&self) -> Result<()> {
         let pool = SqlitePool::connect(&format!("sqlite:{}?mode=ro", self.db_path)).await?;
 
-        // Read dashboard_domain from settings table and update the shared value.
-        let setting: Option<(String,)> =
-            sqlx::query_as("SELECT value FROM settings WHERE key = 'dashboard_domain'")
-                .fetch_optional(&pool)
-                .await?;
+        let settings: Vec<(String, String)> = sqlx::query_as(
+            "SELECT key, value FROM settings WHERE key IN ('dashboard_domain', 'preview_domain')",
+        )
+        .fetch_all(&pool)
+        .await?;
+        let setting = |key: &str| {
+            settings
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        let new_preview_domain = setting("preview_domain");
         {
-            let new_domain = setting.map(|(v,)| v).filter(|v| !v.is_empty());
+            let new_domain = setting("dashboard_domain");
             let mut dd = self.dashboard_domain.write().await;
             if *dd != new_domain {
                 tracing::info!("Dashboard domain updated: {:?} -> {:?}", *dd, new_domain);
                 *dd = new_domain;
             }
         }
+        {
+            let mut pd = self.preview_domain.write().await;
+            if *pd != new_preview_domain {
+                tracing::info!(
+                    "Preview domain updated: {:?} -> {:?}",
+                    *pd,
+                    new_preview_domain
+                );
+                *pd = new_preview_domain.clone();
+            }
+        }
+        let under_preview_domain = |host: &str| {
+            new_preview_domain
+                .as_deref()
+                .is_some_and(|pd| is_under_domain(host, pd))
+        };
 
-        // Prefer DB-stored host_port; fall back to NULL for legacy rows.
-        let rows: Vec<(String, String, i64, Option<i64>)> = sqlx::query_as(
-            "SELECT name, domain, container_port, host_port FROM apps WHERE status = 'running' AND domain IS NOT NULL",
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT name, domain, host_port FROM apps
+             WHERE status = 'running' AND domain IS NOT NULL AND host_port IS NOT NULL",
         )
         .fetch_all(&pool)
         .await?;
 
-        tracing::info!("Route refresh: {} running app(s) with a domain", rows.len());
-
         let mut new_routes = HashMap::new();
 
-        // Only open the Docker socket if at least one row needs a fallback lookup.
-        let needs_docker = rows.iter().any(|(_, _, _, hp)| hp.is_none());
-        let docker_opt = if needs_docker {
-            match bollard::Docker::connect_with_local_defaults() {
-                Ok(d) => Some(d),
-                Err(e) => {
-                    tracing::warn!(
-                        "Could not connect to Docker for fallback port lookup: {}",
-                        e
-                    );
-                    None
-                }
+        for (name, domain, host_port) in &rows {
+            // The preview domain is reserved for previews.
+            if under_preview_domain(domain) {
+                tracing::warn!(
+                    "App {} uses domain {} under the preview domain — not routed",
+                    name,
+                    domain
+                );
+                continue;
             }
-        } else {
-            None
-        };
-
-        for (name, domain, container_port, host_port_db) in &rows {
-            let host_port = if let Some(hp) = host_port_db {
-                // Fast path: use the value stored in the DB.
-                *hp as u16
-            } else {
-                // Legacy / in-progress: fall back to Docker inspect.
-                let Some(ref docker) = docker_opt else {
-                    tracing::warn!(
-                        "App {} has no stored host_port and Docker is unavailable — skipping",
-                        name
-                    );
-                    continue;
-                };
-
-                let container_name = format!("tond-{}", name);
-                match docker.inspect_container(&container_name, None).await {
-                    Ok(info) => {
-                        let raw_ports = info
-                            .network_settings
-                            .as_ref()
-                            .and_then(|ns| ns.ports.as_ref())
-                            .map(|p| format!("{:?}", p))
-                            .unwrap_or_else(|| "<none>".to_string());
-                        tracing::info!(
-                            "Container {} port map (fallback): {}",
-                            container_name,
-                            raw_ports
-                        );
-
-                        let host_port_opt = info.network_settings.and_then(|ns| {
-                            let ports = ns.ports?;
-                            let tcp_key = format!("{}/tcp", container_port);
-                            let udp_key = format!("{}/udp", container_port);
-                            let binding = ports
-                                .get(&tcp_key)
-                                .or_else(|| ports.get(&udp_key))
-                                .and_then(|b| b.as_ref())
-                                .and_then(|b| b.first())
-                                .and_then(|b| b.host_port.clone());
-                            if binding.is_some() {
-                                return binding;
-                            }
-                            ports
-                                .into_values()
-                                .flatten()
-                                .flat_map(|b| b.into_iter())
-                                .find_map(|b| b.host_port)
-                        });
-
-                        match host_port_opt.and_then(|p| p.parse::<u16>().ok()) {
-                            Some(p) => p,
-                            None => {
-                                tracing::warn!(
-                                    "Container {} has no host port binding for port {}",
-                                    container_name,
-                                    container_port
-                                );
-                                continue;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to inspect container {}: {}", container_name, e);
-                        continue;
-                    }
-                }
-            };
-
             let upstream = format!("127.0.0.1:{}", host_port);
-            new_routes.insert(domain.clone(), upstream.clone());
-            tracing::info!("Route added: {} -> {}", domain, upstream);
+            new_routes.insert(domain.clone(), upstream);
         }
 
         // Also load active preview deployments (subdomain routing).
@@ -350,19 +459,25 @@ impl TondProxy {
         .await
         .unwrap_or_default();
 
-        tracing::info!("Route refresh: {} active preview(s)", preview_rows.len());
-
         for (subdomain, host_port) in preview_rows {
             if let Some(sub) = subdomain {
-                let upstream = format!("127.0.0.1:{}", host_port);
-                new_routes.insert(sub.clone(), upstream.clone());
-                tracing::info!("Preview route added: {} -> {}", sub, upstream);
+                // Previews are served only under the current preview domain.
+                if !under_preview_domain(&sub) {
+                    continue;
+                }
+                new_routes.insert(sub, format!("127.0.0.1:{}", host_port));
             }
         }
 
         let mut routes = self.routes.write().await;
+        let changes = route_changes(&routes, &new_routes);
+        if !changes.is_empty() {
+            for change in &changes {
+                tracing::info!("Route {}", change);
+            }
+            tracing::info!("Routing table now has {} route(s)", new_routes.len());
+        }
         *routes = new_routes;
-        tracing::info!("Refreshed {} routes", routes.len());
 
         pool.close().await;
         Ok(())
@@ -390,18 +505,28 @@ impl ProxyHttp for TondProxy {
                 .and_then(|v| v.to_str().ok()),
         );
 
-        let route_target = {
-            let dd = self.dashboard_domain.read().await;
-            let routes = self.routes.read().await;
-            resolve_route(&host, dd.as_deref(), &routes)
-        };
+        let route_target = self.resolve(&host).await;
 
-        if route_target != RouteTarget::Missing {
-            return Ok(false);
+        match route_target {
+            RouteTarget::Dashboard | RouteTarget::Upstream(_) => return Ok(false),
+            RouteTarget::NotFound => {
+                let body = "404 Not Found\n";
+                let mut resp = pingora::http::ResponseHeader::build(404, None)?;
+                resp.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                resp.insert_header("Content-Length", body.len().to_string())?;
+                resp.insert_header("Cache-Control", "no-store")?;
+                session.write_response_header(Box::new(resp), false).await?;
+                session
+                    .write_response_body(Some(bytes::Bytes::from_static(body.as_bytes())), true)
+                    .await?;
+                return Ok(true);
+            }
+            RouteTarget::Missing => {}
         }
 
-        // No route found — return a friendly HTML 502 page
-        tracing::warn!("No route found for host '{}', returning 502 page", host);
+        // No route found — return a friendly HTML 502 page. Debug only:
+        // scanners hit unknown hosts constantly.
+        tracing::debug!("No route found for host '{}', returning 502 page", host);
 
         let body = format!(
             r#"<!DOCTYPE html>
@@ -429,7 +554,7 @@ impl ProxyHttp for TondProxy {
   </div>
 </body>
 </html>"#,
-            host = host
+            host = html_escape(&host)
         );
 
         let mut resp = pingora::http::ResponseHeader::build(502, None)?;
@@ -458,17 +583,9 @@ impl ProxyHttp for TondProxy {
                 .and_then(|v| v.to_str().ok()),
         );
 
-        let route_target = {
-            let dd = self.dashboard_domain.read().await;
-            let routes = self.routes.read().await;
-            resolve_route(&host, dd.as_deref(), &routes)
-        };
+        let route_target = self.resolve(&host).await;
 
-        tracing::info!(
-            "Routing request for host: {:?} (route map has {} entries)",
-            host,
-            self.routes.read().await.len(),
-        );
+        tracing::debug!("Routing request for host {:?} -> {:?}", host, route_target);
 
         match route_target {
             RouteTarget::Dashboard => {
@@ -481,7 +598,7 @@ impl ProxyHttp for TondProxy {
                     return Ok(Box::new(HttpPeer::new((addr, port), false, String::new())));
                 }
             }
-            RouteTarget::Missing => {}
+            RouteTarget::Missing | RouteTarget::NotFound => {}
         }
 
         // request_filter already handled the no-route case; if we somehow
@@ -492,6 +609,31 @@ impl ProxyHttp for TondProxy {
         );
         let peer = Box::new(HttpPeer::new(("127.0.0.1", 9999), false, String::new()));
         Ok(peer)
+    }
+
+    /// Requests for the dashboard domain carry the TCP peer as X-Forwarded-For.
+    async fn upstream_request_filter(
+        &self,
+        session: &mut Session,
+        upstream_request: &mut pingora::http::RequestHeader,
+        _ctx: &mut Self::CTX,
+    ) -> pingora::Result<()> {
+        let host = normalize_host(
+            session
+                .req_header()
+                .headers
+                .get("host")
+                .and_then(|v| v.to_str().ok()),
+        );
+        let is_dashboard = self.dashboard_domain.read().await.as_deref() == Some(host.as_str());
+        if is_dashboard {
+            let client_ip = session
+                .client_addr()
+                .and_then(|addr| addr.as_inet())
+                .map(|addr| addr.ip());
+            set_dashboard_forwarding_headers(upstream_request, client_ip)?;
+        }
+        Ok(())
     }
 }
 
@@ -595,6 +737,7 @@ fn main() {
 
     let routes = proxy.routes.clone();
     let dashboard_domain_shared = proxy.dashboard_domain.clone();
+    let preview_domain_shared = proxy.preview_domain.clone();
     let db_path_bg = db_path.clone();
     let cert_store_bg = cert_store.clone();
     let challenges_bg = challenges.clone();
@@ -607,137 +750,43 @@ fn main() {
                 routes: routes.clone(),
                 db_path: db_path_bg,
                 dashboard_domain: dashboard_domain_shared.clone(),
+                preview_domain: preview_domain_shared.clone(),
                 server_addr: String::new(),
             };
             let db_url = format!("sqlite:{}", proxy_for_refresh.db_path);
             let db_pool = SqlitePool::connect(&db_url).await.unwrap_or_else(|err| {
-                panic!("failed to open SQLite database for ACME loop: {err}")
+                panic!("failed to open SQLite database for the certificate loop: {err}")
             });
 
             // Spawn the HTTP server for port 80 (ACME challenges + redirect)
-            let challenges_http = challenges_bg.clone();
+            let http_ctx = HttpContext {
+                challenges: challenges_bg.clone(),
+                routes: routes.clone(),
+                dashboard_domain: dashboard_domain_shared.clone(),
+                preview_domain: preview_domain_shared.clone(),
+            };
             tokio::spawn(async move {
-                if let Err(e) = run_http_server(challenges_http).await {
-                    tracing::error!("HTTP server (port 80) failed: {}", e);
+                if let Err(e) = run_http_server(http_ctx).await {
+                    tracing::error!("HTTP server (port 80) failed to start: {}", e);
                 }
             });
 
-            // Spawn ACME renewal loop (every 6 h) — handles cert renewal for
-            // domains already in the CertStore plus the dashboard domain.
-            let cert_store_acme = cert_store_bg.clone();
-            let challenges_acme = challenges_bg.clone();
-            let data_dir_acme = data_dir_bg.clone();
-            let dashboard_domain_acme = dashboard_domain_shared.clone();
-            let db_pool_acme = db_pool.clone();
-            tokio::spawn(async move {
-                // Initial delay to let routes populate
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-
-                loop {
-                    let mut domains = cert_store_acme.domains().await;
-                    // Include the dashboard domain so it gets a cert too
-                    {
-                        let dd = dashboard_domain_acme.read().await;
-                        if let Some(ref d) = *dd
-                            && !domains.contains(d)
-                        {
-                            domains.push(d.clone());
-                        }
-                    }
-                    if let Err(e) = acme::renewal_check(
-                        &domains,
-                        &data_dir_acme,
-                        Some(&db_pool_acme),
-                        &cert_store_acme,
-                        &challenges_acme,
-                        acme_staging,
-                    )
-                    .await
-                    {
-                        tracing::error!("ACME renewal check failed: {}", e);
-                    }
-
-                    // Check every 6 hours
-                    tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
+            // Certificate issuance/renewal loop (per-domain backoff, DNS
+            // pre-check, state persisted for the dashboard).
+            tokio::spawn(
+                IssuanceLoop {
+                    routes: routes.clone(),
+                    dashboard_domain: dashboard_domain_shared.clone(),
+                    cert_store: cert_store_bg,
+                    challenges: challenges_bg,
+                    data_dir: data_dir_bg,
+                    db: db_pool,
+                    staging: acme_staging,
                 }
-            });
+                .run(),
+            );
 
-            // Spawn preview cert provisioning loop (every 30 s) — provisions
-            // TLS certs for preview subdomains that appear in the route map but
-            // don't yet have a cert. Runs more frequently than the 6-hour renewal
-            // loop so new previews get a valid cert within ~30 s of being routed.
-            let cert_store_preview = cert_store_bg;
-            let challenges_preview = challenges_bg;
-            let data_dir_preview = data_dir_bg;
-            let routes_preview = routes.clone();
-            let db_pool_preview = db_pool.clone();
-            tokio::spawn(async move {
-                // Initial delay to let the first route refresh complete.
-                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-
-                loop {
-                    let route_keys: Vec<String> = {
-                        let map = routes_preview.read().await;
-                        map.keys().cloned().collect()
-                    };
-
-                    for domain in route_keys {
-                        if !cert_store_preview.has_cert(&domain).await {
-                            tracing::info!(
-                                "[preview-cert] No cert for preview domain {}, provisioning…",
-                                domain
-                            );
-                            if let Err(e) = acme::provision_cert(
-                                &domain,
-                                &data_dir_preview,
-                                &cert_store_preview,
-                                &challenges_preview,
-                                acme_staging,
-                            )
-                            .await
-                            {
-                                tracing::warn!(
-                                    "[preview-cert] Failed to provision cert for {}: {}",
-                                    domain,
-                                    e
-                                );
-                                let _ = acme::persist_certificate_status(
-                                    &db_pool_preview,
-                                    &data_dir_preview,
-                                    &domain,
-                                    "failed",
-                                    None,
-                                    None,
-                                )
-                                .await;
-                            } else {
-                                let cert_path = data_dir_preview
-                                    .join("certs")
-                                    .join(&domain)
-                                    .join("cert.pem");
-                                if let Ok(cert_pem) = tokio::fs::read(&cert_path).await
-                                    && let Ok((issued_at, expires_at)) =
-                                        acme::certificate_timestamps(&cert_pem)
-                                {
-                                    let _ = acme::persist_certificate_status(
-                                        &db_pool_preview,
-                                        &data_dir_preview,
-                                        &domain,
-                                        "active",
-                                        Some(issued_at),
-                                        Some(expires_at),
-                                    )
-                                    .await;
-                                }
-                            }
-                        }
-                    }
-
-                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                }
-            });
-
-            // Route refresh loop — also refreshes dashboard_domain from DB
+            // Route refresh loop — also refreshes dashboard_domain and preview_domain from DB
             loop {
                 if let Err(e) = proxy_for_refresh.refresh_routes().await {
                     tracing::warn!("Failed to refresh routes: {}", e);
@@ -765,32 +814,83 @@ fn main() {
     server.run_forever();
 }
 
-/// Simple HTTP server on port 80 that:
+/// Most port-80 connections served at once; extra connections are closed.
+const HTTP_MAX_CONNECTIONS: usize = 512;
+/// A client must send its whole request head within this time.
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Largest request head we read.
+const HTTP_MAX_HEAD_BYTES: usize = 8 * 1024;
+
+/// HTTP server on port 80 that:
 /// - Serves ACME HTTP-01 challenge responses at `/.well-known/acme-challenge/{token}`
-/// - Redirects all other traffic to HTTPS (301)
-async fn run_http_server(challenges: ChallengeMap) -> Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+/// - Redirects requests for hosts Tond serves to HTTPS (301); 404 otherwise
+///
+/// Only a bind failure returns an error: accept errors (e.g. out of file
+/// descriptors) are logged and the loop keeps going, since certificate
+/// issuance and renewal depend on this listener.
+async fn run_http_server(ctx: HttpContext) -> Result<()> {
     use tokio::net::TcpListener;
 
     let listener = TcpListener::bind("0.0.0.0:80").await?;
     tracing::info!("HTTP redirect server listening on :80");
 
+    let permits = Arc::new(Semaphore::new(HTTP_MAX_CONNECTIONS));
+    let mut last_accept_warning: Option<Instant> = None;
+
     loop {
-        let (mut stream, _addr) = listener.accept().await?;
-        let challenges = challenges.clone();
-
+        let stream = match listener.accept().await {
+            Ok((stream, _addr)) => stream,
+            Err(e) => {
+                if last_accept_warning.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+                    tracing::warn!("HTTP server (port 80) accept error: {}", e);
+                    last_accept_warning = Some(Instant::now());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let Ok(permit) = permits.clone().try_acquire_owned() else {
+            // At capacity: shed the connection instead of queueing it.
+            drop(stream);
+            continue;
+        };
+        let ctx = ctx.clone();
         tokio::spawn(async move {
-            let mut buf = vec![0u8; 4096];
-            let n = match stream.read(&mut buf).await {
-                Ok(n) if n > 0 => n,
-                _ => return,
-            };
-
-            let request = String::from_utf8_lossy(&buf[..n]);
-            let response = build_http_redirect_or_challenge_response(&request, &challenges).await;
-            let _ = stream.write_all(response.as_bytes()).await;
+            let _permit = permit;
+            let _ = tokio::time::timeout(HTTP_REQUEST_TIMEOUT, serve_http_connection(stream, &ctx))
+                .await;
         });
     }
+}
+
+/// Read one request head (up to the blank line or HTTP_MAX_HEAD_BYTES) and
+/// write the response. The caller bounds the total time.
+async fn serve_http_connection<S>(mut stream: S, ctx: &HttpContext)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    loop {
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() >= HTTP_MAX_HEAD_BYTES {
+                    break;
+                }
+            }
+        }
+    }
+    if buf.is_empty() {
+        return;
+    }
+    let request = String::from_utf8_lossy(&buf);
+    let response = ctx.respond(&request).await;
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
 }
 
 #[cfg(test)]
@@ -900,13 +1000,19 @@ mod tests {
             resolve_route(
                 "dashboard.example.com",
                 Some("dashboard.example.com"),
+                None,
                 &routes
             ),
             RouteTarget::Dashboard,
             "resolve_route should prioritize the configured dashboard domain over app routes"
         );
         assert_eq!(
-            resolve_route("app.example.com", Some("dashboard.example.com"), &routes),
+            resolve_route(
+                "app.example.com",
+                Some("dashboard.example.com"),
+                None,
+                &routes
+            ),
             RouteTarget::Upstream("127.0.0.1:4200".to_string()),
             "resolve_route should return the configured upstream for known app hosts"
         );
@@ -914,10 +1020,66 @@ mod tests {
             resolve_route(
                 "missing.example.com",
                 Some("dashboard.example.com"),
+                None,
                 &routes
             ),
             RouteTarget::Missing,
             "resolve_route should report missing for unknown hosts"
+        );
+    }
+
+    #[test]
+    fn preview_domain_serves_only_previews_and_never_the_dashboard() {
+        let routes = HashMap::from([
+            (
+                "abc-frontend.previews.test".to_string(),
+                "127.0.0.1:5100".to_string(),
+            ),
+            ("app.example.com".to_string(), "127.0.0.1:4200".to_string()),
+        ]);
+        let resolve = |host: &str| {
+            resolve_route(
+                host,
+                Some("dash.example.com"),
+                Some("previews.test"),
+                &routes,
+            )
+        };
+
+        assert_eq!(
+            resolve("abc-frontend.previews.test"),
+            RouteTarget::Upstream("127.0.0.1:5100".to_string()),
+            "a known preview host is routed to its container"
+        );
+        assert_eq!(
+            resolve("unknown.previews.test"),
+            RouteTarget::NotFound,
+            "unknown hosts under the preview domain get a 404"
+        );
+        assert_eq!(
+            resolve("previews.test"),
+            RouteTarget::NotFound,
+            "the preview domain apex is never the dashboard"
+        );
+        assert_eq!(
+            resolve("dash.example.com"),
+            RouteTarget::Dashboard,
+            "the dashboard domain still reaches the dashboard"
+        );
+        assert_eq!(
+            resolve_route(
+                "dash.previews.test",
+                Some("dash.previews.test"),
+                Some("previews.test"),
+                &routes
+            ),
+            RouteTarget::NotFound,
+            "even a (misconfigured) dashboard domain under the preview domain is not served there"
+        );
+        assert_eq!(
+            resolve("notpreviews.test"),
+            RouteTarget::Missing,
+            "suffix matching respects label boundaries"
         );
     }
 
@@ -937,6 +1099,35 @@ mod tests {
             parse_upstream_addr("127.0.0.1", 8080),
             None,
             "parse_upstream_addr should reject malformed upstream values without a host-port separator"
+        );
+    }
+
+    #[test]
+    fn dashboard_forwarding_headers_replace_client_supplied_values() {
+        let mut req = pingora::http::RequestHeader::build("POST", b"/api/auth/login", None)
+            .unwrap_or_else(|err| panic!("failed to build request header: {err}"));
+        req.insert_header("X-Forwarded-For", "1.2.3.4")
+            .unwrap_or_else(|err| panic!("{err}"));
+        req.append_header("X-Forwarded-For", "5.6.7.8")
+            .unwrap_or_else(|err| panic!("{err}"));
+        req.insert_header("X-Real-IP", "9.9.9.9")
+            .unwrap_or_else(|err| panic!("{err}"));
+        req.insert_header("X-Forwarded-Proto", "http")
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        set_dashboard_forwarding_headers(&mut req, "203.0.113.7".parse().ok())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let xff: Vec<_> = req.headers.get_all("x-forwarded-for").iter().collect();
+        assert_eq!(
+            xff,
+            vec!["203.0.113.7"],
+            "spoofed X-Forwarded-For values must be dropped"
+        );
+        assert!(req.headers.get("x-real-ip").is_none());
+        assert_eq!(
+            req.headers.get("x-forwarded-proto").map(|v| v.as_bytes()),
+            Some(&b"https"[..])
         );
     }
 
@@ -965,22 +1156,65 @@ mod tests {
         );
     }
 
+    fn http_ctx(routes: &[(&str, &str)], dashboard: Option<&str>) -> HttpContext {
+        http_ctx_with_preview(routes, dashboard, None)
+    }
+
+    fn http_ctx_with_preview(
+        routes: &[(&str, &str)],
+        dashboard: Option<&str>,
+        preview: Option<&str>,
+    ) -> HttpContext {
+        HttpContext {
+            challenges: acme::new_challenge_map(),
+            routes: Arc::new(RwLock::new(
+                routes
+                    .iter()
+                    .map(|(d, u)| (d.to_string(), u.to_string()))
+                    .collect(),
+            )),
+            dashboard_domain: Arc::new(RwLock::new(dashboard.map(str::to_string))),
+            preview_domain: Arc::new(RwLock::new(preview.map(str::to_string))),
+        }
+    }
+
+    #[tokio::test]
+    async fn port_80_redirects_previews_but_not_unmatched_preview_domain_hosts() {
+        let ctx = http_ctx_with_preview(
+            &[("abc-web.previews.test", "127.0.0.1:5100")],
+            Some("dash.example.com"),
+            Some("previews.test"),
+        );
+        let redirect = ctx
+            .respond(&sample_http_request("/", Some("abc-web.previews.test")))
+            .await;
+        assert!(
+            redirect.starts_with("HTTP/1.1 301"),
+            "a routed preview host should be redirected to HTTPS, got: {redirect}"
+        );
+        for host in ["previews.test", "dash.previews.test", "nope.previews.test"] {
+            let resp = ctx.respond(&sample_http_request("/", Some(host))).await;
+            assert!(
+                resp.starts_with("HTTP/1.1 404"),
+                "{host} must get a 404 on port 80, got: {resp}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn build_http_redirect_or_challenge_response_returns_acme_body_for_known_token() {
-        let challenges = acme::new_challenge_map();
-        challenges
+        let ctx = http_ctx(&[], None);
+        ctx.challenges
             .write()
             .await
             .insert("token-123".to_string(), "token-123.key-auth".to_string());
 
-        let response = build_http_redirect_or_challenge_response(
-            &sample_http_request(
+        let response = ctx
+            .respond(&sample_http_request(
                 "/.well-known/acme-challenge/token-123",
                 Some("app.example.com"),
-            ),
-            &challenges,
-        )
-        .await;
+            ))
+            .await;
 
         assert!(
             response.starts_with("HTTP/1.1 200 OK\r\n"),
@@ -998,37 +1232,140 @@ mod tests {
 
     #[tokio::test]
     async fn build_http_redirect_or_challenge_response_returns_404_for_unknown_acme_token() {
-        let challenges = acme::new_challenge_map();
+        let ctx = http_ctx(&[], None);
 
-        let response = build_http_redirect_or_challenge_response(
-            &sample_http_request(
+        let response = ctx
+            .respond(&sample_http_request(
                 "/.well-known/acme-challenge/missing-token",
                 Some("app.example.com"),
-            ),
-            &challenges,
-        )
-        .await;
+            ))
+            .await;
 
         assert_eq!(
-            response, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+            response, HTTP_NOT_FOUND,
             "unknown ACME challenge tokens should return a 404 without a response body"
         );
     }
 
     #[tokio::test]
     async fn build_http_redirect_or_challenge_response_redirects_other_requests_to_https() {
-        let challenges = acme::new_challenge_map();
+        let ctx = http_ctx(
+            &[("app.example.com", "127.0.0.1:4100")],
+            Some("dashboard.example.com"),
+        );
 
-        let response = build_http_redirect_or_challenge_response(
-            &sample_http_request("/dashboard", Some("dashboard.example.com")),
-            &challenges,
-        )
-        .await;
-
+        let response = ctx
+            .respond(&sample_http_request(
+                "/dashboard",
+                Some("dashboard.example.com:80"),
+            ))
+            .await;
         assert_eq!(
             response,
-            "HTTP/1.1 301 Moved Permanently\r\nLocation: https://dashboard.example.com/dashboard\r\nContent-Length: 0\r\n\r\n",
-            "non-ACME HTTP requests should be redirected to the equivalent HTTPS URL"
+            "HTTP/1.1 301 Moved Permanently\r\nLocation: https://dashboard.example.com/dashboard\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "requests for the dashboard domain should be redirected to the equivalent HTTPS URL"
+        );
+
+        let response = ctx
+            .respond(&sample_http_request("/x?y=1", Some("app.example.com")))
+            .await;
+        assert!(
+            response.contains("Location: https://app.example.com/x?y=1\r\n"),
+            "requests for routed apps should be redirected to HTTPS"
+        );
+    }
+
+    #[tokio::test]
+    async fn port_80_refuses_to_redirect_unknown_or_malformed_hosts() {
+        let ctx = http_ctx(&[("app.example.com", "127.0.0.1:4100")], None);
+
+        for host in [Some("evil.example.net"), None] {
+            assert_eq!(
+                ctx.respond(&sample_http_request("/", host)).await,
+                HTTP_NOT_FOUND,
+                "unknown hosts must not be redirected (open redirect)"
+            );
+        }
+        assert_eq!(
+            ctx.respond(&sample_http_request("/", Some("bad host<script>")))
+                .await,
+            HTTP_BAD_REQUEST
+        );
+        // Protocol-relative paths must not turn into another host.
+        assert!(
+            ctx.respond(&sample_http_request(
+                "//evil.example.net/x",
+                Some("app.example.com")
+            ))
+            .await
+            .contains("Location: https://app.example.com/\r\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn port_80_connection_answers_a_complete_request_head() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let ctx = http_ctx(&[("app.example.com", "127.0.0.1:4100")], None);
+        let (mut client, server) = tokio::io::duplex(4096);
+        let handle = tokio::spawn(async move { serve_http_connection(server, &ctx).await });
+
+        // Send the head in two pieces, as a slow client would.
+        let _ = client.write_all(b"GET /a HTTP/1.1\r\nHost: app.exa").await;
+        let _ = client.write_all(b"mple.com\r\n\r\n").await;
+        let mut response = String::new();
+        let _ = client.read_to_string(&mut response).await;
+        let _ = handle.await;
+        assert!(response.starts_with("HTTP/1.1 301"), "got {response:?}");
+    }
+
+    #[tokio::test]
+    async fn port_80_slow_client_is_cut_off_by_the_request_timeout() {
+        let ctx = http_ctx(&[], None);
+        let (_client, server) = tokio::io::duplex(64);
+        // The client never sends anything; the timeout must end the task.
+        let result = tokio::time::timeout(
+            Duration::from_millis(50),
+            serve_http_connection(server, &ctx),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a silent client keeps the handler waiting until the timeout"
+        );
+    }
+
+    #[test]
+    fn html_escape_neutralises_markup() {
+        assert_eq!(
+            html_escape(r#"<img src=x onerror="a">&'"#),
+            "&lt;img src=x onerror=&quot;a&quot;&gt;&amp;&#39;"
+        );
+    }
+
+    #[test]
+    fn route_changes_reports_only_differences() {
+        let old = HashMap::from([
+            ("a.com".to_string(), "127.0.0.1:1".to_string()),
+            ("b.com".to_string(), "127.0.0.1:2".to_string()),
+            ("c.com".to_string(), "127.0.0.1:3".to_string()),
+        ]);
+        assert!(
+            route_changes(&old, &old.clone()).is_empty(),
+            "no change, no log lines"
+        );
+
+        let mut new = old.clone();
+        new.remove("b.com");
+        new.insert("c.com".to_string(), "127.0.0.1:30".to_string());
+        new.insert("d.com".to_string(), "127.0.0.1:4".to_string());
+        assert_eq!(
+            route_changes(&old, &new),
+            vec![
+                "removed b.com".to_string(),
+                "changed c.com: 127.0.0.1:3 -> 127.0.0.1:30".to_string(),
+                "added d.com -> 127.0.0.1:4".to_string(),
+            ]
         );
     }
 
@@ -1048,12 +1385,12 @@ mod tests {
         let dashboard_target = {
             let dd = proxy.dashboard_domain.read().await;
             let routes = proxy.routes.read().await;
-            resolve_route("dashboard.example.com", dd.as_deref(), &routes)
+            resolve_route("dashboard.example.com", dd.as_deref(), None, &routes)
         };
         let app_target = {
             let dd = proxy.dashboard_domain.read().await;
             let routes = proxy.routes.read().await;
-            resolve_route("app.example.com", dd.as_deref(), &routes)
+            resolve_route("app.example.com", dd.as_deref(), None, &routes)
         };
 
         let dashboard_peer = match dashboard_target {
@@ -1086,14 +1423,19 @@ mod tests {
     }
 
     async fn insert_setting(pool: &SqlitePool, value: &str) {
+        insert_setting_key(pool, "dashboard_domain", value).await;
+    }
+
+    async fn insert_setting_key(pool: &SqlitePool, key: &str, value: &str) {
         sqlx::query(
             "INSERT INTO settings (key, value, updated_at)
-             VALUES ('dashboard_domain', ?, datetime('now'))",
+             VALUES (?, ?, datetime('now'))",
         )
+        .bind(key)
         .bind(value)
         .execute(pool)
         .await
-        .unwrap_or_else(|err| panic!("failed to insert dashboard_domain setting: {err}"));
+        .unwrap_or_else(|err| panic!("failed to insert {key} setting: {err}"));
     }
 
     async fn insert_app(
@@ -1149,6 +1491,7 @@ mod tests {
         let pool = create_test_db(&db_path).await;
 
         insert_setting(&pool, "dashboard.example.com").await;
+        insert_setting_key(&pool, "preview_domain", "previews.test").await;
         insert_app(
             &pool,
             "app-running",
@@ -1183,7 +1526,7 @@ mod tests {
         insert_preview(
             &pool,
             "preview-running",
-            Some("pr-42-frontend.example.com"),
+            Some("pr-42-frontend.previews.test"),
             Some(5100),
             "running",
             "2999-01-01T00:00:00Z",
@@ -1192,7 +1535,7 @@ mod tests {
         insert_preview(
             &pool,
             "preview-expired",
-            Some("expired-frontend.example.com"),
+            Some("expired-frontend.previews.test"),
             Some(5200),
             "running",
             "2000-01-01T00:00:00Z",
@@ -1201,7 +1544,7 @@ mod tests {
         insert_preview(
             &pool,
             "preview-failed",
-            Some("failed-frontend.example.com"),
+            Some("failed-frontend.previews.test"),
             Some(5300),
             "failed",
             "2999-01-01T00:00:00Z",
@@ -1233,7 +1576,7 @@ mod tests {
             "refresh_routes should route running apps with stored host_port values"
         );
         assert_eq!(
-            routes.get("pr-42-frontend.example.com"),
+            routes.get("pr-42-frontend.previews.test"),
             Some(&"127.0.0.1:5100".to_string()),
             "refresh_routes should route active preview deployments with stored host_port values"
         );
@@ -1242,11 +1585,11 @@ mod tests {
             "refresh_routes should ignore apps that are not running"
         );
         assert!(
-            !routes.contains_key("expired-frontend.example.com"),
+            !routes.contains_key("expired-frontend.previews.test"),
             "refresh_routes should ignore expired preview deployments"
         );
         assert!(
-            !routes.contains_key("failed-frontend.example.com"),
+            !routes.contains_key("failed-frontend.previews.test"),
             "refresh_routes should ignore previews that are not running"
         );
 
@@ -1266,6 +1609,7 @@ mod tests {
         let pool = create_test_db(&db_path).await;
 
         insert_setting(&pool, "dashboard.example.com").await;
+        insert_setting_key(&pool, "preview_domain", "previews.test").await;
         insert_app(
             &pool,
             "app-old",
@@ -1310,7 +1654,7 @@ mod tests {
         insert_preview(
             &pool,
             "preview-new",
-            Some("pr-99-api.example.com"),
+            Some("pr-99-api.previews.test"),
             Some(6300),
             "running",
             "2999-01-01T00:00:00Z",
@@ -1340,7 +1684,7 @@ mod tests {
             "refresh_routes should load newly added running app routes"
         );
         assert_eq!(
-            routes.get("pr-99-api.example.com"),
+            routes.get("pr-99-api.previews.test"),
             Some(&"127.0.0.1:6300".to_string()),
             "refresh_routes should retain only active preview routes from the latest refresh"
         );
@@ -1349,6 +1693,82 @@ mod tests {
         assert_eq!(
             dashboard_domain, None,
             "refresh_routes should clear the shared dashboard domain when the setting becomes empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_routes_keeps_previews_and_apps_on_their_own_domains() {
+        let dir = temp_dir();
+        let db_path = temp_db_path(dir.path());
+        let pool = create_test_db(&db_path).await;
+
+        insert_setting(&pool, "dash.example.com").await;
+        insert_setting_key(&pool, "preview_domain", "previews.test").await;
+        insert_app(
+            &pool,
+            "app-squatter",
+            "squatter",
+            Some("squatter.previews.test"),
+            "running",
+            3000,
+            Some(4100),
+        )
+        .await;
+        insert_app(
+            &pool,
+            "app-deploying",
+            "deploying",
+            Some("deploying.example.com"),
+            "running",
+            3000,
+            None,
+        )
+        .await;
+        insert_preview(
+            &pool,
+            "preview-on-dashboard",
+            Some("abc-frontend.dash.example.com"),
+            Some(5100),
+            "running",
+            "2999-01-01T00:00:00Z",
+        )
+        .await;
+        insert_preview(
+            &pool,
+            "preview-ok",
+            Some("def-frontend.previews.test"),
+            Some(5200),
+            "running",
+            "2999-01-01T00:00:00Z",
+        )
+        .await;
+        pool.close().await;
+
+        let proxy = TondProxy::new(
+            &db_path.to_string_lossy(),
+            None,
+            "127.0.0.1:3001".to_string(),
+        );
+        proxy
+            .refresh_routes()
+            .await
+            .unwrap_or_else(|err| panic!("refresh_routes should succeed: {err}"));
+
+        let routes = proxy.routes.read().await.clone();
+        assert_eq!(
+            routes.keys().collect::<Vec<_>>(),
+            vec!["def-frontend.previews.test"],
+            "only the preview under the preview domain is routed: apps under the preview \
+             domain, previews outside it and apps without a host port are dropped"
+        );
+        assert_eq!(
+            proxy.preview_domain.read().await.as_deref(),
+            Some("previews.test"),
+            "refresh_routes should load the preview domain"
+        );
+        assert_eq!(
+            proxy.resolve("squatter.previews.test").await,
+            RouteTarget::NotFound
         );
     }
 }

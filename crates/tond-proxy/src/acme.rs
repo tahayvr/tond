@@ -6,10 +6,9 @@
 // How it fits into the system:
 //   1. When a user sets a custom domain (PUT /api/apps/{id}/domain),
 //      tond-server writes a 'pending' cert row to the database.
-//   2. The ACME renewal loop in main.rs (runs every 6 h, initial 10 s delay)
-//      calls renewal_check() with all known domains.
-//   3. For domains without a cert in CertStore, provision_cert() runs the
-//      full ACME HTTP-01 flow:
+//   2. The issuance loop (issuance.rs, every 30 s with per-domain backoff)
+//      decides which domains need a cert or a renewal.
+//   3. For each of those, provision_cert() runs the full ACME HTTP-01 flow:
 //        a. Get/restore an ACME account (credentials persisted to disk as
 //           acme_account.json so the same account is reused across restarts)
 //        b. Create an ACME order for the domain
@@ -65,7 +64,7 @@ fn account_creds_path(data_dir: &Path) -> PathBuf {
     data_dir.join("acme_account.json")
 }
 
-fn should_renew(days_until_expiry: Option<i64>) -> bool {
+pub(crate) fn should_renew(days_until_expiry: Option<i64>) -> bool {
     match days_until_expiry {
         Some(days) => days <= 30,
         None => true,
@@ -104,7 +103,7 @@ async fn get_or_create_account(data_dir: &Path, staging: bool) -> Result<Account
             .await
             .context("restoring ACME account")?;
 
-        tracing::info!("Restored ACME account from {}", creds_path.display());
+        tracing::debug!("Restored ACME account from {}", creds_path.display());
         Ok(account)
     } else {
         // Create new account
@@ -150,7 +149,33 @@ pub async fn provision_cert(
     challenges: &ChallengeMap,
     staging: bool,
 ) -> Result<()> {
-    tracing::info!("Starting ACME cert provisioning for {}", domain);
+    let mut tokens = Vec::new();
+    let result = provision_cert_inner(
+        domain,
+        data_dir,
+        cert_store,
+        challenges,
+        staging,
+        &mut tokens,
+    )
+    .await;
+    // Challenge responses are only needed while the order is validated.
+    let mut map = challenges.write().await;
+    for token in tokens {
+        map.remove(&token);
+    }
+    result
+}
+
+async fn provision_cert_inner(
+    domain: &str,
+    data_dir: &Path,
+    cert_store: &CertStore,
+    challenges: &ChallengeMap,
+    staging: bool,
+    tokens: &mut Vec<String>,
+) -> Result<()> {
+    tracing::debug!("Starting ACME cert provisioning for {}", domain);
 
     let account = get_or_create_account(data_dir, staging).await?;
 
@@ -189,6 +214,7 @@ pub async fn provision_cert(
             let mut map = challenges.write().await;
             map.insert(token.clone(), key_auth_str);
         }
+        tokens.push(token.clone());
 
         // Tell the ACME server we're ready
         challenge
@@ -224,7 +250,7 @@ pub async fn provision_cert(
         .await
         .context("polling certificate")?;
 
-    tracing::info!("Certificate obtained for {}", domain);
+    tracing::debug!("Certificate obtained for {}", domain);
 
     // Store cert in the cert store (memory + disk)
     cert_store
@@ -233,127 +259,6 @@ pub async fn provision_cert(
         .context("storing certificate")?;
 
     tracing::info!("ACME provisioning complete for {}", domain);
-    Ok(())
-}
-
-/// Check all domains with certs and renew any expiring within 30 days.
-/// Also provision certs for domains that don't have one yet.
-pub async fn renewal_check(
-    domains: &[String],
-    data_dir: &Path,
-    db: Option<&sqlx::SqlitePool>,
-    cert_store: &CertStore,
-    challenges: &ChallengeMap,
-    staging: bool,
-) -> Result<()> {
-    for domain in domains {
-        if !cert_store.has_cert(domain).await {
-            tracing::info!("No cert for {}, provisioning...", domain);
-            if let Err(e) = provision_cert(domain, data_dir, cert_store, challenges, staging).await
-            {
-                tracing::error!("Failed to provision cert for {}: {}", domain, e);
-                if let Some(pool) = db {
-                    let _ =
-                        persist_certificate_status(pool, data_dir, domain, "failed", None, None)
-                            .await;
-                }
-            } else if let Some(pool) = db {
-                let (cert_path, _) = cert_store.cert_paths(domain);
-                if let Ok(cert_pem) = tokio::fs::read(&cert_path).await
-                    && let Ok((issued_at, expires_at)) = certificate_timestamps(&cert_pem)
-                {
-                    let _ = persist_certificate_status(
-                        pool,
-                        data_dir,
-                        domain,
-                        "active",
-                        Some(issued_at),
-                        Some(expires_at),
-                    )
-                    .await;
-                }
-            }
-            continue;
-        }
-
-        // Renew if within 30 days of expiry
-        match cert_store.days_until_expiry(domain).await {
-            Some(days) if should_renew(Some(i64::from(days))) => {
-                tracing::info!(
-                    "Cert for {} expires in {} day(s), renewing...",
-                    domain,
-                    days
-                );
-                if let Err(e) =
-                    provision_cert(domain, data_dir, cert_store, challenges, staging).await
-                {
-                    tracing::error!("Failed to renew cert for {}: {}", domain, e);
-                    if let Some(pool) = db {
-                        let _ = persist_certificate_status(
-                            pool, data_dir, domain, "failed", None, None,
-                        )
-                        .await;
-                    }
-                } else if let Some(pool) = db {
-                    let (cert_path, _) = cert_store.cert_paths(domain);
-                    if let Ok(cert_pem) = tokio::fs::read(&cert_path).await
-                        && let Ok((issued_at, expires_at)) = certificate_timestamps(&cert_pem)
-                    {
-                        let _ = persist_certificate_status(
-                            pool,
-                            data_dir,
-                            domain,
-                            "active",
-                            Some(issued_at),
-                            Some(expires_at),
-                        )
-                        .await;
-                    }
-                }
-            }
-            Some(days) => {
-                tracing::debug!(
-                    "Cert for {} is valid for {} more day(s), skipping",
-                    domain,
-                    days
-                );
-            }
-            None => {
-                // has_cert returned true but days_until_expiry returned None —
-                // the cert is unparseable. Re-provision defensively.
-                tracing::warn!(
-                    "Could not read expiry for cert {} — re-provisioning defensively",
-                    domain
-                );
-                if let Err(e) =
-                    provision_cert(domain, data_dir, cert_store, challenges, staging).await
-                {
-                    tracing::error!("Failed to re-provision cert for {}: {}", domain, e);
-                    if let Some(pool) = db {
-                        let _ = persist_certificate_status(
-                            pool, data_dir, domain, "failed", None, None,
-                        )
-                        .await;
-                    }
-                } else if let Some(pool) = db {
-                    let (cert_path, _) = cert_store.cert_paths(domain);
-                    if let Ok(cert_pem) = tokio::fs::read(&cert_path).await
-                        && let Ok((issued_at, expires_at)) = certificate_timestamps(&cert_pem)
-                    {
-                        let _ = persist_certificate_status(
-                            pool,
-                            data_dir,
-                            domain,
-                            "active",
-                            Some(issued_at),
-                            Some(expires_at),
-                        )
-                        .await;
-                    }
-                }
-            }
-        }
-    }
     Ok(())
 }
 

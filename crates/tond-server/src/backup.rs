@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use crate::handlers::storage_providers::decrypt_provider_secret;
 use crate::state::AppState;
-use crate::{docker, storage};
+use crate::{db, docker, storage};
 use tond_common::{BackupConfig, ManagedDatabase, Snapshot};
 
 // ── Progress event ────────────────────────────────────────────────────────────
@@ -572,6 +572,8 @@ async fn do_full_restore(state: &AppState, snap: &Snapshot) -> Result<()> {
             tokio::fs::create_dir_all(parent).await?;
         }
         tokio::fs::copy(&db_src, &db_dest).await?;
+        // fs::copy also copies the snapshot's mode; restore tond-proxy's access.
+        db::share_with_proxy(&db_dest);
     }
 
     // Replace app volumes
