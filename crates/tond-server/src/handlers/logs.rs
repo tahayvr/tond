@@ -1,6 +1,6 @@
 // handlers/logs.rs — WebSocket live log streaming
 //
-// GET /api/apps/{id}/logs/stream[?service=<name>]
+// GET /api/v1/apps/{id}/logs/stream[?service=<name>]
 //
 //   Streams deploy logs and container logs for a single app. For a compose
 //   app every service is followed (frames carry `service`); `?service=`
@@ -12,7 +12,7 @@
 //     {"type":"deploy","level":"info","message":"...","ts":"..."}
 //     {"type":"container","line":"..."}
 //
-// GET /api/system/logs/stream
+// GET /api/v1/system/logs/stream
 //
 //   Streams deploy logs and container logs across *all* apps.
 //   Each incremental frame carries `app_id` and `app_name` so the client can
@@ -24,8 +24,8 @@
 //     {"type":"deploy","app_id":"...","app_name":"...","level":"...","message":"...","ts":"..."}
 //     {"type":"container","app_id":"...","app_name":"...","line":"..."}
 //
-// GET /api/databases/logs/stream, GET /api/databases/{id}/logs/stream,
-// GET /api/cron/{id}/runs/stream — see the handlers below.
+// GET /api/v1/databases/logs/stream, GET /api/v1/databases/{id}/logs/stream,
+// GET /api/v1/cron/{id}/runs/stream — see the handlers below.
 //
 // Authentication (all endpoints): the local Unix socket (CLI on the host),
 // `?token=<tond_pat_…>` query param, or `__Host-tond_session` cookie (browser
@@ -572,6 +572,7 @@ async fn follow_container(
 
 /// `?service=<name>`: only one service of a compose app.
 #[derive(Debug, Default, serde::Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct AppLogStreamQuery {
     pub service: Option<String>,
 }
@@ -974,7 +975,7 @@ pub(crate) async fn authorize(
 
 // ── Cron run output stream ────────────────────────────────────────────────────
 //
-// GET /api/cron/{id}/runs/stream
+// GET /api/v1/cron/{id}/runs/stream
 //
 // Streams cron job run history for the given job as new runs complete.
 //

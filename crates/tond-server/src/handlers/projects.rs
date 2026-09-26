@@ -4,13 +4,13 @@
 // shared environment variables injected into every member app at deploy time.
 //
 // Routes (all require RateLimit + an Authz scope, see each handler):
-//   GET    /api/projects              — list all projects
-//   POST   /api/projects              — create a project
-//   GET    /api/projects/{id}         — get project details (with member apps)
-//   PUT    /api/projects/{id}         — update name / description / env_vars
-//   DELETE /api/projects/{id}         — delete project (apps are un-assigned, not deleted)
-//   POST   /api/projects/{id}/deploy  — deploy all apps in the project
-//   PUT    /api/apps/{id}/project     — assign or remove an app's project (in handlers.rs)
+//   GET    /api/v1/projects              — list all projects
+//   POST   /api/v1/projects              — create a project
+//   GET    /api/v1/projects/{id}         — get project details (with member apps)
+//   PUT    /api/v1/projects/{id}         — update name / description / env_vars
+//   DELETE /api/v1/projects/{id}         — delete project (apps are un-assigned, not deleted)
+//   POST   /api/v1/projects/{id}/deploy  — deploy all apps in the project
+//   PUT    /api/v1/apps/{id}/project     — assign or remove an app's project (in handlers.rs)
 
 use axum::{
     Json,

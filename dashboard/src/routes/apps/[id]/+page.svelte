@@ -293,7 +293,7 @@
 		stopLogStream();
 		logBuffer.clear();
 		logStreaming = true;
-		const close = openLogStream(`/api/apps/${appId}/logs/stream`, {
+		const close = openLogStream(`/api/v1/apps/${appId}/logs/stream`, {
 			onLine(line) {
 				logBuffer.push(line);
 			},

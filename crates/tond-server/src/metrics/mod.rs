@@ -15,7 +15,7 @@
 //              no dockerd load — computes CPU and network *rates* against the
 //              previous reading, and writes one small row per target in a
 //              single transaction (store.rs). The host gauges are sampled in
-//              the same tick and cached for /api/system/metrics (host.rs);
+//              the same tick and cached for /api/v1/system/metrics (host.rs);
 //              they also become one host_1m row a minute (host_history.rs),
 //              and every 30 minutes the tick starts a `docker system df`
 //              refresh in the background (docker_host.rs).
@@ -926,7 +926,7 @@ pub async fn run_metrics_collector(state: AppState) {
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                // Loop health for GET /api/system/self (runtime::loops).
+                // Loop health for GET /api/v1/system/self (runtime::loops).
                 lp.woke();
                 let _run = lp.run();
                 collector.tick(&state, &mut host).await;

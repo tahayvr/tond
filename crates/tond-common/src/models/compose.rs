@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 /// A service of a compose app as the file declares it (from
 /// `POST /api/compose/validate` and compose saves), before anything runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ComposeServiceSpec {
     pub name: String,
     /// Image ref from the file (None for build-only services)
@@ -24,6 +25,7 @@ pub struct ComposeServiceSpec {
 /// `GET /api/apps/{id}/services` item: one compose service with what Docker
 /// reports about it now.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ComposeServiceResponse {
     pub name: String,
     #[serde(default)]
@@ -74,6 +76,7 @@ pub struct ComposeServiceResponse {
 /// `PUT /api/apps/{id}/services/{service}`: publish a container port and
 /// route domains to it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateComposeServiceRequest {
     /// Container port to publish on a loopback host port (None = none)
     #[serde(default)]
@@ -86,6 +89,7 @@ pub struct UpdateComposeServiceRequest {
 /// `PUT /api/apps/{id}/compose`: replace the compose file (inline) or the
 /// repository location of a git-sourced compose app.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateComposeRequest {
     #[serde(default)]
     pub compose_content: Option<String>,
@@ -100,6 +104,7 @@ pub struct UpdateComposeRequest {
 /// One service of a compose deployment: how its image was produced and the
 /// pinned tag rollback restores.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DeploymentService {
     pub service: String,
     /// "build" | "pull" | "reuse"

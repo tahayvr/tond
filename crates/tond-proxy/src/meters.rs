@@ -3,7 +3,7 @@
 // Each loop (route sync, fallback poll, certificate loop, control socket)
 // registers a Meter and reports wakeups, runs, errors, the last run's time and
 // duration, and scheduler lag. Reported to tond-server over the control
-// socket (`stats`), which shows them in GET /api/system/self.
+// socket (`stats`), which shows them in GET /api/v1/system/self.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};

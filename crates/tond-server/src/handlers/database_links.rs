@@ -5,10 +5,10 @@
 // project is explicit: a link attaches the database container to the app's
 // network, where the app reaches it by the database's name.
 //
-//   GET    /api/databases/{id}/access       db:read + apps:read   project apps + linked apps
-//   PUT    /api/databases/{id}/links/{app}  db:write + apps:write link an app (idempotent)
-//   DELETE /api/databases/{id}/links/{app}  db:write + apps:write unlink an app (idempotent)
-//   GET    /api/apps/{id}/databases         apps:read + db:read   databases an app can reach
+//   GET    /api/v1/databases/{id}/access       db:read + apps:read   project apps + linked apps
+//   PUT    /api/v1/databases/{id}/links/{app}  db:write + apps:write link an app (idempotent)
+//   DELETE /api/v1/databases/{id}/links/{app}  db:write + apps:write unlink an app (idempotent)
+//   GET    /api/v1/apps/{id}/databases         apps:read + db:read   databases an app can reach
 //
 // A link changes both sides' network reach, so it needs write access to
 // databases and to apps. Resource-limited API tokens are refused on the
@@ -115,7 +115,7 @@ fn link_refusal(db: &ManagedDatabase, app: &App) -> Option<String> {
     None
 }
 
-// ── GET /api/databases/{id}/access ──
+// ── GET /api/v1/databases/{id}/access ──
 
 pub async fn get_database_access(
     _rate: RateLimit,
@@ -128,7 +128,7 @@ pub async fn get_database_access(
     Ok((StatusCode::OK, Json(ApiResponse::ok(access))))
 }
 
-// ── PUT /api/databases/{id}/links/{app} ──
+// ── PUT /api/v1/databases/{id}/links/{app} ──
 
 pub async fn link_app(
     _rate: RateLimit,
@@ -185,7 +185,7 @@ pub async fn link_app(
     Ok((StatusCode::OK, Json(ApiResponse::ok(access))))
 }
 
-// ── DELETE /api/databases/{id}/links/{app} ──
+// ── DELETE /api/v1/databases/{id}/links/{app} ──
 
 pub async fn unlink_app(
     _rate: RateLimit,
@@ -229,7 +229,7 @@ pub async fn unlink_app(
     Ok((StatusCode::OK, Json(ApiResponse::ok(access))))
 }
 
-// ── GET /api/apps/{id}/databases ──
+// ── GET /api/v1/apps/{id}/databases ──
 
 pub async fn list_app_databases(
     _rate: RateLimit,

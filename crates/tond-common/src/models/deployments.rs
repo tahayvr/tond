@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 /// the new container and draining the old one) is the step users wait on
 /// instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum DeployPhase {
     /// Fetch the source: git clone, image pull, or the uploaded image.
@@ -45,6 +46,7 @@ impl DeployPhase {
 
 /// Where a phase is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum PhaseStatus {
     Pending,
@@ -57,6 +59,7 @@ pub enum PhaseStatus {
 
 /// One phase's state and timing, stored as JSON in `deployments.phases`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PhaseRecord {
     pub phase: DeployPhase,
     pub status: PhaseStatus,
@@ -84,6 +87,7 @@ impl PhaseRecord {
 /// The classified likely cause of a failed deployment, stored as JSON in
 /// `deployments.failure`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DeployFailure {
     /// Phase that failed, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -104,6 +108,7 @@ pub struct DeployFailure {
 
 /// A single deployment attempt for an app. One row per deploy invocation.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Deployment {
     pub id: String,
     pub app_id: String,
@@ -183,6 +188,7 @@ pub fn duration_secs(started_at: &str, finished_at: Option<&str>) -> Option<i64>
 pub const UNFINISHED_DEPLOYMENT_STATUSES: [&str; 2] = ["queued", "running"];
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DeploymentResponse {
     pub id: String,
     pub app_id: String,
@@ -234,7 +240,7 @@ pub struct DeploymentResponse {
     /// This deployment's image is what the app currently runs
     #[serde(default)]
     pub is_current: bool,
-    /// `POST /api/apps/{id}/rollback {"deployment_id": id}` would restore this
+    /// `POST /api/v1/apps/{id}/rollback {"deployment_id": id}` would restore this
     /// deployment's exact image
     #[serde(default)]
     pub rollback_available: bool,
@@ -284,15 +290,17 @@ impl From<Deployment> for DeploymentResponse {
 
 /// One deploy log line of a deployment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DeploymentLogLine {
     pub level: String,
     pub message: String,
     pub ts: String,
 }
 
-/// `GET /api/apps/{id}/deployments/{deployment_id}`: the deployment plus its
+/// `GET /api/v1/apps/{id}/deployments/{deployment_id}`: the deployment plus its
 /// log (the newest lines, capped server-side).
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DeploymentDetailResponse {
     #[serde(flatten)]
     pub deployment: DeploymentResponse,
@@ -312,9 +320,10 @@ pub struct DeploymentDetailResponse {
 // ── Phase 4.4: Preview Deployments ──
 
 /// A single ephemeral preview deployment for an app.
-/// Created via `POST /api/apps/{id}/preview` or `tond deploy <app> --preview`.
+/// Created via `POST /api/v1/apps/{id}/preview` or `tond deploy <app> --preview`.
 /// Automatically cleaned up after `ttl_seconds` (default 24 h).
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PreviewDeployment {
     pub id: String,
     pub app_id: String,
@@ -349,6 +358,7 @@ pub struct PreviewDeployment {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PreviewDeploymentResponse {
     pub id: String,
     pub app_id: String,
@@ -396,8 +406,9 @@ impl PreviewDeploymentResponse {
     }
 }
 
-/// POST /api/apps/{id}/preview request body
+/// POST /api/v1/apps/{id}/preview request body
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreatePreviewRequest {
     /// TTL in hours (default 24)
     pub ttl_hours: Option<i64>,
@@ -417,6 +428,7 @@ pub struct CreatePreviewRequest {
 /// One "project preview" groups a preview deployment for every member app
 /// under a shared slug. Stored in the `project_previews` table.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ProjectPreview {
     pub id: String,
     pub project_id: String,
@@ -464,6 +476,7 @@ pub fn aggregate_preview_status(statuses: &[String]) -> String {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ProjectPreviewResponse {
     pub id: String,
     pub project_id: String,
@@ -477,8 +490,9 @@ pub struct ProjectPreviewResponse {
     pub previews: Vec<PreviewDeploymentResponse>,
 }
 
-/// POST /api/projects/{id}/previews request body
+/// POST /api/v1/projects/{id}/previews request body
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreateProjectPreviewRequest {
     /// TTL in hours (default 24)
     pub ttl_hours: Option<i64>,

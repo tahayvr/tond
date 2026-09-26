@@ -1,7 +1,7 @@
 // handlers/certificates.rs — TLS certificate status
 //
-//   list_certs()  GET  /api/certs                 — every certificate, with what it serves
-//   retry_cert()  POST /api/certs/{domain}/retry  — try issuance now instead of after backoff
+//   list_certs()  GET  /api/v1/certs                 — every certificate, with what it serves
+//   retry_cert()  POST /api/v1/certs/{domain}/retry  — try issuance now instead of after backoff
 //
 // tond-proxy obtains and renews certificates; tond-server stores the results
 // it reports over the control socket (proxy_link.rs). The list joins each row
@@ -140,7 +140,7 @@ pub async fn list_certs(
 
 // ── Retry a certificate now ──
 
-/// POST /api/certs/{domain}/retry — ask tond-proxy to attempt issuance now
+/// POST /api/v1/certs/{domain}/retry — ask tond-proxy to attempt issuance now
 /// instead of waiting for the backoff. The failure count is kept, so repeated
 /// retries of a broken domain still back off. A served domain without a row
 /// yet just gets a certificate pass.

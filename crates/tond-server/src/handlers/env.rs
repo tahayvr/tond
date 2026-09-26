@@ -3,11 +3,11 @@
 // Env var values are secrets, so reads never return them in bulk and writes
 // never replace the whole map:
 //
-//   GET   /api/apps/{id}/env               — keys with masked values + preview config
-//   GET   /api/apps/{id}/env/{key}         — reveal one value (admin only, audit-logged)
-//   PATCH /api/apps/{id}/env               — {set: {K: V}, unset: [K]}
-//   GET   /api/apps/{id}/preview-env/{key} — reveal one preview override (admin only, audit-logged)
-//   PATCH /api/apps/{id}/preview-env       — {set, unset, share, unshare}
+//   GET   /api/v1/apps/{id}/env               — keys with masked values + preview config
+//   GET   /api/v1/apps/{id}/env/{key}         — reveal one value (admin only, audit-logged)
+//   PATCH /api/v1/apps/{id}/env               — {set: {K: V}, unset: [K]}
+//   GET   /api/v1/apps/{id}/preview-env/{key} — reveal one preview override (admin only, audit-logged)
+//   PATCH /api/v1/apps/{id}/preview-env       — {set, unset, share, unshare}
 //
 // Previews never inherit the app's environment: they get their own overrides
 // plus only the app variables an admin explicitly shares (shared_keys).
@@ -408,7 +408,7 @@ mod tests {
 
     /// HTTP status the reveal route's `Authz<scope::EnvReadValues>` gives these headers (200 = passes).
     async fn reveal_gate(state: &AppState, headers: &[(header::HeaderName, String)]) -> u16 {
-        let mut builder = axum::http::Request::builder().uri("/api/apps/x/env/K");
+        let mut builder = axum::http::Request::builder().uri("/api/v1/apps/x/env/K");
         for (name, value) in headers {
             builder = builder.header(name, value);
         }

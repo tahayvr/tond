@@ -80,6 +80,7 @@ mod acme;
 mod certs;
 mod control;
 mod issuance;
+mod log_limit;
 mod meters;
 mod traffic;
 
@@ -922,6 +923,16 @@ impl ProxyHttp for TondProxy {
         Ok(())
     }
 
+    /// Pingora logs every failed request at ERROR; they are counted in the
+    /// request metrics, so the journal gets the first one and then at most
+    /// one an hour (log_limit.rs), plus a summary of what was held back.
+    fn suppress_error_log(&self, session: &Session, _ctx: &Self::CTX, e: &pingora::Error) -> bool {
+        tracing::debug!("Fail to proxy: {e}, Host: {}", request_host(session));
+        !log_limit::LIMITER.allow(log_limit::FAIL_TO_PROXY, Instant::now(), || {
+            format!("Fail to proxy: {e}, Host: {}", request_host(session))
+        })
+    }
+
     /// Pingora's default error response, except that upstream timeouts are
     /// a 504 (so request metrics can tell them from a refused connection).
     async fn fail_to_proxy(
@@ -991,9 +1002,10 @@ fn main() {
     {
         use tracing_subscriber::prelude::*;
         tracing_subscriber::registry()
-            .with(tond_common::logging::fmt_layer(
-                tond_common::logging::LogFormat::from_env(),
-            ))
+            .with(
+                tond_common::logging::fmt_layer(tond_common::logging::LogFormat::from_env())
+                    .with_filter(log_limit::RateLimit),
+            )
             .init();
     }
 
@@ -1177,6 +1189,11 @@ async fn background(
             _ => {}
         }
         meter.ran(run, result.err().map(|e| format!("{e:#}")));
+        if let Some((n, example)) = log_limit::LIMITER.take_summary(Instant::now()) {
+            tracing::warn!(
+                "{n} repeated warning(s) from the proxy's libraries were not logged in the last hour, e.g. \"{example}\". Failed requests are counted in the request metrics; set RUST_LOG=debug for every one."
+            );
+        }
     }
 }
 
@@ -1501,7 +1518,7 @@ mod tests {
 
     #[test]
     fn dashboard_forwarding_headers_replace_client_supplied_values() {
-        let mut req = pingora::http::RequestHeader::build("POST", b"/api/auth/login", None)
+        let mut req = pingora::http::RequestHeader::build("POST", b"/api/v1/auth/login", None)
             .unwrap_or_else(|err| panic!("failed to build request header: {err}"));
         req.insert_header("X-Forwarded-For", "1.2.3.4")
             .unwrap_or_else(|err| panic!("{err}"));

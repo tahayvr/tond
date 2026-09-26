@@ -107,7 +107,14 @@ fn is_safe_method(method: &Method) -> bool {
 }
 
 fn forbidden(message: &str) -> Response {
-    (StatusCode::FORBIDDEN, Json(ApiResponse::<()>::err(message))).into_response()
+    (
+        StatusCode::FORBIDDEN,
+        Json(ApiResponse::<()>::err(
+            tond_common::code::CSRF_REJECTED,
+            message,
+        )),
+    )
+        .into_response()
 }
 
 /// Decide whether a request passes the same-origin rules (see module docs).
@@ -223,7 +230,7 @@ mod tests {
 
     #[test]
     fn body_less_cookie_post_without_csrf_header_is_rejected() {
-        // e.g. POST /api/apps/{id}/deploy from a preview page.
+        // e.g. POST /api/v1/apps/{id}/deploy from a preview page.
         let h = headers(&[COOKIE]);
         assert_eq!(
             check_request(&Method::POST, &h, DASH),

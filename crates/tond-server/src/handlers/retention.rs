@@ -1,7 +1,7 @@
 // handlers/retention.rs — how long Tond keeps its history, and what it costs
 //
-//   get_retention()     GET /api/settings/retention — rules with bounds + database size
-//   update_retention()  PUT /api/settings/retention — `{ "<key>": n, … }` within bounds
+//   get_retention()     GET /api/v1/settings/retention — rules with bounds + database size
+//   update_retention()  PUT /api/v1/settings/retention — `{ "<key>": n, … }` within bounds
 //
 // The rules and their bounds are `tond_common::RETENTION_RULES`; the janitor
 // (janitor.rs) reads the same settings keys every pass. The database size

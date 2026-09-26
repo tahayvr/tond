@@ -381,6 +381,7 @@ pub(crate) async fn combined_logs(state: &AppState, app: &App, tail: usize) -> V
 // ── Logs of one service ──
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ServiceLogsQuery {
     pub tail: Option<usize>,
 }
