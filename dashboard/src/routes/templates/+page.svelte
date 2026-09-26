@@ -143,7 +143,9 @@
 	{:else}
 		<ul class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4" aria-label="Templates">
 			{#each shown as template (template.id)}
-				<li><TemplateCard {template} memory={catalog.memory} /></li>
+				<li>
+					<TemplateCard {template} memory={catalog.memory} serverArch={catalog.architecture} />
+				</li>
 			{/each}
 		</ul>
 		<p class="text-xs text-muted-foreground">

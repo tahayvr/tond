@@ -9,6 +9,7 @@ version = "sha-4bfc5bb"
 website = "https://excalidraw.com"
 docs = "https://github.com/excalidraw/excalidraw#self-hosting"
 repository = "https://github.com/excalidraw/excalidraw"
+architectures = ["amd64"]
 ram_mb = 20
 setup_notes = "Open the app and start drawing. Drawings are saved in your browser; export them to keep copies."
 upgrade_notes = "Excalidraw publishes images per commit. Replace the sha-… tag with a newer one from Docker Hub and redeploy."

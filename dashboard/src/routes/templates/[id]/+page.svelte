@@ -157,7 +157,7 @@
 			{/if}
 
 			{#if template.upgrade_notes}
-				<section class="space-y-2" aria-labelledby="upgrade-heading">
+				<section id="upgrading" class="scroll-mt-20 space-y-2" aria-labelledby="upgrade-heading">
 					<h2 id="upgrade-heading" class="flex items-center gap-2 text-sm font-semibold">
 						<ArrowUpIcon class="size-4 text-muted-foreground" aria-hidden="true" />
 						Upgrading
@@ -203,6 +203,7 @@
 						{template}
 						{memory}
 						appsDomain={data.appsDomain as string}
+						serverArch={data.architecture as string}
 						{projects}
 						ondeployed={(r) => (result = r)}
 					/>

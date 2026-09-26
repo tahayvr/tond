@@ -22,7 +22,8 @@ use axum::{
 use tond_common::{
     ApiResponse, App, CreateAppRequest, Scope, Template, TemplateCatalogResponse, TemplateContext,
     TemplateCredential, TemplateDeployRequest, TemplateDeployResponse, TemplateHostMemory,
-    TemplateResponse, TondError, builtin_template, builtin_templates, resolve_inputs,
+    TemplateResponse, TondError, architecture_label, builtin_template, builtin_templates,
+    host_architecture, resolve_inputs,
 };
 
 use crate::{
@@ -65,7 +66,30 @@ pub async fn list_templates(
             templates,
             memory,
             apps_domain,
+            architecture: host_architecture().to_string(),
         })),
+    ))
+}
+
+/// Refuse a template whose images don't exist for this server's CPU.
+fn check_architecture(template: &Template, host: &str) -> Result<(), AppError> {
+    if template.manifest.architectures.iter().any(|a| a == host) {
+        return Ok(());
+    }
+    let available: Vec<&str> = template
+        .manifest
+        .architectures
+        .iter()
+        .map(|a| architecture_label(a))
+        .collect();
+    Err(AppError(
+        TondError::Conflict(format!(
+            "{} isn't available on {}: its images are published for {} only.",
+            template.manifest.name,
+            architecture_label(host),
+            available.join(" and ")
+        ))
+        .with_hint("Pick another template, or deploy it on a server with a matching CPU."),
     ))
 }
 
@@ -190,6 +214,7 @@ async fn deploy_from_template(
             "App name must be 1–40 lowercase letters, digits and hyphens",
         )));
     }
+    check_architecture(&template, host_architecture())?;
     check_memory(&template, available_memory(), req.allow_low_memory)?;
 
     // The address the app will answer on, for inputs like {app_url}: the
@@ -272,6 +297,13 @@ async fn deploy_from_template(
         remove_app(state, &app, data_dir).await;
         return Err(e);
     }
+
+    sqlx::query("UPDATE apps SET template_id = ?, template_version = ? WHERE id = ?")
+        .bind(&template.manifest.id)
+        .bind(&template.manifest.version)
+        .bind(&app.id)
+        .execute(&state.db)
+        .await?;
 
     let app_id = app.id.clone();
     let app_domain = app.domain.clone();
@@ -613,6 +645,70 @@ mod tests {
                 t.manifest.id
             );
         }
+    }
+
+    #[tokio::test]
+    async fn deploy_sets_the_primary_domain_and_records_the_template() {
+        let state = test_state().await;
+        let dir = tmp();
+        let mut req = deploy_request("tools", &[]);
+        req.domain = Some("Tools.Example.com".into());
+        let body = deploy(&state, dir.path(), "it-tools", req)
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.0));
+        assert_eq!(body["data"]["domain"], "tools.example.com");
+
+        let (domain, template_id, version): (Option<String>, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT domain, template_id, template_version FROM apps WHERE name = 'tools'",
+            )
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(domain.as_deref(), Some("tools.example.com"));
+        assert_eq!(template_id.as_deref(), Some("it-tools"));
+        assert!(version.is_some());
+        let primary: String = sqlx::query_scalar(
+            "SELECT d.domain FROM app_domains d JOIN apps a ON a.id = d.app_id WHERE a.name = 'tools' AND d.kind = 'primary'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            primary, "tools.example.com",
+            "the domain seeds app_domains' primary row"
+        );
+
+        // The same domain can't go to a second app.
+        let mut again = deploy_request("tools2", &[]);
+        again.domain = Some("tools.example.com".into());
+        let err = deploy(&state, dir.path(), "it-tools", again)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("a taken domain is refused"));
+        assert_eq!(err.0.status_code(), 400);
+        assert_eq!(app_count(&state).await, 1);
+    }
+
+    #[test]
+    fn architecture_check_refuses_missing_images() {
+        let t = builtin_template("mattermost")
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("mattermost"));
+        assert!(check_architecture(&t, "amd64").is_ok());
+        let err = check_architecture(&t, "arm64")
+            .err()
+            .unwrap_or_else(|| panic!("mattermost has no ARM64 image"));
+        assert_eq!(err.0.status_code(), 409);
+        assert!(
+            err.0.message().contains("isn't available on ARM64"),
+            "{}",
+            err.0.message()
+        );
+        let umami = builtin_template("umami")
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("umami"));
+        assert!(check_architecture(&umami, "arm64").is_ok());
     }
 
     #[test]

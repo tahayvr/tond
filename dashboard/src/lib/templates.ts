@@ -106,6 +106,26 @@ export function memoryWarning(
 	return `${template.name} needs about ${need} and this server has ${free} free, so it will be tight. Other apps may slow down.`;
 }
 
+/** "x86_64" / "ARM64" for Docker's architecture names. */
+export function architectureLabel(arch: string): string {
+	if (arch === 'amd64') return 'x86_64';
+	if (arch === 'arm64') return 'ARM64';
+	return arch;
+}
+
+/**
+ * Why a template can't run on this server's CPU, or null when it can (or the
+ * server's architecture is unknown).
+ */
+export function architectureProblem(
+	template: Pick<Template, 'name' | 'architectures'>,
+	serverArch: string
+): string | null {
+	if (!serverArch || template.architectures.includes(serverArch)) return null;
+	const available = template.architectures.map(architectureLabel).join(' and ');
+	return `${template.name} isn't available on ${architectureLabel(serverArch)}: its images are published for ${available} only.`;
+}
+
 /** Expand `{app_url}`, `{app_host}` and `{app_name}` for a preview of defaults. */
 export function expandPlaceholders(value: string, appName: string, host: string): string {
 	const scheme = host === 'localhost' || host.endsWith('.localhost') ? 'http' : 'https';

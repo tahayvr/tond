@@ -17,6 +17,7 @@
 	import {
 		appHost,
 		appNameError,
+		architectureProblem,
 		formatRam,
 		inputError,
 		inputsToSend,
@@ -39,12 +40,15 @@
 		template,
 		memory,
 		appsDomain,
+		serverArch = '',
 		projects,
 		ondeployed
 	}: {
 		template: Template;
 		memory: TemplateHostMemory | null;
 		appsDomain: string;
+		/** This server's CPU architecture ('' = unknown). */
+		serverArch?: string;
 		projects: Project[];
 		ondeployed: (result: TemplateDeployResult) => void;
 	} = $props();
@@ -76,6 +80,7 @@
 		) as Record<string, string>
 	);
 	let blocked = $derived(fit === 'short' && !allowLowMemory);
+	let archProblem = $derived(architectureProblem(template, serverArch));
 	let allowed = $derived(can('apps:write') && can('apps:deploy') && can('settings:write'));
 
 	async function handleSubmit(event: SubmitEvent) {
@@ -277,7 +282,15 @@
 
 	<InlineError message={error} ondismiss={() => (error = '')} />
 
-	{#if allowed}
+	{#if archProblem}
+		<p
+			class="flex items-start gap-2 rounded-md border border-warn/40 bg-warn/10 px-3 py-2.5 text-sm text-warn"
+			role="status"
+		>
+			<AlertIcon class="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+			<span>{archProblem} Pick another template for this server.</span>
+		</p>
+	{:else if allowed}
 		<Button type="submit" class="w-full" disabled={pending || blocked}>
 			<RocketIcon class="mr-1 size-4" aria-hidden="true" />
 			{pending ? 'Starting the deploy…' : `Deploy ${template.name}`}

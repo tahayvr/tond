@@ -357,6 +357,9 @@ export const MOCK_TEMPLATES: Template[] = templatesJson as Template[];
 /** Host memory the mock catalog reports: small enough that heavy templates warn. */
 export const MOCK_TEMPLATE_MEMORY: TemplateHostMemory = { total_mb: 2048, available_mb: 1400 };
 
+/** The mock server's CPU (ARM64, so x86_64-only templates show as unavailable). */
+export const MOCK_SERVER_ARCH = 'arm64';
+
 // ── App environment variables (served masked by GET /apps/:id/env) ─────────
 
 export const MOCK_APP_ENV_VARS: Record<string, Record<string, string>> = {

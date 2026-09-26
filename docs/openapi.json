@@ -1455,6 +1455,22 @@
           "status": {
             "type": "string"
           },
+          "template_id": {
+            "default": null,
+            "description": "One-click template the app was deployed from (see GET /api/v1/templates)",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "template_version": {
+            "default": null,
+            "description": "The template's version at deploy time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "updated_at": {
             "type": "string"
           },
@@ -1477,6 +1493,8 @@
           "id",
           "name",
           "domain",
+          "template_id",
+          "template_version",
           "source_type",
           "source_url",
           "status",
@@ -9918,6 +9936,11 @@
             "description": "Apps get `<name>.<apps_domain>` when no domain is given (\"\" = none).",
             "type": "string"
           },
+          "architecture": {
+            "default": "",
+            "description": "This server's CPU architecture (\"amd64\" | \"arm64\").",
+            "type": "string"
+          },
           "memory": {
             "anyOf": [
               {
@@ -9939,7 +9962,8 @@
         "required": [
           "templates",
           "memory",
-          "apps_domain"
+          "apps_domain",
+          "architecture"
         ],
         "type": "object"
       },
@@ -10153,6 +10177,17 @@
               "null"
             ]
           },
+          "architectures": {
+            "default": [
+              "amd64",
+              "arm64"
+            ],
+            "description": "CPU architectures its images exist for (\"amd64\", \"arm64\").",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "category": {
             "type": "string"
           },
@@ -10264,6 +10299,7 @@
           "repository",
           "ram_mb",
           "fits_2gb",
+          "architectures",
           "public",
           "services",
           "volumes",

@@ -49,6 +49,10 @@ export interface App {
 	 * (allowed, but shown as a warning).
 	 */
 	domain_warning?: string | null;
+	/** One-click template the app was deployed from (see /templates). */
+	template_id?: string | null;
+	/** The template's version at deploy time. */
+	template_version?: string | null;
 	source_type: string;
 	source_url: string | null;
 	status: string;
@@ -167,6 +171,8 @@ export interface Template {
 	/** Typical memory of all services together, in MiB. */
 	ram_mb: number;
 	fits_2gb: boolean;
+	/** CPU architectures its images exist for ('amd64', 'arm64'). */
+	architectures: string[];
 	public: TemplatePublic;
 	services: TemplateService[];
 	volumes: TemplateVolume[];
@@ -188,6 +194,8 @@ export interface TemplateCatalog {
 	memory: TemplateHostMemory | null;
 	/** Apps without a domain get `<name>.<apps_domain>` ("" = none). */
 	apps_domain: string;
+	/** This server's CPU architecture ('amd64' | 'arm64'). */
+	architecture: string;
 }
 
 export interface TemplateDeployRequest {

@@ -24,6 +24,7 @@ import {
 	MOCK_PROJECTS,
 	MOCK_TEMPLATES,
 	MOCK_TEMPLATE_MEMORY,
+	MOCK_SERVER_ARCH,
 	MOCK_SETTINGS,
 	MOCK_RETENTION,
 	MOCK_AUDIT_SHIPPING,
@@ -1871,7 +1872,8 @@ export const handlers = [
 		return ok({
 			templates,
 			memory: MOCK_TEMPLATE_MEMORY,
-			apps_domain: MOCK_SETTINGS.apps_domain
+			apps_domain: MOCK_SETTINGS.apps_domain,
+			architecture: MOCK_SERVER_ARCH
 		});
 	}),
 
@@ -1887,6 +1889,13 @@ export const handlers = [
 					field: 'name'
 				}),
 				{ status: 400 }
+			);
+		}
+		if (!template.architectures.includes(MOCK_SERVER_ARCH)) {
+			return err(
+				`${template.name} isn't available on ARM64: its images are published for x86_64 only.`,
+				409,
+				'CONFLICT'
 			);
 		}
 		if (apps.some((a) => a.name === name))
@@ -1939,6 +1948,8 @@ export const handlers = [
 			compose_content: template.compose,
 			dockerfile_content: null,
 			readiness: template.public.health_path ? 'http' : 'tcp',
+			template_id: template.id,
+			template_version: template.version,
 			created_at: now,
 			updated_at: now
 		};

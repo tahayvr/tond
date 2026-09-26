@@ -3,6 +3,7 @@ import type { Template, TemplateInput } from '$lib/api';
 import templatesJson from '../mocks/templates.json';
 import {
 	appHost,
+	architectureProblem,
 	appNameError,
 	categoryCounts,
 	categoryLabel,
@@ -74,6 +75,20 @@ describe('template catalog', () => {
 		const small = filterTemplates(catalog, { query: '', category: '', fitsOnly: true });
 		expect(small.every((t) => t.fits_2gb)).toBe(true);
 		expect(small.map((t) => t.id)).not.toContain('immich');
+	});
+});
+
+describe('architecture', () => {
+	it('flags templates without images for the server CPU', () => {
+		const mattermost = catalog.find((t) => t.id === 'mattermost');
+		expect(mattermost?.architectures).toEqual(['amd64']);
+		expect(architectureProblem(mattermost!, 'arm64')).toMatch(
+			/isn't available on ARM64.*x86_64 only/
+		);
+		expect(architectureProblem(mattermost!, 'amd64')).toBeNull();
+		expect(architectureProblem(mattermost!, '')).toBeNull();
+		const umami = catalog.find((t) => t.id === 'umami');
+		expect(architectureProblem(umami!, 'arm64')).toBeNull();
 	});
 });
 

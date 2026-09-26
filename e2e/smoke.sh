@@ -1659,6 +1659,15 @@ jq -e '[.data.templates[].services[].image | select(test(":latest$") or (test(":
 jq -e '.data.memory.total_mb > 0 and .data.memory.available_mb > 0' <<< "$CATALOG" > /dev/null \
     || fail "the catalog should report host memory: $(jq -c '.data.memory' <<< "$CATALOG")"
 pass "catalog: $(jq '.data.templates | length' <<< "$CATALOG") templates, images pinned, free memory reported"
+case "$(uname -m)" in x86_64) HOST_ARCH=amd64 ;; aarch64) HOST_ARCH=arm64 ;; *) HOST_ARCH=$(uname -m) ;; esac
+[[ "$(jq -r '.data.architecture' <<< "$CATALOG")" == "$HOST_ARCH" ]] \
+    || fail "the catalog should report the server's architecture (${HOST_ARCH}): $(jq -c '.data.architecture' <<< "$CATALOG")"
+if [[ "$HOST_ARCH" == arm64 ]]; then
+    code=$(api_req POST /api/v1/templates/mattermost/deploy '{"name":"e2e-mm","inputs":{},"allow_low_memory":true}')
+    [[ "$code" == 409 ]] && jq -e '.error.message | test("ARM64")' "$API_BODY" > /dev/null \
+        || fail "an x86_64-only template must be refused on ARM64, got ${code}: $(cat "$API_BODY")"
+    pass "x86_64-only templates are refused on ARM64"
+fi
 code=$(api_req POST /api/v1/templates/vaultwarden/deploy '{"name":"Bad Name","inputs":{}}')
 [[ "$code" == 400 ]] && jq -e '.error.code == "INVALID_INPUT" and .error.field == "name"' "$API_BODY" > /dev/null \
     || fail "a template deploy with an invalid name must be 400 INVALID_INPUT on field name, got ${code}: $(cat "$API_BODY")"
@@ -1670,7 +1679,9 @@ code=$(api_req POST /api/v1/templates/vaultwarden/deploy \
 VAULT_TOKEN=$(jq -r '.data.credentials[] | select(.key == "ADMIN_TOKEN") | .value' "$API_BODY")
 [[ ${#VAULT_TOKEN} -eq 24 ]] || fail "the deploy should return the generated admin token once: $(jq -c '.data.credentials | map(.key)' "$API_BODY")"
 jq -e '.data.deployment_id | length > 0' "$API_BODY" > /dev/null || fail "the deploy response needs a deployment id"
-pass "template deploy → 202 with a generated 24-character admin token"
+[[ "$(app_field e2e-vault template_id)" == vaultwarden ]] || fail "the app should record the template it came from"
+[[ "$(app_field e2e-vault domain)" == "$VAULT_DOMAIN" ]] || fail "the template's domain should be the app's primary domain"
+pass "template deploy → 202 with a generated 24-character admin token; template and domain recorded"
 wait_for_app_running e2e-vault 300
 VAULT_CID=$(docker ps -q --filter label=com.docker.compose.project=e2e-vault --filter label=com.docker.compose.service=vaultwarden)
 [[ -n "$VAULT_CID" ]] || fail "the vaultwarden compose service should be running"

@@ -9,6 +9,7 @@ version = "11.11"
 website = "https://mattermost.com"
 docs = "https://docs.mattermost.com/deployment-guide/server/deploy-containers.html"
 repository = "https://github.com/mattermost/mattermost"
+architectures = ["amd64"]
 ram_mb = 800
 setup_notes = "Open the app right away: the first account created becomes the system admin. Then create a team and invite people."
 upgrade_notes = "Change the image to a newer tag and redeploy; the database is migrated on start. Stay on Extended Support Releases for fewer upgrades, and snapshot first."

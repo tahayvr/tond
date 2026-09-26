@@ -143,6 +143,22 @@ describe('TemplateDeployForm', () => {
 		expect(screen.getByRole('button', { name: /deploy umami/i })).toBeEnabled();
 	});
 
+	it('replaces the deploy button on a server whose CPU the images lack', () => {
+		const ondeployed = vi.fn();
+		render(TemplateDeployForm, {
+			props: {
+				template: byId('mattermost'),
+				memory: { total_mb: 4096, available_mb: 3000 },
+				appsDomain: 'apps.example.com',
+				serverArch: 'arm64',
+				projects: [],
+				ondeployed
+			}
+		});
+		expect(screen.queryByRole('button', { name: /deploy mattermost/i })).not.toBeInTheDocument();
+		expect(screen.getByText(/isn't available on ARM64/)).toBeInTheDocument();
+	});
+
 	it('explains who can deploy when the user may not', () => {
 		auth.admin = false;
 		try {

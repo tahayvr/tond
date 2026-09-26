@@ -3,11 +3,17 @@
 -->
 <script lang="ts">
 	import type { Template, TemplateHostMemory } from '$lib/api';
-	import { categoryLabel } from '$lib/templates';
+	import { architectureLabel, categoryLabel } from '$lib/templates';
 	import TemplateLogo from './template-logo.svelte';
 	import MemoryBadge from './memory-badge.svelte';
 
-	let { template, memory }: { template: Template; memory: TemplateHostMemory | null } = $props();
+	let {
+		template,
+		memory,
+		serverArch = ''
+	}: { template: Template; memory: TemplateHostMemory | null; serverArch?: string } = $props();
+
+	let unavailable = $derived(!!serverArch && !template.architectures.includes(serverArch));
 </script>
 
 <a
@@ -22,5 +28,12 @@
 		</div>
 	</div>
 	<p class="line-clamp-2 flex-1 text-sm text-muted-foreground">{template.description}</p>
-	<MemoryBadge {template} {memory} />
+	<div class="flex flex-wrap items-center gap-1.5">
+		<MemoryBadge {template} {memory} />
+		{#if unavailable}
+			<span class="rounded-sm border border-warn/40 bg-warn/10 px-1.5 py-0.5 text-xs text-warn"
+				>{template.architectures.map(architectureLabel).join(', ')} only</span
+			>
+		{/if}
+	</div>
 </a>

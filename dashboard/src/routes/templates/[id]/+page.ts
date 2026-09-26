@@ -15,6 +15,7 @@ export async function load({ params }: { params: { id: string } }) {
 		template,
 		memory: catalog.memory,
 		appsDomain: catalog.apps_domain,
+		architecture: catalog.architecture,
 		projects
 	};
 }

@@ -25,6 +25,8 @@
 //   version                 upstream app version the images are pinned to
 //   website/docs/repository optional links
 //   ram_mb                  typical steady-state memory of all services together
+//   architectures           CPU architectures its images exist for (default
+//                           both: ["amd64", "arm64"])
 //   setup_notes             shown after deploy (first login, what to do next)
 //   upgrade_notes           how to move to a newer version safely
 //   post_deploy_checks      short manual checklist
@@ -120,6 +122,8 @@ pub struct TemplateManifest {
     pub docs: Option<String>,
     pub repository: Option<String>,
     pub ram_mb: u32,
+    #[serde(default = "all_architectures")]
+    pub architectures: Vec<String>,
     pub setup_notes: Option<String>,
     pub upgrade_notes: Option<String>,
     #[serde(default)]
@@ -182,6 +186,34 @@ pub struct TemplateInput {
 
 fn default_true() -> bool {
     true
+}
+
+/// CPU architectures Tond runs on, in Docker's naming.
+pub const TEMPLATE_ARCHITECTURES: &[&str] = &["amd64", "arm64"];
+
+fn all_architectures() -> Vec<String> {
+    TEMPLATE_ARCHITECTURES
+        .iter()
+        .map(|a| a.to_string())
+        .collect()
+}
+
+/// This server's CPU architecture in Docker's naming ("amd64", "arm64").
+pub fn host_architecture() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    }
+}
+
+/// Human name for an architecture ("x86_64", "ARM64").
+pub fn architecture_label(arch: &str) -> &str {
+    match arch {
+        "amd64" => "x86_64",
+        "arm64" => "ARM64",
+        other => other,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -677,6 +709,16 @@ pub fn validate(
             TEMPLATE_CATEGORIES.join(", ")
         ));
     }
+    if m.architectures.is_empty()
+        || m.architectures
+            .iter()
+            .any(|a| !TEMPLATE_ARCHITECTURES.contains(&a.as_str()))
+    {
+        return fail(format!(
+            "architectures must list some of: {}",
+            TEMPLATE_ARCHITECTURES.join(", ")
+        ));
+    }
     if m.ram_mb == 0 {
         return fail("ram_mb must be greater than 0".into());
     }
@@ -974,6 +1016,9 @@ pub struct TemplateResponse {
     pub repository: Option<String>,
     pub ram_mb: u32,
     pub fits_2gb: bool,
+    /// CPU architectures its images exist for ("amd64", "arm64").
+    #[serde(default = "all_architectures")]
+    pub architectures: Vec<String>,
     pub public: TemplatePublic,
     pub services: Vec<TemplateService>,
     pub volumes: Vec<TemplateVolume>,
@@ -1018,6 +1063,7 @@ impl From<Template> for TemplateResponse {
             repository: m.repository,
             ram_mb: m.ram_mb,
             fits_2gb,
+            architectures: m.architectures,
             public: m.public,
             services: t.services,
             volumes: m.volumes,
@@ -1047,6 +1093,9 @@ pub struct TemplateCatalogResponse {
     pub memory: Option<TemplateHostMemory>,
     /// Apps get `<name>.<apps_domain>` when no domain is given ("" = none).
     pub apps_domain: String,
+    /// This server's CPU architecture ("amd64" | "arm64").
+    #[serde(default)]
+    pub architecture: String,
 }
 
 /// POST /api/templates/{id}/deploy

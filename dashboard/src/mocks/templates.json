@@ -18,6 +18,10 @@
     "repository": "https://github.com/actualbudget/actual",
     "ram_mb": 120,
     "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "actual",
       "port": 5006,
@@ -67,6 +71,10 @@
     "repository": "https://github.com/appsmithorg/appsmith",
     "ram_mb": 2500,
     "fits_2gb": false,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "appsmith",
       "port": 80,
@@ -116,6 +124,10 @@
     "repository": "https://github.com/advplyr/audiobookshelf",
     "ram_mb": 200,
     "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "audiobookshelf",
       "port": 80,
@@ -183,6 +195,10 @@
     "repository": "https://github.com/coder/code-server",
     "ram_mb": 350,
     "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "code-server",
       "port": 8080,
@@ -256,6 +272,10 @@
     "repository": "https://github.com/directus/directus",
     "ram_mb": 300,
     "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "directus",
       "port": 8055,
@@ -343,6 +363,10 @@
     "repository": "https://github.com/docmost/docmost",
     "ram_mb": 600,
     "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "docmost",
       "port": 3000,
@@ -431,6 +455,9 @@
     "repository": "https://github.com/excalidraw/excalidraw",
     "ram_mb": 20,
     "fits_2gb": true,
+    "architectures": [
+      "amd64"
+    ],
     "public": {
       "service": "excalidraw",
       "port": 80,
@@ -473,6 +500,10 @@
     "repository": "https://codeberg.org/forgejo/forgejo",
     "ram_mb": 250,
     "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "forgejo",
       "port": 3000,
@@ -522,6 +553,10 @@
     "repository": "https://github.com/FreshRSS/FreshRSS",
     "ram_mb": 100,
     "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "freshrss",
       "port": 80,
@@ -609,6 +644,10 @@
     "repository": "https://github.com/TryGhost/Ghost",
     "ram_mb": 700,
     "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "ghost",
       "port": 2368,
@@ -692,6 +731,10 @@
     "repository": "https://github.com/go-gitea/gitea",
     "ram_mb": 220,
     "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "gitea",
       "port": 3000,
@@ -741,6 +784,10 @@
     "repository": "https://github.com/gotify/server",
     "ram_mb": 30,
     "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "gotify",
       "port": 80,
@@ -802,6 +849,10 @@
     "repository": "https://github.com/grafana/grafana",
     "ram_mb": 150,
     "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "grafana",
       "port": 3000,
@@ -863,6 +914,10 @@
     "repository": "https://github.com/prometheus/prometheus",
     "ram_mb": 350,
     "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "grafana",
       "port": 3000,
@@ -936,6 +991,10 @@
     "repository": "https://github.com/immich-app/immich",
     "ram_mb": 1600,
     "fits_2gb": false,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "immich-server",
       "port": 2283,
@@ -1014,6 +1073,10 @@
     "repository": "https://github.com/CorentinTh/it-tools",
     "ram_mb": 20,
     "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "it-tools",
       "port": 80,
@@ -1055,6 +1118,10 @@
     "repository": "https://github.com/sissbruecker/linkding",
     "ram_mb": 150,
     "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "linkding",
       "port": 9090,
@@ -1115,6 +1182,10 @@
     "repository": "https://github.com/knadh/listmonk",
     "ram_mb": 120,
     "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "listmonk",
       "port": 9000,
@@ -1207,6 +1278,9 @@
     "repository": "https://github.com/mattermost/mattermost",
     "ram_mb": 800,
     "fits_2gb": true,
+    "architectures": [
+      "amd64"
+    ],
     "public": {
       "service": "mattermost",
       "port": 8065,
@@ -1291,6 +1365,10 @@
     "repository": "https://github.com/mealie-recipes/mealie",
     "ram_mb": 300,
     "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "mealie",
       "port": 9000,
@@ -1351,6 +1429,10 @@
     "repository": "https://github.com/usememos/memos",
     "ram_mb": 40,
     "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "memos",
       "port": 5230,
@@ -1401,6 +1483,10 @@
     "repository": "https://github.com/metabase/metabase",
     "ram_mb": 1200,
     "fits_2gb": false,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "metabase",
       "port": 3000,
@@ -1467,6 +1553,10 @@
     "repository": "https://github.com/miniflux/v2",
     "ram_mb": 100,
     "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "miniflux",
       "port": 8080,
@@ -1544,6 +1634,10 @@
     "repository": "https://github.com/n8n-io/n8n",
     "ram_mb": 350,
     "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "n8n",
       "port": 5678,
@@ -1616,6 +1710,10 @@
     "repository": "https://github.com/nextcloud/server",
     "ram_mb": 600,
     "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "nextcloud",
       "port": 80,
@@ -1698,6 +1796,10 @@
     "repository": "https://github.com/binwiederhier/ntfy",
     "ram_mb": 40,
     "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "ntfy",
       "port": 80,
@@ -1748,6 +1850,10 @@
     "repository": "https://github.com/paperless-ngx/paperless-ngx",
     "ram_mb": 800,
     "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "paperless",
       "port": 8000,
@@ -1846,6 +1952,10 @@
     "repository": "https://github.com/plausible/analytics",
     "ram_mb": 1200,
     "fits_2gb": false,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "plausible",
       "port": 8000,
@@ -1942,6 +2052,10 @@
     "repository": "https://github.com/pocketbase/pocketbase",
     "ram_mb": 40,
     "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "pocketbase",
       "port": 8090,
@@ -2013,6 +2127,10 @@
     "repository": "https://github.com/Stirling-Tools/Stirling-PDF",
     "ram_mb": 1100,
     "fits_2gb": false,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "stirling-pdf",
       "port": 8080,
@@ -2073,6 +2191,10 @@
     "repository": "https://github.com/twentyhq/twenty",
     "ram_mb": 1500,
     "fits_2gb": false,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "server",
       "port": 3000,
@@ -2167,6 +2289,10 @@
     "repository": "https://github.com/umami-software/umami",
     "ram_mb": 300,
     "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "umami",
       "port": 3000,
@@ -2243,6 +2369,10 @@
     "repository": "https://github.com/louislam/uptime-kuma",
     "ram_mb": 230,
     "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "uptime-kuma",
       "port": 3001,
@@ -2292,6 +2422,10 @@
     "repository": "https://github.com/dani-garcia/vaultwarden",
     "ram_mb": 60,
     "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "vaultwarden",
       "port": 80,
@@ -2353,6 +2487,10 @@
     "repository": "https://github.com/requarks/wiki",
     "ram_mb": 350,
     "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
     "public": {
       "service": "wiki",
       "port": 3000,

@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use clap::Subcommand;
-use tond_common::{TemplateCatalogResponse, TemplateResponse};
+use tond_common::{TemplateCatalogResponse, TemplateResponse, architecture_label};
 
 use crate::client::TondClient;
 use crate::error::CliError;
@@ -63,13 +63,23 @@ fn format_list(catalog: &TemplateCatalogResponse) -> String {
         "ID", "NAME", "CATEGORY", "RAM", "FITS 2 GB"
     );
     for t in &catalog.templates {
+        let unavailable =
+            !catalog.architecture.is_empty() && !t.architectures.contains(&catalog.architecture);
         out.push_str(&format!(
-            "{:<20} {:<24} {:<14} {:>8}  {}\n",
+            "{:<20} {:<24} {:<14} {:>8}  {}{}\n",
             t.id,
             t.name,
             t.category,
             format!("~{}", format_ram(t.ram_mb)),
-            if t.fits_2gb { "yes" } else { "no" }
+            if t.fits_2gb { "yes" } else { "no" },
+            if unavailable {
+                format!(
+                    "  (not available on {})",
+                    architecture_label(&catalog.architecture)
+                )
+            } else {
+                String::new()
+            }
         ));
     }
     if let Some(memory) = catalog.memory {
@@ -146,6 +156,7 @@ mod tests {
                 available_mb: 1536,
             }),
             apps_domain: String::new(),
+            architecture: "arm64".into(),
         }
     }
 
@@ -154,6 +165,11 @@ mod tests {
         let out = format_list(&catalog());
         assert!(out.contains("umami"), "{out}");
         assert!(out.contains("1.5 GB of 2.0 GB memory free"), "{out}");
+        let mattermost = out
+            .lines()
+            .find(|l| l.starts_with("mattermost"))
+            .unwrap_or_default();
+        assert!(mattermost.contains("not available on ARM64"), "{out}");
     }
 
     #[test]
