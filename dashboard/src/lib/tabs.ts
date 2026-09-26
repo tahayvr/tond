@@ -44,7 +44,7 @@ export function tabHref(
 
 // ── App page ────────────────────────────────────────────────────────────────
 
-export type AppTab = 'overview' | 'deployments' | 'logs' | 'metrics' | 'settings';
+export type AppTab = 'overview' | 'deployments' | 'logs' | 'metrics' | 'uptime' | 'settings';
 export type AppSettingsSection =
 	| 'environment'
 	| 'domain'
@@ -62,6 +62,7 @@ export const APP_TABS: readonly TabDef<AppTab>[] = [
 	{ id: 'deployments', label: 'Deployments' },
 	{ id: 'logs', label: 'Logs', scope: 'logs:read' },
 	{ id: 'metrics', label: 'Metrics', scope: 'metrics:read' },
+	{ id: 'uptime', label: 'Uptime', scope: 'metrics:read' },
 	{ id: 'settings', label: 'Settings' }
 ];
 
@@ -108,6 +109,14 @@ export const DATABASE_TABS: readonly TabDef<DatabaseTab>[] = [
 	{ id: 'backups', label: 'Backups', scope: 'snapshots:read' },
 	{ id: 'metrics', label: 'Metrics', scope: 'metrics:read' },
 	{ id: 'settings', label: 'Settings' }
+];
+
+export type SystemTab = 'overview' | 'history' | 'disk' | 'uptime';
+export const SYSTEM_TABS: readonly TabDef<SystemTab>[] = [
+	{ id: 'overview', label: 'Overview' },
+	{ id: 'history', label: 'History' },
+	{ id: 'disk', label: 'Disk' },
+	{ id: 'uptime', label: 'Uptime' }
 ];
 
 export type CronTab = 'overview' | 'runs' | 'settings';

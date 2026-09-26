@@ -1381,8 +1381,9 @@ pass "the heartbeat URL is encrypted at rest and can be removed"
 # Host history: one row a minute from the metrics tick.
 wait_for 150 "host history samples" \
     bash -c "curl -sf --unix-socket '$SOCK' 'http://localhost/api/system/host/history?range=1h' | jq -e '(.data.series.t | length) >= 1'"
-jq -e '.data.step == 60 and .data.series.disk_total[-1] > 0 and .data.series.inodes_total[-1] > 0 and .data.series.mem_total[-1] > 0 and (.data.series.load1 | length) == (.data.series.t | length)' \
+jq -e '.data.step == 60 and .data.series.disk_total[-1] > 0 and .data.series.inodes_total[-1] >= .data.series.inodes_used[-1] and .data.series.mem_total[-1] > 0 and (.data.series.load1 | length) == (.data.series.t | length)' \
     <<<"$(api '/api/system/host/history?range=1h')" > /dev/null || fail "host history should carry disk, inodes, memory and load: $(api '/api/system/host/history?range=1h' | head -c 600)"
+# (btrfs reports no inode counts: inodes_total is 0 there.)
 pass "host history is recorded every minute (CPU, load, memory, swap, disk, inodes)"
 api /api/system/host/forecast | jq -e '.data.day.status | IN("filling", "stable", "insufficient_data")' > /dev/null \
     || fail "the disk forecast should answer: $(api /api/system/host/forecast)"

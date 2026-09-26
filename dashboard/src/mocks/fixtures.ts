@@ -2050,7 +2050,12 @@ export function makeMockSystemSelf(): SystemSelf {
 			loop('backup-scheduler', { next_wake_at: new Date(now + 9 * 3_600_000).toISOString() }),
 			loop('preview-cleanup'),
 			loop('proxy-link', { next_wake_at: null }),
-			loop('route-nudge', { last_duration_ms: 11.3, next_wake_at: null })
+			loop('route-nudge', { last_duration_ms: 11.3, next_wake_at: null }),
+			loop('uptime', {
+				last_run_at: new Date(now - 23_000).toISOString(),
+				last_duration_ms: 212.4,
+				next_wake_at: new Date(now + 37_000).toISOString()
+			})
 		],
 		db: {
 			size_bytes: 1.8 * 1024 * 1024,

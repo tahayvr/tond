@@ -5,6 +5,7 @@
 	import PageHeader from '$lib/components/nav/page-header.svelte';
 	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import SessionSettingsForm from '$lib/components/forms/session-settings-form.svelte';
+	import HeartbeatSettings from '$lib/components/forms/HeartbeatSettings.svelte';
 	import { can } from '$lib/auth.svelte';
 	import type { PageProps } from './$types';
 
@@ -73,7 +74,10 @@
 </script>
 
 <div class="space-y-6">
-	<PageHeader title="Settings" description="Server name, dashboard domain and preview domain." />
+	<PageHeader
+		title="Settings"
+		description="Server name, domains, sessions and the outbound heartbeat."
+	/>
 
 	<InlineError message={error} ondismiss={() => (error = '')} />
 
@@ -92,4 +96,6 @@
 	/>
 
 	<SessionSettingsForm settings={data.settings} canEdit={can('settings:write')} />
+
+	<HeartbeatSettings canEdit={can('settings:write')} />
 </div>

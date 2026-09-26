@@ -1720,6 +1720,338 @@ export async function getSystemSelf(): Promise<SystemSelf> {
 	return request<SystemSelf>('/system/self');
 }
 
+// ── Host history, disk, Docker (GET /api/system/host…) ──
+
+export interface Filesystem {
+	mount: string;
+	used: number;
+	total: number;
+	inodes_used: number;
+	inodes_total: number;
+}
+
+export interface HostCurrent {
+	cpu_percent: number;
+	load1: number;
+	load5: number;
+	load15: number;
+	cpus: number;
+	mem_used: number;
+	mem_total: number;
+	swap_used: number;
+	swap_total: number;
+	/** Filesystem holding Tond's data directory. */
+	data_fs: Filesystem;
+	/** `/`, when it is a different filesystem. */
+	root_fs: Filesystem | null;
+	collected_at: number;
+}
+
+export type DiskTrend = 'filling' | 'stable' | 'insufficient_data';
+
+export interface DiskForecast {
+	window: '24h' | '7d';
+	status: DiskTrend;
+	/** Bytes per day (negative when shrinking). */
+	growth_per_day: number;
+	eta_secs: number | null;
+	samples: number;
+}
+
+export interface DiskEta {
+	used: number;
+	total: number;
+	day: DiskForecast;
+	week: DiskForecast;
+	/** The sooner of the two ETAs; null when not filling. */
+	eta_secs: number | null;
+}
+
+export interface UsageItem {
+	bytes: number;
+	count: number;
+	reclaimable: number;
+}
+
+export interface DiskUsage {
+	images: UsageItem;
+	containers: UsageItem;
+	volumes: UsageItem;
+	build_cache: UsageItem;
+	/** Bytes under the data directory (null when it couldn't be measured). */
+	tond_data: number | null;
+	data_dir: string;
+	docker_root: string | null;
+	/** Docker's data is on the data directory's filesystem. */
+	docker_on_data_fs: boolean;
+	error: string | null;
+	collected_at: number;
+	took_ms: number;
+}
+
+export interface DockerHealth {
+	reachable: boolean;
+	version: string | null;
+	api_version: string | null;
+	storage_driver: string | null;
+	root_dir: string | null;
+	cgroup_version: string | null;
+	warnings: string[];
+	containers: number | null;
+	containers_running: number | null;
+	images: number | null;
+	rss_bytes: number | null;
+	uptime_secs: number | null;
+	error: string | null;
+	checked_at: number;
+}
+
+export interface HostOverview {
+	current: HostCurrent | null;
+	forecast: DiskEta;
+	disk: DiskUsage | null;
+	docker: DockerHealth;
+}
+
+export interface HostSeries {
+	t: number[];
+	cpu: number[];
+	cpu_max: number[];
+	load1: number[];
+	load5: number[];
+	load15: number[];
+	mem_used: number[];
+	mem_total: number[];
+	swap_used: number[];
+	swap_total: number[];
+	disk_used: number[];
+	disk_total: number[];
+	inodes_used: number[];
+	inodes_total: number[];
+	root_used: number[];
+	root_total: number[];
+	root_inodes_used: number[];
+	root_inodes_total: number[];
+}
+
+export interface HostHistory {
+	range: MetricsRange;
+	step: number;
+	from: number;
+	to: number;
+	separate_root: boolean;
+	data_mount: string;
+	series: HostSeries;
+}
+
+export interface CleanupPreview {
+	build_cache_bytes: number;
+	build_cache_entries: number;
+	dangling_images: { id: string; bytes: number; created: number }[];
+	dangling_bytes: number;
+	total_bytes: number;
+}
+
+export interface CleanupResult {
+	build_cache_bytes: number;
+	build_cache_entries: number;
+	images_deleted: number;
+	image_bytes: number;
+	total_bytes: number;
+}
+
+export async function getHostOverview(): Promise<HostOverview> {
+	return request<HostOverview>('/system/host');
+}
+
+export async function getHostHistory(range: MetricsRange): Promise<HostHistory> {
+	return request<HostHistory>(`/system/host/history?range=${encodeURIComponent(range)}`);
+}
+
+export async function refreshDiskUsage(): Promise<DiskUsage> {
+	return request<DiskUsage>('/system/disk/refresh', { method: 'POST' });
+}
+
+export async function getCleanupPreview(): Promise<CleanupPreview> {
+	return request<CleanupPreview>('/system/disk/cleanup');
+}
+
+export async function freeUpSpace(): Promise<CleanupResult> {
+	return request<CleanupResult>('/system/disk/cleanup', { method: 'POST' });
+}
+
+// ── Outbound heartbeat ──
+
+export interface HeartbeatStatus {
+	configured: boolean;
+	/** Host of the heartbeat URL; the URL itself is write-only. */
+	url_host: string | null;
+	method: 'GET' | 'POST';
+	interval_secs: number;
+	enabled: boolean;
+	last_ok_at: number | null;
+	last_failure_at: number | null;
+	last_error: string | null;
+	last_skipped_at: number | null;
+	last_skip_reason: string | null;
+	next_at: number | null;
+	/** Whether a ping would be sent right now. */
+	healthy: boolean;
+	unhealthy_reason: string | null;
+}
+
+export interface HeartbeatUpdate {
+	/** Omit to keep the stored URL; '' removes it. */
+	url?: string;
+	method?: 'GET' | 'POST';
+	interval_secs?: number;
+	enabled?: boolean;
+}
+
+export type HeartbeatOutcome =
+	| { outcome: 'sent'; status: number }
+	| { outcome: 'failed'; error: string }
+	| { outcome: 'skipped'; reason: string };
+
+export async function getHeartbeat(): Promise<HeartbeatStatus> {
+	return request<HeartbeatStatus>('/system/heartbeat');
+}
+
+export async function updateHeartbeat(update: HeartbeatUpdate): Promise<HeartbeatStatus> {
+	return request<HeartbeatStatus>('/system/heartbeat', {
+		method: 'PUT',
+		body: JSON.stringify(update)
+	});
+}
+
+export async function testHeartbeat(): Promise<HeartbeatOutcome & { heartbeat: HeartbeatStatus }> {
+	return request<HeartbeatOutcome & { heartbeat: HeartbeatStatus }>('/system/heartbeat/test', {
+		method: 'POST'
+	});
+}
+
+// ── Uptime checks ──
+
+export type UptimeStatus = 'up' | 'down' | 'paused' | 'pending';
+export type UptimeCause =
+	'dns' | 'refused' | 'connect' | 'timeout' | 'tls' | 'http_5xx' | 'http_status';
+export type UptimeDnsState = 'matches' | 'elsewhere' | 'unknown' | 'failed' | 'overridden';
+
+export interface UptimeCheckSettings {
+	id: number;
+	enabled: boolean;
+	path: string;
+	interval_secs: number;
+	/** null = any 2xx or 3xx */
+	expected_status: number | null;
+	timeout_secs: number;
+}
+
+export interface UptimeProbe {
+	/** Unix seconds. */
+	at: number;
+	ok: boolean;
+	cause: UptimeCause | null;
+	detail: string;
+	status: number | null;
+	latency_ms: number;
+	ip: string | null;
+	dns: UptimeDnsState;
+	cert_expires_at: number | null;
+	cert_days_left: number | null;
+	dns_label: string;
+}
+
+export interface UptimeBar {
+	/** Bucket start, unix seconds. */
+	t: number;
+	probes: number;
+	up: number;
+}
+
+export interface UptimePercent {
+	day: number | null;
+	week: number | null;
+	month: number | null;
+	day_probes: number;
+}
+
+export interface UptimeIncident {
+	id: number;
+	check_id: number;
+	started_at: number;
+	ended_at: number | null;
+	cause: UptimeCause;
+	detail: string;
+	duration_secs: number;
+}
+
+export interface UptimeCheck {
+	check: UptimeCheckSettings | null;
+	host: string | null;
+	url: string | null;
+	status: UptimeStatus;
+	paused_reason: string | null;
+	last: UptimeProbe | null;
+	down_since: number | null;
+	next_at: number | null;
+	uptime: UptimePercent;
+	/** Last 24 h, 30-minute bars. */
+	recent: UptimeBar[];
+	/** Last 90 days, daily bars. */
+	daily: UptimeBar[];
+	latency: { t: number[]; ms: number[] };
+	incidents: UptimeIncident[];
+}
+
+export interface UptimeSummary {
+	check_id: number;
+	kind: 'app' | 'dashboard';
+	app_id: string | null;
+	name: string;
+	host: string;
+	status: UptimeStatus;
+	uptime: UptimePercent;
+	last_at: number | null;
+	latency_ms: number | null;
+	down_since: number | null;
+}
+
+export interface UptimeCheckUpdate {
+	enabled: boolean;
+	path: string;
+	interval_secs: number;
+	expected_status: number | null;
+	timeout_secs: number;
+}
+
+/** `app` is an app id or name; null means the dashboard's own check. */
+function uptimePath(app: string | null): string {
+	return app === null ? '/system/uptime' : `/apps/${encodeURIComponent(app)}/uptime`;
+}
+
+export async function listUptime(): Promise<UptimeSummary[]> {
+	return request<UptimeSummary[]>('/uptime');
+}
+
+export async function getUptime(app: string | null): Promise<UptimeCheck> {
+	return request<UptimeCheck>(uptimePath(app));
+}
+
+export async function updateUptime(
+	app: string | null,
+	update: UptimeCheckUpdate
+): Promise<UptimeCheck> {
+	return request<UptimeCheck>(uptimePath(app), {
+		method: 'PUT',
+		body: JSON.stringify(update)
+	});
+}
+
+export async function checkUptimeNow(app: string | null): Promise<UptimeCheck> {
+	return request<UptimeCheck>(`${uptimePath(app)}/check`, { method: 'POST' });
+}
+
 // ── Alert Rules ──
 
 /** Valid metric identifiers for threshold-based alert rules. */
