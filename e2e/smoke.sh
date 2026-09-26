@@ -19,6 +19,8 @@ set -euo pipefail
 #   E2E_FIXTURE_DIR       static site pushed via `tond apps push`
 #                         (default: fixtures/static-site next to this script)
 #   E2E_CLEANUP           1 to delete the created resources at the end (default: 0)
+#   E2E_ADMIN_EMAIL       admin account the auth checks create (via the setup token)
+#   E2E_ADMIN_PASSWORD    or sign in with on re-runs (defaults below)
 
 BASE="${E2E_BASE_DOMAIN:?E2E_BASE_DOMAIN is required}"
 DASH="${E2E_DASHBOARD_DOMAIN:-dash.${BASE}}"
@@ -27,6 +29,9 @@ CA_FILE="${E2E_CA_FILE:-}"
 FIXTURE_DIR="${E2E_FIXTURE_DIR:-$(cd "$(dirname "$0")" && pwd)/fixtures/static-site}"
 CLEANUP="${E2E_CLEANUP:-0}"
 SOCK="/opt/tond/data/tond.sock"
+DATA_DIR="/opt/tond/data"
+ADMIN_EMAIL="${E2E_ADMIN_EMAIL:-e2e-admin@tond.test}"
+ADMIN_PASSWORD="${E2E_ADMIN_PASSWORD:-E2e-Smoke-Passw0rd!}"
 
 WHOAMI_DOMAIN="whoami.${BASE}"
 STATIC_DOMAIN="static.${BASE}"
@@ -151,7 +156,21 @@ if runuser -u nobody -- tond apps list > /dev/null 2>&1; then
 fi
 pass "non-root user is refused by the CLI socket"
 
-ROOT_KEY=$(journalctl -u tond-server --no-pager | grep -A1 "ROOT API KEY" | grep -oE '[0-9a-f]{64}' | tail -1 || true)
+ROOT_KEY_FILE="${DATA_DIR}/root-api-key"
+ROOT_KEY=""
+if [[ -f "$ROOT_KEY_FILE" ]]; then
+    [[ "$(stat -c '%a %U' "$ROOT_KEY_FILE")" == "600 root" ]] \
+        || fail "root API key file must be 0600 root, got: $(stat -c '%a %U' "$ROOT_KEY_FILE")"
+    ROOT_KEY=$(tr -d '[:space:]' < "$ROOT_KEY_FILE")
+    [[ "$ROOT_KEY" =~ ^[0-9a-f]{64}$ ]] || fail "root API key file must hold a 64-hex key"
+    pass "root API key stored in ${ROOT_KEY_FILE} (0600 root)"
+    # Capture first: with pipefail, `journalctl | grep -q` can report SIGPIPE instead of a match.
+    journal="$(journalctl -u tond-server --no-pager -o cat)"
+    if grep -qF "$ROOT_KEY" <<< "$journal"; then
+        fail "the root API key must never appear in the journal"
+    fi
+    pass "root API key is not in the journal"
+fi
 if [[ -n "$ROOT_KEY" ]]; then
     tond --server http://127.0.0.1:3001 --api-key "$ROOT_KEY" apps list > /dev/null \
         || fail "root API key must work over TCP"
@@ -161,8 +180,182 @@ if [[ -n "$ROOT_KEY" ]]; then
     fi
     pass "wrong API key rejected"
 else
-    echo "  - root API key not found in the journal (reused install?); skipping key checks"
+    echo "  - ${ROOT_KEY_FILE} not found (reused install?); skipping key checks"
 fi
+
+step "Auth hardening"
+# Requests to the dashboard through tond-proxy, as a browser on the dashboard origin would send them.
+DASH_ORIGIN="https://${DASH}"
+COOKIES="$(mktemp)"
+dash() { curl -sk --resolve "${DASH}:443:${IP}" -b "$COOKIES" -c "$COOKIES" "$@"; }
+# dash_code <method> <path> [curl args...]: HTTP status of a dashboard request.
+dash_code() {
+    local method=$1 path=$2; shift 2
+    dash -o /dev/null -w '%{http_code}' -X "$method" "$@" "https://${DASH}${path}"
+}
+json_post() { printf '{"token":"%s","email":"%s","password":"%s"}' "$1" "$2" "$3"; }
+
+if dash "https://${DASH}/api/auth/status" | jq -e '.data | has("needs_setup")' > /dev/null; then
+    fail "/api/auth/status must not tell anonymous callers whether setup is open"
+fi
+pass "/api/auth/status does not reveal whether setup is open"
+
+SETUP_TOKEN_FILE="${DATA_DIR}/setup-token"
+signed_in=false
+if [[ -f "$SETUP_TOKEN_FILE" ]]; then
+    [[ "$(stat -c '%a %U' "$SETUP_TOKEN_FILE")" == "600 root" ]] \
+        || fail "setup token file must be 0600 root, got: $(stat -c '%a %U' "$SETUP_TOKEN_FILE")"
+    SETUP_TOKEN=$(tr -d '[:space:]' < "$SETUP_TOKEN_FILE")
+    [[ "$SETUP_TOKEN" =~ ^[0-9a-f]{64}$ ]] || fail "setup token file must hold a 64-hex token"
+    journal="$(journalctl -u tond-server --no-pager -o cat)"
+    if grep -qF "$SETUP_TOKEN" <<< "$journal"; then
+        fail "the setup token must never appear in the journal"
+    fi
+    pass "setup token in ${SETUP_TOKEN_FILE} (0600 root), not in the journal"
+    setup_link="$(tond setup-link)"
+    grep -qF "setup?token=${SETUP_TOKEN}" <<< "$setup_link" || fail "tond setup-link must print the setup link"
+    pass "tond setup-link prints the setup link"
+
+    for token in "" "$(printf '0%.0s' {1..64})"; do
+        code=$(dash_code POST /api/auth/setup -H "Origin: ${DASH_ORIGIN}" -H 'Content-Type: application/json' \
+            -d "$(json_post "$token" "$ADMIN_EMAIL" "$ADMIN_PASSWORD")")
+        [[ "$code" == 403 ]] || fail "setup without the right token must get 403, got ${code}"
+    done
+    pass "setup without the setup token → 403"
+
+    headers="$(mktemp)"
+    code=$(dash -D "$headers" -o /dev/null -w '%{http_code}' -X POST "https://${DASH}/api/auth/setup" \
+        -H "Origin: ${DASH_ORIGIN}" -H 'Content-Type: application/json' \
+        -d "$(json_post "$SETUP_TOKEN" "$ADMIN_EMAIL" "$ADMIN_PASSWORD")")
+    [[ "$code" == 201 ]] || fail "setup with the token must create the admin (got ${code})"
+    grep -iE '^set-cookie: __Host-tond_session=[0-9a-f]{64}; Secure; HttpOnly; SameSite=Strict; Path=/' "$headers" > /dev/null \
+        || fail "session cookie must be __Host-tond_session with Secure; HttpOnly; SameSite=Strict; Path=/ (got: $(grep -i '^set-cookie' "$headers"))"
+    rm -f "$headers"
+    pass "setup with the token creates the admin and sets a __Host- Secure SameSite=Strict cookie"
+    [[ ! -e "$SETUP_TOKEN_FILE" ]] || fail "the setup token file must be deleted after setup"
+    # (with the CSRF header: the session cookie from setup is in the jar now)
+    code=$(dash_code POST /api/auth/setup -H "Origin: ${DASH_ORIGIN}" -H 'X-Tond-CSRF: 1' \
+        -H 'Content-Type: application/json' \
+        -d "$(json_post "$SETUP_TOKEN" "second@tond.test" "$ADMIN_PASSWORD")")
+    [[ "$code" == 403 ]] || fail "a used setup token must get 403, got ${code}"
+    pass "setup token is single-use and its file is removed"
+    signed_in=true
+else
+    code=$(dash_code POST /api/auth/login -H "Origin: ${DASH_ORIGIN}" -H 'Content-Type: application/json' \
+        -d "$(printf '{"email":"%s","password":"%s"}' "$ADMIN_EMAIL" "$ADMIN_PASSWORD")")
+    if [[ "$code" == 200 ]] && dash "https://${DASH}/api/auth/me" | jq -e '.success' > /dev/null; then
+        signed_in=true
+        pass "signed in as ${ADMIN_EMAIL} (setup was completed by an earlier run)"
+    else
+        echo "  - setup already done and ${ADMIN_EMAIL} can't sign in (got ${code}); skipping session checks"
+    fi
+fi
+
+headers="$(dash -D - -o /dev/null "https://${DASH}/")"
+grep -qi "^content-security-policy:.*frame-ancestors 'none'" <<< "$headers" || fail "dashboard must send a CSP with frame-ancestors 'none'"
+grep -qi '^x-content-type-options: nosniff' <<< "$headers" || fail "dashboard must send X-Content-Type-Options: nosniff"
+grep -qi '^referrer-policy: same-origin' <<< "$headers" || fail "dashboard must send Referrer-Policy: same-origin"
+grep -qi '^strict-transport-security: max-age=' <<< "$headers" || fail "dashboard over HTTPS must send HSTS"
+pass "security headers (CSP frame-ancestors, nosniff, Referrer-Policy, HSTS) on the dashboard"
+direct_headers="$(curl -s -D - -o /dev/null http://127.0.0.1:3001/)"
+if grep -qi '^strict-transport-security' <<< "$direct_headers"; then
+    fail "HSTS must only be sent for requests that came through the TLS proxy"
+fi
+pass "no HSTS on plain loopback HTTP"
+
+code=$(curl -sk --resolve "${DASH}:443:${IP}" --http1.1 -o /dev/null -w '%{http_code}' \
+    -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' \
+    -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H "Origin: https://evil.${DASH}" \
+    "https://${DASH}/api/system/logs/stream")
+[[ "$code" == 403 ]] || fail "a WebSocket upgrade from a foreign origin must get 403, got ${code}"
+pass "cross-origin WebSocket upgrade → 403"
+
+if [[ "$signed_in" == true ]]; then
+    code=$(dash_code PUT /api/settings -H "Origin: ${DASH_ORIGIN}" -H 'Content-Type: application/json' -d '{}')
+    [[ "$code" == 403 ]] || fail "a cookie-authenticated mutation without X-Tond-CSRF must get 403, got ${code}"
+    code=$(dash_code PUT /api/settings -H "Origin: https://evil.${DASH}" -H 'X-Tond-CSRF: 1' \
+        -H 'Content-Type: application/json' -d '{}')
+    [[ "$code" == 403 ]] || fail "a mutation from a foreign origin must get 403, got ${code}"
+    code=$(dash_code PUT /api/settings -H "Origin: ${DASH_ORIGIN}" -H 'X-Tond-CSRF: 1' \
+        -H 'Content-Type: application/json' -d '{}')
+    [[ "$code" == 200 ]] || fail "a same-origin mutation with X-Tond-CSRF must succeed, got ${code}"
+    pass "cookie mutations need X-Tond-CSRF and the dashboard origin"
+
+    csrf=(-H "Origin: ${DASH_ORIGIN}" -H 'X-Tond-CSRF: 1' -H 'Content-Type: application/json')
+    code=$(dash_code POST /api/auth/2fa/setup "${csrf[@]}" -d '{"password":"not-my-password"}')
+    [[ "$code" == 401 ]] || fail "2FA setup with a wrong password must get 401, got ${code}"
+    pass "2FA setup requires the current password"
+
+    tond settings host-terminal off > /dev/null
+    ticket_body='{"target_kind":"server","target_id":"server","password":"'"${ADMIN_PASSWORD}"'"}'
+    resp=$(dash -w '\n%{http_code}' -X POST "https://${DASH}/api/terminal/tickets" "${csrf[@]}" -d "$ticket_body")
+    [[ "$(tail -1 <<< "$resp")" == 403 ]] || fail "host terminal tickets must be refused while it is off"
+    grep -qF 'tond settings host-terminal on' <<< "$resp" || fail "the refusal must name the enable command"
+    pass "host terminal is off by default and says how to enable it"
+    code=$(dash_code PUT /api/settings/host-terminal "${csrf[@]}" -d '{"enabled":true}')
+    [[ "$code" == 403 ]] || fail "the dashboard must not be able to enable the host terminal, got ${code}"
+    if [[ -n "$ROOT_KEY" ]]; then
+        code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "Authorization: Bearer ${ROOT_KEY}" \
+            -H 'Content-Type: application/json' -d '{"enabled":true}' http://127.0.0.1:3001/api/settings/host-terminal)
+        [[ "$code" == 403 ]] || fail "an API key must not be able to enable the host terminal, got ${code}"
+    fi
+    pass "only the root CLI socket can switch the host terminal"
+
+    tond settings host-terminal on > /dev/null
+    code=$(dash_code POST /api/terminal/tickets "${csrf[@]}" \
+        -d '{"target_kind":"server","target_id":"server","password":"wrong-password"}')
+    [[ "$code" == 401 ]] || fail "host terminal tickets must require the password (step-up), got ${code}"
+    resp=$(dash -X POST "https://${DASH}/api/terminal/tickets" "${csrf[@]}" -d "$ticket_body")
+    ticket=$(jq -r '.data.ticket // empty' <<< "$resp")
+    [[ -n "$ticket" ]] || fail "host terminal ticket with the right password must be issued: ${resp}"
+    ws_code() {
+        curl -sk --resolve "${DASH}:443:${IP}" --http1.1 -o /dev/null -w '%{http_code}' --max-time 5 \
+            -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' \
+            -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H "Origin: $1" \
+            "https://${DASH}/api/terminal/ws?ticket=$2" || true
+    }
+    # curl can't speak WebSocket here; after a 101 it just waits until --max-time.
+    code=$(ws_code "$DASH_ORIGIN" "$ticket")
+    [[ "$code" != 401 && "$code" != 403 ]] || fail "a fresh ticket must open the terminal WebSocket, got ${code}"
+    code=$(ws_code "$DASH_ORIGIN" "$ticket")
+    [[ "$code" == 401 ]] || fail "a terminal ticket must be single-use, got ${code}"
+    pass "host terminal: step-up password, single-use ticket"
+    if [[ -n "$ROOT_KEY" ]]; then
+        code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer ${ROOT_KEY}" \
+            -H 'Content-Type: application/json' -d "$ticket_body" http://127.0.0.1:3001/api/terminal/tickets)
+        [[ "$code" == 403 ]] || fail "API keys must not get terminal tickets, got ${code}"
+        pass "API keys are refused terminal tickets"
+    fi
+    tond settings host-terminal off > /dev/null
+    audit="$(api '/api/audit-log?limit=20')"
+    grep -q 'terminal_opened' <<< "$audit" || fail "terminal sessions must be audited"
+    pass "terminal sessions are written to the audit log"
+fi
+
+# Rotating X-Forwarded-For must not create fresh rate-limit buckets: the proxy
+# replaces it with the real peer. Up to 200 quick requests exceed the 60-request
+# burst plus the 10/s refill.
+limited=false
+for i in $(seq 1 200); do
+    code=$(curl -sk --resolve "${DASH}:443:${IP}" -o /dev/null -w '%{http_code}' \
+        -H "X-Forwarded-For: 198.51.100.$((i % 250))" "https://${DASH}/api/auth/status")
+    if [[ "$code" == 429 ]]; then limited=true; break; fi
+done
+[[ "$limited" == true ]] || fail "a spoofed X-Forwarded-For must not bypass the rate limiter"
+pass "spoofed X-Forwarded-For does not bypass the rate limiter"
+sleep 7 # let the bucket refill
+
+# Failed logins back off per client (unknown emails, rotating X-Forwarded-For).
+codes=""
+for i in $(seq 1 6); do
+    codes+="$(curl -sk --resolve "${DASH}:443:${IP}" -o /dev/null -w '%{http_code} ' \
+        -X POST -H "Origin: ${DASH_ORIGIN}" -H 'Content-Type: application/json' \
+        -H "X-Forwarded-For: 203.0.113.${i}" \
+        -d "{\"email\":\"nobody${i}@tond.test\",\"password\":\"wrong\"}" "https://${DASH}/api/auth/login")"
+done
+[[ "$codes" == *429* ]] || fail "repeated failed logins must be throttled (got: ${codes})"
+pass "failed logins back off (got: ${codes% })"
+rm -f "$COOKIES"
 
 step "Image app (pull + run + route)"
 tond apps create e2e-whoami --source-type image --source traefik/whoami:v1.10 \
