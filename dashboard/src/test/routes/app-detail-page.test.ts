@@ -1,6 +1,6 @@
 import { render, screen, within } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { App } from '$lib/api';
 
 const state = vi.hoisted(() => ({
@@ -24,7 +24,6 @@ const api = vi.hoisted(() => ({
 	startApp: vi.fn(),
 	restartApp: vi.fn(),
 	deleteApp: vi.fn(),
-	updateEnv: vi.fn(),
 	updateDomain: vi.fn(),
 	updateHealth: vi.fn(),
 	updateDrainTimeout: vi.fn(),
@@ -154,7 +153,6 @@ const app: App = {
 	static_build: false,
 	preview_enabled: false,
 	preview_excluded_keys: [],
-	preview_env_vars: {},
 	created_at: '2026-01-01T00:00:00.000Z',
 	updated_at: '2026-01-01T00:00:00.000Z'
 };
@@ -269,10 +267,9 @@ describe('apps/[id] page', () => {
 		expect(api.getApp).not.toHaveBeenCalled();
 	});
 
-	it('saves environment changes and persists preview config', async () => {
-		api.updateEnv.mockResolvedValue(undefined);
-		api.updatePreviewConfig.mockResolvedValue(undefined);
+	it('wires the environment tab to the registry credential and redeploy actions', async () => {
 		api.setAppRegistryCredential.mockResolvedValue(undefined);
+		api.deployApp.mockResolvedValue(undefined);
 		api.getApp.mockResolvedValue({
 			...app,
 			source_type: 'image',
@@ -283,13 +280,13 @@ describe('apps/[id] page', () => {
 		renderPage({ ...app, source_type: 'image', registry_credential_id: null });
 
 		await user.click(screen.getByRole('tab', { name: /environment/i }));
-		await user.click(screen.getByRole('button', { name: /save environment/i }));
+		expect(screen.getByText('Environment for app_1')).toBeInTheDocument();
 
-		expect(api.updateEnv).toHaveBeenCalledWith('app_1', { API_KEY: 'secret' });
+		await user.click(screen.getByRole('button', { name: /attach credential/i }));
 		expect(api.setAppRegistryCredential).toHaveBeenCalledWith('app_1', 'cred_1');
-		expect(api.updatePreviewConfig).toHaveBeenCalledWith('app_1', false, ['API_KEY'], {
-			API_KEY: 'preview-secret'
-		});
+
+		await user.click(screen.getByRole('button', { name: /redeploy from environment/i }));
+		expect(api.deployApp).toHaveBeenCalledWith('app_1');
 		expect(api.getApp).toHaveBeenCalledWith('app_1');
 	});
 
@@ -467,5 +464,82 @@ describe('apps/[id] page', () => {
 
 		expect(api.listOpenPRs).toHaveBeenCalledWith('app_1');
 		expect(await screen.findByText(/add feature/i)).toBeInTheDocument();
+	});
+
+	describe('lifecycle', () => {
+		class FakeWebSocket {
+			static instances: FakeWebSocket[] = [];
+			url: string;
+			closed = false;
+			onmessage: ((evt: { data: string }) => void) | null = null;
+			onerror: (() => void) | null = null;
+			onclose: (() => void) | null = null;
+			constructor(url: string) {
+				this.url = url;
+				FakeWebSocket.instances.push(this);
+			}
+			close() {
+				this.closed = true;
+			}
+		}
+
+		beforeEach(() => {
+			FakeWebSocket.instances = [];
+			vi.stubGlobal('WebSocket', FakeWebSocket);
+		});
+
+		afterEach(() => {
+			vi.unstubAllGlobals();
+		});
+
+		it('keeps the log stream open and the feed paused when the app reloads', async () => {
+			api.deployApp.mockResolvedValue(undefined);
+			api.getApp.mockResolvedValue({ ...app, status: 'running' });
+
+			const user = userEvent.setup();
+			renderPage();
+
+			await user.click(screen.getByRole('tab', { name: /^logs$/i }));
+			expect(FakeWebSocket.instances).toHaveLength(1);
+			expect(FakeWebSocket.instances[0].url).toMatch(/\/api\/apps\/app_1\/logs\/stream$/);
+
+			// Re-deploying reloads the app data, which used to tear everything down.
+			await user.click(screen.getByRole('button', { name: /re-deploy/i }));
+			await vi.waitFor(() => expect(api.getApp).toHaveBeenCalled());
+
+			expect(FakeWebSocket.instances).toHaveLength(1);
+			expect(FakeWebSocket.instances[0].closed).toBe(false);
+			expect(clearUiContext).not.toHaveBeenCalled();
+			expect(setUiContext).toHaveBeenLastCalledWith(
+				expect.objectContaining({ feed: expect.objectContaining({ wsUrl: null }) })
+			);
+		});
+
+		it('closes the log stream when leaving the Logs tab', async () => {
+			const user = userEvent.setup();
+			renderPage();
+
+			await user.click(screen.getByRole('tab', { name: /^logs$/i }));
+			await user.click(screen.getByRole('tab', { name: /overview/i }));
+
+			expect(FakeWebSocket.instances).toHaveLength(1);
+			expect(FakeWebSocket.instances[0].closed).toBe(true);
+		});
+
+		it('keeps a single metrics poller across app reloads', async () => {
+			api.deployApp.mockResolvedValue(undefined);
+			api.getApp.mockResolvedValue({ ...app, status: 'running' });
+
+			const user = userEvent.setup();
+			renderPage();
+
+			await user.click(screen.getByRole('tab', { name: /metrics/i }));
+			await vi.waitFor(() => expect(api.getAppMetrics).toHaveBeenCalledTimes(1));
+
+			await user.click(screen.getByRole('button', { name: /re-deploy/i }));
+			await vi.waitFor(() => expect(api.getApp).toHaveBeenCalled());
+
+			expect(api.getAppMetrics).toHaveBeenCalledTimes(1);
+		});
 	});
 });

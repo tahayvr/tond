@@ -67,7 +67,7 @@
 	},
 	"msw": {
 		"workerDirectory": [
-			"static"
+			"dev"
 		]
 	}
 }

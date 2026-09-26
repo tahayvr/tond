@@ -2,6 +2,7 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { checkAuth, getStatus } from '$lib/auth.svelte';
+	import { authRedirect, isAuthRoute as isAuthRoutePath, showsAppShell } from '$lib/auth-routes';
 	import {
 		getFeedOpen,
 		getTerminalOpen,
@@ -20,6 +21,8 @@
 	import { toast } from 'svelte-sonner';
 	import { SvelteMap } from 'svelte/reactivity';
 	import { registerDashboardShortcuts } from '$lib/dashboard-shortcuts';
+	import { pollWhileVisible } from '$lib/polling';
+	import { untrack } from 'svelte';
 	import favicon from '$lib/assets/favicon.svg';
 
 	import './layout.css';
@@ -33,31 +36,21 @@
 		checkAuth();
 	});
 
-	function isAuthPath(path: string): boolean {
-		return path === '/login' || path === '/login/2fa' || path === '/setup';
-	}
-
-	// Redirect based on auth status + current path
+	// Redirect based on auth status + current path. Signed-out users keep the
+	// page they were on as ?next= so they return to it after signing in.
 	$effect(() => {
 		if (typeof window === 'undefined') return;
 
-		const status = getStatus();
-		const path = page.url.pathname;
-
-		if (status === 'loading') return;
-
-		// Unauthenticated visitors may stay on /setup: it is reached through the
-		// one-time setup link and validates its token itself.
-		if (status === 'login' && !isAuthPath(path)) {
-			goto('/login');
-		} else if (status === 'authenticated' && isAuthPath(path)) {
-			goto('/');
-		}
+		const target = authRedirect(getStatus(), page.url);
+		if (target !== null) goto(target, { replaceState: true });
 	});
 
 	// True when we know what to show: auth boot completed.
 	let ready = $derived(getStatus() !== 'loading');
-	let isAuthRoute = $derived(isAuthPath(page.url.pathname));
+	let isAuthRoute = $derived(isAuthRoutePath(page.url.pathname));
+	// Never render the dashboard shell for a signed-out user, even for the
+	// moment before the redirect above lands.
+	let showShell = $derived(showsAppShell(getStatus(), page.url.pathname));
 	let terminalOpen = $derived(getTerminalOpen());
 	let showBootShell = $state(false);
 
@@ -96,10 +89,7 @@
 	$effect(() => {
 		if (getStatus() !== 'authenticated') return;
 
-		let stopped = false;
-
 		async function poll() {
-			if (stopped) return;
 			try {
 				const rules = await listAlertRules();
 
@@ -120,18 +110,10 @@
 			} catch {
 				// Polling failures are silent — don't interrupt the user
 			}
-
-			if (!stopped) {
-				setTimeout(poll, ALERT_POLL_MS);
-			}
 		}
 
-		// Seed snapshot immediately, then start polling
-		poll();
-
-		return () => {
-			stopped = true;
-		};
+		// Seed the snapshot immediately, then poll while the tab is visible.
+		return pollWhileVisible(() => untrack(poll), ALERT_POLL_MS);
 	});
 
 	$effect(() => {
@@ -203,6 +185,9 @@
 	{:else}
 		<div class="min-h-screen bg-background"></div>
 	{/if}
+{:else if !showShell}
+	<!-- Signed out on a protected page: the redirect to /login is in flight. -->
+	<div class="min-h-screen bg-background"></div>
 {:else}
 	<Tooltip.Provider>
 		<div class="flex h-screen flex-col bg-background">

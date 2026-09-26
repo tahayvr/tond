@@ -11,6 +11,7 @@
 		type CronJobRun,
 		type Project
 	} from '$lib/api';
+	import { intOr, optionalInt } from '$lib/form-numbers';
 	import { goto } from '$app/navigation';
 	import {
 		setUiContext,
@@ -64,14 +65,15 @@
 	let settingsSchedule = $state('');
 	let settingsImage = $state('');
 	let settingsCommand = $state('');
-	let settingsTimeout = $state('');
+	// Number inputs bind as number | null (null when empty).
+	let settingsTimeout = $state<number | null>(null);
 	let settingsEnvVars = $state<Record<string, string>>({});
 	let settingsConcurrencyPolicy = $state('skip');
-	let settingsMemoryMb = $state('');
-	let settingsCpuShares = $state('');
+	let settingsMemoryMb = $state<number | null>(null);
+	let settingsCpuShares = $state<number | null>(null);
 	let settingsTimezone = $state('');
-	let settingsMaxRetries = $state('');
-	let settingsRetryDelay = $state('');
+	let settingsMaxRetries = $state<number | null>(0);
+	let settingsRetryDelay = $state<number | null>(60);
 	// volumes in settings
 	let settingsVolumes = $state<{ host_path: string; container_path: string }[]>([]);
 	// project assignment
@@ -109,14 +111,14 @@
 			settingsSchedule = job.schedule;
 			settingsImage = job.image;
 			settingsCommand = parseCommand(job.command);
-			settingsTimeout = job.timeout_seconds != null ? String(job.timeout_seconds) : '';
+			settingsTimeout = job.timeout_seconds ?? null;
 			settingsEnvVars = job.env ? { ...job.env } : {};
 			settingsConcurrencyPolicy = job.concurrency_policy ?? 'skip';
-			settingsMemoryMb = job.memory_mb != null ? String(job.memory_mb) : '';
-			settingsCpuShares = job.cpu_shares != null ? String(job.cpu_shares) : '';
+			settingsMemoryMb = job.memory_mb ?? null;
+			settingsCpuShares = job.cpu_shares ?? null;
 			settingsTimezone = job.timezone ?? '';
-			settingsMaxRetries = String(job.max_retries ?? 0);
-			settingsRetryDelay = String(job.retry_delay_seconds ?? 60);
+			settingsMaxRetries = job.max_retries ?? 0;
+			settingsRetryDelay = job.retry_delay_seconds ?? 60;
 			settingsVolumes = job.volumes ? [...job.volumes] : [];
 			settingsProjectId = job.project_id;
 			setUiContext(cronJobContext(job));
@@ -207,11 +209,11 @@
 						.match(/(?:[^\s"]+|"[^"]*")+/g)
 						?.map((t) => t.replace(/^"|"$/g, '')) ?? [])
 				: [];
-			const timeoutNum = settingsTimeout.trim() ? parseInt(settingsTimeout.trim(), 10) : null;
-			const memoryMb = settingsMemoryMb.trim() ? parseInt(settingsMemoryMb.trim(), 10) : null;
-			const cpuShares = settingsCpuShares.trim() ? parseInt(settingsCpuShares.trim(), 10) : null;
-			const maxRetries = parseInt(settingsMaxRetries.trim() || '0', 10);
-			const retryDelay = parseInt(settingsRetryDelay.trim() || '60', 10);
+			const timeoutNum = optionalInt(settingsTimeout);
+			const memoryMb = optionalInt(settingsMemoryMb);
+			const cpuShares = optionalInt(settingsCpuShares);
+			const maxRetries = intOr(settingsMaxRetries, 0);
+			const retryDelay = intOr(settingsRetryDelay, 60);
 
 			job = await updateCronJob(jobId, {
 				name: settingsName.trim(),
@@ -394,14 +396,14 @@
 			settingsSchedule = job.schedule;
 			settingsImage = job.image;
 			settingsCommand = parseCommand(job.command);
-			settingsTimeout = job.timeout_seconds != null ? String(job.timeout_seconds) : '';
+			settingsTimeout = job.timeout_seconds ?? null;
 			settingsEnvVars = job.env ? { ...job.env } : {};
 			settingsConcurrencyPolicy = job.concurrency_policy ?? 'skip';
-			settingsMemoryMb = job.memory_mb != null ? String(job.memory_mb) : '';
-			settingsCpuShares = job.cpu_shares != null ? String(job.cpu_shares) : '';
+			settingsMemoryMb = job.memory_mb ?? null;
+			settingsCpuShares = job.cpu_shares ?? null;
 			settingsTimezone = job.timezone ?? '';
-			settingsMaxRetries = String(job.max_retries ?? 0);
-			settingsRetryDelay = String(job.retry_delay_seconds ?? 60);
+			settingsMaxRetries = job.max_retries ?? 0;
+			settingsRetryDelay = job.retry_delay_seconds ?? 60;
 			settingsVolumes = job.volumes ? [...job.volumes] : [];
 			settingsProjectId = job.project_id;
 			setUiContext(cronJobContext(job));

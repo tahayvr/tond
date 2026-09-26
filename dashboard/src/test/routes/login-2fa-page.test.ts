@@ -15,6 +15,10 @@ vi.mock('$lib/auth.svelte', () => ({
 	setAuthenticated
 }));
 
+vi.mock('$app/state', () => ({
+	page: { url: new URL('http://localhost/login/2fa?next=%2Fapps%2Fapp_1') }
+}));
+
 import TwoFactorPage from '../../routes/login/2fa/+page.svelte';
 
 describe('2fa login page', () => {
@@ -82,5 +86,14 @@ describe('2fa login page', () => {
 
 		expect(await screen.findByText(/invalid totp code/i)).toBeInTheDocument();
 		expect(setAuthenticated).not.toHaveBeenCalled();
+	});
+
+	it('links back to sign in, keeping the return target', () => {
+		render(TwoFactorPage);
+
+		expect(screen.getByRole('link', { name: /back to sign in/i })).toHaveAttribute(
+			'href',
+			'/login?next=%2Fapps%2Fapp_1'
+		);
 	});
 });

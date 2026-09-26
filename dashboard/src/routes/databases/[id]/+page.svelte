@@ -31,6 +31,7 @@
 	import ConfirmDeleteDialog from '$lib/components/dialogs/confirm-delete-dialog.svelte';
 	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import { SvelteSet } from 'svelte/reactivity';
+	import { untrack } from 'svelte';
 	import Eye from '~icons/ri/eye-line';
 	import EyeOff from '~icons/ri/eye-off-line';
 	import Copy from '~icons/ri/file-copy-line';
@@ -66,15 +67,27 @@
 	let savingImage = $state(false);
 	let imageError = $state('');
 
-	// Credentials editing state
-	let editingCredField = $state<'db_name' | 'db_user' | 'db_password' | 'root_password' | null>(
-		null
-	);
+	// Password changes run inside the running database (server-side ALTER USER),
+	// so only passwords are editable and only while the database is running.
+	type CredField = 'db_name' | 'db_user' | 'db_password' | 'root_password';
+	type PasswordField = 'db_password' | 'root_password';
+	let editingCredField = $state<PasswordField | null>(null);
 	let credDraft = $state('');
+	let credDraftVisible = $state(false);
 	let savingCred = $state(false);
 	let credError = $state('');
 	let credDialogOpen = $state(false);
-	let credRedeployNeeded = $state(false);
+	let credSuccess = $state('');
+	let isRedisLike = $derived(db?.db_type === 'redis' || db?.db_type === 'keydb');
+	let dbRunning = $derived(db?.status === 'running');
+
+	function isPasswordField(field: CredField): field is PasswordField {
+		return field === 'db_password' || field === 'root_password';
+	}
+
+	function credLabel(field: PasswordField | null): string {
+		return field === 'root_password' ? 'Root password' : 'Password';
+	}
 
 	// Per-row reveal/copy state
 	let revealedKeys = new SvelteSet<string>();
@@ -139,7 +152,6 @@
 		try {
 			db = await redeployDatabase(dbId);
 			if (db) setUiContext(databaseContext(db));
-			credRedeployNeeded = false;
 		} catch (e: any) {
 			error = e.message ?? 'Failed to redeploy database';
 		} finally {
@@ -273,15 +285,9 @@
 
 	// ── Credentials editing ──
 
-	function startEditCred(field: 'db_name' | 'db_user' | 'db_password' | 'root_password') {
-		credDraft =
-			field === 'db_name'
-				? (db?.db_name ?? '')
-				: field === 'db_user'
-					? (db?.db_user ?? '')
-					: field === 'root_password'
-						? (db?.root_password ?? '')
-						: (db?.db_password ?? '');
+	function startEditCred(field: PasswordField) {
+		credDraft = '';
+		credDraftVisible = false;
 		editingCredField = field;
 		credError = '';
 		credDialogOpen = true;
@@ -293,18 +299,34 @@
 		credError = '';
 	}
 
+	/** A 24-character random password (letters and digits, safe in connection URLs). */
+	function handleGeneratePassword() {
+		const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+		const bytes = crypto.getRandomValues(new Uint8Array(24));
+		credDraft = Array.from(bytes, (b) => alphabet[b % alphabet.length]).join('');
+		credDraftVisible = true;
+	}
+
 	async function saveCred() {
 		if (!editingCredField) return;
+		if (!credDraft.trim()) {
+			credError = 'Enter a new password.';
+			return;
+		}
 		savingCred = true;
 		credError = '';
+		credSuccess = '';
 		try {
-			const res = await updateDatabaseCredentials(dbId, { [editingCredField]: credDraft || null });
+			const field = editingCredField;
+			const res = await updateDatabaseCredentials(dbId, { [field]: credDraft });
 			db = res.database;
-			credRedeployNeeded = res.requires_redeploy;
+			if (db) setUiContext(databaseContext(db));
+			credSuccess = `${credLabel(field)} changed inside the database and saved. Update any app that still connects with the old password, then redeploy it.`;
 			credDialogOpen = false;
 			editingCredField = null;
+			credDraft = '';
 		} catch (e: any) {
-			credError = e.message ?? 'Failed to save credential';
+			credError = e.message ?? 'Could not change the password';
 		} finally {
 			savingCred = false;
 		}
@@ -373,7 +395,7 @@
 		const type = db.db_type;
 		const vars: {
 			envKey: string;
-			credField: 'db_name' | 'db_user' | 'db_password' | 'root_password';
+			credField: CredField;
 			label: string;
 			value: string | null;
 		}[] = [];
@@ -496,14 +518,18 @@
 
 	// Listen for the footer action button's stop/start event so the page
 	// refreshes when triggered from the footer.
+	// Re-seed local state when the route data changes. Only `data` is tracked:
+	// reading `db` here after assigning it would re-run this effect forever.
 	$effect(() => {
 		const routeData = data as DatabaseDetailData;
-		db = routeData.db;
-		projects = routeData.projects;
-		if (db) {
-			setUiContext(databaseContext(db));
-			initLimitsDraft();
-		}
+		untrack(() => {
+			db = routeData.db;
+			projects = routeData.projects;
+			if (db) {
+				setUiContext(databaseContext(db));
+				initLimitsDraft();
+			}
+		});
 	});
 
 	// Listen for the footer action button's stop/start event so the page
@@ -840,28 +866,40 @@
 						</p>
 					</div>
 				{:else}
-					<!-- Pending-redeploy notice -->
-					<div
-						class={credRedeployNeeded
-							? 'rounded-lg border border-amber-500/50 bg-amber-500/10 px-4 py-3 text-xs text-amber-700 dark:text-amber-300'
-							: 'rounded-lg border border-amber-500/30 bg-amber-500/5 px-4 py-3 text-xs text-muted-foreground'}
-					>
-						{#if credRedeployNeeded}
-							<span class="font-semibold text-amber-600 dark:text-amber-400"
-								>Redeploy required:</span
-							>
-							Credential changes have been saved and will take effect after a
-						{:else}
-							<span class="font-semibold text-amber-600 dark:text-amber-400">Note:</span>
-							Credential changes are saved immediately but only take effect in the container after a
-						{/if}
-						<button
-							class="font-semibold underline underline-offset-2 hover:text-foreground"
-							onclick={handleRedeploy}
-							disabled={redeploying}
+					<!-- How credential changes work -->
+					{#if credSuccess}
+						<div
+							class="flex items-start justify-between gap-3 rounded-lg bg-success/10 px-4 py-3 text-sm text-success"
+							role="status"
 						>
-							{redeploying ? 'redeploying...' : 'Redeploy'}
-						</button>.
+							<p>{credSuccess}</p>
+							<button
+								type="button"
+								class="text-xs underline-offset-2 hover:underline"
+								onclick={() => (credSuccess = '')}
+							>
+								Dismiss
+							</button>
+						</div>
+					{/if}
+					<div
+						class="rounded-lg border border-border bg-muted/30 px-4 py-3 text-xs text-muted-foreground"
+					>
+						{#if isRedisLike}
+							Redis and KeyDB passwords can't be changed in place yet.
+						{:else}
+							<p>
+								<span class="font-semibold text-foreground">Changing a password</span> updates it inside
+								the running database right away, then saves it here. Apps that use the old password must
+								be updated and redeployed.
+							</p>
+							<p class="mt-1">
+								The database name and username can't be changed after creation.
+								{#if !dbRunning}
+									<span class="text-warn">Start the database to change a password.</span>
+								{/if}
+							</p>
+						{/if}
 					</div>
 
 					<!-- Credentials table -->
@@ -924,15 +962,22 @@
 														{/if}
 													</Button>
 												{/if}
-												<Button
-													variant="ghost"
-													size="icon"
-													class="h-7 w-7 text-muted-foreground hover:text-foreground"
-													aria-label="Edit credential"
-													onclick={() => startEditCred(v.credField)}
-												>
-													<Pencil class="h-3.5 w-3.5" />
-												</Button>
+												{#if isPasswordField(v.credField) && !isRedisLike}
+													{@const field = v.credField}
+													<Button
+														variant="ghost"
+														size="icon"
+														class="h-7 w-7 text-muted-foreground hover:text-foreground"
+														aria-label={`Change ${credLabel(field).toLowerCase()}`}
+														title={dbRunning
+															? `Change ${credLabel(field).toLowerCase()}`
+															: 'Start the database to change its password'}
+														disabled={!dbRunning}
+														onclick={() => startEditCred(field)}
+													>
+														<Pencil class="h-3.5 w-3.5" />
+													</Button>
+												{/if}
 											</div>
 										</td>
 									</tr>
@@ -1021,45 +1066,75 @@
 	<div class="py-12 text-center text-muted-foreground">Database not found</div>
 {/if}
 
-<!-- Edit credential dialog -->
+<!-- Change password dialog -->
 <Dialog.Root bind:open={credDialogOpen}>
 	<Dialog.Content class="sm:max-w-md">
 		<Dialog.Header>
-			<Dialog.Title>Edit Credential</Dialog.Title>
+			<Dialog.Title>Change {credLabel(editingCredField).toLowerCase()}</Dialog.Title>
 			<Dialog.Description>
-				Update the value for
-				<span class="font-mono font-medium">
-					{envVars.find((v) => v.credField === editingCredField)?.envKey ?? ''}
-				</span>.
+				Changes the password inside the running database; apps using the old password must be
+				updated.
 			</Dialog.Description>
 		</Dialog.Header>
-		<div class="space-y-4 py-2">
+		<form
+			class="space-y-4 py-2"
+			onsubmit={(e) => {
+				e.preventDefault();
+				saveCred();
+			}}
+		>
 			<div class="space-y-2">
-				<Label for="cred-value">Value</Label>
-				<Input
-					id="cred-value"
-					bind:value={credDraft}
-					class="font-mono"
-					type={editingCredField === 'db_password' || editingCredField === 'root_password'
-						? 'password'
-						: 'text'}
-					disabled={savingCred}
-					autofocus
-					onkeydown={(e) => {
-						if (e.key === 'Enter') saveCred();
-					}}
-				/>
+				<div class="flex items-center justify-between">
+					<Label for="cred-value">New {credLabel(editingCredField).toLowerCase()}</Label>
+					<button
+						type="button"
+						class="text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+						onclick={handleGeneratePassword}
+						disabled={savingCred}
+					>
+						Generate
+					</button>
+				</div>
+				<div class="flex gap-2">
+					<Input
+						id="cred-value"
+						bind:value={credDraft}
+						class="font-mono"
+						type={credDraftVisible ? 'text' : 'password'}
+						autocomplete="new-password"
+						spellcheck={false}
+						disabled={savingCred}
+						autofocus
+					/>
+					<Button
+						type="button"
+						variant="ghost"
+						size="icon"
+						aria-label={credDraftVisible ? 'Hide password' : 'Show password'}
+						onclick={() => (credDraftVisible = !credDraftVisible)}
+					>
+						{#if credDraftVisible}
+							<EyeOff class="h-4 w-4" />
+						{:else}
+							<Eye class="h-4 w-4" />
+						{/if}
+					</Button>
+				</div>
 			</div>
 			{#if credError}
-				<p class="text-xs text-destructive">{credError}</p>
+				<p class="rounded bg-destructive/10 px-3 py-2 text-xs text-destructive" role="alert">
+					{credError}
+				</p>
 			{/if}
-		</div>
-		<Dialog.Footer>
-			<Button variant="outline" onclick={cancelEditCred} disabled={savingCred}>Cancel</Button>
-			<Button onclick={saveCred} disabled={savingCred}>
-				{savingCred ? 'Saving...' : 'Save'}
-			</Button>
-		</Dialog.Footer>
+			<Dialog.Footer>
+				<Button type="button" variant="outline" onclick={cancelEditCred} disabled={savingCred}>
+					Cancel
+				</Button>
+				<Button type="submit" disabled={savingCred || !credDraft.trim()}>
+					{savingCred ? 'Changing…' : 'Change password'}
+				</Button>
+			</Dialog.Footer>
+		</form>
 	</Dialog.Content>
 </Dialog.Root>
 

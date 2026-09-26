@@ -51,8 +51,6 @@ export interface App {
 	preview_enabled: boolean;
 	/** Phase 4.6: env var keys excluded from preview containers */
 	preview_excluded_keys: string[];
-	/** Phase 4.6: override env vars for preview containers (key→value) */
-	preview_env_vars: Record<string, string>;
 	created_at: string;
 	updated_at: string;
 }
@@ -116,6 +114,8 @@ export interface User {
 	id: string;
 	email: string;
 	role: string;
+	/** Whether TOTP two-factor auth is active for this user */
+	totp_enabled: boolean;
 	created_at: string;
 }
 
@@ -140,25 +140,118 @@ const BASE = '/api';
  */
 export const CSRF_HEADER = 'X-Tond-CSRF';
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
-	const headers = new Headers(options?.headers);
-	if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
-	headers.set(CSRF_HEADER, '1');
-	const res = await fetch(`${BASE}${path}`, {
-		credentials: 'same-origin',
-		...options,
-		headers
-	});
+export const SERVER_UNAVAILABLE_MESSAGE =
+	'Server unavailable. Tond may be restarting — try again in a moment.';
+export const SESSION_EXPIRED_MESSAGE = 'Your session has expired. Sign in again to continue.';
+
+/** An API failure, carrying the HTTP status (0 = the request never got a response). */
+export class ApiError extends Error {
+	readonly status: number;
+	/** Seconds to wait before retrying, from a 429's Retry-After header. */
+	readonly retryAfter: number | null;
+
+	constructor(message: string, status: number, retryAfter: number | null = null) {
+		super(message);
+		this.name = 'ApiError';
+		this.status = status;
+		this.retryAfter = retryAfter;
+	}
+}
+
+// Endpoints that answer 401 for a wrong password or code. A 401 from these is
+// an input error, not an expired session, so it must not sign the user out.
+// (/terminal/tickets answers 401 for a wrong step-up password; a truly expired
+// session is still caught by the next ordinary request.)
+const CREDENTIAL_ENDPOINTS = [
+	'/auth/status',
+	'/auth/login',
+	'/auth/logout',
+	'/auth/setup',
+	'/auth/setup/check',
+	'/auth/2fa/setup',
+	'/auth/2fa/verify',
+	'/auth/2fa/confirm',
+	'/auth/2fa/disable',
+	'/auth/change-password',
+	'/terminal/tickets'
+];
+
+let unauthorizedHandler: (() => void) | null = null;
+
+/** Register what happens when the session expires (auth.svelte.ts signs the user out). */
+export function setUnauthorizedHandler(handler: (() => void) | null) {
+	unauthorizedHandler = handler;
+}
+
+/** Parse a Retry-After header (delta-seconds or HTTP date) into whole seconds. */
+export function parseRetryAfter(header: string | null, now: number = Date.now()): number | null {
+	if (!header) return null;
+	const trimmed = header.trim();
+	if (/^\d+$/.test(trimmed)) return Number(trimmed);
+	const date = Date.parse(trimmed);
+	if (Number.isNaN(date)) return null;
+	return Math.max(0, Math.ceil((date - now) / 1000));
+}
+
+/** Turn a fetch Response into data or a descriptive ApiError. */
+async function parseResponse<T>(path: string, res: Response): Promise<T> {
+	const endpoint = path.split('?')[0];
+
+	if (res.status === 401 && !CREDENTIAL_ENDPOINTS.includes(endpoint)) {
+		unauthorizedHandler?.();
+		throw new ApiError(SESSION_EXPIRED_MESSAGE, 401);
+	}
+
+	if (res.status === 429) {
+		const retryAfter = parseRetryAfter(res.headers.get('Retry-After'));
+		const message =
+			retryAfter !== null
+				? `Too many attempts, try again in ${retryAfter} s.`
+				: 'Too many attempts, try again in a moment.';
+		throw new ApiError(message, 429, retryAfter);
+	}
+
+	// A proxy error page (502/504 HTML) or an empty body is not our API talking.
+	// A 5xx without our JSON body means the server (or proxy) is down; any
+	// other non-JSON reply is reported with its status.
+	const notApi = () =>
+		new ApiError(
+			res.status === 0 || res.status >= 500
+				? SERVER_UNAVAILABLE_MESSAGE
+				: `Request failed (HTTP ${res.status})`,
+			res.status
+		);
 	let json: ApiResponse<T>;
 	try {
 		json = await res.json();
 	} catch {
-		throw new Error(`Request failed (HTTP ${res.status})`);
+		throw notApi();
 	}
-	if (!json.success) {
-		throw new Error(json.error || 'Unknown error');
+	if (!json || typeof json !== 'object' || !('success' in json)) {
+		throw notApi();
+	}
+	if (!res.ok || !json.success) {
+		throw new ApiError(json.error || `Request failed (HTTP ${res.status})`, res.status);
 	}
 	return json.data as T;
+}
+
+async function request<T>(path: string, options?: RequestInit): Promise<T> {
+	const headers = new Headers(options?.headers);
+	if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+	headers.set(CSRF_HEADER, '1');
+	let res: Response;
+	try {
+		res = await fetch(`${BASE}${path}`, {
+			credentials: 'same-origin',
+			...options,
+			headers
+		});
+	} catch {
+		// Network failure: server down, connection reset, offline.
+		throw new ApiError(SERVER_UNAVAILABLE_MESSAGE, 0);
+	}
+	return parseResponse<T>(path, res);
 }
 
 export async function listApps(): Promise<App[]> {
@@ -236,11 +329,68 @@ export async function getAppLogs(
 	return request(`/apps/${id}/logs`);
 }
 
-export async function updateEnv(id: string, env_vars: Record<string, string>): Promise<void> {
-	await request(`/apps/${id}/env`, {
-		method: 'PUT',
-		body: JSON.stringify({ env_vars })
+// ── App environment variables ──
+// Values are secrets: the list endpoint returns masked values only, a single
+// value is fetched with an explicit reveal, and writes are per-key patches.
+
+export interface EnvVarEntry {
+	key: string;
+	/** Masked placeholder for a non-empty value, '' for an empty value */
+	masked: string;
+}
+
+export interface AppEnv {
+	vars: EnvVarEntry[];
+	preview: {
+		enabled: boolean;
+		/** App variables that preview containers do not receive */
+		excluded_keys: string[];
+		/** Values that replace or add variables in preview containers only */
+		overrides: EnvVarEntry[];
+	};
+}
+
+export interface EnvPatch {
+	set?: Record<string, string>;
+	unset?: string[];
+}
+
+export interface PreviewEnvPatch extends EnvPatch {
+	exclude?: string[];
+	include?: string[];
+}
+
+export async function getAppEnv(id: string): Promise<AppEnv> {
+	return request<AppEnv>(`/apps/${id}/env`);
+}
+
+/** Set and remove individual variables; variables not named are left unchanged. */
+export async function patchAppEnv(id: string, patch: EnvPatch): Promise<AppEnv> {
+	return request<AppEnv>(`/apps/${id}/env`, {
+		method: 'PATCH',
+		body: JSON.stringify(patch)
 	});
+}
+
+export async function revealAppEnvVar(id: string, key: string): Promise<string> {
+	const res = await request<{ key: string; value: string }>(
+		`/apps/${id}/env/${encodeURIComponent(key)}`
+	);
+	return res.value;
+}
+
+export async function patchPreviewEnv(id: string, patch: PreviewEnvPatch): Promise<AppEnv> {
+	return request<AppEnv>(`/apps/${id}/preview-env`, {
+		method: 'PATCH',
+		body: JSON.stringify(patch)
+	});
+}
+
+export async function revealPreviewEnvVar(id: string, key: string): Promise<string> {
+	const res = await request<{ key: string; value: string }>(
+		`/apps/${id}/preview-env/${encodeURIComponent(key)}`
+	);
+	return res.value;
 }
 
 export async function updateDomain(id: string, domain: string): Promise<void> {
@@ -803,15 +953,11 @@ export async function deletePreview(id: string, previewId: string): Promise<void
 	await request(`/apps/${id}/previews/${previewId}`, { method: 'DELETE' });
 }
 
-export async function updatePreviewConfig(
-	id: string,
-	preview_enabled: boolean,
-	preview_excluded_keys?: string[],
-	preview_env_vars?: Record<string, string>
-): Promise<void> {
+/** Enable or disable PR previews. Preview env is edited with patchPreviewEnv(). */
+export async function updatePreviewConfig(id: string, preview_enabled: boolean): Promise<void> {
 	await request(`/apps/${id}/preview-config`, {
 		method: 'PUT',
-		body: JSON.stringify({ preview_enabled, preview_excluded_keys, preview_env_vars })
+		body: JSON.stringify({ preview_enabled })
 	});
 }
 
@@ -1175,14 +1321,18 @@ export async function redeployDatabase(id: string): Promise<ManagedDatabaseDetai
 
 export interface UpdateDatabaseCredentialsResponse {
 	database: ManagedDatabaseDetail;
-	requires_redeploy: boolean;
+	/** Fields changed inside the running database and saved, e.g. ["db_password"] */
+	changed: ('db_password' | 'root_password')[];
 }
 
+/**
+ * Change a password inside the running database (the server runs ALTER USER /
+ * ALTER ROLE in the container), then save it. Refused when the database is
+ * stopped, for Redis/KeyDB, and for database or user renames.
+ */
 export async function updateDatabaseCredentials(
 	id: string,
 	data: {
-		db_name?: string | null;
-		db_user?: string | null;
 		db_password?: string | null;
 		root_password?: string | null;
 	}

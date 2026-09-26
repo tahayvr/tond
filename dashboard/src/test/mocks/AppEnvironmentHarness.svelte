@@ -1,20 +1,15 @@
 <script lang="ts">
 	interface Props {
-		onSave: (
-			envVars: Record<string, string>,
-			credentialId: string | null,
-			previewExcludedKeys: string[],
-			previewEnvVars: Record<string, string>
-		) => void | Promise<void>;
+		appId: string;
+		onRegistryCredentialChange: (credentialId: string | null) => Promise<void>;
+		onRedeploy: () => Promise<void>;
 	}
 
-	let { onSave }: Props = $props();
+	let { appId, onRegistryCredentialChange, onRedeploy }: Props = $props();
 </script>
 
-<button
-	type="button"
-	onclick={() =>
-		onSave({ API_KEY: 'secret' }, 'cred_1', ['API_KEY'], { API_KEY: 'preview-secret' })}
->
-	Save environment
+<p>Environment for {appId}</p>
+<button type="button" onclick={() => onRegistryCredentialChange('cred_1')}>
+	Attach credential
 </button>
+<button type="button" onclick={() => onRedeploy()}>Redeploy from environment</button>

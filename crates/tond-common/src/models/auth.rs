@@ -81,6 +81,8 @@ pub struct UserResponse {
     pub id: String,
     pub email: String,
     pub role: String,
+    /// Whether TOTP 2FA is active, so the dashboard can offer "disable"
+    pub totp_enabled: bool,
     pub created_at: String,
 }
 
@@ -90,6 +92,7 @@ impl From<User> for UserResponse {
             id: u.id,
             email: u.email,
             role: u.role,
+            totp_enabled: u.totp_enabled,
             created_at: u.created_at,
         }
     }
@@ -331,6 +334,11 @@ mod tests {
             serialized.get("totp_secret_enc"),
             None,
             "UserResponse should not expose the encrypted TOTP secret"
+        );
+        assert_eq!(
+            serialized.get("totp_enabled"),
+            Some(&serde_json::json!(true)),
+            "UserResponse should say whether 2FA is enabled"
         );
     }
 

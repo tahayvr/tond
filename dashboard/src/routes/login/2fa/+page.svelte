@@ -6,6 +6,7 @@
 	import { Input } from '$lib/components/ui/input/index.js';
 	import TondLogo from '$lib/components/brand/tond-logo.svelte';
 	import { REGEXP_ONLY_DIGITS } from 'bits-ui';
+	import { page } from '$app/state';
 
 	let otpValue = $state('');
 	let backupCode = $state('');
@@ -124,6 +125,13 @@
 			>
 				{useBackup ? 'use authenticator app instead' : 'use a backup code instead'}
 			</button>
+
+			<a
+				href={`/login${page.url.search}`}
+				class="block text-xs text-muted-foreground hover:text-foreground"
+			>
+				← back to sign in
+			</a>
 		</form>
 	</div>
 </div>

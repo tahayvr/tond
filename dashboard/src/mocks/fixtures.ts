@@ -38,6 +38,7 @@ export const MOCK_USER: User = {
 	id: 'usr_dev',
 	email: 'admin@localhost',
 	role: 'admin',
+	totp_enabled: false,
 	created_at: '2025-01-01T00:00:00.000Z'
 };
 
@@ -47,6 +48,7 @@ export const MOCK_USERS: User[] = [
 		id: 'usr_2',
 		email: 'member@localhost',
 		role: 'member',
+		totp_enabled: false,
 		created_at: '2025-02-01T00:00:00.000Z'
 	}
 ];
@@ -140,6 +142,24 @@ export const MOCK_TEMPLATES: TemplateCatalogEntry[] = [
 	}
 ];
 
+// ── App environment variables (served masked by GET /apps/:id/env) ─────────
+
+export const MOCK_APP_ENV_VARS: Record<string, Record<string, string>> = {
+	app_running: {
+		DATABASE_URL: 'postgres://api:s3cret@db.internal:5432/api',
+		SECRET_KEY: 'sk_live_4f9a2c7e1b',
+		LOG_LEVEL: 'info',
+		FEATURE_FLAGS: ''
+	},
+	app_stopped: {
+		NEXT_PUBLIC_API_URL: 'https://api.example.com'
+	}
+};
+
+export const MOCK_PREVIEW_ENV_VARS: Record<string, Record<string, string>> = {
+	app_running: { DATABASE_URL: 'postgres://preview:pass@localhost/preview_db' }
+};
+
 // ── Apps ───────────────────────────────────────────────────────────────────
 
 export const MOCK_APPS: App[] = [
@@ -174,7 +194,6 @@ export const MOCK_APPS: App[] = [
 		static_build: false,
 		preview_enabled: true,
 		preview_excluded_keys: ['DATABASE_URL', 'SECRET_KEY'],
-		preview_env_vars: { DATABASE_URL: 'postgres://preview:pass@localhost/preview_db' },
 		created_at: '2025-01-10T12:00:00.000Z',
 		updated_at: '2025-03-01T09:00:00.000Z'
 	},
@@ -208,7 +227,6 @@ export const MOCK_APPS: App[] = [
 		static_build: false,
 		preview_enabled: false,
 		preview_excluded_keys: [],
-		preview_env_vars: {},
 		created_at: '2025-01-15T08:00:00.000Z',
 		updated_at: '2025-02-28T14:22:00.000Z'
 	},
@@ -242,7 +260,6 @@ export const MOCK_APPS: App[] = [
 		static_build: false,
 		preview_enabled: false,
 		preview_excluded_keys: [],
-		preview_env_vars: {},
 		created_at: '2025-02-20T10:00:00.000Z',
 		updated_at: '2025-03-05T11:45:00.000Z'
 	},
@@ -276,7 +293,6 @@ export const MOCK_APPS: App[] = [
 		static_build: false,
 		preview_enabled: false,
 		preview_excluded_keys: [],
-		preview_env_vars: {},
 		created_at: '2025-02-01T00:00:00.000Z',
 		updated_at: '2025-03-07T06:00:00.000Z'
 	},
@@ -310,7 +326,6 @@ export const MOCK_APPS: App[] = [
 		static_build: false,
 		preview_enabled: false,
 		preview_excluded_keys: [],
-		preview_env_vars: {},
 		created_at: '2025-03-08T07:00:00.000Z',
 		updated_at: '2025-03-08T07:00:00.000Z'
 	}

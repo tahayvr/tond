@@ -16,14 +16,22 @@ vi.mock('$lib/api', () => ({
 	login
 }));
 
+const state = vi.hoisted(() => ({ sessionExpired: false }));
+
 vi.mock('$lib/auth.svelte', () => ({
-	setAuthenticated
+	setAuthenticated,
+	getSessionExpired: () => state.sessionExpired
+}));
+
+vi.mock('$app/state', () => ({
+	page: { url: new URL('http://localhost/login?next=%2Fapps%2Fapp_1') }
 }));
 
 import LoginPage from '../../routes/login/+page.svelte';
 
 describe('login page', () => {
 	beforeEach(() => {
+		state.sessionExpired = false;
 		goto.mockReset();
 		login.mockReset();
 		setAuthenticated.mockReset();
@@ -63,8 +71,16 @@ describe('login page', () => {
 		await user.type(screen.getByLabelText('password'), 'supersecret');
 		await user.click(screen.getByRole('button', { name: /sign in/i }));
 
-		expect(goto).toHaveBeenCalledWith('/login/2fa');
+		expect(goto).toHaveBeenCalledWith('/login/2fa?next=%2Fapps%2Fapp_1');
 		expect(setAuthenticated).not.toHaveBeenCalled();
+	});
+
+	it('explains why the user is back on the login page after a session expired', () => {
+		state.sessionExpired = true;
+
+		render(LoginPage);
+
+		expect(screen.getByRole('status')).toHaveTextContent(/session expired/i);
 	});
 
 	it('shows an inline error when login fails', async () => {

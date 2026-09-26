@@ -48,7 +48,6 @@ const app = {
 	static_build: false,
 	preview_enabled: false,
 	preview_excluded_keys: [],
-	preview_env_vars: {},
 	created_at: '2026-01-01T00:00:00.000Z',
 	updated_at: '2026-01-01T00:00:00.000Z'
 };

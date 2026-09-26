@@ -26,6 +26,9 @@
 		})
 			.then(() => goto('/integrations/github', { replaceState: true }))
 			.catch((e: any) => {
+				// Signed out: the root layout sends the admin to /login?next=<this page,
+				// with its query>, and the flow finishes after they sign in.
+				if (e?.status === 401) return;
 				const code = /^[a-z_]+$/.test(e?.message ?? '') ? e.message : 'internal';
 				goto(`/integrations/github?error=${code}`, { replaceState: true });
 			});

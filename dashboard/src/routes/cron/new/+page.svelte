@@ -2,6 +2,7 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { createCronJob, type Project } from '$lib/api';
+	import { intOr, optionalInt } from '$lib/form-numbers';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
@@ -28,15 +29,16 @@
 	let image = $state('');
 	let command = $state('');
 	let selectedProjectId = $state('');
-	let timeoutSeconds = $state('');
+	// Number inputs bind as number | null (null when empty).
+	let timeoutSeconds = $state<number | null>(null);
 
 	// New fields
 	let timezone = $state('');
 	let concurrencyPolicy = $state('skip');
-	let memoryMb = $state('');
-	let cpuShares = $state('');
-	let maxRetries = $state('0');
-	let retryDelaySeconds = $state('0');
+	let memoryMb = $state<number | null>(null);
+	let cpuShares = $state<number | null>(null);
+	let maxRetries = $state<number | null>(0);
+	let retryDelaySeconds = $state<number | null>(0);
 
 	// Environment variables
 	let envVars = $state<Record<string, string>>({});
@@ -99,12 +101,12 @@
 						.match(/(?:[^\s"]+|"[^"]*")+/g)
 						?.map((t) => t.replace(/^"|"$/g, '')) ?? [])
 				: [];
-			const timeoutNum = timeoutSeconds.trim() ? parseInt(timeoutSeconds.trim(), 10) : null;
+			const timeoutNum = optionalInt(timeoutSeconds);
 			const hasEnv = Object.keys(envVars).length > 0;
-			const memoryNum = memoryMb.trim() ? parseInt(memoryMb.trim(), 10) : null;
-			const cpuNum = cpuShares.trim() ? parseInt(cpuShares.trim(), 10) : null;
-			const retriesNum = parseInt(maxRetries, 10) || 0;
-			const retryDelayNum = parseInt(retryDelaySeconds, 10) || 0;
+			const memoryNum = optionalInt(memoryMb);
+			const cpuNum = optionalInt(cpuShares);
+			const retriesNum = intOr(maxRetries, 0);
+			const retryDelayNum = intOr(retryDelaySeconds, 0);
 			const created = await createCronJob({
 				name: name.trim(),
 				schedule: schedule.trim(),

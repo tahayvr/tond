@@ -24,7 +24,7 @@
 //   start_app()         POST /api/apps/{id}/start  — Docker start + set status=running
 //   restart_app()       POST /api/apps/{id}/restart— sequential stop+start
 //   app_logs()          GET  /api/apps/{id}/logs   — last 50 deploy_logs + 100 container lines
-//   update_env()        PUT  /api/apps/{id}/env    — overwrite env_vars JSON (redeploy to apply)
+//   (env vars live in handlers/env.rs: masked GET, PATCH, per-key reveal)
 //   update_domain()     PUT  /api/apps/{id}/domain — set domain, upsert 'pending' cert record
 //   list_certs()        GET  /api/certs            — all certificate rows
 //   upload_deploy()     POST /api/apps/{id}/upload — accept .tar.gz, extract, build,
@@ -41,6 +41,7 @@ pub mod backups;
 pub mod cron;
 pub mod databases;
 pub mod deployments;
+pub mod env;
 pub mod git;
 pub mod github_apps;
 pub mod gitlab_tokens;
@@ -637,42 +638,6 @@ pub async fn app_logs(
     ))
 }
 
-// ── Update Env Vars ──
-
-pub async fn update_env(
-    _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(req): Json<UpdateEnvRequest>,
-) -> Result<impl IntoResponse, AppError> {
-    let app = fetch_app(&state.db, &id).await?;
-
-    sqlx::query("UPDATE apps SET env_vars = ?, updated_at = datetime('now') WHERE id = ?")
-        .bind(req.env_vars.to_string())
-        .bind(&app.id)
-        .execute(&state.db)
-        .await?;
-
-    write_audit_log(
-        &state.db,
-        Some(&app.id),
-        Some(&app.name),
-        "env_update",
-        &actor.0,
-        None,
-    )
-    .await;
-
-    Ok((
-        StatusCode::OK,
-        Json(ApiResponse::ok(
-            json!({ "message": "Environment variables updated. Redeploy to apply." }),
-        )),
-    ))
-}
-
 // ── Update Domain ──
 
 pub async fn update_domain(
@@ -1209,7 +1174,7 @@ mod tests {
     use tokio::sync::RwLock;
     use tond_common::{
         AssignProjectRequest, CreateAppRequest, ServerSettings, UpdateDomainRequest,
-        UpdateDrainTimeoutRequest, UpdateEnvRequest, UpdateHealthRequest, VolumeRequest,
+        UpdateDrainTimeoutRequest, UpdateHealthRequest, VolumeRequest,
     };
 
     use super::*;
@@ -1882,46 +1847,6 @@ mod tests {
             data[0]["id"],
             serde_json::json!(app.id),
             "list_apps with ?name should return the matching app record"
-        );
-    }
-
-    #[tokio::test]
-    async fn update_env_overwrites_env_vars_json() {
-        let state = test_state().await;
-        let app = seed_app(&state, "demo").await;
-
-        let response = update_env(
-            RateLimit,
-            RequireAuth,
-            AuthActor("admin@example.com".to_string()),
-            State(state.clone()),
-            Path(app.id.clone()),
-            Json(UpdateEnvRequest {
-                env_vars: serde_json::json!({ "MODE": "prod", "DEBUG": "0" }),
-            }),
-        )
-        .await
-        .unwrap_or_else(|err| panic!("expected update_env to succeed: {}", err.0))
-        .into_response();
-
-        assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "update_env should succeed for existing apps"
-        );
-        let env_vars: Option<String> = sqlx::query_scalar("SELECT env_vars FROM apps WHERE id = ?")
-            .bind(&app.id)
-            .fetch_one(&state.db)
-            .await
-            .unwrap_or_else(|err| panic!("failed to read updated env_vars: {err}"));
-        assert_eq!(
-            env_vars
-                .as_deref()
-                .map(serde_json::from_str::<serde_json::Value>)
-                .transpose()
-                .unwrap_or_else(|err| panic!("failed to parse persisted env_vars JSON: {err}")),
-            Some(serde_json::json!({ "MODE": "prod", "DEBUG": "0" })),
-            "update_env should persist the provided env var object as JSON regardless of key order"
         );
     }
 

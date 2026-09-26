@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { page } from '$app/state';
+	import { pollWhileVisible } from '$lib/polling';
 	import {
 		getProject,
 		updateProject,
@@ -226,17 +227,21 @@
 		const id = projectId;
 		void id; // declare dependency
 
-		// Poll previews every 5 s while any preview is building
-		const interval = setInterval(() => {
-			const hasBuilding = projectPreviews.some(
-				(pp) => pp.status === 'building' || pp.previews.some((p) => p.status === 'building')
-			);
-			if (hasBuilding) loadPreviews();
-		}, 5000);
+		// Poll previews every 5 s while any preview is building (paused in hidden tabs)
+		const stopPolling = pollWhileVisible(
+			() => {
+				const hasBuilding = projectPreviews.some(
+					(pp) => pp.status === 'building' || pp.previews.some((p) => p.status === 'building')
+				);
+				if (hasBuilding) return loadPreviews();
+			},
+			5000,
+			{ immediate: false }
+		);
 
 		return () => {
 			clearUiContext();
-			clearInterval(interval);
+			stopPolling();
 		};
 	});
 </script>
