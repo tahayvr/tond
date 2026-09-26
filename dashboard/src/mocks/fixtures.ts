@@ -11,6 +11,7 @@ import type {
 	Certificate,
 	RetentionSettings,
 	AuditShipping,
+	AppEvent,
 	CronJob,
 	CronJobRun,
 	Deployment,
@@ -712,6 +713,88 @@ export const MOCK_AUDIT_SHIPPING: AuditShipping = {
 	},
 	latest_seq: 1284
 };
+
+// ── App events ─────────────────────────────────────────────────────────────
+
+const hoursAgo = (h: number) => new Date(Date.now() - h * 3_600_000).toISOString();
+
+export function makeMockAppEvents(appId: string): AppEvent[] {
+	const events: AppEvent[] = [
+		{
+			at: hoursAgo(0.3),
+			kind: 'deploy_succeeded',
+			severity: 'success',
+			title: 'Deploy succeeded in 1 min 12 s',
+			detail: 'a1b2c3d Fix login redirect',
+			actor: 'dev@example.com',
+			deployment_id: 'dep_001'
+		},
+		{
+			at: hoursAgo(2),
+			kind: 'resources_changed',
+			severity: 'info',
+			title: 'Resource limits changed',
+			detail: 'memory=512MiB cpu=1',
+			actor: 'dev@example.com',
+			deployment_id: null
+		},
+		{
+			at: hoursAgo(5),
+			kind: 'oom',
+			severity: 'danger',
+			title: 'Killed: out of memory',
+			detail: 'exit code 137 (killed by the kernel: out of memory)',
+			actor: null,
+			deployment_id: null
+		},
+		{
+			at: hoursAgo(5.1),
+			kind: 'restart',
+			severity: 'warning',
+			title: 'Container restarted',
+			detail: 'exit code 137',
+			actor: null,
+			deployment_id: null
+		},
+		{
+			at: hoursAgo(26),
+			kind: 'deploy_failed',
+			severity: 'danger',
+			title: 'Deploy failed',
+			detail: 'build failed: npm ERR! missing script: build',
+			actor: 'github push',
+			deployment_id: 'dep_002'
+		},
+		{
+			at: hoursAgo(49),
+			kind: 'cert_issued',
+			severity: 'success',
+			title: 'HTTPS certificate issued for api.example.com',
+			detail: null,
+			actor: null,
+			deployment_id: null
+		},
+		{
+			at: hoursAgo(50),
+			kind: 'domain_changed',
+			severity: 'info',
+			title: 'Domain changed',
+			detail: 'domain=api.example.com',
+			actor: 'dev@example.com',
+			deployment_id: null
+		},
+		{
+			at: hoursAgo(72),
+			kind: 'control',
+			severity: 'info',
+			title: 'Restarted',
+			detail: null,
+			actor: 'ops-token',
+			deployment_id: null
+		}
+	];
+	return appId === 'app_running' ? events : events.slice(4);
+}
 
 // ── Certificates ───────────────────────────────────────────────────────────
 

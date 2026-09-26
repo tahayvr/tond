@@ -74,6 +74,8 @@
 	import * as Select from '$lib/components/ui/select/index.js';
 	import Breadcrumb from '$lib/components/nav/breadcrumb.svelte';
 	import AppOverview from '$lib/components/tabs/app-page/app-overview.svelte';
+	import AppEventsStrip from '$lib/components/events/app-events-strip.svelte';
+	import AppEventsList from '$lib/components/events/app-events-list.svelte';
 	import AppLogs from '$lib/components/tabs/app-page/app-logs.svelte';
 	import AppDeployments from '$lib/components/tabs/app-page/app-deployments.svelte';
 	import AppEnvironment from '$lib/components/tabs/app-page/app-environment.svelte';
@@ -1010,6 +1012,9 @@
 				{/if}
 				<!-- Overview tab -->
 				{#if viewAllowed && activeTab === 'overview'}
+					<div class="pt-4">
+						<AppEventsStrip appId={app.id} />
+					</div>
 					<AppOverview {app} />
 				{/if}
 
@@ -1844,6 +1849,11 @@
 					{#key appId}
 						<MetricsPanel owner="apps" id={appId} noun="app" />
 					{/key}
+				{/if}
+
+				<!-- Events tab -->
+				{#if viewAllowed && activeTab === 'events'}
+					<AppEventsList appId={app.id} />
 				{/if}
 
 				<!-- History tab -->

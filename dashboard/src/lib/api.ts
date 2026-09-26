@@ -1093,6 +1093,51 @@ export async function testAuditShipping(
 	});
 }
 
+// ── App events ──
+
+export type AppEventKind =
+	| 'deploy_started'
+	| 'deploy_succeeded'
+	| 'deploy_failed'
+	| 'deploy_cancelled'
+	| 'restart'
+	| 'crash'
+	| 'oom'
+	| 'cert_issued'
+	| 'cert_failed'
+	| 'domain_changed'
+	| 'resources_changed'
+	| 'config_changed'
+	| 'control';
+
+export interface AppEvent {
+	at: string;
+	kind: AppEventKind;
+	severity: 'info' | 'success' | 'warning' | 'danger';
+	title: string;
+	detail: string | null;
+	actor: string | null;
+	deployment_id: string | null;
+}
+
+export interface AppEventsPage {
+	/** Newest first */
+	events: AppEvent[];
+	/** Pass as `before` for older events; null when there are none */
+	next_before: string | null;
+}
+
+export async function getAppEvents(
+	id: string,
+	opts: { limit?: number; before?: string | null } = {}
+): Promise<AppEventsPage> {
+	const params = new URLSearchParams();
+	if (opts.limit) params.set('limit', String(opts.limit));
+	if (opts.before) params.set('before', opts.before);
+	const query = params.toString();
+	return request<AppEventsPage>(`/apps/${id}/events${query ? `?${query}` : ''}`);
+}
+
 // ── Deployments ──
 
 /** Steps of a deployment, in order ("release" = switch traffic, stop the old container). */

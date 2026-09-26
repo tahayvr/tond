@@ -26,6 +26,7 @@ import {
 	MOCK_SETTINGS,
 	MOCK_RETENTION,
 	MOCK_AUDIT_SHIPPING,
+	makeMockAppEvents,
 	MOCK_ONBOARDING_STATUS,
 	MOCK_DEPLOYMENTS,
 	MOCK_DEPLOYMENT_LOGS,
@@ -2571,6 +2572,21 @@ export const handlers = [
 			? 'pending'
 			: null;
 		return ok(MOCK_ONBOARDING_STATUS);
+	}),
+
+	http.get('/api/apps/:id/events', async ({ params, request }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
+		if (!app) return err('App not found', 404);
+		const url = new URL(request.url);
+		const limit = Number(url.searchParams.get('limit') ?? 50);
+		const before = url.searchParams.get('before');
+		const all = makeMockAppEvents(app.id).filter((e) => !before || e.at < before);
+		const page = all.slice(0, limit);
+		return ok({
+			events: page,
+			next_before: all.length > limit ? page[page.length - 1].at : null
+		});
 	}),
 
 	http.get('/api/audit-log/shipping', async () => {
