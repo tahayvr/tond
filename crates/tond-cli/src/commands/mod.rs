@@ -7,6 +7,7 @@ pub mod integrations;
 pub mod projects;
 pub mod scanner;
 pub mod settings;
+pub mod setup;
 pub mod snapshots;
 pub mod storage_providers;
 pub mod update;

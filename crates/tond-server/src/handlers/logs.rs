@@ -26,7 +26,8 @@
 // GET /api/cron/{id}/runs/stream — see the handlers below.
 //
 // Authentication (all endpoints): the local Unix socket (CLI on the host),
-// `?token=<api-key>` query param, or `tond_session` cookie. Close code 4001 on failure.
+// `?token=<api-key>` query param, or `__Host-tond_session` cookie (browser
+// upgrades must come from the dashboard origin, see auth/csrf.rs). Close code 4001 on failure.
 //
 // Task lifecycle: every stream owns a `JoinSet` holding its producer tasks
 // (deploy-log forwarder, container supervisor, cron poller). The socket loop
@@ -850,7 +851,7 @@ async fn authenticate(
 // Incremental frames — emitted each time a new run row appears:
 //   {"type":"run","run":{...}}
 //
-// Authentication: ?token= query param or tond_session cookie.
+// Authentication: ?token= query param or __Host-tond_session cookie.
 
 /// Axum handler — upgrades to WebSocket and streams cron run output.
 pub async fn stream_cron_runs(

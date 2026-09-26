@@ -170,6 +170,26 @@ fn parse_upstream_addr(upstream: &str, fallback_port: u16) -> Option<(&str, u16)
     Some((parts[0], parts[1].parse().unwrap_or(fallback_port)))
 }
 
+/// Set the forwarding headers on a request bound for tond-server.
+///
+/// tond-server attributes requests from a loopback peer (this proxy) to the
+/// address in `X-Forwarded-For` for rate limiting and login backoff, so any
+/// client-supplied value is replaced, never appended to. `X-Forwarded-Proto`
+/// tells it the request arrived over TLS (it sends HSTS only then).
+fn set_dashboard_forwarding_headers(
+    req: &mut pingora::http::RequestHeader,
+    client_ip: Option<std::net::IpAddr>,
+) -> pingora::Result<()> {
+    req.remove_header("x-forwarded-for");
+    req.remove_header("x-real-ip");
+    req.remove_header("forwarded");
+    if let Some(ip) = client_ip {
+        req.insert_header("X-Forwarded-For", ip.to_string())?;
+    }
+    req.insert_header("X-Forwarded-Proto", "https")?;
+    Ok(())
+}
+
 fn parse_http_request_line_and_host(request: &str) -> (&str, &str) {
     let first_line = request.lines().next().unwrap_or("");
     let parts: Vec<&str> = first_line.split_whitespace().collect();
@@ -582,6 +602,31 @@ impl ProxyHttp for TondProxy {
         let peer = Box::new(HttpPeer::new(("127.0.0.1", 9999), false, String::new()));
         Ok(peer)
     }
+
+    /// Requests for the dashboard domain carry the TCP peer as X-Forwarded-For.
+    async fn upstream_request_filter(
+        &self,
+        session: &mut Session,
+        upstream_request: &mut pingora::http::RequestHeader,
+        _ctx: &mut Self::CTX,
+    ) -> pingora::Result<()> {
+        let host = normalize_host(
+            session
+                .req_header()
+                .headers
+                .get("host")
+                .and_then(|v| v.to_str().ok()),
+        );
+        let is_dashboard = self.dashboard_domain.read().await.as_deref() == Some(host.as_str());
+        if is_dashboard {
+            let client_ip = session
+                .client_addr()
+                .and_then(|addr| addr.as_inet())
+                .map(|addr| addr.ip());
+            set_dashboard_forwarding_headers(upstream_request, client_ip)?;
+        }
+        Ok(())
+    }
 }
 
 fn main() {
@@ -981,6 +1026,35 @@ mod tests {
             parse_upstream_addr("127.0.0.1", 8080),
             None,
             "parse_upstream_addr should reject malformed upstream values without a host-port separator"
+        );
+    }
+
+    #[test]
+    fn dashboard_forwarding_headers_replace_client_supplied_values() {
+        let mut req = pingora::http::RequestHeader::build("POST", b"/api/auth/login", None)
+            .unwrap_or_else(|err| panic!("failed to build request header: {err}"));
+        req.insert_header("X-Forwarded-For", "1.2.3.4")
+            .unwrap_or_else(|err| panic!("{err}"));
+        req.append_header("X-Forwarded-For", "5.6.7.8")
+            .unwrap_or_else(|err| panic!("{err}"));
+        req.insert_header("X-Real-IP", "9.9.9.9")
+            .unwrap_or_else(|err| panic!("{err}"));
+        req.insert_header("X-Forwarded-Proto", "http")
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        set_dashboard_forwarding_headers(&mut req, "203.0.113.7".parse().ok())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let xff: Vec<_> = req.headers.get_all("x-forwarded-for").iter().collect();
+        assert_eq!(
+            xff,
+            vec!["203.0.113.7"],
+            "spoofed X-Forwarded-For values must be dropped"
+        );
+        assert!(req.headers.get("x-real-ip").is_none());
+        assert_eq!(
+            req.headers.get("x-forwarded-proto").map(|v| v.as_bytes()),
+            Some(&b"https"[..])
         );
     }
 

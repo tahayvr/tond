@@ -38,6 +38,17 @@
 //   The Unix socket (mode 0600) is for the `tond` CLI on the host; its router
 //   adds the `LocalSocket` extension, which RequireAuth accepts in place of
 //   credentials.
+//
+// Browser protections (applied to every response / TCP request):
+//   auth::csrf::enforce_same_origin    — Origin check on mutations and WebSocket
+//                                        upgrades, X-Tond-CSRF header on
+//                                        cookie-authenticated mutations. No CORS.
+//   security_headers::add_security_headers — CSP, HSTS (behind the TLS proxy),
+//                                        nosniff, Referrer-Policy, X-Frame-Options.
+//
+// One-time credentials (never logged; see auth/secret_file.rs):
+//   <data dir>/root-api-key  — root API key, written when first generated
+//   <data dir>/setup-token   — first-run setup token, removed after setup
 
 mod alerts;
 mod audit_log;
@@ -55,6 +66,7 @@ mod log_bus;
 mod metrics;
 mod notifications;
 mod secret_key;
+mod security_headers;
 mod state;
 mod storage;
 
@@ -66,7 +78,6 @@ use axum::{
     Extension, Router,
     routing::{delete, get, post, put},
 };
-use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
@@ -120,8 +131,16 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Ensure a root API key exists (generates one on first run)
-    auth::ensure_root_key(&state.db).await?;
+    // Ensure a root API key exists (generates one on first run, into a root-only file)
+    auth::ensure_root_key(
+        &state.db,
+        &auth::secret_file::data_dir().join(auth::secret_file::ROOT_API_KEY_FILE),
+    )
+    .await?;
+
+    // While no admin exists, keep a one-time setup token in a root-only file
+    auth::setup_token::ensure_setup_token(&state.db, &auth::setup_token::setup_token_path())
+        .await?;
 
     // Spawn background health check poller
     tokio::spawn(health::run_health_checker(state.clone()));
@@ -160,6 +179,7 @@ async fn main() -> Result<()> {
         // Dashboard auth routes (no RequireAuth -- they handle their own auth)
         .route("/api/auth/status", get(handlers::auth::auth_status))
         .route("/api/auth/setup", post(handlers::auth::setup))
+        .route("/api/auth/setup/check", post(handlers::auth::setup_check))
         .route("/api/auth/login", post(handlers::auth::login))
         .route("/api/auth/logout", post(handlers::auth::logout))
         .route("/api/auth/me", get(handlers::auth::me))
@@ -210,6 +230,10 @@ async fn main() -> Result<()> {
             "/api/terminal/targets",
             get(handlers::terminal::list_targets),
         )
+        .route(
+            "/api/terminal/tickets",
+            post(handlers::terminal::create_ticket),
+        )
         .route("/api/terminal/ws", get(handlers::terminal::terminal_ws))
         .route("/api/apps/{id}/env", put(handlers::update_env))
         .route("/api/apps/{id}/domain", put(handlers::update_domain))
@@ -244,6 +268,16 @@ async fn main() -> Result<()> {
         // Server settings
         .route("/api/settings", get(handlers::settings::get_settings))
         .route("/api/settings", put(handlers::settings::update_settings))
+        // Host terminal switch: readable by any authenticated caller, writable
+        // only over the root-only Unix socket (`tond settings host-terminal`)
+        .route(
+            "/api/settings/host-terminal",
+            get(handlers::terminal::get_host_terminal),
+        )
+        .route(
+            "/api/settings/host-terminal",
+            put(handlers::terminal::set_host_terminal),
+        )
         .route("/api/templates", get(handlers::templates::list_templates))
         // Git integration — auto-deploy toggle, webhook secret, deploy keys, source
         .route(
@@ -354,6 +388,10 @@ async fn main() -> Result<()> {
         .route(
             "/api/github-apps/callback",
             get(handlers::github_apps::github_app_callback),
+        )
+        .route(
+            "/api/github-apps/complete",
+            post(handlers::github_apps::complete_github_flow),
         )
         .route(
             "/webhooks/source/github/install",
@@ -602,7 +640,7 @@ async fn main() -> Result<()> {
             "/api/snapshots/{id}/restore-database",
             post(handlers::backups::restore_database),
         )
-        .with_state(state);
+        .with_state(state.clone());
 
     // Serve the dashboard if the build directory exists, otherwise API-only mode
     let dashboard_dir =
@@ -613,6 +651,7 @@ async fn main() -> Result<()> {
         .exists()
     {
         tracing::info!("Serving dashboard from {}", dashboard_dir);
+        security_headers::init_from_dashboard(Path::new(&dashboard_dir));
         let serve_dir = ServeDir::new(&dashboard_dir)
             .not_found_service(ServeFile::new(format!("{}/index.html", dashboard_dir)));
         api.fallback_service(serve_dir)
@@ -621,8 +660,16 @@ async fn main() -> Result<()> {
         api
     };
 
+    // No CORS layer on purpose: the dashboard is same-origin, and answering
+    // no preflight is what makes the X-Tond-CSRF header unforgeable.
     let app = app
-        .layer(CorsLayer::permissive())
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            auth::csrf::enforce_same_origin,
+        ))
+        .layer(axum::middleware::from_fn(
+            security_headers::add_security_headers,
+        ))
         .layer(TraceLayer::new_for_http());
 
     let bind = std::env::var("TOND_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());

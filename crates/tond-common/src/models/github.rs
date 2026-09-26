@@ -92,6 +92,17 @@ pub struct GitHubCallbackQuery {
     pub state: Option<String>,
 }
 
+/// POST /api/github-apps/complete — finish a manifest or install flow from the
+/// dashboard page GitHub's redirect lands on.
+#[derive(Debug, Deserialize)]
+pub struct CompleteGitHubFlowRequest {
+    /// "manifest" or "install"
+    pub kind: String,
+    pub state: Option<String>,
+    pub code: Option<String>,
+    pub installation_id: Option<i64>,
+}
+
 /// Query params for the GitHub App installation callback.
 /// GitHub appends `?installation_id=<id>&setup_action=<action>&state=<state>`,
 /// echoing the `state` we put on the installation URL.

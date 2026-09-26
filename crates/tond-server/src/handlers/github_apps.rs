@@ -51,9 +51,9 @@ use axum::{
 };
 use serde::Serialize;
 use tond_common::{
-    ApiResponse, GitHubApp, GitHubAppResponse, GitHubBranchResponse, GitHubCallbackQuery,
-    GitHubInstallQuery, GitHubRepoResponse, SetGitHubAppRequest, TondError, UpdateGitHubAppRequest,
-    User, generate_raw_key,
+    ApiResponse, CompleteGitHubFlowRequest, GitHubApp, GitHubAppResponse, GitHubBranchResponse,
+    GitHubCallbackQuery, GitHubInstallQuery, GitHubRepoResponse, SetGitHubAppRequest, TondError,
+    UpdateGitHubAppRequest, User, generate_raw_key,
 };
 
 use crate::{
@@ -457,52 +457,168 @@ pub async fn get_manifest_url(
     ))
 }
 
-// ── GET /api/github-apps/callback?code=<code>&state=<state> ─────────────────
+// ── GitHub App flow completion ────────────────────────────────────────────────
+//
+// GitHub sends the browser back to Tond with a top-level cross-site redirect.
+// The session cookie is SameSite=Strict, so it is NOT sent on that request.
+// The GET callbacks therefore only bounce the browser to the dashboard page
+// /integrations/github/complete, which finishes the flow with a same-origin
+// POST /api/github-apps/complete: that request carries the admin's session
+// cookie and the CSRF header, and consumes the single-use state bound to that
+// admin. Nothing is stored before that POST.
 
-/// GitHub redirects here after App creation with a one-time code.
+/// Where GitHub's redirect is sent: the dashboard page that completes the flow.
+async fn redirect_to_completion(state: &AppState, query: &[(&str, String)]) -> Response {
+    let domain = state.settings.read().await.dashboard_domain.clone();
+    let base = if domain.is_empty() {
+        "/integrations/github/complete".to_string()
+    } else {
+        format!("https://{}/integrations/github/complete", domain)
+    };
+    let qs = query
+        .iter()
+        .map(|(k, v)| format!("{k}={}", urlencoding::encode(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    Redirect::to(&format!("{base}?{qs}")).into_response()
+}
+
+/// GET /api/github-apps/callback?code=<code>&state=<state>
 ///
-/// Only completes a pending `manifest` flow that the admin whose session
-/// cookie accompanies this request started within the last hour. Anything
-/// else (no state, unknown/expired/used state, different or no session) is
-/// refused before the code is exchanged, so an attacker cannot make Tond
-/// register an App they control.
+/// GitHub redirects here after App creation. Hands off to the dashboard.
 pub async fn github_app_callback(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Query(params): Query<GitHubCallbackQuery>,
 ) -> Response {
-    let Some(flow_state) = params.state.as_deref().filter(|s| !s.is_empty()) else {
-        tracing::warn!("GitHub App callback without state — refused");
-        return redirect_to_integrations(&state, Some("missing_state")).await;
+    let mut query = vec![("kind", "manifest".to_string())];
+    if let Some(code) = params.code {
+        query.push(("code", code));
+    }
+    if let Some(flow_state) = params.state {
+        query.push(("state", flow_state));
+    }
+    redirect_to_completion(&state, &query).await
+}
+
+/// GET /webhooks/source/github/install?installation_id=..&state=..
+///
+/// GitHub redirects here after the App is installed. Redirects without state
+/// (e.g. `setup_on_update` after changing the repo selection on github.com)
+/// change nothing and just return to the integrations page.
+pub async fn github_install_callback(
+    State(state): State<AppState>,
+    Query(params): Query<GitHubInstallQuery>,
+) -> Response {
+    let (Some(installation_id), Some(flow_state)) = (
+        params.installation_id,
+        params.state.filter(|s| !s.is_empty()),
+    ) else {
+        return redirect_to_integrations(&state, None).await;
     };
-    let Some(admin) = session_admin(&state, &headers).await else {
-        tracing::warn!("GitHub App callback without an admin session — refused");
-        return redirect_to_integrations(&state, Some("not_logged_in")).await;
+    redirect_to_completion(
+        &state,
+        &[
+            ("kind", "install".to_string()),
+            ("installation_id", installation_id.to_string()),
+            ("state", flow_state),
+        ],
+    )
+    .await
+}
+
+/// POST /api/github-apps/complete — body `{kind, state, code?, installation_id?}`.
+///
+/// Called by the dashboard page GitHub's redirect lands on. Returns 200 when
+/// the flow completed, otherwise 400 with an error code the page explains:
+/// missing_state, not_logged_in, invalid_state, missing_code, exchange_failed,
+/// internal.
+pub async fn complete_github_flow(
+    _rate: RateLimit,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CompleteGitHubFlowRequest>,
+) -> Response {
+    let result = match req.kind.as_str() {
+        "manifest" => {
+            finish_manifest_flow(
+                &state,
+                &headers,
+                GitHubCallbackQuery {
+                    code: req.code,
+                    state: req.state,
+                },
+            )
+            .await
+        }
+        "install" => {
+            finish_install_flow(
+                &state,
+                &headers,
+                GitHubInstallQuery {
+                    installation_id: req.installation_id,
+                    setup_action: None,
+                    state: req.state,
+                },
+            )
+            .await
+        }
+        _ => Err("invalid_state"),
+    };
+    match result {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serde_json::json!({ "completed": true }))),
+        )
+            .into_response(),
+        Err(code) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<()>::err(code.to_string())),
+        )
+            .into_response(),
+    }
+}
+
+/// Complete a pending `manifest` flow: only the admin who started it, with
+/// their session, once, within FLOW_TTL_MINUTES. The state is consumed before
+/// the code is exchanged, so an attacker cannot make Tond register an App
+/// they control.
+async fn finish_manifest_flow(
+    state: &AppState,
+    headers: &HeaderMap,
+    params: GitHubCallbackQuery,
+) -> Result<(), &'static str> {
+    let Some(flow_state) = params.state.as_deref().filter(|s| !s.is_empty()) else {
+        tracing::warn!("GitHub App completion without state — refused");
+        return Err("missing_state");
+    };
+    let Some(admin) = session_admin(state, headers).await else {
+        tracing::warn!("GitHub App completion without an admin session — refused");
+        return Err("not_logged_in");
     };
 
     match consume_flow(&state.db, flow_state, "manifest", &admin.id).await {
         Ok(Ok(_)) => {}
         Ok(Err(())) => {
-            tracing::warn!("GitHub App callback with unknown, expired or used state — refused");
-            return redirect_to_integrations(&state, Some("invalid_state")).await;
+            tracing::warn!("GitHub App completion with unknown, expired or used state — refused");
+            return Err("invalid_state");
         }
         Err(e) => {
-            tracing::error!("GitHub App callback: failed to load flow: {}", e);
-            return redirect_to_integrations(&state, Some("internal")).await;
+            tracing::error!("GitHub App completion: failed to load flow: {}", e);
+            return Err("internal");
         }
     }
 
     let Some(code) = params.code.as_deref().filter(|c| is_valid_manifest_code(c)) else {
-        return redirect_to_integrations(&state, Some("missing_code")).await;
+        return Err("missing_code");
     };
 
-    match exchange_manifest_code(&state, code).await {
-        Ok(_) => redirect_to_integrations(&state, None).await,
-        Err(e) => {
+    exchange_manifest_code(state, code)
+        .await
+        .map(|_| ())
+        .map_err(|e| {
             tracing::error!("GitHub App manifest exchange failed: {}", e);
-            redirect_to_integrations(&state, Some("exchange_failed")).await
-        }
-    }
+            "exchange_failed"
+        })
 }
 
 /// Manifest codes are short alphanumeric tokens; anything else is refused
@@ -593,64 +709,56 @@ async fn exchange_manifest_code(state: &AppState, code: &str) -> anyhow::Result<
     Ok(GitHubAppResponse::from_app(gh_app))
 }
 
-// ── GET /webhooks/source/github/install ───────────────────────────────────────
-
-/// GitHub redirects here after the user installs the App on their repos.
-///
-/// Stores `installation_id` only when `state` matches a pending `install`
-/// flow started (via `POST /api/github-apps/{id}/install`) by the admin whose
-/// session accompanies this request. Redirects without state — e.g. GitHub's
-/// `setup_on_update` after changing the repo selection on github.com — change
-/// nothing.
-pub async fn github_install_callback(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(params): Query<GitHubInstallQuery>,
-) -> Response {
+/// Complete a pending `install` flow started (via `POST /api/github-apps/{id}/install`)
+/// by the admin whose session accompanies the request. A request without state
+/// changes nothing.
+async fn finish_install_flow(
+    state: &AppState,
+    headers: &HeaderMap,
+    params: GitHubInstallQuery,
+) -> Result<(), &'static str> {
     let (Some(installation_id), Some(flow_state)) = (
         params.installation_id,
         params.state.as_deref().filter(|s| !s.is_empty()),
     ) else {
-        return redirect_to_integrations(&state, None).await;
+        return Ok(());
     };
-    let Some(admin) = session_admin(&state, &headers).await else {
-        tracing::warn!("GitHub install callback without an admin session — refused");
-        return redirect_to_integrations(&state, Some("not_logged_in")).await;
+    let Some(admin) = session_admin(state, headers).await else {
+        tracing::warn!("GitHub install completion without an admin session — refused");
+        return Err("not_logged_in");
     };
 
     let github_app_id = match consume_flow(&state.db, flow_state, "install", &admin.id).await {
         Ok(Ok(Some(id))) => id,
         Ok(_) => {
-            tracing::warn!("GitHub install callback with unknown, expired or used state — refused");
-            return redirect_to_integrations(&state, Some("invalid_state")).await;
+            tracing::warn!(
+                "GitHub install completion with unknown, expired or used state — refused"
+            );
+            return Err("invalid_state");
         }
         Err(e) => {
-            tracing::error!("GitHub install callback: failed to load flow: {}", e);
-            return redirect_to_integrations(&state, Some("internal")).await;
+            tracing::error!("GitHub install completion: failed to load flow: {}", e);
+            return Err("internal");
         }
     };
 
-    match sqlx::query(
+    sqlx::query(
         "UPDATE github_apps SET installation_id = ?, updated_at = datetime('now') WHERE id = ?",
     )
     .bind(installation_id)
     .bind(&github_app_id)
     .execute(&state.db)
     .await
-    {
-        Ok(_) => {
-            tracing::info!(
-                "Stored GitHub App installation_id={} for {}",
-                installation_id,
-                github_app_id
-            );
-            redirect_to_integrations(&state, None).await
-        }
-        Err(e) => {
-            tracing::error!("Failed to store GitHub App installation_id: {}", e);
-            redirect_to_integrations(&state, Some("internal")).await
-        }
-    }
+    .map_err(|e| {
+        tracing::error!("Failed to store GitHub App installation_id: {}", e);
+        "internal"
+    })?;
+    tracing::info!(
+        "Stored GitHub App installation_id={} for {}",
+        installation_id,
+        github_app_id
+    );
+    Ok(())
 }
 
 // ── POST /api/github-apps/{id}/install ────────────────────────────────────────
@@ -1269,7 +1377,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO sessions (id, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)",
         )
-        .bind(&session_id)
+        .bind(tond_common::hash_key(&session_id))
         .bind(user_id)
         .bind((now + chrono::Duration::hours(1)).to_rfc3339())
         .bind(now.to_rfc3339())
@@ -1280,7 +1388,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::COOKIE,
-            axum::http::HeaderValue::from_str(&format!("tond_session={session_id}"))
+            axum::http::HeaderValue::from_str(&format!("__Host-tond_session={session_id}"))
                 .unwrap_or_else(|err| panic!("invalid cookie header: {err}")),
         );
         headers
@@ -1293,6 +1401,50 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .to_string()
+    }
+
+    #[tokio::test]
+    async fn github_redirects_hand_off_to_the_dashboard_without_storing_anything() {
+        // The browser arrives from github.com without the SameSite=Strict
+        // session cookie, so the GET callbacks must not act on their own.
+        let state = test_state().await;
+        seed_github_app(&state, "gh-app-1").await;
+
+        let response = github_app_callback(
+            State(state.clone()),
+            Query(GitHubCallbackQuery {
+                code: Some("abc123".to_string()),
+                state: Some("s t&x".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(
+            location(&response),
+            "https://dashboard.example.com/integrations/github/complete?kind=manifest&code=abc123&state=s%20t%26x"
+        );
+
+        let response = github_install_callback(
+            State(state.clone()),
+            Query(GitHubInstallQuery {
+                installation_id: Some(42),
+                setup_action: Some("install".to_string()),
+                state: Some("st".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(
+            location(&response),
+            "https://dashboard.example.com/integrations/github/complete?kind=install&installation_id=42&state=st"
+        );
+        assert_eq!(installation_id(&state, "gh-app-1").await, None);
+        assert_eq!(
+            count(
+                &state,
+                "SELECT COUNT(*) FROM github_apps WHERE installation_id IS NOT NULL"
+            )
+            .await,
+            0
+        );
     }
 
     async fn count(state: &AppState, sql: &'static str) -> i64 {
@@ -1353,55 +1505,55 @@ mod tests {
         let admin = seed_session(&state, "admin-1", "admin").await;
 
         // The original attack: a bare code (no state) from anyone.
-        let response = github_app_callback(
-            State(state.clone()),
-            HeaderMap::new(),
-            Query(GitHubCallbackQuery {
+        let response = finish_manifest_flow(
+            &state,
+            &HeaderMap::new(),
+            GitHubCallbackQuery {
                 code: Some("attackercode".to_string()),
                 state: None,
-            }),
+            },
         )
         .await;
-        assert!(location(&response).ends_with("/integrations/github?error=missing_state"));
+        assert_eq!(response, Err("missing_state"));
 
         // A made-up state, even from a logged-in admin.
-        let response = github_app_callback(
-            State(state.clone()),
-            admin.clone(),
-            Query(GitHubCallbackQuery {
+        let response = finish_manifest_flow(
+            &state,
+            &admin.clone(),
+            GitHubCallbackQuery {
                 code: Some("attackercode".to_string()),
                 state: Some("made-up".to_string()),
-            }),
+            },
         )
         .await;
-        assert!(location(&response).ends_with("?error=invalid_state"));
+        assert_eq!(response, Err("invalid_state"));
 
         // A real state, but the callback arrives without that admin's session
         // (e.g. an attacker sending the victim's state with their own code).
         let flow_state = manifest_state_for(&state, admin.clone()).await;
-        let response = github_app_callback(
-            State(state.clone()),
-            HeaderMap::new(),
-            Query(GitHubCallbackQuery {
+        let response = finish_manifest_flow(
+            &state,
+            &HeaderMap::new(),
+            GitHubCallbackQuery {
                 code: Some("attackercode".to_string()),
                 state: Some(flow_state.clone()),
-            }),
+            },
         )
         .await;
-        assert!(location(&response).ends_with("?error=not_logged_in"));
+        assert_eq!(response, Err("not_logged_in"));
 
         // Another admin's session cannot complete it either.
         let other = seed_session(&state, "admin-2", "admin").await;
-        let response = github_app_callback(
-            State(state.clone()),
-            other,
-            Query(GitHubCallbackQuery {
+        let response = finish_manifest_flow(
+            &state,
+            &other,
+            GitHubCallbackQuery {
                 code: Some("attackercode".to_string()),
                 state: Some(flow_state.clone()),
-            }),
+            },
         )
         .await;
-        assert!(location(&response).ends_with("?error=invalid_state"));
+        assert_eq!(response, Err("invalid_state"));
 
         assert_eq!(count(&state, "SELECT COUNT(*) FROM github_apps").await, 0);
     }
@@ -1414,28 +1566,29 @@ mod tests {
         // The owner's callback consumes the state before the code is used. A
         // malformed code stops before any network call.
         let flow_state = manifest_state_for(&state, admin.clone()).await;
-        let response = github_app_callback(
-            State(state.clone()),
-            admin.clone(),
-            Query(GitHubCallbackQuery {
+        let response = finish_manifest_flow(
+            &state,
+            &admin.clone(),
+            GitHubCallbackQuery {
                 code: Some("../bad".to_string()),
                 state: Some(flow_state.clone()),
-            }),
+            },
         )
         .await;
-        assert!(location(&response).ends_with("?error=missing_code"));
+        assert_eq!(response, Err("missing_code"));
 
-        let response = github_app_callback(
-            State(state.clone()),
-            admin.clone(),
-            Query(GitHubCallbackQuery {
+        let response = finish_manifest_flow(
+            &state,
+            &admin.clone(),
+            GitHubCallbackQuery {
                 code: Some("../bad".to_string()),
                 state: Some(flow_state),
-            }),
+            },
         )
         .await;
-        assert!(
-            location(&response).ends_with("?error=invalid_state"),
+        assert_eq!(
+            response,
+            Err("invalid_state"),
             "a state can only be used once"
         );
 
@@ -1447,16 +1600,16 @@ mod tests {
             .execute(&state.db)
             .await
             .unwrap_or_else(|err| panic!("failed to expire flow: {err}"));
-        let response = github_app_callback(
-            State(state.clone()),
-            admin,
-            Query(GitHubCallbackQuery {
+        let response = finish_manifest_flow(
+            &state,
+            &admin,
+            GitHubCallbackQuery {
                 code: Some("code".to_string()),
                 state: Some(expired_state),
-            }),
+            },
         )
         .await;
-        assert!(location(&response).ends_with("?error=invalid_state"));
+        assert_eq!(response, Err("invalid_state"));
     }
 
     async fn install_state_for(state: &AppState, headers: HeaderMap, id: &str) -> String {
@@ -1495,60 +1648,60 @@ mod tests {
         let admin = seed_session(&state, "admin-1", "admin").await;
 
         // No state (e.g. setup_on_update, or an attacker): nothing changes.
-        let response = github_install_callback(
-            State(state.clone()),
-            admin.clone(),
-            Query(GitHubInstallQuery {
+        let response = finish_install_flow(
+            &state,
+            &admin.clone(),
+            GitHubInstallQuery {
                 installation_id: Some(1111),
                 setup_action: Some("install".to_string()),
                 state: None,
-            }),
+            },
         )
         .await;
-        assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+        assert_eq!(response, Ok(()));
         assert_eq!(installation_id(&state, "gh-app-1").await, None);
 
         let flow_state = install_state_for(&state, admin.clone(), "gh-app-1").await;
 
         // Without the admin's session the state is useless.
-        let response = github_install_callback(
-            State(state.clone()),
-            HeaderMap::new(),
-            Query(GitHubInstallQuery {
+        let response = finish_install_flow(
+            &state,
+            &HeaderMap::new(),
+            GitHubInstallQuery {
                 installation_id: Some(2222),
                 setup_action: Some("install".to_string()),
                 state: Some(flow_state.clone()),
-            }),
+            },
         )
         .await;
-        assert!(location(&response).ends_with("?error=not_logged_in"));
+        assert_eq!(response, Err("not_logged_in"));
         assert_eq!(installation_id(&state, "gh-app-1").await, None);
 
-        let response = github_install_callback(
-            State(state.clone()),
-            admin.clone(),
-            Query(GitHubInstallQuery {
+        let response = finish_install_flow(
+            &state,
+            &admin.clone(),
+            GitHubInstallQuery {
                 installation_id: Some(9876),
                 setup_action: Some("install".to_string()),
                 state: Some(flow_state.clone()),
-            }),
+            },
         )
         .await;
-        assert!(location(&response).ends_with("/integrations/github"));
+        assert_eq!(response, Ok(()));
         assert_eq!(installation_id(&state, "gh-app-1").await, Some(9876));
 
         // Replaying the same state is refused.
-        let response = github_install_callback(
-            State(state.clone()),
-            admin,
-            Query(GitHubInstallQuery {
+        let response = finish_install_flow(
+            &state,
+            &admin,
+            GitHubInstallQuery {
                 installation_id: Some(3333),
                 setup_action: Some("install".to_string()),
                 state: Some(flow_state),
-            }),
+            },
         )
         .await;
-        assert!(location(&response).ends_with("?error=invalid_state"));
+        assert_eq!(response, Err("invalid_state"));
         assert_eq!(installation_id(&state, "gh-app-1").await, Some(9876));
     }
 
@@ -1559,17 +1712,17 @@ mod tests {
         let admin = seed_session(&state, "admin-1", "admin").await;
         let manifest_state = manifest_state_for(&state, admin.clone()).await;
 
-        let response = github_install_callback(
-            State(state.clone()),
-            admin,
-            Query(GitHubInstallQuery {
+        let response = finish_install_flow(
+            &state,
+            &admin,
+            GitHubInstallQuery {
                 installation_id: Some(1),
                 setup_action: None,
                 state: Some(manifest_state),
-            }),
+            },
         )
         .await;
-        assert!(location(&response).ends_with("?error=invalid_state"));
+        assert_eq!(response, Err("invalid_state"));
         assert_eq!(installation_id(&state, "gh-app-1").await, None);
     }
 

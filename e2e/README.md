@@ -10,6 +10,13 @@ What the smoke test covers:
 - services up, API health
 - auth boundaries: loopback TCP and proxied requests without credentials get 401,
   the CLI socket is `0600 root` and refuses non-root users, API keys over TCP
+- auth hardening: root API key and setup token only in `0600 root` files (never in
+  the journal), token-gated single-use setup, `__Host-` Secure/SameSite=Strict session
+  cookie, CSRF header + Origin checks, cross-origin WebSocket refusal, security
+  headers/HSTS, 2FA re-auth, host terminal off by default (socket-only switch,
+  step-up, single-use tickets, audit log), rate limiter not bypassable with a
+  spoofed `X-Forwarded-For`, failed-login backoff. It creates the admin account
+  `E2E_ADMIN_EMAIL` / `E2E_ADMIN_PASSWORD` through the setup token.
 - an image app (pull, run, route through the proxy, HTTP→HTTPS redirect)
 - a pushed app (`tond apps push` → TBuild → `docker build` → run → route)
 - a real certificate issued over ACME HTTP-01 and verified against the CA

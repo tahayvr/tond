@@ -131,7 +131,7 @@ mod tests {
             "INSERT INTO sessions (id, user_id, created_at, expires_at, user_agent, ip_address, last_used_at)
              VALUES (?, ?, datetime('now'), datetime('now', '+1 day'), ?, ?, datetime('now'))",
         )
-        .bind("session-1")
+        .bind(tond_common::hash_key("session-1"))
         .bind("user-1")
         .bind("test-agent")
         .bind("127.0.0.1")
@@ -187,7 +187,7 @@ mod tests {
         let mut parts = empty_parts();
         parts.headers.insert(
             header::COOKIE,
-            HeaderValue::from_static("tond_session=session-1"),
+            HeaderValue::from_static("__Host-tond_session=session-1"),
         );
         parts.headers.insert(
             header::AUTHORIZATION,

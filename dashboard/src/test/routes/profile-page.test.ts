@@ -126,7 +126,12 @@ describe('profile page', () => {
 		await user.click(screen.getByRole('tab', { name: /two-factor auth/i }));
 		await user.click(screen.getByRole('button', { name: /enable two-factor auth/i }));
 
-		expect(api.setup2FA).toHaveBeenCalledOnce();
+		// The current password is required before a new authenticator is enrolled.
+		expect(api.setup2FA).not.toHaveBeenCalled();
+		await user.type(screen.getByLabelText(/confirm password/i), 'my-password');
+		await user.click(screen.getByRole('button', { name: /continue/i }));
+
+		expect(api.setup2FA).toHaveBeenCalledWith('my-password');
 		expect(await screen.findByAltText(/totp qr code/i)).toBeInTheDocument();
 		expect(screen.getByText(/secret123/i)).toBeInTheDocument();
 

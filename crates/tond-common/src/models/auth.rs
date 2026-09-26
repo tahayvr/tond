@@ -95,10 +95,19 @@ impl From<User> for UserResponse {
     }
 }
 
+/// Request body for `POST /api/auth/setup` (first-run admin account).
 #[derive(Debug, Deserialize)]
 pub struct SetupRequest {
+    /// One-time setup token from the installer (`<data dir>/setup-token`).
+    pub token: String,
     pub email: String,
     pub password: String,
+}
+
+/// Request body for `POST /api/auth/setup/check`.
+#[derive(Debug, Deserialize)]
+pub struct SetupCheckRequest {
+    pub token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,6 +176,13 @@ pub struct TotpSetupResponse {
     pub otpauth_uri: String,
     /// Base64-encoded PNG QR code (data URI payload, no prefix).
     pub qr_code: String,
+}
+
+/// Request body for `POST /api/auth/2fa/setup`: the current password, so a
+/// hijacked session can't silently enroll an attacker's authenticator.
+#[derive(Debug, Deserialize)]
+pub struct TotpSetupRequest {
+    pub password: String,
 }
 
 /// Request body for `POST /api/auth/2fa/confirm`.
