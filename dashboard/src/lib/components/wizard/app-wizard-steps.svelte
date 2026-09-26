@@ -25,9 +25,11 @@
 					class="group flex flex-col items-center gap-2"
 					onclick={() => onStepClick(index)}
 					disabled={index > currentStep}
+					aria-label="Step {index + 1}: {step.label}"
+					aria-current={index === currentStep ? 'step' : undefined}
 				>
 					<div
-						class="flex h-10 w-10 items-center justify-center rounded-sm border-2 font-mono text-sm font-bold transition-all {index ===
+						class="flex size-9 items-center justify-center rounded-sm border-2 font-mono text-sm font-bold transition-all sm:size-10 {index ===
 						currentStep
 							? 'border-primary bg-primary text-primary-foreground'
 							: index < currentStep
@@ -41,7 +43,7 @@
 						{/if}
 					</div>
 					<span
-						class="font-mono text-[10px] tracking-wider uppercase transition-colors {index ===
+						class="hidden font-mono text-[10px] tracking-wider uppercase transition-colors sm:inline {index ===
 						currentStep
 							? 'text-foreground'
 							: index < currentStep
@@ -53,7 +55,7 @@
 				</button>
 				{#if index < steps.length - 1}
 					<div
-						class="mx-2 h-0.5 flex-1 transition-colors {index < currentStep
+						class="mx-1 h-0.5 flex-1 transition-colors sm:mx-2 {index < currentStep
 							? 'bg-chart-2'
 							: 'bg-border'}"
 					></div>
@@ -61,4 +63,9 @@
 			</div>
 		{/each}
 	</div>
+	<!-- Phones show icons only; name the current step in words. -->
+	<p class="mt-2 font-mono text-xs text-muted-foreground sm:hidden">
+		Step {currentStep + 1} of {steps.length}:
+		<span class="text-foreground">{steps[currentStep]?.label}</span>
+	</p>
 </div>

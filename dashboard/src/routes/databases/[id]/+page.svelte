@@ -716,7 +716,7 @@
 			{#if tab === 'overview'}
 				<div class="mt-4 space-y-4">
 					<!-- Info grid -->
-					<div class="grid gap-4 sm:grid-cols-2">
+					<div class="grid gap-4 sm:grid-cols-2 [&>*]:min-w-0">
 						<!-- Connection strings -->
 						<div class="space-y-4 rounded-lg border p-4">
 							<h2 class="text-sm font-semibold tracking-wide text-muted-foreground uppercase">
