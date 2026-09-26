@@ -39,6 +39,7 @@ import {
 	MOCK_STORAGE_PROVIDERS,
 	MOCK_SNAPSHOTS,
 	MOCK_BACKUP_CONFIG,
+	MOCK_CERTIFICATES,
 	makeMockSystemMetrics,
 	makeMockAppMetrics
 } from './fixtures';
@@ -73,6 +74,36 @@ function ok<T>(data: T) {
 
 function err(message: string, status = 400) {
 	return HttpResponse.json({ success: false, data: null, error: message }, { status });
+}
+
+const certificates = MOCK_CERTIFICATES.map((c) => ({ ...c }));
+
+/** Mirror the server: saving a domain queues a pending cert and resets retry state. */
+function queueMockCertificate(domain: string) {
+	if (!domain.trim()) return;
+	const now = new Date().toISOString();
+	const existing = certificates.find((c) => c.domain === domain);
+	if (existing) {
+		Object.assign(existing, {
+			status: 'pending',
+			last_error: null,
+			next_retry_at: null,
+			failure_count: 0
+		});
+		return;
+	}
+	certificates.push({
+		id: `cert-${Date.now()}`,
+		domain,
+		cert_type: 'acme',
+		status: 'pending',
+		issued_at: now,
+		expires_at: now,
+		last_error: null,
+		last_attempt_at: null,
+		next_retry_at: null,
+		failure_count: 0
+	});
 }
 
 // In-memory mutable state (mutations survive page navigation within the session)
@@ -491,7 +522,23 @@ export const handlers = [
 		if (idx === -1) return err('App not found', 404);
 		const body = (await request.json()) as { domain: string };
 		apps[idx] = { ...apps[idx], domain: body.domain, updated_at: new Date().toISOString() };
+		queueMockCertificate(body.domain);
 		return ok(apps[idx]);
+	}),
+
+	// ── Certificates ──────────────────────────────────────────────────────────
+
+	http.get('/api/certs', async () => {
+		await delay(LATENCY);
+		return ok(certificates);
+	}),
+
+	http.post('/api/certs/:domain/retry', async ({ params }) => {
+		await delay(LATENCY);
+		const cert = certificates.find((c) => c.domain === params.domain);
+		if (!cert) return err(`No certificate for ${params.domain}`, 404);
+		cert.next_retry_at = null;
+		return ok({ message: 'Certificate retry queued', domain: cert.domain });
 	}),
 
 	http.put('/api/apps/:id/health', async ({ params, request }) => {
@@ -896,6 +943,7 @@ export const handlers = [
 		await delay(LATENCY);
 		const body = (await request.json()) as Partial<typeof MOCK_SETTINGS>;
 		Object.assign(MOCK_SETTINGS, body);
+		if (body.dashboard_domain) queueMockCertificate(body.dashboard_domain);
 		MOCK_ONBOARDING_STATUS.dashboard_domain = MOCK_SETTINGS.dashboard_domain;
 		MOCK_ONBOARDING_STATUS.domain_status.configured =
 			MOCK_SETTINGS.dashboard_domain.trim().length > 0;

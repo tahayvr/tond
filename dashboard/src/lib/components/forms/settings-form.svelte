@@ -4,10 +4,15 @@
 	import { Label } from '$lib/components/ui/label/index.js';
 	import Server from '~icons/ri/server-line';
 	import Settings from '~icons/ri/settings-3-line';
+	import CertificateStatus from '$lib/components/domains/certificate-status.svelte';
 
 	interface Props {
 		serverName: string;
 		dashboardDomain: string;
+		/** Saved dashboard domain; its certificate status is shown below the field. */
+		savedDashboardDomain?: string;
+		/** Bumped after a save so the certificate status re-fetches. */
+		certRefreshKey?: number;
 		isSaving?: boolean;
 		saved?: boolean;
 		error: string;
@@ -17,6 +22,8 @@
 	let {
 		serverName = $bindable(''),
 		dashboardDomain = $bindable(''),
+		savedDashboardDomain = '',
+		certRefreshKey = 0,
 		isSaving = false,
 		saved = false,
 		error,
@@ -80,6 +87,7 @@
 			<p class="font-mono text-[10px] text-muted-foreground/60">
 				Leave blank for direct IP access. If you set a domain, point its A record at this server.
 			</p>
+			<CertificateStatus domain={savedDashboardDomain} refreshKey={certRefreshKey} />
 		</div>
 	</div>
 

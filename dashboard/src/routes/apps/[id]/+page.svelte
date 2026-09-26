@@ -93,6 +93,7 @@
 
 	// Domain form
 	let domainInput = $state('');
+	let certRefreshKey = $state(0);
 
 	// Health form
 	let healthPath = $state('');
@@ -384,6 +385,7 @@
 		try {
 			await updateDomain(appId, domainInput);
 			await loadApp();
+			certRefreshKey += 1;
 		} catch (e: any) {
 			error = e.message;
 		}
@@ -1035,7 +1037,12 @@
 
 			<!-- Domain tab -->
 			<Tabs.Content value="domain">
-				<AppDomain bind:domainInput onUpdate={handleUpdateDomain} />
+				<AppDomain
+					bind:domainInput
+					savedDomain={app?.domain ?? null}
+					{certRefreshKey}
+					onUpdate={handleUpdateDomain}
+				/>
 			</Tabs.Content>
 
 			<!-- Health tab -->
