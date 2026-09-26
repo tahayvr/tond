@@ -21,8 +21,11 @@ describe('Tond health panel', () => {
 		render(TondHealthPanel);
 
 		expect(await screen.findByText('13.4 MB')).toBeInTheDocument();
-		expect(screen.getByText('<0.1%')).toBeInTheDocument();
-		expect(screen.getByText('Connected: route changes apply instantly')).toBeInTheDocument();
+		const server = screen.getByText('tond-server').closest('tr') as HTMLElement;
+		expect(within(server).getByText(/CPU <0\.1%/)).toBeInTheDocument();
+		const proxy = screen.getByText('tond-proxy').closest('tr') as HTMLElement;
+		expect(within(proxy).getByText('Connected')).toBeInTheDocument();
+		expect(within(proxy).getByText(/route changes apply instantly/)).toBeInTheDocument();
 		expect(screen.getByText('1.8 MB')).toBeInTheDocument();
 
 		const health = screen.getByText('Health checks').closest('tr');
@@ -49,10 +52,53 @@ describe('Tond health panel', () => {
 
 		render(TondHealthPanel);
 
-		expect(
-			await screen.findByText('Not connected: routes update within a minute')
-		).toBeInTheDocument();
-		expect(screen.getByText('Not reporting')).toBeInTheDocument();
+		expect(await screen.findByText('Not connected')).toBeInTheDocument();
+		expect(screen.getByText(/not connected: routes update within a minute/)).toBeInTheDocument();
+	});
+
+	it('lists Docker and the heartbeat with what to do when they fail', async () => {
+		api.getSystemSelf.mockResolvedValue(makeMockSystemSelf());
+
+		render(TondHealthPanel, {
+			docker: {
+				reachable: false,
+				version: null,
+				api_version: null,
+				storage_driver: null,
+				root_dir: null,
+				cgroup_version: null,
+				warnings: [],
+				containers: null,
+				containers_running: null,
+				images: null,
+				rss_bytes: null,
+				uptime_secs: null,
+				error: 'Docker did not answer within 5 s',
+				checked_at: 0
+			},
+			heartbeat: {
+				configured: true,
+				url_host: 'hc-ping.com',
+				method: 'GET',
+				interval_secs: 300,
+				enabled: true,
+				last_ok_at: 100,
+				last_failure_at: null,
+				last_error: null,
+				last_skipped_at: 400,
+				last_skip_reason: 'Docker is not healthy',
+				next_at: null,
+				healthy: false,
+				unhealthy_reason: 'Docker is not healthy'
+			}
+		});
+
+		const docker = (await screen.findByText('Docker')).closest('tr') as HTMLElement;
+		expect(within(docker).getByText('Unreachable')).toBeInTheDocument();
+		expect(within(docker).getByText(/systemctl status docker/)).toBeInTheDocument();
+		const beat = screen.getByText('Heartbeat').closest('tr') as HTMLElement;
+		expect(within(beat).getByText('Holding')).toBeInTheDocument();
+		expect(within(beat).getByText(/Docker is not healthy/)).toBeInTheDocument();
 	});
 
 	it('explains a failed load', async () => {

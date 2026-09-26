@@ -5,6 +5,7 @@
 	import PageHeader from '$lib/components/nav/page-header.svelte';
 	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import SessionSettingsForm from '$lib/components/forms/session-settings-form.svelte';
+	import HeartbeatSettings from '$lib/components/forms/HeartbeatSettings.svelte';
 	import RetentionSettingsForm from '$lib/components/forms/retention-settings-form.svelte';
 	import AuditShippingForm from '$lib/components/forms/audit-shipping-form.svelte';
 	import ObservabilityCard from '$lib/components/forms/observability-card.svelte';
@@ -78,7 +79,7 @@
 <div class="space-y-6">
 	<PageHeader
 		title="Settings"
-		description="Server name, domains, sessions, data retention and observability."
+		description="Server name, domains, sessions, data retention, observability and the heartbeat."
 	/>
 
 	<InlineError message={error} ondismiss={() => (error = '')} />
@@ -106,4 +107,6 @@
 	{/if}
 
 	<ObservabilityCard dashboardDomain={savedDashboardDomain} />
+
+	<HeartbeatSettings canEdit={can('settings:write')} />
 </div>

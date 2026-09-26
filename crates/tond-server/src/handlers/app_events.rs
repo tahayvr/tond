@@ -12,6 +12,8 @@
 //                   callers who may read the audit log (events:read)
 //   alert_history   alerts that fired for the app and when they resolved —
 //                   only for callers who may see alerts (metrics:read)
+//   uptime_incidents  when the app's public URL went down and came back up
+//                   (uptime checks) — also metrics:read
 //
 // Each source is read through an index with the same `before` bound and
 // `limit`, then merged; `next_before` pages further back.
@@ -360,6 +362,45 @@ pub async fn app_events(
         }
     }
 
+    // Uptime incidents (unix seconds): down at the start, up at the end.
+    if include_alerts {
+        let rows: Vec<(i64, Option<i64>, String, String)> = sqlx::query_as(
+            "SELECT i.started_at, i.ended_at, i.cause, i.detail FROM uptime_incidents i
+             JOIN uptime_checks c ON c.id = i.check_id
+             WHERE c.kind = 'app' AND c.owner_id = ? AND i.started_at < ?
+             ORDER BY i.started_at DESC LIMIT ?",
+        )
+        .bind(&app.id)
+        .bind(before.timestamp())
+        .bind(limit)
+        .fetch_all(db)
+        .await?;
+        some_source_full |= i64::try_from(rows.len()).unwrap_or(0) >= limit;
+        for (started, ended, cause, detail) in rows {
+            if let Some(at) = DateTime::<Utc>::from_timestamp(started, 0) {
+                let why = crate::uptime::probe::Cause::parse(&cause)
+                    .map(crate::uptime::cause_label)
+                    .unwrap_or("unreachable");
+                all.push(event(
+                    at,
+                    AppEventKind::UptimeDown,
+                    format!("Went down: {why}"),
+                    Some(detail),
+                ));
+            }
+            if let Some(end) = ended
+                && let Some(at) = DateTime::<Utc>::from_timestamp(end, 0)
+            {
+                all.push(event(
+                    at,
+                    AppEventKind::UptimeUp,
+                    format!("Back up after {}", format_duration(end - started)),
+                    None,
+                ));
+            }
+        }
+    }
+
     all.retain(|(at, _)| *at < before);
     all.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
     let more = some_source_full || i64::try_from(all.len()).unwrap_or(0) > limit;
@@ -559,6 +600,59 @@ mod tests {
         assert_eq!(
             second.events.first().map(|e| e.kind),
             Some(AppEventKind::Oom)
+        );
+    }
+
+    #[tokio::test]
+    async fn uptime_incidents_show_as_down_and_back_up() {
+        let state = AppState::for_tests().await;
+        let app = seed(&state.db).await;
+        crate::uptime::store::load_checks(&state.db)
+            .await
+            .unwrap_or_else(|e| panic!("checks: {e}"));
+        let check: i64 = sqlx::query_scalar(
+            "SELECT id FROM uptime_checks WHERE kind = 'app' AND owner_id = 'a1'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or_else(|e| panic!("check: {e}"));
+        let start = Utc::now().timestamp() - 600;
+        let id = crate::uptime::store::open_incident(
+            &state.db,
+            check,
+            start,
+            crate::uptime::probe::Cause::Http5xx,
+            "HTTP 502",
+        )
+        .await
+        .unwrap_or_else(|e| panic!("incident: {e}"));
+        crate::uptime::store::close_incident(&state.db, id, start + 180)
+            .await
+            .unwrap_or_else(|e| panic!("close: {e}"));
+        let res = app_events(&state.db, &app, false, true, Utc::now(), 50)
+            .await
+            .unwrap_or_else(|e| panic!("events: {e}"));
+        let up = res
+            .events
+            .iter()
+            .find(|e| e.kind == AppEventKind::UptimeUp)
+            .unwrap_or_else(|| panic!("no up event: {:?}", res.events));
+        assert_eq!(up.title, "Back up after 3 min");
+        let down = res
+            .events
+            .iter()
+            .find(|e| e.kind == AppEventKind::UptimeDown)
+            .unwrap_or_else(|| panic!("no down event"));
+        assert_eq!(down.title, "Went down: server error (5xx)");
+        assert_eq!(down.severity, "danger");
+        let hidden = app_events(&state.db, &app, false, false, Utc::now(), 50)
+            .await
+            .unwrap_or_else(|e| panic!("events: {e}"));
+        assert!(
+            !hidden
+                .events
+                .iter()
+                .any(|e| e.kind == AppEventKind::UptimeDown)
         );
     }
 

@@ -13,12 +13,11 @@
 // The window's p95 is approximated by the request-weighted mean of the
 // per-minute p95 values.
 //
-// Disk-full forecast: a linear regression over the last 24 hours of host disk
-// usage. The metrics collector hands the engine a disk reading every tick
-// (`record_disk`); one point is kept per 5 minutes (at most 288 points, a few
-// KiB) in memory, so a restart starts a fresh history.
+// Disk-full forecast: the host history's persisted trend
+// (`metrics::host::disk_full_eta`, least squares over 24 h and 7 d of
+// minute/hour rows), so it survives restarts; the sooner ETA counts.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use sqlx::SqlitePool;
@@ -82,45 +81,11 @@ pub async fn request_windows(
 
 // ── Disk forecast ────────────────────────────────────────────────────────────
 
-const DISK_STEP_SECS: i64 = 300;
-const DISK_SPAN_SECS: i64 = 24 * 3600;
-/// Need at least this much history before forecasting.
-const DISK_MIN_SPAN_SECS: i64 = 3600;
+/// How long a computed forecast is reused (the history moves once a minute;
+/// rules are evaluated every 30 s).
+const FORECAST_TTL_SECS: i64 = 300;
 
-/// (unix seconds, used bytes, total bytes)
-static DISK: Mutex<VecDeque<(i64, f64, f64)>> = Mutex::new(VecDeque::new());
-
-/// Remember a disk reading (called on every metrics tick; one point is kept
-/// per 5 minutes).
-pub fn record_disk(now: i64, used: u64, total: u64) {
-    if total == 0 {
-        return;
-    }
-    let mut ring = DISK.lock().unwrap_or_else(|e| e.into_inner());
-    push_point(&mut ring, now, used as f64, total as f64);
-}
-
-fn push_point(ring: &mut VecDeque<(i64, f64, f64)>, now: i64, used: f64, total: f64) {
-    if ring
-        .back()
-        .is_some_and(|(t, _, _)| now - t < DISK_STEP_SECS)
-    {
-        return;
-    }
-    ring.push_back((now, used, total));
-    while ring
-        .front()
-        .is_some_and(|(t, _, _)| now - t > DISK_SPAN_SECS)
-    {
-        ring.pop_front();
-    }
-}
-
-/// Forecast from the in-memory history.
-pub fn disk_forecast() -> Forecast {
-    let ring = DISK.lock().unwrap_or_else(|e| e.into_inner());
-    forecast(ring.iter().copied())
-}
+static FORECAST: Mutex<Option<(i64, Forecast)>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Forecast {
@@ -132,71 +97,81 @@ pub enum Forecast {
     HoursLeft(f64),
 }
 
-/// Least-squares slope of used bytes over time, projected to the total.
-pub fn forecast(points: impl Iterator<Item = (i64, f64, f64)>) -> Forecast {
-    let pts: Vec<(i64, f64, f64)> = points.collect();
-    let (Some(first), Some(last)) = (pts.first(), pts.last()) else {
-        return Forecast::Unknown;
+/// Turn the host history's forecast into what the rule compares.
+pub fn from_eta(eta: &crate::metrics::host::DiskEta) -> Forecast {
+    match eta.eta_secs {
+        Some(secs) => Forecast::HoursLeft(secs as f64 / 3600.0),
+        None if eta.day.status == "stable" || eta.week.status == "stable" => Forecast::NotFilling,
+        None => Forecast::Unknown,
+    }
+}
+
+/// Disk-full forecast from the persisted host history
+/// (`metrics::host::disk_full_eta`: 24 h and 7 d trends, survives restarts),
+/// cached for a few minutes.
+pub async fn disk_forecast(db: &SqlitePool, now: i64) -> Forecast {
+    let cached = *FORECAST.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, f)) = cached
+        && now - at < FORECAST_TTL_SECS
+    {
+        return f;
+    }
+    let f = match crate::metrics::host::disk_full_eta(db, now).await {
+        Ok(eta) => from_eta(&eta),
+        Err(e) => {
+            tracing::debug!("alerts: disk forecast unavailable: {e}");
+            Forecast::Unknown
+        }
     };
-    if pts.len() < 6 || last.0 - first.0 < DISK_MIN_SPAN_SECS {
-        return Forecast::Unknown;
-    }
-    let n = pts.len() as f64;
-    let t0 = first.0;
-    let mean_t = pts.iter().map(|p| (p.0 - t0) as f64).sum::<f64>() / n;
-    let mean_u = pts.iter().map(|p| p.1).sum::<f64>() / n;
-    let (mut num, mut den) = (0.0, 0.0);
-    for p in &pts {
-        let dt = (p.0 - t0) as f64 - mean_t;
-        num += dt * (p.1 - mean_u);
-        den += dt * dt;
-    }
-    if den <= 0.0 {
-        return Forecast::Unknown;
-    }
-    let slope = num / den; // bytes per second
-    // Below ~1 MiB/day is noise, not a trend.
-    if slope <= 1_048_576.0 / 86_400.0 {
-        return Forecast::NotFilling;
-    }
-    let free = (last.2 - last.1).max(0.0);
-    Forecast::HoursLeft(free / slope / 3600.0)
+    *FORECAST.lock().unwrap_or_else(|e| e.into_inner()) = Some((now, f));
+    f
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-
     #[test]
-    fn steady_growth_is_projected_to_full() {
-        // 100 GiB disk, 50 GiB used, +1 GiB per hour for 6 hours.
-        let pts = (0..=72).map(|i| (i * 300, 50.0 * GIB + i as f64 * GIB / 12.0, 100.0 * GIB));
-        match forecast(pts) {
-            Forecast::HoursLeft(h) => assert!((h - 44.0).abs() < 0.5, "{h}"),
-            other => panic!("expected a forecast, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn flat_or_short_histories_do_not_forecast() {
-        let flat = (0..=72).map(|i| (i * 300, 50.0 * GIB, 100.0 * GIB));
-        assert_eq!(forecast(flat), Forecast::NotFilling);
-        let short = (0..5).map(|i| (i * 300, i as f64 * GIB, 100.0 * GIB));
-        assert_eq!(forecast(short), Forecast::Unknown);
-        assert_eq!(forecast(std::iter::empty()), Forecast::Unknown);
-    }
-
-    #[test]
-    fn the_ring_keeps_one_point_per_step_for_a_day() {
-        let mut ring = VecDeque::new();
-        for t in (0..(2 * 86_400)).step_by(30) {
-            push_point(&mut ring, t, 1.0, 2.0);
-        }
-        assert!(ring.len() <= 289, "{}", ring.len());
-        let span = ring.back().map(|p| p.0).unwrap_or(0) - ring.front().map(|p| p.0).unwrap_or(0);
-        assert!(span <= DISK_SPAN_SECS);
+    fn forecasts_map_from_the_host_history() {
+        use crate::metrics::host_history::{DiskEta, DiskForecast};
+        let w = |window, status, eta_secs| DiskForecast {
+            window,
+            status,
+            growth_per_day: 0.0,
+            eta_secs,
+            samples: 100,
+        };
+        let eta = |day, week, eta_secs| DiskEta {
+            used: 1,
+            total: 2,
+            day,
+            week,
+            eta_secs,
+        };
+        assert_eq!(
+            from_eta(&eta(
+                w("24h", "filling", Some(7200)),
+                w("7d", "stable", None),
+                Some(7200)
+            )),
+            Forecast::HoursLeft(2.0)
+        );
+        assert_eq!(
+            from_eta(&eta(
+                w("24h", "stable", None),
+                w("7d", "insufficient_data", None),
+                None
+            )),
+            Forecast::NotFilling
+        );
+        assert_eq!(
+            from_eta(&eta(
+                w("24h", "insufficient_data", None),
+                w("7d", "insufficient_data", None),
+                None
+            )),
+            Forecast::Unknown
+        );
     }
 
     #[tokio::test]

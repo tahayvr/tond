@@ -15,7 +15,10 @@
 //              no dockerd load — computes CPU and network *rates* against the
 //              previous reading, and writes one small row per target in a
 //              single transaction (store.rs). The host gauges are sampled in
-//              the same tick and cached for /api/system/metrics (host.rs).
+//              the same tick and cached for /api/system/metrics (host.rs);
+//              they also become one host_1m row a minute (host_history.rs),
+//              and every 30 minutes the tick starts a `docker system df`
+//              refresh in the background (docker_host.rs).
 //   Rollups    When a 5-minute / 1-hour bucket closes, it is rolled up.
 //              Retention is the janitor's job (store::prune).
 //   Events     Restarts (a container that exited on its own and was started
@@ -27,7 +30,9 @@
 //              deltas catch what the event stream missed.
 
 pub mod cgroup;
+pub mod docker_host;
 pub mod host;
+pub mod host_history;
 pub mod store;
 
 use std::collections::HashMap;
@@ -50,6 +55,8 @@ pub use store::{EventKind, Owner, Sample, TargetKind};
 pub const TICK: Duration = Duration::from_secs(30);
 /// Delay before the first tick, so host CPU has a baseline to diff against.
 const FIRST_TICK: Duration = Duration::from_secs(5);
+/// The first `docker system df` waits until startup work is done.
+const FIRST_DF_AFTER: Duration = Duration::from_secs(120);
 /// A die this soon after a kill/stop request was requested, not a crash.
 const REQUESTED_WINDOW_SECS: i64 = 60;
 /// An unrequested exit not followed by a start within this long is a crash.
@@ -274,6 +281,9 @@ pub struct Collector {
     /// Changes to the owner tables (runtime::changes): the resolver is
     /// reloaded only when one moved, not on every tick.
     owner_changes: Vec<tokio::sync::watch::Receiver<u64>>,
+    host_history: host_history::HostHistory,
+    /// When the next background `docker system df` is due.
+    next_df: Instant,
 }
 
 /// Reload the owner tables at least this often even without a change
@@ -300,6 +310,8 @@ impl Collector {
             .into_iter()
             .map(changes::subscribe)
             .collect(),
+            host_history: host_history::HostHistory::default(),
+            next_df: Instant::now() + FIRST_DF_AFTER,
         }
     }
 
@@ -613,7 +625,17 @@ impl Collector {
     pub async fn tick(&mut self, state: &AppState, host: &mut host::HostSampler) {
         let now = now_unix();
         let at = Instant::now();
-        host.sample(now);
+        let snapshot = host.sample(now);
+        if let Err(e) = self.host_history.record(&state.db, &snapshot).await {
+            tracing::warn!("metrics: cannot store host history: {}", e);
+        }
+        if at >= self.next_df {
+            self.next_df = at + docker_host::DF_EVERY;
+            let docker = state.docker.clone();
+            tokio::spawn(async move {
+                docker_host::refresh_disk(&docker, &secret_file::data_dir()).await;
+            });
+        }
 
         // Idle servers tick with nothing new: skip re-reading four tables.
         if self.owners_stale() {

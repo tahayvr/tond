@@ -184,6 +184,22 @@ pub const RETENTION_RULES: &[RetentionRule] = &[
         max: 365,
         unit: "days",
     },
+    // Hourly uptime rollups and incidents (probe-level rows: fixed 48 h).
+    RetentionRule {
+        key: "retention_uptime_days",
+        default: 90,
+        min: 7,
+        max: 365,
+        unit: "days",
+    },
+    // Hourly host history (minute rows: fixed 48 h).
+    RetentionRule {
+        key: "retention_host_history_days",
+        default: 365,
+        min: 30,
+        max: 1095,
+        unit: "days",
+    },
 ];
 
 /// The rule for a settings key.

@@ -51,7 +51,8 @@ export function relativeTime(iso: string | null, now: number = Date.now()): stri
 
 const LOOP_LABELS: Record<string, string> = {
 	health: 'Health checks',
-	metrics: 'Container metrics',
+	metrics: 'Container and host metrics',
+	uptime: 'Uptime checks and heartbeat',
 	alerts: 'Alert rules',
 	cron: 'Cron scheduler',
 	janitor: 'Retention cleanup',

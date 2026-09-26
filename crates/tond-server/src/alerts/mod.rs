@@ -6,14 +6,16 @@
 //                queues deliveries
 //   deliver.rs   sends due deliveries, records failures, retries
 //   quiet.rs     quiet hours (global and per channel)
-//   sources.rs   request metrics and disk forecast interfaces
+//   sources.rs   request metrics and disk forecast interfaces (the forecast
+//                is the host history's, metrics::host::disk_full_eta)
 //
 // When it runs — no polling loop of its own:
 //   - on the metrics collector's 30 s tick (`on_metrics_tick`, inline in the
 //     collector task, so it costs no extra wakeup), while any rule exists;
 //   - in the "alerts" loop when something event-style rules watch changes:
 //     deployments, snapshots, certificates, cron jobs, container events
-//     (`kick`), or the rules themselves. With no rules the loop only watches
+//     (`kick`; uptime checks going down or up kick too), or the rules
+//     themselves. With no rules the loop only watches
 //     alert_rules and sleeps;
 //   - the same loop sends deliveries and sleeps until the next retry or the
 //     end of quiet hours.
@@ -35,7 +37,7 @@ use tond_common::AlertRule;
 use crate::notifications::{self, Notice};
 use crate::runtime::changes::{self, Table, Watch};
 use crate::runtime::loops::{self, Wake};
-use crate::{metrics, secrets, state::AppState};
+use crate::{secrets, state::AppState};
 use evaluate::Source;
 
 /// Enabled rules, as last counted by the alert loop (-1 = not yet known).
@@ -67,9 +69,6 @@ fn now_unix() -> i64 {
 
 /// Called by the metrics collector at the end of every tick.
 pub async fn on_metrics_tick(state: &AppState, now: i64) {
-    if let Some(s) = metrics::host::snapshot() {
-        sources::record_disk(now, s.disk_used, s.disk_total);
-    }
     if ENABLED_RULES.load(Ordering::Relaxed) == 0 {
         return;
     }

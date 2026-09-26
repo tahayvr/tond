@@ -1,13 +1,16 @@
 <script lang="ts">
 	import { safeUrl } from '$lib/utils';
 	import StatusBadge from '$lib/components/feedback/status-badge.svelte';
+	import UptimeBadge from '$lib/components/uptime/UptimeBadge.svelte';
 	import type { App } from '$lib/api';
 
 	interface Props {
 		app: App;
+		/** Link to the Uptime tab; the uptime summary shows when set. */
+		uptimeHref?: string | null;
 	}
 
-	let { app }: Props = $props();
+	let { app, uptimeHref = null }: Props = $props();
 
 	const SOURCE_LABELS: Record<string, string> = {
 		git: 'Git — Public Repo',
@@ -45,6 +48,9 @@
 </script>
 
 <div class="space-y-4 pt-4">
+	{#if uptimeHref && app.domain}
+		<UptimeBadge appId={app.id} href={uptimeHref} />
+	{/if}
 	<div class="grid grid-cols-1 gap-4 sm:grid-cols-2 [&>*]:min-w-0">
 		<!-- Status -->
 		<div class="min-w-0 space-y-3 rounded border border-dotted p-4">

@@ -36,14 +36,20 @@ pub enum AppEventKind {
     AlertFired,
     /// A firing alert resolved.
     AlertResolved,
+    /// The app's public URL stopped answering (uptime check).
+    UptimeDown,
+    /// The app's public URL answers again.
+    UptimeUp,
 }
 
 impl AppEventKind {
     /// "info" | "success" | "warning" | "danger" — how the dashboard colours it.
     pub fn severity(self) -> &'static str {
         match self {
-            Self::DeploySucceeded | Self::CertIssued | Self::AlertResolved => "success",
-            Self::AlertFired => "danger",
+            Self::DeploySucceeded | Self::CertIssued | Self::AlertResolved | Self::UptimeUp => {
+                "success"
+            }
+            Self::AlertFired | Self::UptimeDown => "danger",
             Self::DeployFailed | Self::Crash | Self::Oom | Self::CertFailed => "danger",
             Self::Restart | Self::DeployCancelled => "warning",
             _ => "info",

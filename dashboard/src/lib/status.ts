@@ -38,7 +38,8 @@ const SUCCESS = new Set([
 	'connected',
 	'deployed',
 	'ready',
-	'installed'
+	'installed',
+	'up'
 ]);
 const PROGRESS = new Set([
 	'building',
@@ -66,7 +67,16 @@ const WARNING = new Set([
 	'firing',
 	'not_installed'
 ]);
-const DANGER = new Set(['failed', 'failure', 'error', 'expired', 'crashed', 'dead', 'invalid']);
+const DANGER = new Set([
+	'failed',
+	'failure',
+	'error',
+	'expired',
+	'crashed',
+	'dead',
+	'invalid',
+	'down'
+]);
 const PAUSED = new Set(['paused', 'disabled']);
 
 /** Kinds where `running` is work in progress rather than a healthy service. */
