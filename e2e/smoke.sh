@@ -22,6 +22,11 @@ set -euo pipefail
 #   E2E_CA_FILE           root CA of the ACME server (Pebble / LE staging). When set,
 #                         the test waits for a real certificate and verifies it
 #                         against this CA; when unset the TLS issuance check is skipped.
+#   E2E_CHALLTESTSRV      management URL of Pebble's challtestsrv (default
+#                         http://127.0.0.1:8055). With E2E_CA_FILE and E2E_APPS_DOMAIN,
+#                         the domains step orders a DNS-01 wildcard through it
+#                         (tond-server must run with TOND_DNS_TEST_PROVIDER=1, which
+#                         e2e/run.sh sets for --acme pebble; the installer never does).
 #   E2E_FIXTURE_DIR       static site pushed via `tond apps push`
 #                         (default: fixtures/static-site next to this script)
 #   E2E_CLEANUP           1 to delete the created resources at the end (default: 0)
@@ -34,6 +39,7 @@ PREVIEW="${E2E_PREVIEW_DOMAIN:-}"
 APPS_DOMAIN="${E2E_APPS_DOMAIN:-}"
 IP="${E2E_TARGET_IP:-127.0.0.1}"
 CA_FILE="${E2E_CA_FILE:-}"
+CHALLTESTSRV="${E2E_CHALLTESTSRV:-http://127.0.0.1:8055}"
 FIXTURE_DIR="${E2E_FIXTURE_DIR:-$(cd "$(dirname "$0")" && pwd)/fixtures/static-site}"
 CLEANUP="${E2E_CLEANUP:-0}"
 SOCK="/opt/tond/data/tond.sock"
@@ -132,7 +138,7 @@ wait_for_app_running() {
 }
 
 delete_e2e_resources() {
-    for app in e2e-whoami e2e-static e2e-rooted e2e-compose e2e-badport e2e-worker e2e-worker-domain e2e-auto; do
+    for app in e2e-whoami e2e-static e2e-rooted e2e-compose e2e-badport e2e-worker e2e-worker-domain e2e-auto e2e-wild; do
         tond apps delete "$app" -y > /dev/null 2>&1 || true
     done
     tond db delete e2e-redis -y > /dev/null 2>&1 || true
@@ -1246,6 +1252,104 @@ if [[ -n "$APPS_DOMAIN" ]]; then
     pass "deleting the app removes its network"
 else
     echo "  - E2E_APPS_DOMAIN not set; skipping the automatic hostname check"
+fi
+
+step "Domains: aliases, redirects, uploaded certificates, DNS-01 wildcard"
+ALIAS_DOMAIN="alias.${BASE}"
+SITE_DOMAIN="site.${BASE}"
+read -r code body < <(api_send POST /api/apps/e2e-whoami/domains "{\"domain\": \"${ALIAS_DOMAIN}\"}")
+[[ "$code" == 201 ]] || fail "adding an alias must succeed (got ${code}: ${body})"
+read -r code body < <(api_send POST /api/apps/e2e-whoami/domains/www-pair "{\"domain\": \"${SITE_DOMAIN}\", \"canonical\": \"apex\", \"primary\": false}")
+[[ "$code" == 201 ]] || fail "adding a www/apex pair must succeed (got ${code}: ${body})"
+[[ "$(app_field e2e-whoami domain)" == "$WHOAMI_DOMAIN" ]] || fail "adding aliases must keep the primary domain"
+wait_for 60 "route for ${ALIAS_DOMAIN}" \
+    bash -c "curl -sk --resolve '${ALIAS_DOMAIN}:443:${IP}' 'https://${ALIAS_DOMAIN}/' | grep -q Hostname:"
+pass "an alias serves the app (${ALIAS_DOMAIN})"
+redirect=$(curl -sk -o /dev/null -w '%{http_code} %{redirect_url}' --resolve "www.${SITE_DOMAIN}:443:${IP}" "https://www.${SITE_DOMAIN}/a/b?x=1&y=2")
+[[ "$redirect" == "308 https://${SITE_DOMAIN}/a/b?x=1&y=2" ]] \
+    || fail "www.${SITE_DOMAIN} must 308 to https://${SITE_DOMAIN} with path and query, got: ${redirect}"
+http_redirect=$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' --resolve "www.${SITE_DOMAIN}:80:${IP}" "http://www.${SITE_DOMAIN}/p?q=1")
+[[ "$http_redirect" == "308 https://${SITE_DOMAIN}/p?q=1" ]] \
+    || fail "port 80 must send a redirect domain straight to its target, got: ${http_redirect}"
+pass "the proxy answers redirect domains itself (308, path and query kept; port 80 goes straight to the target)"
+read -r code body < <(api_send DELETE "/api/apps/e2e-whoami/domains/${SITE_DOMAIN}" '{}')
+[[ "$code" == 400 && "$body" == *"redirects to"* ]] \
+    || fail "removing a redirect target must be refused (got ${code}: ${body})"
+pass "a domain other domains redirect to can't be removed"
+
+if command -v openssl > /dev/null; then
+    UPLOAD_DOMAIN="upload.${BASE}"
+    UPLOAD_DIR=$(mktemp -d)
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 \
+        -subj "/CN=${UPLOAD_DOMAIN}" -addext "subjectAltName=DNS:${UPLOAD_DOMAIN}" \
+        -keyout "${UPLOAD_DIR}/key.pem" -out "${UPLOAD_DIR}/cert.pem" 2> /dev/null
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 \
+        -subj "/CN=other" -keyout "${UPLOAD_DIR}/other.pem" -out /dev/null 2> /dev/null
+    upload_body() {
+        jq -n --arg d "$UPLOAD_DOMAIN" --rawfile c "${UPLOAD_DIR}/cert.pem" --rawfile k "$1" \
+            '{domain: $d, cert_pem: $c, key_pem: $k}'
+    }
+    read -r code body < <(api_send POST /api/certs/custom "$(upload_body "${UPLOAD_DIR}/other.pem")")
+    [[ "$code" == 400 && "$body" == *"doesn't belong to the certificate"* ]] \
+        || fail "an upload with the wrong key must be refused (got ${code}: ${body})"
+    read -r code body < <(api_send POST /api/certs/custom "$(upload_body "${UPLOAD_DIR}/key.pem")")
+    [[ "$code" == 201 ]] || fail "uploading a certificate must succeed (got ${code}: ${body})"
+    read -r code body < <(api_send POST /api/apps/e2e-whoami/domains "{\"domain\": \"${UPLOAD_DOMAIN}\"}")
+    [[ "$code" == 201 ]] || fail "adding ${UPLOAD_DOMAIN} must succeed (got ${code}: ${body})"
+    served=$(openssl s_client -connect "${IP}:443" -servername "$UPLOAD_DOMAIN" < /dev/null 2> /dev/null | openssl x509 -noout -fingerprint -sha256)
+    [[ "$served" == "$(openssl x509 -in "${UPLOAD_DIR}/cert.pem" -noout -fingerprint -sha256)" ]] \
+        || fail "tond-proxy must serve the uploaded certificate for ${UPLOAD_DOMAIN}"
+    api /api/certs | jq -e --arg d "$UPLOAD_DOMAIN" '.data[] | select(.domain == $d and .cert_type == "custom" and .issuer_kind == "uploaded" and .status == "active")' > /dev/null \
+        || fail "the uploaded certificate must be listed as custom/uploaded"
+    [[ "$(stat -c '%a %U' "${DATA_DIR}/certs/${UPLOAD_DOMAIN}/key.pem")" == "600 tond-proxy" ]] \
+        || fail "an uploaded key must be 600 tond-proxy, got: $(perms "${DATA_DIR}/certs/${UPLOAD_DOMAIN}/key.pem")"
+    pass "an uploaded certificate is validated, served and stored like tond-proxy's own (key 0600)"
+    read -r code body < <(api_send DELETE "/api/certs/custom/${UPLOAD_DOMAIN}" '{}')
+    [[ "$code" == 200 ]] || fail "removing the upload must succeed (got ${code}: ${body})"
+    [[ ! -e "${DATA_DIR}/certs/${UPLOAD_DOMAIN}" ]] || fail "removing an upload must delete its files"
+    pass "removing the upload deletes it (ACME takes the domain over)"
+    rm -rf "$UPLOAD_DIR"
+    tond apps domains remove e2e-whoami "$UPLOAD_DOMAIN" > /dev/null
+else
+    echo "  - openssl not installed; skipping the uploaded certificate check"
+fi
+tond apps domains remove e2e-whoami "www.${SITE_DOMAIN}" > /dev/null
+tond apps domains remove e2e-whoami "$SITE_DOMAIN" > /dev/null
+tond apps domains remove e2e-whoami "$ALIAS_DOMAIN" > /dev/null
+tond apps domains list e2e-whoami | grep -qF "$WHOAMI_DOMAIN" \
+    || fail "tond apps domains list must show ${WHOAMI_DOMAIN}"
+[[ "$(api /api/apps/e2e-whoami/domains | jq '.data | length')" == 1 ]] \
+    || fail "only the primary domain must be left: $(api /api/apps/e2e-whoami/domains | jq -c '.data')"
+pass "tond apps domains add/list/remove"
+
+if [[ -n "$CA_FILE" && -n "$APPS_DOMAIN" ]] && curl -s -o /dev/null "${CHALLTESTSRV}/"; then
+    WILDCARD="*.${APPS_DOMAIN}"
+    read -r code body < <(api_send POST /api/dns-providers "{\"name\": \"e2e challtestsrv\", \"kind\": \"challtestsrv\", \"zones\": [\"${APPS_DOMAIN}\"], \"token\": \"unused\", \"config\": {\"url\": \"${CHALLTESTSRV}\"}}")
+    [[ "$code" == 201 ]] || fail "creating the test DNS provider must succeed (got ${code}: ${body})"
+    DNS_PROVIDER_ID=$(jq -r .data.id <<< "$body")
+    [[ "$body" != *'"unused"'* ]] || fail "the DNS provider token must never be returned"
+    wait_for 240 "a DNS-01 wildcard certificate for ${WILDCARD}" \
+        bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/certs | jq -e '.data[] | select(.domain == \"${WILDCARD}\" and .status == \"active\" and .challenge == \"dns-01\")'"
+    pass "${WILDCARD} issued through DNS-01 (records published by tond-server via the provider)"
+    tond apps create e2e-wild --source-type image --source traefik/whoami:v1.10 --port 80 > /dev/null
+    tond apps deploy e2e-wild > /dev/null
+    wait_for_app_running e2e-wild 180
+    wait_for 60 "e2e-wild.${APPS_DOMAIN} served with a certificate signed by ${CA_FILE}" \
+        curl -sf --cacert "$CA_FILE" --resolve "e2e-wild.${APPS_DOMAIN}:443:${IP}" "https://e2e-wild.${APPS_DOMAIN}/"
+    if command -v openssl > /dev/null; then
+        openssl s_client -connect "${IP}:443" -servername "e2e-wild.${APPS_DOMAIN}" < /dev/null 2> /dev/null \
+            | openssl x509 -noout -ext subjectAltName | grep -qF "DNS:${WILDCARD}" \
+            || fail "e2e-wild.${APPS_DOMAIN} must be served by the ${WILDCARD} certificate"
+    fi
+    sleep 5
+    ! api /api/certs | jq -e --arg d "e2e-wild.${APPS_DOMAIN}" '.data[] | select(.domain == $d)' > /dev/null \
+        || fail "a host under the wildcard must not get a certificate of its own"
+    pass "a new app under the apps domain is served by the wildcard at once (no per-app order)"
+    tond apps delete e2e-wild -y > /dev/null
+    curl -sf --unix-socket "$SOCK" -X DELETE "http://localhost/api/dns-providers/${DNS_PROVIDER_ID}" > /dev/null \
+        || fail "deleting the DNS provider must succeed"
+else
+    echo "  - no ACME CA, apps domain or challtestsrv (${CHALLTESTSRV}); skipping the DNS-01 wildcard check"
 fi
 
 step "Per-deployment images and rollback"
