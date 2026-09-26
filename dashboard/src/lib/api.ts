@@ -51,8 +51,6 @@ export interface App {
 	preview_enabled: boolean;
 	/** Phase 4.6: env var keys excluded from preview containers */
 	preview_excluded_keys: string[];
-	/** Phase 4.6: override env vars for preview containers (key→value) */
-	preview_env_vars: Record<string, string>;
 	created_at: string;
 	updated_at: string;
 }
@@ -116,6 +114,8 @@ export interface User {
 	id: string;
 	email: string;
 	role: string;
+	/** Whether TOTP two-factor auth is active for this user */
+	totp_enabled: boolean;
 	created_at: string;
 }
 
@@ -221,11 +221,68 @@ export async function getAppLogs(
 	return request(`/apps/${id}/logs`);
 }
 
-export async function updateEnv(id: string, env_vars: Record<string, string>): Promise<void> {
-	await request(`/apps/${id}/env`, {
-		method: 'PUT',
-		body: JSON.stringify({ env_vars })
+// ── App environment variables ──
+// Values are secrets: the list endpoint returns masked values only, a single
+// value is fetched with an explicit reveal, and writes are per-key patches.
+
+export interface EnvVarEntry {
+	key: string;
+	/** Masked placeholder for a non-empty value, '' for an empty value */
+	masked: string;
+}
+
+export interface AppEnv {
+	vars: EnvVarEntry[];
+	preview: {
+		enabled: boolean;
+		/** App variables that preview containers do not receive */
+		excluded_keys: string[];
+		/** Values that replace or add variables in preview containers only */
+		overrides: EnvVarEntry[];
+	};
+}
+
+export interface EnvPatch {
+	set?: Record<string, string>;
+	unset?: string[];
+}
+
+export interface PreviewEnvPatch extends EnvPatch {
+	exclude?: string[];
+	include?: string[];
+}
+
+export async function getAppEnv(id: string): Promise<AppEnv> {
+	return request<AppEnv>(`/apps/${id}/env`);
+}
+
+/** Set and remove individual variables; variables not named are left unchanged. */
+export async function patchAppEnv(id: string, patch: EnvPatch): Promise<AppEnv> {
+	return request<AppEnv>(`/apps/${id}/env`, {
+		method: 'PATCH',
+		body: JSON.stringify(patch)
 	});
+}
+
+export async function revealAppEnvVar(id: string, key: string): Promise<string> {
+	const res = await request<{ key: string; value: string }>(
+		`/apps/${id}/env/${encodeURIComponent(key)}`
+	);
+	return res.value;
+}
+
+export async function patchPreviewEnv(id: string, patch: PreviewEnvPatch): Promise<AppEnv> {
+	return request<AppEnv>(`/apps/${id}/preview-env`, {
+		method: 'PATCH',
+		body: JSON.stringify(patch)
+	});
+}
+
+export async function revealPreviewEnvVar(id: string, key: string): Promise<string> {
+	const res = await request<{ key: string; value: string }>(
+		`/apps/${id}/preview-env/${encodeURIComponent(key)}`
+	);
+	return res.value;
 }
 
 export async function updateDomain(id: string, domain: string): Promise<void> {
@@ -689,15 +746,11 @@ export async function deletePreview(id: string, previewId: string): Promise<void
 	await request(`/apps/${id}/previews/${previewId}`, { method: 'DELETE' });
 }
 
-export async function updatePreviewConfig(
-	id: string,
-	preview_enabled: boolean,
-	preview_excluded_keys?: string[],
-	preview_env_vars?: Record<string, string>
-): Promise<void> {
+/** Enable or disable PR previews. Preview env is edited with patchPreviewEnv(). */
+export async function updatePreviewConfig(id: string, preview_enabled: boolean): Promise<void> {
 	await request(`/apps/${id}/preview-config`, {
 		method: 'PUT',
-		body: JSON.stringify({ preview_enabled, preview_excluded_keys, preview_env_vars })
+		body: JSON.stringify({ preview_enabled })
 	});
 }
 

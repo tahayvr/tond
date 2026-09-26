@@ -20,6 +20,7 @@ describe('auth state', () => {
 				id: 'usr_1',
 				email: 'admin@example.com',
 				role: 'admin',
+				totp_enabled: false,
 				created_at: '2026-01-01T00:00:00.000Z'
 			}
 		});
@@ -57,6 +58,7 @@ describe('auth state', () => {
 			id: 'usr_1',
 			email: 'admin@example.com',
 			role: 'admin',
+			totp_enabled: false,
 			created_at: '2026-01-01T00:00:00.000Z'
 		});
 		await auth.checkAuth();
@@ -89,6 +91,7 @@ describe('auth state', () => {
 			id: 'usr_2',
 			email: 'member@example.com',
 			role: 'member',
+			totp_enabled: false,
 			created_at: '2026-01-01T00:00:00.000Z'
 		});
 

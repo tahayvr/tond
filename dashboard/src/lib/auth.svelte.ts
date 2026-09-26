@@ -32,6 +32,7 @@ export async function checkAuth(): Promise<void> {
 			id: 'dev',
 			email: 'dev@localhost',
 			role: 'admin',
+			totp_enabled: false,
 			created_at: '1970-01-01T00:00:00.000Z'
 		};
 		return;

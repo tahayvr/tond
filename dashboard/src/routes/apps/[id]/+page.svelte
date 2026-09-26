@@ -7,7 +7,6 @@
 		startApp,
 		restartApp,
 		deleteApp,
-		updateEnv,
 		updateDomain,
 		updateHealth,
 		updateDrainTimeout,
@@ -86,10 +85,6 @@
 
 	// Status polling — auto-starts when app is building, stops on terminal status
 	let statusInterval: ReturnType<typeof setInterval> | null = null;
-
-	// Env form
-	let envSaving = $state(false);
-	let envError = $state('');
 
 	// Domain form
 	let domainInput = $state('');
@@ -351,33 +346,16 @@
 		}
 	}
 
-	async function handleSaveEnv(
-		envVars: Record<string, string>,
-		credentialId: string | null,
-		previewExcludedKeys: string[],
-		previewEnvVars: Record<string, string>
-	) {
-		envSaving = true;
-		envError = '';
-		try {
-			await updateEnv(appId, envVars);
-			// If source is image and credential changed, persist it too
-			if (app?.source_type === 'image' && credentialId !== app.registry_credential_id) {
-				await setAppRegistryCredential(appId, credentialId);
-			}
-			// Persist scoped secrets alongside the preview toggle state
-			await updatePreviewConfig(
-				appId,
-				app?.preview_enabled ?? false,
-				previewExcludedKeys,
-				previewEnvVars
-			);
-			await loadApp();
-		} catch (e: any) {
-			envError = e.message;
-		} finally {
-			envSaving = false;
-		}
+	// Environment tab: errors are shown inside the tab, so these rethrow.
+	async function handleEnvRegistryCredential(credentialId: string | null) {
+		await setAppRegistryCredential(appId, credentialId);
+		await loadApp();
+	}
+
+	async function handleEnvRedeploy() {
+		openFeedPanel();
+		await deployApp(appId);
+		await loadApp();
 	}
 
 	async function handleUpdateDomain() {
@@ -1021,15 +999,12 @@
 			<!-- Environment tab -->
 			<Tabs.Content value="env">
 				<AppEnvironment
+					appId={app.id}
 					sourceType={app.source_type}
 					{registryCredentials}
 					registryCredentialId={app.registry_credential_id}
-					saving={envSaving}
-					saveError={envError}
-					previewEnabled={app.preview_enabled}
-					previewExcludedKeys={app.preview_excluded_keys}
-					previewEnvVars={app.preview_env_vars}
-					onSave={handleSaveEnv}
+					onRegistryCredentialChange={handleEnvRegistryCredential}
+					onRedeploy={handleEnvRedeploy}
 				/>
 			</Tabs.Content>
 

@@ -24,7 +24,6 @@ const api = vi.hoisted(() => ({
 	startApp: vi.fn(),
 	restartApp: vi.fn(),
 	deleteApp: vi.fn(),
-	updateEnv: vi.fn(),
 	updateDomain: vi.fn(),
 	updateHealth: vi.fn(),
 	updateDrainTimeout: vi.fn(),
@@ -151,7 +150,6 @@ const app: App = {
 	static_build: false,
 	preview_enabled: false,
 	preview_excluded_keys: [],
-	preview_env_vars: {},
 	created_at: '2026-01-01T00:00:00.000Z',
 	updated_at: '2026-01-01T00:00:00.000Z'
 };
@@ -261,10 +259,9 @@ describe('apps/[id] page', () => {
 		expect(api.getApp).not.toHaveBeenCalled();
 	});
 
-	it('saves environment changes and persists preview config', async () => {
-		api.updateEnv.mockResolvedValue(undefined);
-		api.updatePreviewConfig.mockResolvedValue(undefined);
+	it('wires the environment tab to the registry credential and redeploy actions', async () => {
 		api.setAppRegistryCredential.mockResolvedValue(undefined);
+		api.deployApp.mockResolvedValue(undefined);
 		api.getApp.mockResolvedValue({
 			...app,
 			source_type: 'image',
@@ -275,13 +272,13 @@ describe('apps/[id] page', () => {
 		renderPage({ ...app, source_type: 'image', registry_credential_id: null });
 
 		await user.click(screen.getByRole('tab', { name: /environment/i }));
-		await user.click(screen.getByRole('button', { name: /save environment/i }));
+		expect(screen.getByText('Environment for app_1')).toBeInTheDocument();
 
-		expect(api.updateEnv).toHaveBeenCalledWith('app_1', { API_KEY: 'secret' });
+		await user.click(screen.getByRole('button', { name: /attach credential/i }));
 		expect(api.setAppRegistryCredential).toHaveBeenCalledWith('app_1', 'cred_1');
-		expect(api.updatePreviewConfig).toHaveBeenCalledWith('app_1', false, ['API_KEY'], {
-			API_KEY: 'preview-secret'
-		});
+
+		await user.click(screen.getByRole('button', { name: /redeploy from environment/i }));
+		expect(api.deployApp).toHaveBeenCalledWith('app_1');
 		expect(api.getApp).toHaveBeenCalledWith('app_1');
 	});
 

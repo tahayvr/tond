@@ -39,6 +39,8 @@ import {
 	MOCK_STORAGE_PROVIDERS,
 	MOCK_SNAPSHOTS,
 	MOCK_BACKUP_CONFIG,
+	MOCK_APP_ENV_VARS,
+	MOCK_PREVIEW_ENV_VARS,
 	makeMockSystemMetrics,
 	makeMockAppMetrics
 } from './fixtures';
@@ -96,6 +98,57 @@ let integrations: Integration[] = structuredClone(MOCK_INTEGRATIONS);
 let storageProviders: StorageProvider[] = structuredClone(MOCK_STORAGE_PROVIDERS);
 let snapshots: Snapshot[] = structuredClone(MOCK_SNAPSHOTS);
 let backupConfig: BackupConfig = structuredClone(MOCK_BACKUP_CONFIG);
+// app_id → env vars / preview overrides (plaintext; only masked values leave the mock)
+const appEnvVars: Record<string, Record<string, string>> = structuredClone(MOCK_APP_ENV_VARS);
+const previewEnvVars: Record<string, Record<string, string>> = structuredClone(
+	MOCK_PREVIEW_ENV_VARS
+);
+
+function envStore(appId: string) {
+	return (appEnvVars[appId] ??= {});
+}
+
+function previewStore(appId: string) {
+	return (previewEnvVars[appId] ??= {});
+}
+
+function maskedEntries(vars: Record<string, string>) {
+	return Object.keys(vars)
+		.sort()
+		.map((key) => ({ key, masked: vars[key] ? '••••••••' : '' }));
+}
+
+function appEnvResponse(app: App) {
+	return {
+		vars: maskedEntries(envStore(app.id)),
+		preview: {
+			enabled: app.preview_enabled,
+			excluded_keys: app.preview_excluded_keys,
+			overrides: maskedEntries(previewStore(app.id))
+		}
+	};
+}
+
+function validateEnvPatch(body: { set?: Record<string, string>; unset?: string[] }) {
+	const set = Object.keys(body.set ?? {});
+	const unset = body.unset ?? [];
+	if (set.length === 0 && unset.length === 0) {
+		return 'Invalid input: nothing to change: send at least one variable to set or unset';
+	}
+	const bad = [...set, ...unset].find((key) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key));
+	if (bad) return `Invalid input: '${bad}' is not a valid variable name`;
+	return null;
+}
+
+function applyEnvPatch(
+	current: Record<string, string>,
+	body: { set?: Record<string, string>; unset?: string[] }
+) {
+	const next = { ...current, ...(body.set ?? {}) };
+	for (const key of body.unset ?? []) delete next[key];
+	return next;
+}
+
 // alert_id → AlertIntegrationLink[]
 let alertIntegrationLinks: Record<string, AlertIntegrationLink[]> = {
 	alert_1: [
@@ -179,6 +232,7 @@ export const handlers = [
 			id: `usr_${Date.now()}`,
 			email: body.email,
 			role: body.role ?? 'member',
+			totp_enabled: false,
 			created_at: new Date().toISOString()
 		};
 		users = [...users, newUser];
@@ -420,7 +474,6 @@ export const handlers = [
 			static_build: body.static_build ?? false,
 			preview_enabled: false,
 			preview_excluded_keys: [],
-			preview_env_vars: {},
 			created_at: new Date().toISOString(),
 			updated_at: new Date().toISOString()
 		};
@@ -478,11 +531,64 @@ export const handlers = [
 		return ok(null);
 	}),
 
-	http.put('/api/apps/:id/env', async ({ params }) => {
+	// ── App environment (masked reads, per-key patches) ──
+
+	http.get('/api/apps/:id/env', async ({ params }) => {
 		await delay(LATENCY);
 		const app = apps.find((a) => a.id === params.id);
 		if (!app) return err('App not found', 404);
-		return ok(null);
+		return ok(appEnvResponse(app));
+	}),
+
+	http.get('/api/apps/:id/env/:key', async ({ params }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id);
+		if (!app) return err('App not found', 404);
+		const value = envStore(app.id)[params.key as string];
+		if (value === undefined) return err(`Not found: variable '${params.key}'`, 404);
+		return ok({ key: params.key, value });
+	}),
+
+	http.patch('/api/apps/:id/env', async ({ params, request }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id);
+		if (!app) return err('App not found', 404);
+		const body = (await request.json()) as { set?: Record<string, string>; unset?: string[] };
+		const problem = validateEnvPatch(body);
+		if (problem) return err(problem);
+		appEnvVars[app.id] = applyEnvPatch(envStore(app.id), body);
+		return ok(appEnvResponse(app));
+	}),
+
+	http.get('/api/apps/:id/preview-env/:key', async ({ params }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id);
+		if (!app) return err('App not found', 404);
+		const value = previewStore(app.id)[params.key as string];
+		if (value === undefined) return err(`Not found: preview override '${params.key}'`, 404);
+		return ok({ key: params.key, value });
+	}),
+
+	http.patch('/api/apps/:id/preview-env', async ({ params, request }) => {
+		await delay(LATENCY);
+		const idx = apps.findIndex((a) => a.id === params.id);
+		if (idx === -1) return err('App not found', 404);
+		const body = (await request.json()) as {
+			set?: Record<string, string>;
+			unset?: string[];
+			exclude?: string[];
+			include?: string[];
+		};
+		const hasExclusions = (body.exclude?.length ?? 0) + (body.include?.length ?? 0) > 0;
+		const problem = hasExclusions && !body.set && !body.unset ? null : validateEnvPatch(body);
+		if (problem) return err(problem);
+		const app = apps[idx];
+		previewEnvVars[app.id] = applyEnvPatch(previewStore(app.id), body);
+		const excluded = new Set(app.preview_excluded_keys);
+		for (const key of body.exclude ?? []) excluded.add(key);
+		for (const key of body.include ?? []) excluded.delete(key);
+		apps[idx] = { ...app, preview_excluded_keys: [...excluded].sort() };
+		return ok(appEnvResponse(apps[idx]));
 	}),
 
 	http.put('/api/apps/:id/domain', async ({ params, request }) => {
@@ -754,19 +860,13 @@ export const handlers = [
 		await delay(LATENCY);
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx === -1) return err('App not found', 404);
-		const body = (await request.json()) as {
-			preview_enabled: boolean;
-			preview_excluded_keys?: string[];
-			preview_env_vars?: Record<string, string>;
-		};
+		const body = (await request.json()) as { preview_enabled: boolean };
 		apps[idx] = {
 			...apps[idx],
 			preview_enabled: body.preview_enabled,
-			preview_excluded_keys: body.preview_excluded_keys ?? apps[idx].preview_excluded_keys,
-			preview_env_vars: body.preview_env_vars ?? apps[idx].preview_env_vars,
 			updated_at: new Date().toISOString()
 		};
-		return ok(apps[idx]);
+		return ok({ preview_enabled: body.preview_enabled });
 	}),
 
 	// ── Project Previews ──────────────────────────────────────────────────────

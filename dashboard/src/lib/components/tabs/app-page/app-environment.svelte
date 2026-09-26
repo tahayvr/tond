@@ -1,495 +1,532 @@
 <script lang="ts">
-	import { Label } from '$lib/components/ui/label/index.js';
-	import { Input } from '$lib/components/ui/input/index.js';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Separator } from '$lib/components/ui/separator/index.js';
+	import { Skeleton } from '$lib/components/ui/skeleton/index.js';
 	import * as Dialog from '$lib/components/ui/dialog/index.js';
 	import * as Select from '$lib/components/ui/select/index.js';
-	import { SvelteSet } from 'svelte/reactivity';
+	import EnvVarTable from '$lib/components/env/env-var-table.svelte';
+	import EnvVarDialog, { type EnvVarDialogResult } from '$lib/components/env/env-var-dialog.svelte';
+	import EnvImportDialog from '$lib/components/env/env-import-dialog.svelte';
+	import { SvelteMap } from 'svelte/reactivity';
 	import { untrack } from 'svelte';
-	import type { RegistryCredential } from '$lib/api';
+	import {
+		getAppEnv,
+		patchAppEnv,
+		patchPreviewEnv,
+		revealAppEnvVar,
+		revealPreviewEnvVar,
+		type AppEnv,
+		type RegistryCredential
+	} from '$lib/api';
 	import Plus from '~icons/ri/add-line';
-	import Trash2 from '~icons/ri/delete-bin-line';
-	import Pencil from '~icons/ri/pencil-line';
-	import Eye from '~icons/ri/eye-line';
-	import EyeOff from '~icons/ri/eye-off-line';
-	import Copy from '~icons/ri/file-copy-line';
-	import Check from '~icons/ri/check-line';
+	import FileUpload from '~icons/ri/file-upload-line';
+	import Refresh from '~icons/ri/refresh-line';
+
+	type Target = 'env' | 'preview';
 
 	interface Props {
+		appId: string;
 		/** Source type of the app — registry section only shown for image sources */
 		sourceType: string;
 		registryCredentials: RegistryCredential[];
 		registryCredentialId: string | null;
-		saving: boolean;
-		saveError: string;
-		/** Whether PR preview deployments are enabled for this app */
-		previewEnabled: boolean;
-		/** Keys excluded from preview containers */
-		previewExcludedKeys: string[];
-		/** Override env vars for preview containers */
-		previewEnvVars: Record<string, string>;
-		onSave: (
-			envVars: Record<string, string>,
-			credentialId: string | null,
-			previewExcludedKeys: string[],
-			previewEnvVars: Record<string, string>
-		) => void;
+		onRegistryCredentialChange: (credentialId: string | null) => Promise<void>;
+		/** Redeploy the app so saved changes reach the container */
+		onRedeploy: () => Promise<void>;
 	}
 
 	let {
+		appId,
 		sourceType,
 		registryCredentials,
 		registryCredentialId,
-		saving,
-		saveError,
-		previewEnabled,
-		previewExcludedKeys,
-		previewEnvVars,
-		onSave
+		onRegistryCredentialChange,
+		onRedeploy
 	}: Props = $props();
 
-	// Local mutable state — values are write-only from API, so we maintain them locally.
-	let envVars = $state<Record<string, string>>({});
-	let selectedCredentialId: string | undefined = $derived(registryCredentialId ?? undefined);
+	let env = $state<AppEnv | null>(null);
+	let loading = $state(true);
+	let loadError = $state('');
+	let actionError = $state('');
+	let notice = $state('');
+	/** Saved changes that the running container has not picked up yet */
+	let pendingDeploy = $state(false);
+	let redeploying = $state(false);
 
-	// Scoped secrets state — initialised from props
-	let excludedKeys = new SvelteSet<string>(untrack(() => previewExcludedKeys));
-	let previewOverrides = $state<Record<string, string>>(untrack(() => ({ ...previewEnvVars })));
-
-	// Dialog state (shared for both env vars and preview overrides)
-	let dialogOpen = $state(false);
-	let dialogTarget = $state<'env' | 'preview'>('env');
-	/** null = adding new, string = editing existing key */
-	let editingKey = $state<string | null>(null);
-	let newKey = $state('');
-	let newValue = $state('');
-	let dialogError = $state('');
-
-	let entries = $derived(Object.entries(envVars));
-	let previewOverrideEntries = $derived(Object.entries(previewOverrides));
-	let isImage = $derived(sourceType === 'image');
-
-	// Per-row reveal and copy state, keyed by env var key
-	let revealedKeys = new SvelteSet<string>();
+	// Plaintext values revealed on request, per target. Cleared when a value changes.
+	const revealed = {
+		env: new SvelteMap<string, string>(),
+		preview: new SvelteMap<string, string>()
+	};
+	let busyKey = $state<string | null>(null);
 	let copiedKey = $state<string | null>(null);
 	let copyTimeout: ReturnType<typeof setTimeout> | null = null;
 
-	function toggleReveal(key: string) {
-		if (revealedKeys.has(key)) {
-			revealedKeys.delete(key);
-		} else {
-			revealedKeys.add(key);
+	// Add/edit dialog
+	let dialogOpen = $state(false);
+	let dialogTarget = $state<Target>('env');
+	let editingKey = $state<string | null>(null);
+
+	// Import dialog
+	let importOpen = $state(false);
+	let importTarget = $state<Target>('env');
+
+	// Delete confirmation
+	let deleteOpen = $state(false);
+	let deleteTarget = $state<Target>('env');
+	let deleteKey = $state<string | null>(null);
+	let deleting = $state(false);
+	let deleteError = $state('');
+
+	let envKeys = $derived(env?.vars.map((v) => v.key) ?? []);
+	let overrideKeys = $derived(env?.preview.overrides.map((v) => v.key) ?? []);
+	let excluded = $derived(new Set(env?.preview.excluded_keys ?? []));
+	let previewEnabled = $derived(env?.preview.enabled ?? false);
+	let isImage = $derived(sourceType === 'image');
+	let selectedCredentialId = $derived(registryCredentialId ?? '');
+
+	function noun(target: Target) {
+		return target === 'env' ? 'variable' : 'preview override';
+	}
+
+	async function load() {
+		loading = true;
+		loadError = '';
+		try {
+			env = await getAppEnv(appId);
+		} catch (e: any) {
+			loadError = e.message ?? 'Could not load environment variables';
+		} finally {
+			loading = false;
 		}
 	}
 
-	async function handleCopy(key: string, value: string) {
-		await navigator.clipboard.writeText(value);
-		copiedKey = key;
-		if (copyTimeout) clearTimeout(copyTimeout);
-		copyTimeout = setTimeout(() => {
-			copiedKey = null;
-		}, 2000);
+	// Load once per app; switching apps drops revealed values and pending state.
+	$effect(() => {
+		void appId;
+		untrack(() => {
+			revealed.env.clear();
+			revealed.preview.clear();
+			pendingDeploy = false;
+			notice = '';
+			actionError = '';
+			load();
+		});
+	});
+
+	async function reveal(target: Target, key: string): Promise<string> {
+		const cached = revealed[target].get(key);
+		if (cached !== undefined) return cached;
+		const value =
+			target === 'env' ? await revealAppEnvVar(appId, key) : await revealPreviewEnvVar(appId, key);
+		revealed[target].set(key, value);
+		return value;
 	}
 
-	function openAdd(target: 'env' | 'preview' = 'env') {
+	async function handleToggleReveal(target: Target, key: string) {
+		if (revealed[target].has(key)) {
+			revealed[target].delete(key);
+			return;
+		}
+		busyKey = key;
+		actionError = '';
+		try {
+			await reveal(target, key);
+		} catch (e: any) {
+			actionError = e.message ?? `Could not reveal ${key}`;
+		} finally {
+			busyKey = null;
+		}
+	}
+
+	async function handleCopy(target: Target, key: string) {
+		busyKey = key;
+		actionError = '';
+		try {
+			const wasRevealed = revealed[target].has(key);
+			const value = await reveal(target, key);
+			// Copying does not reveal the value on screen.
+			if (!wasRevealed) revealed[target].delete(key);
+			await navigator.clipboard.writeText(value);
+			copiedKey = key;
+			if (copyTimeout) clearTimeout(copyTimeout);
+			copyTimeout = setTimeout(() => (copiedKey = null), 2000);
+		} catch (e: any) {
+			actionError = e.message ?? `Could not copy ${key}`;
+		} finally {
+			busyKey = null;
+		}
+	}
+
+	/** Send a patch, then optionally redeploy. Errors propagate to the caller's dialog. */
+	async function applyPatch(
+		target: Target,
+		patch: {
+			set?: Record<string, string>;
+			unset?: string[];
+			exclude?: string[];
+			include?: string[];
+		},
+		redeploy: boolean,
+		message: string
+	) {
+		env = target === 'env' ? await patchAppEnv(appId, patch) : await patchPreviewEnv(appId, patch);
+		for (const key of [...Object.keys(patch.set ?? {}), ...(patch.unset ?? [])]) {
+			revealed[target].delete(key);
+		}
+		actionError = '';
+		pendingDeploy = true;
+		notice = message;
+		if (redeploy) await handleRedeploy();
+	}
+
+	async function handleRedeploy() {
+		redeploying = true;
+		actionError = '';
+		try {
+			await onRedeploy();
+			pendingDeploy = false;
+			notice = 'Redeploy started. The new values apply once it finishes.';
+		} catch (e: any) {
+			actionError = `Saved, but the redeploy failed to start: ${e.message ?? 'unknown error'}`;
+		} finally {
+			redeploying = false;
+		}
+	}
+
+	function openAdd(target: Target) {
 		dialogTarget = target;
 		editingKey = null;
-		newKey = '';
-		newValue = '';
-		dialogError = '';
 		dialogOpen = true;
 	}
 
-	function openEdit(target: 'env' | 'preview', key: string, value: string) {
+	function openEdit(target: Target, key: string) {
 		dialogTarget = target;
 		editingKey = key;
-		newKey = key;
-		newValue = value;
-		dialogError = '';
 		dialogOpen = true;
 	}
 
-	function handleConfirm() {
-		const key = newKey.trim();
-		if (!key) {
-			dialogError = 'Key is required';
-			return;
-		}
-		if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
-			dialogError =
-				'Key must start with a letter or underscore and contain only letters, numbers, and underscores';
-			return;
-		}
+	async function handleDialogSubmit({ key, value, redeploy }: EnvVarDialogResult) {
+		const target = dialogTarget;
+		const previousKey = editingKey;
+		const renamed = previousKey !== null && previousKey !== key;
 
-		if (dialogTarget === 'env') {
-			// If renaming (key changed), remove the old key first
-			if (editingKey !== null && editingKey !== key) {
-				const next = { ...envVars };
-				delete next[editingKey];
-				envVars = { ...next, [key]: newValue };
-				// Move exclusion if the old key was excluded
-				if (excludedKeys.has(editingKey)) {
-					excludedKeys.delete(editingKey);
-					excludedKeys.add(key);
-				}
-			} else {
-				envVars = { ...envVars, [key]: newValue };
-			}
-		} else {
-			if (editingKey !== null && editingKey !== key) {
-				const next = { ...previewOverrides };
-				delete next[editingKey];
-				previewOverrides = { ...next, [key]: newValue };
-			} else {
-				previewOverrides = { ...previewOverrides, [key]: newValue };
-			}
-		}
+		if (previousKey !== null && value === null && !renamed) return; // nothing changed
 
-		dialogOpen = false;
-	}
+		// Renaming without a new value carries the current value over.
+		const nextValue = value ?? (await reveal(target, previousKey as string));
+		const patch = renamed
+			? { set: { [key]: nextValue }, unset: [previousKey as string] }
+			: { set: { [key]: nextValue } };
+		const verb = previousKey === null ? 'Added' : renamed ? `Renamed ${previousKey} to` : 'Updated';
+		await applyPatch(target, patch, redeploy, `${verb} ${key}.`);
 
-	function handleRemove(key: string) {
-		const next = { ...envVars };
-		delete next[key];
-		envVars = next;
-		revealedKeys.delete(key);
-		excludedKeys.delete(key);
-	}
-
-	function handleRemoveOverride(key: string) {
-		const next = { ...previewOverrides };
-		delete next[key];
-		previewOverrides = next;
-	}
-
-	function toggleExclude(key: string) {
-		if (excludedKeys.has(key)) {
-			excludedKeys.delete(key);
-		} else {
-			excludedKeys.add(key);
+		// Keep a renamed variable's preview exclusion.
+		if (target === 'env' && renamed && excluded.has(previousKey as string)) {
+			env = await patchPreviewEnv(appId, {
+				exclude: [key],
+				include: [previousKey as string]
+			});
 		}
 	}
 
-	function handleKeydown(e: KeyboardEvent) {
-		if (e.key === 'Enter') handleConfirm();
+	async function handleImport(target: Target, vars: Record<string, string>, redeploy: boolean) {
+		const count = Object.keys(vars).length;
+		await applyPatch(
+			target,
+			{ set: vars },
+			redeploy,
+			`Imported ${count} ${count === 1 ? noun(target) : `${noun(target)}s`}.`
+		);
 	}
 
-	function handleSave() {
-		onSave(envVars, selectedCredentialId || null, [...excludedKeys], previewOverrides);
+	function openDelete(target: Target, key: string) {
+		deleteTarget = target;
+		deleteKey = key;
+		deleteError = '';
+		deleteOpen = true;
+	}
+
+	async function handleConfirmDelete() {
+		if (!deleteKey) return;
+		deleting = true;
+		deleteError = '';
+		try {
+			await applyPatch(deleteTarget, { unset: [deleteKey] }, false, `Deleted ${deleteKey}.`);
+			deleteOpen = false;
+		} catch (e: any) {
+			deleteError = e.message ?? 'Could not delete the variable';
+		} finally {
+			deleting = false;
+		}
+	}
+
+	async function handleToggleExclude(key: string, exclude: boolean) {
+		busyKey = key;
+		try {
+			await applyPatch(
+				'preview',
+				exclude ? { exclude: [key] } : { include: [key] },
+				false,
+				exclude
+					? `${key} will no longer be passed to preview deployments.`
+					: `${key} will be passed to preview deployments again.`
+			);
+		} catch (e: any) {
+			actionError = e.message ?? `Could not update ${key}`;
+		} finally {
+			busyKey = null;
+		}
+	}
+
+	async function handleCredentialChange(value: string) {
+		actionError = '';
+		try {
+			await onRegistryCredentialChange(value || null);
+			notice = value ? 'Registry credential attached.' : 'Registry credential removed.';
+		} catch (e: any) {
+			actionError = e.message ?? 'Could not update the registry credential';
+		}
 	}
 </script>
 
 <div class="space-y-6 pt-4">
-	<!-- Variables section -->
-	<div class="space-y-3">
-		<div class="flex items-center justify-between">
-			<div>
-				<h4 class="font-mono text-xs font-medium tracking-wider text-muted-foreground uppercase">
-					Environment Variables
-				</h4>
-				{#if previewEnabled}
-					<p class="mt-0.5 text-xs text-muted-foreground">
-						Check "Exclude" to hide a variable from preview containers.
-					</p>
-				{/if}
-			</div>
-			<Dialog.Root bind:open={dialogOpen}>
-				<Dialog.Trigger>
-					{#snippet child({ props })}
-						<Button variant="outline" size="sm" onclick={() => openAdd('env')} {...props}>
-							<Plus class="mr-2 h-3.5 w-3.5" />
-							Add Variable
-						</Button>
-					{/snippet}
-				</Dialog.Trigger>
-				<Dialog.Content class="sm:max-w-md">
-					<Dialog.Header>
-						<Dialog.Title>
-							{editingKey !== null ? 'Edit' : 'Add'}
-							{dialogTarget === 'preview' ? 'Preview Override' : 'Environment Variable'}
-						</Dialog.Title>
-						<Dialog.Description>
-							{#if dialogTarget === 'preview'}
-								{editingKey !== null
-									? 'Update the key or value for this preview override.'
-									: 'Enter a key and value to override in preview containers.'}
-							{:else}
-								{editingKey !== null
-									? 'Update the key or value for this environment variable.'
-									: 'Enter a key and value for the new environment variable.'}
-							{/if}
-						</Dialog.Description>
-					</Dialog.Header>
-					<div class="space-y-4 py-2">
-						<div class="space-y-2">
-							<Label for="env-key">Key</Label>
-							<Input
-								id="env-key"
-								bind:value={newKey}
-								placeholder="DATABASE_URL"
-								class="font-mono"
-								onkeydown={handleKeydown}
-								autofocus
-							/>
-						</div>
-						<div class="space-y-2">
-							<Label for="env-value">Value</Label>
-							<Input
-								id="env-value"
-								bind:value={newValue}
-								placeholder="postgres://user:pass@host/db"
-								class="font-mono"
-								onkeydown={handleKeydown}
-							/>
-						</div>
-						{#if dialogError}
-							<p class="text-xs text-destructive">{dialogError}</p>
-						{/if}
-					</div>
-					<Dialog.Footer>
-						<Button variant="outline" onclick={() => (dialogOpen = false)}>Cancel</Button>
-						<Button onclick={handleConfirm}>{editingKey !== null ? 'Save' : 'Add'}</Button>
-					</Dialog.Footer>
-				</Dialog.Content>
-			</Dialog.Root>
+	{#if loading && !env}
+		<div class="space-y-2" aria-busy="true" aria-label="Loading environment variables">
+			<Skeleton class="h-6 w-48" />
+			<Skeleton class="h-24 w-full" />
 		</div>
-
-		{#if entries.length === 0}
-			<div class="rounded border border-dashed border-border py-8 text-center">
-				<p class="text-sm text-muted-foreground">No environment variables defined.</p>
-				<p class="mt-1 text-xs text-muted-foreground">
-					Click "Add Variable" to define key-value pairs.
-				</p>
-			</div>
-		{:else}
-			<div class="overflow-hidden rounded border border-border">
-				<table class="w-full text-sm">
-					<thead>
-						<tr class="border-b border-border bg-muted/50">
-							<th
-								class="px-3 py-2 text-left font-mono text-xs font-medium text-muted-foreground uppercase"
-								>Key</th
-							>
-							<th
-								class="px-3 py-2 text-left font-mono text-xs font-medium text-muted-foreground uppercase"
-								>Value</th
-							>
-							{#if previewEnabled}
-								<th
-									class="w-20 px-3 py-2 text-center font-mono text-xs font-medium text-muted-foreground uppercase"
-									>Exclude</th
-								>
-							{/if}
-							<th class="w-28 px-3 py-2"></th>
-						</tr>
-					</thead>
-					<tbody>
-						{#each entries as [key, value], i (key)}
-							{@const revealed = revealedKeys.has(key)}
-							{@const excluded = excludedKeys.has(key)}
-							<tr class={i < entries.length - 1 ? 'border-b border-border' : ''}>
-								<td class="px-3 py-2 font-mono text-xs font-medium">{key}</td>
-								<td class="max-w-0 truncate px-3 py-2 font-mono text-xs text-muted-foreground">
-									{#if !value}
-										<span class="italic">empty</span>
-									{:else if revealed}
-										{value}
-									{:else}
-										<span class="tracking-widest">••••••••</span>
-									{/if}
-								</td>
-								{#if previewEnabled}
-									<td class="px-3 py-2 text-center">
-										<input
-											type="checkbox"
-											checked={excluded}
-											onchange={() => toggleExclude(key)}
-											class="h-4 w-4 cursor-pointer accent-primary"
-											aria-label="Exclude from previews"
-										/>
-									</td>
-								{/if}
-								<td class="px-3 py-2">
-									<div class="flex items-center justify-end gap-1">
-										{#if value}
-											<Button
-												variant="ghost"
-												size="icon"
-												class="h-7 w-7 text-muted-foreground hover:text-foreground"
-												aria-label={revealed ? 'Hide value' : 'Reveal value'}
-												onclick={() => toggleReveal(key)}
-											>
-												{#if revealed}
-													<EyeOff class="h-3.5 w-3.5" />
-												{:else}
-													<Eye class="h-3.5 w-3.5" />
-												{/if}
-											</Button>
-											<Button
-												variant="ghost"
-												size="icon"
-												class="h-7 w-7 text-muted-foreground hover:text-foreground"
-												aria-label="Copy value"
-												onclick={() => handleCopy(key, value)}
-											>
-												{#if copiedKey === key}
-													<Check class="h-3.5 w-3.5 text-green-500" />
-												{:else}
-													<Copy class="h-3.5 w-3.5" />
-												{/if}
-											</Button>
-										{/if}
-										<Button
-											variant="ghost"
-											size="icon"
-											class="h-7 w-7 text-muted-foreground hover:text-foreground"
-											aria-label="Edit variable"
-											onclick={() => openEdit('env', key, value)}
-										>
-											<Pencil class="h-3.5 w-3.5" />
-										</Button>
-										<Button
-											variant="ghost"
-											size="icon"
-											class="h-7 w-7 text-muted-foreground hover:text-destructive"
-											aria-label="Delete variable"
-											onclick={() => handleRemove(key)}
-										>
-											<Trash2 class="h-3.5 w-3.5" />
-										</Button>
-									</div>
-								</td>
-							</tr>
-						{/each}
-					</tbody>
-				</table>
-			</div>
-		{/if}
-	</div>
-
-	{#if isImage}
-		<Separator class="bg-border" />
-
-		<!-- Registry credentials section -->
-		<div class="space-y-3">
-			<h4 class="font-mono text-xs font-medium tracking-wider text-muted-foreground uppercase">
-				Registry Credentials
-			</h4>
-			<div class="space-y-2">
-				<Select.Root type="single" bind:value={selectedCredentialId}>
-					<Select.Trigger>
-						{selectedCredentialId
-							? (registryCredentials.find((c) => c.id === selectedCredentialId)?.name ?? 'Unknown')
-							: 'None (public image)'}
-					</Select.Trigger>
-					<Select.Content>
-						<Select.Item value="">None (public image)</Select.Item>
-						{#each registryCredentials as cred (cred.id)}
-							<Select.Item value={cred.id}>{cred.name} ({cred.server})</Select.Item>
-						{/each}
-					</Select.Content>
-				</Select.Root>
-				<p class="text-xs text-muted-foreground">Required for private Docker registries.</p>
-			</div>
+	{:else if loadError && !env}
+		<div
+			class="space-y-3 rounded bg-destructive/10 px-4 py-3 text-sm text-destructive"
+			role="alert"
+		>
+			<p>Could not load environment variables: {loadError}</p>
+			<p class="text-xs">Nothing was changed. Your saved variables are safe.</p>
+			<Button variant="outline" size="sm" onclick={load}>
+				<Refresh class="mr-2 h-3.5 w-3.5" />
+				Retry
+			</Button>
 		</div>
-	{/if}
-
-	{#if previewEnabled}
-		<Separator class="bg-border" />
-
-		<!-- Preview overrides section -->
-		<div class="space-y-3">
-			<div class="flex items-center justify-between">
+	{:else if env}
+		{#if pendingDeploy}
+			<div
+				class="flex flex-wrap items-center justify-between gap-3 rounded border border-warn/40 bg-warn/10 px-4 py-3 text-sm"
+				role="status"
+			>
 				<div>
-					<h4 class="font-mono text-xs font-medium tracking-wider text-muted-foreground uppercase">
-						Preview Overrides
-					</h4>
-					<p class="mt-0.5 text-xs text-muted-foreground">
-						These key-value pairs replace or add env vars in preview containers only.
+					<p class="font-medium text-warn">{notice || 'Changes saved.'}</p>
+					<p class="text-xs text-muted-foreground">
+						The running app still uses the previous values until the next deploy.
 					</p>
 				</div>
-				<Button variant="outline" size="sm" onclick={() => openAdd('preview')}>
-					<Plus class="mr-2 h-3.5 w-3.5" />
-					Add Override
+				<Button size="sm" onclick={handleRedeploy} disabled={redeploying}>
+					{redeploying ? 'Redeploying…' : 'Redeploy now'}
 				</Button>
 			</div>
+		{:else if notice}
+			<div class="rounded bg-success/10 px-4 py-3 text-sm text-success" role="status">{notice}</div>
+		{/if}
 
-			{#if previewOverrideEntries.length === 0}
-				<div class="rounded border border-dashed border-border py-6 text-center">
-					<p class="text-sm text-muted-foreground">No preview overrides defined.</p>
+		{#if actionError}
+			<div
+				class="flex items-start justify-between gap-3 rounded bg-destructive/10 px-4 py-3 text-sm text-destructive"
+				role="alert"
+			>
+				<p>{actionError}</p>
+				<button
+					type="button"
+					class="text-xs underline-offset-2 hover:underline"
+					onclick={() => (actionError = '')}
+				>
+					Dismiss
+				</button>
+			</div>
+		{/if}
+
+		<!-- Variables -->
+		<section class="space-y-3">
+			<div class="flex flex-wrap items-center justify-between gap-2">
+				<div>
+					<h4 class="font-mono text-xs font-medium tracking-wider text-muted-foreground uppercase">
+						Environment Variables
+					</h4>
+					<p class="mt-0.5 text-xs text-muted-foreground">
+						Values are hidden; reveal one when you need it. Each change is saved on its own and
+						applies on the next deploy.
+						{#if previewEnabled}Tick "Exclude" to keep a variable out of preview deployments.{/if}
+					</p>
+				</div>
+				<div class="flex gap-2">
+					<Button
+						variant="outline"
+						size="sm"
+						onclick={() => ((importTarget = 'env'), (importOpen = true))}
+					>
+						<FileUpload class="mr-2 h-3.5 w-3.5" />
+						Import .env
+					</Button>
+					<Button variant="outline" size="sm" onclick={() => openAdd('env')}>
+						<Plus class="mr-2 h-3.5 w-3.5" />
+						Add Variable
+					</Button>
+				</div>
+			</div>
+
+			{#if env.vars.length === 0}
+				<div class="rounded border border-dashed border-border py-8 text-center">
+					<p class="text-sm text-muted-foreground">No environment variables yet.</p>
 					<p class="mt-1 text-xs text-muted-foreground">
-						Overrides replace or add env vars in preview containers only.
+						Add them one at a time, or paste a .env file with "Import .env".
 					</p>
 				</div>
 			{:else}
-				<div class="overflow-hidden rounded border border-border">
-					<table class="w-full text-sm">
-						<thead>
-							<tr class="border-b border-border bg-muted/50">
-								<th
-									class="px-3 py-2 text-left font-mono text-xs font-medium text-muted-foreground uppercase"
-									>Key</th
-								>
-								<th
-									class="px-3 py-2 text-left font-mono text-xs font-medium text-muted-foreground uppercase"
-									>Value</th
-								>
-								<th class="w-20 px-3 py-2"></th>
-							</tr>
-						</thead>
-						<tbody>
-							{#each previewOverrideEntries as [key, value], i (key)}
-								<tr class={i < previewOverrideEntries.length - 1 ? 'border-b border-border' : ''}>
-									<td class="px-3 py-2 font-mono text-xs font-medium">{key}</td>
-									<td class="max-w-0 truncate px-3 py-2 font-mono text-xs text-muted-foreground">
-										{#if value}
-											{value}
-										{:else}
-											<span class="italic">empty</span>
-										{/if}
-									</td>
-									<td class="px-3 py-2">
-										<div class="flex items-center justify-end gap-1">
-											<Button
-												variant="ghost"
-												size="icon"
-												class="h-7 w-7 text-muted-foreground hover:text-foreground"
-												aria-label="Edit override"
-												onclick={() => openEdit('preview', key, value)}
-											>
-												<Pencil class="h-3.5 w-3.5" />
-											</Button>
-											<Button
-												variant="ghost"
-												size="icon"
-												class="h-7 w-7 text-muted-foreground hover:text-destructive"
-												aria-label="Delete override"
-												onclick={() => handleRemoveOverride(key)}
-											>
-												<Trash2 class="h-3.5 w-3.5" />
-											</Button>
-										</div>
-									</td>
-								</tr>
-							{/each}
-						</tbody>
-					</table>
-				</div>
+				<EnvVarTable
+					entries={env.vars}
+					revealed={revealed.env}
+					{busyKey}
+					{copiedKey}
+					noun="variable"
+					excluded={previewEnabled ? excluded : undefined}
+					onToggleExclude={previewEnabled ? handleToggleExclude : undefined}
+					onToggleReveal={(key) => handleToggleReveal('env', key)}
+					onCopy={(key) => handleCopy('env', key)}
+					onEdit={(key) => openEdit('env', key)}
+					onDelete={(key) => openDelete('env', key)}
+				/>
 			{/if}
-		</div>
-	{/if}
+		</section>
 
-	<Separator class="bg-border" />
+		{#if isImage}
+			<Separator class="bg-border" />
 
-	<!-- Save footer -->
-	<div class="flex items-center gap-4">
-		<Button onclick={handleSave} disabled={saving}>
-			{saving ? 'Saving…' : 'Save'}
-		</Button>
-		<p class="text-xs text-muted-foreground">Changes take effect after redeploying.</p>
-		{#if saveError}
-			<p class="text-xs text-destructive">{saveError}</p>
+			<section class="space-y-3">
+				<h4 class="font-mono text-xs font-medium tracking-wider text-muted-foreground uppercase">
+					Registry Credentials
+				</h4>
+				<div class="space-y-2">
+					<Select.Root
+						type="single"
+						value={selectedCredentialId}
+						onValueChange={handleCredentialChange}
+					>
+						<Select.Trigger>
+							{selectedCredentialId
+								? (registryCredentials.find((c) => c.id === selectedCredentialId)?.name ??
+									'Unknown')
+								: 'None (public image)'}
+						</Select.Trigger>
+						<Select.Content>
+							<Select.Item value="">None (public image)</Select.Item>
+							{#each registryCredentials as cred (cred.id)}
+								<Select.Item value={cred.id}>{cred.name} ({cred.server})</Select.Item>
+							{/each}
+						</Select.Content>
+					</Select.Root>
+					<p class="text-xs text-muted-foreground">
+						Required for private Docker registries. Saved as soon as you pick one.
+					</p>
+				</div>
+			</section>
 		{/if}
-	</div>
+
+		{#if previewEnabled}
+			<Separator class="bg-border" />
+
+			<section class="space-y-3">
+				<div class="flex flex-wrap items-center justify-between gap-2">
+					<div>
+						<h4
+							class="font-mono text-xs font-medium tracking-wider text-muted-foreground uppercase"
+						>
+							Preview Overrides
+						</h4>
+						<p class="mt-0.5 text-xs text-muted-foreground">
+							These values replace or add variables in preview deployments only.
+						</p>
+					</div>
+					<div class="flex gap-2">
+						<Button
+							variant="outline"
+							size="sm"
+							onclick={() => ((importTarget = 'preview'), (importOpen = true))}
+						>
+							<FileUpload class="mr-2 h-3.5 w-3.5" />
+							Import .env
+						</Button>
+						<Button variant="outline" size="sm" onclick={() => openAdd('preview')}>
+							<Plus class="mr-2 h-3.5 w-3.5" />
+							Add Override
+						</Button>
+					</div>
+				</div>
+
+				{#if env.preview.overrides.length === 0}
+					<div class="rounded border border-dashed border-border py-6 text-center">
+						<p class="text-sm text-muted-foreground">No preview overrides.</p>
+						<p class="mt-1 text-xs text-muted-foreground">
+							Previews get the app's variables, minus any you exclude above.
+						</p>
+					</div>
+				{:else}
+					<EnvVarTable
+						entries={env.preview.overrides}
+						revealed={revealed.preview}
+						{busyKey}
+						{copiedKey}
+						noun="override"
+						onToggleReveal={(key) => handleToggleReveal('preview', key)}
+						onCopy={(key) => handleCopy('preview', key)}
+						onEdit={(key) => openEdit('preview', key)}
+						onDelete={(key) => openDelete('preview', key)}
+					/>
+				{/if}
+			</section>
+		{/if}
+	{/if}
 </div>
+
+<EnvVarDialog
+	bind:open={dialogOpen}
+	{editingKey}
+	existingKeys={dialogTarget === 'env' ? envKeys : overrideKeys}
+	title={`${editingKey === null ? 'Add' : 'Edit'} ${dialogTarget === 'env' ? 'environment variable' : 'preview override'}`}
+	description={dialogTarget === 'env'
+		? 'Saved immediately. The app picks it up on the next deploy.'
+		: 'Applies to preview deployments only, from their next deploy.'}
+	onLoadCurrent={() => reveal(dialogTarget, editingKey as string)}
+	onSubmit={handleDialogSubmit}
+/>
+
+<EnvImportDialog
+	bind:open={importOpen}
+	existingKeys={importTarget === 'env' ? envKeys : overrideKeys}
+	targetLabel={importTarget === 'env' ? 'environment variables' : 'preview overrides'}
+	onApply={(vars, redeploy) => handleImport(importTarget, vars, redeploy)}
+/>
+
+<Dialog.Root bind:open={deleteOpen}>
+	<Dialog.Content class="sm:max-w-md">
+		<Dialog.Header>
+			<Dialog.Title>Delete {deleteKey}?</Dialog.Title>
+			<Dialog.Description>
+				{deleteTarget === 'env'
+					? 'The variable is removed now. The running app keeps it until the next deploy.'
+					: 'Preview deployments fall back to the app value (if any) from their next deploy.'}
+			</Dialog.Description>
+		</Dialog.Header>
+		{#if deleteError}
+			<p class="rounded bg-destructive/10 px-3 py-2 text-xs text-destructive" role="alert">
+				{deleteError}
+			</p>
+		{/if}
+		<Dialog.Footer>
+			<Button variant="outline" onclick={() => (deleteOpen = false)} disabled={deleting}>
+				Cancel
+			</Button>
+			<Button variant="destructive" onclick={handleConfirmDelete} disabled={deleting}>
+				{deleting ? 'Deleting…' : 'Delete'}
+			</Button>
+		</Dialog.Footer>
+	</Dialog.Content>
+</Dialog.Root>
