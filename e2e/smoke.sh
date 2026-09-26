@@ -1279,7 +1279,7 @@ assert_hardened() { # <container> <label>
         || fail "$2: published ports must bind 127.0.0.1, got $(jq -c '.PortBindings' <<<"$hc")"
     jq -e '(.SecurityOpt // []) | any(.[]; . == "no-new-privileges:true")' <<<"$hc" > /dev/null \
         || fail "$2: missing no-new-privileges, got $(jq -c '.SecurityOpt' <<<"$hc")"
-    jq -e '(.CapDrop // []) | any(.[]; . == "NET_RAW")' <<<"$hc" > /dev/null \
+    jq -e '(.CapDrop // []) | any(.[]; ltrimstr("CAP_") == "NET_RAW")' <<<"$hc" > /dev/null \
         || fail "$2: NET_RAW must be dropped, got $(jq -c '.CapDrop' <<<"$hc")"
     jq -e '(.PidsLimit // 0) > 0 and (.Memory // 0) > 0' <<<"$hc" > /dev/null \
         || fail "$2: pids and memory limits must be set, got pids=$(jq '.PidsLimit' <<<"$hc") memory=$(jq '.Memory' <<<"$hc")"
