@@ -66,7 +66,7 @@
 			/>
 			<Input
 				type="search"
-				placeholder="Search templates (analytics, git, wiki…)"
+				placeholder="Search: analytics, git, wiki…"
 				aria-label="Search templates"
 				bind:value={query}
 				class="pl-9"

@@ -2011,8 +2011,8 @@
     "website": "https://www.stirling.com",
     "docs": "https://docs.stirlingpdf.com",
     "repository": "https://github.com/Stirling-Tools/Stirling-PDF",
-    "ram_mb": 700,
-    "fits_2gb": true,
+    "ram_mb": 1100,
+    "fits_2gb": false,
     "public": {
       "service": "stirling-pdf",
       "port": 8080,
@@ -2023,7 +2023,7 @@
         "name": "stirling-pdf",
         "image": "stirlingtools/stirling-pdf:2.14.3",
         "public": true,
-        "memory_limit_mb": 1024
+        "memory_limit_mb": 2048
       }
     ],
     "volumes": [
@@ -2052,7 +2052,7 @@
       "Sign in and change the password",
       "Merge two PDFs"
     ],
-    "compose": "services:\n  stirling-pdf:\n    image: stirlingtools/stirling-pdf:2.14.3\n    restart: unless-stopped\n    mem_limit: 1g\n    ports: [\"8080\"]\n    environment:\n      SECURITY_ENABLELOGIN: \"true\"\n      SECURITY_INITIALLOGIN_USERNAME: admin\n      SECURITY_INITIALLOGIN_PASSWORD: ${ADMIN_PASSWORD}\n      SYSTEM_ENABLEANALYTICS: \"false\"\n      LANGS: en_GB\n    volumes:\n      - ./configs:/configs\n"
+    "compose": "services:\n  stirling-pdf:\n    image: stirlingtools/stirling-pdf:2.14.3\n    restart: unless-stopped\n    mem_limit: 2g\n    ports: [\"8080\"]\n    environment:\n      SECURITY_ENABLELOGIN: \"true\"\n      SECURITY_INITIALLOGIN_USERNAME: admin\n      SECURITY_INITIALLOGIN_PASSWORD: ${ADMIN_PASSWORD}\n      SYSTEM_ENABLEANALYTICS: \"false\"\n      LANGS: en_GB\n    volumes:\n      - ./configs:/configs\n"
   },
   {
     "id": "twenty",
