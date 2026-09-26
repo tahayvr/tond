@@ -1,0 +1,24 @@
+id = "uptime-kuma"
+name = "Uptime Kuma"
+description = "Friendly uptime monitoring with status pages and 90+ notification services."
+about = "Uptime Kuma checks your websites, APIs, ports, DNS records and more every few seconds, alerts you on Telegram, Slack, email and dozens of other channels, and publishes public status pages."
+category = "monitoring"
+tags = ["uptime", "monitoring", "status page", "alerts"]
+logo = "uptimekuma"
+version = "2.5"
+website = "https://uptime.kuma.pet"
+docs = "https://github.com/louislam/uptime-kuma/wiki"
+repository = "https://github.com/louislam/uptime-kuma"
+ram_mb = 150
+setup_notes = "Open the app right away: the first visitor creates the admin account. Choose the embedded SQLite database when asked."
+upgrade_notes = "Change the image to a newer 2.x tag and redeploy. Take a snapshot first; the database is migrated on start."
+post_deploy_checks = ["Create the admin account", "Add a monitor and a notification channel"]
+
+[public]
+service = "uptime-kuma"
+port = 3001
+
+[[volumes]]
+service = "uptime-kuma"
+path = "./data"
+description = "Settings, monitors and check history (SQLite)"

@@ -1,0 +1,35 @@
+id = "immich"
+name = "Immich"
+description = "High-performance photo and video backup, a Google Photos alternative."
+about = "Immich backs up photos and videos from your phone automatically and gives you timelines, albums, sharing, maps and a fast web app. This template leaves out the machine-learning service to save 1–2 GB of memory, so smart search and face recognition are off; everything else works. Photo libraries grow fast: watch your disk."
+category = "media"
+tags = ["photos", "videos", "backup", "google photos alternative", "gallery"]
+logo = "immich"
+version = "2.7"
+website = "https://immich.app"
+docs = "https://immich.app/docs/install/docker-compose"
+repository = "https://github.com/immich-app/immich"
+ram_mb = 1500
+setup_notes = "Open the app and create the admin account (the first user). Then install the mobile app, sign in with this address and turn on backup."
+upgrade_notes = "Immich releases often and sometimes changes its compose setup. Read the release notes, snapshot the app, then change the immich-server tag and redeploy. Keep the database image on the version the release notes name."
+post_deploy_checks = ["Create the admin account", "Connect the mobile app and back up a photo"]
+
+[public]
+service = "immich-server"
+port = 2283
+health_path = "/api/server/ping"
+
+[[inputs]]
+key = "DB_PASSWORD"
+label = "Database password"
+generate = "password"
+
+[[volumes]]
+service = "immich-server"
+path = "./library"
+description = "Your photos and videos, thumbnails and transcodes"
+
+[[volumes]]
+service = "database"
+path = "./postgres"
+description = "PostgreSQL data: albums, people, metadata"

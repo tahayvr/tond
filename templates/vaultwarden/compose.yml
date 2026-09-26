@@ -1,0 +1,13 @@
+services:
+  vaultwarden:
+    image: vaultwarden/server:1.37.3-alpine
+    restart: unless-stopped
+    mem_limit: 256m
+    ports: ["80"]
+    environment:
+      DOMAIN: ${DOMAIN}
+      ADMIN_TOKEN: ${ADMIN_TOKEN}
+      SIGNUPS_ALLOWED: "true"
+      WEBSOCKET_ENABLED: "true"
+    volumes:
+      - ./data:/data

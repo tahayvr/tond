@@ -1,0 +1,40 @@
+services:
+  nextcloud:
+    image: nextcloud:34-apache
+    restart: unless-stopped
+    mem_limit: 768m
+    ports: ["80"]
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_DB: nextcloud
+      POSTGRES_USER: nextcloud
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      NEXTCLOUD_ADMIN_USER: admin
+      NEXTCLOUD_ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      NEXTCLOUD_TRUSTED_DOMAINS: ${NEXTCLOUD_TRUSTED_DOMAINS}
+      OVERWRITEPROTOCOL: https
+      OVERWRITECLIURL: ${OVERWRITE_CLI_URL}
+      TRUSTED_PROXIES: 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+      PHP_MEMORY_LIMIT: 512M
+      PHP_UPLOAD_LIMIT: 2G
+    volumes:
+      - ./html:/var/www/html
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    mem_limit: 256m
+    environment:
+      POSTGRES_DB: nextcloud
+      POSTGRES_USER: nextcloud
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - ./postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nextcloud -d nextcloud"]
+      interval: 5s
+      timeout: 5s
+      retries: 10

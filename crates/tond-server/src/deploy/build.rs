@@ -58,9 +58,19 @@ fn compose_file_path(work_dir: &str) -> String {
 /// `docker compose -p <app> -f <file> up --build -d` with a cleared
 /// environment: compose interpolates `${VAR}` from its own environment, and
 /// tond-server's holds TOND_SECRET_KEY. Only what docker needs is passed on.
-fn compose_command(compose_path: &str, app_name: &str) -> tokio::process::Command {
+///
+/// `interpolation` (from [`compose_policy::interpolation_env`]) is added so
+/// `${VAR}` in the file can use the app's own env vars.
+fn compose_command(
+    compose_path: &str,
+    app_name: &str,
+    interpolation: &[(String, String)],
+) -> tokio::process::Command {
     let mut cmd = crate::process::command("docker");
     cmd.env_clear();
+    for (key, value) in interpolation {
+        cmd.env(key, value);
+    }
     for key in [
         "PATH",
         "HOME",
@@ -640,6 +650,7 @@ pub(super) async fn run_inline_compose(
     app_id: &str,
     app_name: &str,
     compose_content: &str,
+    app_env: &std::collections::BTreeMap<String, String>,
     trigger_source: &str,
 ) -> Result<String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -673,7 +684,8 @@ pub(super) async fn run_inline_compose(
     )
     .await?;
 
-    let mut child = compose_command(&compose_path, app_name)
+    let interpolation = compose_policy::interpolation_env(compose_content, app_env);
+    let mut child = compose_command(&compose_path, app_name, &interpolation)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()?;

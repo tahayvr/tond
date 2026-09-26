@@ -1,0 +1,48 @@
+id = "listmonk"
+name = "listmonk"
+description = "Fast newsletter and mailing-list manager in a single binary."
+about = "listmonk manages subscribers, lists and campaigns, with templates, analytics and transactional mail over any SMTP provider. It handles millions of subscribers on very little memory."
+category = "communication"
+tags = ["newsletter", "email", "mailing list", "mailchimp alternative"]
+logo = "listmonk"
+version = "6.2"
+website = "https://listmonk.app"
+docs = "https://listmonk.app/docs/installation/"
+repository = "https://github.com/knadh/listmonk"
+ram_mb = 120
+setup_notes = "Sign in as admin with the password shown below. Set the root URL under Settings → General to this app's address and add your SMTP server under Settings → SMTP."
+upgrade_notes = "Change the image to a newer tag and redeploy; the container runs listmonk --upgrade on every start. Snapshot the app first."
+post_deploy_checks = ["Sign in and set the root URL", "Configure SMTP and send a test campaign"]
+
+[public]
+service = "listmonk"
+port = 9000
+health_path = "/api/health"
+
+[[inputs]]
+key = "ADMIN_PASSWORD"
+label = "Admin password"
+kind = "password"
+generate = "password"
+credential = true
+
+[[inputs]]
+key = "DB_PASSWORD"
+label = "Database password"
+generate = "password"
+
+[[inputs]]
+key = "TZ"
+label = "Time zone"
+description = "For scheduled campaigns, e.g. Europe/Berlin."
+default = "UTC"
+
+[[volumes]]
+service = "listmonk"
+path = "./uploads"
+description = "Uploaded media for campaigns"
+
+[[volumes]]
+service = "db"
+path = "./postgres"
+description = "PostgreSQL data: subscribers, lists and campaigns"

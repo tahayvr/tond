@@ -1,30 +1,289 @@
-use axum::{Json, http::StatusCode, response::IntoResponse};
-use tond_common::{ApiResponse, TemplateCatalogEntry, TondError, load_template_manifests};
+// handlers/templates.rs — the one-click template catalog
+//
+//   GET  /api/templates              the catalog (tond_common::builtin_templates)
+//   POST /api/templates/{id}/deploy  create the app and start its first deploy
+//
+// A template deploy is one server-side step so every client gets the same
+// behaviour: inputs are checked and generated, the app is created as an inline
+// compose app whose env holds the (encrypted) inputs, its volume directories
+// are created with the owners the images expect, and the first deployment is
+// queued. If anything fails after the app row exists, the app is removed again
+// so a retry starts clean. Generated credentials are returned once.
+
+use std::collections::BTreeMap;
+use std::path::Path as FsPath;
+
+use axum::{
+    Json,
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+};
+use tond_common::{
+    ApiResponse, App, CreateAppRequest, Scope, Template, TemplateContext, TemplateCredential,
+    TemplateDeployRequest, TemplateDeployResponse, TemplateResponse, TondError, builtin_template,
+    builtin_templates, resolve_inputs,
+};
 
 use crate::{
+    audit_log::write_audit_log,
     auth::{Authz, RateLimit, scope},
+    deploy, domains,
     error::AppError,
+    handlers::{deploy_trigger, insert_app},
+    metrics::host,
+    state::AppState,
+    volumes,
 };
+
+const MIB: u64 = 1024 * 1024;
+
+fn catalog_error(err: impl std::fmt::Display) -> AppError {
+    AppError(TondError::Internal(format!(
+        "the template catalog is invalid: {err}"
+    )))
+}
 
 pub async fn list_templates(
     _rate: RateLimit,
     _auth: Authz<scope::AppsRead>,
 ) -> Result<impl IntoResponse, AppError> {
-    let template_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("templates");
-    let entries = load_template_manifests(&template_dir).map_err(|err| {
-        AppError(TondError::Internal(format!(
-            "failed to load template catalog: {err}"
-        )))
-    })?;
-    let templates: Vec<TemplateCatalogEntry> = entries
+    let templates: Vec<TemplateResponse> = builtin_templates()
+        .map_err(catalog_error)?
         .into_iter()
-        .map(|(_, manifest)| TemplateCatalogEntry::from(manifest))
+        .map(TemplateResponse::from)
         .collect();
-
     Ok((StatusCode::OK, Json(ApiResponse::ok(templates))))
+}
+
+/// Free memory in bytes (total minus used, i.e. what the kernel reports as
+/// available), from the host collector's last sample.
+fn available_memory() -> Option<u64> {
+    host::snapshot().map(|s| s.mem_total.saturating_sub(s.mem_used))
+}
+
+/// The 409 for a template that needs more memory than is free, unless the
+/// caller chose to deploy anyway.
+fn check_memory(
+    template: &Template,
+    available: Option<u64>,
+    allow_low_memory: bool,
+) -> Result<(), AppError> {
+    let Some(available) = available else {
+        return Ok(());
+    };
+    let needed = u64::from(template.manifest.ram_mb) * MIB;
+    if allow_low_memory || needed <= available {
+        return Ok(());
+    }
+    Err(AppError(TondError::Conflict {
+        code: "insufficient_memory",
+        message: format!(
+            "{} needs about {} MB of memory and this server has {} MB free. Stop or remove an app to make room, or deploy anyway and let it swap.",
+            template.manifest.name,
+            template.manifest.ram_mb,
+            available / MIB
+        ),
+    }))
+}
+
+/// Refuse an app name whose volume directory already holds data: data left
+/// by an earlier app of the same name would not match the new passwords.
+fn check_no_leftover_data(data_dir: &FsPath, app_name: &str) -> Result<(), AppError> {
+    let volume_dir = volumes::app_volume_dir(data_dir, app_name);
+    if std::fs::read_dir(&volume_dir).is_ok_and(|mut d| d.next().is_some()) {
+        return Err(AppError(TondError::InvalidInput(format!(
+            "{} still holds data from an earlier app named {app_name}. Pick another name, or delete that directory on the server first.",
+            volume_dir.display()
+        ))));
+    }
+    Ok(())
+}
+
+/// Create the declared volume directories, with their owners, inside the
+/// app's volume directory.
+fn prepare_volumes(template: &Template, data_dir: &FsPath, app_name: &str) -> Result<(), AppError> {
+    let volume_dir = volumes::app_volume_dir(data_dir, app_name);
+    for volume in &template.manifest.volumes {
+        let dir = volumes::prepare_host_dir(
+            data_dir,
+            &volume_dir,
+            FsPath::new(volume.relative_path()),
+            false,
+        )
+        .map_err(|e| {
+            AppError(TondError::Internal(format!(
+                "could not create the volume directory {}: {e:#}",
+                volume.path
+            )))
+        })?;
+        #[cfg(unix)]
+        if let Some((uid, gid)) = volume.owner_ids()
+            && let Err(e) = std::os::unix::fs::chown(&dir, Some(uid), Some(gid))
+        {
+            // Only root can chown; outside production (dev, tests) the
+            // image may then fail to write, which its logs will say.
+            tracing::warn!("could not give {} to {uid}:{gid}: {e}", dir.display());
+        }
+    }
+    Ok(())
+}
+
+/// Undo a template deploy that failed after the app was created. Its volume
+/// directory was new or empty (check_no_leftover_data), so removing it only
+/// removes what this deploy created.
+async fn remove_app(state: &AppState, app: &App, data_dir: &FsPath) {
+    let _ = sqlx::query("DELETE FROM apps WHERE id = ?")
+        .bind(&app.id)
+        .execute(&state.db)
+        .await;
+    let _ = std::fs::remove_dir_all(volumes::app_volume_dir(data_dir, &app.name));
+}
+
+pub async fn deploy_template(
+    _rate: RateLimit,
+    auth: Authz<scope::AppsWrite>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<TemplateDeployRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    // Templates are compose apps (admin scope, checked by insert_app) that
+    // are deployed right away.
+    auth.require_to(Scope::AppsDeploy, "deploy apps")?;
+    let template = builtin_template(&id)
+        .map_err(catalog_error)?
+        .ok_or_else(|| AppError(TondError::NotFound(format!("No template named {id}"))))?;
+
+    let name = req.name.trim().to_ascii_lowercase();
+    if name.is_empty()
+        || name.len() > 40
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        || name.starts_with('-')
+        || name.ends_with('-')
+    {
+        return Err(AppError(TondError::InvalidInput(
+            "App name must be 1–40 lowercase letters, digits and hyphens".into(),
+        )));
+    }
+    check_memory(&template, available_memory(), req.allow_low_memory)?;
+
+    // The address the app will answer on, for inputs like {app_url}: the
+    // custom domain, else the automatic one (<name>.<apps domain>).
+    let domain = req
+        .domain
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(domains::normalize_domain);
+    let apps_domain = state.settings.read().await.apps_domain.clone();
+    let host = match &domain {
+        Some(d) => d.clone(),
+        None if !apps_domain.is_empty() => domains::app_host(&name, &apps_domain),
+        None => format!("{name}.localhost"),
+    };
+    let ctx = TemplateContext::new(&name, &host);
+    let resolved = resolve_inputs(&template.manifest, &req.inputs, &ctx)
+        .map_err(|e| AppError(TondError::InvalidInput(e.to_string())))?;
+
+    let data_dir = volumes::data_dir();
+    check_no_leftover_data(&data_dir, &name)?;
+
+    let public = &template.manifest.public;
+    let env: BTreeMap<&str, &str> = resolved
+        .env
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let create = CreateAppRequest {
+        name: name.clone(),
+        source_type: "compose".into(),
+        source_url: None,
+        branch: None,
+        container_port: i64::from(public.port),
+        env_vars: Some(serde_json::json!(env)),
+        domain: domain.clone(),
+        project_id: req.project_id.clone().filter(|p| !p.is_empty()),
+        memory_limit: None,
+        cpu_limit: None,
+        health_check_path: public.health_path.clone(),
+        health_check_interval: None,
+        health_failure_threshold: None,
+        drain_timeout: None,
+        build_method: None,
+        auto_deploy: false,
+        watch_branch: None,
+        volumes: None,
+        registry_credential_id: None,
+        github_app_id: None,
+        dockerfile_content: None,
+        compose_content: Some(template.compose.clone()),
+        base_dir: None,
+        static_build: false,
+        readiness: Some(
+            if public.health_path.is_some() {
+                "http"
+            } else {
+                "tcp"
+            }
+            .into(),
+        ),
+        ready_after_secs: None,
+    };
+    let app = insert_app(&state, &auth, create).await?;
+
+    if let Err(e) = prepare_volumes(&template, &data_dir, &name) {
+        remove_app(&state, &app, &data_dir).await;
+        return Err(e);
+    }
+
+    let app_id = app.id.clone();
+    let app_domain = app.domain.clone();
+    let (trigger, detail) = deploy_trigger(&auth);
+    let queued = match deploy::start(
+        &state,
+        app.clone(),
+        deploy::DeployRequest::source(trigger, detail),
+    )
+    .await
+    {
+        Ok(q) => q,
+        Err(e) => {
+            remove_app(&state, &app, &data_dir).await;
+            return Err(AppError(TondError::Internal(format!(
+                "{} was not created: the first deploy couldn't be queued ({e:#})",
+                template.manifest.name
+            ))));
+        }
+    };
+
+    write_audit_log(
+        &state.db,
+        Some(&app_id),
+        Some(&name),
+        "template.deploy",
+        &auth.audit_actor(),
+        Some(&format!(
+            "template={} version={} deployment={}",
+            template.manifest.id, template.manifest.version, queued.deployment_id
+        )),
+    )
+    .await;
+
+    let response = TemplateDeployResponse {
+        app_id,
+        app_name: name,
+        domain: app_domain.or_else(|| (!apps_domain.is_empty()).then_some(host)),
+        deployment_id: queued.deployment_id.clone(),
+        credentials: resolved
+            .credentials
+            .into_iter()
+            .map(|(key, label, value)| TemplateCredential { key, label, value })
+            .collect(),
+        setup_notes: template.manifest.setup_notes.clone(),
+    };
+    Ok((StatusCode::ACCEPTED, Json(ApiResponse::ok(response))))
 }
 
 #[cfg(test)]
@@ -33,6 +292,7 @@ mod tests {
 
     use super::*;
     use crate::auth::Principal;
+    use crate::compose_policy;
     use tond_common::Role;
 
     async fn response_json(response: axum::response::Response) -> serde_json::Value {
@@ -44,7 +304,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_templates_returns_manifest_catalog_entries() {
+    async fn list_templates_returns_the_catalog() {
         let response = list_templates(
             RateLimit,
             Authz::unchecked(Principal::test_user(Role::Admin)),
@@ -56,25 +316,84 @@ mod tests {
         let templates = body["data"]
             .as_array()
             .unwrap_or_else(|| panic!("expected templates payload to be an array"));
-        let plausible = templates
+        assert!(templates.len() >= 25);
+        let umami = templates
             .iter()
-            .find(|template| template["id"] == "plausible")
-            .unwrap_or_else(|| panic!("expected plausible template to be present in catalog"));
+            .find(|t| t["id"] == "umami")
+            .unwrap_or_else(|| panic!("umami should be in the catalog"));
+        assert_eq!(umami["public"]["service"], "umami");
+        assert_eq!(umami["fits_2gb"], true);
+        assert!(umami["services"].as_array().is_some_and(|s| s.len() == 2));
+        assert!(
+            umami["inputs"]
+                .as_array()
+                .is_some_and(|i| i.iter().all(|i| i["key"] != "DATABASE_URL")),
+            "computed values are not form inputs"
+        );
+    }
 
-        assert_eq!(
-            plausible["project"]["name"],
-            serde_json::Value::String("plausible".to_string()),
-            "list_templates should expose project-scoped template metadata"
+    /// Every shipped compose file passes the same policy user compose files do.
+    #[test]
+    fn every_template_passes_compose_policy() {
+        let volume_dir = FsPath::new("/opt/tond/data/volumes/app");
+        for t in builtin_templates().unwrap_or_else(|e| panic!("{e}")) {
+            if let Err(errors) = compose_policy::validate(&t.compose, volume_dir) {
+                panic!(
+                    "{}: {}",
+                    t.manifest.id,
+                    compose_policy::format_errors(&errors)
+                );
+            }
+            // Every input reaches compose (no reserved names are dropped).
+            let env: BTreeMap<String, String> = t
+                .manifest
+                .inputs
+                .iter()
+                .map(|i| (i.key.clone(), "x".to_string()))
+                .collect();
+            assert_eq!(
+                compose_policy::interpolation_env(&t.compose, &env).len(),
+                env.len(),
+                "{}: every input should be passed to docker compose",
+                t.manifest.id
+            );
+        }
+    }
+
+    #[test]
+    fn memory_check_warns_unless_overridden() {
+        let t = builtin_template("umami")
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("umami"));
+        let need = u64::from(t.manifest.ram_mb) * MIB;
+        assert!(check_memory(&t, Some(need), false).is_ok());
+        assert!(
+            check_memory(&t, None, false).is_ok(),
+            "no sample yet: don't block"
         );
-        assert_eq!(
-            plausible["dependencies"][0]["name"],
-            serde_json::Value::String("plausible-db".to_string()),
-            "list_templates should include declared dependencies so dashboard and CLI share the same manifest data"
-        );
-        assert_eq!(
-            plausible["required_env"][2]["value"],
-            serde_json::Value::String("${db.plausible-db.internal_connection_string}".to_string()),
-            "list_templates should expose interpolated env definitions for template-aware creation flows"
-        );
+        let err = check_memory(&t, Some(need / 2), false)
+            .err()
+            .unwrap_or_else(|| panic!("expected insufficient_memory"));
+        assert_eq!(err.0.code(), Some("insufficient_memory"));
+        assert_eq!(err.0.status_code(), 409);
+        assert!(check_memory(&t, Some(need / 2), true).is_ok());
+    }
+
+    #[test]
+    fn prepare_volumes_refuses_leftover_data() {
+        let tmp = tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e}"));
+        let t = builtin_template("umami")
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("umami"));
+        check_no_leftover_data(tmp.path(), "stats").unwrap_or_else(|e| panic!("{}", e.0));
+        prepare_volumes(&t, tmp.path(), "stats").unwrap_or_else(|e| panic!("{}", e.0));
+        let dir = volumes::app_volume_dir(tmp.path(), "stats");
+        for v in &t.manifest.volumes {
+            assert!(dir.join(v.relative_path()).is_dir());
+        }
+        let err = check_no_leftover_data(tmp.path(), "stats")
+            .err()
+            .unwrap_or_else(|| panic!("an app's leftover data should be refused"));
+        assert!(err.0.to_string().contains("earlier app named stats"));
     }
 }

@@ -1,0 +1,53 @@
+id = "mattermost"
+name = "Mattermost"
+description = "Team chat with channels, threads, calls and integrations, a Slack alternative."
+about = "Mattermost Team Edition is an open-source messaging platform with channels, threads, file sharing, search, playbooks and a large integration ecosystem, with desktop and mobile apps. Its configuration is stored in the database, so settings you change in the System Console survive redeploys. The Team Edition image is published for x86_64 only."
+category = "communication"
+tags = ["chat", "slack alternative", "team", "messaging"]
+logo = "mattermost"
+version = "11.11"
+website = "https://mattermost.com"
+docs = "https://docs.mattermost.com/deployment-guide/server/deploy-containers.html"
+repository = "https://github.com/mattermost/mattermost"
+ram_mb = 800
+setup_notes = "Open the app right away: the first account created becomes the system admin. Then create a team and invite people."
+upgrade_notes = "Change the image to a newer tag and redeploy; the database is migrated on start. Stay on Extended Support Releases for fewer upgrades, and snapshot first."
+post_deploy_checks = ["Create the admin account", "Configure SMTP in the System Console for invites and notifications"]
+
+[public]
+service = "mattermost"
+port = 8065
+health_path = "/api/v4/system/ping"
+
+[[inputs]]
+key = "MM_SERVICESETTINGS_SITEURL"
+label = "Site URL"
+value = "{app_url}"
+
+[[inputs]]
+key = "DB_PASSWORD"
+label = "Database password"
+generate = "password"
+
+[[volumes]]
+service = "mattermost"
+path = "./data"
+description = "Uploaded files and images"
+owner = "2000:2000"
+
+[[volumes]]
+service = "mattermost"
+path = "./plugins"
+description = "Server plugins"
+owner = "2000:2000"
+
+[[volumes]]
+service = "mattermost"
+path = "./client-plugins"
+description = "Web app plugins"
+owner = "2000:2000"
+
+[[volumes]]
+service = "db"
+path = "./postgres"
+description = "PostgreSQL data: messages, users, channels and settings"

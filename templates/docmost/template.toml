@@ -1,0 +1,44 @@
+id = "docmost"
+name = "Docmost"
+description = "Collaborative wiki and documentation, a Confluence and Notion alternative."
+about = "Docmost is a wiki with real-time collaborative editing, spaces, permissions, comments, page history, diagrams (Draw.io, Excalidraw, Mermaid) and full-text search."
+category = "documents"
+tags = ["wiki", "documentation", "knowledge base", "confluence alternative", "notion alternative"]
+version = "0.95"
+website = "https://docmost.com"
+docs = "https://docmost.com/docs/installation"
+repository = "https://github.com/docmost/docmost"
+ram_mb = 400
+setup_notes = "Open the app right away and create your workspace and admin account. Add SMTP settings as environment variables to send invitations by email."
+upgrade_notes = "Docmost is pre-1.0. Read the release notes, snapshot the app, then change the image tag and redeploy; migrations run on start."
+post_deploy_checks = ["Create the workspace and admin account", "Create a space and a page"]
+
+[public]
+service = "docmost"
+port = 3000
+health_path = "/api/health"
+
+[[inputs]]
+key = "APP_URL"
+label = "Public URL"
+value = "{app_url}"
+
+[[inputs]]
+key = "APP_SECRET"
+label = "App secret"
+generate = "hex"
+
+[[inputs]]
+key = "DB_PASSWORD"
+label = "Database password"
+generate = "password"
+
+[[volumes]]
+service = "docmost"
+path = "./storage"
+description = "Uploaded files and attachments"
+
+[[volumes]]
+service = "db"
+path = "./postgres"
+description = "PostgreSQL data: pages, spaces and users"

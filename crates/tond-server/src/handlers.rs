@@ -233,6 +233,20 @@ pub async fn create_app(
     State(state): State<AppState>,
     Json(req): Json<CreateAppRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    let app = insert_app(&state, &auth, req).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiResponse::ok(AppResponse::from(app))),
+    ))
+}
+
+/// Validate a create request and insert the app (POST /api/apps and template
+/// deploys). `auth` must already hold `apps:write`.
+pub(crate) async fn insert_app(
+    state: &AppState,
+    auth: &Principal,
+    req: CreateAppRequest,
+) -> Result<App, AppError> {
     // Volumes and compose files reach the host: they also need an admin scope.
     if req.volumes.as_ref().is_some_and(|v| !v.is_empty()) {
         auth.require_to(Scope::SettingsWrite, "configure volumes")?;
@@ -336,7 +350,7 @@ pub async fn create_app(
     );
 
     if let Some(domain) = req.domain.filter(|d| !d.trim().is_empty()) {
-        app.domain = Some(check_app_domain(&state, &domain).await?.0);
+        app.domain = Some(check_app_domain(state, &domain).await?.0);
     }
 
     let env = match req.env_vars {
@@ -481,10 +495,7 @@ pub async fn create_app(
     )
     .await;
 
-    Ok((
-        StatusCode::CREATED,
-        Json(ApiResponse::ok(AppResponse::from(app))),
-    ))
+    Ok(app)
 }
 
 // ── Validate Compose ──

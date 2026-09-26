@@ -1,0 +1,32 @@
+services:
+  wiki:
+    image: ghcr.io/requarks/wiki:2.5.315
+    restart: unless-stopped
+    mem_limit: 512m
+    ports: ["3000"]
+    environment:
+      DB_TYPE: postgres
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USER: wikijs
+      DB_PASS: ${DB_PASSWORD}
+      DB_NAME: wiki
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    mem_limit: 256m
+    environment:
+      POSTGRES_DB: wiki
+      POSTGRES_USER: wikijs
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - ./postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wikijs -d wiki"]
+      interval: 5s
+      timeout: 5s
+      retries: 10

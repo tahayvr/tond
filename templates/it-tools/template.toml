@@ -1,0 +1,19 @@
+id = "it-tools"
+name = "IT Tools"
+description = "Handy online tools for developers: encoders, generators, converters and more."
+about = "IT Tools bundles 80+ small utilities (UUID and hash generators, JWT and base64 decoders, cron parser, JSON/YAML converters, QR codes, subnet calculator…) in one fast static web app. Everything runs in your browser."
+category = "developer"
+tags = ["tools", "developer", "converter", "utilities"]
+version = "2024.10.22"
+website = "https://it-tools.tech"
+docs = "https://github.com/CorentinTh/it-tools#self-host"
+repository = "https://github.com/CorentinTh/it-tools"
+ram_mb = 20
+setup_notes = "Open the app; there is nothing to configure. It has no login, so anyone with the address can use it."
+upgrade_notes = "Change the image to a newer tag and redeploy."
+post_deploy_checks = ["Open the app and try a tool"]
+
+[public]
+service = "it-tools"
+port = 80
+health_path = "/"

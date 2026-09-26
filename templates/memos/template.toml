@@ -1,0 +1,24 @@
+id = "memos"
+name = "Memos"
+description = "Lightweight note-taking for quick thoughts, like a private timeline."
+about = "Memos is a privacy-first, Markdown-native notes service for capturing ideas quickly, with tags, a timeline, sharing and an API. It runs on SQLite with a tiny footprint."
+category = "productivity"
+tags = ["notes", "markdown", "journal", "microblog"]
+version = "0.31"
+website = "https://usememos.com"
+docs = "https://usememos.com/docs/install/container-install"
+repository = "https://github.com/usememos/memos"
+ram_mb = 40
+setup_notes = "Open the app right away: the first account you create becomes the admin. Then turn off sign-ups in Settings if you use it alone."
+upgrade_notes = "Memos is pre-1.0 and minor versions can change the database. Snapshot the app, then change the image tag and redeploy."
+post_deploy_checks = ["Create the admin account", "Disable public sign-ups"]
+
+[public]
+service = "memos"
+port = 5230
+health_path = "/healthz"
+
+[[volumes]]
+service = "memos"
+path = "./data"
+description = "Notes, resources and the SQLite database"

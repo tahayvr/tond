@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::{Args, Subcommand};
 use serde_json::Value;
-use tond_common::{DatabaseCredentialsResponse, TemplateManifest, load_template_manifests};
+use tond_common::{TemplateDeployRequest, TemplateResponse};
 
 use crate::client::TondClient;
 use crate::deploy_follow;
@@ -13,9 +13,15 @@ pub struct CreateAppOptions {
     /// App name (alphanumeric + hyphens)
     pub name: String,
 
-    /// Curated in-repo template to use for app creation
+    /// Create the app from a one-click template (see `tond templates list`)
+    /// and deploy it. Template inputs are given with --env KEY=VALUE.
     #[arg(long, conflicts_with_all = ["source_type", "source", "branch", "build_method"])]
     pub template: Option<String>,
+
+    /// With --template: deploy even if the server has less free memory than
+    /// the template needs.
+    #[arg(long, requires = "template")]
+    pub allow_low_memory: bool,
 
     /// Source type: git, image
     #[arg(short = 't', long, default_value = "git")]
@@ -348,6 +354,7 @@ pub async fn handle(client: &TondClient, action: AppsAction) -> Result<()> {
             let CreateAppOptions {
                 name,
                 template,
+                allow_low_memory,
                 source_type,
                 source,
                 branch,
@@ -363,71 +370,55 @@ pub async fn handle(client: &TondClient, action: AppsAction) -> Result<()> {
                 build_method,
                 yes,
             } = *create;
+            if let Some(template) = template {
+                return create_from_template(
+                    client,
+                    &template,
+                    TemplateDeployRequest {
+                        name,
+                        domain,
+                        project_id: None,
+                        inputs: Default::default(),
+                        allow_low_memory,
+                    },
+                    &env,
+                    yes,
+                )
+                .await;
+            }
             let memory_limit = memory_mb.map(|m| m * 1_048_576);
             let cpu_limit = cpus.map(|c| (c * 1_000_000_000.0) as i64);
-            let template_manifest = template.as_deref().map(resolve_template).transpose()?;
-            let resolved_source_type = template_manifest
-                .as_ref()
-                .map(|template| template.source.kind.clone())
-                .unwrap_or(source_type);
-            let resolved_source = template_manifest
-                .as_ref()
-                .map(template_source_url)
-                .unwrap_or(source);
-            let resolved_branch = template_manifest
-                .as_ref()
-                .and_then(template_branch)
-                .or(Some(branch));
-            let resolved_port = template_manifest
-                .as_ref()
-                .map(|template| i64::from(template.deploy.default_port))
-                .unwrap_or(port);
-            let resolved_health_path = template_manifest
-                .as_ref()
-                .and_then(|template| template.deploy.health_check_path.clone())
-                .or(health_path);
-            let resolved_build_method = template_manifest
-                .as_ref()
-                .and_then(template_build_method)
-                .or(build_method);
-            let created_project = if let Some(template) = &template_manifest {
-                create_template_project(client, template).await?
-            } else {
+            let env = if env.is_empty() {
                 None
-            };
-            let created_dependencies = if let Some(template) = &template_manifest {
-                create_template_dependencies(client, template, created_project.as_ref()).await?
             } else {
-                Vec::new()
+                let mut map = serde_json::Map::new();
+                for pair in &env {
+                    let (key, value) = parse_env_pair(pair)?;
+                    map.insert(key, Value::String(value));
+                }
+                Some(map)
             };
-            let resolved_env = template_manifest
-                .as_ref()
-                .map(|template| resolve_template_env(template, &env, yes, &created_dependencies))
-                .transpose()?;
             let app = client
                 .create_app(
                     &name,
-                    &resolved_source_type,
-                    resolved_source,
-                    resolved_branch,
-                    resolved_port,
-                    resolved_env,
-                    created_project.as_ref().map(|project| project.id.clone()),
+                    &source_type,
+                    source,
+                    Some(branch),
+                    port,
+                    env,
+                    None,
                     domain,
                     memory_limit,
                     cpu_limit,
-                    resolved_health_path,
+                    health_path,
                     health_interval,
                     health_threshold,
                     drain_timeout,
-                    resolved_build_method,
+                    build_method,
                 )
                 .await?;
             println!("App created: {} (ID: {})", app.name, app.id);
             println!("Deploy with: tond apps deploy {}", app.name);
-            if let Some(template) = &template_manifest {
-                print_template_follow_up(template);
-            }
         }
 
         AppsAction::Deploy { app, no_follow } => {
@@ -841,182 +832,97 @@ pub async fn handle(client: &TondClient, action: AppsAction) -> Result<()> {
     Ok(())
 }
 
-fn resolve_template(template_id: &str) -> Result<TemplateManifest> {
-    let template_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("templates");
-    let manifests = load_template_manifests(&template_dir)?;
-
-    manifests
-        .into_iter()
-        .map(|(_, manifest)| manifest)
-        .find(|manifest| manifest.id == template_id)
-        .ok_or_else(|| anyhow::anyhow!("Unknown template '{template_id}'"))
-}
-
-fn template_source_url(template: &TemplateManifest) -> Option<String> {
-    Some(template.source.url.clone())
-}
-
-fn template_branch(template: &TemplateManifest) -> Option<String> {
-    (template.source.kind == "git")
-        .then(|| template.source.r#ref.clone())
-        .flatten()
-}
-
-fn template_build_method(template: &TemplateManifest) -> Option<String> {
-    match template.deploy.method.as_str() {
-        "tbuild" | "dockerfile" => Some(template.deploy.method.clone()),
-        _ => None,
-    }
-}
-
-fn resolve_template_env(
-    template: &TemplateManifest,
+/// `tond apps create <name> --template <id>`: fill the template's inputs
+/// (from --env, prompting for required ones unless --yes), create and deploy
+/// the app on the server, print the one-time credentials and follow the deploy.
+async fn create_from_template(
+    client: &TondClient,
+    template_id: &str,
+    mut request: TemplateDeployRequest,
     env_pairs: &[String],
     yes: bool,
-    dependencies: &[CreatedTemplateDependency],
-) -> Result<serde_json::Map<String, Value>> {
-    let mut env = serde_json::Map::new();
+) -> Result<()> {
+    let template = client
+        .list_templates()
+        .await?
+        .into_iter()
+        .find(|t| t.id == template_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!("Unknown template '{template_id}'. See `tond templates list`.")
+        })?;
+    request.inputs = template_inputs(&template, env_pairs, yes, |prompt| {
+        crate::commands::settings::read_line_prompt(prompt)
+    })?;
 
+    let created = client.deploy_template(template_id, &request).await?;
+    println!(
+        "Created {} from the {} template (ID: {}).",
+        created.app_name, template.name, created.app_id
+    );
+    if let Some(domain) = &created.domain {
+        println!("Address: https://{domain}");
+    }
+    if !created.credentials.is_empty() {
+        println!();
+        println!("Save these now; they are shown only once:");
+        for c in &created.credentials {
+            println!("  {}: {}", c.label, c.value);
+        }
+        println!();
+    }
+    let outcome = deploy_follow::follow(client, &created.app_name, &created.deployment_id).await?;
+    let result = deploy_follow::finish(&created.app_name, outcome);
+    if let Some(notes) = &created.setup_notes {
+        println!("Next: {notes}");
+    }
+    result
+}
+
+/// Inputs for a template deploy: --env pairs, then a prompt for each required
+/// input that is still missing (an error with --yes). Generated and defaulted
+/// inputs may stay empty: the server fills them.
+fn template_inputs(
+    template: &TemplateResponse,
+    env_pairs: &[String],
+    yes: bool,
+    mut prompt: impl FnMut(&str) -> Result<String>,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut inputs = std::collections::BTreeMap::new();
     for pair in env_pairs {
         let (key, value) = parse_env_pair(pair)?;
-        env.insert(key, Value::String(value));
-    }
-
-    for required in &template.required_env {
-        if env.contains_key(&required.key) {
-            continue;
-        }
-
-        if let Some(value) = &required.value {
-            let resolved = interpolate_template_value(value, dependencies)?;
-            env.insert(required.key.clone(), Value::String(resolved));
-            continue;
-        }
-
-        if yes {
+        if !template.inputs.iter().any(|i| i.key == key) {
+            let known: Vec<&str> = template.inputs.iter().map(|i| i.key.as_str()).collect();
             anyhow::bail!(
-                "Template '{}' requires env var '{}' and --yes disables prompting",
-                template.id,
-                required.key
+                "{} has no input {key}; its inputs are: {}",
+                template.name,
+                if known.is_empty() {
+                    "none".to_string()
+                } else {
+                    known.join(", ")
+                }
             );
         }
-
-        let value = crate::commands::settings::read_line_prompt(&format!(
-            "{} ({}): ",
-            required.key, required.description
-        ))?;
-        if value.trim().is_empty() {
-            anyhow::bail!("Template env var '{}' cannot be empty", required.key);
-        }
-        env.insert(required.key.clone(), Value::String(value));
+        inputs.insert(key, value);
     }
-
-    Ok(env)
-}
-
-#[derive(Debug)]
-struct CreatedTemplateDependency {
-    name: String,
-    /// Returned once when the database is created
-    credentials: DatabaseCredentialsResponse,
-}
-
-async fn create_template_project(
-    client: &TondClient,
-    template: &TemplateManifest,
-) -> Result<Option<tond_common::ProjectResponse>> {
-    let Some(project) = &template.project else {
-        return Ok(None);
-    };
-
-    let created = client
-        .create_project(&project.name, project.description.as_deref())
-        .await?;
-    Ok(Some(created))
-}
-
-async fn create_template_dependencies(
-    client: &TondClient,
-    template: &TemplateManifest,
-    project: Option<&tond_common::ProjectResponse>,
-) -> Result<Vec<CreatedTemplateDependency>> {
-    let mut created = Vec::new();
-
-    for dependency in &template.dependencies {
-        if dependency.kind != "database" {
+    for input in template.inputs.iter().filter(|i| i.required) {
+        if inputs.contains_key(&input.key) {
             continue;
         }
-
-        let name = dependency
-            .name
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("database template dependencies require a name"))?;
-        let engine = dependency
-            .engine
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("database template dependencies require an engine"))?;
-
-        let created_db = client
-            .create_database(
-                &name,
-                engine,
-                project.map(|project| project.id.as_str()),
-                None,
-            )
-            .await?;
-        let credentials = created_db.credentials.ok_or_else(|| {
-            anyhow::anyhow!(
-                "created database '{name}', but this token may not read database credentials \
-                 (db:credentials), which the template needs"
-            )
-        })?;
-        created.push(CreatedTemplateDependency { name, credentials });
+        if yes {
+            anyhow::bail!(
+                "{} needs {} (--env {}=…) and --yes disables prompting",
+                template.name,
+                input.label,
+                input.key
+            );
+        }
+        let value = prompt(&format!("{} ({}): ", input.label, input.key))?;
+        if value.trim().is_empty() {
+            anyhow::bail!("{} is required", input.label);
+        }
+        inputs.insert(input.key.clone(), value.trim().to_string());
     }
-
-    Ok(created)
-}
-
-fn interpolate_template_value(
-    value: &str,
-    dependencies: &[CreatedTemplateDependency],
-) -> Result<String> {
-    let Some(reference) = value
-        .strip_prefix("${db.")
-        .and_then(|value| value.strip_suffix('}'))
-    else {
-        return Ok(value.to_string());
-    };
-
-    let (dependency_name, field) = reference.split_once('.').ok_or_else(|| {
-        anyhow::anyhow!("template dependency interpolation must use ${{db.<name>.<field>}} syntax")
-    })?;
-    let dependency = dependencies
-        .iter()
-        .find(|dependency| dependency.name == dependency_name)
-        .ok_or_else(|| anyhow::anyhow!("unknown template dependency '{dependency_name}'"))?;
-
-    match field {
-        "connection_string" => dependency
-            .credentials
-            .connection_string
-            .clone()
-            .ok_or_else(|| {
-                anyhow::anyhow!("dependency '{dependency_name}' has no connection string")
-            }),
-        "internal_connection_string" => dependency
-            .credentials
-            .internal_connection_string
-            .clone()
-            .ok_or_else(|| {
-                anyhow::anyhow!("dependency '{dependency_name}' has no internal connection string")
-            }),
-        _ => Err(anyhow::anyhow!(
-            "unsupported template dependency field '{field}'"
-        )),
-    }
+    Ok(inputs)
 }
 
 fn parse_env_pair(pair: &str) -> Result<(String, String)> {
@@ -1029,19 +935,6 @@ fn parse_env_pair(pair: &str) -> Result<(String, String)> {
     }
 
     Ok((key.trim().to_string(), value.to_string()))
-}
-
-fn print_template_follow_up(template: &TemplateManifest) {
-    if let Some(notes) = &template.setup_notes {
-        println!("Template notes: {notes}");
-    }
-
-    if !template.post_deploy_checks.is_empty() {
-        println!("Post-deploy checks:");
-        for check in &template.post_deploy_checks {
-            println!("- {check}");
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1075,76 +968,64 @@ mod tests {
         addr
     }
 
-    fn sample_template() -> TemplateManifest {
-        TemplateManifest::from_toml_str(
-            std::path::Path::new("template.toml"),
-            r#"
-id = "plausible"
-name = "Plausible"
-description = "Analytics"
-category = "analytics"
-setup_notes = "Configure your site before sharing the dashboard."
-post_deploy_checks = ["Open /", "Add a site domain"]
-
-[source]
-kind = "image"
-url = "ghcr.io/plausible/community-edition"
-
-[deploy]
-method = "image"
-default_port = 8000
-
-[[required_env]]
-key = "BASE_URL"
-description = "Public URL"
-required = true
-
-[[required_env]]
-key = "SECRET_KEY_BASE"
-description = "Secret key"
-required = true
-"#,
-        )
+    fn sample_template() -> TemplateResponse {
+        serde_json::from_value(json!({
+            "id": "umami", "name": "Umami", "description": "Analytics", "about": null,
+            "category": "analytics", "tags": [], "logo": null, "version": "3.4",
+            "website": null, "docs": null, "repository": null, "ram_mb": 300, "fits_2gb": true,
+            "public": {"service": "umami", "port": 3000, "health_path": null},
+            "services": [], "volumes": [],
+            "inputs": [
+                {"key": "ADMIN_EMAIL", "label": "Admin email", "description": null, "kind": "email",
+                 "required": true, "generated": false, "default": null, "credential": false},
+                {"key": "ADMIN_PASSWORD", "label": "Admin password", "description": null, "kind": "password",
+                 "required": false, "generated": true, "default": null, "credential": true}
+            ],
+            "setup_notes": "Sign in", "upgrade_notes": null, "post_deploy_checks": [], "compose": ""
+        }))
         .unwrap_or_else(|err| panic!("failed to build sample template: {err}"))
     }
 
-    #[test]
-    fn resolve_template_env_uses_provided_values() {
-        let env = resolve_template_env(
-            &sample_template(),
-            &[
-                "BASE_URL=https://stats.example.com".to_string(),
-                "SECRET_KEY_BASE=abc123".to_string(),
-            ],
-            true,
-            &[],
-        )
-        .unwrap_or_else(|err| panic!("expected provided env vars to satisfy template: {err}"));
-
-        assert_eq!(
-            env,
-            serde_json::Map::from_iter([
-                ("BASE_URL".to_string(), json!("https://stats.example.com"),),
-                ("SECRET_KEY_BASE".to_string(), json!("abc123")),
-            ]),
-            "template env resolution should preserve provided required values"
-        );
+    fn no_prompt(_: &str) -> Result<String> {
+        panic!("should not prompt")
     }
 
     #[test]
-    fn resolve_template_env_rejects_missing_required_values_in_yes_mode() {
-        let err = resolve_template_env(
+    fn template_inputs_use_env_pairs_and_leave_generated_ones_to_the_server() {
+        let inputs = template_inputs(
             &sample_template(),
-            &["BASE_URL=https://stats.example.com".to_string()],
+            &["ADMIN_EMAIL=me@example.com".to_string()],
             true,
-            &[],
+            no_prompt,
         )
-        .expect_err("--yes should reject missing required template env vars");
+        .unwrap_or_else(|err| panic!("expected inputs to resolve: {err}"));
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs["ADMIN_EMAIL"], "me@example.com");
+    }
 
+    #[test]
+    fn template_inputs_reject_missing_required_values_with_yes() {
+        let err = template_inputs(&sample_template(), &[], true, no_prompt)
+            .expect_err("--yes should reject a missing required input");
+        assert!(err.to_string().contains("--env ADMIN_EMAIL"), "got: {err}");
+    }
+
+    #[test]
+    fn template_inputs_prompt_for_missing_required_values() {
+        let inputs = template_inputs(&sample_template(), &[], false, |_| {
+            Ok("typed@example.com".to_string())
+        })
+        .unwrap_or_else(|err| panic!("expected the prompt to fill the input: {err}"));
+        assert_eq!(inputs["ADMIN_EMAIL"], "typed@example.com");
+    }
+
+    #[test]
+    fn template_inputs_reject_unknown_keys() {
+        let err = template_inputs(&sample_template(), &["NOPE=1".to_string()], true, no_prompt)
+            .expect_err("unknown inputs should be rejected");
         assert!(
-            err.to_string()
-                .contains("requires env var 'SECRET_KEY_BASE' and --yes disables prompting"),
-            "missing required envs should produce a clear non-interactive error, got: {err}"
+            err.to_string().contains("ADMIN_EMAIL, ADMIN_PASSWORD"),
+            "got: {err}"
         );
     }
 
@@ -1160,174 +1041,34 @@ required = true
         );
     }
 
-    #[test]
-    fn interpolate_template_value_resolves_database_connection_strings() {
-        let value = interpolate_template_value(
-            "${db.analytics-db.internal_connection_string}",
-            &[CreatedTemplateDependency {
-                name: "analytics-db".to_string(),
-                credentials: DatabaseCredentialsResponse {
-                    db_user: Some("tond_analytics".to_string()),
-                    db_password: Some("secret".to_string()),
-                    root_password: None,
-                    public_connection_string: None,
-                    connection_string: Some(
-                        "postgres://tond_analytics:secret@localhost:5432/tond_analytics"
-                            .to_string(),
-                    ),
-                    internal_connection_string: Some(
-                        "postgres://tond_analytics:secret@analytics-db:5432/tond_analytics"
-                            .to_string(),
-                    ),
-                },
-            }],
-        )
-        .unwrap_or_else(|err| panic!("expected dependency interpolation to succeed: {err}"));
-
-        assert_eq!(
-            value, "postgres://tond_analytics:secret@analytics-db:5432/tond_analytics",
-            "dependency interpolation should expose the requested created database field"
-        );
-    }
-
     #[tokio::test]
-    async fn create_template_flow_creates_project_database_and_app_with_interpolated_env() {
+    async fn create_from_template_posts_one_deploy_request() {
         let capture = TemplateFlowCaptureState::default();
         let router = Router::new()
             .route(
-                "/api/projects",
-                post(
-                    |State(state): State<TemplateFlowCaptureState>, body: Bytes| async move {
-                        let request: serde_json::Value = serde_json::from_slice(&body)
-                            .unwrap_or_else(|err| panic!("failed to decode project request body: {err}"));
-                        state
-                            .requests
-                            .lock()
-                            .await
-                            .push(("project".to_string(), request));
-
-                        (
-                            StatusCode::OK,
-                            axum::Json(json!({
-                                "success": true,
-                                "data": {
-                                    "id": "project-1",
-                                    "name": "plausible",
-                                    "description": "Plausible app and supporting services",
-                                    "env_vars": {},
-                                    "created_at": "2026-01-01T00:00:00Z",
-                                    "updated_at": "2026-01-01T00:00:00Z",
-                                    "active_preview_count": 0
-                                },
-                                "error": null
-                            })),
-                        )
-                    },
-                ),
+                "/api/templates",
+                axum::routing::get(|| async {
+                    axum::Json(
+                        json!({"success": true, "data": [sample_template_json()], "error": null}),
+                    )
+                }),
             )
             .route(
-                "/api/databases",
+                "/api/templates/{id}/deploy",
                 post(
                     |State(state): State<TemplateFlowCaptureState>, body: Bytes| async move {
                         let request: serde_json::Value = serde_json::from_slice(&body)
-                            .unwrap_or_else(|err| panic!("failed to decode database request body: {err}"));
+                            .unwrap_or_else(|err| panic!("failed to decode deploy body: {err}"));
                         state
                             .requests
                             .lock()
                             .await
-                            .push(("database".to_string(), request));
-
+                            .push(("deploy".to_string(), request));
                         (
-                            StatusCode::OK,
-                            axum::Json(json!({
-                                "success": true,
-                                "data": {
-                                    "id": "db-1",
-                                    "name": "plausible-db",
-                                    "db_type": "postgres",
-                                    "project_id": "project-1",
-                                    "host_port": 5432,
-                                    "status": "running",
-                                    "db_name": "tond_plausible",
-                                    "db_user": "tond_plausible",
-                                    "has_password": true,
-                                    "memory_limit": null,
-                                    "custom_external_url": null,
-                                    "custom_internal_url": null,
-                                    "image_used": null,
-                                    "custom_image": null,
-                                    "created_at": "2026-01-01T00:00:00Z",
-                                    "updated_at": "2026-01-01T00:00:00Z",
-                                    "connection_string": "postgres://tond_plausible:••••••••@localhost:5432/tond_plausible",
-                                    "internal_connection_string": "postgres://tond_plausible:••••••••@plausible-db:5432/tond_plausible",
-                                    "credentials": {
-                                        "db_user": "tond_plausible",
-                                        "db_password": "secret",
-                                        "root_password": null,
-                                        "connection_string": "postgres://tond_plausible:secret@localhost:5432/tond_plausible",
-                                        "public_connection_string": null,
-                                        "internal_connection_string": "postgres://tond_plausible:secret@plausible-db:5432/tond_plausible"
-                                    }
-                                },
-                                "error": null
-                            })),
-                        )
-                    },
-                ),
-            )
-            .route(
-                "/api/apps",
-                post(
-                    |State(state): State<TemplateFlowCaptureState>, body: Bytes| async move {
-                        let request: serde_json::Value = serde_json::from_slice(&body)
-                            .unwrap_or_else(|err| panic!("failed to decode app request body: {err}"));
-                        state
-                            .requests
-                            .lock()
-                            .await
-                            .push(("app".to_string(), request));
-
-                        (
-                            StatusCode::OK,
-                            axum::Json(json!({
-                                "success": true,
-                                "data": {
-                                    "id": "app-1",
-                                    "name": "plausible-app",
-                                    "domain": null,
-                                    "source_type": "image",
-                                    "source_url": "ghcr.io/plausible/community-edition",
-                                    "status": "pending",
-                                    "container_port": 8000,
-                                    "host_port": null,
-                                    "memory_limit": null,
-                                    "cpu_limit": null,
-                                    "health_check_path": "/",
-                                    "health_check_interval": 30,
-                                    "health_failure_threshold": 3,
-                                    "health_consecutive_failures": 0,
-                                    "volumes": [],
-                                    "drain_timeout": 30,
-                                    "build_method": null,
-                                    "auto_deploy": false,
-                                    "watch_branch": null,
-                                    "deploy_key_pub": null,
-                                    "project_id": "project-1",
-                                    "registry_credential_id": null,
-                                    "github_app_id": null,
-                                    "gitlab_token_id": null,
-                                    "preview_enabled": false,
-                                    "preview_shared_keys": [],
-                                    "preview_env_vars": {},
-                                    "dockerfile_content": null,
-                                    "compose_content": null,
-                                    "base_dir": null,
-                                    "static_build": false,
-                                    "created_at": "2026-01-01T00:00:00Z",
-                                    "updated_at": "2026-01-01T00:00:00Z"
-                                },
-                                "error": null
-                            })),
+                            StatusCode::BAD_REQUEST,
+                            axum::Json(
+                                json!({"success": false, "data": null, "error": "stop here"}),
+                            ),
                         )
                     },
                 ),
@@ -1336,20 +1077,18 @@ required = true
         let addr = spawn_test_server(router).await;
         let client = TondClient::new(&format!("http://{}", addr), None);
 
-        handle(
+        let err = handle(
             &client,
             AppsAction::Create(Box::new(CreateAppOptions {
-                name: "plausible-app".to_string(),
-                template: Some("plausible".to_string()),
+                name: "stats".to_string(),
+                template: Some("umami".to_string()),
+                allow_low_memory: true,
                 source_type: "git".to_string(),
                 source: None,
                 branch: "main".to_string(),
                 port: 3000,
-                domain: None,
-                env: vec![
-                    "BASE_URL=https://stats.example.com".to_string(),
-                    "SECRET_KEY_BASE=super-secret".to_string(),
-                ],
+                domain: Some("stats.example.com".to_string()),
+                env: vec!["ADMIN_EMAIL=me@example.com".to_string()],
                 memory_mb: None,
                 cpus: None,
                 health_path: None,
@@ -1361,47 +1100,20 @@ required = true
             })),
         )
         .await
-        .unwrap_or_else(|err| panic!("expected templated app create command to succeed: {err}"));
+        .expect_err("the stub server refuses the deploy");
+        assert!(err.to_string().contains("stop here"));
 
         let requests = capture.requests.lock().await.clone();
-        assert_eq!(
-            requests.len(),
-            3,
-            "template create flow should issue project, database, and app requests"
-        );
-        assert_eq!(
-            requests[0].0, "project",
-            "template create flow should create the project before dependencies"
-        );
-        assert_eq!(
-            requests[1].0, "database",
-            "template create flow should create dependencies before the app"
-        );
-        assert_eq!(
-            requests[2].0, "app",
-            "template create flow should create the app last after dependency interpolation"
-        );
-        assert_eq!(
-            requests[1].1["project_id"],
-            serde_json::Value::String("project-1".to_string()),
-            "template dependency creation should attach managed databases to the created project"
-        );
-        assert_eq!(
-            requests[2].1["project_id"],
-            serde_json::Value::String("project-1".to_string()),
-            "templated app creation should attach the app to the created project"
-        );
-        assert_eq!(
-            requests[2].1["env_vars"]["DATABASE_URL"],
-            serde_json::Value::String(
-                "postgres://tond_plausible:secret@plausible-db:5432/tond_plausible".to_string(),
-            ),
-            "templated app creation should interpolate dependency connection strings into env vars"
-        );
-        assert_eq!(
-            requests[2].1["source_type"],
-            serde_json::Value::String("image".to_string()),
-            "templated app creation should preserve the template source type"
-        );
+        assert_eq!(requests.len(), 1, "a template deploy is a single request");
+        let body = &requests[0].1;
+        assert_eq!(body["name"], "stats");
+        assert_eq!(body["domain"], "stats.example.com");
+        assert_eq!(body["allow_low_memory"], true);
+        assert_eq!(body["inputs"], json!({"ADMIN_EMAIL": "me@example.com"}));
+    }
+
+    fn sample_template_json() -> serde_json::Value {
+        serde_json::to_value(sample_template())
+            .unwrap_or_else(|err| panic!("failed to encode sample template: {err}"))
     }
 }

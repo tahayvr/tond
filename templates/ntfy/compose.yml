@@ -1,0 +1,18 @@
+services:
+  ntfy:
+    image: binwiederhier/ntfy:v2.28.0
+    restart: unless-stopped
+    mem_limit: 128m
+    command: serve
+    ports: ["80"]
+    environment:
+      NTFY_BASE_URL: ${NTFY_BASE_URL}
+      NTFY_LISTEN_HTTP: ":80"
+      NTFY_BEHIND_PROXY: "true"
+      NTFY_CACHE_FILE: /var/lib/ntfy/cache.db
+      NTFY_AUTH_FILE: /var/lib/ntfy/auth.db
+      NTFY_AUTH_DEFAULT_ACCESS: deny-all
+      NTFY_ENABLE_LOGIN: "true"
+      NTFY_ATTACHMENT_CACHE_DIR: /var/lib/ntfy/attachments
+    volumes:
+      - ./data:/var/lib/ntfy

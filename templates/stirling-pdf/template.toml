@@ -1,0 +1,31 @@
+id = "stirling-pdf"
+name = "Stirling-PDF"
+description = "Merge, split, convert, compress, sign and OCR PDFs in your browser."
+about = "Stirling-PDF offers 50+ PDF tools in a web UI and an API: merge, split, rotate, compress, convert to and from images and Office formats, OCR, sign, redact and more. Files are processed on your server and never stored. Login is on, so the tools aren't open to the internet."
+category = "documents"
+tags = ["pdf", "documents", "ocr", "convert", "tools"]
+version = "2.14"
+website = "https://www.stirling.com"
+docs = "https://docs.stirlingpdf.com"
+repository = "https://github.com/Stirling-Tools/Stirling-PDF"
+ram_mb = 700
+setup_notes = "Sign in as admin with the password shown below; you'll be asked to change it. Add more users under Settings."
+upgrade_notes = "Change the image to a newer tag and redeploy. Read the release notes before a major version."
+post_deploy_checks = ["Sign in and change the password", "Merge two PDFs"]
+
+[public]
+service = "stirling-pdf"
+port = 8080
+health_path = "/api/v1/info/status"
+
+[[inputs]]
+key = "ADMIN_PASSWORD"
+label = "Initial admin password"
+kind = "password"
+generate = "password"
+credential = true
+
+[[volumes]]
+service = "stirling-pdf"
+path = "./configs"
+description = "Settings and the user database"

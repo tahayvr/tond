@@ -1,0 +1,44 @@
+id = "prometheus-grafana"
+name = "Grafana + Prometheus"
+description = "A metrics stack: Prometheus collects and stores, Grafana shows and alerts."
+about = "Prometheus scrapes metrics from your services and stores them as time series; Grafana comes pre-connected to it for dashboards and alerts. Prometheus stays private on the app network, only Grafana is public. Add scrape targets in the prometheus_config block of the app's compose file, then redeploy. Host metrics (node-exporter) aren't included: it needs host access Tond doesn't grant to apps."
+category = "monitoring"
+tags = ["prometheus", "grafana", "metrics", "observability", "monitoring"]
+logo = "prometheus"
+version = "Prometheus 3.14 · Grafana 12.4"
+website = "https://prometheus.io"
+docs = "https://prometheus.io/docs/prometheus/latest/configuration/configuration/"
+repository = "https://github.com/prometheus/prometheus"
+ram_mb = 350
+setup_notes = "Sign in to Grafana as admin with the password shown below; the Prometheus data source is already set up. Metrics are kept for 15 days."
+upgrade_notes = "Change either image tag and redeploy. Prometheus keeps its data format across 3.x releases; snapshot the app before a major version."
+post_deploy_checks = ["Sign in to Grafana", "Open Explore and query the 'up' metric"]
+
+[public]
+service = "grafana"
+port = 3000
+health_path = "/api/health"
+
+[[inputs]]
+key = "GF_SERVER_ROOT_URL"
+label = "Root URL"
+value = "{app_url}"
+
+[[inputs]]
+key = "ADMIN_PASSWORD"
+label = "Grafana admin password"
+kind = "password"
+generate = "password"
+credential = true
+
+[[volumes]]
+service = "grafana"
+path = "./grafana"
+description = "Grafana dashboards, users and settings"
+owner = "472:0"
+
+[[volumes]]
+service = "prometheus"
+path = "./prometheus"
+description = "Prometheus time-series data (15 days)"
+owner = "65534:65534"

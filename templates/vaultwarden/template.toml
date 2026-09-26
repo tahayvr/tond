@@ -1,0 +1,38 @@
+id = "vaultwarden"
+name = "Vaultwarden"
+description = "Lightweight Bitwarden-compatible password manager server."
+about = "Vaultwarden implements the Bitwarden API in Rust, so the official Bitwarden apps and browser extensions work with it, in a fraction of the memory of the official server. It needs HTTPS, which Tond provides on the app's domain."
+category = "security"
+tags = ["passwords", "bitwarden", "vault", "security"]
+logo = "vaultwarden"
+version = "1.37"
+website = "https://github.com/dani-garcia/vaultwarden"
+docs = "https://github.com/dani-garcia/vaultwarden/wiki"
+repository = "https://github.com/dani-garcia/vaultwarden"
+ram_mb = 60
+setup_notes = "Open the app and create your account. Then open /admin with the admin token shown below and turn off 'Allow new signups' so nobody else can register."
+upgrade_notes = "Change the image to a newer 1.x tag and redeploy. Snapshot the app first: the SQLite database holds every vault."
+post_deploy_checks = ["Create your account", "Disable new signups in /admin", "Set up backups of this app"]
+
+[public]
+service = "vaultwarden"
+port = 80
+health_path = "/alive"
+
+[[inputs]]
+key = "DOMAIN"
+label = "Public URL"
+value = "{app_url}"
+
+[[inputs]]
+key = "ADMIN_TOKEN"
+label = "Admin panel token"
+description = "Opens /admin. Keep it secret."
+kind = "password"
+generate = "password"
+credential = true
+
+[[volumes]]
+service = "vaultwarden"
+path = "./data"
+description = "The vault database, attachments and keys"

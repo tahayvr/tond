@@ -1065,7 +1065,10 @@ async fn source_image(
             )
             .await?;
 
-            run_inline_compose(state, app_id, app_name, content, trigger_source).await?
+            // `${VAR}` in the compose file is filled from the app's env
+            // (templates keep their generated passwords there).
+            let env = secrets::app_env(app)?;
+            run_inline_compose(state, app_id, app_name, content, &env, trigger_source).await?
         }
         other => {
             anyhow::bail!("Unsupported source type: {}", other);

@@ -43,8 +43,9 @@ use tond_common::{
     DatabaseCredentialsResponse, DeployKeyResponse, DeploymentResponse, IntegrationResponse,
     ManagedDatabaseDetail, ManagedDatabaseResponse, PasswordLinkResponse,
     PreviewDeploymentResponse, ProjectPreviewResponse, ProjectResponse, ServerSettings,
-    SnapshotResponse, StorageProviderResponse, TokenResponse, UpdateCronJobRequest,
-    UpdateSettingsRequest, UserResponse, WebhookConfigResponse, WebhookSecretResponse,
+    SnapshotResponse, StorageProviderResponse, TemplateDeployRequest, TemplateDeployResponse,
+    TemplateResponse, TokenResponse, UpdateCronJobRequest, UpdateSettingsRequest, UserResponse,
+    WebhookConfigResponse, WebhookSecretResponse,
 };
 
 /// Body and response of `/api/settings/host-terminal`.
@@ -210,6 +211,37 @@ impl TondClient {
             .get(format!("{}/api/apps/{}", self.base_url, id));
         let resp: ApiResponse<AppResponse> = self.auth_header(req).send().await?.json().await?;
 
+        if resp.success {
+            resp.data.context("No data returned")
+        } else {
+            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
+        }
+    }
+
+    /// GET /api/templates — the one-click catalog.
+    pub async fn list_templates(&self) -> Result<Vec<TemplateResponse>> {
+        let req = self.client.get(format!("{}/api/templates", self.base_url));
+        let resp: ApiResponse<Vec<TemplateResponse>> =
+            self.auth_header(req).send().await?.json().await?;
+        if resp.success {
+            Ok(resp.data.unwrap_or_default())
+        } else {
+            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
+        }
+    }
+
+    /// POST /api/templates/{id}/deploy — create the app and queue its first deploy.
+    pub async fn deploy_template(
+        &self,
+        id: &str,
+        body: &TemplateDeployRequest,
+    ) -> Result<TemplateDeployResponse> {
+        let req = self
+            .client
+            .post(format!("{}/api/templates/{}/deploy", self.base_url, id))
+            .json(body);
+        let resp: ApiResponse<TemplateDeployResponse> =
+            self.auth_header(req).send().await?.json().await?;
         if resp.success {
             resp.data.context("No data returned")
         } else {

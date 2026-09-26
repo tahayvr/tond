@@ -1,0 +1,35 @@
+id = "mealie"
+name = "Mealie"
+description = "Recipe manager and meal planner that imports recipes from any website."
+about = "Mealie scrapes recipes from a URL, organises them with tags and categories, plans meals and builds shopping lists, for your whole household."
+category = "productivity"
+tags = ["recipes", "cooking", "meal planning", "shopping list"]
+version = "3.28"
+website = "https://mealie.io"
+docs = "https://docs.mealie.io/documentation/getting-started/installation/installation-checklist/"
+repository = "https://github.com/mealie-recipes/mealie"
+ram_mb = 300
+setup_notes = "Sign in with changeme@example.com and password MyPassword, then change the email and password immediately under your profile."
+upgrade_notes = "Change the image to a newer tag and redeploy; migrations run on start. Snapshot the app first."
+post_deploy_checks = ["Sign in and change the default credentials", "Import a recipe from a URL"]
+
+[public]
+service = "mealie"
+port = 9000
+health_path = "/api/app/about"
+
+[[inputs]]
+key = "BASE_URL"
+label = "Public URL"
+value = "{app_url}"
+
+[[inputs]]
+key = "TZ"
+label = "Time zone"
+description = "For meal plans, e.g. Europe/Berlin."
+default = "UTC"
+
+[[volumes]]
+service = "mealie"
+path = "./data"
+description = "Recipes, images and the SQLite database"

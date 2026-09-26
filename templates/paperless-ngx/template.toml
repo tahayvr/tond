@@ -1,0 +1,58 @@
+id = "paperless-ngx"
+name = "Paperless-ngx"
+description = "Scan, OCR, tag and search all your paper documents."
+about = "Paperless-ngx turns scanned documents into a searchable archive: OCR, automatic tagging and matching, full-text search and a clean web UI. This template uses SQLite and one worker to stay frugal; OCR of large batches takes a while on a small server."
+category = "documents"
+tags = ["documents", "ocr", "scanner", "archive", "paperless"]
+logo = "paperlessngx"
+version = "2.20"
+website = "https://docs.paperless-ngx.com"
+docs = "https://docs.paperless-ngx.com/setup/"
+repository = "https://github.com/paperless-ngx/paperless-ngx"
+ram_mb = 800
+setup_notes = "Sign in as admin with the password shown below, then upload a document from the web UI or the mobile apps."
+upgrade_notes = "Change the image to a newer 2.x tag and redeploy; migrations run on start. Paperless 3 has breaking changes: read its release notes and snapshot first."
+post_deploy_checks = ["Sign in as admin", "Upload a PDF and search for a word in it"]
+
+[public]
+service = "paperless"
+port = 8000
+health_path = "/accounts/login/"
+
+[[inputs]]
+key = "PAPERLESS_URL"
+label = "Public URL"
+value = "{app_url}"
+
+[[inputs]]
+key = "PAPERLESS_SECRET_KEY"
+label = "Secret key"
+generate = "hex"
+
+[[inputs]]
+key = "ADMIN_PASSWORD"
+label = "Admin password"
+kind = "password"
+generate = "password"
+credential = true
+
+[[inputs]]
+key = "PAPERLESS_OCR_LANGUAGE"
+label = "OCR language"
+description = "Tesseract language code of most documents, e.g. eng, deu, fra."
+default = "eng"
+
+[[volumes]]
+service = "paperless"
+path = "./data"
+description = "The database, search index and classifier"
+
+[[volumes]]
+service = "paperless"
+path = "./media"
+description = "Original and archived documents"
+
+[[volumes]]
+service = "paperless"
+path = "./consume"
+description = "Drop folder: files placed here are imported"

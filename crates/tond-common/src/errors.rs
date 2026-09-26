@@ -46,6 +46,11 @@ pub enum TondError {
     /// The request body (e.g. an uploaded archive) exceeds a configured limit.
     #[error("Too large: {0}")]
     PayloadTooLarge(String),
+
+    /// The request conflicts with the server's state and can be retried with
+    /// an explicit override (e.g. `insufficient_memory` for a template deploy).
+    #[error("{message}")]
+    Conflict { code: &'static str, message: String },
 }
 
 impl TondError {
@@ -58,6 +63,7 @@ impl TondError {
             TondError::Forbidden(_) => 403,
             TondError::PayloadTooLarge(_) => 413,
             TondError::ScopeDenied { .. } => 403,
+            TondError::Conflict { .. } => 409,
             _ => 500,
         }
     }
@@ -65,7 +71,7 @@ impl TondError {
     /// Stable machine-readable error code, when the variant has one.
     pub fn code(&self) -> Option<&'static str> {
         match self {
-            TondError::ScopeDenied { code, .. } => Some(code),
+            TondError::ScopeDenied { code, .. } | TondError::Conflict { code, .. } => Some(code),
             _ => None,
         }
     }

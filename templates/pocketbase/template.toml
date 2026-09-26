@@ -1,0 +1,38 @@
+id = "pocketbase"
+name = "PocketBase"
+description = "Open-source backend in one file: database, auth, file storage and realtime."
+about = "PocketBase gives you an embedded SQLite database with a realtime API, user authentication, file storage and an admin dashboard, all in a single tiny Go binary. A great backend for prototypes, mobile apps and SPAs."
+category = "developer"
+tags = ["backend", "baas", "firebase alternative", "sqlite", "realtime", "api"]
+logo = "pocketbase"
+version = "0.40"
+website = "https://pocketbase.io"
+docs = "https://pocketbase.io/docs/"
+repository = "https://github.com/pocketbase/pocketbase"
+ram_mb = 40
+setup_notes = "Open /_/ on the app's address and sign in with the superuser email and the password shown below."
+upgrade_notes = "PocketBase is pre-1.0 and minor versions can break. Read the changelog, snapshot the app, then change the image tag and redeploy."
+post_deploy_checks = ["Sign in to the dashboard at /_/", "Create your first collection"]
+
+[public]
+service = "pocketbase"
+port = 8090
+health_path = "/api/health"
+
+[[inputs]]
+key = "SUPERUSER_EMAIL"
+label = "Superuser email"
+kind = "email"
+credential = true
+
+[[inputs]]
+key = "SUPERUSER_PASSWORD"
+label = "Superuser password"
+kind = "password"
+generate = "password"
+credential = true
+
+[[volumes]]
+service = "pocketbase"
+path = "./pb_data"
+description = "The database and uploaded files"

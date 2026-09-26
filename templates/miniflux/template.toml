@@ -1,0 +1,42 @@
+id = "miniflux"
+name = "Miniflux"
+description = "Minimalist, fast RSS and Atom feed reader."
+about = "Miniflux is an opinionated feed reader: a clean, keyboard-friendly web UI, readability extraction, integrations with read-later services and a Fever/Google Reader API for mobile apps. It uses a few dozen megabytes of memory."
+category = "productivity"
+tags = ["rss", "feeds", "reader", "news"]
+logo = "miniflux"
+version = "2.3"
+website = "https://miniflux.app"
+docs = "https://miniflux.app/docs/docker.html"
+repository = "https://github.com/miniflux/v2"
+ram_mb = 100
+setup_notes = "Sign in as admin with the password shown below and add your first feeds, or import an OPML file."
+upgrade_notes = "Change the image to a newer 2.x tag and redeploy; migrations run on start."
+post_deploy_checks = ["Sign in as admin", "Import an OPML file or add a feed"]
+
+[public]
+service = "miniflux"
+port = 8080
+health_path = "/healthcheck"
+
+[[inputs]]
+key = "BASE_URL"
+label = "Public URL"
+value = "{app_url}"
+
+[[inputs]]
+key = "ADMIN_PASSWORD"
+label = "Admin password"
+kind = "password"
+generate = "password"
+credential = true
+
+[[inputs]]
+key = "DB_PASSWORD"
+label = "Database password"
+generate = "password"
+
+[[volumes]]
+service = "db"
+path = "./postgres"
+description = "PostgreSQL data: feeds, entries and users"

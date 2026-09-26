@@ -431,6 +431,10 @@ async fn run() -> Result<()> {
             put(handlers::terminal::set_host_terminal),
         )
         .route("/api/templates", get(handlers::templates::list_templates))
+        .route(
+            "/api/templates/{id}/deploy",
+            post(handlers::templates::deploy_template),
+        )
         // Git integration — auto-deploy toggle, webhook secret, deploy keys, source
         .route(
             "/api/apps/{id}/auto-deploy",

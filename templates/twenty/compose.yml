@@ -1,0 +1,63 @@
+services:
+  server:
+    image: twentycrm/twenty:v2.42.6
+    restart: unless-stopped
+    mem_limit: 1g
+    ports: ["3000"]
+    environment:
+      NODE_PORT: "3000"
+      SERVER_URL: ${SERVER_URL}
+      APP_SECRET: ${APP_SECRET}
+      PG_DATABASE_URL: postgres://twenty:${DB_PASSWORD}@db:5432/twenty
+      REDIS_URL: redis://redis:6379
+      STORAGE_TYPE: local
+    volumes:
+      - ./storage:/app/packages/twenty-server/.local-storage
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    image: twentycrm/twenty:v2.42.6
+    restart: unless-stopped
+    mem_limit: 768m
+    command: ["yarn", "worker:prod"]
+    environment:
+      SERVER_URL: ${SERVER_URL}
+      APP_SECRET: ${APP_SECRET}
+      PG_DATABASE_URL: postgres://twenty:${DB_PASSWORD}@db:5432/twenty
+      REDIS_URL: redis://redis:6379
+      STORAGE_TYPE: local
+      DISABLE_DB_MIGRATIONS: "true"
+      DISABLE_CRON_JOBS_REGISTRATION: "true"
+    depends_on:
+      - server
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    mem_limit: 384m
+    environment:
+      POSTGRES_DB: twenty
+      POSTGRES_USER: twenty
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - ./postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U twenty -d twenty"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: valkey/valkey:8-alpine
+    restart: unless-stopped
+    mem_limit: 128m
+    command: ["valkey-server", "--maxmemory-policy", "noeviction"]
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
