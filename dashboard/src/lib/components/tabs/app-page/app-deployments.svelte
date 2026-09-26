@@ -4,13 +4,16 @@
 	import type { Deployment } from '$lib/api';
 	import { Badge } from '$lib/components/ui/badge/index.js';
 	import * as Dialog from '$lib/components/ui/dialog/index.js';
+	import * as Tooltip from '$lib/components/ui/tooltip/index.js';
 	import { Textarea } from '$lib/components/ui/textarea/index.js';
+	import HistoryIcon from '~icons/ri/history-line';
 
 	interface Props {
 		deployments: Deployment[];
 		loading: boolean;
 		error: string;
-		onRollback: () => void;
+		/** Restore a deployment's exact image; no id = the previous distinct image */
+		onRollback: (deploymentId?: string) => void | Promise<void>;
 		onViewGeneratedDockerfile: (deploymentId: string) => Promise<string>;
 	}
 
@@ -20,6 +23,34 @@
 	let dockerfileError = $state('');
 	let dockerfileContent = $state('');
 	let selectedDeploymentId = $state('');
+
+	// Restore confirmation
+	let confirmTarget = $state<Deployment | null>(null);
+	let confirmOpen = $state(false);
+	let restoring = $state(false);
+
+	/** The deployment the plain "Roll back" button restores (server picks the same). */
+	let previousTarget = $derived(deployments.find((d) => d.rollback_available) ?? null);
+
+	function shortImage(tag: string | null): string {
+		return tag ?? '-';
+	}
+
+	function handleAskRestore(d: Deployment) {
+		confirmTarget = d;
+		confirmOpen = true;
+	}
+
+	async function handleConfirmRestore() {
+		if (!confirmTarget) return;
+		restoring = true;
+		try {
+			await onRollback(confirmTarget.id);
+			confirmOpen = false;
+		} finally {
+			restoring = false;
+		}
+	}
 
 	async function handleViewGeneratedDockerfile(deploymentId: string) {
 		dockerfileDialogOpen = true;
@@ -39,13 +70,66 @@
 
 <div class="space-y-4 pt-4">
 	{#if error}
-		<ErrorAlert title="Error" description={error} />
+		<ErrorAlert title="Rollback failed" description={error} />
 	{/if}
 
-	<div class="flex items-center justify-between">
-		<p class="text-sm text-muted-foreground">Last 20 deployments for this app.</p>
-		<Button variant="outline" size="sm" onclick={onRollback}>Rollback</Button>
+	<div class="flex items-start justify-between gap-4">
+		<div class="space-y-1">
+			<p class="text-sm text-muted-foreground">Last 20 deployments for this app.</p>
+			<p class="text-xs text-muted-foreground/80">
+				Rolling back restores the exact image a deployment ran. Current environment variables,
+				volumes and resource limits are kept. Images of the last 3 successful deployments stay on
+				the server; older ones are pruned to save disk space.
+			</p>
+		</div>
+		<Tooltip.Root>
+			<Tooltip.Trigger>
+				{#snippet child({ props })}
+					<span {...props} class="shrink-0">
+						<Button
+							variant="outline"
+							size="sm"
+							disabled={!previousTarget}
+							onclick={() => previousTarget && handleAskRestore(previousTarget)}
+						>
+							<HistoryIcon class="size-4" />
+							Roll back to previous
+						</Button>
+					</span>
+				{/snippet}
+			</Tooltip.Trigger>
+			<Tooltip.Content>
+				{#if previousTarget}
+					<p>Restore {shortImage(previousTarget.image_tag)}</p>
+				{:else}
+					<p>No earlier deployment with an image still on this server</p>
+				{/if}
+			</Tooltip.Content>
+		</Tooltip.Root>
 	</div>
+
+	<Dialog.Root bind:open={confirmOpen}>
+		<Dialog.Content class="max-w-lg">
+			<Dialog.Header>
+				<Dialog.Title>Restore this deployment?</Dialog.Title>
+				<Dialog.Description>
+					The app will run
+					<span class="font-mono">{shortImage(confirmTarget?.image_tag ?? null)}</span>
+					again, from {confirmTarget ? new Date(confirmTarget.started_at).toLocaleString() : ''}.
+					Traffic switches over once the container is healthy. Environment variables, volumes and
+					limits stay as they are now.
+				</Dialog.Description>
+			</Dialog.Header>
+			<Dialog.Footer>
+				<Button variant="outline" onclick={() => (confirmOpen = false)} disabled={restoring}>
+					Cancel
+				</Button>
+				<Button onclick={handleConfirmRestore} disabled={restoring}>
+					{restoring ? 'Starting rollback…' : 'Restore image'}
+				</Button>
+			</Dialog.Footer>
+		</Dialog.Content>
+	</Dialog.Root>
 
 	<Dialog.Root bind:open={dockerfileDialogOpen}>
 		<Dialog.Content class="max-w-4xl">
@@ -73,7 +157,7 @@
 			<p class="mt-1 text-sm text-muted-foreground/60">Deploy this app to see history here</p>
 		</div>
 	{:else}
-		<div class="rounded-md border">
+		<div class="overflow-x-auto rounded-md border">
 			<table class="w-full text-sm">
 				<thead>
 					<tr class="border-b bg-muted/50">
@@ -83,26 +167,39 @@
 						<th class="px-4 py-2 text-left font-medium text-muted-foreground">Artifacts</th>
 						<th class="px-4 py-2 text-left font-medium text-muted-foreground">Started</th>
 						<th class="px-4 py-2 text-left font-medium text-muted-foreground">Finished</th>
+						<th class="px-4 py-2 text-right font-medium text-muted-foreground">Rollback</th>
 					</tr>
 				</thead>
 				<tbody>
 					{#each deployments as d (d.id)}
 						<tr class="border-b last:border-0">
 							<td class="px-4 py-2">
-								<Badge
-									variant={d.status === 'succeeded'
-										? 'default'
-										: d.status === 'failed'
-											? 'destructive'
-											: 'outline'}>{d.status}</Badge
-								>
+								<div class="flex items-center gap-1.5">
+									<Badge
+										variant={d.status === 'succeeded'
+											? 'default'
+											: d.status === 'failed'
+												? 'destructive'
+												: 'outline'}>{d.status}</Badge
+									>
+									{#if d.is_current}
+										<Badge variant="outline" class="text-xs">current</Badge>
+									{/if}
+								</div>
 							</td>
 							<td class="px-4 py-2">
 								<Badge variant="outline" class="font-mono text-xs"
 									>{d.trigger_source ?? 'manual'}</Badge
 								>
 							</td>
-							<td class="px-4 py-2 font-mono text-muted-foreground">{d.image_tag ?? '-'}</td>
+							<td class="px-4 py-2 font-mono text-muted-foreground">
+								<span class={d.image_pruned ? 'line-through opacity-60' : ''}
+									>{shortImage(d.image_tag)}</span
+								>
+								{#if d.image_pruned}
+									<span class="ml-1 font-sans text-xs">(pruned)</span>
+								{/if}
+							</td>
 							<td class="px-4 py-2">
 								{#if d.has_generated_dockerfile}
 									<Button
@@ -122,6 +219,28 @@
 							<td class="px-4 py-2 text-muted-foreground"
 								>{d.finished_at ? new Date(d.finished_at).toLocaleString() : '-'}</td
 							>
+							<td class="px-4 py-2 text-right">
+								{#if d.rollback_available}
+									<Button variant="outline" size="sm" onclick={() => handleAskRestore(d)}>
+										Restore
+									</Button>
+								{:else if d.status === 'succeeded' && !d.is_current}
+									<Tooltip.Root>
+										<Tooltip.Trigger>
+											{#snippet child({ props })}
+												<span {...props} class="inline-block">
+													<Button variant="outline" size="sm" disabled>Restore</Button>
+												</span>
+											{/snippet}
+										</Tooltip.Trigger>
+										<Tooltip.Content>
+											<p>{d.rollback_unavailable_reason ?? 'Rollback unavailable'}</p>
+										</Tooltip.Content>
+									</Tooltip.Root>
+								{:else}
+									<span class="text-xs text-muted-foreground">-</span>
+								{/if}
+							</td>
 						</tr>
 					{/each}
 				</tbody>

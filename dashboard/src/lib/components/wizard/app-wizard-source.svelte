@@ -17,6 +17,7 @@
 		listGitHubApps,
 		listGitHubRepos,
 		listGitHubBranches,
+		validateCompose,
 		type GitHubApp,
 		type GitHubRepo,
 		type TemplateCatalogEntry
@@ -73,6 +74,32 @@
 				)
 			: []
 	);
+
+	// Compose policy check: ask the server (debounced) so problems show up under
+	// the editor instead of at the end of the wizard.
+	let composeErrors = $state<string[]>([]);
+	$effect(() => {
+		const content = composeContent;
+		const appName = name;
+		if (sourceSubType !== 'compose' || !content.trim()) {
+			composeErrors = [];
+			return;
+		}
+		let cancelled = false;
+		const timer = setTimeout(async () => {
+			try {
+				const result = await validateCompose(content, appName);
+				if (!cancelled) composeErrors = result.errors;
+			} catch {
+				// Validation is advisory; the create request re-checks and reports errors.
+				if (!cancelled) composeErrors = [];
+			}
+		}, 500);
+		return () => {
+			cancelled = true;
+			clearTimeout(timer);
+		};
+	});
 
 	// GitHub App picker state
 	let githubApps = $state<GitHubApp[]>([]);
@@ -589,6 +616,24 @@ CMD [&quot;node&quot;, &quot;dist/index.js&quot;]"
 				Paste your docker-compose.yml content. The application will be started with
 				<code class="rounded bg-muted px-1 font-mono">docker compose up --build -d</code>.
 			</p>
+			<p class="text-xs text-muted-foreground">
+				For safety Tond refuses privileged mode, host namespaces (<code class="font-mono"
+					>network_mode: host</code
+				>, <code class="font-mono">pid: host</code>…), extra capabilities, devices and bind mounts
+				outside the app's folder. Use relative binds like
+				<code class="font-mono">./data:/data</code> — they are stored in the app's volume folder. Published
+				ports are bound to 127.0.0.1 and reached through Tond's proxy.
+			</p>
+			{#if composeErrors.length > 0}
+				<div class="rounded-md bg-destructive/10 p-3 text-xs text-destructive" role="alert">
+					<p class="font-medium">This compose file will be rejected:</p>
+					<ul class="mt-1 list-disc space-y-0.5 pl-4">
+						{#each composeErrors as problem (problem)}
+							<li>{problem}</li>
+						{/each}
+					</ul>
+				</div>
+			{/if}
 		</div>
 	{/if}
 

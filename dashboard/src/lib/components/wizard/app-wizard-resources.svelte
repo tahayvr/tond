@@ -4,23 +4,25 @@
 	import { Button } from '$lib/components/ui/button/index.js';
 	import * as Select from '$lib/components/ui/select/index.js';
 	import { Separator } from '$lib/components/ui/separator/index.js';
-
-	interface Volume {
-		host_path: string;
-		container_path: string;
-	}
+	import LockIcon from '~icons/ri/lock-line';
+	import type { VolumeInput } from '$lib/api';
 
 	interface Props {
+		appName: string;
+		/** Only admins may configure volumes */
+		canEditVolumes: boolean;
 		memoryLimit: number | null;
 		memoryUnit: 'mb' | 'gb';
 		cpuLimit: number | null;
-		volumes: Volume[];
+		volumes: VolumeInput[];
 		newVolumePath: string;
 		onAddVolume: () => void;
 		onRemoveVolume: (index: number) => void;
 	}
 
 	let {
+		appName,
+		canEditVolumes,
 		memoryLimit = $bindable(null),
 		memoryUnit = $bindable('mb'),
 		cpuLimit = $bindable(null),
@@ -29,6 +31,18 @@
 		onAddVolume,
 		onRemoveVolume
 	}: Props = $props();
+
+	/** Mirrors the server's default volume name: "/data/cache" → "data_cache". */
+	function volumeDir(v: VolumeInput): string {
+		const name =
+			v.name ||
+			v.container_path
+				.replace(/^\/+|\/+$/g, '')
+				.replace(/[^A-Za-z0-9._-]/g, '_')
+				.replace(/^\.+/, '') ||
+			'data';
+		return `/opt/tond/data/volumes/${appName || '<app>'}/${name}`;
+	}
 </script>
 
 <div class="space-y-6">
@@ -78,7 +92,7 @@
 					<div class="flex items-center gap-2 rounded border border-border bg-muted p-3">
 						<div class="flex-1 font-mono text-xs">
 							<div class="text-muted-foreground">Container: {volume.container_path}</div>
-							<div class="text-muted-foreground/70">Host: {volume.host_path}</div>
+							<div class="text-muted-foreground/70">Stored in: {volumeDir(volume)}</div>
 						</div>
 						<Button
 							variant="ghost"
@@ -93,14 +107,24 @@
 			</div>
 		{/if}
 
-		<div class="flex gap-2">
-			<Input type="text" bind:value={newVolumePath} placeholder="/app/data" class="font-mono" />
-			<Button variant="outline" onclick={onAddVolume} disabled={!newVolumePath.trim()}>
-				Add Volume
-			</Button>
-		</div>
-		<p class="text-xs text-muted-foreground">
-			Mount host directories into the container. Host paths are auto-generated.
-		</p>
+		{#if canEditVolumes}
+			<div class="flex gap-2">
+				<Input type="text" bind:value={newVolumePath} placeholder="/app/data" class="font-mono" />
+				<Button variant="outline" onclick={onAddVolume} disabled={!newVolumePath.trim()}>
+					Add Volume
+				</Button>
+			</div>
+			<p class="text-xs text-muted-foreground">
+				Enter the path inside the container. Tond stores the data in this app's own folder on the
+				server; other host paths can't be mounted.
+			</p>
+		{:else}
+			<div
+				class="flex items-start gap-2 rounded-md border bg-muted/30 p-3 text-sm text-muted-foreground"
+			>
+				<LockIcon class="mt-0.5 size-4 shrink-0" />
+				<p>Only admins can configure volumes, because volumes are directories on the server.</p>
+			</div>
+		{/if}
 	</div>
 </div>

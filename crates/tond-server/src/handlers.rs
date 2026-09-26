@@ -395,6 +395,42 @@ pub async fn create_app(
     ))
 }
 
+// ── Validate Compose ──
+//
+// POST /api/compose/validate — lets the dashboard show compose policy problems
+// under the editor while the user types, before they create the app.
+
+#[derive(Deserialize)]
+pub struct ValidateComposeRequest {
+    /// App name, used to show where bind mounts will be stored (default "app")
+    pub app_name: Option<String>,
+    pub compose_content: String,
+}
+
+pub async fn validate_compose(
+    _rate: RateLimit,
+    _auth: RequireAuth,
+    Json(req): Json<ValidateComposeRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let name = req
+        .app_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_alphanumeric() || c == '-'))
+        .unwrap_or("app");
+    let volume_dir = volumes::app_volume_dir(&volumes::data_dir(), name);
+    let errors = match compose_policy::validate(&req.compose_content, &volume_dir) {
+        Ok(()) => Vec::new(),
+        Err(errors) => errors,
+    };
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(
+            json!({ "valid": errors.is_empty(), "errors": errors }),
+        )),
+    ))
+}
+
 // ── Delete App ──
 
 pub async fn delete_app(
@@ -2342,6 +2378,43 @@ mod tests {
         .unwrap_or_else(|err| panic!("a clean compose file should be accepted: {}", err.0))
         .into_response();
         assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn validate_compose_lists_problems_without_failing_the_request() {
+        let response = validate_compose(
+            RateLimit,
+            RequireAuth,
+            Json(ValidateComposeRequest {
+                app_name: Some("web".to_string()),
+                compose_content: "services:\n  a:\n    image: x\n    privileged: true\n"
+                    .to_string(),
+            }),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("validate_compose should not error: {}", err.0))
+        .into_response();
+        let body = response_json(response).await;
+        assert_eq!(body["data"]["valid"], serde_json::json!(false));
+        assert!(
+            body["data"]["errors"][0]
+                .as_str()
+                .is_some_and(|e| e.contains("privileged"))
+        );
+
+        let response = validate_compose(
+            RateLimit,
+            RequireAuth,
+            Json(ValidateComposeRequest {
+                app_name: None,
+                compose_content: "services:\n  a:\n    image: x\n".to_string(),
+            }),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("validate_compose should not error: {}", err.0))
+        .into_response();
+        let body = response_json(response).await;
+        assert_eq!(body["data"]["valid"], serde_json::json!(true));
     }
 
     #[tokio::test]

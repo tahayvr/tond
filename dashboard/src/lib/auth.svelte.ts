@@ -14,6 +14,15 @@ export function getUser() {
 	return _user;
 }
 
+/**
+ * Whether the signed-in user is an admin. Admin-only actions (volumes, compose
+ * files, cron jobs, database exposure, credentials, settings) are refused by
+ * the API for members; the UI disables them up front.
+ */
+export function isAdmin() {
+	return _user?.role === 'admin';
+}
+
 export function setAuthenticated(user: User) {
 	_user = user;
 	_status = 'authenticated';

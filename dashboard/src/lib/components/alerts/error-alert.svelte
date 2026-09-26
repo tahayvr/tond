@@ -9,6 +9,7 @@
 	<Alert.Root variant="destructive">
 		<AlertCircleIcon />
 		<Alert.Title>{title}</Alert.Title>
-		<Alert.Description>{description}</Alert.Description>
+		<!-- pre-line keeps multi-line server errors (e.g. compose problems) readable -->
+		<Alert.Description class="whitespace-pre-line">{description}</Alert.Description>
 	</Alert.Root>
 </div>

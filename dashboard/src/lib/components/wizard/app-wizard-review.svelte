@@ -3,8 +3,8 @@
 	import type { SourceSubType } from '$lib/components/wizard/app-wizard-source.svelte';
 
 	interface Volume {
-		host_path: string;
 		container_path: string;
+		name?: string;
 	}
 
 	interface Props {

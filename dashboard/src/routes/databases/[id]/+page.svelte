@@ -36,6 +36,10 @@
 	import Copy from '~icons/ri/file-copy-line';
 	import Check from '~icons/ri/check-line';
 	import Pencil from '~icons/ri/pencil-line';
+	import GlobeIcon from '~icons/ri/global-line';
+	import LockIcon from '~icons/ri/lock-line';
+	import AlertIcon from '~icons/ri/alert-line';
+	import { isAdmin } from '$lib/auth.svelte';
 	import type { PageProps } from './$types';
 
 	let { data, params }: PageProps = $props();
@@ -65,6 +69,11 @@
 	let imageDraft = $state('');
 	let savingImage = $state(false);
 	let imageError = $state('');
+
+	// Public access state
+	let publicDialogOpen = $state(false);
+	let savingPublic = $state(false);
+	let publicError = $state('');
 
 	// Credentials editing state
 	let editingCredField = $state<'db_name' | 'db_user' | 'db_password' | 'root_password' | null>(
@@ -101,6 +110,20 @@
 			}
 		} catch (e: any) {
 			error = e.message ?? 'Failed to load database';
+		}
+	}
+
+	async function setPublicAccess(enabled: boolean) {
+		if (!db) return;
+		savingPublic = true;
+		publicError = '';
+		try {
+			db = await updateDatabase(dbId, { public_access: enabled });
+			publicDialogOpen = false;
+		} catch (e: any) {
+			publicError = e.message ?? 'Failed to change public access';
+		} finally {
+			savingPublic = false;
 		}
 	}
 
@@ -599,7 +622,9 @@
 						<!-- External URL -->
 						<div class="space-y-2">
 							<div class="flex items-center justify-between">
-								<p class="text-xs font-medium text-muted-foreground">External</p>
+								<p class="text-xs font-medium text-muted-foreground">
+									{db.public_access ? 'External' : 'From this server (localhost)'}
+								</p>
 								{#if !editingExternal}
 									<Button
 										variant="ghost"
@@ -749,7 +774,7 @@
 							<div class="flex flex-col gap-1">
 								<div class="flex items-center justify-between">
 									<dt class="text-muted-foreground">Image</dt>
-									{#if !editingImage}
+									{#if !editingImage && isAdmin()}
 										<Button
 											variant="ghost"
 											size="sm"
@@ -829,6 +854,128 @@
 						</dl>
 					</div>
 				</div>
+
+				<!-- Network access (H6): private by default, explicit opt-in for public -->
+				<div class="space-y-3 rounded-lg border p-4" data-testid="db-network-access">
+					<div class="flex flex-wrap items-center justify-between gap-2">
+						<h3 class="text-sm font-semibold tracking-wide text-muted-foreground uppercase">
+							Network access
+						</h3>
+						{#if db.public_access}
+							<Badge variant="destructive" class="gap-1"><GlobeIcon class="size-3" /> Public</Badge>
+						{:else}
+							<Badge variant="outline" class="gap-1"><LockIcon class="size-3" /> Private</Badge>
+						{/if}
+					</div>
+
+					{#if publicError}
+						<p class="rounded bg-destructive/10 px-3 py-2 text-xs text-destructive">
+							{publicError}
+						</p>
+					{/if}
+
+					{#if db.public_access}
+						<p class="text-sm text-muted-foreground">
+							Port <span class="font-mono">{db.host_port ?? '—'}</span> is open to the internet. Anyone
+							who can reach this server can try to log in, so use a strong password and turn this off
+							when you no longer need it.
+						</p>
+						{#if db.public_connection_string}
+							<div class="space-y-1">
+								<p class="text-xs font-medium text-muted-foreground">Public connection string</p>
+								<code
+									class="block w-full truncate rounded bg-muted px-3 py-2 font-mono text-xs"
+									title={db.public_connection_string}>{db.public_connection_string}</code
+								>
+								{#if db.public_connection_string.includes('<server-ip>')}
+									<p class="text-xs text-muted-foreground/70">
+										Replace <span class="font-mono">&lt;server-ip&gt;</span> with this server's public
+										IP, or set a dashboard domain in Settings.
+									</p>
+								{/if}
+							</div>
+						{/if}
+					{:else}
+						<p class="text-sm text-muted-foreground">
+							Only reachable from this server on
+							<span class="font-mono">127.0.0.1:{db.host_port ?? '—'}</span>{db.project_id
+								? ' and from apps in its project'
+								: ''}. To connect from your computer, use an SSH tunnel:
+							<code class="rounded bg-muted px-1 font-mono text-xs"
+								>ssh -L {db.host_port ?? 5432}:localhost:{db.host_port ?? 5432} root@your-server</code
+							>
+						</p>
+					{/if}
+
+					{#if isAdmin()}
+						<div class="flex flex-wrap items-center gap-3">
+							{#if db.public_access}
+								<Button
+									variant="outline"
+									size="sm"
+									disabled={savingPublic}
+									onclick={() => setPublicAccess(false)}
+								>
+									<LockIcon class="size-4" />
+									{savingPublic ? 'Updating…' : 'Make private'}
+								</Button>
+							{:else}
+								<Button
+									variant="outline"
+									size="sm"
+									disabled={savingPublic}
+									onclick={() => (publicDialogOpen = true)}
+								>
+									<GlobeIcon class="size-4" />
+									Enable public access…
+								</Button>
+							{/if}
+							<p class="text-xs text-muted-foreground/70">
+								Changing this restarts the database container (a few seconds of downtime). Data is
+								kept.
+							</p>
+						</div>
+					{:else}
+						<p class="flex items-center gap-1.5 text-xs text-muted-foreground">
+							<LockIcon class="size-3.5" /> Only admins can change network access.
+						</p>
+					{/if}
+				</div>
+
+				<Dialog.Root bind:open={publicDialogOpen}>
+					<Dialog.Content class="max-w-md">
+						<Dialog.Header>
+							<Dialog.Title class="flex items-center gap-2">
+								<AlertIcon class="size-5 text-destructive" /> Expose {db.name} to the internet?
+							</Dialog.Title>
+							<Dialog.Description>
+								Port <span class="font-mono">{db.host_port ?? '—'}</span> will accept connections from
+								any address. Docker opens it directly, so the server firewall (UFW) does not block it.
+								Bots scan these ports constantly: only do this if you must connect from outside and the
+								password is strong. An SSH tunnel is safer.
+							</Dialog.Description>
+						</Dialog.Header>
+						{#if publicError}
+							<p class="rounded bg-destructive/10 px-3 py-2 text-xs text-destructive">
+								{publicError}
+							</p>
+						{/if}
+						<Dialog.Footer>
+							<Button
+								variant="outline"
+								disabled={savingPublic}
+								onclick={() => (publicDialogOpen = false)}>Cancel</Button
+							>
+							<Button
+								variant="destructive"
+								disabled={savingPublic}
+								onclick={() => setPublicAccess(true)}
+							>
+								{savingPublic ? 'Restarting database…' : 'Make public'}
+							</Button>
+						</Dialog.Footer>
+					</Dialog.Content>
+				</Dialog.Root>
 			</Tabs.Content>
 
 			<!-- ── Environment tab ── -->

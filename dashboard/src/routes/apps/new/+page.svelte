@@ -9,7 +9,8 @@
 		type ManagedDatabaseDetail,
 		type Project,
 		type RegistryCredential,
-		type TemplateCatalogEntry
+		type TemplateCatalogEntry,
+		type VolumeInput
 	} from '$lib/api';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import * as Card from '$lib/components/ui/card/index.js';
@@ -17,6 +18,7 @@
 	import { Label } from '$lib/components/ui/label/index.js';
 	import * as Select from '$lib/components/ui/select/index.js';
 	import { SvelteMap } from 'svelte/reactivity';
+	import { isAdmin } from '$lib/auth.svelte';
 	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import { setUiContext, clearUiContext, projectsContext } from '$lib/ui-context.svelte';
 	import ChevronRight from '~icons/ri/arrow-right-s-line';
@@ -91,7 +93,8 @@
 	let memoryLimit = $state<number | null>(null);
 	let memoryUnit = $state<'mb' | 'gb'>('mb');
 	let cpuLimit = $state<number | null>(null);
-	let volumes = $state<{ host_path: string; container_path: string }[]>([]);
+	// Host paths are assigned by the server (<data>/volumes/<app>/<name>).
+	let volumes = $state<VolumeInput[]>([]);
 	let newVolumePath = $state('');
 
 	// Step 5: Environment
@@ -139,7 +142,6 @@
 		}
 		volumes = template.deploy.volumes.map(
 			(volume: TemplateCatalogEntry['deploy']['volumes'][number]) => ({
-				host_path: `/var/lib/tond/volumes/${name || template.id}/${volume.container_path.replace(/^\//, '')}`,
 				container_path: volume.container_path
 			})
 		);
@@ -299,9 +301,9 @@
 	}
 
 	function addVolume() {
-		if (!newVolumePath.trim()) return;
-		const hostPath = `/var/lib/tond/volumes/${name || 'app'}/${newVolumePath.replace(/^\//, '')}`;
-		volumes = [...volumes, { host_path: hostPath, container_path: newVolumePath }];
+		const path = newVolumePath.trim();
+		if (!path) return;
+		volumes = [...volumes, { container_path: path }];
 		newVolumePath = '';
 	}
 
@@ -560,6 +562,8 @@
 				/>
 			{:else if currentStep === 3}
 				<AppWizardResources
+					appName={name}
+					canEditVolumes={isAdmin()}
 					bind:memoryLimit
 					bind:memoryUnit
 					bind:cpuLimit

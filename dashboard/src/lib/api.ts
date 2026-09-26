@@ -293,6 +293,23 @@ export async function updateAppResources(
 	});
 }
 
+export interface ComposeValidation {
+	valid: boolean;
+	/** One human-readable line per problem (privileged, host binds, …) */
+	errors: string[];
+}
+
+/** Check a compose file against Tond's policy without creating anything. */
+export async function validateCompose(
+	composeContent: string,
+	appName?: string
+): Promise<ComposeValidation> {
+	return request<ComposeValidation>('/compose/validate', {
+		method: 'POST',
+		body: JSON.stringify({ compose_content: composeContent, app_name: appName || null })
+	});
+}
+
 export async function addVolume(id: string, volume: VolumeInput): Promise<void> {
 	await request(`/apps/${id}/volumes`, {
 		method: 'POST',

@@ -48,6 +48,7 @@
 		type GitHubBranch
 	} from '$lib/api';
 	import { goto } from '$app/navigation';
+	import { isAdmin } from '$lib/auth.svelte';
 	import { setUiContext, clearUiContext, appContext, openFeedPanel } from '$lib/ui-context.svelte';
 	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import ConfirmDeleteDialog from '$lib/components/dialogs/confirm-delete-dialog.svelte';
@@ -102,6 +103,7 @@
 
 	// Volume form
 	let volumeContainerPath = $state('');
+	let volumeName = $state('');
 	let volumeError = $state('');
 
 	// Resources form
@@ -422,13 +424,15 @@
 	async function handleAddVolume() {
 		volumeError = '';
 		const path = volumeContainerPath.trim();
+		const name = volumeName.trim();
 		if (!path || !path.startsWith('/')) {
 			volumeError = 'Container path must be an absolute path (e.g. /data)';
 			return;
 		}
 		try {
-			await addVolume(appId, path);
+			await addVolume(appId, { container_path: path, ...(name ? { name } : {}) });
 			volumeContainerPath = '';
+			volumeName = '';
 			await loadApp();
 		} catch (e: any) {
 			volumeError = e.message;
@@ -454,10 +458,10 @@
 		}
 	}
 
-	async function handleRollback() {
+	async function handleRollback(deploymentId?: string) {
 		rollbackError = '';
 		try {
-			await rollbackApp(appId);
+			await rollbackApp(appId, deploymentId);
 			await loadApp();
 			await loadDeployments();
 		} catch (e: any) {
@@ -1057,6 +1061,8 @@
 				<AppVolumes
 					{app}
 					bind:volumeContainerPath
+					bind:volumeName
+					canEdit={isAdmin()}
 					{volumeError}
 					onAdd={handleAddVolume}
 					onRemove={handleRemoveVolume}
