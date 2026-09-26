@@ -1290,7 +1290,7 @@ pub async fn upload_deploy(
             })?;
 
             // Extract tarball
-            let output = tokio::process::Command::new("tar")
+            let output = crate::process::command("tar")
                 .args(["xzf", &tar_path, "-C", &extract_dir])
                 .output()
                 .await

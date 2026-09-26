@@ -87,6 +87,7 @@ mod log_bus;
 mod log_scrub;
 mod metrics;
 mod notifications;
+mod process;
 mod proxy_link;
 mod reconcile;
 mod runtime;

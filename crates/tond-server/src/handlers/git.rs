@@ -524,7 +524,7 @@ pub async fn list_remote_branches(
         );
     }
 
-    let mut cmd = tokio::process::Command::new("git");
+    let mut cmd = crate::process::command("git");
     cmd.args(ls_remote_args(&url))
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ALLOW_PROTOCOL", GIT_ALLOW_PROTOCOL)

@@ -806,6 +806,9 @@ fn spawn_terminal_process(spec: &TerminalSessionSpec) -> anyhow::Result<Terminal
 
     let command = build_terminal_command(spec);
     let child = pair.slave.spawn_command(command)?;
+    if let Some(pid) = child.process_id() {
+        crate::process::reset_oom_score(pid);
+    }
     let writer = pair.master.take_writer()?;
 
     Ok(TerminalSessionRuntime {
