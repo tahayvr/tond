@@ -30,9 +30,6 @@ pub struct GitHubApp {
     pub slug: String,
     pub created_at: String,
     pub updated_at: String,
-    /// UUID generated at manifest-creation time; echoed back by GitHub in the
-    /// setup_url redirect so we can route installation_id to the exact row.
-    pub manifest_state: Option<String>,
 }
 
 /// API response for a GitHub App — omits all sensitive credentials.
@@ -46,15 +43,12 @@ pub struct GitHubAppResponse {
     pub installation_id: Option<i64>,
     /// Whether the App has been installed on at least one org/repo
     pub installed: bool,
-    /// URL the user visits to install the App on their repos
-    pub install_url: String,
     pub created_at: String,
     pub updated_at: String,
 }
 
 impl GitHubAppResponse {
     pub fn from_app(a: GitHubApp) -> Self {
-        let install_url = format!("https://github.com/apps/{}/installations/new", a.slug);
         let installed = a.installation_id.is_some();
         Self {
             id: a.id,
@@ -64,7 +58,6 @@ impl GitHubAppResponse {
             slug: a.slug,
             installation_id: a.installation_id,
             installed,
-            install_url,
             created_at: a.created_at,
             updated_at: a.updated_at,
         }
@@ -89,24 +82,24 @@ pub struct GitHubBranchResponse {
     pub name: String,
 }
 
-/// Query params for the GitHub App manifest callback
-/// GitHub appends `?code=<code>` and preserves any extra params we put in
-/// `redirect_url`, so we embed `state=<manifest_state>` there too.
+/// Query params for the GitHub App manifest callback.
+/// GitHub appends `?code=<code>&state=<state>`, echoing the `state` we put on
+/// the `github.com/settings/apps/new?state=` form action.
 #[derive(Debug, Deserialize)]
 pub struct GitHubCallbackQuery {
-    pub code: String,
-    /// Our manifest_state UUID, echoed back from the redirect_url we supplied
+    pub code: Option<String>,
+    /// Pending flow state created by `POST /api/github-apps/manifest`
     pub state: Option<String>,
 }
 
-/// Query params for the GitHub App installation callback
-/// GitHub appends `?installation_id=<id>&setup_action=<action>` and preserves
-/// any extra params we put in `setup_url`, so we embed `state=<manifest_state>`.
+/// Query params for the GitHub App installation callback.
+/// GitHub appends `?installation_id=<id>&setup_action=<action>&state=<state>`,
+/// echoing the `state` we put on the installation URL.
 #[derive(Debug, Deserialize)]
 pub struct GitHubInstallQuery {
     pub installation_id: Option<i64>,
     pub setup_action: Option<String>,
-    /// Our manifest_state UUID, echoed back from the setup_url we supplied
+    /// Pending flow state created by `POST /api/github-apps/{id}/install`
     pub state: Option<String>,
 }
 
