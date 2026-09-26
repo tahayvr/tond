@@ -25,6 +25,8 @@
 		description: string;
 		/** Fetch the current plaintext value of `editingKey` (explicit reveal) */
 		onLoadCurrent: () => Promise<string>;
+		/** Offer "Show current value" (admins only) */
+		canReveal?: boolean;
 		onSubmit: (result: EnvVarDialogResult) => Promise<void>;
 	}
 
@@ -35,6 +37,7 @@
 		title,
 		description,
 		onLoadCurrent,
+		canReveal = true,
 		onSubmit
 	}: Props = $props();
 
@@ -135,7 +138,7 @@
 			<div class="space-y-2">
 				<div class="flex items-center justify-between">
 					<Label for="env-var-value">Value</Label>
-					{#if isEdit && !valueTouched}
+					{#if isEdit && !valueTouched && canReveal}
 						<button
 							type="button"
 							class="text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline disabled:opacity-50"

@@ -12,6 +12,12 @@ const api = vi.hoisted(() => ({
 	revealPreviewEnvVar: vi.fn()
 }));
 
+const auth = vi.hoisted(() => ({ role: 'admin' }));
+
+vi.mock('$lib/auth.svelte', () => ({
+	getUser: () => ({ id: 'usr_1', email: 'a@b.c', role: auth.role, totp_enabled: false })
+}));
+
 vi.mock('$lib/api', async () => {
 	const actual = await vi.importActual<typeof import('$lib/api')>('$lib/api');
 	return { ...actual, ...api };
@@ -49,6 +55,19 @@ describe('AppEnvironment', () => {
 		for (const fn of Object.values(api)) fn.mockReset();
 		// bits-ui leaves `pointer-events: none` on <body> if a test ends with a dialog open.
 		document.body.style.pointerEvents = '';
+		auth.role = 'admin';
+	});
+
+	it('does not offer reveal or copy to non-admins, but still allows editing', async () => {
+		auth.role = 'member';
+		api.getAppEnv.mockResolvedValue(envWith(['API_KEY']));
+
+		renderTab();
+
+		expect(await screen.findByText('API_KEY')).toBeInTheDocument();
+		expect(screen.queryByRole('button', { name: 'Reveal API_KEY' })).not.toBeInTheDocument();
+		expect(screen.queryByRole('button', { name: 'Copy API_KEY' })).not.toBeInTheDocument();
+		expect(screen.getByRole('button', { name: 'Edit variable API_KEY' })).toBeInTheDocument();
 	});
 
 	it('lists existing variables with masked values instead of starting empty', async () => {

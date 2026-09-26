@@ -9,6 +9,7 @@
 	import EnvImportDialog from '$lib/components/env/env-import-dialog.svelte';
 	import { SvelteMap } from 'svelte/reactivity';
 	import { untrack } from 'svelte';
+	import { getUser } from '$lib/auth.svelte';
 	import {
 		getAppEnv,
 		patchAppEnv,
@@ -85,6 +86,8 @@
 	let overrideKeys = $derived(env?.preview.overrides.map((v) => v.key) ?? []);
 	let excluded = $derived(new Set(env?.preview.excluded_keys ?? []));
 	let isImage = $derived(sourceType === 'image');
+	// The server only reveals values to admins; don't offer it to anyone else.
+	let canReveal = $derived(getUser()?.role === 'admin');
 	let selectedCredentialId = $derived(registryCredentialId ?? '');
 
 	function noun(target: Target) {
@@ -215,7 +218,11 @@
 
 		if (previousKey !== null && value === null && !renamed) return; // nothing changed
 
-		// Renaming without a new value carries the current value over.
+		// Renaming without a new value carries the current value over, which
+		// needs a reveal — admins only.
+		if (renamed && value === null && !canReveal) {
+			throw new Error(`Type the value for ${key}: only admins can copy the current value over.`);
+		}
 		const nextValue = value ?? (await reveal(target, previousKey as string));
 		const patch = renamed
 			? { set: { [key]: nextValue }, unset: [previousKey as string] }
@@ -384,6 +391,7 @@
 				</div>
 			{:else}
 				<EnvVarTable
+					{canReveal}
 					entries={env.vars}
 					revealed={revealed.env}
 					{busyKey}
@@ -472,6 +480,7 @@
 					</div>
 				{:else}
 					<EnvVarTable
+						{canReveal}
 						entries={env.preview.overrides}
 						revealed={revealed.preview}
 						{busyKey}
@@ -489,6 +498,7 @@
 </div>
 
 <EnvVarDialog
+	{canReveal}
 	bind:open={dialogOpen}
 	{editingKey}
 	existingKeys={dialogTarget === 'env' ? envKeys : overrideKeys}

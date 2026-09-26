@@ -4,9 +4,9 @@
 // never replace the whole map:
 //
 //   GET   /api/apps/{id}/env               — keys with masked values + preview config
-//   GET   /api/apps/{id}/env/{key}         — reveal one value (audit-logged)
+//   GET   /api/apps/{id}/env/{key}         — reveal one value (admin only, audit-logged)
 //   PATCH /api/apps/{id}/env               — {set: {K: V}, unset: [K]}
-//   GET   /api/apps/{id}/preview-env/{key} — reveal one preview override (audit-logged)
+//   GET   /api/apps/{id}/preview-env/{key} — reveal one preview override (admin only, audit-logged)
 //   PATCH /api/apps/{id}/preview-env       — {set, unset, exclude, include}
 //
 // Changes are stored immediately and reach the container on the next deploy.
@@ -17,19 +17,73 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use axum::{
     Json,
-    extract::{Path, State},
-    http::StatusCode,
-    response::IntoResponse,
+    extract::{FromRequestParts, Path, State},
+    http::{StatusCode, header, request::Parts},
+    response::{IntoResponse, Response},
 };
 use tond_common::*;
 
-use super::fetch_app;
+use super::{
+    auth::{extract_session_token, validate_session},
+    fetch_app,
+};
 use crate::{
     audit_log::{AuthActor, write_audit_log},
-    auth::{RateLimit, RequireAuth},
+    auth::{LocalSocket, RateLimit, RequireAuth},
     error::AppError,
     state::AppState,
 };
+
+// ── Admin gate for reveals ──
+
+/// Admits admins only: a dashboard session whose user has role "admin", an API
+/// key, or the root-only Unix socket. Use after `RequireAuth`, which has
+/// already validated whichever credential was sent.
+///
+/// TODO: switch to the shared `RequireAdmin` extractor once the containers
+/// workstream lands it on phase-0-lockdown.
+pub struct AdminCaller;
+
+impl FromRequestParts<AppState> for AdminCaller {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        if parts.extensions.get::<LocalSocket>().is_some() {
+            return Ok(AdminCaller);
+        }
+        if let Some(token) = extract_session_token(&parts.headers) {
+            match validate_session(&state.db, &token).await {
+                Ok(Some(user)) if user.role == "admin" => return Ok(AdminCaller),
+                Ok(Some(_)) => return Err(admin_only()),
+                // Not a valid session: fall through to an API key, if any.
+                _ => {}
+            }
+        }
+        let has_bearer = parts
+            .headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("Bearer "));
+        if has_bearer {
+            Ok(AdminCaller)
+        } else {
+            Err(admin_only())
+        }
+    }
+}
+
+fn admin_only() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(ApiResponse::<()>::err(
+            "Only admins can reveal environment variable values.",
+        )),
+    )
+        .into_response()
+}
 
 // ── Pure helpers ──
 
@@ -165,6 +219,7 @@ pub async fn get_env(
 pub async fn reveal_env_var(
     _rate: RateLimit,
     _auth: RequireAuth,
+    _admin: AdminCaller,
     actor: AuthActor,
     State(state): State<AppState>,
     Path((id, key)): Path<(String, String)>,
@@ -247,6 +302,7 @@ pub async fn patch_env(
 pub async fn reveal_preview_env_var(
     _rate: RateLimit,
     _auth: RequireAuth,
+    _admin: AdminCaller,
     actor: AuthActor,
     State(state): State<AppState>,
     Path((id, key)): Path<(String, String)>,
@@ -352,6 +408,7 @@ mod tests {
 
     use super::*;
     use crate::auth::RateLimiter;
+    use crate::handlers::auth::SESSION_COOKIE;
 
     async fn test_state() -> AppState {
         let db = SqlitePool::connect("sqlite::memory:")
@@ -410,6 +467,80 @@ mod tests {
 
     fn actor() -> AuthActor {
         AuthActor("admin@example.com".to_string())
+    }
+
+    /// Seed a user with `role` and a live session; returns the raw session token.
+    async fn seed_session_for(state: &AppState, role: &str) -> String {
+        let user_id = format!("user-{role}");
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "INSERT INTO users (id, email, password_hash, role, created_at, updated_at, totp_enabled) VALUES (?, ?, 'x', ?, ?, ?, 0)",
+        )
+        .bind(&user_id)
+        .bind(format!("{role}@example.com"))
+        .bind(role)
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap_or_else(|err| panic!("failed to seed user: {err}"));
+        let token = format!("token-{role}");
+        sqlx::query(
+            "INSERT INTO sessions (id, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(hash_key(&token))
+        .bind(&user_id)
+        .bind((now + chrono::Duration::hours(1)).to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap_or_else(|err| panic!("failed to seed session: {err}"));
+        token
+    }
+
+    async fn admin_gate(state: &AppState, headers: &[(header::HeaderName, String)]) -> bool {
+        let mut builder = axum::http::Request::builder().uri("/api/apps/x/env/K");
+        for (name, value) in headers {
+            builder = builder.header(name, value);
+        }
+        let (mut parts, _) = builder
+            .body(())
+            .unwrap_or_else(|err| panic!("failed to build request: {err}"))
+            .into_parts();
+        AdminCaller::from_request_parts(&mut parts, state)
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn only_admins_pass_the_reveal_gate() {
+        let state = test_state().await;
+        let admin = seed_session_for(&state, "admin").await;
+        let member = seed_session_for(&state, "member").await;
+        let cookie = |t: &str| (header::COOKIE, format!("{SESSION_COOKIE}={t}"));
+
+        assert!(admin_gate(&state, &[cookie(&admin)]).await, "admin session");
+        assert!(
+            !admin_gate(&state, &[cookie(&member)]).await,
+            "member session must be refused"
+        );
+        assert!(
+            admin_gate(&state, &[(header::AUTHORIZATION, "Bearer key".to_string())]).await,
+            "API keys (validated by RequireAuth) count as admin"
+        );
+        assert!(!admin_gate(&state, &[]).await, "no credential");
+
+        let (mut parts, _) = axum::http::Request::builder()
+            .extension(LocalSocket)
+            .body(())
+            .unwrap_or_else(|err| panic!("failed to build request: {err}"))
+            .into_parts();
+        assert!(
+            AdminCaller::from_request_parts(&mut parts, &state)
+                .await
+                .is_ok(),
+            "the root-only Unix socket counts as admin"
+        );
     }
 
     #[test]
@@ -574,6 +705,7 @@ mod tests {
         let response = reveal_env_var(
             RateLimit,
             RequireAuth,
+            AdminCaller,
             actor(),
             State(state.clone()),
             Path((app.id.clone(), "TOKEN".to_string())),
@@ -597,6 +729,7 @@ mod tests {
         let missing = reveal_env_var(
             RateLimit,
             RequireAuth,
+            AdminCaller,
             actor(),
             State(state.clone()),
             Path((app.id.clone(), "NOPE".to_string())),

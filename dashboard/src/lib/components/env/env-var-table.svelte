@@ -17,6 +17,8 @@
 		copiedKey: string | null;
 		/** Short noun used in button labels, e.g. "variable" or "override" */
 		noun: string;
+		/** Show reveal and copy (admins only; the server refuses others) */
+		canReveal?: boolean;
 		/** When set, shows an "Exclude from previews" checkbox column */
 		excluded?: ReadonlySet<string>;
 		onToggleExclude?: (key: string, exclude: boolean) => void;
@@ -32,6 +34,7 @@
 		busyKey,
 		copiedKey,
 		noun,
+		canReveal = true,
 		excluded,
 		onToggleExclude,
 		onToggleReveal,
@@ -95,7 +98,7 @@
 					{/if}
 					<td class="px-3 py-2">
 						<div class="flex items-center justify-end gap-1">
-							{#if entry.masked}
+							{#if entry.masked && canReveal}
 								<Button
 									variant="ghost"
 									size="icon"
