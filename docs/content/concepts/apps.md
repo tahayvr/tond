@@ -1,6 +1,6 @@
 # Apps
 
-An app is one service that Tond builds, runs and routes traffic to: a web site, an API, a TCP service or a background worker. Each app runs as a Docker container on your server. This page explains what an app is made of, how Tond decides it is ready, and what happens over its lifetime.
+An app is something Tond builds, runs and routes traffic to: a web site, an API, a TCP service or a background worker. Most apps run as one Docker container on your server. A Docker Compose app runs several containers, its services, from one compose file. This page explains what an app is made of, how Tond decides it is ready, and what happens over its lifetime.
 
 ## What an app is
 
@@ -41,7 +41,7 @@ A background worker serves no traffic. It gets no domain, no route and no health
 | Git (`git`) | A repository and branch. Public repos work directly. Private repos use a GitHub App, a GitLab token or an SSH deploy key. | TBuild or Dockerfile |
 | Docker image (`image`) | An image reference from any registry, optionally with a registry credential | Pulled, not built |
 | Dockerfile (`dockerfile`) | A Dockerfile you paste into Tond, without Git | `docker build` |
-| Docker Compose (`compose`) | A compose file you paste into Tond | `docker compose up --build` |
+| Docker Compose (`compose`) | A compose file you paste into Tond, or one read from a repository | Each service built or pulled, then `docker compose up` |
 | Upload (`tarball`) | An archive of a directory, sent with `tond apps push` | TBuild or Dockerfile |
 
 For Git and uploaded sources you choose a **build method**:
@@ -59,7 +59,9 @@ tond apps push web
 
 Uploads are limited to 1 GiB by default. An admin can change the limit in **Settings**.
 
-Compose apps and apps with volumes need an admin, because both reach the host. Tond checks every compose file before it stores or deploys it. It refuses host-level options such as `privileged`, host binds outside the app's volume directory and the Docker socket. It publishes ports on `127.0.0.1` only and adds the same hardening as any other container. For a compose app, set the app's container port to the port your web service publishes.
+Compose apps and apps with volumes need an admin, because both reach the host. Tond checks every compose file before it stores or deploys it. It refuses host-level options such as `privileged`, host binds outside the app's volume directory and the Docker socket. It publishes ports on `127.0.0.1` only and adds the same hardening as any other container.
+
+A compose app's container port is the port of its **web service**, the service that gets the app's domain. Other services can get domains of their own or stay internal, and you can restart, stop, start and read the logs of each one on the app's **Services** tab. Apps created from a [template](/guides/templates) are compose apps. See [Docker Compose apps](/guides/sources#docker-compose-apps).
 
 For step-by-step setup, see [Deploy from Git](/guides/deploy-from-git) and [Build sources](/guides/sources).
 
@@ -83,6 +85,8 @@ tond apps health web --path /health --interval 30 --threshold 3
 tond apps health web --disable
 ```
 
+For a Docker Compose app, the deploy-time check probes every published service by the app's kind and health check path, and also waits for services with a compose `healthcheck` to be healthy. Runtime health checks don't run for compose apps: the service states and compose health are shown on the **Services** tab.
+
 Health checks only test the app from the server itself. To test the public URL, including DNS and TLS, use [uptime checks](/concepts/observability).
 
 ## Lifecycle
@@ -102,9 +106,9 @@ tond apps restart web
 tond apps delete web
 ```
 
-Stop, start and restart act on the existing container. Changes to environment variables, the port, volumes, readiness and resource limits only apply when a new container is created, so deploy again to apply them.
+Stop, start and restart act on the existing container. Changes to environment variables, the port, volumes, readiness and resource limits only apply when a new container is created, so deploy again to apply them. On a Docker Compose app they act on every service; the **Services** tab and `tond apps service` act on one.
 
-Delete is in the app's **Settings → Danger zone**. Deleting an app doesn't delete its volume data on disk (see [Volumes](/concepts/volumes)).
+Delete is in the app's **Settings → Danger zone**. Deleting an app doesn't delete its volume data on disk (see [Volumes](/concepts/volumes)). Deleting a compose app also removes its named Docker volumes and its images.
 
 Containers use Docker's `unless-stopped` restart policy, so Docker restarts a crashed container on its own. Tond records restarts, crashes and out-of-memory kills as [events](/concepts/observability).
 
@@ -129,13 +133,19 @@ Every container Tond starts also gets:
 | Status | Meaning |
 | --- | --- |
 | `pending` | Created, never deployed |
-| `building` | A deploy is in progress |
-| `running` | The container is up and routed (unless it is a worker) |
+| `building` | A deploy is in progress and nothing is serving yet: a first deploy, or a deploy of a stopped or failed app |
+| `running` | The container is up and routed (unless it is a worker). It stays `running` while a new version deploys. |
 | `stopped` | Stopped by you |
-| `failed` | The first deploy (or a Docker Compose deploy) failed, so there is no working container |
-| `unhealthy` | Runtime health checks failed and Tond is restarting the container |
+| `failed` | A deploy failed and there is no working container to fall back on |
+| `unhealthy` | Runtime health checks failed and Tond is restarting the container, or a compose deploy failed after some services were already replaced |
 
-When a redeploy of any other app fails, the app keeps its previous status, because the old container is still serving.
+A running app keeps its status during a deploy and stays routed: the old container serves every request until the new one passes its health gate and traffic moves over. The dashboard shows **Deploying a new version** next to the status, with a link to the live deploy. The app's status changes only at the end, if at all.
+
+When a deploy fails, the app falls back to what it was doing before:
+
+- A running or unhealthy app keeps its status, because the old container is still serving. The exception is a compose app whose failed deploy had already recreated some services: it becomes `unhealthy`, and its domains stay routed.
+- A stopped app stays `stopped`.
+- An app with nothing to fall back on, such as a failed first deploy, becomes `failed`.
 
 ## Related
 

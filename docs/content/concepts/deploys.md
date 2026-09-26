@@ -108,11 +108,28 @@ The **drain timeout** (default 30 seconds) sets both how long the health gate wa
 tond apps drain-timeout web 60
 ```
 
-Docker Compose apps skip this sequence. `docker compose up -d` recreates only the services that changed, and Tond then routes to the service that publishes the app's port.
+### The app keeps serving during a deploy
+
+A running app stays `running` and routed for the whole deploy, from the clone to the cutover. tond-proxy keeps sending every request to the old container while the new version builds and passes its health gate, and moves traffic only once the new container is ready. The dashboard shows **Deploying a new version** next to the app's status, with a link to the live deploy. Only an app with nothing serving (a first deploy, or a stopped or failed app) shows `building` while it deploys. See [Status](/concepts/apps#status).
+
+## Docker Compose apps
+
+A Docker Compose app deploys all its services together, through the same queue and phases:
+
+- **Build.** Tond checks the compose file against its policy, then builds each service that has a `build:` section and pulls the others. Every service image is pinned as `tond-<app>/<service>:<first 12 characters of the image ID>`. The build slot is released once every image exists.
+- **Start.** Tond runs `docker compose up -d --remove-orphans` with its hardened copy of the file. Compose recreates only the services whose image or configuration changed. Because the tag depends only on the image's content, an unchanged service keeps its tag and its container keeps running.
+- **Health.** Tond waits for services with a compose `healthcheck` to be healthy and for every service to run, then probes each published service the same way as a single-container app, waiting as long as the drain timeout and at least 60 seconds.
+- **Release.** Tond records the compose file and every service's pinned image on the deployment, and waits until tond-proxy routes the service domains.
+
+Each service's domains are routed to a loopback port that Tond keeps across deploys, so they stay routed while the app deploys. A service that compose recreates is replaced in place rather than started next to the old one, so it can be unavailable for a moment. The deployment page lists each service with its image and status.
+
+For the compose file, services and service domains, see [Docker Compose apps](/guides/sources#docker-compose-apps).
 
 ## Failures
 
-When a deploy fails, Tond classifies the failure into a likely cause with a hint, for example "The build ran out of memory" or "The health check at /health returned HTTP 500". It shows the log lines that point to the problem. The app's status doesn't change on a failed redeploy, because the old container is still serving. Only a failed first deploy, or a failed Docker Compose deploy, leaves the app `failed`.
+When a deploy fails, Tond classifies the failure into a likely cause with a hint, for example "The build ran out of memory" or "The health check at /health returned HTTP 500". It shows the log lines that point to the problem.
+
+A failed deploy leaves the app as it was, because the old container is still serving: a running app stays `running` and a stopped app stays `stopped`. Only an app with nothing to fall back on, such as a failed first deploy, becomes `failed`. A Docker Compose app whose deploy failed after compose had already recreated some services becomes `unhealthy`, and its domains stay routed; fix the problem and deploy again, or roll back.
 
 ## Deploy logs
 
@@ -132,17 +149,23 @@ A rollback redeploys the exact image of an earlier successful deployment, throug
 - With the CLI, `tond apps rollback <app>` restores the most recent successful deployment whose image differs from the one running now.
 
 ```sh
-tond apps rollback web
+tond apps rollback web          # asks first; add --yes in scripts
 ```
 
-A deployment can be restored only if it succeeded and its image is still on the server. After each successful deploy or rollback, Tond prunes old images. It keeps the three most recent successful deployment images plus the running one. The dashboard marks older deployments as no longer available. Docker Compose apps can't be rolled back: change the compose file and deploy again.
+A deployment can be restored only if it succeeded and its image is still on the server. After each successful deploy or rollback, Tond prunes old images. It keeps the three most recent successful deployment images plus the running one. The dashboard marks older deployments as no longer available.
+
+### Rolling back a Docker Compose app
+
+A compose rollback restores a whole release: the compose file that deployment ran and the pinned image of every service. Nothing is built or pulled. For an app with a pasted compose file, the restored file also replaces the stored one, so **Settings → Compose file** shows what is running again. For an app that reads its compose file from a repository, the next ordinary deploy reads the file from the branch again.
+
+A compose deployment can be restored if it succeeded, its compose file was recorded and every service image is still on the server. Pruning keeps every image that a kept release uses.
 
 > [!NOTE]
 > A rollback restores code, not data. To undo a change to an app's volume data, restore a snapshot (see below).
 
 ## Pre-deploy snapshots
 
-When an app has volumes, every deploy starts a snapshot of those volumes in the background, labelled `pre-deploy`. A failed snapshot never blocks the deploy. Tond keeps 10 pre-deploy snapshots per app by default. You can restore one to put the app's volume data back as it was before that deploy. See [Snapshots and backups](/concepts/backups).
+When an app has volumes, every deploy starts a snapshot of those volumes in the background, labelled `pre-deploy`. For a Docker Compose app this covers its bind mounts and named volumes (an app that reads its compose file from a repository is always snapshotted, because the file is only known after the clone). A failed snapshot never blocks the deploy. Tond keeps 10 pre-deploy snapshots per app by default. You can restore one to put the app's volume data back as it was before that deploy. See [Snapshots and backups](/concepts/backups).
 
 ## Permissions
 

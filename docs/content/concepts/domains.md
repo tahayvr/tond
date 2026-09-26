@@ -117,6 +117,19 @@ A domain may be on the same site as the dashboard: you own both. The dashboard t
 
 DNS: an `A` record (and `AAAA` for IPv6) for each domain, pointing at the server. A domain under the apps domain is covered by the wildcard record. If a CDN or another proxy sits in front, it must pass HTTP requests on port 80 through to the server for certificate validation, unless a [DNS provider](#dns-providers-and-wildcard-certificates) covers the domain.
 
+### Compose service domains
+
+In a Docker Compose app, each domain belongs to one service and is routed to the container port Tond publishes for it. Set them on the app's **Services** tab with **Domains & port** (up to 20 per service), or with `PUT /api/v1/apps/{id}/services/{service}`. A compose app has no **Settings → Domain** section.
+
+Service domains follow the same rules as other app domains: a domain belongs to one app (and within it to one service), the app has at most one primary, and every domain gets a certificate. The first domain added to the app becomes its primary.
+
+- The web service gets the domain you set when you created the app, and on the first deploy the automatic `<app>.<apps domain>` hostname if the app has no domain yet.
+- A service must publish a container port before domains can be routed to it. A domain added to a service that already publishes its port is routed at once; a newly published port is bound on the next deploy.
+- A domain added to a compose app without naming a service, for example with `tond apps domains add`, goes to the web service on the next deploy.
+- When a service leaves the compose file, its domains are removed with it.
+
+A compose app's domains stay routed while it is running, deploying or `unhealthy`, and aren't routed while it is stopped.
+
 ## HTTP and HTTPS
 
 - **Port 443** serves every routed hostname over TLS. Redirect domains are answered there with their `301` or `308`.
