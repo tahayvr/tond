@@ -2,6 +2,8 @@
 	import {
 		getOnboardingStatus,
 		getSystemMetrics,
+		listActiveAlerts,
+		type ActiveAlert,
 		type Project,
 		type App,
 		type ManagedDatabase,
@@ -19,6 +21,7 @@
 	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { errorMessage } from '$lib/action.svelte';
 	import { buildChecklist } from '$lib/onboarding';
+	import FiringBanner from '$lib/components/alerts/FiringBanner.svelte';
 	import { appTabHref } from '$lib/tabs';
 	import { formatRelativePast } from '$lib/time';
 	import Plus from '~icons/ri/add-line';
@@ -51,6 +54,7 @@
 	let onboarding = $state<OnboardingStatus | null>(null);
 	let onboardingError = $state('');
 	let metrics = $state<SystemMetrics | null>(null);
+	let firing = $state<ActiveAlert[]>([]);
 
 	$effect(() => {
 		let cancelled = false;
@@ -60,6 +64,11 @@
 		getSystemMetrics()
 			.then((m) => !cancelled && (metrics = m))
 			.catch(() => {});
+		if (can('metrics:read')) {
+			listActiveAlerts()
+				.then((a) => !cancelled && (firing = a.filter((x) => x.state === 'firing')))
+				.catch(() => {});
+		}
 		return () => {
 			cancelled = true;
 		};
@@ -101,6 +110,8 @@
 			{/if}
 		{/snippet}
 	</PageHeader>
+
+	<FiringBanner alerts={firing} />
 
 	<!-- First-run checklist -->
 	{#if onboardingError}
