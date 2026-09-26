@@ -281,7 +281,7 @@ pub struct Collector {
 
 /// Reload the owner tables at least this often even without a change
 /// notification (writes behind tond-server's back, e.g. sqlite3 by hand).
-const OWNER_RELOAD_MAX_AGE: Duration = Duration::from_secs(600);
+const OWNER_RELOAD_MAX_AGE: Duration = Duration::from_secs(3600);
 
 impl Collector {
     pub fn new(cgroup_root: PathBuf, proc_root: PathBuf) -> Self {
