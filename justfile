@@ -217,6 +217,10 @@ vm-install: package
 vm-e2e: package
     scripts/dev-vm.sh e2e --arch {{ linux_arch }}
 
+# Run the resource budget test (idle RSS, CPU, wakeups, DB queries, journal; 0 and 50 apps) on a fresh install in the local VM
+vm-budget: package
+    scripts/dev-vm.sh budget --arch {{ linux_arch }}
+
 # Open a root shell in the local VM
 vm-shell:
     scripts/dev-vm.sh shell --arch {{ linux_arch }}

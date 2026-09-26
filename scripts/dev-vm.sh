@@ -13,7 +13,7 @@ set -euo pipefail
 #
 #   just server=root@tond-vm@orb deploy
 #
-# Usage: scripts/dev-vm.sh <create|install|e2e|shell|destroy> [--arch amd64|arm64] [--name <machine>]
+# Usage: scripts/dev-vm.sh <create|install|e2e|budget|shell|destroy> [--arch amd64|arm64] [--name <machine>]
 #   --arch    amd64 (alias x86_64, default) or arm64 (alias aarch64)
 #   --name    machine name (default: tond-vm for amd64, tond-vm-arm64 for arm64)
 #
@@ -23,6 +23,9 @@ set -euo pipefail
 #   e2e       wipe Tond's data and containers, then install + smoke test with a
 #             local Pebble ACME CA and the preview domain preview.test (the VM
 #             is meant to be disposable)
+#   budget    like e2e, but runs e2e/budget.sh (idle resource budgets) on the
+#             fresh install instead of the smoke test (BUDGET_ARGS passes
+#             options, e.g. BUDGET_ARGS="--window 60")
 #   shell     open a root shell in the machine
 #   destroy   delete the machine
 
@@ -88,7 +91,7 @@ case "$CMD" in
         in_vm "${BUNDLE}/install.sh" --non-interactive --dashboard-domain "${NAME}.orb.local"
         echo "Tond installed in ${NAME}. Deploy changes with: just server=root@${NAME}@orb deploy"
         ;;
-    e2e)
+    e2e|budget)
         require_bundle
         # Start from a clean slate: a database from an older build may carry
         # migrations this build no longer has, and leftover apps would collide.
@@ -96,8 +99,10 @@ case "$CMD" in
             docker ps -aq --filter label=managed-by=tond | xargs -r docker rm -f > /dev/null
             rm -rf /opt/tond/data'
         rosetta_workaround
-        in_vm "${ROOT}/e2e/run.sh" --bundle "$BUNDLE" --acme pebble \
-            --base-domain tond.test --preview-domain preview.test
+        test="smoke"
+        [[ "$CMD" == budget ]] && test="budget"
+        in_vm env BUDGET_ARGS="${BUDGET_ARGS:-}" "${ROOT}/e2e/run.sh" --bundle "$BUNDLE" --acme pebble \
+            --base-domain tond.test --preview-domain preview.test --test "$test"
         ;;
     shell)
         in_vm bash -l
@@ -106,7 +111,7 @@ case "$CMD" in
         orb delete -f "$NAME"
         ;;
     *)
-        sed -n '4,28p' "$0"
+        sed -n '4,31p' "$0"
         exit 1
         ;;
 esac
