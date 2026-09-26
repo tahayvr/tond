@@ -97,7 +97,7 @@ case "$CMD" in
             rm -rf /opt/tond/data'
         rosetta_workaround
         in_vm "${ROOT}/e2e/run.sh" --bundle "$BUNDLE" --acme pebble \
-            --base-domain tond.test --preview-domain preview.test
+            --base-domain tond.test --preview-domain preview.test --apps-domain apps.test
         ;;
     shell)
         in_vm bash -l
