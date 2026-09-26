@@ -18,6 +18,13 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    # Timings only: the image's own HEALTHCHECK test is kept, but its 30s interval
+    # would keep the deploy waiting.
+    healthcheck:
+      interval: 10s
+      timeout: 10s
+      start_period: 60s
+      start_interval: 2s
 
   db:
     image: postgres:17-alpine

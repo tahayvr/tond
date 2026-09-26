@@ -135,7 +135,7 @@ pub async fn insert_tick(db: &SqlitePool, ts: i64, rows: &[TickRow]) -> sqlx::Re
     if rows.is_empty() {
         return Ok(());
     }
-    let mut tx = db.begin().await?;
+    let mut tx = crate::db::begin_write(db).await?;
     for row in rows {
         let s = row.sample;
         sqlx::query(

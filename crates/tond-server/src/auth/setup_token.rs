@@ -63,7 +63,7 @@ pub async fn ensure_setup_token(pool: &SqlitePool, path: &Path) -> Result<()> {
     // Write the file first: if the DB insert then fails, the next start sees a
     // file without a matching hash and simply issues a new token.
     write_secret_file(path, &token)?;
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::begin_write(pool).await?;
     sqlx::query("DELETE FROM setup_tokens")
         .execute(&mut *tx)
         .await?;
@@ -242,7 +242,9 @@ mod tests {
             .unwrap_or_else(|err| panic!("{err}"));
         let token = read_secret_file(&path).unwrap_or_default();
 
-        let mut tx = pool.begin().await.unwrap_or_else(|err| panic!("{err}"));
+        let mut tx = crate::db::begin_write(&pool)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
         assert!(
             consume(&mut tx, &token)
                 .await
@@ -250,7 +252,9 @@ mod tests {
         );
         tx.commit().await.unwrap_or_else(|err| panic!("{err}"));
 
-        let mut tx = pool.begin().await.unwrap_or_else(|err| panic!("{err}"));
+        let mut tx = crate::db::begin_write(&pool)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
         assert!(
             !consume(&mut tx, &token)
                 .await

@@ -8,3 +8,10 @@ services:
       APPSMITH_DISABLE_TELEMETRY: "true"
     volumes:
       - ./stacks:/appsmith-stacks
+    # Timings only: the image's own HEALTHCHECK test is kept, but its 15s interval
+    # would keep the deploy waiting.
+    healthcheck:
+      interval: 10s
+      timeout: 15s
+      start_period: 180s
+      start_interval: 3s

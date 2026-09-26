@@ -10,3 +10,10 @@ services:
       LD_CSRF_TRUSTED_ORIGINS: ${TRUSTED_ORIGIN}
     volumes:
       - ./data:/etc/linkding/data
+    # Timings only: the image's own HEALTHCHECK test is kept, but its 30s interval
+    # would keep the deploy waiting.
+    healthcheck:
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      start_interval: 2s

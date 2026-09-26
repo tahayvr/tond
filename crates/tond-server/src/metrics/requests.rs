@@ -385,7 +385,7 @@ pub async fn write_minute(
     rows: &[(i64, TrafficCounters)],
     rollup: Option<(i64, i64)>,
 ) -> sqlx::Result<()> {
-    let mut tx = db.begin().await?;
+    let mut tx = crate::db::begin_write(db).await?;
     for (target, counters) in rows {
         insert_row(&mut tx, "requests_1m", *target, minute, counters).await?;
     }
