@@ -632,7 +632,15 @@ function startMockDeploy(
 		finished_at: null,
 		created_at: now,
 		duration_secs: null,
-		phases: mockPhasePlan(plan, app.health_check_path),
+		phases: mockPhasePlan(plan, app.health_check_path).map((p) =>
+			p.phase === 'health' && p.status !== 'skipped' && app.readiness === 'none'
+				? { ...p, label: `Stay up for ${app.ready_after_secs ?? 10}s` }
+				: p.phase === 'health' && p.status !== 'skipped' && app.readiness === 'tcp'
+					? { ...p, label: 'Wait for the port to accept connections' }
+					: p.phase === 'release' && app.readiness === 'none'
+						? { ...p, label: 'Replace the old container' }
+						: p
+		),
 		failure: null,
 		image_pruned: false,
 		is_current: false,
@@ -774,9 +782,11 @@ function startMockDeploy(
 			() =>
 				log(
 					'info',
-					app.health_check_path
-						? `Waiting up to 30s for the health check on port ${app.container_port}${app.health_check_path} to pass`
-						: `Waiting up to 60s for the app to answer on port ${app.container_port}`
+					app.readiness === 'none'
+						? `Background worker: waiting ${app.ready_after_secs ?? 10}s to make sure it stays up`
+						: app.health_check_path
+							? `Waiting up to 30s for the health check on port ${app.container_port}${app.health_check_path} to pass`
+							: `Waiting up to 60s for the app to answer on port ${app.container_port}`
 				)
 		]
 	);
@@ -1566,6 +1576,11 @@ export const handlers = [
 			const problem = mockVolumeError(v, `${MOCK_VOLUMES_DIR}/${appName}`);
 			if (problem) return err(problem, 400);
 		}
+		if (body.readiness === 'none' && body.domain) {
+			return err(
+				'Invalid input: Background workers have no domain: they serve no traffic. Leave the domain empty.'
+			);
+		}
 		const newApp: App = {
 			id: `app_${Date.now()}`,
 			name: body.name ?? 'new-app',
@@ -1599,6 +1614,8 @@ export const handlers = [
 			static_build: body.static_build ?? false,
 			preview_enabled: false,
 			preview_excluded_keys: [],
+			readiness: body.readiness ?? 'http',
+			ready_after_secs: body.ready_after_secs ?? 10,
 			created_at: new Date().toISOString(),
 			updated_at: new Date().toISOString()
 		};
@@ -1639,6 +1656,25 @@ export const handlers = [
 		);
 	}),
 
+	http.put('/api/apps/:id/readiness', async ({ params, request }) => {
+		await delay(LATENCY);
+		const idx = apps.findIndex((a) => a.id === params.id);
+		if (idx === -1) return err('App not found', 404);
+		const body = (await request.json()) as { readiness: string; ready_after_secs?: number };
+		if (!['http', 'tcp', 'none'].includes(body.readiness)) {
+			return err('Invalid input: readiness must be one of: http, tcp, none');
+		}
+		const readiness = body.readiness as 'http' | 'tcp' | 'none';
+		apps[idx] = {
+			...apps[idx],
+			readiness,
+			ready_after_secs: body.ready_after_secs ?? apps[idx].ready_after_secs ?? 10,
+			...(readiness === 'none' ? { domain: null, health_check_path: null } : {}),
+			updated_at: new Date().toISOString()
+		};
+		return ok(apps[idx]);
+	}),
+
 	http.put('/api/apps/:id/port', async ({ params, request }) => {
 		await delay(LATENCY);
 		const idx = apps.findIndex((a) => a.id === params.id);
@@ -1677,17 +1713,24 @@ export const handlers = [
 
 	http.post('/api/images/inspect', async ({ request }) => {
 		await delay(LATENCY * 4);
-		const body = (await request.json()) as { image: string };
+		const body = (await request.json()) as { image: string; registry_credential_id?: string };
 		const image = (body.image ?? '').trim();
 		if (!image || /\s/.test(image)) {
 			return err(
 				'Invalid input: Enter an image reference like nginx:alpine or ghcr.io/org/app:1.2'
 			);
 		}
-		if (/does-not-exist/.test(image)) {
-			return err(
-				`Invalid input: Couldn't pull ${image}: manifest unknown. Check the name and tag; private images need registry credentials.`
-			);
+		if (/does-not-exist|private/.test(image) && !body.registry_credential_id) {
+			// Soft failure, as the server does for a pull the registry refuses.
+			return ok({
+				image,
+				exposed_ports: [],
+				env_port: null,
+				suggested_port: null,
+				pulled: false,
+				unavailable: `Tond couldn't read ${image}. If it's private, choose registry credentials on the Environment step and Tond reads its port then; otherwise check the name and tag.`,
+				needs_credentials: true
+			});
 		}
 		const { exposed, env } = mockImagePorts(image);
 		const suggested =

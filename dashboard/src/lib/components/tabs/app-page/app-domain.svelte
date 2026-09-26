@@ -31,7 +31,7 @@
 	// certificate checks with one-click re-check/retry, and — for apps without
 	// a domain — the choice between the automatic address and a custom domain.
 	import { untrack } from 'svelte';
-	import { checkDomain, getSettings, type App, type DomainCheck } from '$lib/api';
+	import { appReadiness, checkDomain, getSettings, type App, type DomainCheck } from '$lib/api';
 	import { pollWhileVisible } from '$lib/polling';
 	import { relativeTime } from '$lib/deploy-view';
 	import { cn, safeUrl } from '$lib/utils';
@@ -259,182 +259,196 @@
 {/snippet}
 
 <div class="space-y-4 pt-4">
-	<section class="space-y-4 rounded-md border p-4" aria-label="Domain">
-		{#if domain}
-			<div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-				<div class="flex min-w-0 items-center gap-3">
-					<GlobeIcon class="size-5 shrink-0 text-muted-foreground" />
-					<div class="min-w-0">
-						<div class="flex flex-wrap items-center gap-2">
-							{#if appUrl}
-								<a
-									href={appUrl}
-									target="_blank"
-									rel="noreferrer"
-									class="truncate font-medium underline-offset-2 hover:underline">{domain}</a
-								>
-							{:else}
-								<span class="truncate font-medium">{domain}</span>
-							{/if}
-							<Badge variant="outline">{isAutomatic ? 'Automatic address' : 'Custom domain'}</Badge>
-						</div>
-						<p class="text-xs text-muted-foreground">
-							{isAutomatic
-								? 'Every app gets an address under the apps domain.'
-								: 'Traffic for this domain goes to the app.'}
-						</p>
-					</div>
-				</div>
-				<div class="flex shrink-0 gap-2">
-					{#if appUrl}
-						<Button href={appUrl} target="_blank" rel="noreferrer" variant="ghost" size="sm">
-							<ExternalIcon /> Open
-						</Button>
-					{/if}
-					{#if !editing && canEdit}
-						<Button variant="outline" size="sm" onclick={startEditing}>Change domain</Button>
-					{/if}
-				</div>
-			</div>
-			{#if editing}
-				{@render editForm()}
-			{/if}
-		{:else}
-			<div class="space-y-1">
-				<h3 class="font-medium">This app has no address yet</h3>
-				<p class="text-sm text-muted-foreground">Choose how people reach it.</p>
-			</div>
-			<div class="grid gap-3 md:grid-cols-2">
-				<div class="space-y-1.5 rounded-md border p-3">
-					<p class="text-sm font-medium">Automatic address</p>
-					{#if automatic}
-						<p class="text-sm text-muted-foreground">
-							Deploy the app and it's served at <code class="text-foreground">{automatic}</code>.
-							One wildcard DNS record for <code>*.{appsDomain}</code> covers every app.
-						</p>
-					{:else}
-						<p class="text-sm text-muted-foreground">
-							Set a dashboard domain in <a href="/settings" class="underline underline-offset-2"
-								>Settings</a
-							> first; apps then get an address under it automatically.
-						</p>
-					{/if}
-				</div>
-				<div class="space-y-2 rounded-md border p-3">
-					<p class="text-sm font-medium">Your own domain</p>
-					<p class="text-sm text-muted-foreground">
-						Use a domain you own. Tond shows the DNS record to create and gets a certificate.
-					</p>
-					{#if editing}
-						{@render editForm()}
-					{:else if canEdit}
-						<Button variant="outline" size="sm" onclick={startEditing}>Add a domain</Button>
-					{:else}
-						<p class="text-xs text-muted-foreground">Ask an admin or deployer to add one.</p>
-					{/if}
-				</div>
-			</div>
-		{/if}
-	</section>
-
-	{#if domain && placeholder}
-		<div class="flex items-start gap-2 rounded-md border bg-muted/30 p-3 text-sm">
+	{#if appReadiness(app) === 'none'}
+		<div class="flex items-start gap-2 rounded-md border bg-muted/30 p-4 text-sm">
 			<InfoIcon class="mt-0.5 size-4 shrink-0 text-muted-foreground" />
 			<p class="text-muted-foreground">
-				<code>{domain}</code> is a local placeholder and can't be reached from the internet. Set a
-				dashboard domain in <a href="/settings" class="underline underline-offset-2">Settings</a> so apps
-				get real addresses, or add your own domain.
+				{app.name} is a background worker: it serves no traffic, so it has no domain and Tond doesn't
+				route to it. To give it an address, make it a web app in the Health tab.
 			</p>
 		</div>
-	{:else if domain}
-		<section class="space-y-3 rounded-md border p-4" aria-label="DNS">
-			<div class="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-				<div class="flex min-w-0 items-start gap-2">
-					{#if check?.dns.status === 'ok' && check.dns.stray.length === 0}
-						<OkIcon class="mt-0.5 size-4 shrink-0 text-success" />
-					{:else if check && check.dns.status !== 'inconclusive'}
-						<WarnIcon class="mt-0.5 size-4 shrink-0 text-warn" />
-					{:else}
-						<InfoIcon class="mt-0.5 size-4 shrink-0 text-muted-foreground" />
-					{/if}
-					<div class="min-w-0 space-y-0.5">
-						<p class="text-sm font-medium">
-							{check ? dnsHeadline(check.dns.status) : checking ? 'Checking DNS…' : 'DNS'}
-						</p>
-						{#if check}
-							<p class="text-sm break-words text-muted-foreground">{check.dns.message}</p>
+	{:else}
+		<section class="space-y-4 rounded-md border p-4" aria-label="Domain">
+			{#if domain}
+				<div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+					<div class="flex min-w-0 items-center gap-3">
+						<GlobeIcon class="size-5 shrink-0 text-muted-foreground" />
+						<div class="min-w-0">
+							<div class="flex flex-wrap items-center gap-2">
+								{#if appUrl}
+									<a
+										href={appUrl}
+										target="_blank"
+										rel="noreferrer"
+										class="truncate font-medium underline-offset-2 hover:underline">{domain}</a
+									>
+								{:else}
+									<span class="truncate font-medium">{domain}</span>
+								{/if}
+								<Badge variant="outline"
+									>{isAutomatic ? 'Automatic address' : 'Custom domain'}</Badge
+								>
+							</div>
+							<p class="text-xs text-muted-foreground">
+								{isAutomatic
+									? 'Every app gets an address under the apps domain.'
+									: 'Traffic for this domain goes to the app.'}
+							</p>
+						</div>
+					</div>
+					<div class="flex shrink-0 gap-2">
+						{#if appUrl}
+							<Button href={appUrl} target="_blank" rel="noreferrer" variant="ghost" size="sm">
+								<ExternalIcon /> Open
+							</Button>
+						{/if}
+						{#if !editing && canEdit}
+							<Button variant="outline" size="sm" onclick={startEditing}>Change domain</Button>
 						{/if}
 					</div>
 				</div>
-				<div class="flex shrink-0 items-center gap-2">
-					{#if check}
-						<span class="text-xs text-muted-foreground">
-							Checked {relativeTime(check.checked_at, now)}
-						</span>
-					{/if}
-					<Button variant="outline" size="sm" onclick={handleCheckAgain} disabled={checking}>
-						<RefreshIcon class={cn(checking && 'animate-spin')} />
-						{checking ? 'Checking…' : 'Check again'}
-					</Button>
-				</div>
-			</div>
-
-			{#if checkError}
-				<p class="rounded bg-destructive/10 px-3 py-2 text-xs text-destructive" role="alert">
-					{checkError}
-				</p>
-			{/if}
-
-			{#if check}
-				{#if check.records.length === 0}
-					<p class="text-sm text-muted-foreground">
-						Tond couldn't determine this server's public IP address. Point the domain at the
-						server's public IP with an A record (and AAAA for IPv6).
-					</p>
-				{:else if check.dns.status !== 'ok' || check.dns.stray.length > 0}
-					{#if isAutomatic && check.wildcard_records.length > 0}
-						<p class="text-sm">
-							Create this record at your DNS provider{check.zone ? ` for ${check.zone}` : ''}; it
-							covers every app under <code>{check.apps_domain}</code>:
-						</p>
-						{@render recordTable(check.wildcard_records, 'Wildcard DNS records for all apps')}
-						<p class="text-xs text-muted-foreground">Or add a record for this app only:</p>
-					{:else}
-						<p class="text-sm">
-							Create {check.records.length === 1 ? 'this record' : 'these records'} at your DNS provider{check.zone
-								? ` for ${check.zone}`
-								: ''}:
-						</p>
-					{/if}
-					{@render recordTable(check.records, 'DNS records to create')}
-					{#if check.dns.resolved.length > 0}
-						<p class="text-xs text-muted-foreground">
-							Now resolves to <code>{check.dns.resolved.join(', ')}</code>{check.dns.expected.length
-								? `; this server is ${check.dns.expected.join(', ')}`
-								: ''}. DNS changes usually show up within minutes; Tond re-checks every 30 seconds.
-						</p>
-					{/if}
-				{:else}
-					<details class="text-sm">
-						<summary class="cursor-pointer text-muted-foreground select-none">
-							Show the DNS record
-						</summary>
-						<div class="mt-2">
-							{@render recordTable(
-								isAutomatic && check.wildcard_records.length
-									? check.wildcard_records
-									: check.records,
-								'DNS records'
-							)}
-						</div>
-					</details>
+				{#if editing}
+					{@render editForm()}
 				{/if}
+			{:else}
+				<div class="space-y-1">
+					<h3 class="font-medium">This app has no address yet</h3>
+					<p class="text-sm text-muted-foreground">Choose how people reach it.</p>
+				</div>
+				<div class="grid gap-3 md:grid-cols-2">
+					<div class="space-y-1.5 rounded-md border p-3">
+						<p class="text-sm font-medium">Automatic address</p>
+						{#if automatic}
+							<p class="text-sm text-muted-foreground">
+								Deploy the app and it's served at <code class="text-foreground">{automatic}</code>.
+								One wildcard DNS record for <code>*.{appsDomain}</code> covers every app.
+							</p>
+						{:else}
+							<p class="text-sm text-muted-foreground">
+								Set a dashboard domain in <a href="/settings" class="underline underline-offset-2"
+									>Settings</a
+								> first; apps then get an address under it automatically.
+							</p>
+						{/if}
+					</div>
+					<div class="space-y-2 rounded-md border p-3">
+						<p class="text-sm font-medium">Your own domain</p>
+						<p class="text-sm text-muted-foreground">
+							Use a domain you own. Tond shows the DNS record to create and gets a certificate.
+						</p>
+						{#if editing}
+							{@render editForm()}
+						{:else if canEdit}
+							<Button variant="outline" size="sm" onclick={startEditing}>Add a domain</Button>
+						{:else}
+							<p class="text-xs text-muted-foreground">Ask an admin or deployer to add one.</p>
+						{/if}
+					</div>
+				</div>
 			{/if}
 		</section>
 
-		<section class="space-y-2" aria-label="HTTPS certificate">
-			<h3 class="text-sm font-medium">HTTPS</h3>
-			<CertificateStatus {domain} refreshKey={certRefreshKey + certKey} />
-		</section>
+		{#if domain && placeholder}
+			<div class="flex items-start gap-2 rounded-md border bg-muted/30 p-3 text-sm">
+				<InfoIcon class="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+				<p class="text-muted-foreground">
+					<code>{domain}</code> is a local placeholder and can't be reached from the internet. Set a
+					dashboard domain in <a href="/settings" class="underline underline-offset-2">Settings</a> so
+					apps get real addresses, or add your own domain.
+				</p>
+			</div>
+		{:else if domain}
+			<section class="space-y-3 rounded-md border p-4" aria-label="DNS">
+				<div class="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+					<div class="flex min-w-0 items-start gap-2">
+						{#if check?.dns.status === 'ok' && check.dns.stray.length === 0}
+							<OkIcon class="mt-0.5 size-4 shrink-0 text-success" />
+						{:else if check && check.dns.status !== 'inconclusive'}
+							<WarnIcon class="mt-0.5 size-4 shrink-0 text-warn" />
+						{:else}
+							<InfoIcon class="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+						{/if}
+						<div class="min-w-0 space-y-0.5">
+							<p class="text-sm font-medium">
+								{check ? dnsHeadline(check.dns.status) : checking ? 'Checking DNS…' : 'DNS'}
+							</p>
+							{#if check}
+								<p class="text-sm break-words text-muted-foreground">{check.dns.message}</p>
+							{/if}
+						</div>
+					</div>
+					<div class="flex shrink-0 items-center gap-2">
+						{#if check}
+							<span class="text-xs text-muted-foreground">
+								Checked {relativeTime(check.checked_at, now)}
+							</span>
+						{/if}
+						<Button variant="outline" size="sm" onclick={handleCheckAgain} disabled={checking}>
+							<RefreshIcon class={cn(checking && 'animate-spin')} />
+							{checking ? 'Checking…' : 'Check again'}
+						</Button>
+					</div>
+				</div>
+
+				{#if checkError}
+					<p class="rounded bg-destructive/10 px-3 py-2 text-xs text-destructive" role="alert">
+						{checkError}
+					</p>
+				{/if}
+
+				{#if check}
+					{#if check.records.length === 0}
+						<p class="text-sm text-muted-foreground">
+							Tond couldn't determine this server's public IP address. Point the domain at the
+							server's public IP with an A record (and AAAA for IPv6).
+						</p>
+					{:else if check.dns.status !== 'ok' || check.dns.stray.length > 0}
+						{#if isAutomatic && check.wildcard_records.length > 0}
+							<p class="text-sm">
+								Create this record at your DNS provider{check.zone ? ` for ${check.zone}` : ''}; it
+								covers every app under <code>{check.apps_domain}</code>:
+							</p>
+							{@render recordTable(check.wildcard_records, 'Wildcard DNS records for all apps')}
+							<p class="text-xs text-muted-foreground">Or add a record for this app only:</p>
+						{:else}
+							<p class="text-sm">
+								Create {check.records.length === 1 ? 'this record' : 'these records'} at your DNS provider{check.zone
+									? ` for ${check.zone}`
+									: ''}:
+							</p>
+						{/if}
+						{@render recordTable(check.records, 'DNS records to create')}
+						{#if check.dns.resolved.length > 0}
+							<p class="text-xs text-muted-foreground">
+								Now resolves to <code>{check.dns.resolved.join(', ')}</code>{check.dns.expected
+									.length
+									? `; this server is ${check.dns.expected.join(', ')}`
+									: ''}. DNS changes usually show up within minutes; Tond re-checks every 30
+								seconds.
+							</p>
+						{/if}
+					{:else}
+						<details class="text-sm">
+							<summary class="cursor-pointer text-muted-foreground select-none">
+								Show the DNS record
+							</summary>
+							<div class="mt-2">
+								{@render recordTable(
+									isAutomatic && check.wildcard_records.length
+										? check.wildcard_records
+										: check.records,
+									'DNS records'
+								)}
+							</div>
+						</details>
+					{/if}
+				{/if}
+			</section>
+
+			<section class="space-y-2" aria-label="HTTPS certificate">
+				<h3 class="text-sm font-medium">HTTPS</h3>
+				<CertificateStatus {domain} refreshKey={certRefreshKey + certKey} />
+			</section>
+		{/if}
 	{/if}
 </div>

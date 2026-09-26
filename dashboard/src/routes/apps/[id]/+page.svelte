@@ -44,6 +44,7 @@
 		type GitHubRepo,
 		type GitHubBranch,
 		type LogLine,
+		appReadiness,
 		openLogStream
 	} from '$lib/api';
 	import { goto } from '$app/navigation';
@@ -66,6 +67,7 @@
 	import AppDomain from '$lib/components/tabs/app-page/app-domain.svelte';
 	import AppHealth from '$lib/components/tabs/app-page/app-health.svelte';
 	import AppPort from '$lib/components/tabs/app-page/app-port.svelte';
+	import AppReadiness from '$lib/components/tabs/app-page/app-readiness.svelte';
 	import AppVolumes from '$lib/components/tabs/app-page/app-volumes.svelte';
 	import AppPreviews from '$lib/components/tabs/app-page/app-previews.svelte';
 	import PreviewDomainRequiredAlert from '$lib/components/alerts/preview-domain-required-alert.svelte';
@@ -1011,9 +1013,20 @@
 				/>
 			</Tabs.Content>
 
-			<!-- Health tab (port, health check, deploy timeout) -->
+			<!-- Health tab (kind of app, port, health check, deploy timeout) -->
 			<Tabs.Content value="health" class="space-y-6">
 				<div class="pt-4">
+					<AppReadiness
+						{app}
+						onSaved={(updated) => {
+							app = updated;
+							initForms(updated);
+						}}
+						canEdit={can('apps:write')}
+					/>
+				</div>
+				{#if appReadiness(app) !== 'none'}
+					<Separator />
 					<AppPort
 						{app}
 						onSaved={(updated) => (app = updated)}
@@ -1021,10 +1034,11 @@
 						canEdit={can('apps:write')}
 						canDeploy={can('apps:deploy')}
 					/>
-				</div>
+				{/if}
 				<Separator />
 				<AppHealth
 					{app}
+					showHealthCheck={appReadiness(app) === 'http'}
 					bind:healthPath
 					bind:healthInterval
 					bind:healthThreshold

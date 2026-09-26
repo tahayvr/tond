@@ -81,8 +81,23 @@ export interface App {
 	preview_enabled: boolean;
 	/** Phase 4.6: env var keys excluded from preview containers */
 	preview_excluded_keys: string[];
+	/**
+	 * How a deploy decides the new container is ready: `http` (health path, or
+	 * any HTTP answer on the port), `tcp` (the port accepts connections) or
+	 * `none` (background worker: no port, no domain, never routed).
+	 */
+	readiness?: Readiness;
+	/** For `none`: seconds the container must stay up */
+	ready_after_secs?: number;
 	created_at: string;
 	updated_at: string;
+}
+
+export type Readiness = 'http' | 'tcp' | 'none';
+
+/** An app's readiness mode (`http` for apps from before the setting). */
+export function appReadiness(app: Pick<App, 'readiness'>): Readiness {
+	return app.readiness === 'tcp' || app.readiness === 'none' ? app.readiness : 'http';
 }
 
 export interface TemplateProject {
@@ -356,6 +371,10 @@ export async function createApp(data: {
 	base_dir?: string;
 	/** Serve build output as a static site */
 	static_build?: boolean;
+	/** `http` (default) | `tcp` | `none` (background worker: no port, no domain) */
+	readiness?: Readiness;
+	/** For `none`: seconds the container must stay up (default 10) */
+	ready_after_secs?: number;
 }): Promise<App> {
 	return request<App>('/apps', {
 		method: 'POST',
@@ -496,6 +515,21 @@ export async function updateHealth(
 	await request(`/apps/${id}/health`, {
 		method: 'PUT',
 		body: JSON.stringify({ health_check_path, health_check_interval, health_failure_threshold })
+	});
+}
+
+/**
+ * Set how deploys decide the app is ready. Switching to `none` (background
+ * worker) removes the app's domain and health check path.
+ */
+export async function updateReadiness(
+	id: string,
+	readiness: Readiness,
+	ready_after_secs?: number
+): Promise<App> {
+	return request<App>(`/apps/${id}/readiness`, {
+		method: 'PUT',
+		body: JSON.stringify({ readiness, ...(ready_after_secs ? { ready_after_secs } : {}) })
 	});
 }
 
@@ -1109,6 +1143,10 @@ export interface ImageInspection {
 	env_port: number | null;
 	suggested_port: number | null;
 	pulled: boolean;
+	/** Set when the image couldn't be read; says why and what to do */
+	unavailable?: string | null;
+	/** The registry refused the image: it may need registry credentials */
+	needs_credentials?: boolean;
 }
 
 /** Ports an image exposes (pulls it first if it isn't on the server yet). */

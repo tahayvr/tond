@@ -1,9 +1,11 @@
 <script lang="ts">
-	// Network step: the container port (asked for every source type, with a
-	// hint from the Dockerfile, compose file or image when Tond can tell),
-	// domain and health checks.
+	// Network step: what kind of app it is (web app, TCP service or
+	// background worker), the container port (asked for every source type
+	// that serves traffic, with a hint from the Dockerfile, compose file or
+	// image when Tond can tell), domain and health checks.
 	import { untrack } from 'svelte';
-	import { inspectImage } from '$lib/api';
+	import { inspectImage, type Readiness } from '$lib/api';
+	import { cn } from '$lib/utils';
 	import { parseComposePorts, parseDockerfileExpose } from '$lib/wizard-detect';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
@@ -30,6 +32,10 @@
 		templatePort: number | null;
 		/** The user typed a port; don't overwrite it with a detected one. */
 		portTouched: boolean;
+		/** Web app (http), TCP service (tcp) or background worker (none). */
+		readiness: Readiness;
+		/** For background workers: seconds the container must stay up. */
+		readyAfterSecs: number;
 	}
 
 	let {
@@ -46,11 +52,38 @@
 		registryCredentialId,
 		buildMethod,
 		templatePort,
-		portTouched = $bindable(false)
+		portTouched = $bindable(false),
+		readiness = $bindable<Readiness>('http'),
+		readyAfterSecs = $bindable(10)
 	}: Props = $props();
+
+	const MODES: { value: Readiness; label: string; desc: string }[] = [
+		{
+			value: 'http',
+			label: 'Web app',
+			desc: 'Serves HTTP. Gets a domain; the deploy waits until it answers.'
+		},
+		{
+			value: 'tcp',
+			label: 'TCP service',
+			desc: "Listens on a port but doesn't speak HTTP (a database proxy, a game server)."
+		},
+		{
+			value: 'none',
+			label: 'Background worker',
+			desc: 'Serves no traffic (a queue consumer, a scheduler). No port, no domain.'
+		}
+	];
+	let worker = $derived(readiness === 'none');
+	// Compose apps route to a published web service; they can't be workers.
+	let modes = $derived(
+		sourceSubType === 'compose' ? MODES.filter((m) => m.value !== 'none') : MODES
+	);
 
 	let detecting = $state(false);
 	let detectError = $state('');
+	/** A soft failure: the image couldn't be read (e.g. private, no credentials yet). */
+	let detectHint = $state('');
 	let imagePorts = $state<number[] | null>(null);
 	let imageEnvPort = $state<number | null>(null);
 	let detectedFor = $state('');
@@ -86,11 +119,18 @@
 		if (!image) return;
 		detecting = true;
 		detectError = '';
+		detectHint = '';
+		const key = detectKey(image, registryCredentialId);
 		try {
 			const info = await inspectImage(image, registryCredentialId || undefined);
+			detectedFor = key;
+			if (info.unavailable) {
+				detectHint = info.unavailable;
+				imagePorts = null;
+				return;
+			}
 			imagePorts = info.exposed_ports;
 			imageEnvPort = info.env_port;
-			detectedFor = image;
 		} catch (e: any) {
 			detectError = e.message ?? "Couldn't inspect the image";
 			imagePorts = null;
@@ -99,11 +139,19 @@
 		}
 	}
 
-	// Look at the image's ports once per image (the first deploy pulls it anyway).
+	function detectKey(image: string, credential: string): string {
+		return `${image}|${credential}`;
+	}
+
+	// Look at the image's ports once per image and credential choice (the
+	// first deploy pulls it anyway). A private image fails softly until
+	// registry credentials are chosen; coming back after choosing them reads
+	// it again. Workers have no port to read.
 	$effect(() => {
-		if (sourceSubType !== 'image') return;
+		if (sourceSubType !== 'image' || worker) return;
 		const image = sourceUrl.trim();
-		if (!image || untrack(() => detectedFor === image || detecting)) return;
+		const key = detectKey(image, registryCredentialId);
+		if (!image || untrack(() => detectedFor === key || detecting)) return;
 		untrack(detectImage);
 	});
 
@@ -118,156 +166,204 @@
 </script>
 
 <div class="space-y-6">
-	<section class="space-y-2">
-		<Label for="container-port">Container port *</Label>
-		<div class="flex flex-wrap items-center gap-2">
+	<fieldset class="space-y-2">
+		<legend class="text-sm font-medium">What does this app do?</legend>
+		<div class="grid gap-2 sm:grid-cols-3">
+			{#each modes as mode (mode.value)}
+				<button
+					type="button"
+					class={cn(
+						'rounded-md border p-3 text-left transition-colors hover:bg-accent/50',
+						readiness === mode.value && 'border-foreground bg-accent/40'
+					)}
+					aria-pressed={readiness === mode.value}
+					onclick={() => (readiness = mode.value)}
+				>
+					<span class="block text-sm font-medium">{mode.label}</span>
+					<span class="mt-1 block text-xs text-muted-foreground">{mode.desc}</span>
+				</button>
+			{/each}
+		</div>
+	</fieldset>
+
+	{#if worker}
+		<section class="space-y-2">
+			<Label for="ready-after">Stays up for (seconds)</Label>
 			<Input
-				id="container-port"
+				id="ready-after"
 				type="number"
-				bind:value={containerPort}
-				oninput={handlePortInput}
+				bind:value={readyAfterSecs}
 				min={1}
-				max={65535}
+				max={600}
 				class="w-32"
 			/>
-			{#if sourceSubType === 'image'}
-				<Button
-					variant="outline"
-					size="sm"
-					onclick={detectImage}
-					disabled={detecting || !sourceUrl.trim()}
-				>
-					<ScanIcon />
-					{detecting ? 'Checking the image…' : 'Detect from image'}
-				</Button>
-			{/if}
-		</div>
-		<p class="text-xs text-muted-foreground">
-			The port your app listens on inside the container. Tond passes it as <code>$PORT</code> and sends
-			traffic there; the deploy waits until the app answers on it.
-		</p>
-
-		<div class="flex items-start gap-2 rounded-md bg-muted/40 px-3 py-2 text-xs">
-			<InfoIcon class="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
-			<div class="space-y-1">
+			<p class="text-xs text-muted-foreground">
+				A worker has no port to check, so a deploy counts as ready once the new container has run
+				this long without exiting. Then the old one is stopped.
+			</p>
+		</section>
+	{:else}
+		<section class="space-y-2">
+			<Label for="container-port">Container port *</Label>
+			<div class="flex flex-wrap items-center gap-2">
+				<Input
+					id="container-port"
+					type="number"
+					bind:value={containerPort}
+					oninput={handlePortInput}
+					min={1}
+					max={65535}
+					class="w-32"
+				/>
 				{#if sourceSubType === 'image'}
-					{#if detecting}
-						<p>Pulling the image to read its ports…</p>
-					{:else if detectError}
-						<p class="text-destructive">{detectError}</p>
-					{:else if imagePorts && imagePorts.length > 0}
+					<Button
+						variant="outline"
+						size="sm"
+						onclick={detectImage}
+						disabled={detecting || !sourceUrl.trim()}
+					>
+						<ScanIcon />
+						{detecting ? 'Checking the image…' : 'Detect from image'}
+					</Button>
+				{/if}
+			</div>
+			<p class="text-xs text-muted-foreground">
+				The port your app listens on inside the container. Tond passes it as <code>$PORT</code> and sends
+				traffic there; the deploy waits until the app answers on it.
+			</p>
+
+			<div class="flex items-start gap-2 rounded-md bg-muted/40 px-3 py-2 text-xs">
+				<InfoIcon class="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
+				<div class="space-y-1">
+					{#if sourceSubType === 'image'}
+						{#if detecting}
+							<p>Pulling the image to read its ports…</p>
+						{:else if detectError}
+							<p class="text-destructive">{detectError}</p>
+						{:else if imagePorts && imagePorts.length > 0}
+							<p>
+								The image exposes {imagePorts.join(', ')}.
+								{#if imagePorts.length > 1}Pick the one that serves HTTP.{/if}
+							</p>
+						{:else if detectHint}
+							<p>{detectHint}</p>
+						{:else if imagePorts}
+							<p>
+								The image doesn't declare a port{imageEnvPort
+									? `, but sets PORT=${imageEnvPort}`
+									: ''}. Check its documentation (nginx uses 80, many Node apps 3000).
+							</p>
+						{:else}
+							<p>Tond reads the port from the image once you enter it on the Source step.</p>
+						{/if}
+					{:else if sourceSubType === 'dockerfile'}
 						<p>
-							The image exposes {imagePorts.join(', ')}.
-							{#if imagePorts.length > 1}Pick the one that serves HTTP.{/if}
+							{filePorts.length
+								? `Your Dockerfile EXPOSEs ${filePorts.join(', ')}.`
+								: "Your Dockerfile doesn't EXPOSE a port; use the one your server listens on."}
 						</p>
-					{:else if imagePorts}
+					{:else if sourceSubType === 'compose'}
 						<p>
-							The image doesn't declare a port{imageEnvPort
-								? `, but sets PORT=${imageEnvPort}`
-								: ''}. Check its documentation (nginx uses 80, many Node apps 3000).
+							{filePorts.length
+								? `Your compose file uses container port${filePorts.length > 1 ? 's' : ''} ${filePorts.join(', ')}. Tond routes to the service that publishes the port you pick.`
+								: 'Publish the web service’s port in your compose file (ports: ["80"]) and enter it here.'}
+						</p>
+					{:else if sourceSubType === 'template'}
+						<p>The template's default{templatePort ? ` is ${templatePort}` : ''}.</p>
+					{:else if buildMethod === 'tbuild'}
+						<p>
+							Images TBuild generates listen on <code>$PORT</code>, so 8080 works unless your code
+							hard-codes another port.
 						</p>
 					{:else}
-						<p>Tond reads the port from the image once you enter it on the Source step.</p>
+						<p>Use the port your Dockerfile EXPOSEs or your server listens on.</p>
 					{/if}
-				{:else if sourceSubType === 'dockerfile'}
-					<p>
-						{filePorts.length
-							? `Your Dockerfile EXPOSEs ${filePorts.join(', ')}.`
-							: "Your Dockerfile doesn't EXPOSE a port; use the one your server listens on."}
-					</p>
-				{:else if sourceSubType === 'compose'}
-					<p>
-						{filePorts.length
-							? `Your compose file uses container port${filePorts.length > 1 ? 's' : ''} ${filePorts.join(', ')}. Tond routes to the service that publishes the port you pick.`
-							: 'Publish the web service’s port in your compose file (ports: ["80"]) and enter it here.'}
-					</p>
-				{:else if sourceSubType === 'template'}
-					<p>The template's default{templatePort ? ` is ${templatePort}` : ''}.</p>
-				{:else if buildMethod === 'tbuild'}
-					<p>
-						Images TBuild generates listen on <code>$PORT</code>, so 8080 works unless your code
-						hard-codes another port.
-					</p>
-				{:else}
-					<p>Use the port your Dockerfile EXPOSEs or your server listens on.</p>
-				{/if}
-				{#if suggested && suggested !== containerPort}
-					<Button
-						variant="link"
-						size="sm"
-						class="h-auto p-0 text-xs"
-						onclick={() => suggested && applyPort(suggested)}
-					>
-						Use {suggested}
-					</Button>
-				{:else if (sourceSubType === 'dockerfile' || sourceSubType === 'compose' || sourceSubType === 'image') && filePorts.length + (imagePorts?.length ?? 0) > 1}
-					<div class="flex flex-wrap gap-1">
-						{#each sourceSubType === 'image' ? (imagePorts ?? []) : filePorts as p (p)}
-							<Button
-								variant={p === containerPort ? 'secondary' : 'outline'}
-								size="sm"
-								class="h-6 px-2 text-xs"
-								onclick={() => applyPort(p)}>{p}</Button
-							>
-						{/each}
-					</div>
-				{/if}
+					{#if suggested && suggested !== containerPort}
+						<Button
+							variant="link"
+							size="sm"
+							class="h-auto p-0 text-xs"
+							onclick={() => suggested && applyPort(suggested)}
+						>
+							Use {suggested}
+						</Button>
+					{:else if (sourceSubType === 'dockerfile' || sourceSubType === 'compose' || sourceSubType === 'image') && filePorts.length + (imagePorts?.length ?? 0) > 1}
+						<div class="flex flex-wrap gap-1">
+							{#each sourceSubType === 'image' ? (imagePorts ?? []) : filePorts as p (p)}
+								<Button
+									variant={p === containerPort ? 'secondary' : 'outline'}
+									size="sm"
+									class="h-6 px-2 text-xs"
+									onclick={() => applyPort(p)}>{p}</Button
+								>
+							{/each}
+						</div>
+					{/if}
+				</div>
 			</div>
-		</div>
-	</section>
+		</section>
 
-	<Separator class="bg-border" />
-
-	<div class="space-y-2">
-		<Label for="domain">Custom Domain (Optional)</Label>
-		<Input id="domain" type="text" bind:value={domain} placeholder="app.example.com" />
-		<p class="text-xs text-muted-foreground">
-			Leave empty to use the automatic address under your apps domain. For your own domain, the
-			app's Domain tab shows the DNS record to create.
-		</p>
-	</div>
-
-	<Separator class="bg-border" />
-
-	<div class="space-y-4">
-		<h4 class="font-mono text-sm tracking-wider uppercase">Health Check Settings</h4>
-
-		<div class="grid gap-4 sm:grid-cols-2">
-			<div class="space-y-2">
-				<Label for="health-path">Health Check Path</Label>
-				<Input id="health-path" type="text" bind:value={healthCheckPath} placeholder="/health" />
-				<p class="text-xs text-muted-foreground">
-					HTTP path that answers 2xx when the app is ready. Leave empty to only wait for the port.
-				</p>
-			</div>
-
-			<div class="space-y-2">
-				<Label for="health-interval">Check Interval (seconds)</Label>
-				<Input
-					id="health-interval"
-					type="number"
-					bind:value={healthCheckInterval}
-					min={5}
-					max={300}
-				/>
-				<p class="text-xs text-muted-foreground">Range: 5-300 seconds</p>
-			</div>
-		</div>
+		<Separator class="bg-border" />
 
 		<div class="space-y-2">
-			<Label for="health-threshold">Failure Threshold</Label>
-			<Input
-				id="health-threshold"
-				type="number"
-				bind:value={healthFailureThreshold}
-				min={1}
-				max={10}
-			/>
+			<Label for="domain">Custom Domain (Optional)</Label>
+			<Input id="domain" type="text" bind:value={domain} placeholder="app.example.com" />
 			<p class="text-xs text-muted-foreground">
-				Consecutive failures before marking unhealthy (1-10)
+				Leave empty to use the automatic address under your apps domain. For your own domain, the
+				app's Domain tab shows the DNS record to create.
 			</p>
 		</div>
-	</div>
+
+		{#if readiness === 'http'}
+			<Separator class="bg-border" />
+
+			<div class="space-y-4">
+				<h4 class="font-mono text-sm tracking-wider uppercase">Health Check Settings</h4>
+
+				<div class="grid gap-4 sm:grid-cols-2">
+					<div class="space-y-2">
+						<Label for="health-path">Health Check Path</Label>
+						<Input
+							id="health-path"
+							type="text"
+							bind:value={healthCheckPath}
+							placeholder="/health"
+						/>
+						<p class="text-xs text-muted-foreground">
+							HTTP path that answers 2xx when the app is ready. Leave empty to only wait for the
+							port.
+						</p>
+					</div>
+
+					<div class="space-y-2">
+						<Label for="health-interval">Check Interval (seconds)</Label>
+						<Input
+							id="health-interval"
+							type="number"
+							bind:value={healthCheckInterval}
+							min={5}
+							max={300}
+						/>
+						<p class="text-xs text-muted-foreground">Range: 5-300 seconds</p>
+					</div>
+				</div>
+
+				<div class="space-y-2">
+					<Label for="health-threshold">Failure Threshold</Label>
+					<Input
+						id="health-threshold"
+						type="number"
+						bind:value={healthFailureThreshold}
+						min={1}
+						max={10}
+					/>
+					<p class="text-xs text-muted-foreground">
+						Consecutive failures before marking unhealthy (1-10)
+					</p>
+				</div>
+			</div>
+		{/if}
+	{/if}
 
 	<Separator class="bg-border" />
 
