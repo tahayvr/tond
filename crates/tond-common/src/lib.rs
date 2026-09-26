@@ -17,6 +17,8 @@
 pub mod dns;
 pub mod errors;
 pub mod models;
+pub mod procstat;
+pub mod proxy_control;
 
 pub use errors::*;
 pub use models::*;

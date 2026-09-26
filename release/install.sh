@@ -698,10 +698,12 @@ ensure_terminal_user() {
 
 # Permission scheme for /opt/tond/data (also applied by update.sh):
 #   data dir            root:tond-proxy 3770  setgid: new files get group tond-proxy;
-#                                             sticky: tond-proxy can create files
-#                                             (SQLite -wal/-shm) but never remove or
+#                                             sticky: tond-proxy can create its own
+#                                             files (proxy.sock) but never remove or
 #                                             replace root's (tond.env, tond.sock, ...)
-#   tond.db, -wal, -shm root:tond-proxy 0660  shared by tond-server and tond-proxy
+#   tond.db, -wal, -shm root:tond-proxy 0640  written by tond-server, read-only for
+#                                             tond-proxy (which also opens it mode=ro)
+#   proxy.sock          tond-proxy 0600       created by tond-proxy at start
 #   certs/, acme_account.json  tond-proxy     0700 dirs / 0600 files (TLS + ACME keys)
 #   tond.env, setup-token                 root 0600 (written by tond-server/install.sh)
 #   everything else     root only: top-level entries lose group/other access;
@@ -729,19 +731,19 @@ secure_data_dir() {
     # the proxy's own state, handled below.
     find "$DATA_DIR" -mindepth 1 -maxdepth 1 \
         ! -name 'tond.db' ! -name 'tond.db-wal' ! -name 'tond.db-shm' \
-        ! -name certs ! -name acme_account.json \
+        ! -name certs ! -name acme_account.json ! -name proxy.sock \
         -exec chmod go-rwx {} +
 
     # Pre-create the database so the proxy can open it on first start; an
     # empty file is a valid new SQLite database.
     if [[ ! -e "${DATA_DIR}/tond.db" ]]; then
-        install -m 0660 -o root -g "$PROXY_USER" /dev/null "${DATA_DIR}/tond.db"
+        install -m 0640 -o root -g "$PROXY_USER" /dev/null "${DATA_DIR}/tond.db"
     fi
     local f
     for f in tond.db tond.db-wal tond.db-shm; do
         if [[ -e "${DATA_DIR}/${f}" ]]; then
             chown root:"$PROXY_USER" "${DATA_DIR}/${f}"
-            chmod 0660 "${DATA_DIR}/${f}"
+            chmod 0640 "${DATA_DIR}/${f}"
         fi
     done
 
@@ -759,7 +761,7 @@ secure_data_dir() {
         chmod 0600 "$SECRET_ENV_FILE"
     fi
 
-    info "Data directory locked down (tond.db shared with ${PROXY_USER} via group; secrets root-only)"
+    info "Data directory locked down (tond.db read-only for ${PROXY_USER} via group; secrets root-only)"
 }
 
 # Ensure ${SECRET_ENV_FILE} holds TOND_SECRET_KEY, the at-rest encryption key
@@ -857,6 +859,8 @@ install_services() {
     # Copy service files
     cp "${SCRIPT_DIR}/tond-server.service" /etc/systemd/system/tond-server.service
     cp "${SCRIPT_DIR}/tond-proxy.service"  /etc/systemd/system/tond-proxy.service
+    # Memory cap for image builds (docker build --cgroup-parent tondbuild.slice)
+    cp "${SCRIPT_DIR}/tondbuild.slice"    /etc/systemd/system/tondbuild.slice
     
     systemctl daemon-reload
     
@@ -899,9 +903,11 @@ configure_dashboard_domain_seed() {
 
     step "Seeding dashboard domain"
 
-    mkdir -p /etc/systemd/system/tond-proxy.service.d/
+    # tond-server writes the dashboard_domain setting from this on start
+    # while the setting is empty (tond-proxy opens the database read-only).
+    mkdir -p /etc/systemd/system/tond-server.service.d/
 
-    cat > /etc/systemd/system/tond-proxy.service.d/override.conf <<EOF
+    cat > /etc/systemd/system/tond-server.service.d/dashboard-domain.conf <<EOF
 [Service]
 Environment=TOND_DASHBOARD_DOMAIN=${DASHBOARD_DOMAIN}
 EOF

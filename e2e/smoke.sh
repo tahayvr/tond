@@ -171,11 +171,11 @@ step "Data directory permissions (tond.db, keys and certs are not world-readable
     || fail "${DATA_DIR} must be 3770 root:tond-proxy, got: $(perms "$DATA_DIR")"
 pass "${DATA_DIR} is 3770 root:tond-proxy (setgid + sticky, no access for others)"
 for f in tond.db tond.db-wal tond.db-shm; do
-    [[ -e "${DATA_DIR}/${f}" ]] || continue
-    [[ "$(perms "${DATA_DIR}/${f}")" == "660 root tond-proxy" ]] \
-        || fail "${f} must be 660 root:tond-proxy, got: $(perms "${DATA_DIR}/${f}")"
+    [[ -e "${DATA_DIR}/${f}" ]] || fail "${f} must exist (persistent WAL: tond-proxy reads it and cannot create it)"
+    [[ "$(perms "${DATA_DIR}/${f}")" == "640 root tond-proxy" ]] \
+        || fail "${f} must be 640 root:tond-proxy, got: $(perms "${DATA_DIR}/${f}")"
 done
-pass "tond.db (+ -wal/-shm) is 660 root:tond-proxy"
+pass "tond.db (+ -wal/-shm) is 640 root:tond-proxy (read-only for the proxy)"
 world=$(find "$DATA_DIR" -maxdepth 1 -mindepth 1 -perm /o+rwx)
 [[ -z "$world" ]] || fail "top-level entries accessible to others: ${world}"
 for d in keys backups volumes databases builds compose docker-config; do
@@ -232,6 +232,70 @@ for svc in tond-server tond-proxy; do
 done
 [[ "$(systemctl show -p UMask --value tond-proxy)" == 0077 ]] || fail "tond-proxy must run with UMask=0077"
 pass "both units: NoNewPrivileges, PrivateTmp, ProtectSystem=strict, ProtectHome, RestrictSUIDSGID, ...; proxy UMask=0077"
+
+step "Runtime guard rails (memory, tasks, OOM, graceful stop, build slice)"
+for svc in tond-server tond-proxy; do
+    [[ "$(systemctl show -p OOMScoreAdjust --value "$svc")" == -900 ]] \
+        || fail "${svc}: OOMScoreAdjust must be -900, got $(systemctl show -p OOMScoreAdjust --value "$svc")"
+    for key in MemoryMax TasksMax; do
+        value=$(systemctl show -p "$key" --value "$svc")
+        [[ -n "$value" && "$value" != infinity ]] || fail "${svc}: ${key} must be set, got '${value}'"
+    done
+    systemctl show -p Environment --value "$svc" | tr ' ' '\n' | grep -qx MALLOC_ARENA_MAX=2 \
+        || fail "${svc}: MALLOC_ARENA_MAX=2 must be set"
+    pid=$(systemctl show -p MainPID --value "$svc")
+    [[ "$(cat "/proc/${pid}/oom_score_adj")" == -900 ]] || fail "${svc}: oom_score_adj of pid ${pid} must be -900"
+done
+pass "both units: MemoryMax, TasksMax, OOMScoreAdjust=-900 (effective), MALLOC_ARENA_MAX=2"
+[[ "$(systemctl show -p KillMode --value tond-server)" == mixed ]] \
+    || fail "tond-server must use KillMode=mixed so SIGTERM reaches only tond-server"
+pass "tond-server: KillMode=mixed (graceful shutdown handles in-flight work)"
+[[ -f /etc/systemd/system/tondbuild.slice ]] || fail "install.sh must install tondbuild.slice"
+systemctl is-active --quiet tondbuild.slice || fail "tondbuild.slice must be active (tond-server Wants= it)"
+# The cgroup BuildKit puts RUN steps under must carry the limit itself.
+slice_max=$(cat /sys/fs/cgroup/tondbuild.slice/memory.max)
+[[ "$slice_max" =~ ^[0-9]+$ ]] || fail "/sys/fs/cgroup/tondbuild.slice must cap memory, got memory.max=${slice_max}"
+pass "tondbuild.slice is active and caps builds at $((slice_max / 1024 / 1024)) MiB (60% of RAM)"
+if [[ -d /sys/fs/cgroup/tondbuild.slice/buildkit ]]; then
+    pass "BuildKit runs build steps inside tondbuild.slice"
+fi
+
+step "tond-proxy control socket and read-only database"
+PROXY_SOCK="${DATA_DIR}/proxy.sock"
+[[ -S "$PROXY_SOCK" ]] || fail "tond-proxy must listen on ${PROXY_SOCK}"
+[[ "$(perms "$PROXY_SOCK")" == "600 tond-proxy "* ]] || fail "proxy.sock must be 0600 tond-proxy, got: $(perms "$PROXY_SOCK")"
+if runuser -u nobody -- curl -s --max-time 2 --unix-socket "$PROXY_SOCK" http://x/ > /dev/null 2>&1; then
+    fail "an unrelated user must not be able to connect to the proxy control socket"
+fi
+pass "proxy.sock is 0600 tond-proxy; other users cannot connect"
+if runuser -u tond-proxy -- bash -c ": >> '${DATA_DIR}/tond.db'" 2>/dev/null; then
+    fail "tond-proxy must not be able to write tond.db"
+fi
+pass "tond-proxy cannot write tond.db"
+self=$(api /api/system/self)
+echo "$self" | jq -e '.data.proxy.connected == true' > /dev/null \
+    || fail "tond-server must hold a control connection to tond-proxy: $(echo "$self" | jq -c .data.proxy)"
+echo "$self" | jq -e '.data.proxy.stats.route_version >= 0 and .data.proxy.stats.pid > 0' > /dev/null \
+    || fail "tond-proxy must report its stats over the control socket"
+pass "tond-server ↔ tond-proxy control link is up (proxy pid $(echo "$self" | jq -r .data.proxy.stats.pid))"
+
+step "Tond measuring itself (/api/system/self, /metrics)"
+echo "$self" | jq -e '.data.server.rss_bytes > 0 and .data.server.tokio_alive_tasks > 0 and .data.server.open_fds > 0' > /dev/null \
+    || fail "/api/system/self must report RSS, tasks and fds: $(echo "$self" | jq -c .data.server)"
+echo "$self" | jq -e '[.data.loops[].name] | index("health") and index("cron") and index("proxy-link")' > /dev/null \
+    || fail "/api/system/self must list the background loops: $(echo "$self" | jq -c '[.data.loops[].name]')"
+echo "$self" | jq -e '.data.db.size_bytes > 0 and .data.db.queries_total > 0' > /dev/null \
+    || fail "/api/system/self must report DB size and statement counts"
+echo "$self" | jq -e '.data.http | length > 0' > /dev/null || fail "/api/system/self must report HTTP latency per route"
+pass "/api/system/self: RSS $(( $(echo "$self" | jq .data.server.rss_bytes) / 1024 )) KiB, $(echo "$self" | jq .data.server.tokio_alive_tasks) tasks, $(echo "$self" | jq '.data.loops | length') loops, DB $(echo "$self" | jq .data.db.size_bytes) bytes"
+metrics=$(curl -sf --unix-socket "$SOCK" http://localhost/metrics)
+for m in tond_process_resident_memory_bytes tond_loop_wakeups_total tond_db_queries_total tond_http_request_duration_seconds_bucket; do
+    grep -q "^${m}" <<<"$metrics" || fail "/metrics must expose ${m}"
+done
+pass "/metrics on the root-only socket exposes Prometheus metrics"
+[[ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3001/metrics)" == 404 ]] \
+    || fail "/metrics must not be served over TCP"
+pass "/metrics over TCP → 404"
 
 id -u tond > /dev/null 2>&1 || fail "install.sh must create the host terminal user 'tond'"
 for group in docker sudo; do
@@ -1145,6 +1209,33 @@ code=$(api_req GET "/api/domains/check?domain=not_a_domain" '')
 [[ "$code" == 400 ]] || fail "an invalid domain must be rejected with 400, got ${code}"
 pass "domain check reports DNS '${DNS_STATUS}' for ${WHOAMI_DOMAIN}; invalid domains → 400"
 
+step "Build queue: coalescing, 202 + queue position, acknowledged cutover"
+wait_for_app_running e2e-whoami 120
+# Three deploys back to back: the first runs, the second waits, the third
+# supersedes the second (one deploy in flight per app, newest wins).
+q1=$(api_req POST /api/apps/e2e-whoami/deploy '{}'); b1=$(cat "$API_BODY")
+q2=$(api_req POST /api/apps/e2e-whoami/deploy '{}'); b2=$(cat "$API_BODY")
+q3=$(api_req POST /api/apps/e2e-whoami/deploy '{}'); b3=$(cat "$API_BODY")
+[[ "$q1 $q2 $q3" == "202 202 202" ]] || fail "deploys must be accepted with 202, got ${q1} ${q2} ${q3}"
+for b in "$b1" "$b2" "$b3"; do
+    echo "$b" | jq -e '.data.deployment_id and .data.status == "queued" and .data.queue_position >= 1' > /dev/null \
+        || fail "a queued deploy must return its deployment id and queue position: ${b}"
+done
+D2=$(echo "$b2" | jq -r .data.deployment_id)
+D3=$(echo "$b3" | jq -r .data.deployment_id)
+[[ "$(echo "$b3" | jq -r .data.superseded)" == "$D2" ]] || fail "the third deploy must supersede the second: ${b3}"
+wait_for 300 "the newest deploy to succeed" \
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/apps/e2e-whoami/deployments | jq -e --arg id '${D3}' '.data[] | select(.id == \$id and .status == \"succeeded\")'"
+api /api/apps/e2e-whoami/deployments | jq -e --arg id "$D2" --arg by "$D3" \
+    '.data[] | select(.id == $id and .status == "superseded" and .superseded_by == $by)' > /dev/null \
+    || fail "the waiting deploy must be marked superseded by the newest one"
+pass "3 deploys → first ran, second superseded by the third, third succeeded"
+wait_for_app_running e2e-whoami 120
+tond apps logs e2e-whoami 2>/dev/null | grep -q "Proxy confirmed the new route in" \
+    || { tond apps logs e2e-whoami | tail -20 >&2; fail "the cutover must wait for tond-proxy's acknowledgement"; }
+pass "cutover waited for the proxy's acknowledgement ($(tond apps logs e2e-whoami | grep -o 'confirmed the new route in [0-9]* ms' | tail -1))"
+wait_for 30 "route after queued deploys" bash -c "curl -sk --resolve '${WHOAMI_DOMAIN}:443:${IP}' 'https://${WHOAMI_DOMAIN}/' | grep -q Hostname:"
+
 step "Background worker (readiness: none — no port, no domain, never routed)"
 # A worker that serves nothing must deploy (the HTTP release check would fail it).
 code=$(api_req POST /api/apps '{"name":"e2e-worker","source_type":"dockerfile","dockerfile_content":"FROM alpine:3\nCMD [\"sh\", \"-c\", \"while true; do echo tick; sleep 5; done\"]","readiness":"none","ready_after_secs":5}')
@@ -1224,6 +1315,33 @@ wait_for 30 "API health after restart" curl -sf http://127.0.0.1:3001/health
 [[ "$(app_field e2e-whoami status)" == running ]] || fail "e2e-whoami should still be running after a restart"
 wait_for 60 "route after restart" bash -c "curl -sk --resolve '${WHOAMI_DOMAIN}:443:${IP}' 'https://${WHOAMI_DOMAIN}/' | grep -q Hostname:"
 pass "apps keep running and routing after restarting tond-server and tond-proxy"
+journalctl -u tond-server --since "-2min" --no-pager -o cat | grep -q "SIGTERM received: shutting down gracefully" \
+    || fail "tond-server must shut down gracefully on SIGTERM"
+pass "tond-server shut down gracefully on SIGTERM"
+# A restart in the middle of a deploy: the deployment is marked interrupted,
+# never left 'running'.
+api_req POST /api/apps/e2e-whoami/deploy '{}' > /dev/null
+INTERRUPTED=$(jq -r .data.deployment_id "$API_BODY")
+systemctl kill -s SIGKILL tond-server
+wait_for 60 "API health after a crash" curl -sf http://127.0.0.1:3001/health
+status=$(api /api/apps/e2e-whoami/deployments | jq -r --arg id "$INTERRUPTED" '.data[] | select(.id == $id) | .status')
+case "$status" in
+    failed)
+        api /api/apps/e2e-whoami/deployments | jq -e --arg id "$INTERRUPTED" '.data[] | select(.id == $id) | .failure.code == "interrupted"' > /dev/null \
+            || fail "an interrupted deploy must say so"
+        pass "a deploy cut off by a crash is marked failed (interrupted) at startup" ;;
+    queued|running|succeeded)
+        # It had not started yet (resumed from the queue) or finished first.
+        wait_for 300 "the resumed deploy to finish" \
+            bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/apps/e2e-whoami/deployments | jq -e --arg id '${INTERRUPTED}' '.data[] | select(.id == \$id and (.status == \"succeeded\" or .status == \"failed\"))'"
+        pass "a deploy caught by the crash was resumed or had finished (status was ${status})" ;;
+    *) fail "unexpected status for the interrupted deploy: '${status}'" ;;
+esac
+unfinished=$(api /api/apps/e2e-whoami/deployments | jq '[.data[] | select(.status == "running")] | length')
+wait_for 300 "no deployment left in flight" \
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/apps/e2e-whoami/deployments | jq -e '[.data[] | select(.status == \"running\" or .status == \"queued\")] | length == 0'"
+wait_for_app_running e2e-whoami 120
+pass "startup reconciliation left nothing in flight (had ${unfinished} right after the crash)"
 
 step "Stability"
 running_runs=$(api "/api/cron/${CRON_ID}/runs" | jq '[.data[] | select(.status == "running")] | length')

@@ -42,6 +42,7 @@ use bollard::query_parameters::{EventsOptionsBuilder, ListContainersOptionsBuild
 use futures::{Stream, StreamExt};
 use sqlx::SqlitePool;
 
+use crate::runtime::changes;
 use crate::{alerts, auth::secret_file, state::AppState};
 pub use store::{EventKind, Owner, Sample, TargetKind};
 
@@ -273,7 +274,14 @@ pub struct Collector {
     next_5m: Option<i64>,
     next_1h: Option<i64>,
     last_alert: HashMap<(Owner, &'static str), i64>,
+    /// Changes to the owner tables (runtime::changes): the resolver is
+    /// reloaded only when one moved, not on every tick.
+    owner_changes: Vec<tokio::sync::watch::Receiver<u64>>,
 }
+
+/// Reload the owner tables at least this often even without a change
+/// notification (writes behind tond-server's back, e.g. sqlite3 by hand).
+const OWNER_RELOAD_MAX_AGE: Duration = Duration::from_secs(3600);
 
 impl Collector {
     pub fn new(cgroup_root: PathBuf, proc_root: PathBuf) -> Self {
@@ -287,7 +295,32 @@ impl Collector {
             next_5m: None,
             next_1h: None,
             last_alert: HashMap::new(),
+            owner_changes: [
+                changes::Table::Apps,
+                changes::Table::Databases,
+                changes::Table::CronJobs,
+                changes::Table::PreviewDeployments,
+            ]
+            .into_iter()
+            .map(changes::subscribe)
+            .collect(),
         }
+    }
+
+    /// Whether the owner tables may have changed since the last load.
+    fn owners_stale(&mut self) -> bool {
+        let changed = self
+            .owner_changes
+            .iter()
+            .any(|rx| rx.has_changed().unwrap_or(true));
+        for rx in &mut self.owner_changes {
+            rx.mark_unchanged();
+        }
+        changed
+            || self
+                .resolver
+                .loaded_at
+                .is_none_or(|t| t.elapsed() > OWNER_RELOAD_MAX_AGE)
     }
 
     fn publish_running_count(&self) {
@@ -605,9 +638,12 @@ impl Collector {
         let at = Instant::now();
         host.sample(now);
 
-        match Resolver::load(&state.db).await {
-            Ok(r) => self.resolver = r,
-            Err(e) => tracing::warn!("metrics: cannot load owners: {}", e),
+        // Idle servers tick with nothing new: skip re-reading four tables.
+        if self.owners_stale() {
+            match Resolver::load(&state.db).await {
+                Ok(r) => self.resolver = r,
+                Err(e) => tracing::warn!("metrics: cannot load owners: {}", e),
+            }
         }
         self.resolve_unowned();
 
@@ -831,12 +867,18 @@ pub async fn run_metrics_collector(state: AppState) {
     let mut events: Option<EventStream> = None;
     let mut retry = EVENT_RETRY_MIN;
     let mut reconnect_at = tokio::time::Instant::now();
+    let lp = crate::runtime::loops::register("metrics");
     let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + FIRST_TICK, TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
-            _ = ticker.tick() => collector.tick(&state, &mut host).await,
+            _ = ticker.tick() => {
+                // Loop health for GET /api/system/self (runtime::loops).
+                lp.woke();
+                let _run = lp.run();
+                collector.tick(&state, &mut host).await;
+            }
             _ = tokio::time::sleep_until(reconnect_at), if events.is_none() => {
                 events = Some(subscribe(&state));
                 match collector.resync(&state).await {

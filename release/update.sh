@@ -239,19 +239,19 @@ secure_data_dir() {
     # the proxy's own state, handled below.
     find "$DATA_DIR" -mindepth 1 -maxdepth 1 \
         ! -name 'tond.db' ! -name 'tond.db-wal' ! -name 'tond.db-shm' \
-        ! -name certs ! -name acme_account.json \
+        ! -name certs ! -name acme_account.json ! -name proxy.sock \
         -exec chmod go-rwx {} +
 
     # Pre-create the database so the proxy can open it on first start; an
     # empty file is a valid new SQLite database.
     if [[ ! -e "${DATA_DIR}/tond.db" ]]; then
-        install -m 0660 -o root -g "$PROXY_USER" /dev/null "${DATA_DIR}/tond.db"
+        install -m 0640 -o root -g "$PROXY_USER" /dev/null "${DATA_DIR}/tond.db"
     fi
     local f
     for f in tond.db tond.db-wal tond.db-shm; do
         if [[ -e "${DATA_DIR}/${f}" ]]; then
             chown root:"$PROXY_USER" "${DATA_DIR}/${f}"
-            chmod 0660 "${DATA_DIR}/${f}"
+            chmod 0640 "${DATA_DIR}/${f}"
         fi
     done
 
@@ -501,6 +501,9 @@ perform_update() {
     info "Updating service files..."
     cp "${download_path}/tond-server.service" /etc/systemd/system/tond-server.service
     cp "${download_path}/tond-proxy.service" /etc/systemd/system/tond-proxy.service
+    if [[ -f "${download_path}/tondbuild.slice" ]]; then
+        cp "${download_path}/tondbuild.slice" /etc/systemd/system/tondbuild.slice
+    fi
     systemctl daemon-reload
 
     # The new units run tond-proxy as ${PROXY_USER}; fix ownership and modes

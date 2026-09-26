@@ -32,6 +32,22 @@
 //   TOND_PREVIOUS_SECRET_KEY — old key to migrate from after a rotation
 //   TOND_SOCKET_PATH   — local Unix socket for the CLI (default: tond.sock next
 //                        to TOND_DB_PATH, i.e. /opt/tond/data/tond.sock)
+//   TOND_PROXY_SOCKET  — tond-proxy's control socket (default: proxy.sock next
+//                        to TOND_DB_PATH); see proxy_link.rs
+//   TOND_DASHBOARD_DOMAIN — one-time seed for the dashboard_domain setting
+//                        (written only while the setting is empty)
+//   TOND_BUILD_CONCURRENCY — concurrent image builds (default 1); see deploy/queue.rs
+//   TOND_BUILD_CGROUP_PARENT — cgroup parent for build containers
+//                        (default tondbuild.slice; empty disables)
+//   TOND_SHUTDOWN_GRACE_SECS — how long in-flight work may finish on SIGTERM
+//
+// Lifecycle:
+//   start:    migrations, settings, reconcile.rs (interrupted work, app
+//             status vs containers, resume queued deploys), background loops,
+//             proxy link, listeners.
+//   SIGTERM:  stop accepting connections and new work, let in-flight deploys,
+//             cron runs and backups finish (grace period), mark the rest
+//             interrupted, close the database (runtime/shutdown.rs).
 //
 // Listeners:
 //   The same router is served on two listeners. TCP (TOND_BIND:TOND_PORT) is
@@ -72,6 +88,9 @@ mod log_scrub;
 mod metrics;
 mod networks;
 mod notifications;
+mod proxy_link;
+mod reconcile;
+mod runtime;
 mod secret_key;
 mod secrets;
 mod security_headers;
@@ -84,6 +103,7 @@ mod volumes;
 
 use std::future::IntoFuture;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::{
@@ -92,17 +112,41 @@ use axum::{
 };
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::prelude::*;
+
+use crate::runtime::{dbstats::DbStatsLayer, http_metrics, selfstats, shutdown};
 
 pub use state::AppState;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Blocking-pool cap: argon2, file I/O and DNS never need hundreds of threads
+/// (Tokio's default is 512), and TasksMax in tond-server.service bounds us.
+const MAX_BLOCKING_THREADS: usize = 64;
+/// How long open HTTP connections (log streams, terminals) get to finish
+/// after SIGTERM before they are dropped.
+const HTTP_DRAIN: Duration = Duration::from_secs(5);
+
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(MAX_BLOCKING_THREADS)
+        .thread_keep_alive(Duration::from_secs(10))
+        .build()?;
+    let result = runtime.block_on(run());
+    // Don't wait on blocking threads still parked in a read (terminal PTYs).
+    runtime.shutdown_timeout(Duration::from_secs(2));
+    result
+}
+
+async fn run() -> Result<()> {
+    selfstats::mark_start();
     tond_common::install_crypto_provider();
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    // Logging: the journal gets RUST_LOG (default info); DbStatsLayer counts
+    // every SQL statement through its own filter (runtime/dbstats.rs).
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+        ))
+        .with(DbStatsLayer.with_filter(DbStatsLayer::filter()))
         .init();
 
     tracing::info!("Starting Tond server...");
@@ -123,15 +167,11 @@ async fn main() -> Result<()> {
 
     // Uploads interrupted by a restart leave their extraction dirs behind.
     upload::clear_upload_dirs(&volumes::data_dir());
-    // Deployments that were running when the server stopped will never finish.
-    let interrupted = deploy::progress::fail_interrupted(&state.db).await?;
-    if interrupted > 0 {
-        tracing::warn!("Marked {interrupted} interrupted deployment(s) as failed");
-    }
 
     // Load persisted settings from DB into the in-memory cache
     {
         use tond_common::SettingRow;
+        seed_dashboard_domain(&state.db).await?;
         let rows = sqlx::query_as::<_, SettingRow>("SELECT key, value FROM settings")
             .fetch_all(&state.db)
             .await?;
@@ -174,39 +214,27 @@ async fn main() -> Result<()> {
     // drift while the server is down). Once, in the background.
     {
         let state = state.clone();
-        tokio::spawn(async move { networks::reconcile_all_databases(&state).await });
+        runtime::shutdown::spawn_tracked(
+            async move { networks::reconcile_all_databases(&state).await },
+        );
     }
 
-    // Spawn background health check poller
+    // Finish what a previous process left behind (and resume queued deploys)
+    // before anything new starts.
+    reconcile::at_startup(&state).await;
+
+    // Background loops. Each sleeps until its next deadline or until a table
+    // it watches changes (runtime/changes.rs), so an idle server barely wakes.
     tokio::spawn(health::run_health_checker(state.clone()));
-
-    // Spawn the metrics collector (cgroup sampling every 30 s, Docker events)
     tokio::spawn(metrics::run_metrics_collector(state.clone()));
-
-    // Spawn background alert checker (every 60 s)
     tokio::spawn(alerts::run_alert_checker(state.clone()));
-
-    // Spawn background cron job scheduler (every 30 s)
     tokio::spawn(cron::run_cron_scheduler(state.clone()));
-
-    // Spawn the janitor (hourly retention for logs, runs, audit, metrics, sessions)
     tokio::spawn(janitor::run_janitor(state.clone()));
-
-    // Spawn backup scheduler (checks cron expression, runs scheduled full snapshots)
     tokio::spawn(backup::backup_scheduler(state.clone()));
+    tokio::spawn(run_preview_cleanup_loop(state.clone()));
 
-    // Spawn background preview cleanup task (runs every 60 s)
-    {
-        let state_for_cleanup = state.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                if let Err(e) = run_preview_cleanup(&state_for_cleanup).await {
-                    tracing::warn!("Preview cleanup error: {}", e);
-                }
-            }
-        });
-    }
+    // Control connection to tond-proxy: route nudges, cutover acks, cert results.
+    tokio::spawn(proxy_link::run(state.clone()));
 
     // API routes
     let api = Router::new()
@@ -562,6 +590,8 @@ async fn main() -> Result<()> {
             "/api/system/metrics",
             get(handlers::metrics::get_system_metrics),
         )
+        .route("/api/system/self", get(handlers::system_self::get_self))
+        .route("/metrics", get(handlers::system_self::metrics))
         // Alert rules
         .route("/api/alerts", get(handlers::alerts::list_alerts))
         .route("/api/alerts", post(handlers::alerts::create_alert))
@@ -785,6 +815,8 @@ async fn main() -> Result<()> {
             "/api/snapshots/{id}/restore-database",
             post(handlers::backups::restore_database),
         )
+        // Latency histogram per route template (runtime/http_metrics.rs).
+        .route_layer(axum::middleware::from_fn(http_metrics::track))
         .with_state(state.clone());
 
     // Serve the dashboard if the build directory exists, otherwise API-only mode
@@ -807,7 +839,7 @@ async fn main() -> Result<()> {
     // no preflight is what makes the X-Tond-CSRF header unforgeable.
     let app = app
         .layer(axum::middleware::from_fn_with_state(
-            state,
+            state.clone(),
             auth::csrf::enforce_same_origin,
         ))
         .layer(axum::middleware::from_fn(
@@ -828,13 +860,72 @@ async fn main() -> Result<()> {
         tcp_listener,
         app.clone()
             .into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    );
+    )
+    .with_graceful_shutdown(shutdown::cancelled());
     let local = axum::serve(
         unix_listener,
         app.layer(Extension(auth::LocalSocket)).into_make_service(),
-    );
-    tokio::try_join!(tcp.into_future(), local.into_future())?;
+    )
+    .with_graceful_shutdown(shutdown::cancelled());
 
+    tokio::spawn(shutdown::wait_for_signal());
+    let servers = async { tokio::try_join!(tcp.into_future(), local.into_future()) };
+    tokio::pin!(servers);
+    tokio::select! {
+        result = &mut servers => { result?; }
+        _ = shutdown::cancelled() => {
+            // Listeners stopped accepting; give open connections a moment.
+            let _ = tokio::time::timeout(HTTP_DRAIN, &mut servers).await;
+        }
+    }
+
+    shutdown_gracefully(&state).await;
+    Ok(())
+}
+
+/// After the listeners closed: let tracked work finish within the grace
+/// period, mark whatever is left as interrupted, and close the database.
+async fn shutdown_gracefully(state: &AppState) {
+    let grace = shutdown::grace_from_env();
+    if shutdown::drain(grace).await {
+        tracing::info!("All in-flight work finished");
+    } else {
+        tracing::warn!(
+            "{} task(s) still running after {}s; marking them interrupted",
+            shutdown::in_flight(),
+            grace.as_secs()
+        );
+        if let Err(e) = reconcile::mark_interrupted(&state.db, reconcile::SHUTDOWN_REASON).await {
+            tracing::warn!("Could not mark interrupted work: {e:#}");
+        }
+    }
+    state.db.close().await;
+    tracing::info!("Tond server stopped");
+}
+
+/// TOND_DASHBOARD_DOMAIN seeds the dashboard_domain setting while it is empty
+/// (install.sh sets it for tond-server; tond-proxy opens the database
+/// read-only and no longer does this). After that the setting wins.
+async fn seed_dashboard_domain(db: &sqlx::SqlitePool) -> Result<()> {
+    let Some(domain) = std::env::var("TOND_DASHBOARD_DOMAIN")
+        .ok()
+        .map(|d| d.trim().trim_end_matches('.').to_ascii_lowercase())
+        .filter(|d| !d.is_empty())
+    else {
+        return Ok(());
+    };
+    let seeded = sqlx::query(
+        "INSERT INTO settings (key, value, updated_at) VALUES ('dashboard_domain', ?, datetime('now'))
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+         WHERE settings.value = ''",
+    )
+    .bind(&domain)
+    .execute(db)
+    .await?
+    .rows_affected();
+    if seeded > 0 {
+        tracing::info!("Dashboard domain seeded from TOND_DASHBOARD_DOMAIN: {domain}");
+    }
     Ok(())
 }
 
@@ -884,9 +975,56 @@ fn bind_local_socket(path: &Path) -> Result<tokio::net::UnixListener> {
 
 // ── Preview cleanup ──
 //
-// Runs every 60 s. Finds all preview_deployments whose expires_at has passed
-// and whose status is not yet 'expired'. Stops the container (best-effort)
-// and marks the row as expired.
+// Sleeps until the earliest preview expiry (at most PREVIEW_CLEANUP_MAX_SLEEP)
+// or until preview_deployments changes. Then finds all preview_deployments
+// whose expires_at has passed and whose status is not yet 'expired', stops
+// the container (best-effort) and marks the row as expired.
+
+/// Longest sleep of the preview cleanup loop when nothing is about to expire.
+const PREVIEW_CLEANUP_MAX_SLEEP: Duration = Duration::from_secs(3600);
+
+async fn run_preview_cleanup_loop(state: AppState) {
+    use crate::runtime::changes::{Table, Watch};
+    let lp = runtime::loops::register("preview-cleanup");
+    let mut watch = Watch::new(&[Table::PreviewDeployments]);
+    loop {
+        let run = lp.run();
+        match run_preview_cleanup(&state).await {
+            Ok(()) => drop(run),
+            Err(e) => {
+                tracing::warn!("Preview cleanup error: {}", e);
+                run.fail(&e);
+            }
+        }
+        let sleep = next_preview_expiry(&state)
+            .await
+            .map_or(PREVIEW_CLEANUP_MAX_SLEEP, |d| {
+                d.min(PREVIEW_CLEANUP_MAX_SLEEP)
+            });
+        lp.wait(Some(sleep), &mut watch).await;
+    }
+}
+
+/// Time until the next active preview expires (zero if one already has).
+async fn next_preview_expiry(state: &AppState) -> Option<Duration> {
+    let next: Option<String> = sqlx::query_scalar(
+        "SELECT MIN(expires_at) FROM preview_deployments WHERE status != 'expired'",
+    )
+    .fetch_one(&state.db)
+    .await
+    .ok()
+    .flatten();
+    let next = next?;
+    let at = chrono::DateTime::parse_from_rfc3339(&next)
+        .map(|t| t.with_timezone(&chrono::Utc))
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(&next, "%Y-%m-%d %H:%M:%S").map(|n| n.and_utc())
+        })
+        .ok()?;
+    // +1 s so the comparison with datetime('now') in the cleanup query holds.
+    Some((at - chrono::Utc::now()).to_std().unwrap_or(Duration::ZERO) + Duration::from_secs(1))
+}
+
 async fn run_preview_cleanup(state: &AppState) -> anyhow::Result<()> {
     let expired: Vec<(String, Option<String>)> = sqlx::query_as(
         "SELECT id, container_id FROM preview_deployments

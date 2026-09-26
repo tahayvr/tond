@@ -2,6 +2,7 @@
 	import type { SystemMetrics } from '$lib/api';
 	import { setUiContext, clearUiContext, projectsContext } from '$lib/ui-context.svelte';
 	import SystemStatsGrid from '$lib/components/system/system-stats-grid.svelte';
+	import TondHealthPanel from '$lib/components/system/TondHealthPanel.svelte';
 	import PageHeader from '$lib/components/nav/page-header.svelte';
 	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import type { PageProps } from './$types';
@@ -25,4 +26,6 @@
 	{#if metrics}
 		<SystemStatsGrid {metrics} />
 	{/if}
+
+	<TondHealthPanel />
 </div>

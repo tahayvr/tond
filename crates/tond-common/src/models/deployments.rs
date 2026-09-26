@@ -110,19 +110,28 @@ pub struct Deployment {
     /// Image this deployment ran: `tond-<app>:<deployment-id-prefix>` (compose
     /// apps record a `tond-compose-<app>` sentinel)
     pub image_tag: Option<String>,
-    /// "pending" | "running" | "succeeded" | "failed" (a build queue may add
-    /// more, e.g. "queued" / "superseded")
+    /// "queued" | "running" | "succeeded" | "failed" | "superseded"
     pub status: String,
     /// How this deployment was triggered: "manual" | "webhook" | "upload" |
     /// "rollback" | "cron" | "cli"
     pub trigger_source: String,
     pub generated_dockerfile: Option<String>,
+    /// When work began (equals `created_at` while queued)
     pub started_at: String,
     pub finished_at: Option<String>,
     pub created_at: String,
     /// The image was removed by pruning; rolling back to it is impossible
     #[sqlx(default)]
     pub image_pruned: bool,
+    /// "deploy" | "rollback" | "upload"
+    #[sqlx(default)]
+    pub kind: String,
+    /// Why it failed, was superseded or was interrupted
+    #[sqlx(default)]
+    pub error: Option<String>,
+    /// The deployment that replaced this one while it was queued
+    #[sqlx(default)]
+    pub superseded_by: Option<String>,
     #[sqlx(default)]
     pub commit_sha: Option<String>,
     #[sqlx(default)]
@@ -164,15 +173,30 @@ pub fn duration_secs(started_at: &str, finished_at: Option<&str>) -> Option<i64>
     Some((end - start).num_seconds().max(0))
 }
 
+/// Deployment statuses that are not final yet.
+pub const UNFINISHED_DEPLOYMENT_STATUSES: [&str; 2] = ["queued", "running"];
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeploymentResponse {
     pub id: String,
     pub app_id: String,
     pub image_tag: Option<String>,
+    /// "queued" | "building" | "deploying" | "succeeded" | "failed" | "superseded"
     pub status: String,
     /// How this deployment was triggered: "manual" | "webhook" | "upload" |
     /// "rollback" | "cron" | "cli"
     pub trigger_source: String,
+    /// "deploy" | "rollback" | "upload"
+    #[serde(default)]
+    pub kind: String,
+    /// Why it failed, was superseded or was interrupted
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub superseded_by: Option<String>,
+    /// 1-based place in the build queue while status is "queued"
+    #[serde(default)]
+    pub queue_position: Option<u32>,
     /// Who or what triggered it (user email, "api-key", webhook provider…)
     #[serde(default)]
     pub trigger_detail: Option<String>,
@@ -224,6 +248,10 @@ impl From<Deployment> for DeploymentResponse {
             image_tag: d.image_tag,
             status: d.status,
             trigger_source: d.trigger_source,
+            kind: d.kind,
+            error: d.error,
+            superseded_by: d.superseded_by,
+            queue_position: None,
             trigger_detail: d.trigger_detail,
             has_generated_dockerfile: d.generated_dockerfile.is_some(),
             started_at: d.started_at,
@@ -463,6 +491,9 @@ mod tests {
             finished_at: Some("2026-01-01T00:01:00Z".to_string()),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             image_pruned: false,
+            kind: "deploy".to_string(),
+            error: Some("boom".to_string()),
+            superseded_by: None,
             commit_sha: Some("0123456789abcdef".to_string()),
             commit_message: Some("Fix login".to_string()),
             commit_author: Some("Ada".to_string()),
@@ -479,6 +510,9 @@ mod tests {
         assert_eq!(response.phases[0].phase, DeployPhase::Build);
         assert_eq!(response.phases[0].status, PhaseStatus::Succeeded);
         assert!(response.failure.is_none());
+        assert_eq!(response.kind, "deploy");
+        assert_eq!(response.error.as_deref(), Some("boom"));
+        assert_eq!(response.queue_position, None);
 
         assert_eq!(
             response.status, "succeeded",
@@ -508,6 +542,9 @@ mod tests {
             finished_at: None,
             created_at: "2026-01-01T00:00:00Z".into(),
             image_pruned: false,
+            kind: "deploy".into(),
+            error: None,
+            superseded_by: None,
             commit_sha: None,
             commit_message: None,
             commit_author: None,

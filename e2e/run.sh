@@ -24,6 +24,8 @@ set -euo pipefail
 #                     (needs public DNS for the domains, e.g. <ip>.sslip.io)
 #                   none: skip certificate issuance checks
 #   --ip            IP the domains resolve to (default: 127.0.0.1)
+#   --test          smoke (default): e2e/smoke.sh; budget: e2e/budget.sh (idle
+#                   resource budgets; run it on a fresh install)
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BUNDLE=""
@@ -32,6 +34,7 @@ PREVIEW_DOMAIN=""
 APPS_DOMAIN=""
 ACME="pebble"
 IP="127.0.0.1"
+TEST="smoke"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -41,7 +44,8 @@ while [[ $# -gt 0 ]]; do
         --apps-domain) APPS_DOMAIN="$2"; shift 2 ;;
         --acme) ACME="$2"; shift 2 ;;
         --ip) IP="$2"; shift 2 ;;
-        -h|--help) sed -n '4,26p' "$0"; exit 0 ;;
+        --test) TEST="$2"; shift 2 ;;
+        -h|--help) sed -n '4,28p' "$0"; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -100,9 +104,15 @@ if [[ "$ACME" == pebble ]]; then
     "${HERE}/pebble/pebble.sh" --refresh-root "$CA_FILE"
 fi
 
-E2E_BASE_DOMAIN="$BASE_DOMAIN" \
-E2E_PREVIEW_DOMAIN="$PREVIEW_DOMAIN" \
-E2E_APPS_DOMAIN="$APPS_DOMAIN" \
-E2E_TARGET_IP="$IP" \
-E2E_CA_FILE="$CA_FILE" \
-    "${HERE}/smoke.sh"
+case "$TEST" in
+    smoke)
+        E2E_BASE_DOMAIN="$BASE_DOMAIN" \
+        E2E_PREVIEW_DOMAIN="$PREVIEW_DOMAIN" \
+        E2E_APPS_DOMAIN="$APPS_DOMAIN" \
+        E2E_TARGET_IP="$IP" \
+        E2E_CA_FILE="$CA_FILE" \
+            "${HERE}/smoke.sh"
+        ;;
+    budget) "${HERE}/budget.sh" ${BUDGET_ARGS:-} ;;
+    *) echo "Unknown --test: $TEST (expected smoke or budget)" >&2; exit 1 ;;
+esac

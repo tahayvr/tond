@@ -262,50 +262,6 @@ async fn provision_cert_inner(
     Ok(())
 }
 
-pub(crate) async fn persist_certificate_status(
-    db: &sqlx::SqlitePool,
-    data_dir: &Path,
-    domain: &str,
-    status: &str,
-    issued_at: Option<String>,
-    expires_at: Option<String>,
-) -> Result<()> {
-    let certs_dir = data_dir.join("certs");
-    let cert_path = certs_dir.join(domain).join("cert.pem");
-    let key_path = certs_dir.join(domain).join("key.pem");
-
-    let now = chrono::Utc::now().to_rfc3339();
-    let issued_at = issued_at.unwrap_or_else(|| now.clone());
-    let expires_at = expires_at
-        .unwrap_or_else(|| (chrono::Utc::now() + chrono::Duration::days(90)).to_rfc3339());
-
-    sqlx::query(
-        "INSERT INTO certificates (id, domain, cert_type, cert_path, key_path, issued_at, expires_at, status, created_at, updated_at)
-         VALUES (?, ?, 'acme', ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(domain) DO UPDATE SET
-            cert_path = excluded.cert_path,
-            key_path = excluded.key_path,
-            issued_at = CASE WHEN excluded.status = 'active' THEN excluded.issued_at ELSE certificates.issued_at END,
-            expires_at = CASE WHEN excluded.status = 'active' THEN excluded.expires_at ELSE certificates.expires_at END,
-            status = excluded.status,
-            updated_at = excluded.updated_at",
-    )
-    .bind(uuid::Uuid::new_v4().to_string())
-    .bind(domain)
-    .bind(cert_path.to_string_lossy().to_string())
-    .bind(key_path.to_string_lossy().to_string())
-    .bind(issued_at)
-    .bind(expires_at)
-    .bind(status)
-    .bind(now.clone())
-    .bind(now)
-    .execute(db)
-    .await
-    .context("persisting certificate status")?;
-
-    Ok(())
-}
-
 pub(crate) fn certificate_timestamps(cert_pem: &[u8]) -> Result<(String, String)> {
     let cert = openssl::x509::X509::from_pem(cert_pem).context("parsing issued certificate PEM")?;
     let issued_at = cert.not_before().to_string();
@@ -315,7 +271,6 @@ pub(crate) fn certificate_timestamps(cert_pem: &[u8]) -> Result<(String, String)
 
 #[cfg(test)]
 mod tests {
-    use sqlx::SqlitePool;
     use tempfile::TempDir;
 
     use super::*;
@@ -346,33 +301,6 @@ mod tests {
             directory_url_from(None, false),
             LetsEncrypt::Production.url()
         );
-    }
-
-    async fn create_test_db(dir: &TempDir) -> SqlitePool {
-        let db_url = format!("sqlite:{}?mode=rwc", dir.path().join("acme.db").display());
-        let pool = SqlitePool::connect(&db_url)
-            .await
-            .unwrap_or_else(|err| panic!("failed to open SQLite database for ACME test: {err}"));
-
-        sqlx::query(
-            "CREATE TABLE certificates (
-                id TEXT PRIMARY KEY,
-                domain TEXT NOT NULL UNIQUE,
-                cert_type TEXT NOT NULL DEFAULT 'acme',
-                cert_path TEXT NOT NULL,
-                key_path TEXT NOT NULL,
-                issued_at TEXT NOT NULL,
-                expires_at TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap_or_else(|err| panic!("failed to create certificates table for ACME test: {err}"));
-
-        pool
     }
 
     #[test]
@@ -411,98 +339,6 @@ mod tests {
         assert!(
             !should_renew(Some(31)),
             "should_renew should skip renewal for certificates with more than 30 days remaining"
-        );
-    }
-
-    #[tokio::test]
-    async fn persist_certificate_status_creates_active_row_for_new_domain() {
-        let dir = TempDir::new().unwrap_or_else(|err| panic!("failed to create temp dir: {err}"));
-        let pool = create_test_db(&dir).await;
-
-        persist_certificate_status(
-            &pool,
-            dir.path(),
-            "dash.example.com",
-            "active",
-            Some("2026-01-01T00:00:00Z".to_string()),
-            Some("2026-04-01T00:00:00Z".to_string()),
-        )
-        .await
-        .unwrap_or_else(|err| panic!("persist_certificate_status should create a new row: {err}"));
-
-        let row: (String, String, String, String) = sqlx::query_as(
-            "SELECT status, cert_path, key_path, expires_at FROM certificates WHERE domain = ?",
-        )
-        .bind("dash.example.com")
-        .fetch_one(&pool)
-        .await
-        .unwrap_or_else(|err| panic!("failed to load persisted certificate row: {err}"));
-
-        assert_eq!(
-            row.0, "active",
-            "new certificate rows should persist the supplied status"
-        );
-        assert!(
-            row.1.ends_with("/certs/dash.example.com/cert.pem"),
-            "persisted cert_path should point at the domain cert.pem under the proxy data dir"
-        );
-        assert!(
-            row.2.ends_with("/certs/dash.example.com/key.pem"),
-            "persisted key_path should point at the domain key.pem under the proxy data dir"
-        );
-        assert_eq!(
-            row.3, "2026-04-01T00:00:00Z",
-            "active certificate rows should persist the supplied expiry"
-        );
-    }
-
-    #[tokio::test]
-    async fn persist_certificate_status_updates_existing_row_without_clobbering_expiry_on_failure()
-    {
-        let dir = TempDir::new().unwrap_or_else(|err| panic!("failed to create temp dir: {err}"));
-        let pool = create_test_db(&dir).await;
-
-        sqlx::query(
-            "INSERT INTO certificates (id, domain, cert_type, cert_path, key_path, issued_at, expires_at, status, created_at, updated_at)
-             VALUES (?, ?, 'acme', ?, ?, ?, ?, 'pending', ?, ?)",
-        )
-        .bind("cert-1")
-        .bind("dash.example.com")
-        .bind("/tmp/cert.pem")
-        .bind("/tmp/key.pem")
-        .bind("2026-01-01T00:00:00Z")
-        .bind("2026-04-01T00:00:00Z")
-        .bind("2026-01-01T00:00:00Z")
-        .bind("2026-01-01T00:00:00Z")
-        .execute(&pool)
-        .await
-        .unwrap_or_else(|err| panic!("failed to seed pending certificate row: {err}"));
-
-        persist_certificate_status(&pool, dir.path(), "dash.example.com", "failed", None, None)
-            .await
-            .unwrap_or_else(|err| {
-                panic!("persist_certificate_status should update existing rows: {err}")
-            });
-
-        let row: (String, String, String) = sqlx::query_as(
-            "SELECT status, issued_at, expires_at FROM certificates WHERE domain = ?",
-        )
-        .bind("dash.example.com")
-        .fetch_one(&pool)
-        .await
-        .unwrap_or_else(|err| panic!("failed to load updated certificate row: {err}"));
-
-        assert_eq!(
-            row.0, "failed",
-            "existing certificate rows should update to the new status"
-        );
-        assert_eq!(
-            row.1, "2026-01-01T00:00:00Z",
-            "non-active updates should preserve the previously recorded issue time"
-        );
-        assert_eq!(
-            row.2, "2026-04-01T00:00:00Z",
-            "non-active updates should preserve the previously recorded expiry"
         );
     }
 
