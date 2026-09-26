@@ -321,6 +321,23 @@ async fn run() -> Result<()> {
         .route("/api/apps/{id}/stop", post(handlers::stop_app))
         .route("/api/apps/{id}/start", post(handlers::start_app))
         .route("/api/apps/{id}/restart", post(handlers::restart_app))
+        .route(
+            "/api/apps/{id}/services",
+            get(handlers::compose::list_services),
+        )
+        .route(
+            "/api/apps/{id}/services/{service}",
+            put(handlers::compose::update_service),
+        )
+        .route(
+            "/api/apps/{id}/services/{service}/logs",
+            get(handlers::compose::service_logs),
+        )
+        .route(
+            "/api/apps/{id}/services/{service}/{action}",
+            post(handlers::compose::service_action),
+        )
+        .route("/api/apps/{id}/compose", put(handlers::compose::update_compose))
         .route("/api/apps/{id}/logs", get(handlers::app_logs))
         .route(
             "/api/apps/{id}/logs/stream",

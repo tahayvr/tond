@@ -198,11 +198,15 @@ fn samples_compute_rates_and_sum_compose_services() {
     let (a, b) = (cid('a'), cid('b'));
     // Two containers of app-2 (compose) and nothing else.
     c.resolver.by_container.clear();
-    for id in [&a, &b] {
+    for (id, service) in [(&a, "web"), (&b, "db")] {
         c.apply_event(
             "start",
             id,
-            &labels(&[("name", "svc"), ("com.docker.compose.project", "shop")]),
+            &labels(&[
+                ("name", "svc"),
+                ("com.docker.compose.project", "shop"),
+                ("com.docker.compose.service", service),
+            ]),
             100,
         );
     }
@@ -228,6 +232,10 @@ fn samples_compute_rates_and_sum_compose_services() {
     let second = aggs.get(&app("app-2")).cloned().unwrap_or_default();
     assert!(second.has_rates);
     assert_eq!(second.sample.cpu, 1_500, "hundredths of a percent");
+    // ...and each service on its own.
+    let per = c.service_samples();
+    assert_eq!(per.get(&("app-2".to_string(), "web".to_string())), Some(&(500, 10_000)));
+    assert_eq!(per.get(&("app-2".to_string(), "db".to_string())), Some(&(1_000, 20_000)));
     // Both containers read the same (shared) fake netns: 1000 B/s each.
     assert_eq!(second.sample.rx, 2_000);
     assert_eq!(second.sample.tx, 200);

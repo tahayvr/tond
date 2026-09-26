@@ -6,7 +6,9 @@
 //   build_from_dir_with_method() — dispatch to the right builder based on build_method
 //   build_with_dockerfile()      — run `docker build` with streaming log output
 //   build_from_inline_dockerfile() — write inline Dockerfile then call build_with_dockerfile()
-//   run_inline_compose()         — write inline compose file then run `docker compose up`
+//   clone_repo()                 — clone a repository into the build directory
+//   build_compose_service()      — build one compose service (build cgroup parent)
+//   compose_up()                 — `docker compose up -d` on a pinned compose file
 //
 // All builder functions write timestamped log entries via super::core::log_deploy().
 
@@ -14,7 +16,7 @@ use anyhow::Result;
 use tond_common::DeployPhase;
 
 use crate::state::AppState;
-use crate::{compose_policy, docker, volumes};
+
 
 use super::progress;
 
@@ -47,18 +49,23 @@ fn deploy_key_path(data_dir: &str, app_id: &str) -> String {
     format!("{}/keys/{}/id_ed25519", data_dir, app_id)
 }
 
-fn compose_work_dir(data_dir: &str, app_name: &str) -> String {
+pub(crate) fn compose_work_dir(data_dir: &str, app_name: &str) -> String {
     format!("{}/compose/{}", data_dir, app_name)
 }
 
-fn compose_file_path(work_dir: &str) -> String {
+pub(crate) fn compose_file_path(work_dir: &str) -> String {
     format!("{}/docker-compose.yml", work_dir)
 }
 
-/// `docker compose -p <app> -f <file> up --build -d` with a cleared
-/// environment: compose interpolates `${VAR}` from its own environment, and
-/// tond-server's holds TOND_SECRET_KEY. Only what docker needs is passed on.
-fn compose_command(compose_path: &str, app_name: &str) -> tokio::process::Command {
+/// `<data>/compose/<app>`: where an app's pinned compose file lives.
+pub fn compose_work_dir_for(app_name: &str) -> String {
+    compose_work_dir(&crate::volumes::data_dir().to_string_lossy(), app_name)
+}
+
+/// `docker compose -p <app> -f <file> <args…>` with a cleared environment:
+/// compose interpolates `${VAR}` from its own environment, and tond-server's
+/// holds TOND_SECRET_KEY. Only what docker needs is passed on.
+pub fn compose_command(compose_path: &str, app_name: &str, args: &[&str]) -> tokio::process::Command {
     let mut cmd = crate::process::command("docker");
     cmd.env_clear();
     for key in [
@@ -78,15 +85,13 @@ fn compose_command(compose_path: &str, app_name: &str) -> tokio::process::Comman
         &compose_project_name(app_name),
         "-f",
         compose_path,
-        "up",
-        "--build",
-        "-d",
     ]);
+    cmd.args(args);
     cmd
 }
 
 /// Compose project names must be lowercase; this is also the label value
-/// `docker::find_compose_host_port` looks up.
+/// compose labels its containers with (`com.docker.compose.project`).
 pub fn compose_project_name(app_name: &str) -> String {
     app_name.to_ascii_lowercase()
 }
@@ -299,6 +304,53 @@ pub(super) async fn build_from_git(
     deployment_id: Option<&str>,
     trigger_source: &str,
 ) -> Result<String> {
+    let work_dir = clone_repo(
+        state,
+        app_id,
+        app_name,
+        git_url,
+        auth,
+        branch,
+        deployment_id,
+        trigger_source,
+    )
+    .await?;
+
+    if deployment_id.is_some() {
+        progress::start(state, app_id, DeployPhase::Build).await;
+    }
+
+    let image_tag = build_from_dir_with_method(
+        state,
+        app_id,
+        image_tag,
+        &work_dir,
+        build_opts,
+        deployment_id,
+        trigger_source,
+    )
+    .await?;
+
+    // Clean up
+    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    Ok(image_tag)
+}
+
+/// Clone `git_url` at `branch` into the app's build directory (replacing a
+/// previous checkout), record the commit on the deployment and drop `.git`.
+/// Returns the checkout directory; the caller removes it when done.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn clone_repo(
+    state: &AppState,
+    app_id: &str,
+    app_name: &str,
+    git_url: &str,
+    auth: Option<&GitHttpAuth>,
+    branch: &str,
+    deployment_id: Option<&str>,
+    trigger_source: &str,
+) -> Result<String> {
     let data_dir = std::env::var("TOND_DATA_DIR").unwrap_or_else(|_| "/opt/tond/data".to_string());
     let work_dir = build_work_dir(&data_dir, app_name);
 
@@ -379,25 +431,7 @@ pub(super) async fn build_from_git(
     // must never end up in the build context or an image.
     tokio::fs::remove_dir_all(std::path::Path::new(&work_dir).join(".git")).await?;
 
-    if deployment_id.is_some() {
-        progress::start(state, app_id, DeployPhase::Build).await;
-    }
-
-    let image_tag = build_from_dir_with_method(
-        state,
-        app_id,
-        image_tag,
-        &work_dir,
-        build_opts,
-        deployment_id,
-        trigger_source,
-    )
-    .await?;
-
-    // Clean up
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
-
-    Ok(image_tag)
+    Ok(work_dir)
 }
 
 /// Build from a local directory using the appropriate build method and tag
@@ -630,104 +664,148 @@ pub(super) async fn build_from_inline_dockerfile(
     build_with_dockerfile(state, app_id, image_tag, &work_dir, None, trigger_source).await
 }
 
-/// Run an inline `docker-compose.yml` (no git clone needed).
-///
-/// Writes the content to a persistent directory, then runs
-/// `docker compose up --build -d`. Returns a sentinel image tag
-/// so the rest of the deploy pipeline can record something meaningful.
-pub(super) async fn run_inline_compose(
+/// Run `cmd` and write every stdout/stderr line to the deploy log (prefixed
+/// with `[prefix] ` when given). Returns the exit status.
+pub(super) async fn run_streaming(
     state: &AppState,
     app_id: &str,
-    app_name: &str,
-    compose_content: &str,
     trigger_source: &str,
-) -> Result<String> {
+    prefix: Option<&str>,
+    mut cmd: tokio::process::Command,
+) -> Result<std::process::ExitStatus> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
-    let data_dir = std::env::var("TOND_DATA_DIR").unwrap_or_else(|_| "/opt/tond/data".to_string());
-    let work_dir = compose_work_dir(&data_dir, app_name);
-
-    // Validate again at deploy time and rewrite the file: binds pinned inside
-    // <data>/volumes/<app>, ports on 127.0.0.1, container hardening added.
-    let data_path = std::path::Path::new(&data_dir);
-    let volume_dir = volumes::app_volume_dir(data_path, app_name);
-    let hardened =
-        compose_policy::harden(compose_content, &volume_dir, docker::default_memory_limit())
-            .map_err(|errors| anyhow::anyhow!(compose_policy::format_errors(&errors)))?;
-    for rel in &hardened.bind_sources {
-        volumes::prepare_host_dir(data_path, &volume_dir, rel, true)?;
-    }
-
-    tokio::fs::create_dir_all(&work_dir).await?;
-
-    // Write the hardened compose file (overwrite on redeploy)
-    let compose_path = compose_file_path(&work_dir);
-    tokio::fs::write(&compose_path, &hardened.yaml).await?;
-
-    log_deploy(
-        state,
-        app_id,
-        "info",
-        trigger_source,
-        "Wrote hardened docker-compose.yml; running docker compose up...",
-    )
-    .await?;
-
-    let mut child = compose_command(&compose_path, app_name)
+    let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()?;
-
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
 
-    let state_stdout = state.clone();
-    let app_id_stdout = app_id.to_string();
-    let trigger_stdout = trigger_source.to_string();
-    let stdout_task = tokio::spawn(async move {
-        let mut lines = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let _ = log_deploy(
-                &state_stdout,
-                &app_id_stdout,
-                "info",
-                &trigger_stdout,
-                &line,
-            )
-            .await;
-        }
-    });
-
-    let state_stderr = state.clone();
-    let app_id_stderr = app_id.to_string();
-    let trigger_stderr = trigger_source.to_string();
-    let stderr_task = tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let _ = log_deploy(
-                &state_stderr,
-                &app_id_stderr,
-                "info",
-                &trigger_stderr,
-                &line,
-            )
-            .await;
-        }
-    });
-
+    let forward = |reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>| {
+        let state = state.clone();
+        let app_id = app_id.to_string();
+        let trigger = trigger_source.to_string();
+        let prefix = prefix.map(|p| format!("[{p}] "));
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(reader).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let line = match &prefix {
+                    Some(p) => format!("{p}{line}"),
+                    None => line,
+                };
+                let _ = log_deploy(&state, &app_id, "info", &trigger, &line).await;
+            }
+        })
+    };
+    let out_task = forward(Box::new(stdout));
+    let err_task = forward(Box::new(stderr));
     let status = child.wait().await?;
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
+    let _ = out_task.await;
+    let _ = err_task.await;
+    Ok(status)
+}
 
+/// `docker build` arguments for one compose service (see compose::BuildSpec):
+/// the build cgroup parent (so compose builds share the build memory cap),
+/// the Dockerfile, build args and target.
+pub(super) fn compose_build_args(
+    tag: &str,
+    spec: &crate::compose::BuildSpec,
+    dockerfile: Option<&str>,
+    cgroup_parent: Option<&str>,
+) -> Vec<String> {
+    let mut args = vec!["build".to_string()];
+    if let Some(parent) = cgroup_parent {
+        args.push("--cgroup-parent".into());
+        args.push(parent.into());
+    }
+    if let Some(path) = dockerfile {
+        args.push("-f".into());
+        args.push(path.into());
+    }
+    for (k, v) in &spec.args {
+        args.push("--build-arg".into());
+        args.push(format!("{k}={v}"));
+    }
+    if let Some(target) = &spec.target {
+        args.push("--target".into());
+        args.push(target.clone());
+    }
+    args.push("-t".into());
+    args.push(tag.into());
+    args.push(spec.context.clone());
+    args
+}
+
+/// Build one compose service's image as `tag` (a pinned
+/// `tond-<app>/<service>:<id>` tag). `scratch_dir` holds inline Dockerfiles.
+pub(super) async fn build_compose_service(
+    state: &AppState,
+    app_id: &str,
+    service: &str,
+    tag: &str,
+    spec: &crate::compose::BuildSpec,
+    scratch_dir: &str,
+    trigger_source: &str,
+) -> Result<()> {
+    let local = !spec.context.contains("://") && !spec.context.starts_with("git@");
+    let dockerfile = if let Some(inline) = &spec.dockerfile_inline {
+        tokio::fs::create_dir_all(scratch_dir).await?;
+        let path = format!(
+            "{scratch_dir}/Dockerfile.{}",
+            crate::compose::repo_component(service)
+        );
+        tokio::fs::write(&path, inline).await?;
+        Some(path)
+    } else {
+        spec.dockerfile.as_ref().map(|d| {
+            if local {
+                std::path::Path::new(&spec.context)
+                    .join(d)
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                d.clone()
+            }
+        })
+    };
+    if local && tokio::fs::metadata(&spec.context).await.is_err() {
+        anyhow::bail!(
+            "service \"{service}\": build context {} does not exist",
+            spec.context
+        );
+    }
+    let cgroup_parent = build_cgroup_parent();
+    let args = compose_build_args(tag, spec, dockerfile.as_deref(), cgroup_parent.as_deref());
+    let mut cmd = crate::process::command("docker");
+    cmd.args(&args);
+    let status = run_streaming(state, app_id, trigger_source, Some(service), cmd).await?;
+    if !status.success() {
+        anyhow::bail!(
+            "Docker build of service \"{service}\" failed (exit code: {})",
+            status
+        );
+    }
+    Ok(())
+}
+
+/// `docker compose up -d --remove-orphans` on the app's pinned compose file.
+/// Every service already has its image (built or pulled and pinned), so
+/// nothing is built here.
+pub(super) async fn compose_up(
+    state: &AppState,
+    app_id: &str,
+    app_name: &str,
+    compose_path: &str,
+    trigger_source: &str,
+) -> Result<()> {
+    let cmd = compose_command(compose_path, app_name, &["up", "-d", "--remove-orphans"]);
+    let status = run_streaming(state, app_id, trigger_source, None, cmd).await?;
     if !status.success() {
         anyhow::bail!("docker compose up failed (exit code: {})", status);
     }
-
-    // For compose apps the "image" is the compose project name, which docker
-    // compose derives from the directory name by default.
-    let image_tag = format!("tond-compose-{}", app_name);
-    tracing::info!("Docker Compose deploy succeeded: {}", image_tag);
-    Ok(image_tag)
+    Ok(())
 }
 
 #[cfg(test)]

@@ -413,7 +413,7 @@ pub fn build_specs(content: &str, base_dir: &std::path::Path) -> BTreeMap<String
 
 /// Docker repository path component for a service name: lowercase, only
 /// `[a-z0-9._-]`, starting with a letter or digit.
-fn repo_component(service: &str) -> String {
+pub fn repo_component(service: &str) -> String {
     let mut s: String = service
         .to_ascii_lowercase()
         .chars()
@@ -608,11 +608,6 @@ pub async fn service_containers(docker: &Docker, project: &str, service: &str) -
         .unwrap_or_default()
 }
 
-/// True when the state counts as "up" for routing and status.
-pub fn is_up(state: &str) -> bool {
-    matches!(state, "running")
-}
-
 /// Whether a container state is a finished one-shot run (exit 0).
 pub fn is_completed(state: &str, exit_code: Option<i64>) -> bool {
     state == "exited" && exit_code == Some(0)
@@ -623,9 +618,7 @@ pub fn is_completed(state: &str, exit_code: Option<i64>) -> bool {
 /// One compose_services row.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ServiceRow {
-    pub app_id: String,
     pub name: String,
-    pub position: i64,
     pub image: Option<String>,
     pub builds: i64,
     pub ports: String,
@@ -748,6 +741,45 @@ pub async fn refresh(state: &crate::state::AppState, app_id: &str, app_name: &st
     let states = discover(&state.docker, &project).await?;
     store_states(&state.db, app_id, &states).await?;
     Ok(())
+}
+
+/// Name of the app that uses `domain` (its own domain or a service domain).
+pub async fn domain_owner(db: &sqlx::SqlitePool, domain: &str) -> sqlx::Result<Option<(String, String)>> {
+    sqlx::query_as(
+        "SELECT id, name FROM apps WHERE domain = ?
+         UNION ALL
+         SELECT a.id, a.name FROM app_domains d JOIN apps a ON a.id = d.app_id WHERE d.domain = ?
+         LIMIT 1",
+    )
+    .bind(domain)
+    .bind(domain)
+    .fetch_optional(db)
+    .await
+}
+
+/// Create (or reset) the pending certificate row of a newly routed domain;
+/// tond-proxy issues it (see the Certificates page for its status).
+pub async fn queue_certificate(db: &sqlx::SqlitePool, domain: &str) {
+    let data_dir = crate::volumes::data_dir();
+    let certs_dir = data_dir.join("certs").join(domain);
+    let now = chrono::Utc::now().to_rfc3339();
+    let expires_at = (chrono::Utc::now() + chrono::Duration::days(90)).to_rfc3339();
+    let _ = sqlx::query(
+        "INSERT INTO certificates (id, domain, cert_type, cert_path, key_path, issued_at, expires_at, status, created_at, updated_at)
+         VALUES (?, ?, 'acme', ?, ?, ?, ?, 'pending', ?, ?)
+         ON CONFLICT(domain) DO UPDATE SET status = 'pending', updated_at = excluded.updated_at,
+            last_error = NULL, next_retry_at = NULL, failure_count = 0",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(domain)
+    .bind(certs_dir.join("cert.pem").to_string_lossy().into_owned())
+    .bind(certs_dir.join("key.pem").to_string_lossy().into_owned())
+    .bind(&now)
+    .bind(&expires_at)
+    .bind(&now)
+    .bind(&now)
+    .execute(db)
+    .await;
 }
 
 /// Domains routed to each service of an app.

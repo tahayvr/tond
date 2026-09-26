@@ -81,6 +81,17 @@ pub struct Current {
 }
 
 static CURRENT: RwLock<Option<HashMap<Owner, Current>>> = RwLock::new(None);
+/// Latest `(cpu, mem)` of each compose service, keyed by (app id, service).
+/// In memory only: the app's series already sums its services.
+static SERVICES: RwLock<Option<HashMap<(String, String), (i64, i64)>>> = RwLock::new(None);
+
+/// Latest CPU (1/100 % of a core) and memory (bytes) of one compose service.
+pub fn service_current(app_id: &str, service: &str) -> Option<(i64, i64)> {
+    SERVICES.read().ok().and_then(|m| {
+        m.as_ref()
+            .and_then(|m| m.get(&(app_id.to_string(), service.to_string())).copied())
+    })
+}
 static CONTAINERS_RUNNING: AtomicI64 = AtomicI64::new(0);
 
 /// Latest in-memory sample for `owner` (None before its first tick).
@@ -290,6 +301,8 @@ pub struct Collector {
     host_history: host_history::HostHistory,
     /// When the next background `docker system df` is due.
     next_df: Instant,
+    /// Per compose service `(cpu, mem)` of the last sample pass.
+    service_samples: HashMap<(String, String), (i64, i64)>,
 }
 
 /// Reload the owner tables at least this often even without a change
@@ -319,6 +332,7 @@ impl Collector {
             requests: requests::Tracker::default(),
             host_history: host_history::HostHistory::default(),
             next_df: Instant::now() + FIRST_DF_AFTER,
+            service_samples: HashMap::new(),
         }
     }
 
@@ -336,6 +350,12 @@ impl Collector {
                 .resolver
                 .loaded_at
                 .is_none_or(|t| t.elapsed() > OWNER_RELOAD_MAX_AGE)
+    }
+
+    /// Per compose service `(cpu, mem)` of the last sample pass.
+    #[cfg(test)]
+    pub fn service_samples(&self) -> &HashMap<(String, String), (i64, i64)> {
+        &self.service_samples
     }
 
     fn publish_running_count(&self) {
@@ -498,6 +518,7 @@ impl Collector {
         pid_hint: &HashMap<String, u32>,
     ) -> (HashMap<Owner, Aggregate>, Vec<Happening>) {
         let mut aggregates: HashMap<Owner, Aggregate> = HashMap::new();
+        let mut services: HashMap<(String, String), (i64, i64)> = HashMap::new();
         let mut happenings = Vec::new();
         for (id, t) in self.tracked.iter_mut() {
             let Some(owner) = t.owner.clone() else {
@@ -530,6 +551,14 @@ impl Collector {
                 .and_then(|pid| cgroup::read_net_dev(&self.proc_root, pid).ok())
                 .unwrap_or((0, 0));
 
+            // Compose services are also kept apart (in memory only).
+            let service_key = (owner.kind == TargetKind::App)
+                .then(|| t.labels.get(crate::compose::SERVICE_LABEL))
+                .flatten()
+                .map(|s| (owner.id.clone(), s.clone()));
+            if let Some(key) = &service_key {
+                services.entry(key.clone()).or_default().1 += reading.mem as i64;
+            }
             let agg = aggregates
                 .entry(owner.clone())
                 .or_insert_with(|| Aggregate {
@@ -566,6 +595,10 @@ impl Collector {
                 } else if elapsed > 0.0 {
                     let cpu = (reading.cpu_usage_usec - prev.cpu_usec) as f64 / (elapsed * 1e6);
                     agg.sample.cpu += (cpu * 10_000.0).round() as i64;
+                    if let Some(key) = &service_key {
+                        services.entry(key.clone()).or_default().0 +=
+                            (cpu * 10_000.0).round() as i64;
+                    }
                     agg.sample.rx += (rx.saturating_sub(prev.rx) as f64 / elapsed).round() as i64;
                     agg.sample.tx += (tx.saturating_sub(prev.tx) as f64 / elapsed).round() as i64;
                     agg.has_rates = true;
@@ -597,6 +630,7 @@ impl Collector {
                 at,
             });
         }
+        self.service_samples = services;
         (aggregates, happenings)
     }
 
@@ -714,6 +748,9 @@ impl Collector {
         }
         if let Err(e) = store::insert_tick(&state.db, now, &rows).await {
             tracing::warn!("metrics: cannot store samples: {}", e);
+        }
+        if let Ok(mut s) = SERVICES.write() {
+            *s = Some(std::mem::take(&mut self.service_samples));
         }
         if let Ok(mut c) = CURRENT.write() {
             *c = Some(current);
