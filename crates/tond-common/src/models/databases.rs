@@ -421,8 +421,58 @@ pub struct ManagedDatabaseDetail {
     /// Connection string via the server's public address; only set when
     /// `public_access` is on
     pub public_connection_string: Option<String>,
-    /// Internal connection string (using container alias within the project network)
+    /// Internal connection string: the database's name as host, reachable
+    /// from apps in its project and from linked apps
     pub internal_connection_string: Option<String>,
+}
+
+// ── Database access (links) ──
+
+/// An app as shown in database access lists.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DatabaseAppRef {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub project_id: Option<String>,
+}
+
+/// GET /api/databases/{id}/access — which apps can reach a database.
+///
+/// Apps in the database's project share its network; other apps need a
+/// link, which attaches the database to that app's network.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseAccessResponse {
+    pub database_id: String,
+    /// The database's project, if any (`{id, name}`)
+    pub project: Option<DatabaseProjectRef>,
+    /// Apps that reach the database through the shared project network
+    pub project_apps: Vec<DatabaseAppRef>,
+    /// Apps linked to the database
+    pub linked_apps: Vec<DatabaseAppRef>,
+    /// Hostname apps use to reach the database (its name, a network alias)
+    pub internal_host: String,
+    /// Port inside the container
+    pub internal_port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DatabaseProjectRef {
+    pub id: String,
+    pub name: String,
+}
+
+/// One database an app can reach (GET /api/apps/{id}/databases).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppDatabaseAccess {
+    pub id: String,
+    pub name: String,
+    pub db_type: String,
+    pub status: String,
+    /// "project" — same project network; "link" — linked to the app
+    pub via: String,
+    pub internal_host: String,
+    pub internal_port: u16,
 }
 
 /// POST /api/databases request body

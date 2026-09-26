@@ -7,7 +7,7 @@
 //
 // Functions:
 //
-//   run_container(docker, image, name, port, host_port, exposure, env_vars, memory_limit, cpu_limit, binds, network_name)
+//   run_container(docker, image, name, port, host_port, exposure, env_vars, memory_limit, cpu_limit, binds, network)
 //     Creates and starts a container named `tond-{name}`. Before creating,
 //     it force-removes any existing container with the same name (handles
 //     re-deploys). The container is configured with:
@@ -24,8 +24,9 @@
 //       - Memory limit: memory_limit bytes (None = no limit)
 //       - CPU limit: cpu_limit nano_cpus (None = no limit; 1e9 = 1 CPU)
 //       - Bind mounts: binds as Vec<String> in "host_path:container_path" format
-//       - network_name: if Some, connect container to that Docker network with
-//         the app name as a network alias (so peers can reach it as http://appname:port)
+//       - network: the only Docker network the container joins (never the
+//         default bridge), with the app name as its alias there (so peers on
+//         that network reach it as http://appname:port). See networks.rs.
 //     Returns the Docker-assigned container ID.
 //
 //   stop_container(docker, container_id)   — graceful stop, 10 s timeout
@@ -45,13 +46,20 @@
 //     Pulls `image` unless it is already present locally. Managed databases
 //     and cron jobs start from stock images that a fresh host doesn't have.
 //
-//   ensure_network(docker, network_name)
-//     Creates a Docker bridge network with the given name if it does not
-//     already exist. Idempotent — safe to call on every deploy.
+//   ensure_network(docker, network_name, icc)
+//     Creates a labelled Docker bridge network with the given name if it does
+//     not already exist (optionally with inter-container traffic off).
+//     Idempotent — safe to call on every deploy.
 //
 //   remove_network(docker, network_name)
 //     Removes a Docker network by name. Best-effort — logs a warning but
 //     does not return an error if the network does not exist.
+//
+//   connect_network / disconnect_network / container_networks
+//     Attach or detach an existing container, list the networks it is on.
+//
+//   prune_networks(docker)
+//     Remove Tond-labelled networks that no container uses any more.
 
 use bollard::Docker;
 use bollard::models::*;
@@ -252,12 +260,36 @@ fn service_host_config(
     host_config
 }
 
+/// Put a container on exactly one network: `network_mode` makes it the
+/// container's network instead of the default bridge, and the endpoint config
+/// gives it `alias` there.
+fn attach_network(
+    mut host_config: HostConfig,
+    network: &str,
+    alias: &str,
+) -> (HostConfig, Option<NetworkingConfig>) {
+    host_config.network_mode = Some(network.to_string());
+    let endpoints = HashMap::from([(
+        network.to_string(),
+        EndpointSettings {
+            aliases: Some(vec![alias.to_string()]),
+            ..Default::default()
+        },
+    )]);
+    (
+        host_config,
+        Some(NetworkingConfig {
+            endpoints_config: Some(endpoints),
+        }),
+    )
+}
+
 /// Create and start a container from a Docker image.
 /// Returns the container ID.
 ///
-/// If `network_name` is Some, the container is connected to that Docker network
-/// with `name` (the app name, without the `tond-` prefix) as the network alias
-/// so that peer containers can reach this one via `http://<name>:<port>`.
+/// The container joins `network` only (never the default bridge), with `name`
+/// (the app name, without the `tond-` prefix) as its alias there so peer
+/// containers on that network reach it via `http://<name>:<port>`.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_container(
     docker: &Docker,
@@ -270,27 +302,14 @@ pub async fn run_container(
     memory_limit: Option<i64>,
     cpu_limit: Option<i64>,
     binds: Vec<String>,
-    network_name: Option<&str>,
+    network: &str,
 ) -> anyhow::Result<String> {
     ensure_image(docker, image).await?;
     let env = env_with_port(env_vars, port);
     let host_config =
         service_host_config(port, host_port, exposure, memory_limit, cpu_limit, binds);
 
-    // Connect to a project network if specified, using the app name as the alias
-    let networking_config = network_name.map(|net| {
-        let mut endpoints = HashMap::new();
-        endpoints.insert(
-            net.to_string(),
-            EndpointSettings {
-                aliases: Some(vec![name.to_string()]),
-                ..Default::default()
-            },
-        );
-        NetworkingConfig {
-            endpoints_config: Some(endpoints),
-        }
-    });
+    let (host_config, networking_config) = attach_network(host_config, network, name);
 
     let config = ContainerCreateBody {
         image: Some(image.to_string()),
@@ -417,8 +436,8 @@ pub async fn get_logs(
 /// (no `tond-` prefix is added). Used for preview deployments which use
 /// the pattern `tond-preview-{slug}`.
 ///
-/// `network_alias` is used as the network alias when connecting to
-/// `network_name` (typically the app name, without the `tond-preview-` prefix).
+/// `network_alias` is used as the alias on `network` (typically the app name,
+/// without the `tond-preview-` prefix); the container joins only `network`.
 /// `cmd` overrides the image's default command (managed Redis/KeyDB pass
 /// their generated config file this way); `None` keeps the image default.
 #[allow(clippy::too_many_arguments)]
@@ -433,7 +452,7 @@ pub async fn run_container_named(
     memory_limit: Option<i64>,
     cpu_limit: Option<i64>,
     binds: Vec<String>,
-    network_name: Option<&str>,
+    network: &str,
     network_alias: Option<&str>,
     cmd: Option<Vec<String>>,
 ) -> anyhow::Result<String> {
@@ -442,21 +461,11 @@ pub async fn run_container_named(
     let host_config =
         service_host_config(port, host_port, exposure, memory_limit, cpu_limit, binds);
 
-    // Connect to a project network if specified
-    let networking_config = network_name.map(|net| {
-        let alias = network_alias.unwrap_or(container_name);
-        let mut endpoints = HashMap::new();
-        endpoints.insert(
-            net.to_string(),
-            EndpointSettings {
-                aliases: Some(vec![alias.to_string()]),
-                ..Default::default()
-            },
-        );
-        NetworkingConfig {
-            endpoints_config: Some(endpoints),
-        }
-    });
+    let (host_config, networking_config) = attach_network(
+        host_config,
+        network,
+        network_alias.unwrap_or(container_name),
+    );
 
     let config = ContainerCreateBody {
         image: Some(image.to_string()),
@@ -615,9 +624,7 @@ pub async fn find_free_port(docker: &Docker, start: u16) -> anyhow::Result<u16> 
     next_free_port(start, &used_ports)
 }
 
-/// Ensure a Docker bridge network with the given name exists.
-/// Creates it if it does not already exist. Idempotent and safe to call on
-/// every deploy — does nothing if the network is already present.
+/// Pull `image` unless it is already present locally.
 pub async fn ensure_image(docker: &Docker, image: &str) -> anyhow::Result<()> {
     if docker.inspect_image(image).await.is_ok() {
         return Ok(());
@@ -633,7 +640,32 @@ pub async fn ensure_image(docker: &Docker, image: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn ensure_network(docker: &Docker, network_name: &str) -> anyhow::Result<()> {
+/// Label on every network Tond creates, so pruning never touches others.
+pub const NETWORK_LABEL: (&str, &str) = ("managed-by", "tond");
+
+/// Bridge driver option that switches off traffic between containers on the
+/// same network (they can still reach the internet and published ports).
+pub const ENABLE_ICC_OPTION: &str = "com.docker.network.bridge.enable_icc";
+
+/// The create request for a Tond bridge network.
+fn network_create_request(network_name: &str, icc: bool) -> NetworkCreateRequest {
+    NetworkCreateRequest {
+        name: network_name.to_string(),
+        driver: Some("bridge".to_string()),
+        labels: Some(HashMap::from([(
+            NETWORK_LABEL.0.to_string(),
+            NETWORK_LABEL.1.to_string(),
+        )])),
+        options: (!icc)
+            .then(|| HashMap::from([(ENABLE_ICC_OPTION.to_string(), "false".to_string())])),
+        ..Default::default()
+    }
+}
+
+/// Ensure a Docker bridge network with the given name exists, creating it
+/// (labelled `managed-by=tond`, and with inter-container traffic off unless
+/// `icc`) if not. Idempotent and safe to call on every deploy.
+pub async fn ensure_network(docker: &Docker, network_name: &str, icc: bool) -> anyhow::Result<()> {
     let filters: HashMap<String, Vec<String>> = {
         let mut m = HashMap::new();
         m.insert("name".to_string(), vec![network_name.to_string()]);
@@ -655,13 +687,17 @@ pub async fn ensure_network(docker: &Docker, network_name: &str) -> anyhow::Resu
         return Ok(());
     }
 
-    let config = NetworkCreateRequest {
-        name: network_name.to_string(),
-        driver: Some("bridge".to_string()),
-        ..Default::default()
-    };
-
-    docker.create_network(config).await?;
+    match docker
+        .create_network(network_create_request(network_name, icc))
+        .await
+    {
+        Ok(_) => {}
+        // Lost a race with a concurrent deploy creating the same network.
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 409, ..
+        }) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    }
     tracing::info!("Created Docker network: {}", network_name);
 
     Ok(())
@@ -698,6 +734,87 @@ pub async fn remove_network(docker: &Docker, network_name: &str) {
         Ok(()) => tracing::info!("Removed Docker network: {}", network_name),
         Err(e) => tracing::warn!("Could not remove Docker network {}: {}", network_name, e),
     }
+}
+
+/// Attach an existing (running or stopped) container to a network with
+/// `alias`. Already being connected is not an error.
+pub async fn connect_network(
+    docker: &Docker,
+    network_name: &str,
+    container: &str,
+    alias: &str,
+) -> anyhow::Result<()> {
+    let req = NetworkConnectRequest {
+        container: container.to_string(),
+        endpoint_config: Some(EndpointSettings {
+            aliases: Some(vec![alias.to_string()]),
+            ..Default::default()
+        }),
+    };
+    match docker.connect_network(network_name, req).await {
+        Ok(()) => Ok(()),
+        Err(bollard::errors::Error::DockerResponseServerError { message, .. })
+            if message.contains("already exists") =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Detach a container from a network (forced, so a stopped container works
+/// too). Not being connected is not an error.
+pub async fn disconnect_network(
+    docker: &Docker,
+    network_name: &str,
+    container: &str,
+) -> anyhow::Result<()> {
+    let req = NetworkDisconnectRequest {
+        container: container.to_string(),
+        force: Some(true),
+    };
+    match docker.disconnect_network(network_name, req).await {
+        Ok(()) => Ok(()),
+        Err(bollard::errors::Error::DockerResponseServerError { message, .. })
+            if message.contains("is not connected") =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Names of the networks a container is attached to.
+pub async fn container_networks(docker: &Docker, container: &str) -> anyhow::Result<Vec<String>> {
+    let detail = docker.inspect_container(container, None).await?;
+    let mut names: Vec<String> = detail
+        .network_settings
+        .and_then(|n| n.networks)
+        .map(|n| n.into_keys().collect())
+        .unwrap_or_default();
+    names.sort();
+    Ok(names)
+}
+
+/// Remove Tond-labelled networks without containers that are older than an
+/// hour (so a network created a moment ago for a deploy in progress is never
+/// raced away). Networks are cheap to recreate: every deploy ensures its own.
+pub async fn prune_networks(docker: &Docker) -> anyhow::Result<usize> {
+    let filters = HashMap::from([
+        (
+            "label".to_string(),
+            vec![format!("{}={}", NETWORK_LABEL.0, NETWORK_LABEL.1)],
+        ),
+        ("until".to_string(), vec!["1h".to_string()]),
+    ]);
+    let response = docker
+        .prune_networks(Some(
+            bollard::query_parameters::PruneNetworksOptionsBuilder::default()
+                .filters(&filters)
+                .build(),
+        ))
+        .await?;
+    Ok(response.networks_deleted.map_or(0, |n| n.len()))
 }
 
 #[cfg(test)]
@@ -862,6 +979,52 @@ mod tests {
                 vec!["com.docker.compose.project=frontend".to_string()],
             )]),
             "compose_project_filter should target containers belonging to the requested compose project"
+        );
+    }
+
+    #[test]
+    fn network_create_request_labels_networks_and_can_switch_off_icc() {
+        let isolated = network_create_request("tond-net-db-main", false);
+        assert_eq!(
+            isolated
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("managed-by"))
+                .map(String::as_str),
+            Some("tond"),
+            "every Tond network carries the managed-by label so pruning only touches ours"
+        );
+        assert_eq!(
+            isolated
+                .options
+                .as_ref()
+                .and_then(|o| o.get(ENABLE_ICC_OPTION))
+                .map(String::as_str),
+            Some("false"),
+            "single-tenant networks switch inter-container traffic off"
+        );
+        let shared = network_create_request("tond-net-app-web", true);
+        assert!(shared.options.is_none(), "app/project networks keep icc on");
+    }
+
+    #[test]
+    fn attach_network_replaces_the_default_bridge() {
+        let (host_config, networking) =
+            attach_network(HostConfig::default(), "tond-net-app-web", "web");
+        assert_eq!(
+            host_config.network_mode.as_deref(),
+            Some("tond-net-app-web"),
+            "network_mode must name the network so Docker never adds the default bridge"
+        );
+        let endpoints = networking
+            .and_then(|n| n.endpoints_config)
+            .unwrap_or_default();
+        assert_eq!(endpoints.len(), 1, "exactly one network");
+        assert_eq!(
+            endpoints
+                .get("tond-net-app-web")
+                .and_then(|e| e.aliases.clone()),
+            Some(vec!["web".to_string()])
         );
     }
 

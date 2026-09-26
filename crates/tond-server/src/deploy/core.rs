@@ -39,6 +39,7 @@ use crate::backup::{self, SnapshotTrigger};
 use crate::docker;
 use crate::handlers::{github_apps, gitlab_tokens};
 use crate::log_bus::{self, DeployLogEvent};
+use crate::networks;
 use crate::secret_key::{self, Purpose};
 use crate::state::AppState;
 use crate::volumes;
@@ -151,16 +152,21 @@ fn auto_domain(base_domain: &str, app_name: &str) -> String {
     format!("{}.{}", app_name, base)
 }
 
+/// The environment of a preview container: only the app variables listed in
+/// `shared_keys_json`, then the preview overrides on top. Previews run
+/// pull-request code, so production variables (database URLs, API keys) are
+/// withheld unless an admin shared them explicitly.
 fn preview_env_vars(
     base_env: &str,
-    excluded_keys_json: &str,
+    shared_keys_json: &str,
     preview_overrides_json: &str,
 ) -> HashMap<String, String> {
-    let mut env_vars: HashMap<String, String> = serde_json::from_str(base_env).unwrap_or_default();
-    let excluded_keys: Vec<String> = serde_json::from_str(excluded_keys_json).unwrap_or_default();
-    for key in &excluded_keys {
-        env_vars.remove(key);
-    }
+    let base: HashMap<String, String> = serde_json::from_str(base_env).unwrap_or_default();
+    let shared_keys: Vec<String> = serde_json::from_str(shared_keys_json).unwrap_or_default();
+    let mut env_vars: HashMap<String, String> = shared_keys
+        .iter()
+        .filter_map(|key| base.get(key).map(|value| (key.clone(), value.clone())))
+        .collect();
 
     let preview_overrides: HashMap<String, String> =
         serde_json::from_str(preview_overrides_json).unwrap_or_default();
@@ -485,17 +491,11 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
     )
     .await?;
 
-    // If the app belongs to a project, ensure the project's Docker network exists
-    // and connect this container to it (lazy creation on first deploy).
-    let network_name = if let Some(ref pid) = app.project_id {
-        let net = format!("tond-{}", pid);
-        if let Err(e) = docker::ensure_network(&state.docker, &net).await {
-            tracing::warn!("Could not ensure project network {}: {}", net, e);
-        }
-        Some(net)
-    } else {
-        None
-    };
+    // The container joins only its home network: the project network, or the
+    // app's own network (see networks.rs). Never the default bridge.
+    let network = networks::ensure_app_home(&state.docker, app)
+        .await
+        .context("could not create the app's Docker network")?;
 
     // Start the NEW container.
     //
@@ -521,7 +521,7 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
             app.memory_limit,
             app.cpu_limit,
             binds,
-            network_name.as_deref(),
+            &network,
             Some(&app_name),
             None,
         )
@@ -542,7 +542,7 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
             app.memory_limit,
             app.cpu_limit,
             binds,
-            network_name.as_deref(),
+            &network,
         )
         .await
         .map_err(|e| {
@@ -733,6 +733,19 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
 
     images::prune_app_images(state, &app_id, &app_name).await;
 
+    // The home network may have just been (re)created: make sure the
+    // databases linked to this app are attached to it.
+    if let Err(e) = networks::reconcile_databases_for_app(state, app).await {
+        log_deploy(
+            state,
+            &app_id,
+            "warn",
+            trigger_source,
+            &format!("Could not attach linked databases to the app network: {e}"),
+        )
+        .await?;
+    }
+
     Ok(())
 }
 
@@ -821,16 +834,10 @@ pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> R
     )
     .await?;
 
-    // Connect to project network if applicable (same as regular deploy).
-    let network_name = if let Some(ref pid) = app.project_id {
-        let net = format!("tond-{}", pid);
-        if let Err(e) = docker::ensure_network(&state.docker, &net).await {
-            tracing::warn!("Could not ensure project network {}: {}", net, e);
-        }
-        Some(net)
-    } else {
-        None
-    };
+    // Same home network as a regular deploy.
+    let network = networks::ensure_app_home(&state.docker, app)
+        .await
+        .context("could not create the app's Docker network")?;
 
     // Use staging name for rollbacks when there is an existing container,
     // so traffic continues to flow to the old container until the rollback
@@ -850,7 +857,7 @@ pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> R
             app.memory_limit,
             app.cpu_limit,
             binds,
-            network_name.as_deref(),
+            &network,
             Some(&app_name),
             None,
         )
@@ -871,7 +878,7 @@ pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> R
             app.memory_limit,
             app.cpu_limit,
             binds,
-            network_name.as_deref(),
+            &network,
         )
         .await
         .map_err(|e| {
@@ -1136,7 +1143,7 @@ pub async fn deploy_preview(
 
     let env_vars = preview_env_vars(
         app.env_vars.as_deref().unwrap_or("{}"),
-        app.preview_excluded_keys.as_str(),
+        app.preview_shared_keys.as_str(),
         app.preview_env_vars.as_str(),
     );
 
@@ -1154,16 +1161,12 @@ pub async fn deploy_preview(
         container_port
     );
 
-    // Connect preview containers to the project network if the app has one.
-    let network_name = if let Some(ref pid) = app.project_id {
-        let net = format!("tond-{}", pid);
-        if let Err(e) = docker::ensure_network(&state.docker, &net).await {
-            tracing::warn!("Could not ensure project network {}: {}", net, e);
-        }
-        Some(net)
-    } else {
-        None
-    };
+    // Previews run pull-request code: they get a network of their own and
+    // never join the project network, so they can't reach production
+    // databases or apps.
+    let network = networks::ensure_preview(&state.docker, &slug)
+        .await
+        .context("could not create the preview's Docker network")?;
 
     let container_id = docker::run_container_named(
         &state.docker,
@@ -1176,7 +1179,7 @@ pub async fn deploy_preview(
         app.memory_limit,
         app.cpu_limit,
         binds,
-        network_name.as_deref(),
+        &network,
         Some(&app_name),
         None,
     )
@@ -1555,10 +1558,10 @@ mod tests {
     }
 
     #[test]
-    fn preview_env_vars_removes_excluded_keys_and_applies_overrides() {
+    fn preview_env_vars_passes_only_shared_keys_and_applies_overrides() {
         let env = preview_env_vars(
             r#"{"DATABASE_URL":"prod","PUBLIC_FLAG":"1","KEEP":"yes"}"#,
-            r#"["DATABASE_URL","MISSING"]"#,
+            r#"["PUBLIC_FLAG","KEEP","MISSING"]"#,
             r#"{"PUBLIC_FLAG":"preview","NEW_KEY":"value"}"#,
         );
 
@@ -1569,7 +1572,13 @@ mod tests {
                 ("KEEP".to_string(), "yes".to_string()),
                 ("NEW_KEY".to_string(), "value".to_string()),
             ]),
-            "preview_env_vars should remove excluded keys and apply preview-specific overrides on top of the base environment"
+            "previews get only shared app variables (never DATABASE_URL here) plus their overrides"
+        );
+
+        let nothing_shared = preview_env_vars(r#"{"DATABASE_URL":"prod"}"#, "[]", "{}");
+        assert!(
+            nothing_shared.is_empty(),
+            "by default a preview receives none of the production environment"
         );
     }
 
@@ -1578,7 +1587,7 @@ mod tests {
         let state = test_state().await;
 
         sqlx::query(
-            "INSERT INTO apps (id, name, source_type, container_port, status, env_vars, volumes, drain_timeout, build_method, auto_deploy, preview_enabled, preview_excluded_keys, preview_env_vars, static_build, created_at, updated_at)
+            "INSERT INTO apps (id, name, source_type, container_port, status, env_vars, volumes, drain_timeout, build_method, auto_deploy, preview_enabled, preview_shared_keys, preview_env_vars, static_build, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))",
         )
         .bind("app-1")

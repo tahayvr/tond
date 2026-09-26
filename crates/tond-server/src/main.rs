@@ -67,6 +67,7 @@ mod health;
 mod janitor;
 mod log_bus;
 mod metrics;
+mod networks;
 mod notifications;
 mod secret_key;
 mod security_headers;
@@ -154,6 +155,13 @@ async fn main() -> Result<()> {
     // While no admin exists, keep a one-time setup token in a root-only file
     auth::setup_token::ensure_setup_token(&state.db, &auth::setup_token::setup_token_path())
         .await?;
+
+    // Attach databases to the networks their links call for (Docker state can
+    // drift while the server is down). Once, in the background.
+    {
+        let state = state.clone();
+        tokio::spawn(async move { networks::reconcile_all_databases(&state).await });
+    }
 
     // Spawn background health check poller
     tokio::spawn(health::run_health_checker(state.clone()));
@@ -593,6 +601,19 @@ async fn main() -> Result<()> {
             "/api/databases/{id}/credentials",
             axum::routing::patch(handlers::databases::update_database_credentials),
         )
+        // Database access: project members + links (networks.rs)
+        .route(
+            "/api/databases/{id}/access",
+            get(handlers::database_links::get_database_access),
+        )
+        .route(
+            "/api/databases/{id}/links/{app}",
+            put(handlers::database_links::link_app).delete(handlers::database_links::unlink_app),
+        )
+        .route(
+            "/api/apps/{id}/databases",
+            get(handlers::database_links::list_app_databases),
+        )
         .route(
             "/api/databases/{id}/logs/stream",
             get(handlers::logs::stream_database_logs),
@@ -928,7 +949,7 @@ mod tests {
         .await
         .unwrap_or_else(|err| panic!("failed to seed project_previews row: {err}"));
         sqlx::query(
-            "INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, host_port, memory_limit, cpu_limit, status, env_vars, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, deploy_key_pub, project_id, registry_credential_id, github_app_id, gitlab_token_id, preview_enabled, preview_excluded_keys, preview_env_vars, dockerfile_content, compose_content, base_dir, static_build, created_at, updated_at)
+            "INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, host_port, memory_limit, cpu_limit, status, env_vars, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, deploy_key_pub, project_id, registry_credential_id, github_app_id, gitlab_token_id, preview_enabled, preview_shared_keys, preview_env_vars, dockerfile_content, compose_content, base_dir, static_build, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind("app-1")

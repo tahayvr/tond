@@ -35,6 +35,7 @@ use crate::{
     db_credentials::{CredentialField, container_running, password_change_step, run_step},
     docker,
     error::AppError,
+    networks,
     state::AppState,
 };
 
@@ -234,10 +235,11 @@ fn build_detail(db: ManagedDatabase, public_host: Option<&str>) -> ManagedDataba
         })
     };
 
-    // Internal string: use override if set, otherwise compute (only when db has a project).
+    // Internal string: use override if set, otherwise compute. Apps in the
+    // database's project and linked apps reach it by its name (networks.rs).
     let internal_connection_string = if let Some(ref custom) = db.custom_internal_url {
         Some(custom.clone())
-    } else if db.project_id.is_some() {
+    } else {
         engine_for(&db.db_type).map(|eng| {
             eng.internal_connection_string(
                 &db.name,
@@ -246,8 +248,6 @@ fn build_detail(db: ManagedDatabase, public_host: Option<&str>) -> ManagedDataba
                 db.db_password.as_deref(),
             )
         })
-    } else {
-        None
     };
 
     ManagedDatabaseDetail {
@@ -380,17 +380,11 @@ pub async fn create_database(
     let mut binds = vec![bind_path];
     binds.extend(extra_binds);
 
-    // Connect to project network if applicable
-    let network_name_owned;
-    let network_name: Option<&str> = if let Some(ref pid) = req.project_id {
-        network_name_owned = format!("tond-{}", pid);
-        docker::ensure_network(&state.docker, &network_name_owned)
-            .await
-            .map_err(|e| AppError(TondError::DockerError(e.to_string())))?;
-        Some(&network_name_owned)
-    } else {
-        None
-    };
+    // Home network: the project network, or the database's own network.
+    // Apps outside the project get access through explicit links.
+    let network = networks::ensure_database_home(&state.docker, &db)
+        .await
+        .map_err(|e| AppError(TondError::DockerError(e.to_string())))?;
 
     let container_name = format!("tond-db-{}", db.name);
     let db_name_alias = db.name.clone();
@@ -407,7 +401,7 @@ pub async fn create_database(
         db.memory_limit,
         None, // no cpu limit for databases
         binds.clone(),
-        network_name,
+        &network,
         Some(&db_name_alias),
         db_cmd.clone(),
     )
@@ -485,6 +479,12 @@ pub async fn delete_database(
     // Stop and remove the container (best-effort)
     if let Some(ref cid) = db.container_id {
         let _ = docker::remove_container(&state.docker, cid).await;
+    }
+
+    // Its own network (a project network belongs to the project); links go
+    // with the row (ON DELETE CASCADE).
+    if db.project_id.is_none() {
+        docker::remove_network(&state.docker, &networks::database_network(&db.name)).await;
     }
 
     // Remove the volume directory (and a generated Redis config) from disk (best-effort)
@@ -771,17 +771,10 @@ async fn recreate_container(
     let mut binds = vec![bind_path];
     binds.extend(extra_binds);
 
-    // Reconnect to project network if applicable.
-    let network_name_owned;
-    let network_name: Option<&str> = if let Some(ref pid) = db.project_id {
-        network_name_owned = format!("tond-{}", pid);
-        docker::ensure_network(&state.docker, &network_name_owned)
-            .await
-            .map_err(|e| AppError(TondError::DockerError(e.to_string())))?;
-        Some(&network_name_owned)
-    } else {
-        None
-    };
+    // Same home network; linked apps' networks are re-attached below.
+    let network = networks::ensure_database_home(&state.docker, &db)
+        .await
+        .map_err(|e| AppError(TondError::DockerError(e.to_string())))?;
 
     let container_name = format!("tond-db-{}", db.name);
     let db_name_alias = db.name.clone();
@@ -797,7 +790,7 @@ async fn recreate_container(
         db.memory_limit,
         None,
         binds.clone(),
-        network_name,
+        &network,
         Some(&db_name_alias),
         db_cmd.clone(),
     )
@@ -821,7 +814,11 @@ async fn recreate_container(
     .execute(&state.db)
     .await?;
 
-    fetch_db(&state.db, &db.id).await
+    let updated = fetch_db(&state.db, &db.id).await?;
+    networks::reconcile_database(state, &updated)
+        .await
+        .map_err(|e| AppError(TondError::DockerError(e.to_string())))?;
+    Ok(updated)
 }
 
 // ── Update credentials ──

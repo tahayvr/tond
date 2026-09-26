@@ -26,6 +26,7 @@ use crate::{
     auth::{RateLimit, RequireAuth},
     deploy, docker,
     error::AppError,
+    networks,
     state::AppState,
 };
 
@@ -257,6 +258,35 @@ pub async fn update_project(
     Ok(Json(ApiResponse::ok(ProjectResponse::from(updated))))
 }
 
+/// After a project is deleted, attach its former apps and databases to their
+/// own home networks (see networks.rs).
+async fn rehome_former_members(state: &AppState, app_ids: &[String], db_ids: &[String]) {
+    for id in app_ids {
+        if let Ok(Some(app)) = sqlx::query_as::<_, App>("SELECT * FROM apps WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await
+            && let Err(e) = networks::reconcile_app(state, &app).await
+        {
+            tracing::warn!("Could not move app {} to its own network: {e}", app.name);
+        }
+    }
+    for id in db_ids {
+        if let Ok(Some(db)) =
+            sqlx::query_as::<_, ManagedDatabase>("SELECT * FROM databases WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&state.db)
+                .await
+            && let Err(e) = networks::reconcile_database(state, &db).await
+        {
+            tracing::warn!(
+                "Could not move database {} to its own network: {e}",
+                db.name
+            );
+        }
+    }
+}
+
 // ── Delete project ──
 
 pub async fn delete_project(
@@ -275,8 +305,26 @@ pub async fn delete_project(
     let project =
         project.ok_or_else(|| AppError(TondError::NotFound(format!("project '{}'", id))))?;
 
+    // Members that leave with the project, to move onto their own networks.
+    let member_apps: Vec<String> = sqlx::query_scalar("SELECT id FROM apps WHERE project_id = ?")
+        .bind(&project.id)
+        .fetch_all(&state.db)
+        .await?;
+    let member_dbs: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM databases WHERE project_id = ?")
+            .bind(&project.id)
+            .fetch_all(&state.db)
+            .await?;
+
     // Un-assign all member apps (do NOT delete them)
     sqlx::query("UPDATE apps SET project_id = NULL WHERE project_id = ?")
+        .bind(&project.id)
+        .execute(&state.db)
+        .await?;
+
+    // cron_jobs.project_id has no foreign key; detach them explicitly so
+    // they run on their own networks instead of recreating this one.
+    sqlx::query("UPDATE cron_jobs SET project_id = NULL WHERE project_id = ?")
         .bind(&project.id)
         .execute(&state.db)
         .await?;
@@ -286,9 +334,13 @@ pub async fn delete_project(
         .execute(&state.db)
         .await?;
 
+    // Move former members to their own networks before the project network
+    // goes away (a container left without a network loses its published
+    // port). Best-effort: the next deploy fixes anything missed.
+    rehome_former_members(&state, &member_apps, &member_dbs).await;
+
     // Remove the Docker network for this project (best-effort)
-    let network_name = format!("tond-{}", project.id);
-    docker::remove_network(&state.docker, &network_name).await;
+    docker::remove_network(&state.docker, &networks::project_network(&project.id)).await;
 
     write_audit_log(
         &state.db,

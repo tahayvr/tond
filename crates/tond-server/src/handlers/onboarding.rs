@@ -437,7 +437,7 @@ mod tests {
         .unwrap_or_else(|err| panic!("failed to seed project: {err}"));
 
         sqlx::query(
-            "INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, host_port, memory_limit, cpu_limit, status, env_vars, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, deploy_key_pub, project_id, registry_credential_id, github_app_id, gitlab_token_id, preview_enabled, preview_excluded_keys, preview_env_vars, dockerfile_content, compose_content, base_dir, static_build, created_at, updated_at)
+            "INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, host_port, memory_limit, cpu_limit, status, env_vars, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, deploy_key_pub, project_id, registry_credential_id, github_app_id, gitlab_token_id, preview_enabled, preview_shared_keys, preview_env_vars, dockerfile_content, compose_content, base_dir, static_build, created_at, updated_at)
              VALUES (?, ?, NULL, 'git', ?, 'main', 3000, NULL, NULL, NULL, NULL, 'created', '{}', NULL, 30, 3, 0, '[]', 30, 'tbuild', NULL, 0, NULL, NULL, ?, NULL, NULL, NULL, 0, '[]', '{}', NULL, NULL, NULL, 0, ?, ?)",
         )
         .bind("app-1")

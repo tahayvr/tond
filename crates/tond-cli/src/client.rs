@@ -1535,7 +1535,7 @@ mod tests {
             "github_app_id": null,
             "gitlab_token_id": null,
             "preview_enabled": false,
-            "preview_excluded_keys": [],
+            "preview_shared_keys": [],
             "preview_env_vars": {},
             "dockerfile_content": null,
             "compose_content": null,

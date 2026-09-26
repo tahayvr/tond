@@ -1256,7 +1256,7 @@ mod tests {
         );
 
         sqlx::query(
-            "INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, host_port, memory_limit, cpu_limit, status, env_vars, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, deploy_key_pub, project_id, registry_credential_id, github_app_id, gitlab_token_id, preview_enabled, preview_excluded_keys, preview_env_vars, dockerfile_content, compose_content, base_dir, static_build, created_at, updated_at)
+            "INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, host_port, memory_limit, cpu_limit, status, env_vars, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, deploy_key_pub, project_id, registry_credential_id, github_app_id, gitlab_token_id, preview_enabled, preview_shared_keys, preview_env_vars, dockerfile_content, compose_content, base_dir, static_build, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(id)
@@ -1288,7 +1288,7 @@ mod tests {
         .bind(&app.github_app_id)
         .bind(&app.gitlab_token_id)
         .bind(app.preview_enabled)
-        .bind(&app.preview_excluded_keys)
+        .bind(&app.preview_shared_keys)
         .bind(&app.preview_env_vars)
         .bind(&app.dockerfile_content)
         .bind(&app.compose_content)

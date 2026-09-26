@@ -25,6 +25,8 @@
 //   • Resource limits: memory_mb and cpu_shares wired into Docker HostConfig.
 //   • Volume mounts: volumes JSON array wired into Docker HostConfig.binds, every
 //     host path re-derived and confined by `volumes::cron_binds`.
+//   • Isolation: the container runs on the job's own network, or its project's
+//     (networks.rs), never on Docker's default bridge.
 //   • Hardening: the same no-new-privileges / capability / pids / memory / log
 //     rotation policy as app containers (`docker::harden_host_config`).
 //   • Retry logic: on non-zero exit, re-queues the job up to max_retries times with
@@ -40,7 +42,7 @@ use std::str::FromStr;
 use tond_common::{CronJob, CronVolume};
 use uuid::Uuid;
 
-use crate::{alerts, docker, state::AppState, volumes};
+use crate::{alerts, docker, networks, state::AppState, volumes};
 
 fn should_run_due_job(job: &CronJob) -> bool {
     !(job.status == "running" && job.concurrency_policy == "skip")
@@ -488,11 +490,15 @@ async fn run_cron_container(
     let memory = cron_memory_limit_bytes(job.memory_mb);
     let cpu_shares: Option<i64> = job.cpu_shares;
 
+    // The job's own network (or its project's) — never the default bridge.
+    let network = networks::ensure_cron_home(docker, job).await?;
+
     let mut host_config = HostConfig {
         auto_remove: Some(false), // we remove manually after collecting logs
         memory,
         cpu_shares,
         binds,
+        network_mode: Some(network),
         ..Default::default()
     };
     docker::harden_host_config(&mut host_config, docker::default_memory_limit());

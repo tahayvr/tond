@@ -22,6 +22,8 @@
 //   terminal_tickets / github_app_flows — drop expired rows.
 //   webhook_deliveries — drop replay IDs older than the 72 h replay window.
 //   preview_deployments — drop expired/failed rows a week after they expired.
+//   Docker networks — remove Tond-labelled networks no container uses (older
+//                    than an hour; see docker::prune_networks).
 //
 // Every delete runs in batches of BATCH_SIZE rows with a short pause between
 // batches, so a single statement never holds SQLite's write lock for long
@@ -39,7 +41,7 @@ use anyhow::Result;
 use chrono::Utc;
 use sqlx::SqlitePool;
 
-use crate::state::AppState;
+use crate::{docker, state::AppState};
 
 /// Rows deleted per statement.
 const BATCH_SIZE: i64 = 2_000;
@@ -156,6 +158,12 @@ pub async fn run_janitor(state: AppState) {
         }
         // Refresh planner statistics for tables whose shape changed.
         let _ = sqlx::query("PRAGMA optimize").execute(&state.db).await;
+        // Networks of finished previews and cron runs, deleted apps, …
+        match docker::prune_networks(&state.docker).await {
+            Ok(n) if n > 0 => tracing::info!("Janitor: removed {n} unused Docker network(s)"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("Janitor: network prune failed: {e}"),
+        }
         tokio::time::sleep(INTERVAL).await;
     }
 }

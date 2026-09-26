@@ -94,8 +94,10 @@ pub struct App {
     /// 1 = automatically create a preview deployment when a GitHub pull_request
     /// webhook event is received for this app; 0 = opt-out (default).
     pub preview_enabled: i64,
-    /// JSON array of env var keys excluded from preview containers (e.g. `["SECRET_KEY"]`)
-    pub preview_excluded_keys: String,
+    /// JSON array of app env var keys shared with preview containers (e.g.
+    /// `["NODE_ENV"]`). Previews get nothing else from the app's environment:
+    /// they run pull-request code and must not see production secrets.
+    pub preview_shared_keys: String,
     /// JSON object of key-value overrides applied only to preview containers
     pub preview_env_vars: String,
     // ── Inline source content ──
@@ -150,7 +152,7 @@ impl App {
             github_app_id: None,
             gitlab_token_id: None,
             preview_enabled: 0,
-            preview_excluded_keys: "[]".to_string(),
+            preview_shared_keys: "[]".to_string(),
             preview_env_vars: "{}".to_string(),
             dockerfile_content: None,
             compose_content: None,
@@ -261,8 +263,8 @@ pub struct AppResponse {
     // ── Phase 4.6: PR Preview Deployments ──
     /// Whether PR preview deployments are enabled for this app
     pub preview_enabled: bool,
-    /// Env var keys excluded from preview containers
-    pub preview_excluded_keys: Vec<String>,
+    /// App env var keys shared with preview containers (all others are withheld)
+    pub preview_shared_keys: Vec<String>,
     // Preview override values are secrets: read them (masked) through
     // GET /api/apps/{id}/env, never through the app response.
     // ── Inline source content ──
@@ -281,8 +283,8 @@ pub struct AppResponse {
 impl From<App> for AppResponse {
     fn from(app: App) -> Self {
         let volumes: Vec<Volume> = serde_json::from_str(&app.volumes).unwrap_or_default();
-        let preview_excluded_keys: Vec<String> =
-            serde_json::from_str(&app.preview_excluded_keys).unwrap_or_default();
+        let preview_shared_keys: Vec<String> =
+            serde_json::from_str(&app.preview_shared_keys).unwrap_or_default();
         let expose_build_method =
             matches!(app.source_type.as_str(), "git" | "tarball" | "dockerfile");
         Self {
@@ -311,7 +313,7 @@ impl From<App> for AppResponse {
             github_app_id: app.github_app_id,
             gitlab_token_id: app.gitlab_token_id,
             preview_enabled: app.preview_enabled != 0,
-            preview_excluded_keys,
+            preview_shared_keys,
             dockerfile_content: app.dockerfile_content,
             compose_content: app.compose_content,
             base_dir: app.base_dir,
@@ -345,8 +347,9 @@ pub struct EnvVarEntry {
 pub struct PreviewEnvResponse {
     /// Whether PR preview deployments are enabled for this app
     pub enabled: bool,
-    /// App env var keys that preview containers do not receive
-    pub excluded_keys: Vec<String>,
+    /// App env var keys preview containers receive. Every other app variable
+    /// is withheld: previews run pull-request code.
+    pub shared_keys: Vec<String>,
     /// Values that replace or add env vars in preview containers only
     pub overrides: Vec<EnvVarEntry>,
 }
@@ -386,12 +389,12 @@ pub struct PatchPreviewEnvRequest {
     /// Preview overrides to remove
     #[serde(default)]
     pub unset: Vec<String>,
-    /// App env var keys to hide from preview containers
+    /// App env var keys to share with preview containers
     #[serde(default)]
-    pub exclude: Vec<String>,
-    /// App env var keys to pass to preview containers again
+    pub share: Vec<String>,
+    /// App env var keys to stop sharing with preview containers
     #[serde(default)]
-    pub include: Vec<String>,
+    pub unshare: Vec<String>,
 }
 
 /// Build the masked list of an env var map, sorted by key.
@@ -661,10 +664,8 @@ mod tests {
             container_path: "/data".to_string(),
         }])
         .unwrap_or_else(|err| panic!("failed to serialize volumes fixture: {err}"));
-        app.preview_excluded_keys = serde_json::to_string(&vec!["SECRET_KEY", "TOKEN"])
-            .unwrap_or_else(|err| {
-                panic!("failed to serialize preview_excluded_keys fixture: {err}")
-            });
+        app.preview_shared_keys = serde_json::to_string(&vec!["SECRET_KEY", "TOKEN"])
+            .unwrap_or_else(|err| panic!("failed to serialize preview_shared_keys fixture: {err}"));
 
         let response = AppResponse::from(app);
 
@@ -686,9 +687,9 @@ mod tests {
             "AppResponse should deserialize persisted volume JSON into typed volumes"
         );
         assert_eq!(
-            response.preview_excluded_keys,
+            response.preview_shared_keys,
             vec!["SECRET_KEY".to_string(), "TOKEN".to_string()],
-            "AppResponse should deserialize preview excluded keys from JSON"
+            "AppResponse should deserialize preview shared keys from JSON"
         );
         assert_eq!(
             response.build_method.as_deref(),
@@ -701,7 +702,7 @@ mod tests {
     fn app_response_from_app_falls_back_for_invalid_json_fields() {
         let mut app = App::new("demo".to_string(), "git".to_string(), None, None, 3000);
         app.volumes = "not json".to_string();
-        app.preview_excluded_keys = "{ definitely not an array }".to_string();
+        app.preview_shared_keys = "{ definitely not an array }".to_string();
 
         let response = AppResponse::from(app);
 
@@ -710,9 +711,9 @@ mod tests {
             "invalid persisted volumes JSON should fall back to an empty list"
         );
         assert_eq!(
-            response.preview_excluded_keys,
+            response.preview_shared_keys,
             Vec::<String>::new(),
-            "invalid persisted preview_excluded_keys JSON should fall back to an empty list"
+            "invalid persisted preview_shared_keys JSON should fall back to an empty list"
         );
     }
 

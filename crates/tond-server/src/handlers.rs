@@ -39,6 +39,7 @@ pub mod audit_log;
 pub mod auth;
 pub mod backups;
 pub mod cron;
+pub mod database_links;
 pub mod databases;
 pub mod deployments;
 pub mod env;
@@ -75,6 +76,7 @@ use crate::{
     auth::{AuthRole, RateLimit, RequireAdmin, RequireAuth},
     compose_policy, deploy, docker,
     error::AppError,
+    networks,
     state::AppState,
     upload, volumes,
 };
@@ -453,6 +455,11 @@ pub async fn delete_app(
             .await;
     } else if let Some(container_id) = &app.container_id {
         let _ = docker::remove_container(&state.docker, container_id).await;
+    }
+    // The app's own network (linked databases are detached with it; the
+    // links themselves go with the row).
+    if app.project_id.is_none() {
+        docker::remove_network(&state.docker, &networks::app_network(&app.name)).await;
     }
 
     sqlx::query("DELETE FROM apps WHERE id = ?")
@@ -1256,6 +1263,21 @@ pub async fn assign_project(
         .bind(&app.id)
         .execute(&state.db)
         .await?;
+
+    // Move the running container to its new home network (project or own)
+    // and re-attach linked databases there; drop the now-unused own network.
+    if req.project_id != app.project_id {
+        let moved = App {
+            project_id: req.project_id.clone(),
+            ..app.clone()
+        };
+        networks::reconcile_app(&state, &moved)
+            .await
+            .map_err(|e| AppError(TondError::DockerError(e.to_string())))?;
+        if moved.project_id.is_some() {
+            docker::remove_network(&state.docker, &networks::app_network(&app.name)).await;
+        }
+    }
 
     write_audit_log(
         &state.db,
