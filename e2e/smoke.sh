@@ -179,6 +179,99 @@ pass "HTTP redirects to HTTPS"
     || fail "plain HTTP for a host Tond does not serve must be 404, not an open redirect"
 pass "HTTP for an unknown host → 404 (no open redirect)"
 
+step "Webhook and integration hardening"
+API_TCP="http://127.0.0.1:3001"
+# status_of <curl args...>: HTTP status code of a request to the TCP API (no credentials).
+status_of() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
+WHOAMI_ID=$(app_field e2e-whoami id)
+[[ "$WHOAMI_ID" =~ ^[0-9a-f-]{36}$ ]] || fail "could not read the e2e-whoami app id (got: ${WHOAMI_ID})"
+WEBHOOK_JSON=$(api "/api/apps/${WHOAMI_ID}/webhook")
+WEBHOOK_SECRET=$(jq -r '.data.secret // empty' <<< "$WEBHOOK_JSON")
+[[ ${#WEBHOOK_SECRET} -ge 32 ]] || fail "every app must get a generated webhook secret"
+pass "app has a generated webhook secret"
+[[ "$(jq -r '.data.paths.github' <<< "$WEBHOOK_JSON")" == "/api/webhooks/github/${WHOAMI_ID}" ]] \
+    || fail "webhook URLs must be addressed by app UUID"
+pass "webhook URLs are addressed by app UUID"
+
+PUSH_BODY='{"ref":"refs/heads/main","after":"e2e"}'
+[[ "$(status_of -X POST -H 'X-GitHub-Event: push' -H 'Content-Type: application/json' \
+    -d "$PUSH_BODY" "${API_TCP}/api/webhooks/github/${WHOAMI_ID}")" == 401 ]] \
+    || fail "an unsigned GitHub webhook must be rejected"
+pass "unsigned GitHub webhook → 401"
+[[ "$(status_of -X POST -H 'X-GitHub-Event: push' -H 'X-Hub-Signature-256: sha256=deadbeef' \
+    -d "$PUSH_BODY" "${API_TCP}/api/webhooks/github/${WHOAMI_ID}")" == 401 ]] \
+    || fail "a wrongly signed GitHub webhook must be rejected"
+pass "wrongly signed GitHub webhook → 401"
+[[ "$(status_of -X POST -H 'X-Gitlab-Event: Push Hook' -H 'X-Gitlab-Token: wrong' \
+    -d "$PUSH_BODY" "${API_TCP}/api/webhooks/gitlab/${WHOAMI_ID}")" == 401 ]] \
+    || fail "a GitLab webhook with a wrong token must be rejected"
+pass "GitLab webhook with a wrong token → 401"
+[[ "$(status_of -X POST -H 'X-Gitea-Event: push' \
+    -d "$PUSH_BODY" "${API_TCP}/api/webhooks/gitea/${WHOAMI_ID}")" == 401 ]] \
+    || fail "an unsigned Gitea webhook must be rejected"
+pass "unsigned Gitea webhook → 401"
+[[ "$(status_of -X POST "${API_TCP}/api/webhooks/generic/${WHOAMI_ID}")" == 401 ]] \
+    || fail "an unauthenticated generic webhook must be rejected"
+pass "unauthenticated generic webhook → 401"
+[[ "$(status_of -X POST -H 'X-GitHub-Event: push' -d "$PUSH_BODY" \
+    "${API_TCP}/api/webhooks/github/e2e-whoami")" == 404 ]] \
+    || fail "webhooks must not resolve apps by name"
+pass "webhook by app name → 404"
+
+# Authenticated generic call: accepted (auto-deploy is off, so nothing deploys),
+# and replaying the same delivery ID is refused.
+DELIVERY="e2e-$(date +%s)-$$"
+generic_signed() {
+    status_of -X POST -H "Authorization: Bearer ${WEBHOOK_SECRET}" -H "X-Tond-Delivery: ${DELIVERY}" \
+        "${API_TCP}/api/webhooks/generic/${WHOAMI_ID}"
+}
+[[ "$(generic_signed)" == 200 ]] || fail "a generic webhook with the app secret must be accepted"
+pass "generic webhook with the app secret → 200"
+[[ "$(generic_signed)" == 409 ]] || fail "a replayed webhook delivery must be rejected"
+pass "replayed delivery → 409"
+
+if command -v openssl > /dev/null; then
+    PING_BODY="{\"zen\":\"e2e ${DELIVERY}\"}"
+    SIG=$(printf '%s' "$PING_BODY" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | awk '{print $NF}')
+    [[ "$(status_of -X POST -H 'X-GitHub-Event: ping' -H "X-GitHub-Delivery: ${DELIVERY}-gh" \
+        -H "X-Hub-Signature-256: sha256=${SIG}" -d "$PING_BODY" \
+        "${API_TCP}/api/webhooks/github/${WHOAMI_ID}")" == 200 ]] \
+        || fail "a correctly signed GitHub webhook must be accepted"
+    pass "correctly signed GitHub webhook → 200"
+else
+    echo "  - openssl not installed; skipping the signed GitHub webhook check"
+fi
+
+[[ "$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$SOCK" -X PUT \
+    -H 'Content-Type: application/json' -d '{"secret":null}' \
+    "http://localhost/api/apps/${WHOAMI_ID}/webhook-secret")" != 200 ]] \
+    || fail "the webhook secret must not be clearable"
+pass "webhook secret cannot be cleared"
+ROTATED=$(curl -sf --unix-socket "$SOCK" -X POST \
+    "http://localhost/api/apps/${WHOAMI_ID}/webhook-secret/rotate" | jq -r '.data.secret // empty')
+[[ ${#ROTATED} -ge 32 && "$ROTATED" != "$WEBHOOK_SECRET" ]] || fail "rotating the webhook secret must return a new one"
+[[ "$(status_of -X POST -H "Authorization: Bearer ${WEBHOOK_SECRET}" \
+    "${API_TCP}/api/webhooks/generic/${WHOAMI_ID}")" == 401 ]] \
+    || fail "the old webhook secret must stop working after rotation"
+pass "rotated secret replaces the old one"
+
+GH_APPS_BEFORE=$(api /api/github-apps | jq '.data | length')
+callback=$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' \
+    "${API_TCP}/api/github-apps/callback?code=e2eattackercode")
+[[ "$callback" == "303 "*"error=missing_state"* ]] \
+    || fail "the GitHub App callback without a pending state must be refused (got: ${callback})"
+callback=$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' \
+    "${API_TCP}/api/github-apps/callback?code=e2eattackercode&state=forged")
+[[ "$callback" == "303 "*"error=not_logged_in"* ]] \
+    || fail "the GitHub App callback without an admin session must be refused (got: ${callback})"
+[[ "$(api /api/github-apps | jq '.data | length')" == "$GH_APPS_BEFORE" ]] \
+    || fail "a refused GitHub App callback must not store an App"
+pass "GitHub App callback without the admin's pending state is refused"
+[[ "$(status_of -X POST -H 'X-GitHub-Event: push' -d "$PUSH_BODY" \
+    "${API_TCP}/webhooks/source/github/events")" == 401 ]] \
+    || fail "unsigned GitHub App events must be rejected"
+pass "unsigned GitHub App event → 401"
+
 step "Built app (tond apps push → TBuild → docker build)"
 tond apps create e2e-static --source-type tarball --port 8080 --domain "$STATIC_DOMAIN" > /dev/null
 (cd "$FIXTURE_DIR" && tond apps push e2e-static > /dev/null)
