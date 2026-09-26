@@ -5,6 +5,9 @@
 	import Activity from '~icons/ri/pulse-line';
 	import ActivityFilterPanel from '$lib/components/activity/activity-filter-panel.svelte';
 	import ActivityLogTable from '$lib/components/activity/activity-log-table.svelte';
+	import PageHeader from '$lib/components/nav/page-header.svelte';
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
+	import { useAction } from '$lib/action.svelte';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();
@@ -38,6 +41,8 @@
 		}
 	}
 
+	const refresh = useAction(refreshEntries);
+
 	$effect(() => {
 		const routeData = data as ActivityPageData;
 		apps = routeData.apps;
@@ -54,22 +59,21 @@
 </script>
 
 <div class="space-y-6">
-	<!-- Header -->
-	<div class="flex h-14 items-center justify-between">
-		<div>
-			<h2 class="text-3xl font-extrabold uppercase">Activity</h2>
-			<p class="font-mono text-xs tracking-wider text-muted-foreground/70">
-				{entries.length} EVENTS_LOGGED
-			</p>
-		</div>
-		<Button variant="outline" size="sm" onclick={refreshEntries}>Refresh</Button>
-	</div>
+	<PageHeader title="Activity" description={`${entries.length} events`}>
+		{#snippet actions()}
+			<Button
+				variant="outline"
+				size="sm"
+				onclick={() => refresh.run()}
+				disabled={refresh.pending}
+				aria-busy={refresh.pending}
+			>
+				{refresh.pending ? 'Refreshing…' : 'Refresh'}
+			</Button>
+		{/snippet}
+	</PageHeader>
 
-	{#if error}
-		<div class="rounded-md border border-destructive/50 bg-destructive/10 p-4 text-destructive">
-			{error}
-		</div>
-	{/if}
+	<InlineError message={error} ondismiss={() => (error = '')} />
 
 	<ActivityFilterPanel
 		{apps}
@@ -83,11 +87,9 @@
 		<div
 			class="flex flex-col items-center justify-center rounded-lg border border-border bg-card py-16"
 		>
-			<Activity class="mb-4 h-12 w-12 text-muted-foreground/40" />
-			<p class="font-mono text-[11px] tracking-widest text-muted-foreground/60 uppercase">
-				NO_EVENTS_LOGGED
-			</p>
-			<p class="mt-2 text-sm text-muted-foreground/70">Actions will be recorded here</p>
+			<Activity class="mb-4 h-12 w-12 text-muted-foreground" />
+			<p class="font-medium">No activity yet</p>
+			<p class="mt-2 text-sm text-muted-foreground">Actions will be recorded here</p>
 		</div>
 	{:else}
 		<ActivityLogTable {entries} {apps} />

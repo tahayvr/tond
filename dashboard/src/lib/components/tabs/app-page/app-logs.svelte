@@ -80,7 +80,7 @@
 					</div>
 				{:else}
 					<div class="py-0.5 whitespace-pre-wrap text-muted-foreground">
-						{#if entry.ts}<span class="text-muted-foreground/50">{fmtTs(entry.ts)} </span>{/if}<span
+						{#if entry.ts}<span class="text-muted-foreground">{fmtTs(entry.ts)} </span>{/if}<span
 							class="text-foreground">{entry.line}</span
 						>
 					</div>

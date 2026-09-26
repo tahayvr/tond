@@ -1,4 +1,5 @@
 <script lang="ts">
+	import PageTitle from '$lib/components/nav/page-title.svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import {
@@ -452,6 +453,8 @@
 		throw new Error(`Unsupported template dependency field: ${field}`);
 	}
 </script>
+
+<PageTitle title={'New app'} />
 
 <div class="min-h-screen space-y-6 pb-12">
 	<!-- Header -->

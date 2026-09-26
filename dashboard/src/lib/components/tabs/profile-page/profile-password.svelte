@@ -1,4 +1,5 @@
 <script lang="ts">
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
@@ -27,8 +28,8 @@
 
 <div class="rounded-lg border border-border bg-card p-4">
 	<div class="mb-4 flex items-center gap-2">
-		<KeyRound class="h-4 w-4 text-muted-foreground/70" />
-		<span class="font-mono text-[10px] tracking-wider text-muted-foreground/70 uppercase">
+		<KeyRound class="h-4 w-4 text-muted-foreground" />
+		<span class="font-mono text-[10px] tracking-wider text-muted-foreground uppercase">
 			CHANGE_PASSWORD
 		</span>
 	</div>
@@ -84,20 +85,14 @@
 			/>
 		</div>
 
-		{#if error}
-			<div
-				class="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive"
-			>
-				{error}
-			</div>
-		{/if}
+		<InlineError message={error} />
 
 		<div class="flex items-center gap-3">
 			<Button type="submit" disabled={saving}>
 				{saving ? 'Saving…' : 'Change Password'}
 			</Button>
 			{#if saved}
-				<span class="font-mono text-[10px] text-green-500">SAVED</span>
+				<span class="font-mono text-[10px] text-success">SAVED</span>
 			{/if}
 		</div>
 	</form>

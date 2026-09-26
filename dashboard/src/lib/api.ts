@@ -658,6 +658,16 @@ export interface ServerSettings {
 	preview_domain: string;
 }
 
+export interface LastDeployment {
+	id: string;
+	app_id: string;
+	app_name: string;
+	status: string;
+	trigger_source: string;
+	created_at: string;
+	finished_at: string | null;
+}
+
 export interface OnboardingStatus {
 	dashboard_domain: string;
 	is_fresh_install: boolean;
@@ -665,6 +675,14 @@ export interface OnboardingStatus {
 	has_apps: boolean;
 	has_databases: boolean;
 	has_cron_jobs: boolean;
+	/** A GitHub App is installed, or a GitLab token or registry credential exists. */
+	has_source_integration: boolean;
+	/** At least one deployment succeeded. */
+	has_successful_deploy: boolean;
+	/** At least one notification channel exists. */
+	has_notification_channel: boolean;
+	/** The newest deployment of any app. */
+	last_deployment: LastDeployment | null;
 	server_public_ip: string | null;
 	domain_status: {
 		configured: boolean;
@@ -1145,8 +1163,11 @@ export async function createAlertRule(data: {
 	name: string;
 	metric?: AlertMetric;
 	threshold?: number;
-	webhook_url: string;
+	/** Optional webhook ('' = none). A rule needs a webhook or at least one channel. */
+	webhook_url?: string;
 	events?: AlertEvent[];
+	/** Notification channels (integration ids) to link when the rule is created. */
+	integration_ids?: string[];
 }): Promise<AlertRule> {
 	return request<AlertRule>('/alerts', {
 		method: 'POST',
@@ -1173,6 +1194,19 @@ export async function updateAlertRule(
 
 export async function deleteAlertRule(id: string): Promise<void> {
 	await request(`/alerts/${id}`, { method: 'DELETE' });
+}
+
+export interface AlertChannelTestResult {
+	/** "webhook" or the integration kind ("slack", "email", …). */
+	kind: string;
+	name: string;
+	ok: boolean;
+	error: string | null;
+}
+
+/** Send a test message to every channel of a rule; one result per channel. */
+export async function testAlertRule(id: string): Promise<AlertChannelTestResult[]> {
+	return request<AlertChannelTestResult[]>(`/alerts/${id}/test`, { method: 'POST' });
 }
 
 // ── Audit Log (Phase 5.5) ──
@@ -1538,6 +1572,76 @@ export async function deleteCronJob(id: string): Promise<void> {
 
 export async function triggerCronJob(id: string): Promise<void> {
 	await request(`/cron/${id}/trigger`, { method: 'POST' });
+}
+
+export interface CronSchedulePreview {
+	/** Next run times as RFC 3339 UTC timestamps (up to `count`). */
+	next_runs: string[];
+	/** Time zone the schedule is evaluated in ("UTC" when none is set). */
+	timezone: string;
+}
+
+/** Validate a schedule and list its next runs, evaluated in `timezone` (IANA, empty = UTC). */
+export async function previewCronSchedule(
+	schedule: string,
+	timezone?: string | null,
+	count = 5
+): Promise<CronSchedulePreview> {
+	const params = new URLSearchParams({ schedule, count: String(count) });
+	if (timezone) params.set('timezone', timezone);
+	return request<CronSchedulePreview>(`/cron/schedule-preview?${params}`);
+}
+
+/**
+ * Wait for the next run of a cron job to finish, using the run stream (no
+ * polling). Calls `onDone` once, when a run completes or the stream closes,
+ * then closes the socket. Returns a cancel function.
+ */
+export function watchCronRunCompletion(id: string, onDone: () => void): () => void {
+	let settled = false;
+	const finish = () => {
+		if (settled) return;
+		settled = true;
+		onDone();
+		close();
+	};
+	const close = openRawStream(`/api/cron/${id}/runs/stream`, (frame) => {
+		if (frame?.type === 'run') finish();
+	}, finish);
+	return () => {
+		settled = true;
+		close();
+	};
+}
+
+function openRawStream(
+	wsUrl: string,
+	onFrame: (frame: any) => void,
+	onEnd: () => void
+): () => void {
+	const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+	let ws: WebSocket;
+	try {
+		ws = new WebSocket(`${protocol}://${window.location.host}${wsUrl}`);
+	} catch {
+		queueMicrotask(onEnd);
+		return () => {};
+	}
+	ws.onmessage = (ev) => {
+		try {
+			onFrame(JSON.parse(ev.data as string));
+		} catch {
+			// ignore non-JSON frames
+		}
+	};
+	ws.onerror = () => onEnd();
+	ws.onclose = () => onEnd();
+	return () => {
+		ws.onmessage = null;
+		ws.onerror = null;
+		ws.onclose = null;
+		ws.close();
+	};
 }
 
 export async function listCronJobRuns(

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import type { SessionInfo } from '$lib/api';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Badge } from '$lib/components/ui/badge/index.js';
@@ -43,8 +44,8 @@
 <div class="rounded-lg border border-border bg-card p-4">
 	<div class="mb-4 flex items-center justify-between">
 		<div class="flex items-center gap-2">
-			<Monitor class="h-4 w-4 text-muted-foreground/70" />
-			<span class="font-mono text-[10px] tracking-wider text-muted-foreground/70 uppercase">
+			<Monitor class="h-4 w-4 text-muted-foreground" />
+			<span class="font-mono text-[10px] tracking-wider text-muted-foreground uppercase">
 				ACTIVE_SESSIONS
 			</span>
 		</div>
@@ -61,23 +62,17 @@
 		{/if}
 	</div>
 
-	{#if error}
-		<div
-			class="mb-4 rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive"
-		>
-			{error}
-		</div>
-	{/if}
+	<InlineError message={error} />
 
 	{#if loading}
 		<div
-			class="py-8 text-center font-mono text-[11px] tracking-widest text-muted-foreground/70 uppercase"
+			class="py-8 text-center font-mono text-[11px] tracking-widest text-muted-foreground uppercase"
 		>
 			LOADING...
 		</div>
 	{:else if sessions.length === 0}
 		<div
-			class="py-8 text-center font-mono text-[11px] tracking-widest text-muted-foreground/70 uppercase"
+			class="py-8 text-center font-mono text-[11px] tracking-widest text-muted-foreground uppercase"
 		>
 			NO_ACTIVE_SESSIONS
 		</div>
@@ -91,7 +86,7 @@
 				>
 					<div class="min-w-0 flex-1 space-y-1">
 						<div class="flex items-center gap-2">
-							<User class="h-3.5 w-3.5 shrink-0 text-muted-foreground/70" />
+							<User class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
 							<span class="truncate font-mono text-xs">
 								{shortAgent(session.user_agent)}
 							</span>
@@ -101,7 +96,7 @@
 								</Badge>
 							{/if}
 						</div>
-						<div class="font-mono text-[10px] text-muted-foreground/60">
+						<div class="font-mono text-[10px] text-muted-foreground">
 							{session.ip_address ?? 'unknown IP'} · last used {formatDate(session.last_used_at)} · expires
 							{formatDate(session.expires_at)}
 						</div>

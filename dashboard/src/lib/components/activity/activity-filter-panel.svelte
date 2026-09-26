@@ -36,8 +36,8 @@
 
 <div class="rounded-lg border border-border bg-card p-4">
 	<div class="mb-4 flex items-center gap-2">
-		<Activity class="h-4 w-4 text-muted-foreground/70" />
-		<span class="font-mono text-[10px] tracking-wider text-muted-foreground/70 uppercase">
+		<Activity class="h-4 w-4 text-muted-foreground" />
+		<span class="font-mono text-[10px] tracking-wider text-muted-foreground uppercase">
 			FILTER_PARAMETERS
 		</span>
 	</div>

@@ -1,8 +1,8 @@
 <script lang="ts">
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { safeUrl } from '$lib/utils';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Badge } from '$lib/components/ui/badge/index.js';
-	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import type { PreviewDeployment } from '$lib/api';
 	import Github from '~icons/ri/github-fill';
 	import GitBranch from '~icons/ri/git-branch-line';
@@ -23,9 +23,7 @@
 </script>
 
 <div class="space-y-6 pt-4">
-	{#if error}
-		<ErrorAlert title="Error" description={error} />
-	{/if}
+	<InlineError message={error} />
 
 	<!-- Active previews list -->
 	{#if loading}
@@ -33,7 +31,7 @@
 	{:else if previews.length === 0}
 		<div class="rounded-lg border border-dashed py-12 text-center">
 			<p class="text-muted-foreground">No active preview deployments</p>
-			<p class="mt-1 text-sm text-muted-foreground/60">Create a preview deployment below</p>
+			<p class="mt-1 text-sm text-muted-foreground">Create a preview deployment below</p>
 		</div>
 	{:else}
 		<div class="rounded-md border">

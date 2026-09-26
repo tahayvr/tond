@@ -1,4 +1,5 @@
 <script lang="ts">
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { safeUrl } from '$lib/utils';
 	import {
 		listGitHubRepos,
@@ -181,9 +182,7 @@
 							<X class="h-3.5 w-3.5" />
 						</button>
 					</div>
-					{#if nameError}
-						<span class="text-[10px] text-destructive">{nameError}</span>
-					{/if}
+					<InlineError message={nameError} />
 				{:else}
 					<div class="flex items-center gap-1.5">
 						<span class="text-sm font-bold uppercase">{displayName}</span>

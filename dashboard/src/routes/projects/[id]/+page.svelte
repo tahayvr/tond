@@ -1,4 +1,5 @@
 <script lang="ts">
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { page } from '$app/state';
 	import { pollWhileVisible } from '$lib/polling';
 	import {
@@ -28,7 +29,6 @@
 		projectContext,
 		openFeedPanel
 	} from '$lib/ui-context.svelte';
-	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import ProjectBlueprint from '$lib/components/cards/project-blueprint/project-blueprint.svelte';
 	import Breadcrumb from '$lib/components/nav/breadcrumb.svelte';
 	import ConfirmDeleteDialog from '$lib/components/dialogs/confirm-delete-dialog.svelte';
@@ -252,9 +252,7 @@
 		items={[{ label: 'Projects', href: '/projects' }, { label: project?.name ?? 'Loading...' }]}
 	/>
 
-	{#if error}
-		<ErrorAlert title="Error" description={error} />
-	{/if}
+	<InlineError message={error} />
 
 	{#if project}
 		<!-- Blueprint diagram -->
@@ -316,9 +314,7 @@
 							<Input id="edit-desc" bind:value={editDescription} placeholder="Optional" />
 						</div>
 					</div>
-					{#if editError}
-						<p class="mt-3 text-sm text-destructive">{editError}</p>
-					{/if}
+					<InlineError message={editError} />
 				</Card.Content>
 				<Card.Footer class="flex justify-end gap-2">
 					<Button variant="outline" onclick={() => (editing = false)}>Cancel</Button>
@@ -357,13 +353,7 @@
 						<PreviewDomainRequiredAlert />
 					</div>
 				{/if}
-				{#if previewsError}
-					<div
-						class="mb-4 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive"
-					>
-						{previewsError}
-					</div>
-				{/if}
+				<InlineError message={previewsError} />
 
 				{#if previewsLoading && projectPreviews.length === 0}
 					<div class="py-8 text-center text-muted-foreground">Loading...</div>
@@ -371,7 +361,7 @@
 					<div class="rounded-lg border border-dashed py-10 text-center">
 						<p class="text-sm text-muted-foreground">No active preview environments</p>
 						{#if project.apps.length === 0}
-							<p class="mt-1 text-xs text-muted-foreground/60">
+							<p class="mt-1 text-xs text-muted-foreground">
 								Add member apps first before creating a preview
 							</p>
 						{:else if previewDomain}
@@ -419,7 +409,7 @@
 				{#if project.apps.length === 0}
 					<div class="rounded-lg border border-dashed py-8 text-center">
 						<p class="text-sm text-muted-foreground">No apps assigned yet.</p>
-						<p class="mt-1 text-xs text-muted-foreground/60">
+						<p class="mt-1 text-xs text-muted-foreground">
 							Create a new app or add from unassigned apps below
 						</p>
 					</div>

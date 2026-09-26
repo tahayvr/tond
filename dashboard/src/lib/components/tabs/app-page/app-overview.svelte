@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { safeUrl } from '$lib/utils';
-	import { Badge } from '$lib/components/ui/badge/index.js';
+	import StatusBadge from '$lib/components/feedback/status-badge.svelte';
 	import type { App } from '$lib/api';
 
 	interface Props {
@@ -22,14 +22,6 @@
 	const BUILD_METHOD_LABELS: Record<string, string> = {
 		tbuild: 'TBuild',
 		dockerfile: 'Dockerfile'
-	};
-
-	const STATUS_VARIANT: Record<string, 'default' | 'secondary' | 'destructive' | 'outline'> = {
-		running: 'default',
-		building: 'secondary',
-		stopped: 'outline',
-		failed: 'destructive',
-		pending: 'secondary'
 	};
 
 	let isGit = $derived(
@@ -62,15 +54,12 @@
 			<div class="space-y-1 text-sm">
 				<div class="flex items-center gap-2">
 					<span class="text-muted-foreground">State:</span>
-					<Badge variant={STATUS_VARIANT[app.status] ?? 'outline'} class="text-xs capitalize">
-						{app.status}
-					</Badge>
+					<StatusBadge status={app.status} kind="app" />
 					{#if app.health_consecutive_failures > 0}
-						<Badge variant="destructive" class="text-xs">
-							{app.health_consecutive_failures} health fail{app.health_consecutive_failures !== 1
-								? 's'
-								: ''}
-						</Badge>
+						<StatusBadge
+							status="failed"
+							label={`${app.health_consecutive_failures} failed health check${app.health_consecutive_failures !== 1 ? 's' : ''}`}
+						/>
 					{/if}
 				</div>
 				<div>
@@ -239,7 +228,7 @@
 				<div class="pt-1 sm:col-span-2">
 					<div class="text-muted-foreground">Volumes ({app.volumes.length}):</div>
 					{#each app.volumes as vol (vol.container_path)}
-						<div class="mt-0.5 truncate font-mono text-xs text-muted-foreground/80">
+						<div class="mt-0.5 truncate font-mono text-xs text-muted-foreground">
 							↳ {vol.host_path} → {vol.container_path}
 						</div>
 					{/each}

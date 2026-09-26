@@ -1,4 +1,5 @@
 <script lang="ts">
+	import PageTitle from '$lib/components/nav/page-title.svelte';
 	// GitHub redirects the browser back to Tond after creating or installing a
 	// GitHub App. That cross-site navigation doesn't carry the SameSite=Strict
 	// session cookie, so the server hands off to this page, which finishes the
@@ -34,6 +35,8 @@
 			});
 	});
 </script>
+
+<PageTitle title={'Connecting GitHub'} />
 
 <div class="flex min-h-[60vh] flex-col items-center justify-center gap-4 text-center">
 	<Github class="size-10 animate-pulse text-muted-foreground" />

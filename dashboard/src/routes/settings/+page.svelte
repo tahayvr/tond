@@ -2,6 +2,8 @@
 	import { updateSettings } from '$lib/api';
 	import { setUiContext, clearUiContext, projectsContext } from '$lib/ui-context.svelte';
 	import SettingsForm from '$lib/components/forms/settings-form.svelte';
+	import PageHeader from '$lib/components/nav/page-header.svelte';
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();
@@ -59,19 +61,9 @@
 </script>
 
 <div class="space-y-6">
-	<!-- Header -->
-	<div class="flex h-14 items-center justify-between">
-		<div>
-			<h2 class="text-3xl font-extrabold uppercase">Settings</h2>
-			<p class="font-mono text-xs tracking-wider text-muted-foreground/70">SYSTEM_CONFIGURATION</p>
-		</div>
-	</div>
+	<PageHeader title="Settings" description="Server name, dashboard domain and preview domain." />
 
-	{#if error}
-		<div class="rounded-md border border-destructive/50 bg-destructive/10 p-4 text-destructive">
-			{error}
-		</div>
-	{/if}
+	<InlineError message={error} ondismiss={() => (error = '')} />
 
 	<SettingsForm
 		bind:serverName

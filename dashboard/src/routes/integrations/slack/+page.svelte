@@ -1,4 +1,5 @@
 <script lang="ts">
+	import PageTitle from '$lib/components/nav/page-title.svelte';
 	import ChevronLeft from '~icons/ri/arrow-left-s-line';
 	import Webhook from '~icons/ri/webhook-line';
 	import { Input } from '$lib/components/ui/input/index.js';
@@ -33,6 +34,8 @@
 	});
 </script>
 
+<PageTitle title={'Slack · Integrations'} />
+
 <div class="space-y-8">
 	<div class="flex h-14 items-center gap-4">
 		<a href="/integrations" class="text-muted-foreground hover:text-foreground">
@@ -40,7 +43,7 @@
 		</a>
 		<div class="flex items-center gap-3">
 			<Webhook class="h-6 w-6" />
-			<h2 class="text-3xl font-extrabold uppercase">Slack / Mattermost</h2>
+			<h1 class="text-2xl font-extrabold sm:text-3xl">Slack / Mattermost</h1>
 		</div>
 	</div>
 

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import type { TotpSetup } from '$lib/api';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
@@ -50,19 +51,13 @@
 
 <div class="rounded-lg border border-border bg-card p-4">
 	<div class="mb-4 flex items-center gap-2">
-		<ShieldCheck class="h-4 w-4 text-muted-foreground/70" />
-		<span class="font-mono text-[10px] tracking-wider text-muted-foreground/70 uppercase">
+		<ShieldCheck class="h-4 w-4 text-muted-foreground" />
+		<span class="font-mono text-[10px] tracking-wider text-muted-foreground uppercase">
 			TWO_FACTOR_AUTH
 		</span>
 	</div>
 
-	{#if error}
-		<div
-			class="mb-4 rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive"
-		>
-			{error}
-		</div>
-	{/if}
+	<InlineError message={error} />
 
 	{#if phase === 'idle' && !enabled}
 		<!-- Not set up -->
@@ -117,7 +112,7 @@
 				height="180"
 			/>
 			<div>
-				<p class="mb-1 font-mono text-[10px] text-muted-foreground/70 uppercase">
+				<p class="mb-1 font-mono text-[10px] text-muted-foreground uppercase">
 					Manual entry key
 				</p>
 				<code class="rounded bg-muted px-2 py-1 font-mono text-xs tracking-widest select-all">
@@ -128,7 +123,7 @@
 
 		<div class="space-y-4">
 			<div>
-				<p class="mb-3 font-mono text-[10px] text-muted-foreground/70 uppercase">
+				<p class="mb-3 font-mono text-[10px] text-muted-foreground uppercase">
 					Enter code to confirm
 				</p>
 				<InputOTP.Root
@@ -163,7 +158,7 @@
 	{:else if phase === 'done'}
 		<!-- Just activated — show backup codes -->
 		<div
-			class="mb-6 rounded-md border border-yellow-500/30 bg-yellow-500/10 p-4 text-sm text-yellow-700 dark:text-yellow-400"
+			class="mb-6 rounded-md border border-warn/30 bg-warn/10 p-4 text-sm text-warn"
 		>
 			<p class="mb-1 font-semibold">Save these backup codes</p>
 			<p class="text-xs">
@@ -185,8 +180,8 @@
 		</div>
 
 		<div class="flex items-center gap-3">
-			<ShieldCheck class="h-4 w-4 text-green-500" />
-			<span class="font-mono text-xs text-green-500">2FA ENABLED</span>
+			<ShieldCheck class="h-4 w-4 text-success" />
+			<span class="font-mono text-xs text-success">2FA ENABLED</span>
 			<Button variant="outline" size="sm" class="ml-auto" onclick={onShowDisable}>
 				Disable 2FA
 			</Button>
@@ -194,8 +189,8 @@
 	{:else if enabled && phase !== 'disable'}
 		<!-- Enabled, steady state -->
 		<div class="mb-4 flex items-center gap-3">
-			<ShieldCheck class="h-4 w-4 text-green-500" />
-			<span class="font-mono text-xs text-green-500">2FA ENABLED</span>
+			<ShieldCheck class="h-4 w-4 text-success" />
+			<span class="font-mono text-xs text-success">2FA ENABLED</span>
 		</div>
 		<p class="mb-4 text-sm text-muted-foreground">
 			Your account is protected with a time-based one-time password.

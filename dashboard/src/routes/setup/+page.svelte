@@ -1,4 +1,5 @@
 <script lang="ts">
+	import PageTitle from '$lib/components/nav/page-title.svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { checkSetupToken, setupAdmin } from '$lib/api';
@@ -89,6 +90,8 @@
 	}
 </script>
 
+<PageTitle title={'Set up'} />
+
 <div class="flex min-h-[80vh] flex-col items-center justify-center px-4">
 	<div class="w-full max-w-lg space-y-8 font-mono">
 		<div class="flex flex-col items-center gap-4">
@@ -131,7 +134,7 @@
 							placeholder="64-character token"
 							autocomplete="off"
 							spellcheck={false}
-							class="border-none bg-transparent p-1 font-mono text-sm shadow-none placeholder:text-muted-foreground/40 focus-visible:ring-0"
+							class="border-none bg-transparent p-1 font-mono text-sm shadow-none placeholder:text-muted-foreground focus-visible:ring-2"
 						/>
 					</div>
 					<div class="h-px bg-border"></div>
@@ -161,7 +164,7 @@
 							placeholder="admin@example.com"
 							required
 							autocomplete="email"
-							class="border-none bg-transparent p-1 font-mono text-sm shadow-none placeholder:text-muted-foreground/40 focus-visible:ring-0"
+							class="border-none bg-transparent p-1 font-mono text-sm shadow-none placeholder:text-muted-foreground focus-visible:ring-2"
 						/>
 					</div>
 					<div class="h-px bg-border"></div>
@@ -179,7 +182,7 @@
 							required
 							minlength={12}
 							autocomplete="new-password"
-							class="border-none bg-transparent p-1 font-mono text-sm shadow-none placeholder:text-muted-foreground/40 focus-visible:ring-0"
+							class="border-none bg-transparent p-1 font-mono text-sm shadow-none placeholder:text-muted-foreground focus-visible:ring-2"
 						/>
 					</div>
 					<div class="h-px bg-border"></div>
@@ -188,7 +191,7 @@
 							{#each requirements as req (req.label)}
 								<li
 									class="text-xs {req.met
-										? 'text-green-600 dark:text-green-500'
+										? 'text-success'
 										: 'text-muted-foreground'}"
 								>
 									{req.met ? '✓' : '○'}
@@ -213,7 +216,7 @@
 							required
 							minlength={12}
 							autocomplete="new-password"
-							class="border-none bg-transparent p-1 font-mono text-sm shadow-none placeholder:text-muted-foreground/40 focus-visible:ring-0"
+							class="border-none bg-transparent p-1 font-mono text-sm shadow-none placeholder:text-muted-foreground focus-visible:ring-2"
 						/>
 					</div>
 					<div class="h-px bg-border"></div>

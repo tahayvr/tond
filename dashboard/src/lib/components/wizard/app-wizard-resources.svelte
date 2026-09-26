@@ -92,7 +92,7 @@
 					<div class="flex items-center gap-2 rounded border border-border bg-muted p-3">
 						<div class="flex-1 font-mono text-xs">
 							<div class="text-muted-foreground">Container: {volume.container_path}</div>
-							<div class="text-muted-foreground/70">Stored in: {volumeDir(volume)}</div>
+							<div class="text-muted-foreground">Stored in: {volumeDir(volume)}</div>
 						</div>
 						<Button
 							variant="ghost"

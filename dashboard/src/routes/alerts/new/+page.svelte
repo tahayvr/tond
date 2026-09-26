@@ -1,11 +1,14 @@
 <script lang="ts">
+	import PageTitle from '$lib/components/nav/page-title.svelte';
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { goto } from '$app/navigation';
 	import {
 		createAlertRule,
 		ALERT_GROUPS,
 		type App,
 		type AlertMetric,
-		type AlertEvent
+		type AlertEvent,
+		type Integration
 	} from '$lib/api';
 	import { SvelteSet } from 'svelte/reactivity';
 	import { Button } from '$lib/components/ui/button/index.js';
@@ -23,6 +26,8 @@
 	let loading = $state(false);
 	let error = $state('');
 	let apps = $derived(data.apps as App[]);
+	let channels = $derived((data.integrations ?? []) as Integration[]);
+	let selectedChannels = new SvelteSet<string>();
 
 	let name = $state('');
 	let selectedGroupId = $state(ALERT_GROUPS[0].id);
@@ -34,6 +39,7 @@
 	let selectedEvents = new SvelteSet<AlertEvent>();
 	let selectedAppId = $state('');
 	let webhookUrl = $state('');
+	let hasRecipient = $derived(selectedChannels.size > 0 || webhookUrl.trim() !== '');
 
 	// Derived: the current group object
 	let currentGroup = $derived(
@@ -100,6 +106,10 @@
 			error = 'Please select at least one event';
 			return;
 		}
+		if (!hasRecipient) {
+			error = 'Choose at least one notification channel or add a webhook URL, so this rule notifies someone.';
+			return;
+		}
 		error = '';
 		loading = true;
 		try {
@@ -110,9 +120,10 @@
 					: {}),
 				...(selectedAppId ? { app_id: selectedAppId } : {}),
 				...(selectedEvents.size > 0 ? { events: [...selectedEvents] } : {}),
-				webhook_url: webhookUrl.trim()
+				webhook_url: webhookUrl.trim(),
+				integration_ids: [...selectedChannels]
 			});
-			goto(`/alerts/${created.id}`);
+			goto(`/alerts/${created.id}`, { invalidateAll: true });
 		} catch (e: any) {
 			error = e.message ?? 'Failed to create alert rule';
 			loading = false;
@@ -120,19 +131,15 @@
 	}
 </script>
 
-<div class="space-y-6 pb-12">
-	<Breadcrumb items={[{ label: 'Alerts', href: '/alerts' }, { label: 'New Alert Rule' }]} />
+<PageTitle title={'New alert rule'} />
 
-	{#if error}
-		<div
-			class="rounded-md border border-destructive/50 bg-destructive/10 p-4 text-sm text-destructive"
-		>
-			{error}
-		</div>
-	{/if}
+<div class="space-y-6 pb-12">
+	<Breadcrumb items={[{ label: 'Alerts', href: '/alerts' }, { label: 'New alert rule' }]} />
+
+	<InlineError message={error} />
 
 	<div class="space-y-1">
-		<h2 class="text-3xl font-extrabold uppercase">New Alert Rule</h2>
+		<h1 class="text-2xl font-extrabold sm:text-3xl">New alert rule</h1>
 		<p class="text-sm text-muted-foreground">
 			Get notified when a metric crosses a threshold or an event occurs.
 		</p>
@@ -147,7 +154,7 @@
 
 		<!-- Group / Category -->
 		<div class="grid gap-2">
-			<Label>Category</Label>
+			<Label for="alert-category">Category</Label>
 			<Select.Root
 				type="single"
 				value={selectedGroupId}
@@ -155,7 +162,7 @@
 					if (v) handleGroupChange(v);
 				}}
 			>
-				<Select.Trigger class="w-full">
+				<Select.Trigger id="alert-category" class="w-full">
 					{currentGroup.label}
 				</Select.Trigger>
 				<Select.Content>
@@ -169,7 +176,7 @@
 		<!-- Metric picker (only for groups with metrics) -->
 		{#if hasMetrics}
 			<div class="grid gap-2">
-				<Label>Metric</Label>
+				<Label for="alert-metric">Metric</Label>
 				<Select.Root
 					type="single"
 					value={selectedMetric || ''}
@@ -177,7 +184,7 @@
 						if (v) handleMetricChange(v);
 					}}
 				>
-					<Select.Trigger class="w-full">
+					<Select.Trigger id="alert-metric" class="w-full">
 						{currentMetric?.label ?? 'Select metric'}
 					</Select.Trigger>
 					<Select.Content>
@@ -215,7 +222,7 @@
 
 			<!-- App scope (for metric groups) -->
 			<div class="grid gap-2">
-				<Label>
+				<Label for="alert-app">
 					App
 					{#if !requiresApp}
 						<span class="text-muted-foreground">(optional)</span>
@@ -228,7 +235,7 @@
 						selectedAppId = v === '__global__' ? '' : (v ?? '');
 					}}
 				>
-					<Select.Trigger class="w-full">
+					<Select.Trigger id="alert-app" class="w-full">
 						{#if selectedAppId}
 							{apps.find((a) => a.id === selectedAppId)?.name ?? selectedAppId.slice(0, 8)}
 						{:else}
@@ -255,8 +262,8 @@
 
 		<!-- Event checkboxes (only for groups with events) -->
 		{#if hasEvents}
-			<div class="grid gap-2">
-				<Label>Events</Label>
+			<fieldset class="grid gap-2">
+				<legend class="text-sm font-medium">Events</legend>
 				<div class="space-y-2 rounded border border-border p-3">
 					{#each currentGroup.events as ev (ev.value)}
 						<div class="flex items-center gap-2">
@@ -272,43 +279,76 @@
 				<p class="text-xs text-muted-foreground">
 					Alert fires when any of the selected events occur.
 				</p>
-			</div>
+			</fieldset>
 		{/if}
 
-		<!-- Webhook URL -->
-		<div class="grid gap-2">
-			<Label for="webhook">
-				Webhook URL
-				<span class="text-muted-foreground">(optional)</span>
-			</Label>
-			<Input
-				id="webhook"
-				type="url"
-				bind:value={webhookUrl}
-				placeholder="https://hooks.example.com/alert"
-				class="font-mono text-sm"
-			/>
-			<p class="text-xs text-muted-foreground">
-				A POST request with the alert payload will be sent to this URL when the rule fires. After
-				creating the rule, link Telegram, Discord, Slack, or Email channels from the rule's Settings
-				tab.
+		<!-- Recipients: at least one channel or a webhook -->
+		<fieldset class="grid gap-3" aria-describedby="recipients-help">
+			<legend class="text-sm font-medium">Notify</legend>
+			<p id="recipients-help" class="text-xs text-muted-foreground">
+				Pick at least one channel or add a webhook, so this rule always reaches someone. You can
+				send a test after creating it.
 			</p>
-		</div>
+			{#if channels.length === 0}
+				<div class="rounded-sm border border-dashed p-3 text-sm">
+					<p>No notification channels yet.</p>
+					<p class="mt-1 text-xs text-muted-foreground">
+						<a href="/integrations" class="underline underline-offset-2">Add Slack, Discord, Telegram or email</a>
+						, or use a webhook below.
+					</p>
+				</div>
+			{:else}
+				<div class="space-y-2 rounded-sm border p-3">
+					{#each channels as channel (channel.id)}
+						<div class="flex items-center gap-2">
+							<Checkbox
+								id={`channel-${channel.id}`}
+								checked={selectedChannels.has(channel.id)}
+								disabled={!channel.enabled}
+								onCheckedChange={(checked) => {
+									if (checked) selectedChannels.add(channel.id);
+									else selectedChannels.delete(channel.id);
+								}}
+							/>
+							<label for={`channel-${channel.id}`} class="flex flex-1 items-center justify-between gap-2 text-sm">
+								<span>{channel.name}</span>
+								<span class="text-xs text-muted-foreground">
+									{channel.enabled ? channel.kind : `${channel.kind} (switched off)`}
+								</span>
+							</label>
+						</div>
+					{/each}
+				</div>
+			{/if}
+
+			<div class="grid gap-2">
+				<Label for="webhook">
+					Webhook URL
+					<span class="text-muted-foreground">(optional)</span>
+				</Label>
+				<Input
+					id="webhook"
+					type="url"
+					bind:value={webhookUrl}
+					placeholder="https://hooks.example.com/alert"
+					class="font-mono text-sm"
+				/>
+				<p class="text-xs text-muted-foreground">Tond POSTs the alert as JSON to this URL.</p>
+			</div>
+		</fieldset>
 	</div>
 
 	<div>
-		<Button
-			onclick={handleCreate}
-			disabled={loading}
-			variant="outline"
-			class="border-success text-success"
-		>
+		<Button onclick={handleCreate} disabled={loading || !hasRecipient} aria-busy={loading}>
 			{#if loading}
-				<span class="animate-pulse">Creating...</span>
+				Creating…
 			{:else}
 				<Bell class="mr-2 h-4 w-4" />
-				Create Alert Rule
+				Create alert rule
 			{/if}
 		</Button>
+		{#if !hasRecipient}
+			<p class="mt-2 text-xs text-muted-foreground">Choose a channel or add a webhook to continue.</p>
+		{/if}
 	</div>
 </div>

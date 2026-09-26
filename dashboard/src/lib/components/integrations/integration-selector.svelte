@@ -1,4 +1,5 @@
 <script lang="ts">
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import {
 		listIntegrations,
 		listAlertIntegrations,
@@ -87,17 +88,12 @@
 </script>
 
 <div class="grid gap-2">
+	<InlineError message={error} ondismiss={() => (error = '')} />
 	{#if loading}
 		<p class="font-mono text-xs text-muted-foreground">Loading integrations...</p>
-	{:else if error}
-		<div
-			class="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-xs text-destructive"
-		>
-			{error}
-		</div>
 	{:else if integrations.length === 0}
 		<div
-			class="flex items-start gap-2 rounded border border-dashed border-border/60 p-3 opacity-60"
+			class="flex items-start gap-2 rounded border border-dashed p-3"
 		>
 			<Plug class="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
 			<div>
@@ -123,7 +119,7 @@
 					<label
 						for={`int-${integration.id}`}
 						class="flex flex-1 cursor-pointer items-center justify-between gap-2 text-sm"
-						class:opacity-40={!integration.enabled}
+						class:text-muted-foreground={!integration.enabled}
 					>
 						<span>{integration.name}</span>
 						<span class="font-mono text-xs text-muted-foreground uppercase">
@@ -134,9 +130,10 @@
 			{/each}
 		</div>
 		<p class="text-xs text-muted-foreground">
-			Selected channels will receive a notification when this rule fires.
+			Selected channels get a message when this rule fires. A rule always keeps at least one channel
+			or a webhook.
 			{#if integrations.some((i) => !i.enabled)}
-				<span class="opacity-60">Disabled integrations cannot be selected.</span>
+				<span>Switched-off channels can't be selected.</span>
 			{/if}
 		</p>
 	{/if}

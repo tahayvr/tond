@@ -43,9 +43,9 @@
 				<Icon class="h-8 w-8" />
 			</div>
 			{#if status === 'connected'}
-				<Badge variant="outline" class="border-green-500 text-green-500">Connected</Badge>
+				<Badge variant="outline" class="border-success text-success">Connected</Badge>
 			{:else if status === 'loading'}
-				<Badge variant="outline" class="border-yellow-500 text-yellow-500">Connecting…</Badge>
+				<Badge variant="outline" class="border-warn text-warn">Connecting…</Badge>
 			{:else}
 				<Badge variant="outline" class="text-muted-foreground">Not Connected</Badge>
 			{/if}

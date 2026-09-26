@@ -1,4 +1,5 @@
 <script lang="ts">
+	import PageTitle from '$lib/components/nav/page-title.svelte';
 	import { login } from '$lib/api';
 	import { getSessionExpired, setAuthenticated } from '$lib/auth.svelte';
 	import { Button } from '$lib/components/ui/button/index.js';
@@ -37,6 +38,8 @@
 	}
 </script>
 
+<PageTitle title={'Sign in'} />
+
 <div class="flex min-h-[80vh] flex-col items-center justify-center">
 	<div class="w-full max-w-lg space-y-8 font-mono">
 		<div class="flex flex-col items-center gap-4">
@@ -66,7 +69,7 @@
 						placeholder="admin@example.com"
 						required
 						autocomplete="email"
-						class="border-none bg-transparent p-1 font-mono text-sm shadow-none placeholder:text-muted-foreground/40 focus-visible:ring-0"
+						class="border-none bg-transparent p-1 font-mono text-sm shadow-none placeholder:text-muted-foreground focus-visible:ring-2"
 					/>
 				</div>
 				<div class="h-px bg-border"></div>
@@ -83,7 +86,7 @@
 						placeholder="enter password"
 						required
 						autocomplete="current-password"
-						class="border-none bg-transparent p-1 font-mono text-sm shadow-none placeholder:text-muted-foreground/40 focus-visible:ring-0"
+						class="border-none bg-transparent p-1 font-mono text-sm shadow-none placeholder:text-muted-foreground focus-visible:ring-2"
 					/>
 				</div>
 				<div class="h-px bg-border"></div>

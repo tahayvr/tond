@@ -1,4 +1,6 @@
 <script lang="ts">
+	import SuccessAlert from '$lib/components/feedback/success-alert.svelte';
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { page } from '$app/state';
 	import {
 		getCronJob,
@@ -7,6 +9,7 @@
 		triggerCronJob,
 		listCronJobRuns,
 		listProjects,
+		watchCronRunCompletion,
 		type CronJob,
 		type CronJobRun,
 		type Project
@@ -26,23 +29,29 @@
 		cronJobContext,
 		openFeedPanel
 	} from '$lib/ui-context.svelte';
-	import { Badge } from '$lib/components/ui/badge/index.js';
+	import StatusBadge from '$lib/components/feedback/status-badge.svelte';
+	import PageHeader from '$lib/components/nav/page-header.svelte';
+	import LinkTabs from '$lib/components/nav/link-tabs.svelte';
+	import ScheduleField from '$lib/components/forms/schedule-field.svelte';
+	import ConfirmDialog from '$lib/components/dialogs/confirm-dialog.svelte';
+	import { confirmAction } from '$lib/confirm.svelte';
+	import { useAction } from '$lib/action.svelte';
+	import { describeCron } from '$lib/cron-schedule';
+	import { CRON_TABS, tabFromUrl, tabHref, type CronTab } from '$lib/tabs';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
 	import { Separator } from '$lib/components/ui/separator/index.js';
-	import * as Tabs from '$lib/components/ui/tabs/index.js';
 	import * as Dialog from '$lib/components/ui/dialog/index.js';
 	import * as Select from '$lib/components/ui/select/index.js';
 	import Breadcrumb from '$lib/components/nav/breadcrumb.svelte';
-	import ConfirmDeleteDialog from '$lib/components/dialogs/confirm-delete-dialog.svelte';
-	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import Play from '~icons/ri/play-line';
 	import RotateCw from '~icons/ri/restart-line';
 	import ChevronDown from '~icons/ri/arrow-down-s-line';
 	import ChevronRight from '~icons/ri/arrow-right-s-line';
 	import Plus from '~icons/ri/add-line';
 	import Trash2 from '~icons/ri/delete-bin-line';
+	import { untrack } from 'svelte';
 	import type { PageProps } from './$types';
 
 	let { data, params }: PageProps = $props();
@@ -56,6 +65,10 @@
 	let showDeleteDialog = $state(false);
 	let triggering = $state(false);
 	let triggerError = $state('');
+	let triggerNotice = $state('');
+	/** Cancels the "wait for the manual run to finish" stream. */
+	let stopWatchingRun: (() => void) | null = null;
+	let tab = $derived<CronTab>(tabFromUrl(page.url, CRON_TABS, 'overview'));
 
 	// Runs tab
 	let runs = $state<CronJobRun[]>([]);
@@ -173,13 +186,22 @@
 	}
 
 	async function handleTrigger() {
+		if (triggering) return;
 		triggering = true;
 		triggerError = '';
+		triggerNotice = '';
 		try {
 			openFeedPanel();
 			await triggerCronJob(jobId);
-			await refreshJobData();
-			await loadRuns();
+			await Promise.all([refreshJobData(), loadRuns()]);
+			triggerNotice = 'Run started. This page updates when it finishes.';
+			// Refresh status and history when the run completes (event-driven, no polling).
+			stopWatchingRun?.();
+			stopWatchingRun = watchCronRunCompletion(jobId, async () => {
+				stopWatchingRun = null;
+				await Promise.all([refreshJobData(), loadRuns()]);
+				triggerNotice = `Run finished: ${job?.last_run_status ?? 'done'}.`;
+			});
 		} catch (e: any) {
 			triggerError = e.message ?? 'Failed to trigger job';
 		} finally {
@@ -187,23 +209,34 @@
 		}
 	}
 
-	async function handleToggleEnabled() {
+	const toggleEnabled = useAction(async () => {
 		if (!job) return;
-		try {
-			job = await updateCronJob(jobId, { enabled: !job.enabled });
-			setUiContext(cronJobContext(job));
-		} catch (e: any) {
-			error = e.message ?? 'Failed to update job';
-		}
+		job = await updateCronJob(jobId, { enabled: !job.enabled });
+		setUiContext(cronJobContext(job));
+	});
+
+	function handleToggleEnabled() {
+		if (!job) return;
+		if (!job.enabled) return toggleEnabled.run();
+		return confirmAction({
+			title: `Pause ${job.name}?`,
+			description: 'Scheduled runs stop until you enable the job again. Run history is kept.',
+			confirmLabel: 'Pause job',
+			pendingLabel: 'Pausing…',
+			destructive: false,
+			onconfirm: async () => {
+				const current = job;
+				if (!current) return;
+				job = await updateCronJob(jobId, { enabled: false });
+				setUiContext(cronJobContext(job));
+			}
+		});
 	}
 
+	// Throws so ConfirmDialog shows the error inside the dialog.
 	async function handleDelete() {
-		try {
-			await deleteCronJob(jobId);
-			goto('/cron');
-		} catch (e: any) {
-			error = e.message ?? 'Failed to delete job';
-		}
+		await deleteCronJob(jobId);
+		goto('/cron', { invalidateAll: true });
 	}
 
 	async function handleSaveSettings() {
@@ -266,45 +299,6 @@
 		} catch {
 			return raw;
 		}
-	}
-
-	function statusVariant(
-		status: string
-	): 'default' | 'secondary' | 'destructive' | 'outline' | undefined {
-		switch (status) {
-			case 'success':
-				return 'default';
-			case 'failed':
-				return 'destructive';
-			case 'running':
-				return 'secondary';
-			default:
-				return 'outline';
-		}
-	}
-
-	function jobStatusVariant(
-		j: CronJob
-	): 'default' | 'secondary' | 'destructive' | 'outline' | undefined {
-		if (!j.enabled) return 'secondary';
-		switch (j.status) {
-			case 'idle':
-				return 'outline';
-			case 'running':
-				return 'default';
-			case 'failed':
-				return 'destructive';
-			default:
-				return 'outline';
-		}
-	}
-
-	function lastRunStatusVariant(
-		s: string | null
-	): 'default' | 'secondary' | 'destructive' | 'outline' | undefined {
-		if (s === 'success') return 'default';
-		if (s === 'failed') return 'destructive';
-		return 'outline';
 	}
 
 	function formatDuration(run: CronJobRun): string {
@@ -405,8 +399,14 @@
 		settingsVolumes = settingsVolumes.filter((_, i) => i !== idx);
 	}
 
+	// Re-seed local state when the route data changes. Only `data` is tracked:
+	// reading `job` after assigning it would re-run this effect forever.
 	$effect(() => {
 		const routeData = data as CronJobDetailData;
+		untrack(() => seedFromRoute(routeData));
+	});
+
+	function seedFromRoute(routeData: CronJobDetailData) {
 		job = routeData.job;
 		projects = routeData.projects;
 		if (job) {
@@ -426,87 +426,79 @@
 			settingsProjectId = job.project_id;
 			setUiContext(cronJobContext(job));
 		}
+	}
+
+	// Load the run history whenever the Runs tab is opened.
+	$effect(() => {
+		if (tab !== 'runs') return;
+		void jobId;
+		untrack(() => loadRuns());
 	});
 
 	$effect(() => {
-		return () => clearUiContext();
+		return () => {
+			stopWatchingRun?.();
+			clearUiContext();
+		};
 	});
 </script>
 
 {#if job}
+	{@const current = job}
 	<div class="space-y-6">
 		<!-- Breadcrumb -->
-		<Breadcrumb items={[{ label: 'Cron Jobs', href: '/cron' }, { label: job.name }]} />
+		<Breadcrumb items={[{ label: 'Cron jobs', href: '/cron' }, { label: job.name }]} />
 
-		<!-- Error banner -->
-		{#if error}
-			<ErrorAlert title="Error" description={error} />
-		{/if}
-
-		<!-- Header -->
-		<div class="flex h-14 items-center justify-between">
-			<div>
-				<h2 class="text-3xl font-extrabold uppercase">{job.name}</h2>
-				<div class="mt-2 flex items-center gap-3 text-sm text-muted-foreground">
-					<Badge variant={jobStatusVariant(job)} class="capitalize">
-						{job.enabled ? job.status : 'disabled'}
-					</Badge>
-					{#if job.last_run_status}
-						<Badge variant={lastRunStatusVariant(job.last_run_status)} class="text-xs capitalize">
-							last: {job.last_run_status}
-						</Badge>
-					{/if}
-					<span class="font-mono text-xs">{job.schedule}</span>
-					<span class="truncate font-mono text-xs">{job.image}</span>
-				</div>
-			</div>
-			<div class="flex gap-2">
+		<PageHeader title={job.name} section={CRON_TABS.find((t) => t.id === tab)?.label}>
+			{#snippet meta()}
+				{#if current.enabled}
+					<StatusBadge status={current.status} kind="run" />
+				{:else}
+					<StatusBadge status="paused" />
+				{/if}
+				{#if current.last_run_status}
+					<span class="flex items-center gap-1.5">
+						Last run <StatusBadge status={current.last_run_status} kind="run" size="sm" />
+					</span>
+				{/if}
+				<span>{describeCron(current.schedule).text}{current.timezone ? ` (${current.timezone})` : ' (UTC)'}</span>
+			{/snippet}
+			{#snippet actions()}
 				<Button
 					variant="outline"
 					size="sm"
 					onclick={handleToggleEnabled}
-					class={job.enabled
-						? 'border-destructive/50 text-destructive hover:border-destructive hover:text-destructive'
-						: ''}
+					disabled={toggleEnabled.pending}
 				>
-					{job.enabled ? 'Disable' : 'Enable'}
+					{current.enabled ? 'Pause' : toggleEnabled.pending ? 'Enabling…' : 'Enable'}
 				</Button>
-				<Button variant="outline" size="sm" onclick={handleTrigger} disabled={triggering}>
+				<Button size="sm" onclick={handleTrigger} disabled={triggering} aria-busy={triggering}>
 					{#if triggering}
-						<RotateCw class="mr-1 h-4 w-4 animate-spin" />
-						Triggering...
+						<RotateCw class="mr-1 h-4 w-4 animate-spin motion-reduce:animate-none" />
+						Starting…
 					{:else}
 						<Play class="mr-1 h-4 w-4" />
-						Run Now
+						Run now
 					{/if}
 				</Button>
-				<Button variant="destructive" size="sm" onclick={() => (showDeleteDialog = true)}>
-					Delete
-				</Button>
-			</div>
-		</div>
+			{/snippet}
+		</PageHeader>
 
-		{#if triggerError}
-			<div class="rounded-md bg-destructive/10 p-3 text-sm text-destructive">{triggerError}</div>
-		{/if}
+		<InlineError message={error} ondismiss={() => (error = '')} />
+		<InlineError title="Couldn't start the run" message={triggerError} ondismiss={() => (triggerError = '')} />
+		<InlineError message={toggleEnabled.error} ondismiss={toggleEnabled.clear} />
+		<SuccessAlert message={triggerNotice} ondismiss={() => (triggerNotice = '')} />
 
-		<Separator />
+		<LinkTabs
+			label="Cron job sections"
+			tabs={CRON_TABS}
+			active={tab}
+			href={(id) => tabHref(page.url.pathname, id, 'overview')}
+		/>
 
-		<!-- Tabs -->
-		<Tabs.Root
-			value="overview"
-			onValueChange={(v) => {
-				if (v === 'runs') loadRuns();
-			}}
-		>
-			<Tabs.List>
-				<Tabs.Trigger value="overview">Overview</Tabs.Trigger>
-				<Tabs.Trigger value="runs">Runs</Tabs.Trigger>
-				<Tabs.Trigger value="settings">Settings</Tabs.Trigger>
-			</Tabs.List>
-
+		<div>
 			<!-- Overview tab -->
-			<Tabs.Content value="overview">
+			{#if tab === 'overview'}
 				<div class="space-y-4 pt-4">
 					<div class="grid gap-4 sm:grid-cols-2">
 						<!-- Status -->
@@ -519,19 +511,16 @@
 							<div class="space-y-1 text-sm">
 								<div class="flex items-center gap-2">
 									<span class="text-muted-foreground">State:</span>
-									<Badge variant={jobStatusVariant(job)} class="text-xs capitalize">
-										{job.enabled ? job.status : 'disabled'}
-									</Badge>
+									{#if job.enabled}
+										<StatusBadge status={job.status} kind="run" />
+									{:else}
+										<StatusBadge status="paused" />
+									{/if}
 								</div>
 								{#if job.last_run_status}
 									<div class="flex items-center gap-2">
 										<span class="text-muted-foreground">Last Outcome:</span>
-										<Badge
-											variant={lastRunStatusVariant(job.last_run_status)}
-											class="text-xs capitalize"
-										>
-											{job.last_run_status}
-										</Badge>
+										<StatusBadge status={job.last_run_status} kind="run" />
 									</div>
 								{/if}
 								<div>
@@ -685,10 +674,10 @@
 						</div>
 					</div>
 				</div>
-			</Tabs.Content>
+			{/if}
 
 			<!-- Runs tab -->
-			<Tabs.Content value="runs">
+			{#if tab === 'runs'}
 				<div class="space-y-4 pt-4">
 					<div class="flex items-center justify-between">
 						<h3 class="text-sm font-medium">Run History</h3>
@@ -700,9 +689,7 @@
 						</Button>
 					</div>
 
-					{#if runsError}
-						<ErrorAlert title="Error" description={runsError} />
-					{/if}
+					<InlineError message={runsError} />
 
 					{#if runsLoading && runs.length === 0}
 						<div class="py-8 text-center text-sm text-muted-foreground">Loading...</div>
@@ -725,11 +712,9 @@
 										{:else}
 											<ChevronRight class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
 										{/if}
-										<Badge variant={statusVariant(run.status)} class="w-16 justify-center text-xs">
-											{run.status}
-										</Badge>
+										<StatusBadge status={run.status} kind="run" size="sm" />
 										{#if run.attempt > 1}
-											<span class="font-mono text-[10px] text-muted-foreground/60 uppercase">
+											<span class="font-mono text-[10px] text-muted-foreground uppercase">
 												attempt {run.attempt}
 											</span>
 										{/if}
@@ -779,23 +764,19 @@
 						{/if}
 					{/if}
 				</div>
-			</Tabs.Content>
+			{/if}
 
 			<!-- Settings tab -->
-			<Tabs.Content value="settings">
+			{#if tab === 'settings'}
 				<div class="space-y-6 pt-4">
-					{#if settingsError}
-						<ErrorAlert title="Error" description={settingsError} />
-					{/if}
+					<InlineError message={settingsError} />
 					{#if !isAdmin()}
 						<div class="rounded-md border bg-muted/30 p-3 text-sm text-muted-foreground">
 							Only admins can change cron job settings, because a job runs any image and command on
 							this server.
 						</div>
 					{/if}
-					{#if settingsSuccess}
-						<div class="rounded-md bg-success/10 p-3 text-sm text-success">{settingsSuccess}</div>
-					{/if}
+					<SuccessAlert message={settingsSuccess} />
 
 					<div class="grid max-w-xl gap-4">
 						<!-- Name -->
@@ -839,36 +820,11 @@
 							<p class="text-xs text-muted-foreground">Associate with a project (optional).</p>
 						</div>
 
-						<div class="grid gap-2">
-							<Label for="settings-schedule">Schedule (cron expression)</Label>
-							<Input
-								id="settings-schedule"
-								type="text"
-								bind:value={settingsSchedule}
-								placeholder="0 * * * *"
-								class="font-mono"
-							/>
-							<p class="text-xs text-muted-foreground">
-								5-field cron expression. e.g. <span class="font-mono">0 * * * *</span> = every hour.
-							</p>
-						</div>
-
-						<!-- Timezone -->
-						<div class="grid gap-2">
-							<Label for="settings-timezone">
-								Timezone <span class="text-muted-foreground">(optional)</span>
-							</Label>
-							<Input
-								id="settings-timezone"
-								type="text"
-								bind:value={settingsTimezone}
-								placeholder="America/New_York"
-								class="font-mono"
-							/>
-							<p class="text-xs text-muted-foreground">
-								IANA timezone for schedule evaluation. Leave empty to use UTC.
-							</p>
-						</div>
+						<ScheduleField
+							bind:schedule={settingsSchedule}
+							bind:timezone={settingsTimezone}
+							idPrefix="settings-schedule"
+						/>
 
 						<div class="grid gap-2">
 							<Label for="settings-image">Docker Image</Label>
@@ -1044,9 +1000,7 @@
 													onkeydown={handleEnvKeydown}
 												/>
 											</div>
-											{#if envDialogError}
-												<p class="text-xs text-destructive">{envDialogError}</p>
-											{/if}
+											<InlineError message={envDialogError} />
 										</div>
 										<Dialog.Footer>
 											<Button variant="outline" onclick={() => (envDialogOpen = false)}>
@@ -1153,9 +1107,7 @@
 											bind:name={volName}
 											bind:containerPath={volContainerPath}
 										/>
-										{#if volDialogError}
-											<p class="text-xs text-destructive">{volDialogError}</p>
-										{/if}
+										<InlineError message={volDialogError} />
 										<Dialog.Footer>
 											<Button variant="outline" onclick={() => (volDialogOpen = false)}>
 												Cancel
@@ -1236,34 +1188,35 @@
 
 					<!-- Danger zone -->
 					<div class="grid gap-3">
-						<h3 class="text-sm font-medium text-destructive">Danger Zone</h3>
+						<h3 class="text-sm font-medium text-destructive">Danger zone</h3>
 						<div
 							class="flex items-center justify-between rounded-md border border-destructive/30 p-4"
 						>
 							<div>
 								<p class="text-sm font-medium">Delete this cron job</p>
 								<p class="text-xs text-muted-foreground">
-									This cannot be undone. The job and all run history will be permanently removed.
+									Stops scheduled runs and deletes the run history. This can't be undone.
 								</p>
 							</div>
 							<Button variant="destructive" size="sm" onclick={() => (showDeleteDialog = true)}>
-								Delete
+								Delete…
 							</Button>
 						</div>
 					</div>
 				</div>
-			</Tabs.Content>
-		</Tabs.Root>
+			{/if}
+		</div>
 	</div>
 {:else}
 	<div class="py-12 text-center text-muted-foreground">Cron job not found</div>
 {/if}
 
 <!-- Delete confirmation dialog -->
-<ConfirmDeleteDialog
+<ConfirmDialog
 	bind:open={showDeleteDialog}
-	title={`Delete "${job?.name}"?`}
-	description="This cannot be undone. The cron job and all run history will be permanently removed."
-	confirmation={job?.name ?? ''}
+	title={`Delete ${job?.name ?? 'this cron job'}?`}
+	description="Scheduled runs stop and the job's run history is deleted. Files it wrote to volumes are kept."
+	confirmLabel="Delete cron job"
+	pendingLabel="Deleting…"
 	onconfirm={handleDelete}
 />

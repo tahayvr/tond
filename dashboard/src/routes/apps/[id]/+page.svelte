@@ -48,15 +48,27 @@
 	} from '$lib/api';
 	import { goto } from '$app/navigation';
 	import { isAdmin } from '$lib/auth.svelte';
+	import { confirmAction } from '$lib/confirm.svelte';
+	import { useAction } from '$lib/action.svelte';
+	import {
+		APP_TABS,
+		APP_SETTINGS_SECTIONS,
+		appTabHref,
+		appViewFromUrl,
+		type AppSettingsSection
+	} from '$lib/tabs';
+	import LinkTabs from '$lib/components/nav/link-tabs.svelte';
+	import PageHeader from '$lib/components/nav/page-header.svelte';
+	import StatusBadge from '$lib/components/feedback/status-badge.svelte';
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
+	import SuccessAlert from '$lib/components/feedback/success-alert.svelte';
+	import ConfirmDialog from '$lib/components/dialogs/confirm-dialog.svelte';
 	import { setUiContext, clearUiContext, appContext, openFeedPanel } from '$lib/ui-context.svelte';
-	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
-	import ConfirmDeleteDialog from '$lib/components/dialogs/confirm-delete-dialog.svelte';
 	import { Badge } from '$lib/components/ui/badge/index.js';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
 	import { Separator } from '$lib/components/ui/separator/index.js';
-	import * as Tabs from '$lib/components/ui/tabs/index.js';
 	import * as Select from '$lib/components/ui/select/index.js';
 	import Breadcrumb from '$lib/components/nav/breadcrumb.svelte';
 	import AppOverview from '$lib/components/tabs/app-page/app-overview.svelte';
@@ -73,7 +85,6 @@
 	import AppWebhooks from '$lib/components/tabs/app-page/app-webhooks.svelte';
 	import { safeUrl } from '$lib/utils';
 	import { SecretInput } from '$lib/components/ui/secret-input/index.js';
-	import Check from '~icons/ri/check-line';
 	import Github from '~icons/ri/github-fill';
 	import GitBranch from '~icons/ri/git-branch-line';
 	import Unlink2 from '~icons/ri/link-unlink-m';
@@ -94,8 +105,15 @@
 	// request) and stops on a terminal status. See the effects at the bottom.
 	let statusPollRequested = $state(false);
 	let appStatus = $derived(app?.status);
-	/** Selected tab; drives the log stream, metrics polling and feed context. */
-	let activeTab = $state('overview');
+	/** Tab (and Settings section) from `?tab=` / `?section=`: deep-linkable. */
+	let view = $derived(appViewFromUrl(page.url));
+	/** Leaf view: a tab, or the Settings section when Settings is open. */
+	let activeTab = $derived<string>(view.tab === 'settings' ? view.section : view.tab);
+	let sectionLabel = $derived(
+		view.tab === 'settings'
+			? APP_SETTINGS_SECTIONS.find((s) => s.id === view.section)?.label
+			: APP_TABS.find((t) => t.id === view.tab)?.label
+	);
 
 	// Domain form
 	let domainInput = $state('');
@@ -118,8 +136,7 @@
 	let resourceCpuDraft = $state<number | null>(null);
 	let savingResources = $state(false);
 	let resourcesError = $state('');
-	let resourcesSaved = $state(false);
-	let resourcesSavedTimeout: ReturnType<typeof setTimeout> | null = null;
+	let resourcesSaved = $state('');
 
 	// Deployments state
 	let deployments = $state<Deployment[]>([]);
@@ -324,14 +341,19 @@
 		}
 	}
 
-	async function handleStop() {
-		try {
-			openFeedPanel();
-			await stopApp(appId);
-			await loadApp();
-		} catch (e: any) {
-			error = e.message;
-		}
+	function handleStop() {
+		return confirmAction({
+			title: `Stop ${app?.name ?? 'this app'}?`,
+			description:
+				'The container stops and the app stops serving traffic until you start it again. Data in volumes is kept.',
+			confirmLabel: 'Stop app',
+			pendingLabel: 'Stopping…',
+			onconfirm: async () => {
+				openFeedPanel();
+				await stopApp(appId);
+				await loadApp();
+			}
+		});
 	}
 
 	async function handleStart() {
@@ -344,24 +366,30 @@
 		}
 	}
 
-	async function handleRestart() {
-		try {
-			openFeedPanel();
-			await restartApp(appId);
-			await loadApp();
-		} catch (e: any) {
-			error = e.message;
-		}
+	function handleRestart() {
+		return confirmAction({
+			title: `Restart ${app?.name ?? 'this app'}?`,
+			description:
+				'The container restarts with its current image and settings. Expect a few seconds of downtime.',
+			confirmLabel: 'Restart app',
+			pendingLabel: 'Restarting…',
+			destructive: false,
+			onconfirm: async () => {
+				openFeedPanel();
+				await restartApp(appId);
+				await loadApp();
+			}
+		});
 	}
 
+	// Throws so ConfirmDialog shows the error inside the dialog.
 	async function handleDelete() {
-		try {
-			await deleteApp(appId);
-			goto('/');
-		} catch (e: any) {
-			error = e.message;
-		}
+		await deleteApp(appId);
+		goto('/apps', { invalidateAll: true });
 	}
+
+	const deploy = useAction(handleDeploy);
+	const start = useAction(handleStart);
 
 	// Environment tab: errors are shown inside the tab, so these rethrow.
 	async function handleEnvRegistryCredential(credentialId: string | null) {
@@ -434,14 +462,19 @@
 		}
 	}
 
-	async function handleRemoveVolume(containerPath: string) {
+	function handleRemoveVolume(containerPath: string) {
 		volumeError = '';
-		try {
-			await removeVolume(appId, containerPath);
-			await loadApp();
-		} catch (e: any) {
-			volumeError = e.message;
-		}
+		return confirmAction({
+			title: `Remove the volume at ${containerPath}?`,
+			description:
+				"The mount is removed on the next deploy, so the app can no longer see these files. The data stays on the server's disk and comes back if you add the same volume again.",
+			confirmLabel: 'Remove volume',
+			pendingLabel: 'Removing…',
+			onconfirm: async () => {
+				await removeVolume(appId, containerPath);
+				await loadApp();
+			}
+		});
 	}
 
 	async function loadDeployments() {
@@ -481,6 +514,15 @@
 	}
 
 	async function handleGenerateDeployKey() {
+		if (deployKey) {
+			const ok = await confirmAction({
+				title: 'Regenerate the deploy key?',
+				description:
+					'The current key stops working immediately. Deploys fail until you add the new public key to your repository.',
+				confirmLabel: 'Regenerate key'
+			});
+			if (!ok) return;
+		}
 		deployKeyError = '';
 		deployKeyLoading = true;
 		try {
@@ -612,6 +654,13 @@
 	}
 
 	async function handleGithubUnlink() {
+		const ok = await confirmAction({
+			title: 'Unlink the GitHub App?',
+			description:
+				'Private-repository access, push-to-deploy and PR previews through this GitHub App stop for this app. The Git URL stays, so public repositories still deploy.',
+			confirmLabel: 'Unlink'
+		});
+		if (!ok) return;
 		githubLinkSaving = true;
 		githubLinkError = '';
 		gitSuccess = '';
@@ -671,19 +720,25 @@
 		}
 	}
 
-	async function handleDeleteCredential(credId: string) {
+	function handleDeleteCredential(credId: string) {
 		credError = '';
-		try {
-			await deleteRegistryCredential(credId);
-			// If the deleted credential was attached to this app, clear it
-			if (app?.registry_credential_id === credId) {
-				await setAppRegistryCredential(appId, null);
-				await loadApp();
+		const cred = registryCredentials.find((c) => c.id === credId);
+		return confirmAction({
+			title: `Delete registry credential ${cred?.name ?? ''}?`.replace(/ \?$/, '?'),
+			description:
+				'The credential is removed for every app. Apps pulling private images with it fail to deploy until another credential is attached.',
+			confirmLabel: 'Delete credential',
+			pendingLabel: 'Deleting…',
+			onconfirm: async () => {
+				await deleteRegistryCredential(credId);
+				// If the deleted credential was attached to this app, clear it
+				if (app?.registry_credential_id === credId) {
+					await setAppRegistryCredential(appId, null);
+					await loadApp();
+				}
+				await loadRegistryCredentials();
 			}
-			await loadRegistryCredentials();
-		} catch (e: any) {
-			credError = e.message;
-		}
+		});
 	}
 
 	// ── Resources ──
@@ -727,9 +782,7 @@
 			}
 			app = await updateAppResources(appId, memoryLimitBytes, cpuLimitNano);
 			if (app) setUiContext(appContext(app));
-			resourcesSaved = true;
-			if (resourcesSavedTimeout) clearTimeout(resourcesSavedTimeout);
-			resourcesSavedTimeout = setTimeout(() => (resourcesSaved = false), 2000);
+			resourcesSaved = 'Resource limits saved. They apply on the next deploy.';
 		} catch (e: any) {
 			resourcesError = e.message ?? 'Failed to save resources';
 		} finally {
@@ -807,14 +860,19 @@
 		}
 	}
 
-	async function handleDeletePreview(previewId: string) {
+	function handleDeletePreview(previewId: string) {
 		previewsError = '';
-		try {
-			await deletePreview(appId, previewId);
-			await loadPreviews();
-		} catch (e: any) {
-			previewsError = e.message;
-		}
+		const preview = previews.find((p) => p.id === previewId);
+		return confirmAction({
+			title: 'Delete this preview?',
+			description: `${preview?.pr_number ? `The preview for PR #${preview.pr_number}` : 'The preview'} is stopped and its URL stops working. Pushing to the PR again recreates it when PR previews are on.`,
+			confirmLabel: 'Delete preview',
+			pendingLabel: 'Deleting…',
+			onconfirm: async () => {
+				await deletePreview(appId, previewId);
+				await loadPreviews();
+			}
+		});
 	}
 
 	async function handleTogglePreviewEnabled(enabled: boolean) {
@@ -827,23 +885,6 @@
 			previewConfigError = e.message;
 		} finally {
 			previewConfigSaving = false;
-		}
-	}
-
-	function statusVariant(
-		status: string
-	): 'default' | 'secondary' | 'destructive' | 'outline' | undefined {
-		switch (status) {
-			case 'running':
-				return 'default';
-			case 'failed':
-				return 'destructive';
-			case 'unhealthy':
-				return 'destructive';
-			case 'stopped':
-				return 'secondary';
-			default:
-				return 'outline';
 		}
 	}
 
@@ -881,12 +922,27 @@
 		return stopLogStream;
 	});
 
+	// Load each tab's data when it's opened (from a link, a deep link or back/forward).
+	$effect(() => {
+		const tab = activeTab;
+		void appId;
+		untrack(() => {
+			if (tab === 'deployments') loadDeployments();
+			if (tab === 'environment') loadRegistryCredentials();
+			if (tab === 'git') {
+				loadDeployKey();
+				loadRegistryCredentials();
+				loadGitHubApps();
+			}
+			if (tab === 'previews') loadPreviews();
+		});
+	});
+
 	// Mount-only teardown, keyed on the app id (navigating to another app
 	// resets the page; a data reload does not).
 	$effect(() => {
 		void appId;
 		untrack(() => {
-			activeTab = 'overview';
 			statusPollRequested = false;
 		});
 		return () => {
@@ -897,85 +953,72 @@
 </script>
 
 {#if app}
+	{@const current = app}
 	<div class="space-y-6">
 		<!-- Breadcrumb -->
 		<Breadcrumb items={[{ label: 'Apps', href: '/apps' }, { label: app.name }]} />
 
-		<!-- Error banner -->
-		{#if error}
-			<ErrorAlert title="Error" description={error} />
-		{/if}
-
-		<!-- App header -->
-		<div class="flex h-14 items-center justify-between">
-			<div>
-				<h2 class="text-3xl font-extrabold uppercase">{app.name}</h2>
-				<div class="mt-2 flex items-center gap-3 text-sm text-muted-foreground">
-					<Badge variant={statusVariant(app.status)}>{app.status}</Badge>
-					<span>Source: {app.source_type}</span>
-					{#if app.source_url}
-						<span class="max-w-xs truncate">{app.source_url}</span>
-					{/if}
-				</div>
-			</div>
-			<div class="flex gap-2">
-				{#if app.status === 'running' || app.status === 'unhealthy'}
+		<PageHeader title={current.name} section={sectionLabel}>
+			{#snippet meta()}
+				<StatusBadge status={current.status} kind="app" />
+				<span>Source: {current.source_type}</span>
+				{#if current.source_url}
+					<span class="max-w-xs truncate font-mono text-xs">{current.source_url}</span>
+				{/if}
+			{/snippet}
+			{#snippet actions()}
+				{#if current.status === 'running' || current.status === 'unhealthy'}
 					<Button variant="outline" size="sm" onclick={handleRestart}>Restart</Button>
 					<Button variant="outline" size="sm" onclick={handleStop}>Stop</Button>
-				{:else if app.status === 'stopped'}
-					<Button variant="outline" size="sm" onclick={handleStart}>Start</Button>
+				{:else if current.status === 'stopped'}
+					<Button
+						variant="outline"
+						size="sm"
+						onclick={() => start.run()}
+						disabled={start.pending}
+						aria-busy={start.pending}
+					>
+						{start.pending ? 'Starting…' : 'Start'}
+					</Button>
 				{/if}
-				<Button size="sm" onclick={handleDeploy}>Re-deploy</Button>
-				<Button variant="destructive" size="sm" onclick={() => (showDeleteDialog = true)}>
-					Delete
+				<Button
+					size="sm"
+					onclick={() => deploy.run()}
+					disabled={deploy.pending || current.status === 'building'}
+					aria-busy={deploy.pending}
+				>
+					{deploy.pending ? 'Starting deploy…' : current.status === 'building' ? 'Deploying…' : 'Deploy'}
 				</Button>
-			</div>
-		</div>
+			{/snippet}
+		</PageHeader>
 
-		<Separator />
+		<InlineError message={error} ondismiss={() => (error = '')} />
 
-		<!-- Tabs -->
-		<Tabs.Root
-			bind:value={activeTab}
-			onValueChange={(v) => {
-				if (v === 'deployments') {
-					loadDeployments();
-				}
-				if (v === 'env') {
-					loadRegistryCredentials();
-				}
-				if (v === 'git') {
-					loadDeployKey();
-					loadRegistryCredentials();
-					loadGitHubApps();
-				}
-				if (v === 'previews') {
-					loadPreviews();
-				}
-			}}
-		>
-			<Tabs.List>
-				<Tabs.Trigger value="overview">Overview</Tabs.Trigger>
-				<Tabs.Trigger value="logs">Logs</Tabs.Trigger>
-				<Tabs.Trigger value="deployments">Deployments</Tabs.Trigger>
-				<Tabs.Trigger value="env">Environment</Tabs.Trigger>
-				<Tabs.Trigger value="domain">Domain</Tabs.Trigger>
-				<Tabs.Trigger value="health">Health</Tabs.Trigger>
-				<Tabs.Trigger value="volumes">Volumes</Tabs.Trigger>
-				<Tabs.Trigger value="resources">Resources</Tabs.Trigger>
-				<Tabs.Trigger value="git">Git</Tabs.Trigger>
-				<Tabs.Trigger value="previews">Previews</Tabs.Trigger>
-				<Tabs.Trigger value="metrics">Metrics</Tabs.Trigger>
-				<Tabs.Trigger value="history">History</Tabs.Trigger>
-			</Tabs.List>
+		<LinkTabs
+			label="App sections"
+			tabs={APP_TABS}
+			active={view.tab}
+			href={(id) => appTabHref(current.id, id, id === 'settings' ? view.section : undefined)}
+		/>
 
+		<div class={view.tab === 'settings' ? 'grid gap-6 md:grid-cols-[11rem_minmax(0,1fr)]' : ''}>
+			{#if view.tab === 'settings'}
+				<LinkTabs
+					label="Settings sections"
+					variant="pills"
+					tabs={APP_SETTINGS_SECTIONS}
+					active={view.section}
+					href={(id: AppSettingsSection) => appTabHref(current.id, 'settings', id)}
+				/>
+			{/if}
+			<div class="min-w-0">
 			<!-- Overview tab -->
-			<Tabs.Content value="overview">
+			{#if activeTab === 'overview'}
 				<AppOverview {app} />
-			</Tabs.Content>
+			{/if}
 
 			<!-- Logs tab -->
-			<Tabs.Content value="logs">
+			{#if activeTab === 'logs'}
 				<AppLogs
 					{logLines}
 					streaming={logStreaming}
@@ -983,10 +1026,10 @@
 					onStop={stopLogStream}
 					onClear={() => logBuffer.clear()}
 				/>
-			</Tabs.Content>
+			{/if}
 
 			<!-- Deployments tab -->
-			<Tabs.Content value="deployments">
+			{#if activeTab === 'deployments'}
 				<AppDeployments
 					{deployments}
 					loading={deploymentsLoading}
@@ -994,10 +1037,10 @@
 					onRollback={handleRollback}
 					onViewGeneratedDockerfile={handleViewGeneratedDockerfile}
 				/>
-			</Tabs.Content>
+			{/if}
 
 			<!-- Environment tab -->
-			<Tabs.Content value="env">
+			{#if activeTab === 'environment'}
 				<AppEnvironment
 					appId={app.id}
 					sourceType={app.source_type}
@@ -1007,20 +1050,20 @@
 					previewEnabled={app.preview_enabled}
 					onRedeploy={handleEnvRedeploy}
 				/>
-			</Tabs.Content>
+			{/if}
 
 			<!-- Domain tab -->
-			<Tabs.Content value="domain">
+			{#if activeTab === 'domain'}
 				<AppDomain
 					bind:domainInput
 					savedDomain={app?.domain ?? null}
 					{certRefreshKey}
 					onUpdate={handleUpdateDomain}
 				/>
-			</Tabs.Content>
+			{/if}
 
 			<!-- Health tab -->
-			<Tabs.Content value="health">
+			{#if activeTab === 'health'}
 				<AppHealth
 					{app}
 					bind:healthPath
@@ -1031,10 +1074,10 @@
 					onDisableHealth={handleDisableHealth}
 					onUpdateDrainTimeout={handleUpdateDrainTimeout}
 				/>
-			</Tabs.Content>
+			{/if}
 
 			<!-- Volumes tab -->
-			<Tabs.Content value="volumes">
+			{#if activeTab === 'volumes'}
 				<AppVolumes
 					{app}
 					bind:volumeContainerPath
@@ -1044,14 +1087,15 @@
 					onAdd={handleAddVolume}
 					onRemove={handleRemoveVolume}
 				/>
-			</Tabs.Content>
+			{/if}
 			<!-- Resources tab -->
-			<Tabs.Content value="resources" class="mt-4 space-y-6 pt-2">
+			{#if activeTab === 'resources'}
 				<div class="max-w-sm space-y-6">
 					<div class="space-y-2">
-						<Label>Memory Limit</Label>
+						<Label for="resource-memory">Memory limit</Label>
 						<div class="flex gap-2">
 							<Input
+								id="resource-memory"
 								type="number"
 								bind:value={resourceMemoryDraft}
 								placeholder="Unlimited"
@@ -1059,7 +1103,7 @@
 								disabled={savingResources}
 							/>
 							<Select.Root type="single" bind:value={resourceMemoryUnit}>
-								<Select.Trigger class="w-24" disabled={savingResources}>
+								<Select.Trigger class="w-24" disabled={savingResources} aria-label="Memory unit">
 									{resourceMemoryUnit.toUpperCase()}
 								</Select.Trigger>
 								<Select.Content>
@@ -1074,8 +1118,9 @@
 					</div>
 
 					<div class="space-y-2">
-						<Label>CPU Limit (cores)</Label>
+						<Label for="resource-cpu">CPU limit (cores)</Label>
 						<Input
+							id="resource-cpu"
 							type="number"
 							bind:value={resourceCpuDraft}
 							placeholder="Unlimited"
@@ -1088,35 +1133,25 @@
 						</p>
 					</div>
 
-					{#if resourcesError}
-						<p class="rounded bg-destructive/10 px-3 py-2 text-xs text-destructive">
-							{resourcesError}
-						</p>
-					{/if}
+					<InlineError message={resourcesError} title="Limits weren't saved" />
 
 					<div class="flex items-center gap-3">
 						<Button onclick={handleSaveResources} disabled={savingResources}>
 							{savingResources ? 'Saving...' : 'Save'}
 						</Button>
-						{#if resourcesSaved}
-							<span class="flex items-center gap-1 text-xs text-green-600 dark:text-green-400">
-								<Check class="h-3.5 w-3.5" /> Saved
-							</span>
-						{/if}
+						<SuccessAlert
+							message={resourcesSaved}
+							ondismiss={() => (resourcesSaved = '')}
+							timeout={5000}
+						/>
 					</div>
 				</div>
-			</Tabs.Content>
+			{/if}
 			<!-- Git tab -->
-			<Tabs.Content value="git">
+			{#if activeTab === 'git'}
 				<div class="space-y-6 pt-4">
-					{#if gitError}
-						<ErrorAlert title="Error" description={gitError} />
-					{/if}
-					{#if gitSuccess}
-						<div class="rounded-md bg-success/10 p-3 text-sm text-success">
-							{gitSuccess}
-						</div>
-					{/if}
+					<InlineError message={gitError} ondismiss={() => (gitError = '')} />
+					<SuccessAlert message={gitSuccess} ondismiss={() => (gitSuccess = '')} />
 
 					<!-- Source type & URL -->
 					<div class="grid gap-3">
@@ -1192,9 +1227,7 @@
 										Unlink
 									</Button>
 								</div>
-								{#if githubLinkError}
-									<p class="text-xs text-destructive">{githubLinkError}</p>
-								{/if}
+								<InlineError message={githubLinkError} />
 							{:else if installedApps.length > 0}
 								<!-- Picker: choose app → repo → branch -->
 								<div class="space-y-3 rounded-md border bg-muted/10 px-4 py-3">
@@ -1207,20 +1240,18 @@
 										the repo.
 									</p>
 
-									{#if githubLinkError}
-										<p class="text-xs text-destructive">{githubLinkError}</p>
-									{/if}
+									<InlineError message={githubLinkError} />
 
 									<div class="flex flex-wrap gap-3">
 										<!-- App selector -->
 										<div class="grid gap-1.5">
-											<Label class="text-xs">GitHub App</Label>
+											<Label class="text-xs" for="gh-app-select">GitHub App</Label>
 											<Select.Root
 												type="single"
 												value={selectedGithubAppId ?? ''}
 												onValueChange={(v) => handleGithubAppChange(v || null)}
 											>
-												<Select.Trigger class="h-8 w-44 text-xs">
+												<Select.Trigger id="gh-app-select" class="h-8 w-44 text-xs">
 													{selectedGithubAppId
 														? (installedApps.find((a) => a.id === selectedGithubAppId)?.name ??
 															selectedGithubAppId)
@@ -1237,7 +1268,7 @@
 										<!-- Repo selector -->
 										{#if selectedGithubAppId}
 											<div class="grid gap-1.5">
-												<Label class="text-xs">Repository</Label>
+												<Label class="text-xs" for="gh-repo-select">Repository</Label>
 												{#if githubPickerReposLoading}
 													<p class="text-xs text-muted-foreground">Loading…</p>
 												{:else}
@@ -1252,7 +1283,7 @@
 															handleGithubRepoChange(repo);
 														}}
 													>
-														<Select.Trigger class="h-8 w-52 font-mono text-xs">
+														<Select.Trigger id="gh-repo-select" class="h-8 w-52 font-mono text-xs">
 															{selectedGithubRepo?.full_name ?? 'Select repo…'}
 														</Select.Trigger>
 														<Select.Content>
@@ -1274,7 +1305,7 @@
 										{#if selectedGithubRepo}
 											{@const branchKey = `${selectedGithubAppId}/${selectedGithubRepo.full_name}`}
 											<div class="grid gap-1.5">
-												<Label class="text-xs">Branch</Label>
+												<Label class="text-xs" for="gh-branch-select">Branch</Label>
 												{#if githubPickerBranchesLoading}
 													<p class="text-xs text-muted-foreground">Loading…</p>
 												{:else}
@@ -1285,7 +1316,7 @@
 															selectedGithubBranch = v || null;
 														}}
 													>
-														<Select.Trigger class="h-8 w-36 font-mono text-xs">
+														<Select.Trigger id="gh-branch-select" class="h-8 w-36 font-mono text-xs">
 															{#if selectedGithubBranch}
 																<GitBranch class="mr-1 inline h-3 w-3" />
 																{selectedGithubBranch}
@@ -1311,7 +1342,6 @@
 										<!-- Link button -->
 										{#if selectedGithubRepo}
 											<div class="grid gap-1.5">
-												<Label class="invisible text-xs">Link</Label>
 												<Button
 													size="sm"
 													class="h-8 text-xs uppercase"
@@ -1339,9 +1369,7 @@
 								Attach a stored credential to authenticate pulls from a private registry.
 							</p>
 
-							{#if credError}
-								<ErrorAlert title="Error" description={credError} />
-							{/if}
+							<InlineError message={credError} ondismiss={() => (credError = '')} />
 
 							<!-- Attach credential dropdown -->
 							<div class="flex gap-3">
@@ -1412,9 +1440,7 @@
 							{#if addCredOpen}
 								<div class="grid gap-3 rounded-md border p-4">
 									<h4 class="text-sm font-medium">Add credential</h4>
-									{#if addCredError}
-										<ErrorAlert title="Error" description={addCredError} />
-									{/if}
+									<InlineError message={addCredError} ondismiss={() => (addCredError = '')} />
 									<div class="grid gap-2">
 										<Label for="cred-name">Name</Label>
 										<Input
@@ -1493,9 +1519,7 @@
 									Automatically deploy when a webhook push event is received.
 								</p>
 							</div>
-							<Badge variant={app.auto_deploy ? 'default' : 'secondary'}>
-								{app.auto_deploy ? 'Enabled' : 'Disabled'}
-							</Badge>
+							<StatusBadge status={app.auto_deploy ? 'enabled' : 'disabled'} />
 						</div>
 						<div class="flex gap-2">
 							{#if !app.auto_deploy}
@@ -1560,9 +1584,7 @@
 							</Button>
 						</div>
 
-						{#if deployKeyError}
-							<ErrorAlert title="Error" description={deployKeyError} />
-						{/if}
+						<InlineError message={deployKeyError} ondismiss={() => (deployKeyError = '')} />
 
 						{#if deployKeyLoading}
 							<div class="py-4 text-center text-sm text-muted-foreground">Loading...</div>
@@ -1578,10 +1600,10 @@
 						{/if}
 					</div>
 				</div>
-			</Tabs.Content>
+			{/if}
 
 			<!-- Previews tab -->
-			<Tabs.Content value="previews">
+			{#if activeTab === 'previews'}
 				<div class="space-y-6 pt-4">
 					<!-- PR Preview config -->
 					<div class="grid gap-3">
@@ -1593,18 +1615,14 @@
 									linked GitHub repository.
 								</p>
 							</div>
-							<Badge variant={app.preview_enabled ? 'default' : 'secondary'}>
-								{app.preview_enabled ? 'Enabled' : 'Disabled'}
-							</Badge>
+							<StatusBadge status={app.preview_enabled ? 'enabled' : 'disabled'} />
 						</div>
 
 						{#if previewsBlocked}
 							<PreviewDomainRequiredAlert />
 						{/if}
 
-						{#if previewConfigError}
-							<ErrorAlert title="Error" description={previewConfigError} />
-						{/if}
+						<InlineError message={previewConfigError} ondismiss={() => (previewConfigError = '')} />
 
 						<div class="flex gap-2">
 							{#if !app.preview_enabled}
@@ -1674,9 +1692,7 @@
 								</Button>
 							</div>
 
-							{#if openPRsError}
-								<p class="text-xs text-destructive">{openPRsError}</p>
-							{/if}
+							<InlineError message={openPRsError} />
 
 							{#if openPRs.length > 0}
 								<div class="overflow-hidden rounded border border-border">
@@ -1768,10 +1784,10 @@
 						</p>
 					</div>
 				</div>
-			</Tabs.Content>
+			{/if}
 
 			<!-- Metrics tab -->
-			<Tabs.Content value="metrics">
+			{#if activeTab === 'metrics'}
 				<AppMetrics
 					{metrics}
 					loading={metricsLoading}
@@ -1779,23 +1795,55 @@
 					period={metricsPeriod}
 					onPeriodChange={(p) => (metricsPeriod = p)}
 				/>
-			</Tabs.Content>
+			{/if}
 
 			<!-- History tab -->
-			<Tabs.Content value="history">
+			{#if activeTab === 'history'}
 				<AppHistory appName={app.name} />
-			</Tabs.Content>
-		</Tabs.Root>
+			{/if}
+
+			{#if activeTab === 'danger'}
+				<section
+					aria-labelledby="danger-zone-heading"
+					class="space-y-4 rounded-sm border border-destructive/40 p-4"
+				>
+					<div>
+						<h2 id="danger-zone-heading" class="text-sm font-semibold text-destructive">
+							Delete this app
+						</h2>
+						<p class="mt-1 text-sm text-muted-foreground">
+							Removes the container, deployment history, environment variables, previews and alert
+							rules scoped to this app. Volume data stays on the server's disk.
+						</p>
+					</div>
+					<Button variant="destructive" size="sm" onclick={() => (showDeleteDialog = true)}>
+						Delete app…
+					</Button>
+				</section>
+			{/if}
+			</div>
+		</div>
 	</div>
 {:else}
 	<div class="py-12 text-center text-muted-foreground">App not found</div>
 {/if}
 
 <!-- Delete confirmation dialog -->
-<ConfirmDeleteDialog
+<ConfirmDialog
 	bind:open={showDeleteDialog}
-	title={`Delete "${app?.name}"?`}
-	description="This cannot be undone. The app and its container will be permanently removed."
-	confirmation={app?.name ?? ''}
+	title={`Delete ${app?.name ?? 'this app'}?`}
+	description="This can't be undone."
+	confirmLabel="Delete app"
+	pendingLabel="Deleting…"
+	typedConfirmation={app?.name ?? ''}
 	onconfirm={handleDelete}
-/>
+>
+	{#snippet details()}
+		<ul class="list-disc space-y-1 pl-5">
+			<li>The running container is stopped and removed; the app goes offline.</li>
+			<li>Deployment history, environment variables and previews are deleted.</li>
+			<li>Alert rules that watch only this app are deleted.</li>
+			<li>Volume data is kept on the server's disk.</li>
+		</ul>
+	{/snippet}
+</ConfirmDialog>

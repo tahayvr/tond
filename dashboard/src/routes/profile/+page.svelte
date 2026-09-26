@@ -1,4 +1,5 @@
 <script lang="ts">
+	import PageTitle from '$lib/components/nav/page-title.svelte';
 	import {
 		changePassword,
 		setup2FA,
@@ -203,11 +204,13 @@
 	});
 </script>
 
+<PageTitle title={'Profile'} />
+
 <div class="space-y-6">
 	<div class="flex h-14 items-center justify-between">
 		<div>
-			<h2 class="text-3xl font-extrabold uppercase">Profile</h2>
-			<p class="font-mono text-xs tracking-wider text-muted-foreground/70">
+			<h1 class="text-2xl font-extrabold sm:text-3xl">Profile</h1>
+			<p class="font-mono text-xs tracking-wider text-muted-foreground">
 				{user?.email ?? ''}
 			</p>
 		</div>

@@ -1,8 +1,8 @@
 <script lang="ts">
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
-	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import LockIcon from '~icons/ri/lock-line';
 	import type { App } from '$lib/api';
 
@@ -51,9 +51,7 @@
 		path. Changes take effect on the next deploy.
 	</p>
 
-	{#if volumeError}
-		<ErrorAlert title="Volume not saved" description={volumeError} />
-	{/if}
+	<InlineError title="Volume not saved" message={volumeError} />
 
 	<!-- Current volumes list -->
 	{#if app.volumes.length > 0}
@@ -94,7 +92,7 @@
 		<div class="rounded-lg border border-dashed py-12 text-center">
 			<p class="text-muted-foreground">No volumes configured</p>
 			{#if canEdit}
-				<p class="mt-1 text-sm text-muted-foreground/60">
+				<p class="mt-1 text-sm text-muted-foreground">
 					Add a volume below to persist data between deploys
 				</p>
 			{/if}

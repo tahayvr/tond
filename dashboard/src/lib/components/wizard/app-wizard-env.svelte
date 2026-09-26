@@ -229,7 +229,7 @@
 												onclick={() => handleCopy(key, value)}
 											>
 												{#if copiedKey === key}
-													<Check class="h-3.5 w-3.5 text-green-500" />
+													<Check class="h-3.5 w-3.5 text-success" />
 												{:else}
 													<Copy class="h-3.5 w-3.5" />
 												{/if}

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import ConnectionString from '$lib/components/databases/connection-string.svelte';
 	import { page } from '$app/state';
 	import {
@@ -20,17 +21,20 @@
 		databaseContext,
 		openFeedPanel
 	} from '$lib/ui-context.svelte';
-	import { Badge } from '$lib/components/ui/badge/index.js';
+	import StatusBadge from '$lib/components/feedback/status-badge.svelte';
+	import SuccessAlert from '$lib/components/feedback/success-alert.svelte';
+	import PageHeader from '$lib/components/nav/page-header.svelte';
+	import LinkTabs from '$lib/components/nav/link-tabs.svelte';
+	import ConfirmDialog from '$lib/components/dialogs/confirm-dialog.svelte';
+	import { confirmAction } from '$lib/confirm.svelte';
+	import { DATABASE_TABS, tabFromUrl, tabHref, type DatabaseTab } from '$lib/tabs';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
 	import { Separator } from '$lib/components/ui/separator/index.js';
-	import * as Tabs from '$lib/components/ui/tabs/index.js';
 	import * as Dialog from '$lib/components/ui/dialog/index.js';
 	import * as Select from '$lib/components/ui/select/index.js';
 	import Breadcrumb from '$lib/components/nav/breadcrumb.svelte';
-	import ConfirmDeleteDialog from '$lib/components/dialogs/confirm-delete-dialog.svelte';
-	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import { SvelteSet } from 'svelte/reactivity';
 	import { untrack } from 'svelte';
 	import Eye from '~icons/ri/eye-line';
@@ -54,6 +58,12 @@
 	let error = $state('');
 	let projects = $state<Project[]>([]);
 	let showDeleteDialog = $state(false);
+	/** Active tab from `?tab=` (old `?tab=limits` links open Settings). */
+	let tab = $derived<DatabaseTab>(
+		page.url.searchParams.get('tab') === 'limits'
+			? 'settings'
+			: tabFromUrl(page.url, DATABASE_TABS, 'overview')
+	);
 	let acting = $state(false);
 	let redeploying = $state(false);
 
@@ -141,18 +151,25 @@
 		}
 	}
 
-	async function handleStop() {
-		acting = true;
+	function handleStop() {
 		error = '';
-		openFeedPanel();
-		try {
-			await stopDatabase(dbId);
-			await refreshDatabaseData();
-		} catch (e: any) {
-			error = e.message ?? 'Failed to stop database';
-		} finally {
-			acting = false;
-		}
+		return confirmAction({
+			title: `Stop ${db?.name ?? 'this database'}?`,
+			description:
+				'Apps that use this database lose their connection until you start it again. Data is kept.',
+			confirmLabel: 'Stop database',
+			pendingLabel: 'Stopping…',
+			onconfirm: async () => {
+				acting = true;
+				openFeedPanel();
+				try {
+					await stopDatabase(dbId);
+					await refreshDatabaseData();
+				} finally {
+					acting = false;
+				}
+			}
+		});
 	}
 
 	async function handleStart() {
@@ -169,27 +186,32 @@
 		}
 	}
 
-	async function handleRedeploy() {
-		redeploying = true;
+	function handleRedeploy() {
 		error = '';
-		openFeedPanel();
-		try {
-			db = await redeployDatabase(dbId);
-			if (db) setUiContext(databaseContext(db));
-		} catch (e: any) {
-			error = e.message ?? 'Failed to redeploy database';
-		} finally {
-			redeploying = false;
-		}
+		return confirmAction({
+			title: `Redeploy ${db?.name ?? 'this database'}?`,
+			description:
+				'The container is recreated from its image with the current settings. Data on its volume is kept; connections drop for a few seconds.',
+			confirmLabel: 'Redeploy',
+			pendingLabel: 'Redeploying…',
+			destructive: false,
+			onconfirm: async () => {
+				redeploying = true;
+				openFeedPanel();
+				try {
+					db = await redeployDatabase(dbId);
+					if (db) setUiContext(databaseContext(db));
+				} finally {
+					redeploying = false;
+				}
+			}
+		});
 	}
 
+	// Throws so ConfirmDialog shows the error inside the dialog.
 	async function handleDelete() {
-		try {
-			await deleteDatabase(dbId);
-			goto('/databases');
-		} catch (e: any) {
-			error = e.message ?? 'Failed to delete database';
-		}
+		await deleteDatabase(dbId);
+		goto('/databases', { invalidateAll: true });
 	}
 
 	// ── URL editing ──
@@ -518,21 +540,6 @@
 		return vars;
 	});
 
-	function statusVariant(
-		status: string
-	): 'default' | 'secondary' | 'destructive' | 'outline' | undefined {
-		switch (status) {
-			case 'running':
-				return 'default';
-			case 'failed':
-				return 'destructive';
-			case 'stopped':
-				return 'secondary';
-			default:
-				return 'outline';
-		}
-	}
-
 	function formatMemory(bytes: number | null): string {
 		if (bytes === null) return 'Unlimited';
 		const mb = bytes / (1024 * 1024);
@@ -572,40 +579,33 @@
 </script>
 
 {#if db}
+	{@const current = db}
 	<div class="space-y-6">
 		<!-- Breadcrumb -->
 		<Breadcrumb items={[{ label: 'Databases', href: '/databases' }, { label: db.name }]} />
 
-		<!-- Error banner -->
-		{#if error}
-			<ErrorAlert title="Error" description={error} />
-		{/if}
-
-		<!-- Header -->
-		<div class="flex h-14 items-center justify-between">
-			<div>
-				<h2 class="text-3xl font-extrabold uppercase">{db.name}</h2>
-				<div class="mt-2 flex items-center gap-3 text-sm text-muted-foreground">
-					<Badge variant={statusVariant(db.status)}>{db.status}</Badge>
-					<span class="font-mono text-xs uppercase">{db.db_type}</span>
-					{#if db.host_port}
-						<span class="font-mono text-xs">:{db.host_port}</span>
-					{/if}
-				</div>
-			</div>
-			<div class="flex gap-2">
-				{#if db.status === 'running'}
+		<PageHeader title={db.name} section={DATABASE_TABS.find((t) => t.id === tab)?.label}>
+			{#snippet meta()}
+				<StatusBadge status={current.status} kind="database" />
+				<span class="font-mono text-xs">{current.db_type}</span>
+				{#if current.host_port}
+					<span class="font-mono text-xs">:{current.host_port}</span>
+				{/if}
+			{/snippet}
+			{#snippet actions()}
+				{#if current.status === 'running'}
 					<Button variant="outline" size="sm" disabled={acting || redeploying} onclick={handleStop}>
-						{acting ? 'Stopping...' : 'Stop'}
+						{acting ? 'Stopping…' : 'Stop'}
 					</Button>
-				{:else if db.status === 'stopped' || db.status === 'failed'}
+				{:else if current.status === 'stopped' || current.status === 'failed'}
 					<Button
 						variant="outline"
 						size="sm"
 						disabled={acting || redeploying}
+						aria-busy={acting}
 						onclick={handleStart}
 					>
-						{acting ? 'Starting...' : 'Start'}
+						{acting ? 'Starting…' : 'Start'}
 					</Button>
 				{/if}
 				<Button
@@ -614,26 +614,24 @@
 					disabled={acting || redeploying}
 					onclick={handleRedeploy}
 				>
-					{redeploying ? 'Redeploying...' : 'Redeploy'}
+					{redeploying ? 'Redeploying…' : 'Redeploy'}
 				</Button>
-				<Button variant="destructive" size="sm" onclick={() => (showDeleteDialog = true)}>
-					Delete
-				</Button>
-			</div>
-		</div>
+			{/snippet}
+		</PageHeader>
 
-		<Separator />
+		<InlineError message={error} ondismiss={() => (error = '')} />
 
-		<!-- Tabs -->
-		<Tabs.Root value="overview">
-			<Tabs.List>
-				<Tabs.Trigger value="overview">Overview</Tabs.Trigger>
-				<Tabs.Trigger value="environment">Environment</Tabs.Trigger>
-				<Tabs.Trigger value="limits">Limits</Tabs.Trigger>
-			</Tabs.List>
+		<LinkTabs
+			label="Database sections"
+			tabs={DATABASE_TABS}
+			active={tab}
+			href={(id) => tabHref(page.url.pathname, id, 'overview')}
+		/>
 
+		<div>
 			<!-- ── Overview tab ── -->
-			<Tabs.Content value="overview" class="mt-4 space-y-4">
+			{#if tab === 'overview'}
+			<div class="mt-4 space-y-4">
 				<!-- Info grid -->
 				<div class="grid gap-4 sm:grid-cols-2">
 					<!-- Connection strings -->
@@ -642,9 +640,7 @@
 							Connection
 						</h3>
 
-						{#if urlError}
-							<p class="rounded bg-destructive/10 px-3 py-2 text-xs text-destructive">{urlError}</p>
-						{/if}
+						<InlineError message={urlError} />
 
 						<!-- External URL -->
 						<div class="space-y-2">
@@ -701,11 +697,11 @@
 								<div>
 									<ConnectionString value={db.connection_string} />
 									{#if db.custom_external_url}
-										<span class="mt-1 block text-xs text-muted-foreground/60">custom override</span>
+										<span class="mt-1 block text-xs text-muted-foreground">custom override</span>
 									{/if}
 								</div>
 							{:else}
-								<p class="text-xs text-muted-foreground/60">Not available (database is stopped)</p>
+								<p class="text-xs text-muted-foreground">Not available (database is stopped)</p>
 							{/if}
 						</div>
 
@@ -764,11 +760,11 @@
 								<div>
 									<ConnectionString value={db.internal_connection_string} />
 									{#if db.custom_internal_url}
-										<span class="mt-1 block text-xs text-muted-foreground/60">custom override</span>
+										<span class="mt-1 block text-xs text-muted-foreground">custom override</span>
 									{/if}
 								</div>
 							{:else}
-								<p class="text-xs text-muted-foreground/60">
+								<p class="text-xs text-muted-foreground">
 									{db.project_id ? 'Not available (database is stopped)' : 'No project assigned'}
 								</p>
 							{/if}
@@ -804,11 +800,7 @@
 								</div>
 								{#if editingImage}
 									<div class="space-y-2">
-										{#if imageError}
-											<p class="rounded bg-destructive/10 px-2 py-1 text-xs text-destructive">
-												{imageError}
-											</p>
-										{/if}
+										<InlineError message={imageError} />
 										<Input
 											class="font-mono text-xs"
 											placeholder="e.g. postgres:15-alpine"
@@ -844,7 +836,7 @@
 									<dd class="flex items-center gap-2">
 										<span class="font-mono text-xs">{db.custom_image ?? db.image_used ?? '—'}</span>
 										{#if db.custom_image}
-											<span class="text-xs text-muted-foreground/60">(pending redeploy)</span>
+											<span class="text-xs text-muted-foreground">(pending redeploy)</span>
 										{/if}
 									</dd>
 								{/if}
@@ -879,17 +871,13 @@
 							Network access
 						</h3>
 						{#if db.public_access}
-							<Badge variant="destructive" class="gap-1"><GlobeIcon class="size-3" /> Public</Badge>
+							<StatusBadge status="public" tone="warning" label="Public" />
 						{:else}
-							<Badge variant="outline" class="gap-1"><LockIcon class="size-3" /> Private</Badge>
+							<StatusBadge status="private" tone="neutral" label="Private" />
 						{/if}
 					</div>
 
-					{#if publicError}
-						<p class="rounded bg-destructive/10 px-3 py-2 text-xs text-destructive">
-							{publicError}
-						</p>
-					{/if}
+					<InlineError message={publicError} />
 
 					{#if db.public_access}
 						<p class="text-sm text-muted-foreground">
@@ -902,7 +890,7 @@
 								<p class="text-xs font-medium text-muted-foreground">Public connection string</p>
 								<ConnectionString value={db.public_connection_string} />
 								{#if db.public_connection_string.includes('<server-ip>')}
-									<p class="text-xs text-muted-foreground/70">
+									<p class="text-xs text-muted-foreground">
 										Replace <span class="font-mono">&lt;server-ip&gt;</span> with this server's public
 										IP, or set a dashboard domain in Settings.
 									</p>
@@ -944,7 +932,7 @@
 									Enable public access…
 								</Button>
 							{/if}
-							<p class="text-xs text-muted-foreground/70">
+							<p class="text-xs text-muted-foreground">
 								Changing this restarts the database container (a few seconds of downtime). Data is
 								kept.
 							</p>
@@ -969,11 +957,7 @@
 								password is strong. An SSH tunnel is safer.
 							</Dialog.Description>
 						</Dialog.Header>
-						{#if publicError}
-							<p class="rounded bg-destructive/10 px-3 py-2 text-xs text-destructive">
-								{publicError}
-							</p>
-						{/if}
+						<InlineError message={publicError} />
 						<Dialog.Footer>
 							<Button
 								variant="outline"
@@ -990,10 +974,12 @@
 						</Dialog.Footer>
 					</Dialog.Content>
 				</Dialog.Root>
-			</Tabs.Content>
+			</div>
+			{/if}
 
 			<!-- ── Environment tab ── -->
-			<Tabs.Content value="environment" class="mt-4 space-y-4">
+			{#if tab === 'environment'}
+			<div class="mt-4 space-y-4">
 				{#if envVars.length === 0}
 					<div class="rounded border border-dashed border-border py-8 text-center">
 						<p class="text-sm text-muted-foreground">
@@ -1091,7 +1077,7 @@
 														onclick={() => copyEnvVar(v.value ?? '', v.envKey)}
 													>
 														{#if copiedEnvVar === v.envKey}
-															<Check class="h-3.5 w-3.5 text-green-500" />
+															<Check class="h-3.5 w-3.5 text-success" />
 														{:else}
 															<Copy class="h-3.5 w-3.5" />
 														{/if}
@@ -1150,10 +1136,12 @@
 								.join('\n')}</pre>
 					</div>
 				{/if}
-			</Tabs.Content>
+			</div>
+			{/if}
 
 			<!-- ── Limits tab ── -->
-			<Tabs.Content value="limits" class="mt-4 space-y-6 pt-2">
+			{#if tab === 'settings'}
+			<div class="mt-4 space-y-8 pt-2">
 				<div class="max-w-sm space-y-6">
 					<div class="space-y-2">
 						<Label>Memory Limit</Label>
@@ -1181,25 +1169,38 @@
 						</p>
 					</div>
 
-					{#if limitsError}
-						<p class="rounded bg-destructive/10 px-3 py-2 text-xs text-destructive">
-							{limitsError}
-						</p>
-					{/if}
+					<InlineError message={limitsError} />
 
 					<div class="flex items-center gap-3">
 						<Button onclick={saveLimits} disabled={savingLimits}>
 							{savingLimits ? 'Saving...' : 'Save'}
 						</Button>
-						{#if limitsSaved}
-							<span class="flex items-center gap-1 text-xs text-green-600 dark:text-green-400">
-								<Check class="h-3.5 w-3.5" /> Saved
-							</span>
-						{/if}
+						<SuccessAlert
+							message={limitsSaved ? 'Memory limit saved.' : ''}
+							class="py-1.5"
+						/>
 					</div>
 				</div>
-			</Tabs.Content>
-		</Tabs.Root>
+				<section
+					aria-labelledby="db-danger-heading"
+					class="max-w-2xl space-y-4 rounded-sm border border-destructive/40 p-4"
+				>
+					<div>
+						<h2 id="db-danger-heading" class="text-sm font-semibold text-destructive">
+							Delete this database
+						</h2>
+						<p class="mt-1 text-sm text-muted-foreground">
+							Stops the container and permanently deletes all of its data. Snapshots taken earlier
+							are kept.
+						</p>
+					</div>
+					<Button variant="destructive" size="sm" onclick={() => (showDeleteDialog = true)}>
+						Delete database…
+					</Button>
+				</section>
+			</div>
+			{/if}
+		</div>
 	</div>
 {:else}
 	<div class="py-12 text-center text-muted-foreground">Database not found</div>
@@ -1260,11 +1261,7 @@
 					</Button>
 				</div>
 			</div>
-			{#if credError}
-				<p class="rounded bg-destructive/10 px-3 py-2 text-xs text-destructive" role="alert">
-					{credError}
-				</p>
-			{/if}
+			<InlineError message={credError} />
 			<Dialog.Footer>
 				<Button type="button" variant="outline" onclick={cancelEditCred} disabled={savingCred}>
 					Cancel
@@ -1278,10 +1275,20 @@
 </Dialog.Root>
 
 <!-- Delete confirmation dialog -->
-<ConfirmDeleteDialog
+<ConfirmDialog
 	bind:open={showDeleteDialog}
-	title={`Delete "${db?.name}"?`}
-	description="This will stop the container and permanently remove all data. This action cannot be undone."
-	confirmation={db?.name ?? ''}
+	title={`Delete ${db?.name ?? 'this database'}?`}
+	description="This permanently deletes the database and all of its data. It can't be undone."
+	confirmLabel="Delete database"
+	pendingLabel="Deleting…"
+	typedConfirmation={db?.name ?? ''}
 	onconfirm={handleDelete}
-/>
+>
+	{#snippet details()}
+		<ul class="list-disc space-y-1 pl-5">
+			<li>The container stops; apps using it lose their connection.</li>
+			<li>Every table, key and file on its volume is deleted.</li>
+			<li>Existing snapshots are kept, so you can restore from one later.</li>
+		</ul>
+	{/snippet}
+</ConfirmDialog>

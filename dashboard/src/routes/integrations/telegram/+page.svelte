@@ -1,4 +1,5 @@
 <script lang="ts">
+	import PageTitle from '$lib/components/nav/page-title.svelte';
 	import ChevronLeft from '~icons/ri/arrow-left-s-line';
 	import Send from '~icons/ri/send-plane-line';
 	import { Input } from '$lib/components/ui/input/index.js';
@@ -45,6 +46,8 @@
 	});
 </script>
 
+<PageTitle title={'Telegram · Integrations'} />
+
 <div class="space-y-8">
 	<div class="flex h-14 items-center gap-4">
 		<a href="/integrations" class="text-muted-foreground hover:text-foreground">
@@ -52,7 +55,7 @@
 		</a>
 		<div class="flex items-center gap-3">
 			<Send class="h-6 w-6" />
-			<h2 class="text-3xl font-extrabold uppercase">Telegram</h2>
+			<h1 class="text-2xl font-extrabold sm:text-3xl">Telegram</h1>
 		</div>
 	</div>
 

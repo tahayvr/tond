@@ -403,6 +403,10 @@ export const MOCK_ONBOARDING_STATUS: OnboardingStatus = {
 	has_apps: true,
 	has_databases: true,
 	has_cron_jobs: true,
+	has_source_integration: true,
+	has_successful_deploy: true,
+	has_notification_channel: true,
+	last_deployment: null,
 	server_public_ip: '203.0.113.10',
 	domain_status: {
 		configured: true,

@@ -159,7 +159,7 @@
 				<div class="flex items-center gap-3">
 					<Server class="h-5 w-5 text-muted-foreground" />
 					<div>
-						<p class="font-mono text-[10px] tracking-[0.3em] text-muted-foreground/70 uppercase">
+						<p class="font-mono text-[10px] tracking-[0.3em] text-muted-foreground uppercase">
 							INFRASTRUCTURE_MAP
 						</p>
 						<p class="font-mono text-sm tracking-wider text-foreground uppercase">
@@ -185,11 +185,11 @@
 
 			{#if !hasResources}
 				<div class="flex flex-col items-center justify-center py-16">
-					<Box class="mb-4 h-12 w-12 text-muted-foreground/40" />
-					<p class="font-mono text-[11px] tracking-widest text-muted-foreground/60 uppercase">
+					<Box class="mb-4 h-12 w-12 text-muted-foreground" />
+					<p class="font-mono text-[11px] tracking-widest text-muted-foreground uppercase">
 						NO_ACTIVE_NODES
 					</p>
-					<p class="mt-2 text-sm text-muted-foreground/70">
+					<p class="mt-2 text-sm text-muted-foreground">
 						Server is online. Use the setup actions above to deploy your first workload.
 					</p>
 					<Button class="mt-4" onclick={() => goto('/projects')}>
@@ -381,21 +381,21 @@
 				</div>
 				<button
 					onclick={() => goto('/activity')}
-					class="font-mono text-[10px] tracking-wider text-muted-foreground/70 hover:text-muted-foreground"
+					class="font-mono text-[10px] tracking-wider text-muted-foreground hover:text-muted-foreground"
 				>
 					VIEW_ALL →
 				</button>
 			</div>
 
 			{#if recentActivity.length === 0}
-				<p class="font-mono text-[10px] tracking-wider text-muted-foreground/60 uppercase">
+				<p class="font-mono text-[10px] tracking-wider text-muted-foreground uppercase">
 					NO_RECENT_ACTIVITY
 				</p>
 			{:else}
 				<div class="space-y-2">
 					{#each recentActivity.slice(0, 5) as entry (entry.id)}
 						<div class="flex items-center gap-3 text-xs">
-							<span class="font-mono text-muted-foreground/60">
+							<span class="font-mono text-muted-foreground">
 								{new Date(entry.created_at).toLocaleTimeString()}
 							</span>
 							<Badge variant={actionVariant(entry.action)} class="font-mono text-[10px]">
@@ -419,7 +419,7 @@
 
 			<div class="space-y-3">
 				<div class="flex items-center justify-between">
-					<span class="font-mono text-[10px] text-muted-foreground/70 uppercase">Apps</span>
+					<span class="font-mono text-[10px] text-muted-foreground uppercase">Apps</span>
 					<span class="font-mono text-sm text-foreground">
 						{runningApps}/{apps.length}
 					</span>
@@ -432,7 +432,7 @@
 				</div>
 
 				<div class="flex items-center justify-between">
-					<span class="font-mono text-[10px] text-muted-foreground/70 uppercase">Databases</span>
+					<span class="font-mono text-[10px] text-muted-foreground uppercase">Databases</span>
 					<span class="font-mono text-sm text-foreground">
 						{runningDatabases}/{databases.length}
 					</span>
@@ -445,7 +445,7 @@
 				</div>
 
 				<div class="flex items-center justify-between">
-					<span class="font-mono text-[10px] text-muted-foreground/70 uppercase">Cron Jobs</span>
+					<span class="font-mono text-[10px] text-muted-foreground uppercase">Cron Jobs</span>
 					<span class="font-mono text-sm text-foreground">
 						{enabledCronJobs}/{cronJobs.length}
 					</span>

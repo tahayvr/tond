@@ -1,4 +1,5 @@
 <script lang="ts">
+	import PageTitle from '$lib/components/nav/page-title.svelte';
 	import { verify2FA } from '$lib/api';
 	import { setAuthenticated } from '$lib/auth.svelte';
 	import { Button } from '$lib/components/ui/button/index.js';
@@ -33,6 +34,8 @@
 	}
 </script>
 
+<PageTitle title={'Two-factor sign in'} />
+
 <div class="flex min-h-[80vh] flex-col items-center justify-center">
 	<div class="w-full max-w-lg space-y-8 font-mono">
 		<div class="flex flex-col items-center gap-4">
@@ -49,7 +52,7 @@
 				<p class="block text-xs text-muted-foreground">
 					{useBackup ? 'backup code' : 'authenticator code'}
 				</p>
-				<p class="text-xs text-muted-foreground/80">
+				<p class="text-xs text-muted-foreground">
 					{useBackup
 						? 'enter one of your 16-character backup codes'
 						: 'enter the 6-digit code from your authenticator app'}
@@ -102,7 +105,7 @@
 							placeholder="xxxxxxxxxxxxxxxx"
 							maxlength={16}
 							autocomplete="off"
-							class="border-none bg-transparent p-1 font-mono text-sm shadow-none placeholder:text-muted-foreground/40 focus-visible:ring-0"
+							class="border-none bg-transparent p-1 font-mono text-sm shadow-none placeholder:text-muted-foreground focus-visible:ring-2"
 						/>
 					</div>
 					<div class="h-px bg-border"></div>

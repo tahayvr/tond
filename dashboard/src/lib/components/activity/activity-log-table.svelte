@@ -1,5 +1,4 @@
 <script lang="ts">
-	import { goto } from '$app/navigation';
 	import { cn } from '$lib/utils';
 	import Activity from '~icons/ri/pulse-line';
 	import type { AuditLogEntry, App } from '$lib/api';
@@ -42,8 +41,8 @@
 
 	<div class="relative">
 		<div class="flex items-center gap-2 border-b border-border p-4">
-			<Activity class="h-4 w-4 text-muted-foreground/70" />
-			<span class="font-mono text-[10px] tracking-wider text-muted-foreground/70 uppercase">
+			<Activity class="h-4 w-4 text-muted-foreground" />
+			<span class="font-mono text-[10px] tracking-wider text-muted-foreground uppercase">
 				EVENT_LOG ({entries.length} ENTRIES)
 			</span>
 		</div>
@@ -52,27 +51,27 @@
 			<thead>
 				<tr class="border-b border-border bg-muted/50">
 					<th
-						class="px-4 py-3 text-left font-mono text-[10px] font-medium tracking-wider text-muted-foreground/70 uppercase"
+						class="px-4 py-3 text-left font-mono text-[10px] font-medium tracking-wider text-muted-foreground uppercase"
 					>
 						Time
 					</th>
 					<th
-						class="px-4 py-3 text-left font-mono text-[10px] font-medium tracking-wider text-muted-foreground/70 uppercase"
+						class="px-4 py-3 text-left font-mono text-[10px] font-medium tracking-wider text-muted-foreground uppercase"
 					>
 						Action
 					</th>
 					<th
-						class="px-4 py-3 text-left font-mono text-[10px] font-medium tracking-wider text-muted-foreground/70 uppercase"
+						class="px-4 py-3 text-left font-mono text-[10px] font-medium tracking-wider text-muted-foreground uppercase"
 					>
 						Unit
 					</th>
 					<th
-						class="px-4 py-3 text-left font-mono text-[10px] font-medium tracking-wider text-muted-foreground/70 uppercase"
+						class="px-4 py-3 text-left font-mono text-[10px] font-medium tracking-wider text-muted-foreground uppercase"
 					>
 						Operator
 					</th>
 					<th
-						class="px-4 py-3 text-left font-mono text-[10px] font-medium tracking-wider text-muted-foreground/70 uppercase"
+						class="px-4 py-3 text-left font-mono text-[10px] font-medium tracking-wider text-muted-foreground uppercase"
 					>
 						Detail
 					</th>
@@ -81,7 +80,7 @@
 			<tbody>
 				{#each entries as entry (entry.id)}
 					<tr class="border-b border-border/50 last:border-0 hover:bg-muted/50">
-						<td class="px-4 py-3 font-mono text-[10px] whitespace-nowrap text-muted-foreground/60">
+						<td class="px-4 py-3 font-mono text-[10px] whitespace-nowrap text-muted-foreground">
 							{new Date(entry.created_at).toLocaleString()}
 						</td>
 						<td class="px-4 py-3">
@@ -91,18 +90,18 @@
 						</td>
 						<td class="px-4 py-3 font-mono text-[10px]">
 							{#if entry.app_id}
-								<button
-									onclick={() => goto(`/apps/${entry.app_id}`)}
+								<a
+									href={`/apps/${entry.app_id}`}
 									class="text-muted-foreground hover:text-foreground hover:underline"
 								>
 									{entry.app_name ?? appName(entry.app_id)}
-								</button>
+								</a>
 							{:else}
-								<span class="text-muted-foreground/60">{entry.app_name ?? '—'}</span>
+								<span class="text-muted-foreground">{entry.app_name ?? '—'}</span>
 							{/if}
 						</td>
-						<td class="px-4 py-3 font-mono text-[10px] text-muted-foreground/60">{entry.actor}</td>
-						<td class="max-w-xs truncate px-4 py-3 font-mono text-[10px] text-muted-foreground/60">
+						<td class="px-4 py-3 font-mono text-[10px] text-muted-foreground">{entry.actor}</td>
+						<td class="max-w-xs truncate px-4 py-3 font-mono text-[10px] text-muted-foreground">
 							{entry.detail ?? '—'}
 						</td>
 					</tr>

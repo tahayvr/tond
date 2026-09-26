@@ -76,7 +76,7 @@
 	<div class="flex items-start justify-between gap-4">
 		<div class="space-y-1">
 			<p class="text-sm text-muted-foreground">Last 20 deployments for this app.</p>
-			<p class="text-xs text-muted-foreground/80">
+			<p class="text-xs text-muted-foreground">
 				Rolling back restores the exact image a deployment ran. Current environment variables,
 				volumes and resource limits are kept. Images of the last 3 successful deployments stay on
 				the server; older ones are pruned to save disk space.
@@ -154,7 +154,7 @@
 	{:else if deployments.length === 0}
 		<div class="rounded-lg border border-dashed py-12 text-center">
 			<p class="text-muted-foreground">No deployments yet</p>
-			<p class="mt-1 text-sm text-muted-foreground/60">Deploy this app to see history here</p>
+			<p class="mt-1 text-sm text-muted-foreground">Deploy this app to see history here</p>
 		</div>
 	{:else}
 		<div class="overflow-x-auto rounded-md border">

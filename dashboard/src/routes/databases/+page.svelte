@@ -1,37 +1,17 @@
 <script lang="ts">
-	import { deleteDatabase, type ManagedDatabase } from '$lib/api';
-	import { goto } from '$app/navigation';
+	import type { ManagedDatabase } from '$lib/api';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { setUiContext, clearUiContext, databasesContext } from '$lib/ui-context.svelte';
 	import Database from '~icons/ri/database-2-line';
+	import Plus from '~icons/ri/add-line';
 	import DatabaseGrid from '$lib/components/cards/database-card/database-grid.svelte';
-	import ConfirmDeleteDialog from '$lib/components/dialogs/confirm-delete-dialog.svelte';
+	import PageHeader from '$lib/components/nav/page-header.svelte';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();
 
 	let databases = $derived(data.databases as ManagedDatabase[]);
-	let error = $state('');
-
-	// Delete dialog state
-	let deleteDialogOpen = $state(false);
-	let dbToDelete = $state<ManagedDatabase | null>(null);
-
 	let runningCount = $derived(databases.filter((d) => d.status === 'running').length);
-
-	async function handleConfirmDelete() {
-		if (!dbToDelete) return;
-		const deletingId = dbToDelete.id;
-		try {
-			await deleteDatabase(deletingId);
-			databases = databases.filter((db) => db.id !== deletingId);
-		} catch (e: any) {
-			error = e.message ?? 'Failed to delete database';
-		} finally {
-			dbToDelete = null;
-			deleteDialogOpen = false;
-		}
-	}
 
 	$effect(() => {
 		setUiContext(databasesContext());
@@ -40,42 +20,33 @@
 </script>
 
 <div class="space-y-6">
-	<!-- Header -->
-	<div class="flex h-14 items-center justify-between">
-		<div>
-			<h2 class="text-3xl font-extrabold uppercase">Databases</h2>
-			<p class="font-mono text-xs tracking-wider text-muted-foreground/70">
-				{runningCount}/{databases.length} DATASTORES_ACTIVE
-			</p>
-		</div>
-		<Button onclick={() => goto('/databases/new')}>New Database</Button>
-	</div>
-
-	{#if error}
-		<div class="rounded-md border border-destructive/50 bg-destructive/10 p-4 text-destructive">
-			{error}
-		</div>
-	{/if}
+	<PageHeader
+		title="Databases"
+		description={databases.length ? `${runningCount} of ${databases.length} running` : undefined}
+	>
+		{#snippet actions()}
+			<Button href="/databases/new">
+				<Plus class="mr-1 h-4 w-4" />
+				New database
+			</Button>
+		{/snippet}
+	</PageHeader>
 
 	{#if databases.length === 0}
 		<div
-			class="flex flex-col items-center justify-center rounded-lg border border-border bg-card py-16"
+			class="flex flex-col items-center justify-center rounded-lg border border-border bg-card px-4 py-16 text-center"
 		>
-			<Database class="mb-4 h-12 w-12 text-muted-foreground/40" />
-			<p class="font-mono text-[11px] tracking-widest text-muted-foreground/60 uppercase">
-				NO_DATASTORES_FOUND
+			<Database aria-hidden="true" class="mb-4 h-12 w-12 text-muted-foreground" />
+			<p class="font-medium">No databases yet</p>
+			<p class="mt-2 text-sm text-muted-foreground">
+				PostgreSQL, MySQL, MariaDB, Redis and more, with backups and connection strings.
 			</p>
-			<p class="mt-2 text-sm text-muted-foreground/70">Create a database to get started</p>
+			<Button class="mt-4" href="/databases/new">
+				<Plus class="mr-1 h-4 w-4" />
+				Create database
+			</Button>
 		</div>
 	{:else}
 		<DatabaseGrid {databases} />
 	{/if}
 </div>
-
-<ConfirmDeleteDialog
-	bind:open={deleteDialogOpen}
-	title={dbToDelete ? `TERMINATE "${dbToDelete.name}"?` : 'TERMINATE DATASTORE?'}
-	description="This will stop the database container and permanently remove all data. This action cannot be undone."
-	confirmation={dbToDelete?.name ?? ''}
-	onconfirm={handleConfirmDelete}
-/>

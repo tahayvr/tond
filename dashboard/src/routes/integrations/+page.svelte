@@ -1,4 +1,5 @@
 <script lang="ts">
+	import PageTitle from '$lib/components/nav/page-title.svelte';
 	import {
 		type GitHubApp,
 		type RegistryCredential,
@@ -68,9 +69,11 @@
 	}
 </script>
 
+<PageTitle title={'Integrations'} />
+
 <div class="space-y-10">
 	<div class="flex h-14 items-center justify-between">
-		<h2 class="text-3xl font-extrabold uppercase">Integrations</h2>
+		<h1 class="text-2xl font-extrabold sm:text-3xl">Integrations</h1>
 	</div>
 
 	<!-- ── Notification Channels ─────────────────────────────────────────────── -->

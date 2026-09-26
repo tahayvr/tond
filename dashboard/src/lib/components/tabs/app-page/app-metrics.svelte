@@ -76,7 +76,7 @@
 	{:else if metrics.length === 0}
 		<div class="rounded-lg border border-dashed py-12 text-center">
 			<p class="text-muted-foreground">No metrics yet</p>
-			<p class="mt-1 text-sm text-muted-foreground/60">
+			<p class="mt-1 text-sm text-muted-foreground">
 				Data is collected every 30 seconds while the app is running
 			</p>
 		</div>
