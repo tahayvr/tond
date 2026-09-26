@@ -4,6 +4,7 @@ pub mod apps;
 pub mod audit;
 pub mod cron;
 pub mod db;
+pub mod docs;
 pub mod integrations;
 pub mod projects;
 pub mod scanner;

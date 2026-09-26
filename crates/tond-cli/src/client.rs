@@ -1560,6 +1560,69 @@ impl TondClient {
     }
 }
 
+// ── Tond updates (System → Updates) ──
+
+impl TondClient {
+    async fn update_call(&self, req: reqwest::RequestBuilder) -> Result<Value> {
+        let resp: ApiResponse<Value> = self
+            .auth_header(req)
+            .send()
+            .await?
+            .json()
+            .await
+            .context("unexpected response from tond-server")?;
+        if resp.success {
+            Ok(resp.data.unwrap_or(Value::Null))
+        } else {
+            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
+        }
+    }
+
+    /// GET /api/system/update: versions, changelog, the current or last run.
+    pub async fn get_update(&self) -> Result<Value> {
+        let req = self
+            .client
+            .get(format!("{}/api/system/update", self.base_url))
+            .timeout(std::time::Duration::from_secs(10));
+        self.update_call(req).await
+    }
+
+    /// POST /api/system/update/check: look for new releases now.
+    pub async fn check_updates(&self) -> Result<Value> {
+        let req = self
+            .client
+            .post(format!("{}/api/system/update/check", self.base_url));
+        self.update_call(req).await
+    }
+
+    /// POST /api/system/update: snapshot, then update (returns the run's status).
+    pub async fn start_update(
+        &self,
+        version: Option<&str>,
+        skip_snapshot: bool,
+        force: bool,
+    ) -> Result<Value> {
+        let req = self
+            .client
+            .post(format!("{}/api/system/update", self.base_url))
+            .json(&serde_json::json!({
+                "version": version,
+                "skip_snapshot": skip_snapshot,
+                "force": force,
+            }));
+        self.update_call(req).await
+    }
+
+    /// POST /api/system/update/rollback: back to the previous version.
+    pub async fn start_rollback(&self, skip_snapshot: bool) -> Result<Value> {
+        let req = self
+            .client
+            .post(format!("{}/api/system/update/rollback", self.base_url))
+            .json(&serde_json::json!({ "skip_snapshot": skip_snapshot }));
+        self.update_call(req).await
+    }
+}
+
 /// Turn the upload endpoint's reply into a result. The server refuses unsafe
 /// or oversized archives with a JSON error that says what to change; anything
 /// else (a proxy's HTML page, an empty body) is reported with its status.
