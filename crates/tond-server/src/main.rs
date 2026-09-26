@@ -85,6 +85,7 @@ mod domains;
 mod error;
 mod handlers;
 mod health;
+mod idempotency;
 mod janitor;
 mod log_bus;
 mod log_scrub;
@@ -244,6 +245,11 @@ async fn run() -> Result<()> {
     // path, and structured errors for axum's own plain-text rejections.
     let api = routes::api_router()
         .route("/api/{*rest}", any(api_errors::not_found))
+        // Safe retries with Idempotency-Key (idempotency.rs).
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            idempotency::layer,
+        ))
         // Latency histogram per route template (runtime/http_metrics.rs).
         .route_layer(axum::middleware::from_fn(http_metrics::track))
         .layer(axum::middleware::from_fn(api_errors::structured))

@@ -78,6 +78,9 @@ pub enum Purpose {
     HeartbeatUrl,
     /// audit_shipping.webhook_secret (HMAC key for shipped audit entries)
     AuditWebhookSecret,
+    /// idempotency_keys.response (a stored response can hold a new token or
+    /// database password). A cache: key rotation drops it instead.
+    IdempotentResponse,
 }
 
 impl Purpose {
@@ -102,6 +105,7 @@ impl Purpose {
             Purpose::IntegrationSecret => b"tond:integrations.config",
             Purpose::HeartbeatUrl => b"tond:heartbeat_config.url_enc",
             Purpose::AuditWebhookSecret => b"tond:audit_shipping.webhook_secret",
+            Purpose::IdempotentResponse => b"tond:idempotency_keys.response",
         }
     }
 }
@@ -451,6 +455,12 @@ pub async fn reencrypt_stored_secrets(
             }
         }
     }
+
+    // Stored idempotent responses are a 24 h cache: drop them rather than
+    // re-encrypt (a retry then simply runs again).
+    sqlx::query("DELETE FROM idempotency_keys")
+        .execute(&mut *tx)
+        .await?;
 
     tx.commit().await?;
     Ok(report)
