@@ -31,6 +31,8 @@
 		registryCredentials: RegistryCredential[];
 		registryCredentialId: string | null;
 		onRegistryCredentialChange: (credentialId: string | null) => Promise<void>;
+		/** Whether PR previews are on (from the app, so toggling them elsewhere shows here) */
+		previewEnabled: boolean;
 		/** Redeploy the app so saved changes reach the container */
 		onRedeploy: () => Promise<void>;
 	}
@@ -41,6 +43,7 @@
 		registryCredentials,
 		registryCredentialId,
 		onRegistryCredentialChange,
+		previewEnabled,
 		onRedeploy
 	}: Props = $props();
 
@@ -81,7 +84,6 @@
 	let envKeys = $derived(env?.vars.map((v) => v.key) ?? []);
 	let overrideKeys = $derived(env?.preview.overrides.map((v) => v.key) ?? []);
 	let excluded = $derived(new Set(env?.preview.excluded_keys ?? []));
-	let previewEnabled = $derived(env?.preview.enabled ?? false);
 	let isImage = $derived(sourceType === 'image');
 	let selectedCredentialId = $derived(registryCredentialId ?? '');
 

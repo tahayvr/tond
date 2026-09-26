@@ -1002,6 +1002,7 @@
 					{registryCredentials}
 					registryCredentialId={app.registry_credential_id}
 					onRegistryCredentialChange={handleEnvRegistryCredential}
+					previewEnabled={app.preview_enabled}
 					onRedeploy={handleEnvRedeploy}
 				/>
 			</Tabs.Content>

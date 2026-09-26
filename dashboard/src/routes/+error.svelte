@@ -40,13 +40,13 @@
 		</p>
 		<h1 class="text-2xl font-extrabold uppercase">{title}</h1>
 		<p class="text-sm text-muted-foreground">
-			{page.error?.message ?? 'Something went wrong.'}
+			{#if unavailable}
+				Tond didn't respond. It may be restarting or updating — nothing was lost. Try again in a few
+				seconds.
+			{:else}
+				{page.error?.message ?? 'Something went wrong.'}
+			{/if}
 		</p>
-		{#if unavailable}
-			<p class="text-xs text-muted-foreground">
-				Tond may be restarting or updating. Nothing was lost — try again in a few seconds.
-			</p>
-		{/if}
 		<div class="flex flex-wrap gap-2 pt-2">
 			{#if !notFound}
 				<Button onclick={handleRetry} disabled={retrying}>

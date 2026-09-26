@@ -65,7 +65,7 @@
 
 		<div class="space-y-4 py-2">
 			<div class="space-y-2">
-				<Label for="env-import-text">.env contents</Label>
+				<Label for="env-import-text" class="normal-case">.env contents</Label>
 				<Textarea
 					id="env-import-text"
 					bind:value={text}

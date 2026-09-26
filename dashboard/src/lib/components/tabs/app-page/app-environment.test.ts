@@ -26,7 +26,9 @@ function envWith(keys: string[], preview: Partial<AppEnv['preview']> = {}): AppE
 	};
 }
 
-function renderTab(props: Partial<{ onRedeploy: () => Promise<void> }> = {}) {
+function renderTab(
+	props: Partial<{ onRedeploy: () => Promise<void>; previewEnabled: boolean }> = {}
+) {
 	const onRedeploy = props.onRedeploy ?? vi.fn().mockResolvedValue(undefined);
 	render(AppEnvironment, {
 		props: {
@@ -35,6 +37,7 @@ function renderTab(props: Partial<{ onRedeploy: () => Promise<void> }> = {}) {
 			registryCredentials: [],
 			registryCredentialId: null,
 			onRegistryCredentialChange: vi.fn().mockResolvedValue(undefined),
+			previewEnabled: props.previewEnabled ?? false,
 			onRedeploy
 		}
 	});
@@ -190,7 +193,7 @@ describe('AppEnvironment', () => {
 		);
 
 		const user = userEvent.setup();
-		renderTab();
+		renderTab({ previewEnabled: true });
 
 		await user.click(await screen.findByLabelText('Exclude SECRET from previews'));
 
