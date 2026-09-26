@@ -219,6 +219,20 @@ impl Output {
         Ok(line.trim_end_matches(['\n', '\r']).to_string())
     }
 
+    /// The refusal half of [`Output::confirm`], for commands that look
+    /// something up before asking: call it first so a missing --yes without
+    /// a terminal is refused (exit 2) before any request is made.
+    pub fn can_confirm(&self, yes: bool, action: &str) -> Result<()> {
+        if yes || self.stdin_tty {
+            return Ok(());
+        }
+        Err(CliError::usage(format!(
+            "Refusing to {action} without --yes (stdin is not a terminal)."
+        ))
+        .with_hint("Pass --yes (-y) to confirm.")
+        .into())
+    }
+
     /// Gate a destructive action. With `yes`, go ahead. Otherwise ask
     /// `question` on stderr when stdin is a terminal (anything but y/yes
     /// cancels), and refuse with a usage error (exit 2) when it is not:
@@ -227,13 +241,7 @@ impl Output {
         if yes {
             return Ok(());
         }
-        if !self.stdin_tty {
-            return Err(CliError::usage(format!(
-                "Refusing to {action} without --yes (stdin is not a terminal)."
-            ))
-            .with_hint("Pass --yes (-y) to confirm.")
-            .into());
-        }
+        self.can_confirm(false, action)?;
         let answer = self.prompt_line(&format!("{question} [y/N] "))?;
         match answer.trim().to_lowercase().as_str() {
             "y" | "yes" => Ok(()),

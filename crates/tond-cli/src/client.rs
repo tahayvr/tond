@@ -86,6 +86,9 @@ pub struct TondClient {
     api_key: Option<String>,
     /// Set when talking to tond-server over its local Unix socket.
     socket_path: Option<PathBuf>,
+    /// Probe the socket before each request ([`TondClient::local_lazy`]), so
+    /// a missing server is reported as clearly as by [`TondClient::local`].
+    probe_socket: bool,
     /// Caller-chosen idempotency key (--idempotency-key); else one per request.
     idempotency_key: Option<String>,
     retry_delays: Vec<Duration>,
@@ -102,6 +105,29 @@ const LOCAL_BASE_URL: &str = "http://localhost";
 /// Hint shown when the local socket can't be used.
 const LOCAL_HINT: &str = "Run the CLI on the Tond server as root, or connect remotely with \
                           --server <url> --token <tond_pat_…>.";
+
+/// Connect to tond-server's Unix socket once, turning a missing server or
+/// missing root privileges into an actionable error.
+fn probe_local_socket(socket_path: &Path) -> Result<()> {
+    let Err(err) = std::os::unix::net::UnixStream::connect(socket_path) else {
+        return Ok(());
+    };
+    let error = match err.kind() {
+        std::io::ErrorKind::NotFound => CliError::unreachable(format!(
+            "tond-server socket not found at {}. Is tond-server running?",
+            socket_path.display()
+        )),
+        std::io::ErrorKind::PermissionDenied => CliError::socket_permission_denied(format!(
+            "permission denied on {} (the socket is root-only).",
+            socket_path.display()
+        )),
+        _ => CliError::unreachable(format!(
+            "could not connect to {}: {err}",
+            socket_path.display()
+        )),
+    };
+    Err(error.with_hint(LOCAL_HINT).into())
+}
 
 fn is_mutating(method: &Method) -> bool {
     !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
@@ -193,6 +219,7 @@ impl TondClient {
             client: reqwest::Client::new(),
             api_key: api_key.map(|s| s.to_string()),
             socket_path: None,
+            probe_socket: false,
             idempotency_key: None,
             retry_delays: RETRY_DELAYS.to_vec(),
         }
@@ -202,26 +229,17 @@ impl TondClient {
     pub fn local(socket_path: &Path) -> Result<Self> {
         // Probe the socket first so a missing server or missing root privileges
         // produce an actionable message instead of a generic request error.
-        if let Err(err) = std::os::unix::net::UnixStream::connect(socket_path) {
-            let error = match err.kind() {
-                std::io::ErrorKind::NotFound => CliError::unreachable(format!(
-                    "tond-server socket not found at {}. Is tond-server running?",
-                    socket_path.display()
-                )),
-                std::io::ErrorKind::PermissionDenied => {
-                    CliError::socket_permission_denied(format!(
-                        "permission denied on {} (the socket is root-only).",
-                        socket_path.display()
-                    ))
-                }
-                _ => CliError::unreachable(format!(
-                    "could not connect to {}: {err}",
-                    socket_path.display()
-                )),
-            };
-            return Err(error.with_hint(LOCAL_HINT).into());
-        }
+        probe_local_socket(socket_path)?;
+        let mut client = Self::local_lazy(socket_path)?;
+        client.probe_socket = false;
+        Ok(client)
+    }
 
+    /// Like [`TondClient::local`], but nothing touches the socket until the
+    /// first request (which probes it the same way). Commands that refuse
+    /// locally (a destructive action without --yes and no terminal) then do
+    /// so before a missing server can turn the usage error into exit 8.
+    pub fn local_lazy(socket_path: &Path) -> Result<Self> {
         let client = reqwest::Client::builder()
             .unix_socket(socket_path)
             .build()
@@ -231,9 +249,18 @@ impl TondClient {
             client,
             api_key: None,
             socket_path: Some(socket_path.to_path_buf()),
+            probe_socket: true,
             idempotency_key: None,
             retry_delays: RETRY_DELAYS.to_vec(),
         })
+    }
+
+    /// With [`TondClient::local_lazy`], check the socket before a request.
+    fn probe(&self) -> Result<()> {
+        match &self.socket_path {
+            Some(path) if self.probe_socket => probe_local_socket(path),
+            _ => Ok(()),
+        }
     }
 
     /// Use `key` as the Idempotency-Key of every mutating request.
@@ -278,6 +305,7 @@ impl TondClient {
         path: &str,
         build: &(dyn Fn(RequestBuilder) -> Result<RequestBuilder> + Send + Sync),
     ) -> Result<(StatusCode, String)> {
+        self.probe()?;
         let key = is_mutating(&method).then(|| {
             self.idempotency_key
                 .clone()
@@ -511,6 +539,7 @@ impl TondClient {
             }
             other => unreachable(&other).into(),
         };
+        self.probe()?;
         Ok(match &self.socket_path {
             Some(socket_path) => {
                 let stream = tokio::net::UnixStream::connect(socket_path)
@@ -1603,6 +1632,22 @@ pub(crate) mod tests {
             None,
             "the local socket client should not send credentials"
         );
+    }
+
+    #[tokio::test]
+    async fn lazy_local_client_reports_a_missing_socket_on_the_first_request() {
+        let dir =
+            tempfile::tempdir().unwrap_or_else(|err| panic!("failed to create temp dir: {err}"));
+        let socket_path = dir.path().join("missing.sock");
+        let client = TondClient::local_lazy(&socket_path)
+            .unwrap_or_else(|err| panic!("building a lazy client never connects: {err}"));
+        let error = client
+            .list_apps()
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("a request to a missing socket must fail"));
+        assert!(error.to_string().contains("socket not found"), "{error}");
+        assert_eq!(crate::error::exit_code(&error), 8);
     }
 
     #[test]

@@ -185,6 +185,7 @@ pub async fn handle(client: &TondClient, out: &Output, action: TokenAction) -> R
             }
         }
         TokenAction::Revoke { token, yes } => {
+            out.can_confirm(yes, &format!("revoke token {token}"))?;
             let tokens = client.list_tokens(true).await?;
             let matches: Vec<&TokenResponse> = tokens
                 .iter()

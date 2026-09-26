@@ -864,6 +864,11 @@ tond apps delete e2e-whoami < /dev/null > /dev/null 2>&1; cli_rc=$?
 set -e
 [[ "$cli_rc" == 2 ]] || fail "a destructive command without --yes and without a terminal must exit 2, got ${cli_rc}"
 [[ "$(app_field e2e-whoami name)" == e2e-whoami ]] || fail "a refused delete must not delete the app"
+set +e
+tond --socket /nonexistent/tond.sock apps delete e2e-whoami < /dev/null > /dev/null 2>&1; cli_rc=$?
+set -e
+[[ "$cli_rc" == 2 ]] \
+    || fail "without --yes the refusal (exit 2) must come before connecting, even with no server socket; got ${cli_rc}"
 tond help exit-codes --json | jq -e '.exit_codes | map(.exit_code) | contains([0,1,2,3,4,5,6,7,8])' > /dev/null \
     || fail "tond help exit-codes --json must list exit codes 0-8"
 [[ "$(tond completions bash)" == *_tond* ]] || fail "tond completions bash must print a completion script"
