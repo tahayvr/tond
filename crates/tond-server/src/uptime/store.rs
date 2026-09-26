@@ -1,6 +1,6 @@
 // uptime/store.rs — check configuration, probe results, rollups, incidents
 //
-// Tables (migrations/030_host_history_uptime.sql):
+// Tables (migrations/001_baseline.sql):
 //   uptime_checks     one per app with a domain + the dashboard
 //   uptime_1m         one row per probe, kept 48 h
 //   uptime_1h         hourly rollups, kept `retention_uptime_days` (90)
