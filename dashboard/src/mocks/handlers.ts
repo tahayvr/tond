@@ -838,11 +838,22 @@ function startMockDeploy(
 		script.push([4000, finish]);
 	} else {
 		script.push(
-			[2000, () => log('info', 'New container is ready — cutting over traffic')],
+			[
+				2000,
+				() =>
+					log(
+						'info',
+						app.readiness === 'none'
+							? 'The worker stayed up — replacing the old container'
+							: 'New container is ready — cutting over traffic'
+					)
+			],
 			[200, () => phase('release')],
 			[
 				300,
-				() => log('info', 'Waiting 3s for proxy to pick up new port before stopping old container')
+				() =>
+					app.readiness !== 'none' &&
+					log('info', 'Waiting 3s for proxy to pick up new port before stopping old container')
 			],
 			[1500, () => log('info', 'Draining old container 4be1c2a9d0f3 (30s grace)')],
 			[800, finish]

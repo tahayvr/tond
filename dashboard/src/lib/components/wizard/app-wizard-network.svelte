@@ -310,7 +310,7 @@
 			<Input id="domain" type="text" bind:value={domain} placeholder="app.example.com" />
 			<p class="text-xs text-muted-foreground">
 				Leave empty to use the automatic address under your apps domain. For your own domain, the
-				app's Domain tab shows the DNS record to create.
+				app's Settings → Domain shows the DNS record to create.
 			</p>
 		</div>
 
