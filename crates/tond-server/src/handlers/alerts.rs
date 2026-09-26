@@ -1,21 +1,21 @@
 // handlers/alerts.rs — alert rules, live alerts, history, snooze, settings
 //
 // Routes:
-//   GET    /api/alerts                          rules (metrics:read)
-//   POST   /api/alerts                          create a rule (settings:write)
-//   GET    /api/alerts/kinds                    rule kinds and whether their data exists
-//   GET    /api/alerts/active                   pending and firing alerts
-//   GET    /api/alerts/history                  episodes, filtered and paginated
-//   GET    /api/alerts/history/{id}             one episode with its deliveries
-//   POST   /api/alerts/history/{id}/acknowledge stop repeats (apps:control)
-//   GET    /api/alerts/settings                 global quiet hours
-//   PUT    /api/alerts/settings                 (settings:write)
-//   GET    /api/alerts/{id}                     one rule
-//   PATCH  /api/alerts/{id}                     change a rule (settings:write)
-//   DELETE /api/alerts/{id}                     delete a rule (settings:write)
-//   POST   /api/alerts/{id}/test                send a test to every channel
-//   POST   /api/alerts/{id}/snooze              mute a target or the rule (apps:control)
-//   POST   /api/alerts/{id}/unsnooze            (apps:control)
+//   GET    /api/v1/alerts                          rules (metrics:read)
+//   POST   /api/v1/alerts                          create a rule (settings:write)
+//   GET    /api/v1/alerts/kinds                    rule kinds and whether their data exists
+//   GET    /api/v1/alerts/active                   pending and firing alerts
+//   GET    /api/v1/alerts/history                  episodes, filtered and paginated
+//   GET    /api/v1/alerts/history/{id}             one episode with its deliveries
+//   POST   /api/v1/alerts/history/{id}/acknowledge stop repeats (apps:control)
+//   GET    /api/v1/alerts/settings                 global quiet hours
+//   PUT    /api/v1/alerts/settings                 (settings:write)
+//   GET    /api/v1/alerts/{id}                     one rule
+//   PATCH  /api/v1/alerts/{id}                     change a rule (settings:write)
+//   DELETE /api/v1/alerts/{id}                     delete a rule (settings:write)
+//   POST   /api/v1/alerts/{id}/test                send a test to every channel
+//   POST   /api/v1/alerts/{id}/snooze              mute a target or the rule (apps:control)
+//   POST   /api/v1/alerts/{id}/unsnooze            (apps:control)
 //
 // A rule must always notify someone: it needs at least one channel, and the
 // channel list can't be emptied.
@@ -848,6 +848,7 @@ pub async fn acknowledge(
 // ── Snooze ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct SnoozeBody {
     /// Target to mute ("app:<id>", "host", …); None mutes the whole rule
     #[serde(default)]
@@ -857,6 +858,7 @@ pub struct SnoozeBody {
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct UnsnoozeBody {
     #[serde(default)]
     pub target: Option<String>,

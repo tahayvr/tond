@@ -1,9 +1,9 @@
 // handlers/certificates.rs — TLS certificate status and uploaded certificates
 //
-//   list_certs()   GET    /api/certs                  — every certificate, with what it serves
-//   retry_cert()   POST   /api/certs/{domain}/retry   — try issuance now instead of after backoff
-//   upload_cert()  POST   /api/certs/custom           — serve an uploaded certificate for a domain
-//   delete_custom_cert() DELETE /api/certs/custom/{domain} — stop serving it (ACME takes over)
+//   list_certs()   GET    /api/v1/certs                  — every certificate, with what it serves
+//   retry_cert()   POST   /api/v1/certs/{domain}/retry   — try issuance now instead of after backoff
+//   upload_cert()  POST   /api/v1/certs/custom           — serve an uploaded certificate for a domain
+//   delete_custom_cert() DELETE /api/v1/certs/custom/{domain} — stop serving it (ACME takes over)
 //
 // tond-proxy obtains and renews certificates; tond-server stores the results
 // it reports over the control socket (proxy_link.rs). The list joins each row
@@ -235,7 +235,7 @@ pub async fn list_certs(
 
 // ── Retry a certificate now ──
 
-/// POST /api/certs/{domain}/retry — ask tond-proxy to attempt issuance now
+/// POST /api/v1/certs/{domain}/retry — ask tond-proxy to attempt issuance now
 /// instead of waiting for the backoff. The failure count is kept, so repeated
 /// retries of a broken domain still back off. A served domain without a row
 /// yet just gets a certificate pass.
@@ -287,15 +287,18 @@ fn check_cert_domain(raw: &str) -> Result<String, AppError> {
     let domain = normalize_domain(raw);
     let host = domain.strip_prefix("*.").unwrap_or(&domain);
     if !is_valid_hostname(host) {
-        return Err(AppError(TondError::InvalidInput(format!(
-            "'{}' isn't a valid domain (use app.example.com or *.example.com)",
-            raw.trim()
-        ))));
+        return Err(AppError(TondError::invalid_field(
+            "domain",
+            format!(
+                "'{}' isn't a valid domain (use app.example.com or *.example.com)",
+                raw.trim()
+            ),
+        )));
     }
     Ok(domain)
 }
 
-/// POST /api/certs/custom — validate (in tond-proxy) and serve an uploaded
+/// POST /api/v1/certs/custom — validate (in tond-proxy) and serve an uploaded
 /// certificate. Replaces an ACME certificate for the same domain; ACME stops
 /// renewing it until the upload is removed.
 pub async fn upload_cert(
@@ -311,20 +314,19 @@ pub async fn upload_cert(
         )));
     }
     if !req.cert_pem.contains("-----BEGIN CERTIFICATE-----") {
-        return Err(AppError(TondError::InvalidInput(
+        return Err(AppError(TondError::invalid_field(
+            "cert_pem",
             "The certificate must be PEM (-----BEGIN CERTIFICATE-----), leaf first, then the \
-             intermediates"
-                .into(),
+             intermediates",
         )));
     }
     if !req.key_pem.contains("PRIVATE KEY-----") {
-        return Err(AppError(TondError::InvalidInput(
-            "The private key must be PEM (-----BEGIN PRIVATE KEY----- or an RSA/EC key)".into(),
+        return Err(AppError(TondError::invalid_field(
+            "key_pem",
+            "The private key must be PEM (-----BEGIN PRIVATE KEY----- or an RSA/EC key)",
         )));
     }
-    let installed = proxy_link::install_cert(&domain, req.cert_pem, req.key_pem)
-        .await
-        .map_err(|message| AppError(TondError::InvalidInput(message)))?;
+    let installed = proxy_link::install_cert(&domain, req.cert_pem, req.key_pem).await?;
 
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
@@ -371,7 +373,7 @@ pub async fn upload_cert(
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(entry))))
 }
 
-/// DELETE /api/certs/custom/{domain} — stop serving an uploaded certificate.
+/// DELETE /api/v1/certs/custom/{domain} — stop serving an uploaded certificate.
 /// A domain Tond still serves gets an ACME certificate on the next pass.
 pub async fn delete_custom_cert(
     _rate: RateLimit,
@@ -388,9 +390,7 @@ pub async fn delete_custom_cert(
     if exists.is_none() {
         return Err(TondError::NotFound(format!("No uploaded certificate for {domain}")).into());
     }
-    proxy_link::remove_cert(&domain)
-        .await
-        .map_err(|m| AppError(TondError::Internal(m)))?;
+    proxy_link::remove_cert(&domain).await?;
     sqlx::query("DELETE FROM certificates WHERE domain = ?")
         .bind(&domain)
         .execute(&state.db)
@@ -528,7 +528,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(&not_pem, Err(AppError(TondError::InvalidInput(m))) if m.contains("PEM")),
+            matches!(&not_pem, Err(AppError(e)) if e.field() == Some("cert_pem") && e.message().contains("PEM")),
             "PEM is checked before anything else"
         );
         let no_proxy = upload_cert(
@@ -542,7 +542,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(&no_proxy, Err(AppError(TondError::InvalidInput(m))) if m.contains("tond-proxy isn't running")),
+            matches!(&no_proxy, Err(AppError(e)) if e.code() == "SERVICE_UNAVAILABLE" && e.message().contains("tond-proxy isn't running")),
             "the proxy validates and stores uploads"
         );
         let bad_domain = upload_cert(

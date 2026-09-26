@@ -10,6 +10,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::client::TondClient;
+use crate::output::{Output, outln};
 
 /// Name of the token file inside the data directory (next to the socket).
 const SETUP_TOKEN_FILE: &str = "setup-token";
@@ -20,7 +21,11 @@ pub fn setup_url(dashboard_domain: &str, token: &str) -> String {
 }
 
 /// Handle `tond setup-link`. `data_dir` is the directory holding the socket.
-pub async fn handle_setup_link(client: Result<TondClient>, data_dir: &Path) -> Result<()> {
+pub async fn handle_setup_link(
+    client: Result<TondClient>,
+    out: &Output,
+    data_dir: &Path,
+) -> Result<()> {
     let token_path = data_dir.join(SETUP_TOKEN_FILE);
     let token = match std::fs::read_to_string(&token_path) {
         Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
@@ -49,23 +54,43 @@ pub async fn handle_setup_link(client: Result<TondClient>, data_dir: &Path) -> R
         Err(_) => String::new(),
     };
 
-    if domain.trim().is_empty() {
-        println!("No dashboard domain is set yet. Point a DNS A record at this server, then run:");
-        println!();
-        println!("  sudo tond settings set-dashboard-domain dash.example.com");
-        println!();
-        println!("and open (valid until used):");
-        println!();
-        println!("  {}", setup_url("dash.example.com", &token));
-        println!();
-        println!("No domain yet? Use an SSH tunnel from your computer instead:");
-        println!();
-        println!("  ssh -L 3001:127.0.0.1:3001 root@<this-server>");
-        println!("  then open http://localhost:3001/setup?token={token}");
+    let domain_set = !domain.trim().is_empty();
+    out.json(&serde_json::json!({
+        "token": token,
+        "dashboard_domain": domain_set.then(|| domain.trim().to_string()),
+        "url": domain_set.then(|| setup_url(domain.trim(), &token)),
+        "tunnel_url": format!("http://localhost:3001/setup?token={token}"),
+    }))?;
+
+    if !domain_set {
+        outln!(
+            out,
+            "No dashboard domain is set yet. Point a DNS A record at this server, then run:"
+        );
+        outln!(out);
+        outln!(
+            out,
+            "  sudo tond settings set-dashboard-domain dash.example.com"
+        );
+        outln!(out);
+        outln!(out, "and open (valid until used):");
+        outln!(out);
+        outln!(out, "  {}", setup_url("dash.example.com", &token));
+        outln!(out);
+        outln!(
+            out,
+            "No domain yet? Use an SSH tunnel from your computer instead:"
+        );
+        outln!(out);
+        outln!(out, "  ssh -L 3001:127.0.0.1:3001 root@<this-server>");
+        outln!(out, "  then open http://localhost:3001/setup?token={token}");
     } else {
-        println!("Open this link to create your admin account (valid until used):");
-        println!();
-        println!("  {}", setup_url(domain.trim(), &token));
+        outln!(
+            out,
+            "Open this link to create your admin account (valid until used):"
+        );
+        outln!(out);
+        outln!(out, "  {}", setup_url(domain.trim(), &token));
     }
     Ok(())
 }
@@ -85,10 +110,14 @@ mod tests {
     #[tokio::test]
     async fn missing_token_file_explains_that_setup_is_done() {
         let dir = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
-        let err = handle_setup_link(Err(anyhow::anyhow!("no server")), dir.path())
-            .await
-            .err()
-            .unwrap_or_else(|| panic!("expected an error without a token file"));
+        let err = handle_setup_link(
+            Err(anyhow::anyhow!("no server")),
+            &Output::capture(false, false, "").0,
+            dir.path(),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("expected an error without a token file"));
         assert!(err.to_string().contains("No setup is pending"));
     }
 
@@ -98,9 +127,13 @@ mod tests {
         std::fs::write(dir.path().join(SETUP_TOKEN_FILE), "tok\n")
             .unwrap_or_else(|err| panic!("write: {err}"));
         assert!(
-            handle_setup_link(Err(anyhow::anyhow!("no server")), dir.path())
-                .await
-                .is_ok()
+            handle_setup_link(
+                Err(anyhow::anyhow!("no server")),
+                &Output::capture(false, false, "").0,
+                dir.path()
+            )
+            .await
+            .is_ok()
         );
     }
 }

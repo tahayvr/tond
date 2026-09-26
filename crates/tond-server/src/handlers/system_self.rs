@@ -1,6 +1,6 @@
 // handlers/system_self.rs — Tond measuring itself
 //
-// GET /api/system/self — (metrics:read) process, background loops, database, HTTP latency,
+// GET /api/v1/system/self — (metrics:read) process, background loops, database, HTTP latency,
 //                        build queue and tond-proxy stats (any signed-in user)
 // GET /metrics         — the same in the Prometheus text format (metrics:read):
 //                        over TCP with an API token as a bearer token (a

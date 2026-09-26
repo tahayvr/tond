@@ -30,6 +30,8 @@
 	let keyPem = $state('');
 	let saving = $state(false);
 	let error = $state('');
+	/** The field the server's error is about (ApiError.field). */
+	let errorField = $state<string | null>(null);
 
 	$effect(() => {
 		if (open) {
@@ -63,6 +65,7 @@
 		}
 		saving = true;
 		error = '';
+		errorField = null;
 		try {
 			const cert = await uploadCertificate({ domain: name, cert_pem: certPem, key_pem: keyPem });
 			keyPem = '';
@@ -70,6 +73,7 @@
 			await onUploaded?.(cert, name);
 		} catch (err: any) {
 			error = err.message ?? 'The upload failed';
+			errorField = err.field ?? null;
 		} finally {
 			saving = false;
 		}
@@ -90,6 +94,7 @@
 				<Label for="upload-domain">Domain</Label>
 				<Input
 					id="upload-domain"
+					aria-invalid={errorField === 'domain' || undefined}
 					bind:value={domain}
 					placeholder="app.example.com or *.example.com"
 					autocomplete="off"
@@ -114,6 +119,7 @@
 				</div>
 				<Textarea
 					id="upload-cert"
+					aria-invalid={errorField === 'cert_pem' || undefined}
 					bind:value={certPem}
 					rows={6}
 					class="font-mono text-xs"
@@ -140,6 +146,7 @@
 				</div>
 				<Textarea
 					id="upload-key"
+					aria-invalid={errorField === 'key_pem' || undefined}
 					bind:value={keyPem}
 					rows={4}
 					class="font-mono text-xs"

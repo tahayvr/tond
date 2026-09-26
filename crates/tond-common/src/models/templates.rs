@@ -22,6 +22,7 @@ pub enum TemplateManifestError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TemplateManifest {
     pub id: String,
     pub name: String,
@@ -48,6 +49,7 @@ pub struct TemplateManifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TemplateCatalogEntry {
     pub id: String,
     pub name: String,
@@ -67,6 +69,7 @@ pub struct TemplateCatalogEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TemplateSource {
     pub kind: String,
     pub url: String,
@@ -75,6 +78,7 @@ pub struct TemplateSource {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TemplateDeploy {
     pub method: String,
     pub default_port: u16,
@@ -84,18 +88,21 @@ pub struct TemplateDeploy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TemplateProject {
     pub name: String,
     pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TemplateVolume {
     pub container_path: String,
     pub description: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TemplateEnvVar {
     pub key: String,
     pub description: String,
@@ -104,6 +111,7 @@ pub struct TemplateEnvVar {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TemplateDependency {
     pub name: Option<String>,
     pub kind: String,

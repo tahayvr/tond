@@ -20,6 +20,7 @@ use std::process;
 
 use anyhow::{Context, Result, bail};
 
+use crate::output::{Output, outln};
 use crate::signature::{self, Verdict};
 
 const FALLBACK_SCRIPT: &str = "/opt/tond/bin/update.sh";
@@ -109,6 +110,7 @@ fn parse_sha256_line(line: &str) -> Option<String> {
 /// `/opt/tond/bin/update.sh` only when the download cannot be completed (e.g.
 /// the host has no internet access).
 pub fn handle(
+    out: &Output,
     version: Option<String>,
     dry_run: bool,
     skip_backup: bool,
@@ -150,7 +152,7 @@ pub fn handle(
     // --- Try to obtain a fresh update.sh from the release tarball ---
     let script_path = match download_update_script(&tmp_dir, version.as_deref()) {
         Ok(p) => {
-            println!("Using update script from release tarball.");
+            outln!(out, "Using update script from release tarball.");
             p
         }
         Err(DownloadError::Untrusted(e)) => {
@@ -177,16 +179,22 @@ pub fn handle(
         }
     };
 
-    println!("Updating Tond...");
+    outln!(out, "Updating Tond...");
 
-    let status = run_script(&script_path, &script_args, is_root)
+    let status = run_script(&script_path, &script_args, is_root, out.is_json())
         .with_context(|| format!("Failed to execute {}", script_path.display()))?;
 
     // Cleanup temp dir — best effort; it will be cleaned by the OS on reboot otherwise.
     let _ = std::fs::remove_dir_all(&tmp_dir);
 
     if status.success() {
-        println!("Update completed successfully.");
+        out.json(&serde_json::json!({
+            "ok": true,
+            "action": "update",
+            "version": version,
+            "dry_run": dry_run,
+        }))?;
+        outln!(out, "Update completed successfully.");
     } else {
         let code = status.code().unwrap_or(1);
         bail!("Update script exited with status {code}");
@@ -195,20 +203,27 @@ pub fn handle(
     Ok(())
 }
 
-/// Run the script, prepending `sudo` if we are not already root.
+/// Run the script, prepending `sudo` if we are not already root. With
+/// `quiet_stdout` (--json) the script's output goes to stderr so stdout
+/// holds only the JSON result.
 fn run_script(
     script: &Path,
     args: &[String],
     is_root: bool,
+    quiet_stdout: bool,
 ) -> std::io::Result<process::ExitStatus> {
-    if is_root {
-        process::Command::new(script).args(args).status()
+    let mut cmd = if is_root {
+        process::Command::new(script)
     } else {
-        process::Command::new("sudo")
-            .arg(script)
-            .args(args)
-            .status()
+        let mut sudo = process::Command::new("sudo");
+        sudo.arg(script);
+        sudo
+    };
+    cmd.args(args);
+    if quiet_stdout {
+        cmd.stdout(process::Stdio::from(std::io::stderr()));
     }
+    cmd.status()
 }
 
 /// Download `update.sh` from the appropriate release tarball into `dir`.
@@ -275,7 +290,7 @@ fn download_update_script(dir: &Path, version: Option<&str>) -> Result<PathBuf, 
         signature::release_public_key(),
         signature::allow_unsigned_from_env(),
     ) {
-        Ok(Verdict::Verified) => println!("Signature of {tag} verified."),
+        Ok(Verdict::Verified) => eprintln!("Signature of {tag} verified."),
         Ok(Verdict::Unverified(why)) => eprintln!("Warning: {why}."),
         Err(e) => return Err(DownloadError::Untrusted(e)),
     }

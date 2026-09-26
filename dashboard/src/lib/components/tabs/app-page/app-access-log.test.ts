@@ -70,7 +70,7 @@ describe('AppAccessLog', () => {
 		expect(screen.getByText('3.0 MB of 60 MB used')).toBeInTheDocument();
 		expect(screen.getByRole('link', { name: /full log/i })).toHaveAttribute(
 			'href',
-			'/api/apps/a1/access-log/download'
+			'/api/v1/apps/a1/access-log/download'
 		);
 
 		await user.type(screen.getByRole('textbox', { name: 'Search the whole access log' }), ' 500 ');

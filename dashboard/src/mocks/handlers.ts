@@ -1,7 +1,7 @@
 /**
  * MSW request handlers for all /api/* endpoints.
  * Every handler returns the ApiResponse<T> envelope the real server uses:
- *   { success: true, data: T, error: null }
+ *   { success: true, data: T }  |  { success: false, data: null, error: { code, message, hint? } }
  */
 
 import { http, HttpResponse, ws, delay } from 'msw';
@@ -9,13 +9,13 @@ import { http, HttpResponse, ws, delay } from 'msw';
 // WebSocket links must be declared at module scope so MSW can track clients
 // across the service worker boundary via a stable BroadcastChannel. Use paths
 // relative to the page origin: a wildcard host ("ws://*/…") never matches.
-const appLogStream = ws.link('/api/apps/:id/logs/stream');
-const systemLogStream = ws.link('/api/system/logs/stream');
-const allDatabaseLogStream = ws.link('/api/databases/logs/stream');
-const databaseLogStream = ws.link('/api/databases/:id/logs/stream');
-const cronRunStream = ws.link('/api/cron/:id/runs/stream');
-const terminalStream = ws.link('/api/terminal/ws');
-const deploymentStream = ws.link('/api/apps/:id/deployments/:deploymentId/stream');
+const appLogStream = ws.link('/api/v1/apps/:id/logs/stream');
+const systemLogStream = ws.link('/api/v1/system/logs/stream');
+const allDatabaseLogStream = ws.link('/api/v1/databases/logs/stream');
+const databaseLogStream = ws.link('/api/v1/databases/:id/logs/stream');
+const cronRunStream = ws.link('/api/v1/cron/:id/runs/stream');
+const terminalStream = ws.link('/api/v1/terminal/ws');
+const deploymentStream = ws.link('/api/v1/apps/:id/deployments/:deploymentId/stream');
 
 import {
 	MOCK_USER,
@@ -108,19 +108,23 @@ import {
 	MOCK_ALERT_SETTINGS
 } from './fixtures';
 import { observeHandlers } from './observe';
+import { errorBody, okBody } from './envelope';
+import { MOCK_OPENAPI } from './openapi';
 
 // Simulated network latency (ms). Set to 0 for instant responses.
 const LATENCY = 200;
 
 function ok<T>(data: T) {
-	return HttpResponse.json({ success: true, data, error: null });
+	return HttpResponse.json(okBody(data));
 }
 
 function err(message: string, status = 400, code?: string) {
-	return HttpResponse.json(
-		{ success: false, data: null, error: message, ...(code ? { code } : {}) },
-		{ status }
-	);
+	return HttpResponse.json(errorBody(message, status, code), { status });
+}
+
+/** INVALID_INPUT about one request field. */
+function fieldErr(message: string, field: string) {
+	return HttpResponse.json(errorBody(message, 400, 'INVALID_INPUT', { field }), { status: 400 });
 }
 
 /** The mock password policy: 12–256 characters, no common passwords. */
@@ -395,19 +399,19 @@ function promoteIfNeeded(appId: string) {
 function checkMockDomain(appId: string, raw: string): string | null {
 	const domain = normalizeDomain(raw);
 	if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(domain)) {
-		return `Invalid input: '${domain}' is not a valid domain name (expected something like app.example.com)`;
+		return `'${domain}' is not a valid domain name (expected something like app.example.com)`;
 	}
 	if (domain === MOCK_SETTINGS.dashboard_domain) {
-		return `Invalid input: ${domain} is the dashboard domain; choose another hostname for the app`;
+		return `${domain} is the dashboard domain; choose another hostname for the app`;
 	}
 	const preview = MOCK_SETTINGS.preview_domain;
 	if (preview && (domain === preview || domain.endsWith(`.${preview}`))) {
-		return `Invalid input: ${domain} is under the preview domain (${preview}), which only serves previews; choose a hostname outside it`;
+		return `${domain} is under the preview domain (${preview}), which only serves previews; choose a hostname outside it`;
 	}
 	for (const [otherId, list] of Object.entries(appDomains)) {
 		if (otherId !== appId && list.some((d) => d.domain === domain)) {
 			const other = apps.find((a) => a.id === otherId)?.name ?? otherId;
-			return `Invalid input: ${domain} is already used by the app '${other}'. Remove it there first.`;
+			return `${domain} is already used by the app '${other}'. Remove it there first.`;
 		}
 	}
 	return null;
@@ -434,9 +438,9 @@ function mockDomainRow(
 
 // In-memory mutable state (mutations survive page navigation within the session)
 // Starts as true so that `pnpm dev:setup` begins signed out with setup open.
-// Like the real server, /api/auth/status doesn't reveal it: open the setup link
+// Like the real server, /api/v1/auth/status doesn't reveal it: open the setup link
 // /setup?token=mock-setup-token (MOCK_SETUP_TOKEN) to reach the form.
-// Flips to false once POST /api/auth/setup succeeds.
+// Flips to false once POST /api/v1/auth/setup succeeds.
 let needsSetup = true;
 export const MOCK_SETUP_TOKEN = 'mock-setup-token';
 
@@ -650,10 +654,10 @@ function randomHex(bytes: number): string {
 function webhookConfig(app: App) {
 	webhookSecrets[app.id] ??= randomHex(32);
 	const paths = {
-		github: `/api/webhooks/github/${app.id}`,
-		gitlab: `/api/webhooks/gitlab/${app.id}`,
-		gitea: `/api/webhooks/gitea/${app.id}`,
-		generic: `/api/webhooks/generic/${app.id}`
+		github: `/api/v1/webhooks/github/${app.id}`,
+		gitlab: `/api/v1/webhooks/gitlab/${app.id}`,
+		gitea: `/api/v1/webhooks/gitea/${app.id}`,
+		generic: `/api/v1/webhooks/generic/${app.id}`
 	};
 	const domain = MOCK_SETTINGS.dashboard_domain.trim();
 	const urls = domain
@@ -737,7 +741,7 @@ function applyEnvPatch(
 //
 //   server-down      every /api request gets a proxy-style 502 HTML page
 //   session-expired  the next data request gets a 401 (one-shot), then normal
-//   rate-limited     POST /api/auth/login gets 429 with Retry-After: 30
+//   rate-limited     POST /api/v1/auth/login gets 429 with Retry-After: 30
 //   logged-out       start signed out (run with VITE_DEV_AUTH_BYPASS=false)
 //   mfa              like logged-out, and sign-in asks for a 2FA code (123456)
 //   2fa-enabled      the current user starts with 2FA enabled
@@ -768,11 +772,11 @@ function currentMockUser() {
 	return { ...MOCK_USER, totp_enabled: mockTotpEnabled };
 }
 
-const CREDENTIAL_PATHS = ['/api/auth/'];
+const CREDENTIAL_PATHS = ['/api/v1/auth/'];
 
 // ── Mock deploy engine ────────────────────────────────────────────────────────
 //
-// POST /api/apps/:id/deploy (and rollback) start a scripted deployment that
+// POST /api/v1/apps/:id/deploy (and rollback) start a scripted deployment that
 // walks through the phases and writes log lines over ~15 s, so the live deploy
 // view can be developed without a server. Apps named "worker-queue" fail the
 // health step (nothing listening on the port); everything else succeeds.
@@ -1043,7 +1047,7 @@ function isFinishedStatus(status: string) {
 }
 
 const deploymentStreamHandler = deploymentStream.addEventListener('connection', ({ client }) => {
-	const match = client.url.pathname.match(/\/api\/apps\/([^/]+)\/deployments\/([^/]+)\/stream/);
+	const match = client.url.pathname.match(/\/api\/v1\/apps\/([^/]+)\/deployments\/([^/]+)\/stream/);
 	const app = match ? apps.find((a) => a.id === match[1] || a.name === match[1]) : undefined;
 	const d = app ? (deployments[app.id] ?? []).find((x) => x.id === match?.[2]) : undefined;
 	if (!app || !d) {
@@ -1080,7 +1084,7 @@ const deploymentStreamHandler = deploymentStream.addEventListener('connection', 
 	client.addEventListener('close', () => set.delete(listener));
 });
 
-/** Mock of GET /api/domains/check (server: handlers/domains.rs). */
+/** Mock of GET /api/v1/domains/check (server: handlers/domains.rs). */
 function mockDomainCheck(domain: string) {
 	const serverIp = '203.0.113.10';
 	const parts = domain.split('.');
@@ -1155,7 +1159,7 @@ function mockDomainCheck(domain: string) {
 	};
 }
 
-/** Ports a few well-known images expose (mock of POST /api/images/inspect). */
+/** Ports a few well-known images expose (mock of POST /api/v1/images/inspect). */
 function mockImagePorts(image: string): { exposed: number[]; env: number | null } {
 	const name = image.toLowerCase();
 	if (/nginx|httpd|caddy|whoami|apache/.test(name)) return { exposed: [80], env: null };
@@ -1168,6 +1172,9 @@ function mockImagePorts(image: string): { exposed: number[]; env: number | null 
 export const handlers = [
 	// Host history, disk, Docker, heartbeat, uptime (./observe.ts)
 	...observeHandlers,
+
+	// The OpenAPI document is plain JSON, not an envelope.
+	http.get('/api/v1/openapi.json', () => HttpResponse.json(MOCK_OPENAPI)),
 
 	// Scenario gate: runs first and falls through (returns undefined) when idle.
 	http.all('/api/*', ({ request }) => {
@@ -1184,17 +1191,17 @@ export const handlers = [
 			clearMockScenario();
 			return err('Unauthorized', 401);
 		}
-		if (scenario === 'rate-limited' && path === '/api/auth/login') {
-			return HttpResponse.json(
-				{ success: false, data: null, error: 'Rate limit exceeded. Try again later.' },
-				{ status: 429, headers: { 'Retry-After': '30' } }
-			);
+		if (scenario === 'rate-limited' && path === '/api/v1/auth/login') {
+			return HttpResponse.json(errorBody('Rate limit exceeded. Try again later.', 429), {
+				status: 429,
+				headers: { 'Retry-After': '30' }
+			});
 		}
 	}),
 
 	// ── Auth ────────────────────────────────────────────────────────────────
 
-	http.get('/api/auth/status', async () => {
+	http.get('/api/v1/auth/status', async () => {
 		await delay(LATENCY);
 		const scenario = mockScenario();
 		if ((scenario === 'logged-out' || scenario === 'mfa') && !mockSignedIn) {
@@ -1206,7 +1213,7 @@ export const handlers = [
 		return ok({ authenticated: true, user: currentMockUser() });
 	}),
 
-	http.post('/api/auth/setup/check', async ({ request }) => {
+	http.post('/api/v1/auth/setup/check', async ({ request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as { token?: string };
 		if (!needsSetup || body.token !== MOCK_SETUP_TOKEN) {
@@ -1218,7 +1225,7 @@ export const handlers = [
 		return ok({ valid: true });
 	}),
 
-	http.post('/api/auth/login', async () => {
+	http.post('/api/v1/auth/login', async () => {
 		await delay(LATENCY);
 		if (mockScenario() === 'mfa') {
 			return ok({ mfa_required: true });
@@ -1227,17 +1234,17 @@ export const handlers = [
 		return ok({ user: currentMockUser() });
 	}),
 
-	http.post('/api/auth/logout', async () => {
+	http.post('/api/v1/auth/logout', async () => {
 		await delay(LATENCY);
 		return ok(null);
 	}),
 
-	http.get('/api/auth/me', async () => {
+	http.get('/api/v1/auth/me', async () => {
 		await delay(LATENCY);
 		return ok(currentMockUser());
 	}),
 
-	http.post('/api/auth/setup', async ({ request }) => {
+	http.post('/api/v1/auth/setup', async ({ request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as { token?: string };
 		if (!needsSetup || body.token !== MOCK_SETUP_TOKEN) {
@@ -1252,12 +1259,12 @@ export const handlers = [
 
 	// ── Users (users:admin) ───────────────────────────────────────────────────
 
-	http.get('/api/users', async () => {
+	http.get('/api/v1/users', async () => {
 		await delay(LATENCY);
 		return ok(users);
 	}),
 
-	http.post('/api/users', async ({ request }) => {
+	http.post('/api/v1/users', async ({ request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as { email?: string; role?: string };
 		const email = body.email?.trim() ?? '';
@@ -1290,14 +1297,13 @@ export const handlers = [
 					token: MOCK_PASSWORD_LINK,
 					path: `/set-password?token=${MOCK_PASSWORD_LINK}`,
 					expires_at: new Date(Date.now() + 86400_000).toISOString()
-				},
-				error: null
+				}
 			},
 			{ status: 201 }
 		);
 	}),
 
-	http.patch('/api/users/:id', async ({ params, request }) => {
+	http.patch('/api/v1/users/:id', async ({ params, request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as { role?: string; disabled?: boolean };
 		const target = users.find((u) => u.id === params.id);
@@ -1320,7 +1326,7 @@ export const handlers = [
 		return ok(users.find((u) => u.id === params.id));
 	}),
 
-	http.delete('/api/users/:id', async ({ params }) => {
+	http.delete('/api/v1/users/:id', async ({ params }) => {
 		await delay(LATENCY);
 		const target = users.find((u) => u.id === params.id);
 		if (!target) return err('Not found: user', 404);
@@ -1330,7 +1336,7 @@ export const handlers = [
 		return ok({ deleted: params.id });
 	}),
 
-	http.post('/api/users/:id/password-link', async ({ params }) => {
+	http.post('/api/v1/users/:id/password-link', async ({ params }) => {
 		await delay(LATENCY);
 		const target = users.find((u) => u.id === params.id);
 		if (!target) return err('Not found: user', 404);
@@ -1342,14 +1348,13 @@ export const handlers = [
 					token: MOCK_PASSWORD_LINK,
 					path: `/set-password?token=${MOCK_PASSWORD_LINK}`,
 					expires_at: new Date(Date.now() + 86400_000).toISOString()
-				},
-				error: null
+				}
 			},
 			{ status: 201 }
 		);
 	}),
 
-	http.get('/api/users/:id/sessions', async ({ params }) => {
+	http.get('/api/v1/users/:id/sessions', async ({ params }) => {
 		await delay(LATENCY);
 		const target = users.find((u) => u.id === params.id);
 		if (!target) return err('Not found: user', 404);
@@ -1370,7 +1375,7 @@ export const handlers = [
 		);
 	}),
 
-	http.delete('/api/users/:id/sessions', async ({ params }) => {
+	http.delete('/api/v1/users/:id/sessions', async ({ params }) => {
 		await delay(LATENCY);
 		const target = users.find((u) => u.id === params.id);
 		if (!target) return err('Not found: user', 404);
@@ -1381,7 +1386,7 @@ export const handlers = [
 		return ok({ revoked });
 	}),
 
-	http.delete('/api/users/:id/sessions/:sessionId', async ({ params }) => {
+	http.delete('/api/v1/users/:id/sessions/:sessionId', async ({ params }) => {
 		await delay(LATENCY);
 		users = users.map((u) =>
 			u.id === params.id ? { ...u, active_sessions: Math.max(0, u.active_sessions - 1) } : u
@@ -1391,7 +1396,7 @@ export const handlers = [
 
 	// ── Set-password links (public) ───────────────────────────────────────────
 
-	http.post('/api/auth/password-link/check', async ({ request }) => {
+	http.post('/api/v1/auth/password-link/check', async ({ request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as { token?: string };
 		if (body.token !== MOCK_PASSWORD_LINK) {
@@ -1407,7 +1412,7 @@ export const handlers = [
 		});
 	}),
 
-	http.post('/api/auth/password-link/complete', async ({ request }) => {
+	http.post('/api/v1/auth/password-link/complete', async ({ request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as { token?: string; password?: string };
 		if (body.token !== MOCK_PASSWORD_LINK) {
@@ -1424,17 +1429,17 @@ export const handlers = [
 
 	// ── API tokens ────────────────────────────────────────────────────────────
 
-	http.get('/api/tokens/catalog', async () => {
+	http.get('/api/v1/tokens/catalog', async () => {
 		await delay(LATENCY);
 		return ok(MOCK_TOKEN_CATALOG);
 	}),
 
-	http.get('/api/tokens', async () => {
+	http.get('/api/v1/tokens', async () => {
 		await delay(LATENCY);
 		return ok(apiTokens);
 	}),
 
-	http.post('/api/tokens', async ({ request }) => {
+	http.post('/api/v1/tokens', async ({ request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as {
 			name?: string;
@@ -1474,13 +1479,10 @@ export const handlers = [
 			created_at: new Date().toISOString()
 		};
 		apiTokens = [token, ...apiTokens];
-		return HttpResponse.json(
-			{ success: true, data: { token, secret }, error: null },
-			{ status: 201 }
-		);
+		return HttpResponse.json({ success: true, data: { token, secret } }, { status: 201 });
 	}),
 
-	http.delete('/api/tokens/:id', async ({ params }) => {
+	http.delete('/api/v1/tokens/:id', async ({ params }) => {
 		await delay(LATENCY);
 		const token = apiTokens.find((t) => t.id === params.id);
 		if (!token) return err('Not found: token', 404);
@@ -1489,7 +1491,7 @@ export const handlers = [
 		return ok(updated);
 	}),
 
-	http.get('/api/terminal/targets', async () => {
+	http.get('/api/v1/terminal/targets', async () => {
 		await delay(LATENCY);
 		return ok([
 			{
@@ -1525,7 +1527,7 @@ export const handlers = [
 		]);
 	}),
 
-	http.post('/api/terminal/tickets', async ({ request }) => {
+	http.post('/api/v1/terminal/tickets', async ({ request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as {
 			target_kind: string;
@@ -1549,18 +1551,15 @@ export const handlers = [
 		}
 		const ticket = `mock-ticket-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 		terminalTickets.set(ticket, { kind: body.target_kind, id: body.target_id });
-		return HttpResponse.json(
-			{ success: true, data: { ticket, expires_in: 30 }, error: null },
-			{ status: 201 }
-		);
+		return HttpResponse.json({ success: true, data: { ticket, expires_in: 30 } }, { status: 201 });
 	}),
 
-	http.get('/api/settings/host-terminal', async () => {
+	http.get('/api/v1/settings/host-terminal', async () => {
 		await delay(LATENCY);
 		return ok({ enabled: mockHostTerminalEnabled() });
 	}),
 
-	http.put('/api/settings/host-terminal', async ({ request }) => {
+	http.put('/api/v1/settings/host-terminal', async ({ request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as { enabled?: boolean };
 		return err(
@@ -1571,7 +1570,7 @@ export const handlers = [
 
 	// ── Phase 7.1 — Password Management ─────────────────────────────────────
 
-	http.post('/api/auth/change-password', async ({ request }) => {
+	http.post('/api/v1/auth/change-password', async ({ request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as {
 			current_password: string;
@@ -1585,7 +1584,7 @@ export const handlers = [
 		return ok({ message: 'Password changed successfully' });
 	}),
 
-	http.get('/api/auth/sessions', async () => {
+	http.get('/api/v1/auth/sessions', async () => {
 		await delay(LATENCY);
 		return ok([
 			{
@@ -1611,19 +1610,19 @@ export const handlers = [
 		]);
 	}),
 
-	http.delete('/api/auth/sessions/:id', async () => {
+	http.delete('/api/v1/auth/sessions/:id', async () => {
 		await delay(LATENCY);
 		return ok({ message: 'Session revoked' });
 	}),
 
-	http.delete('/api/auth/sessions', async () => {
+	http.delete('/api/v1/auth/sessions', async () => {
 		await delay(LATENCY);
 		return ok({ message: 'Revoked 1 session(s)' });
 	}),
 
 	// ── Phase 7.1 — TOTP 2FA ────────────────────────────────────────────────
 
-	http.post('/api/auth/2fa/setup', async ({ request }) => {
+	http.post('/api/v1/auth/2fa/setup', async ({ request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as { password?: string };
 		if (!body.password || body.password === 'wrong') {
@@ -1643,7 +1642,7 @@ export const handlers = [
 		});
 	}),
 
-	http.post('/api/auth/2fa/confirm', async ({ request }) => {
+	http.post('/api/v1/auth/2fa/confirm', async ({ request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as { code: string };
 		if (body.code !== '123456') {
@@ -1658,7 +1657,7 @@ export const handlers = [
 		});
 	}),
 
-	http.post('/api/auth/2fa/disable', async ({ request }) => {
+	http.post('/api/v1/auth/2fa/disable', async ({ request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as { password: string; code: string };
 		if (body.password === 'wrong') {
@@ -1671,7 +1670,7 @@ export const handlers = [
 		return ok({ message: '2FA disabled' });
 	}),
 
-	http.post('/api/auth/2fa/verify', async ({ request }) => {
+	http.post('/api/v1/auth/2fa/verify', async ({ request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as { code: string };
 		if (body.code !== '123456') {
@@ -1683,7 +1682,7 @@ export const handlers = [
 
 	// ── Projects ──────────────────────────────────────────────────────────────
 
-	http.get('/api/projects', async () => {
+	http.get('/api/v1/projects', async () => {
 		await delay(LATENCY);
 		const withCounts = projects.map((p) => ({
 			...p,
@@ -1694,12 +1693,12 @@ export const handlers = [
 		return ok(withCounts);
 	}),
 
-	http.get('/api/templates', async () => {
+	http.get('/api/v1/templates', async () => {
 		await delay(LATENCY);
 		return ok(templates);
 	}),
 
-	http.post('/api/projects', async ({ request }) => {
+	http.post('/api/v1/projects', async ({ request }) => {
 		await delay(LATENCY * 2);
 		const body = (await request.json()) as {
 			name: string;
@@ -1721,7 +1720,7 @@ export const handlers = [
 		return ok(newProject);
 	}),
 
-	http.get('/api/projects/:id', async ({ params }) => {
+	http.get('/api/v1/projects/:id', async ({ params }) => {
 		await delay(LATENCY);
 		const project = projects.find((p) => p.id === params.id || p.name === params.id);
 		if (!project) return err('Project not found', 404);
@@ -1729,7 +1728,7 @@ export const handlers = [
 		return ok({ ...project, apps: memberApps });
 	}),
 
-	http.put('/api/projects/:id', async ({ params, request }) => {
+	http.put('/api/v1/projects/:id', async ({ params, request }) => {
 		await delay(LATENCY);
 		const idx = projects.findIndex((p) => p.id === params.id || p.name === params.id);
 		if (idx === -1) return err('Project not found', 404);
@@ -1746,7 +1745,7 @@ export const handlers = [
 		return ok(projects[idx]);
 	}),
 
-	http.delete('/api/projects/:id', async ({ params }) => {
+	http.delete('/api/v1/projects/:id', async ({ params }) => {
 		await delay(LATENCY);
 		const project = projects.find((p) => p.id === params.id || p.name === params.id);
 		if (project) {
@@ -1757,7 +1756,7 @@ export const handlers = [
 		return ok(null);
 	}),
 
-	http.post('/api/projects/:id/deploy', async ({ params }) => {
+	http.post('/api/v1/projects/:id/deploy', async ({ params }) => {
 		await delay(LATENCY * 3);
 		const project = projects.find((p) => p.id === params.id || p.name === params.id);
 		if (!project) return err('Project not found', 404);
@@ -1770,8 +1769,8 @@ export const handlers = [
 		return ok(null);
 	}),
 
-	// PUT /api/apps/:id/project — assign / un-assign an app from a project
-	http.put('/api/apps/:id/project', async ({ params, request }) => {
+	// PUT /api/v1/apps/:id/project — assign / un-assign an app from a project
+	http.put('/api/v1/apps/:id/project', async ({ params, request }) => {
 		await delay(LATENCY);
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx === -1) return err('App not found', 404);
@@ -1782,12 +1781,12 @@ export const handlers = [
 
 	// ── Apps ─────────────────────────────────────────────────────────────────
 
-	http.get('/api/apps', async () => {
+	http.get('/api/v1/apps', async () => {
 		await delay(LATENCY);
 		return ok(apps);
 	}),
 
-	http.post('/api/apps', async ({ request }) => {
+	http.post('/api/v1/apps', async ({ request }) => {
 		await delay(LATENCY * 2);
 		const body = (await request.json()) as Omit<Partial<App>, 'volumes'> & {
 			volumes?: VolumeInput[];
@@ -1854,14 +1853,14 @@ export const handlers = [
 		return ok(newApp);
 	}),
 
-	http.get('/api/apps/:id', async ({ params }) => {
+	http.get('/api/v1/apps/:id', async ({ params }) => {
 		await delay(LATENCY);
 		const app = apps.find((a) => a.id === params.id);
 		if (!app) return err('App not found', 404);
 		return ok({ ...app, domain_warning: mockDomainWarning(app.domain) });
 	}),
 
-	http.get('/api/apps/:id/databases', async ({ params }) => {
+	http.get('/api/v1/apps/:id/databases', async ({ params }) => {
 		await delay(LATENCY);
 		const app = apps.find((a) => a.id === params.id || a.name === params.id);
 		if (!app) return err('App not found', 404);
@@ -1886,14 +1885,14 @@ export const handlers = [
 		return ok([...viaProject, ...viaLink]);
 	}),
 
-	http.delete('/api/apps/:id', async ({ params }) => {
+	http.delete('/api/v1/apps/:id', async ({ params }) => {
 		await delay(LATENCY);
 		apps = apps.filter((a) => a.id !== params.id);
 		databaseLinks = databaseLinks.filter((l) => l.app_id !== params.id);
 		return ok(null);
 	}),
 
-	http.post('/api/apps/:id/deploy', async ({ params }) => {
+	http.post('/api/v1/apps/:id/deploy', async ({ params }) => {
 		await delay(LATENCY);
 		const app = apps.find((a) => a.id === params.id || a.name === params.id);
 		if (!app) return err('App not found', 404);
@@ -1909,14 +1908,13 @@ export const handlers = [
 					// The mock never has to wait: the build queue is always free.
 					queue_position: 1,
 					superseded: null
-				},
-				error: null
+				}
 			},
 			{ status: 202 }
 		);
 	}),
 
-	http.put('/api/apps/:id/readiness', async ({ params, request }) => {
+	http.put('/api/v1/apps/:id/readiness', async ({ params, request }) => {
 		await delay(LATENCY);
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx === -1) return err('App not found', 404);
@@ -1935,7 +1933,7 @@ export const handlers = [
 		return ok(apps[idx]);
 	}),
 
-	http.put('/api/apps/:id/port', async ({ params, request }) => {
+	http.put('/api/v1/apps/:id/port', async ({ params, request }) => {
 		await delay(LATENCY);
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx === -1) return err('App not found', 404);
@@ -1950,7 +1948,7 @@ export const handlers = [
 
 	// ── Source inspection and domain checks ──
 
-	http.post('/api/git/branches', async ({ request }) => {
+	http.post('/api/v1/git/branches', async ({ request }) => {
 		await delay(LATENCY * 2);
 		const body = (await request.json()) as { url: string; github_app_id?: string };
 		if (!/^https?:\/\//.test(body.url ?? '')) {
@@ -1971,7 +1969,7 @@ export const handlers = [
 		});
 	}),
 
-	http.post('/api/images/inspect', async ({ request }) => {
+	http.post('/api/v1/images/inspect', async ({ request }) => {
 		await delay(LATENCY * 4);
 		const body = (await request.json()) as { image: string; registry_credential_id?: string };
 		const image = (body.image ?? '').trim();
@@ -2004,7 +2002,7 @@ export const handlers = [
 		});
 	}),
 
-	http.get('/api/domains/check', async ({ request }) => {
+	http.get('/api/v1/domains/check', async ({ request }) => {
 		await delay(LATENCY * 2);
 		const domain = (new URL(request.url).searchParams.get('domain') ?? '').trim().toLowerCase();
 		if (!/^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z][a-z0-9-]*$/.test(domain)) {
@@ -2013,7 +2011,7 @@ export const handlers = [
 		return ok(mockDomainCheck(domain));
 	}),
 
-	http.post('/api/apps/:id/stop', async ({ params }) => {
+	http.post('/api/v1/apps/:id/stop', async ({ params }) => {
 		await delay(LATENCY);
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx === -1) return err('App not found', 404);
@@ -2026,7 +2024,7 @@ export const handlers = [
 		return ok(null);
 	}),
 
-	http.post('/api/apps/:id/start', async ({ params }) => {
+	http.post('/api/v1/apps/:id/start', async ({ params }) => {
 		await delay(LATENCY);
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx === -1) return err('App not found', 404);
@@ -2034,7 +2032,7 @@ export const handlers = [
 		return ok(null);
 	}),
 
-	http.post('/api/apps/:id/restart', async ({ params }) => {
+	http.post('/api/v1/apps/:id/restart', async ({ params }) => {
 		await delay(LATENCY);
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx === -1) return err('App not found', 404);
@@ -2044,14 +2042,14 @@ export const handlers = [
 
 	// ── App environment (masked reads, per-key patches) ──
 
-	http.get('/api/apps/:id/env', async ({ params }) => {
+	http.get('/api/v1/apps/:id/env', async ({ params }) => {
 		await delay(LATENCY);
 		const app = apps.find((a) => a.id === params.id);
 		if (!app) return err('App not found', 404);
 		return ok(appEnvResponse(app));
 	}),
 
-	http.get('/api/apps/:id/env/:key', async ({ params }) => {
+	http.get('/api/v1/apps/:id/env/:key', async ({ params }) => {
 		await delay(LATENCY);
 		const app = apps.find((a) => a.id === params.id);
 		if (!app) return err('App not found', 404);
@@ -2060,7 +2058,7 @@ export const handlers = [
 		return ok({ key: params.key, value });
 	}),
 
-	http.patch('/api/apps/:id/env', async ({ params, request }) => {
+	http.patch('/api/v1/apps/:id/env', async ({ params, request }) => {
 		await delay(LATENCY);
 		const app = apps.find((a) => a.id === params.id);
 		if (!app) return err('App not found', 404);
@@ -2071,7 +2069,7 @@ export const handlers = [
 		return ok(appEnvResponse(app));
 	}),
 
-	http.get('/api/apps/:id/preview-env/:key', async ({ params }) => {
+	http.get('/api/v1/apps/:id/preview-env/:key', async ({ params }) => {
 		await delay(LATENCY);
 		const app = apps.find((a) => a.id === params.id);
 		if (!app) return err('App not found', 404);
@@ -2080,7 +2078,7 @@ export const handlers = [
 		return ok({ key: params.key, value });
 	}),
 
-	http.patch('/api/apps/:id/preview-env', async ({ params, request }) => {
+	http.patch('/api/v1/apps/:id/preview-env', async ({ params, request }) => {
 		await delay(LATENCY);
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx === -1) return err('App not found', 404);
@@ -2102,7 +2100,7 @@ export const handlers = [
 		return ok(appEnvResponse(apps[idx]));
 	}),
 
-	http.put('/api/apps/:id/domain', async ({ params, request }) => {
+	http.put('/api/v1/apps/:id/domain', async ({ params, request }) => {
 		await delay(LATENCY);
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx === -1) return err('App not found', 404);
@@ -2140,13 +2138,13 @@ export const handlers = [
 
 	// ── App domains ───────────────────────────────────────────────────────────
 
-	http.get('/api/apps/:id/domains', async ({ params }) => {
+	http.get('/api/v1/apps/:id/domains', async ({ params }) => {
 		await delay(LATENCY);
 		if (!apps.some((a) => a.id === params.id)) return err('App not found', 404);
 		return ok(sortedDomains(params.id as string));
 	}),
 
-	http.post('/api/apps/:id/domains/www-pair', async ({ params, request }) => {
+	http.post('/api/v1/apps/:id/domains/www-pair', async ({ params, request }) => {
 		await delay(LATENCY);
 		const id = params.id as string;
 		if (!apps.some((a) => a.id === id)) return err('App not found', 404);
@@ -2160,7 +2158,7 @@ export const handlers = [
 		const www = `www.${apex}`;
 		const [canonical, other] = body.canonical === 'apex' ? [apex, www] : [www, apex];
 		const problem = checkMockDomain(id, canonical) ?? checkMockDomain(id, other);
-		if (problem) return err(problem);
+		if (problem) return err(problem, problem.includes('already used') ? 409 : 400);
 		const list = (appDomains[id] ??= []);
 		const makePrimary = body.primary ?? true;
 		if (makePrimary) for (const d of list) if (d.kind === 'primary') d.kind = 'alias';
@@ -2179,7 +2177,7 @@ export const handlers = [
 		return ok(sortedDomains(id));
 	}),
 
-	http.post('/api/apps/:id/domains', async ({ params, request }) => {
+	http.post('/api/v1/apps/:id/domains', async ({ params, request }) => {
 		await delay(LATENCY);
 		const id = params.id as string;
 		if (!apps.some((a) => a.id === id)) return err('App not found', 404);
@@ -2191,17 +2189,17 @@ export const handlers = [
 		};
 		const domain = normalizeDomain(body.domain);
 		const problem = checkMockDomain(id, domain);
-		if (problem) return err(problem);
+		if (problem) return err(problem, problem.includes('already used') ? 409 : 400);
 		const list = (appDomains[id] ??= []);
 		if (list.some((d) => d.domain === domain)) {
-			return err(`Invalid input: ${domain} is already a domain of this app`);
+			return err(`${domain} is already a domain of this app`, 409);
 		}
 		const kind = body.kind ?? (list.some((d) => d.kind === 'primary') ? 'alias' : 'primary');
 		if (kind === 'redirect') {
 			const target = list.find((d) => d.domain === body.redirect_to);
 			if (!target || target.kind === 'redirect') {
 				return err(
-					`Invalid input: ${body.redirect_to ?? '(none)'} isn't a serving domain of this app. Redirects can only point at the app's own domains.`
+					`${body.redirect_to ?? '(none)'} isn't a serving domain of this app. Redirects can only point at the app's own domains.`
 				);
 			}
 		}
@@ -2220,12 +2218,12 @@ export const handlers = [
 		return ok(sortedDomains(id));
 	}),
 
-	http.patch('/api/apps/:id/domains/:domain', async ({ params, request }) => {
+	http.patch('/api/v1/apps/:id/domains/:domain', async ({ params, request }) => {
 		await delay(LATENCY);
 		const id = params.id as string;
 		const list = appDomains[id] ?? [];
 		const row = list.find((d) => d.domain === params.domain);
-		if (!row) return err(`Not found: ${params.domain} is not a domain of this app`, 404);
+		if (!row) return err(`${params.domain} is not a domain of this app`, 404);
 		const body = (await request.json()) as {
 			kind?: AppDomain['kind'];
 			redirect_to?: string;
@@ -2233,20 +2231,19 @@ export const handlers = [
 		};
 		const kind = body.kind ?? row.kind;
 		if (row.kind === 'primary' && kind !== 'primary') {
-			return err(
-				`Invalid input: ${row.domain} is the primary domain. Make another domain primary first.`
-			);
+			return err(`${row.domain} is the primary domain. Make another domain primary first.`, 409);
 		}
 		if (kind === 'redirect') {
 			const pointing = list.filter((d) => d.redirect_to === row.domain).map((d) => d.domain);
 			if (pointing.length) {
 				return err(
-					`Invalid input: ${pointing.join(', ')} redirect${pointing.length === 1 ? 's' : ''} to ${row.domain}; point ${pointing.length === 1 ? 'it' : 'them'} at another domain first`
+					`${pointing.join(', ')} redirect${pointing.length === 1 ? 's' : ''} to ${row.domain}; point ${pointing.length === 1 ? 'it' : 'them'} at another domain first`,
+					409
 				);
 			}
 			const target = list.find((d) => d.domain === (body.redirect_to ?? row.redirect_to));
 			if (!target || target.kind === 'redirect' || target.domain === row.domain) {
-				return err(`Invalid input: choose a serving domain of this app to redirect to`);
+				return err(`choose a serving domain of this app to redirect to`);
 			}
 			row.redirect_to = target.domain;
 			row.redirect_code = body.redirect_code ?? row.redirect_code;
@@ -2261,16 +2258,17 @@ export const handlers = [
 		return ok(sortedDomains(id));
 	}),
 
-	http.delete('/api/apps/:id/domains/:domain', async ({ params }) => {
+	http.delete('/api/v1/apps/:id/domains/:domain', async ({ params }) => {
 		await delay(LATENCY);
 		const id = params.id as string;
 		const list = appDomains[id] ?? [];
 		const row = list.find((d) => d.domain === params.domain);
-		if (!row) return err(`Not found: ${params.domain} is not a domain of this app`, 404);
+		if (!row) return err(`${params.domain} is not a domain of this app`, 404);
 		const pointing = list.filter((d) => d.redirect_to === row.domain).map((d) => d.domain);
 		if (pointing.length) {
 			return err(
-				`Invalid input: ${pointing.join(', ')} redirect${pointing.length === 1 ? 's' : ''} to ${row.domain}. Remove ${pointing.length === 1 ? 'it' : 'them'} or point ${pointing.length === 1 ? 'it' : 'them'} at another domain first.`
+				`${pointing.join(', ')} redirect${pointing.length === 1 ? 's' : ''} to ${row.domain}. Remove ${pointing.length === 1 ? 'it' : 'them'} or point ${pointing.length === 1 ? 'it' : 'them'} at another domain first.`,
+				409
 			);
 		}
 		appDomains[id] = list.filter((d) => d !== row);
@@ -2281,12 +2279,12 @@ export const handlers = [
 
 	// ── DNS providers ─────────────────────────────────────────────────────────
 
-	http.get('/api/dns-providers', async () => {
+	http.get('/api/v1/dns-providers', async () => {
 		await delay(LATENCY);
 		return ok(dnsProviders);
 	}),
 
-	http.post('/api/dns-providers', async ({ request }) => {
+	http.post('/api/v1/dns-providers', async ({ request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as {
 			name: string;
@@ -2295,23 +2293,21 @@ export const handlers = [
 			token: string;
 			config?: DnsProvider['config'];
 		};
-		if (!body.name?.trim()) return err('Invalid input: Give the provider a name');
-		if (!body.token?.trim()) return err('Invalid input: Paste the API token');
+		if (!body.name?.trim()) return err('Give the provider a name');
+		if (!body.token?.trim()) return err('Paste the API token');
 		const zones = [...new Set(body.zones.map(normalizeDomain).filter(Boolean))];
 		if (zones.length === 0) {
-			return err(
-				'Invalid input: List at least one zone (the domain the provider hosts, e.g. example.com)'
-			);
+			return err('List at least one zone (the domain the provider hosts, e.g. example.com)');
 		}
 		if (body.kind === 'route53' && !body.config?.access_key_id?.trim()) {
 			return err(
-				'Invalid input: Route 53 needs the access key id (the secret access key goes in the token field)'
+				'Route 53 needs the access key id (the secret access key goes in the token field)'
 			);
 		}
 		const taken = dnsProviders.find((p) => p.zones.some((z) => zones.includes(z)));
 		if (taken) {
 			const zone = zones.find((z) => taken.zones.includes(z));
-			return err(`Invalid input: ${zone} is already handled by the DNS provider '${taken.name}'`);
+			return err(`${zone} is already handled by the DNS provider '${taken.name}'`, 409);
 		}
 		const now = new Date().toISOString();
 		const provider: DnsProvider = {
@@ -2330,10 +2326,10 @@ export const handlers = [
 		return ok(provider);
 	}),
 
-	http.patch('/api/dns-providers/:id', async ({ params, request }) => {
+	http.patch('/api/v1/dns-providers/:id', async ({ params, request }) => {
 		await delay(LATENCY);
 		const idx = dnsProviders.findIndex((p) => p.id === params.id);
-		if (idx === -1) return err(`Not found: DNS provider ${params.id}`, 404);
+		if (idx === -1) return err(`DNS provider ${params.id}`, 404);
 		const body = (await request.json()) as {
 			name?: string;
 			zones?: string[];
@@ -2352,16 +2348,16 @@ export const handlers = [
 		return ok(dnsProviders[idx]);
 	}),
 
-	http.delete('/api/dns-providers/:id', async ({ params }) => {
+	http.delete('/api/v1/dns-providers/:id', async ({ params }) => {
 		await delay(LATENCY);
 		dnsProviders = dnsProviders.filter((p) => p.id !== params.id);
 		return ok({ deleted: params.id });
 	}),
 
-	http.post('/api/dns-providers/:id/test', async ({ params }) => {
+	http.post('/api/v1/dns-providers/:id/test', async ({ params }) => {
 		await delay(LATENCY * 3);
 		const provider = dnsProviders.find((p) => p.id === params.id);
-		if (!provider) return err(`Not found: DNS provider ${params.id}`, 404);
+		if (!provider) return err(`DNS provider ${params.id}`, 404);
 		const labels: Record<DnsProvider['kind'], string> = {
 			cloudflare: 'Cloudflare',
 			hetzner: 'Hetzner DNS',
@@ -2383,23 +2379,26 @@ export const handlers = [
 
 	// ── Certificates ──────────────────────────────────────────────────────────
 
-	http.post('/api/certs/custom', async ({ request }) => {
+	http.post('/api/v1/certs/custom', async ({ request }) => {
 		await delay(LATENCY * 2);
 		const body = (await request.json()) as { domain: string; cert_pem: string; key_pem: string };
 		const domain = normalizeDomain(body.domain);
 		if (!body.cert_pem.includes('-----BEGIN CERTIFICATE-----')) {
-			return err(
-				'Invalid input: The certificate must be PEM (-----BEGIN CERTIFICATE-----), leaf first, then the intermediates'
+			return fieldErr(
+				'The certificate must be PEM (-----BEGIN CERTIFICATE-----), leaf first, then the intermediates',
+				'cert_pem'
 			);
 		}
 		if (!body.key_pem.includes('PRIVATE KEY-----')) {
-			return err(
-				'Invalid input: The private key must be PEM (-----BEGIN PRIVATE KEY----- or an RSA/EC key)'
+			return fieldErr(
+				'The private key must be PEM (-----BEGIN PRIVATE KEY----- or an RSA/EC key)',
+				'key_pem'
 			);
 		}
 		if (body.key_pem.includes('WRONG')) {
-			return err(
-				`Invalid input: The private key doesn't belong to the certificate for ${domain}. Upload the key that was generated with this certificate's request.`
+			return fieldErr(
+				`The private key doesn't belong to the certificate for ${domain}. Upload the key that was generated with this certificate's request.`,
+				'key_pem'
 			);
 		}
 		const now = new Date().toISOString();
@@ -2428,20 +2427,20 @@ export const handlers = [
 		return ok(certificates.find((c) => c.domain === domain) ?? null);
 	}),
 
-	http.delete('/api/certs/custom/:domain', async ({ params }) => {
+	http.delete('/api/v1/certs/custom/:domain', async ({ params }) => {
 		await delay(LATENCY);
 		const i = certificates.findIndex((c) => c.domain === params.domain && c.cert_type === 'custom');
-		if (i === -1) return err(`Not found: No uploaded certificate for ${params.domain}`, 404);
+		if (i === -1) return err(`No uploaded certificate for ${params.domain}`, 404);
 		certificates.splice(i, 1);
 		return ok({ deleted: params.domain });
 	}),
 
-	http.get('/api/certs', async () => {
+	http.get('/api/v1/certs', async () => {
 		await delay(LATENCY);
 		return ok(certificates);
 	}),
 
-	http.post('/api/certs/:domain/retry', async ({ params }) => {
+	http.post('/api/v1/certs/:domain/retry', async ({ params }) => {
 		await delay(LATENCY);
 		const cert = certificates.find((c) => c.domain === params.domain);
 		if (!cert) return err(`No certificate for ${params.domain}`, 404);
@@ -2450,7 +2449,7 @@ export const handlers = [
 		return ok({ message: 'Certificate retry queued', domain: cert.domain });
 	}),
 
-	http.put('/api/apps/:id/health', async ({ params, request }) => {
+	http.put('/api/v1/apps/:id/health', async ({ params, request }) => {
 		await delay(LATENCY);
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx === -1) return err('App not found', 404);
@@ -2463,7 +2462,7 @@ export const handlers = [
 		return ok(apps[idx]);
 	}),
 
-	http.put('/api/apps/:id/drain-timeout', async ({ params, request }) => {
+	http.put('/api/v1/apps/:id/drain-timeout', async ({ params, request }) => {
 		await delay(LATENCY);
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx === -1) return err('App not found', 404);
@@ -2476,7 +2475,7 @@ export const handlers = [
 		return ok(apps[idx]);
 	}),
 
-	http.patch('/api/apps/:id/resources', async ({ params, request }) => {
+	http.patch('/api/v1/apps/:id/resources', async ({ params, request }) => {
 		await delay(LATENCY);
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx === -1) return err('App not found', 404);
@@ -2493,7 +2492,7 @@ export const handlers = [
 		return ok(apps[idx]);
 	}),
 
-	http.post('/api/apps/:id/volumes', async ({ params, request }) => {
+	http.post('/api/v1/apps/:id/volumes', async ({ params, request }) => {
 		await delay(LATENCY);
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx === -1) return err('App not found', 404);
@@ -2512,7 +2511,7 @@ export const handlers = [
 		return ok(apps[idx]);
 	}),
 
-	http.delete('/api/apps/:id/volumes', async ({ params, request }) => {
+	http.delete('/api/v1/apps/:id/volumes', async ({ params, request }) => {
 		await delay(LATENCY);
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx === -1) return err('App not found', 404);
@@ -2527,7 +2526,7 @@ export const handlers = [
 
 	// ── Deployments ───────────────────────────────────────────────────────────
 
-	http.get('/api/apps/:id/deployments/stats', async ({ params }) => {
+	http.get('/api/v1/apps/:id/deployments/stats', async ({ params }) => {
 		await delay(LATENCY);
 		const app = apps.find((a) => a.id === params.id || a.name === params.id);
 		if (!app) return err('App not found', 404);
@@ -2558,31 +2557,34 @@ export const handlers = [
 		});
 	}),
 
-	http.get('/api/apps/:id/deployments', async ({ params }) => {
+	http.get('/api/v1/apps/:id/deployments', async ({ params }) => {
 		await delay(LATENCY);
 		return ok(deployments[params.id as string] ?? []);
 	}),
 
-	http.get('/api/apps/:id/deployments/:deploymentId/generated-dockerfile', async ({ params }) => {
-		await delay(LATENCY);
-		const appDeployments = deployments[params.id as string] ?? [];
-		const deployment = appDeployments.find((d) => d.id === params.deploymentId);
-		if (!deployment || !deployment.has_generated_dockerfile) {
-			return err('Generated Dockerfile not found', 404);
+	http.get(
+		'/api/v1/apps/:id/deployments/:deploymentId/generated-dockerfile',
+		async ({ params }) => {
+			await delay(LATENCY);
+			const appDeployments = deployments[params.id as string] ?? [];
+			const deployment = appDeployments.find((d) => d.id === params.deploymentId);
+			if (!deployment || !deployment.has_generated_dockerfile) {
+				return err('Generated Dockerfile not found', 404);
+			}
+
+			const generatedDockerfile = MOCK_GENERATED_DOCKERFILES[params.deploymentId as string];
+			if (!generatedDockerfile) {
+				return err('Generated Dockerfile not found', 404);
+			}
+
+			return ok({
+				deployment_id: params.deploymentId,
+				generated_dockerfile: generatedDockerfile
+			});
 		}
+	),
 
-		const generatedDockerfile = MOCK_GENERATED_DOCKERFILES[params.deploymentId as string];
-		if (!generatedDockerfile) {
-			return err('Generated Dockerfile not found', 404);
-		}
-
-		return ok({
-			deployment_id: params.deploymentId,
-			generated_dockerfile: generatedDockerfile
-		});
-	}),
-
-	http.post('/api/apps/:id/rollback', async ({ params, request }) => {
+	http.post('/api/v1/apps/:id/rollback', async ({ params, request }) => {
 		await delay(LATENCY);
 		const text = await request.text();
 		const body = (text.trim() ? JSON.parse(text) : {}) as { deployment_id?: string };
@@ -2621,14 +2623,13 @@ export const handlers = [
 					status: 'queued',
 					queue_position: 1,
 					superseded: null
-				},
-				error: null
+				}
 			},
 			{ status: 202 }
 		);
 	}),
 
-	http.get('/api/apps/:id/deployments/:deploymentId', async ({ params }) => {
+	http.get('/api/v1/apps/:id/deployments/:deploymentId', async ({ params }) => {
 		await delay(LATENCY);
 		const app = apps.find((a) => a.id === params.id || a.name === params.id);
 		if (!app) return err('App not found', 404);
@@ -2637,7 +2638,7 @@ export const handlers = [
 		return ok(deploymentDetail(app, d));
 	}),
 
-	http.post('/api/compose/validate', async ({ request }) => {
+	http.post('/api/v1/compose/validate', async ({ request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as { compose_content: string };
 		const errors = mockComposeProblems(body.compose_content);
@@ -2646,14 +2647,14 @@ export const handlers = [
 
 	// ── Git Integration ───────────────────────────────────────────────────────
 
-	http.get('/api/apps/:id/deploy-key', async ({ params }) => {
+	http.get('/api/v1/apps/:id/deploy-key', async ({ params }) => {
 		await delay(LATENCY);
 		const key = MOCK_DEPLOY_KEYS[params.id as string];
 		if (!key) return err('No deploy key found', 404);
 		return ok(key);
 	}),
 
-	http.post('/api/apps/:id/deploy-key', async ({ params }) => {
+	http.post('/api/v1/apps/:id/deploy-key', async ({ params }) => {
 		await delay(LATENCY);
 		const newKey = {
 			app_id: params.id as string,
@@ -2663,14 +2664,14 @@ export const handlers = [
 		return ok(newKey);
 	}),
 
-	http.get('/api/apps/:id/webhook', async ({ params }) => {
+	http.get('/api/v1/apps/:id/webhook', async ({ params }) => {
 		await delay(LATENCY);
 		const app = apps.find((a) => a.id === params.id || a.name === params.id);
 		if (!app) return err('App not found', 404);
 		return ok(webhookConfig(app));
 	}),
 
-	http.put('/api/apps/:id/webhook-secret', async ({ params, request }) => {
+	http.put('/api/v1/apps/:id/webhook-secret', async ({ params, request }) => {
 		await delay(LATENCY);
 		const app = apps.find((a) => a.id === params.id || a.name === params.id);
 		if (!app) return err('App not found', 404);
@@ -2686,7 +2687,7 @@ export const handlers = [
 		return ok(webhookConfig(app));
 	}),
 
-	http.get('/api/apps/:id/webhook-secret', async ({ params }) => {
+	http.get('/api/v1/apps/:id/webhook-secret', async ({ params }) => {
 		await delay(LATENCY);
 		const app = apps.find((a) => a.id === params.id || a.name === params.id);
 		if (!app) return err('App not found', 404);
@@ -2694,7 +2695,7 @@ export const handlers = [
 		return ok({ secret: webhookSecrets[app.id] });
 	}),
 
-	http.post('/api/apps/:id/webhook-secret/rotate', async ({ params }) => {
+	http.post('/api/v1/apps/:id/webhook-secret/rotate', async ({ params }) => {
 		await delay(LATENCY);
 		const app = apps.find((a) => a.id === params.id || a.name === params.id);
 		if (!app) return err('App not found', 404);
@@ -2702,7 +2703,7 @@ export const handlers = [
 		return ok({ secret: webhookSecrets[app.id] });
 	}),
 
-	http.put('/api/apps/:id/auto-deploy', async ({ params, request }) => {
+	http.put('/api/v1/apps/:id/auto-deploy', async ({ params, request }) => {
 		await delay(LATENCY);
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx === -1) return err('App not found', 404);
@@ -2711,7 +2712,7 @@ export const handlers = [
 		return ok(apps[idx]);
 	}),
 
-	http.put('/api/apps/:id/source', async ({ params, request }) => {
+	http.put('/api/v1/apps/:id/source', async ({ params, request }) => {
 		await delay(LATENCY);
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx === -1) return err('App not found', 404);
@@ -2722,12 +2723,12 @@ export const handlers = [
 
 	// ── Registry Credentials (Phase 4.3) ──────────────────────────────────────
 
-	http.get('/api/registry-credentials', async () => {
+	http.get('/api/v1/registry-credentials', async () => {
 		await delay(LATENCY);
 		return ok(registryCredentials);
 	}),
 
-	http.post('/api/registry-credentials', async ({ request }) => {
+	http.post('/api/v1/registry-credentials', async ({ request }) => {
 		await delay(LATENCY * 2);
 		const body = (await request.json()) as {
 			name: string;
@@ -2747,7 +2748,7 @@ export const handlers = [
 		return ok(newCred);
 	}),
 
-	http.delete('/api/registry-credentials/:id', async ({ params }) => {
+	http.delete('/api/v1/registry-credentials/:id', async ({ params }) => {
 		await delay(LATENCY);
 		registryCredentials = registryCredentials.filter((c) => c.id !== params.id);
 		// Clear from any apps that had this credential
@@ -2759,7 +2760,7 @@ export const handlers = [
 		return ok(null);
 	}),
 
-	http.put('/api/apps/:id/registry-credential', async ({ params, request }) => {
+	http.put('/api/v1/apps/:id/registry-credential', async ({ params, request }) => {
 		await delay(LATENCY);
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx === -1) return err('App not found', 404);
@@ -2774,12 +2775,12 @@ export const handlers = [
 
 	// ── Preview Deployments ───────────────────────────────────────────────────
 
-	http.get('/api/apps/:id/previews', async ({ params }) => {
+	http.get('/api/v1/apps/:id/previews', async ({ params }) => {
 		await delay(LATENCY);
 		return ok(previews[params.id as string] ?? []);
 	}),
 
-	http.post('/api/apps/:id/preview', async ({ params, request }) => {
+	http.post('/api/v1/apps/:id/preview', async ({ params, request }) => {
 		await delay(LATENCY);
 		if (!MOCK_SETTINGS.preview_domain) return err(PREVIEW_DOMAIN_REQUIRED);
 		const app = apps.find((a) => a.id === params.id);
@@ -2823,7 +2824,7 @@ export const handlers = [
 		return ok(newPreview);
 	}),
 
-	http.delete('/api/apps/:id/previews/:previewId', async ({ params }) => {
+	http.delete('/api/v1/apps/:id/previews/:previewId', async ({ params }) => {
 		await delay(LATENCY);
 		const appId = params.id as string;
 		previews = {
@@ -2833,7 +2834,7 @@ export const handlers = [
 		return ok(null);
 	}),
 
-	http.put('/api/apps/:id/preview-config', async ({ params, request }) => {
+	http.put('/api/v1/apps/:id/preview-config', async ({ params, request }) => {
 		await delay(LATENCY);
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx === -1) return err('App not found', 404);
@@ -2851,13 +2852,13 @@ export const handlers = [
 
 	// ── Project Previews ──────────────────────────────────────────────────────
 
-	http.get('/api/projects/:id/previews', async ({ params }) => {
+	http.get('/api/v1/projects/:id/previews', async ({ params }) => {
 		await delay(LATENCY);
 		const projectId = params.id as string;
 		return ok(projectPreviews[projectId] ?? []);
 	}),
 
-	http.post('/api/projects/:id/previews', async ({ params, request }) => {
+	http.post('/api/v1/projects/:id/previews', async ({ params, request }) => {
 		await delay(LATENCY * 2);
 		const projectId = params.id as string;
 		const project = projects.find((p) => p.id === projectId || p.name === projectId);
@@ -2912,7 +2913,7 @@ export const handlers = [
 		return ok(newProjectPreview);
 	}),
 
-	http.delete('/api/projects/:id/previews/:previewId', async ({ params }) => {
+	http.delete('/api/v1/projects/:id/previews/:previewId', async ({ params }) => {
 		await delay(LATENCY);
 		const projectId = params.id as string;
 		const list = projectPreviews[projectId] ?? [];
@@ -2928,7 +2929,7 @@ export const handlers = [
 	// ── Metrics ───────────────────────────────────────────────────────────────
 
 	// Stopped / never-deployed apps have no samples (shows the empty state).
-	http.get('/api/apps/:id/metrics', async ({ request, params }) => {
+	http.get('/api/v1/apps/:id/metrics', async ({ request, params }) => {
 		await delay(LATENCY);
 		const range = new URL(request.url).searchParams.get('range') ?? '1h';
 		const app = apps.find((a) => a.id === params.id || a.name === params.id);
@@ -2936,17 +2937,17 @@ export const handlers = [
 		return ok(makeMockMetrics(range, !measured));
 	}),
 
-	http.get('/api/databases/:id/metrics', async ({ request }) => {
+	http.get('/api/v1/databases/:id/metrics', async ({ request }) => {
 		await delay(LATENCY);
 		return ok(makeMockMetrics(new URL(request.url).searchParams.get('range') ?? '1h'));
 	}),
 
-	http.get('/api/cron/:id/metrics', async ({ request }) => {
+	http.get('/api/v1/cron/:id/metrics', async ({ request }) => {
 		await delay(LATENCY);
 		return ok(makeMockMetrics(new URL(request.url).searchParams.get('range') ?? '1h', true));
 	}),
 
-	http.get('/api/previews/:id/metrics', async ({ request }) => {
+	http.get('/api/v1/previews/:id/metrics', async ({ request }) => {
 		await delay(LATENCY);
 		return ok(makeMockMetrics(new URL(request.url).searchParams.get('range') ?? '1h'));
 	}),
@@ -2954,7 +2955,7 @@ export const handlers = [
 	// ── Request metrics (tond-proxy traffic) ──────────────────────────────────
 
 	// Apps that are not running (and workers without a domain) have no traffic.
-	http.get('/api/apps/:id/requests', async ({ request, params }) => {
+	http.get('/api/v1/apps/:id/requests', async ({ request, params }) => {
 		await delay(LATENCY);
 		const range = new URL(request.url).searchParams.get('range') ?? '24h';
 		const app = apps.find((a) => a.id === params.id || a.name === params.id);
@@ -2963,20 +2964,20 @@ export const handlers = [
 		return ok(makeMockRequestMetrics(range, { empty: !served }));
 	}),
 
-	http.get('/api/previews/:id/requests', async ({ request }) => {
+	http.get('/api/v1/previews/:id/requests', async ({ request }) => {
 		await delay(LATENCY);
 		const range = new URL(request.url).searchParams.get('range') ?? '24h';
 		return ok(makeMockRequestMetrics(range, { scale: 0.3, withDeploys: false }));
 	}),
 
-	http.get('/api/system/requests', async ({ request }) => {
+	http.get('/api/v1/system/requests', async ({ request }) => {
 		await delay(LATENCY);
 		return ok(makeMockTrafficOverview(new URL(request.url).searchParams.get('range') ?? '24h'));
 	}),
 
 	// ── Access logs ───────────────────────────────────────────────────────────
 
-	http.get('/api/apps/:id/access-log', async ({ request, params }) => {
+	http.get('/api/v1/apps/:id/access-log', async ({ request, params }) => {
 		await delay(LATENCY);
 		const url = new URL(request.url);
 		const limit = Number(url.searchParams.get('lines') ?? 500);
@@ -2997,7 +2998,7 @@ export const handlers = [
 		});
 	}),
 
-	http.put('/api/apps/:id/access-log', async ({ request, params }) => {
+	http.put('/api/v1/apps/:id/access-log', async ({ request, params }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as { enabled: boolean; include_query?: boolean };
 		const id = params.id as string;
@@ -3013,14 +3014,14 @@ export const handlers = [
 		return ok({ enabled: accessLogs[id].enabled, include_query: accessLogs[id].include_query });
 	}),
 
-	http.delete('/api/apps/:id/access-log', async ({ params }) => {
+	http.delete('/api/v1/apps/:id/access-log', async ({ params }) => {
 		await delay(LATENCY);
 		const id = params.id as string;
 		if (accessLogs[id]) accessLogs = { ...accessLogs, [id]: { ...accessLogs[id], lines: [] } };
 		return ok(null);
 	}),
 
-	http.get('/api/apps/:id/access-log/download', async ({ params }) => {
+	http.get('/api/v1/apps/:id/access-log/download', async ({ params }) => {
 		const lines = accessLogs[params.id as string]?.lines ?? [];
 		return new HttpResponse(lines.map((l) => `${l}\n`).join(''), {
 			headers: {
@@ -3030,24 +3031,24 @@ export const handlers = [
 		});
 	}),
 
-	http.get('/api/system/self', async () => {
+	http.get('/api/v1/system/self', async () => {
 		await delay(LATENCY);
 		return ok(makeMockSystemSelf());
 	}),
 
-	http.get('/api/system/metrics', async () => {
+	http.get('/api/v1/system/metrics', async () => {
 		await delay(LATENCY);
 		return ok(makeMockSystemMetrics());
 	}),
 
 	// ── Settings ──────────────────────────────────────────────────────────────
 
-	http.get('/api/settings', async () => {
+	http.get('/api/v1/settings', async () => {
 		await delay(LATENCY);
 		return ok(MOCK_SETTINGS);
 	}),
 
-	http.get('/api/onboarding/status', async () => {
+	http.get('/api/v1/onboarding/status', async () => {
 		await delay(LATENCY);
 		MOCK_ONBOARDING_STATUS.dashboard_domain = MOCK_SETTINGS.dashboard_domain;
 		MOCK_ONBOARDING_STATUS.has_projects = projects.length > 0;
@@ -3095,7 +3096,7 @@ export const handlers = [
 		return ok(MOCK_ONBOARDING_STATUS);
 	}),
 
-	http.get('/api/apps/:id/events', async ({ params, request }) => {
+	http.get('/api/v1/apps/:id/events', async ({ params, request }) => {
 		await delay(LATENCY);
 		const app = apps.find((a) => a.id === params.id || a.name === params.id);
 		if (!app) return err('App not found', 404);
@@ -3110,12 +3111,12 @@ export const handlers = [
 		});
 	}),
 
-	http.get('/api/audit-log/shipping', async () => {
+	http.get('/api/v1/audit-log/shipping', async () => {
 		await delay(LATENCY);
 		return ok(MOCK_AUDIT_SHIPPING);
 	}),
 
-	http.put('/api/audit-log/shipping', async ({ request }) => {
+	http.put('/api/v1/audit-log/shipping', async ({ request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as UpdateAuditShipping;
 		if (body.syslog) {
@@ -3151,7 +3152,7 @@ export const handlers = [
 		return ok(MOCK_AUDIT_SHIPPING);
 	}),
 
-	http.post('/api/audit-log/shipping/test', async ({ request }) => {
+	http.post('/api/v1/audit-log/shipping/test', async ({ request }) => {
 		await delay(LATENCY * 2);
 		const { destination } = (await request.json()) as { destination: string };
 		if (destination === 'syslog') {
@@ -3165,12 +3166,12 @@ export const handlers = [
 		return ok({ ok: false, message: 'the webhook answered HTTP 401' });
 	}),
 
-	http.get('/api/settings/retention', async () => {
+	http.get('/api/v1/settings/retention', async () => {
 		await delay(LATENCY);
 		return ok(MOCK_RETENTION);
 	}),
 
-	http.put('/api/settings/retention', async ({ request }) => {
+	http.put('/api/v1/settings/retention', async ({ request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as Record<string, number>;
 		for (const [key, value] of Object.entries(body)) {
@@ -3184,7 +3185,7 @@ export const handlers = [
 		return ok(MOCK_RETENTION);
 	}),
 
-	http.put('/api/settings', async ({ request }) => {
+	http.put('/api/v1/settings', async ({ request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as Partial<typeof MOCK_SETTINGS>;
 		if (body.dashboard_domain !== undefined) {
@@ -3232,17 +3233,17 @@ export const handlers = [
 
 	// ── Alerts ────────────────────────────────────────────────────────────────
 
-	http.get('/api/alerts/kinds', async () => {
+	http.get('/api/v1/alerts/kinds', async () => {
 		await delay(LATENCY);
 		return ok(MOCK_ALERT_KINDS);
 	}),
 
-	http.get('/api/alerts/active', async () => {
+	http.get('/api/v1/alerts/active', async () => {
 		await delay(LATENCY);
 		return ok(activeAlerts.filter((a) => alertRules.find((r) => r.id === a.rule_id)?.enabled));
 	}),
 
-	http.get('/api/alerts/history', async ({ request }) => {
+	http.get('/api/v1/alerts/history', async ({ request }) => {
 		await delay(LATENCY);
 		const p = new URL(request.url).searchParams;
 		const perPage = Math.min(Math.max(Number(p.get('per_page') ?? 25) || 25, 1), 100);
@@ -3259,7 +3260,7 @@ export const handlers = [
 		});
 	}),
 
-	http.get('/api/alerts/history/:id', async ({ params }) => {
+	http.get('/api/v1/alerts/history/:id', async ({ params }) => {
 		await delay(LATENCY);
 		const ep = alertHistory.find((e) => e.id === params.id);
 		if (!ep) return err('Alert not found', 404);
@@ -3291,7 +3292,7 @@ export const handlers = [
 		return ok({ episode: ep, deliveries });
 	}),
 
-	http.post('/api/alerts/history/:id/acknowledge', async ({ params }) => {
+	http.post('/api/v1/alerts/history/:id/acknowledge', async ({ params }) => {
 		await delay(LATENCY);
 		const ep = alertHistory.find((e) => e.id === params.id && e.state === 'firing');
 		if (!ep) return err("That alert isn't firing any more.", 404);
@@ -3307,12 +3308,12 @@ export const handlers = [
 		return ok({ acknowledged: ep.id });
 	}),
 
-	http.get('/api/alerts/settings', async () => {
+	http.get('/api/v1/alerts/settings', async () => {
 		await delay(LATENCY);
 		return ok(alertSettings);
 	}),
 
-	http.put('/api/alerts/settings', async ({ request }) => {
+	http.put('/api/v1/alerts/settings', async ({ request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as AlertSettings;
 		const q = body.quiet_hours;
@@ -3327,19 +3328,19 @@ export const handlers = [
 		return ok(alertSettings);
 	}),
 
-	http.get('/api/alerts', async () => {
+	http.get('/api/v1/alerts', async () => {
 		await delay(LATENCY);
 		return ok(alertRules);
 	}),
 
-	http.get('/api/alerts/:id', async ({ params }) => {
+	http.get('/api/v1/alerts/:id', async ({ params }) => {
 		await delay(LATENCY);
 		const rule = alertRules.find((r) => r.id === params.id);
 		if (!rule) return err('Alert rule not found', 404);
 		return ok(rule);
 	}),
 
-	http.post('/api/alerts', async ({ request }) => {
+	http.post('/api/v1/alerts', async ({ request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as AlertRuleInput;
 		const kind = MOCK_ALERT_KINDS.find((k) => k.kind === body.kind);
@@ -3379,10 +3380,10 @@ export const handlers = [
 			updated_at: now
 		};
 		alertRules = [...alertRules, newRule];
-		return HttpResponse.json({ success: true, data: newRule, error: null }, { status: 201 });
+		return HttpResponse.json({ success: true, data: newRule }, { status: 201 });
 	}),
 
-	http.patch('/api/alerts/:id', async ({ params, request }) => {
+	http.patch('/api/v1/alerts/:id', async ({ params, request }) => {
 		await delay(LATENCY);
 		const idx = alertRules.findIndex((r) => r.id === params.id);
 		if (idx === -1) return err('Alert rule not found', 404);
@@ -3404,7 +3405,7 @@ export const handlers = [
 		return ok(alertRules[idx]);
 	}),
 
-	http.post('/api/alerts/:id/test', async ({ params }) => {
+	http.post('/api/v1/alerts/:id/test', async ({ params }) => {
 		await delay(LATENCY * 3);
 		const rule = alertRules.find((r) => r.id === params.id);
 		if (!rule) return err('Alert rule not found', 404);
@@ -3422,7 +3423,7 @@ export const handlers = [
 		return ok(results);
 	}),
 
-	http.post('/api/alerts/:id/snooze', async ({ params, request }) => {
+	http.post('/api/v1/alerts/:id/snooze', async ({ params, request }) => {
 		await delay(LATENCY);
 		const rule = alertRules.find((r) => r.id === params.id);
 		if (!rule) return err('Alert rule not found', 404);
@@ -3445,7 +3446,7 @@ export const handlers = [
 		return ok({ snoozed_until: until, until_resolved: !!body.until_resolved });
 	}),
 
-	http.post('/api/alerts/:id/unsnooze', async ({ params, request }) => {
+	http.post('/api/v1/alerts/:id/unsnooze', async ({ params, request }) => {
 		await delay(LATENCY);
 		const rule = alertRules.find((r) => r.id === params.id);
 		if (!rule) return err('Alert rule not found', 404);
@@ -3460,7 +3461,7 @@ export const handlers = [
 		return ok({ unsnoozed: true });
 	}),
 
-	http.delete('/api/alerts/:id', async ({ params }) => {
+	http.delete('/api/v1/alerts/:id', async ({ params }) => {
 		await delay(LATENCY);
 		const exists = alertRules.some((r) => r.id === params.id);
 		if (!exists) return err('Alert rule not found', 404);
@@ -3472,7 +3473,7 @@ export const handlers = [
 	// ── Audit Log ─────────────────────────────────────────────────────────────
 
 	// Same filters as the server, applied before the limit.
-	http.get('/api/audit-log', async ({ request }) => {
+	http.get('/api/v1/audit-log', async ({ request }) => {
 		await delay(LATENCY);
 		const p = new URL(request.url).searchParams;
 		const limit = Math.min(Math.max(parseInt(p.get('limit') ?? '50', 10) || 50, 1), 200);
@@ -3504,7 +3505,7 @@ export const handlers = [
 		return ok({ entries, next_before: nextBefore });
 	}),
 
-	http.get('/api/audit-log/verify', async () => {
+	http.get('/api/v1/audit-log/verify', async () => {
 		await delay(LATENCY * 2);
 		const seqs = auditLog.map((e) => e.seq);
 		return ok({
@@ -3520,7 +3521,7 @@ export const handlers = [
 
 	// ── App Logs (REST fallback — real traffic uses WebSocket) ────────────────
 
-	http.get('/api/apps/:id/logs', async () => {
+	http.get('/api/v1/apps/:id/logs', async () => {
 		await delay(LATENCY);
 		return ok({
 			deploy_logs: [
@@ -3546,7 +3547,7 @@ export const handlers = [
 			container_logs: [
 				{ ts: new Date().toISOString(), line: '[mock] Server listening on :8080' },
 				{ ts: new Date().toISOString(), line: '[mock] GET /healthz 200 OK' },
-				{ ts: new Date().toISOString(), line: '[mock] GET /api/users 200 OK' }
+				{ ts: new Date().toISOString(), line: '[mock] GET /api/v1/users 200 OK' }
 			]
 		});
 	}),
@@ -3556,12 +3557,12 @@ export const handlers = [
 	// server: responses carry has_password flags and masked strings, and the
 	// plaintext comes only from the (audited) credentials reveal.
 
-	http.get('/api/databases', async () => {
+	http.get('/api/v1/databases', async () => {
 		await delay(LATENCY);
 		return ok(databases);
 	}),
 
-	http.post('/api/databases', async ({ request }) => {
+	http.post('/api/v1/databases', async ({ request }) => {
 		await delay(LATENCY * 2);
 		const body = (await request.json()) as {
 			name: string;
@@ -3609,14 +3610,14 @@ export const handlers = [
 		return ok({ ...dbDetail(newDb), credentials: dbCredentials(newDb) });
 	}),
 
-	http.get('/api/databases/:id/access', async ({ params }) => {
+	http.get('/api/v1/databases/:id/access', async ({ params }) => {
 		await delay(LATENCY);
 		const db = databases.find((d) => d.id === params.id || d.name === params.id);
 		if (!db) return err('Database not found', 404);
 		return ok(mockDatabaseAccess(db));
 	}),
 
-	http.put('/api/databases/:id/links/:app', async ({ params }) => {
+	http.put('/api/v1/databases/:id/links/:app', async ({ params }) => {
 		await delay(LATENCY);
 		const db = databases.find((d) => d.id === params.id || d.name === params.id);
 		if (!db) return err('Not found: database', 404);
@@ -3638,7 +3639,7 @@ export const handlers = [
 		return ok(mockDatabaseAccess(db));
 	}),
 
-	http.delete('/api/databases/:id/links/:app', async ({ params }) => {
+	http.delete('/api/v1/databases/:id/links/:app', async ({ params }) => {
 		await delay(LATENCY);
 		const db = databases.find((d) => d.id === params.id || d.name === params.id);
 		if (!db) return err('Not found: database', 404);
@@ -3648,14 +3649,14 @@ export const handlers = [
 		return ok(mockDatabaseAccess(db));
 	}),
 
-	http.get('/api/databases/:id', async ({ params }) => {
+	http.get('/api/v1/databases/:id', async ({ params }) => {
 		await delay(LATENCY);
 		const db = databases.find((d) => d.id === params.id || d.name === params.id);
 		if (!db) return err('Database not found', 404);
 		return ok(dbDetail(db));
 	}),
 
-	http.get('/api/databases/:id/credentials', async ({ params }) => {
+	http.get('/api/v1/databases/:id/credentials', async ({ params }) => {
 		await delay(LATENCY);
 		const db = databases.find((d) => d.id === params.id || d.name === params.id);
 		if (!db) return err('Database not found', 404);
@@ -3665,23 +3666,23 @@ export const handlers = [
 		return ok(dbCredentials(db));
 	}),
 
-	http.get('/api/databases/:id/backups', async ({ params }) => {
+	http.get('/api/v1/databases/:id/backups', async ({ params }) => {
 		await delay(LATENCY);
 		const db = databases.find((d) => d.id === params.id || d.name === params.id);
 		if (!db) return err(`database '${params.id}' not found`, 404);
 		return ok(snapshots.filter((s) => s.scope === 'full' || s.scope === `database:${db.name}`));
 	}),
 
-	http.post('/api/databases/:id/backups', async ({ params }) => {
+	http.post('/api/v1/databases/:id/backups', async ({ params }) => {
 		await delay(LATENCY * 4);
 		const db = databases.find((d) => d.id === params.id || d.name === params.id);
 		if (!db) return err(`database '${params.id}' not found`, 404);
 		const snap = mockDatabaseSnapshot(db.name, 'manual');
 		snapshots = [snap, ...snapshots];
-		return HttpResponse.json({ success: true, data: snap, error: null }, { status: 201 });
+		return HttpResponse.json({ success: true, data: snap }, { status: 201 });
 	}),
 
-	http.delete('/api/databases/:id', async ({ params }) => {
+	http.delete('/api/v1/databases/:id', async ({ params }) => {
 		await delay(LATENCY);
 		const gone = databases.find((d) => d.id === params.id || d.name === params.id);
 		databases = databases.filter((d) => d.id !== params.id && d.name !== params.id);
@@ -3689,7 +3690,7 @@ export const handlers = [
 		return ok(null);
 	}),
 
-	http.patch('/api/databases/:id', async ({ params, request }) => {
+	http.patch('/api/v1/databases/:id', async ({ params, request }) => {
 		await delay(LATENCY);
 		const idx = databases.findIndex((d) => d.id === params.id || d.name === params.id);
 		if (idx === -1) return err('Database not found', 404);
@@ -3727,7 +3728,7 @@ export const handlers = [
 		return ok(dbDetail(updated));
 	}),
 
-	http.patch('/api/databases/:id/credentials', async ({ params, request }) => {
+	http.patch('/api/v1/databases/:id/credentials', async ({ params, request }) => {
 		await delay(LATENCY);
 		const idx = databases.findIndex((d) => d.id === params.id || d.name === params.id);
 		if (idx === -1) return err('Database not found', 404);
@@ -3777,7 +3778,7 @@ export const handlers = [
 		return ok({ database: dbDetail(updated), changed });
 	}),
 
-	http.post('/api/databases/:id/stop', async ({ params }) => {
+	http.post('/api/v1/databases/:id/stop', async ({ params }) => {
 		await delay(LATENCY);
 		const idx = databases.findIndex((d) => d.id === params.id || d.name === params.id);
 		if (idx === -1) return err('Database not found', 404);
@@ -3790,7 +3791,7 @@ export const handlers = [
 		return ok(null);
 	}),
 
-	http.post('/api/databases/:id/start', async ({ params }) => {
+	http.post('/api/v1/databases/:id/start', async ({ params }) => {
 		await delay(LATENCY);
 		const idx = databases.findIndex((d) => d.id === params.id || d.name === params.id);
 		if (idx === -1) return err('Database not found', 404);
@@ -3803,7 +3804,7 @@ export const handlers = [
 		return ok(null);
 	}),
 
-	http.post('/api/databases/:id/redeploy', async ({ params }) => {
+	http.post('/api/v1/databases/:id/redeploy', async ({ params }) => {
 		await delay(LATENCY * 3);
 		const idx = databases.findIndex((d) => d.id === params.id || d.name === params.id);
 		if (idx === -1) return err('Database not found', 404);
@@ -3830,12 +3831,12 @@ export const handlers = [
 
 	// ── Cron Jobs (Phase 6.4) ──────────────────────────────────────────────────
 
-	http.get('/api/cron', async () => {
+	http.get('/api/v1/cron', async () => {
 		await delay(LATENCY);
 		return ok(cronJobs);
 	}),
 
-	http.get('/api/cron/schedule-preview', async ({ request }) => {
+	http.get('/api/v1/cron/schedule-preview', async ({ request }) => {
 		await delay(LATENCY);
 		const url = new URL(request.url);
 		const schedule = url.searchParams.get('schedule') ?? '';
@@ -3846,7 +3847,7 @@ export const handlers = [
 		return ok({ next_runs: runs, timezone });
 	}),
 
-	http.post('/api/cron', async ({ request }) => {
+	http.post('/api/v1/cron', async ({ request }) => {
 		await delay(LATENCY * 2);
 		const body = (await request.json()) as {
 			name: string;
@@ -3894,14 +3895,14 @@ export const handlers = [
 		return ok(newJob);
 	}),
 
-	http.get('/api/cron/:id', async ({ params }) => {
+	http.get('/api/v1/cron/:id', async ({ params }) => {
 		await delay(LATENCY);
 		const job = cronJobs.find((j) => j.id === params.id || j.name === params.id);
 		if (!job) return err('Cron job not found', 404);
 		return ok(job);
 	}),
 
-	http.patch('/api/cron/:id', async ({ params, request }) => {
+	http.patch('/api/v1/cron/:id', async ({ params, request }) => {
 		await delay(LATENCY);
 		const idx = cronJobs.findIndex((j) => j.id === params.id || j.name === params.id);
 		if (idx === -1) return err('Cron job not found', 404);
@@ -3962,13 +3963,13 @@ export const handlers = [
 		return ok(cronJobs[idx]);
 	}),
 
-	http.delete('/api/cron/:id', async ({ params }) => {
+	http.delete('/api/v1/cron/:id', async ({ params }) => {
 		await delay(LATENCY);
 		cronJobs = cronJobs.filter((j) => j.id !== params.id && j.name !== params.id);
 		return ok(null);
 	}),
 
-	http.post('/api/cron/:id/trigger', async ({ params }) => {
+	http.post('/api/v1/cron/:id/trigger', async ({ params }) => {
 		await delay(LATENCY);
 		const idx = cronJobs.findIndex((j) => j.id === params.id || j.name === params.id);
 		if (idx === -1) return err('Cron job not found', 404);
@@ -3997,7 +3998,7 @@ export const handlers = [
 		return ok({ message: 'Cron job triggered', cron_job_id: jobId });
 	}),
 
-	http.get('/api/cron/:id/runs', async ({ params, request }) => {
+	http.get('/api/v1/cron/:id/runs', async ({ params, request }) => {
 		await delay(LATENCY);
 		const job = cronJobs.find((j) => j.id === params.id || j.name === params.id);
 		if (!job) return err('Cron job not found', 404);
@@ -4010,13 +4011,13 @@ export const handlers = [
 
 	// ── WebSocket: Cron run stream ────────────────────────────────────────────
 	//
-	// Simulates /api/cron/{id}/runs/stream.
+	// Simulates /api/v1/cron/{id}/runs/stream.
 	// On connect: sends a snapshot of the most recent run for the job (or null).
 	// Every 8 s: emits a new simulated completed run frame.
 
 	cronRunStream.addEventListener('connection', ({ client }) => {
-		// Extract job id from the URL path: /api/cron/<id>/runs/stream
-		const match = client.url.pathname.match(/\/api\/cron\/([^/]+)\/runs\/stream/);
+		// Extract job id from the URL path: /api/v1/cron/<id>/runs/stream
+		const match = client.url.pathname.match(/\/api\/v1\/cron\/([^/]+)\/runs\/stream/);
 		const jobId = match?.[1] ?? '';
 
 		const existingRuns = cronRuns[jobId] ?? [];
@@ -4055,7 +4056,7 @@ export const handlers = [
 
 	// ── WebSocket: App log stream ─────────────────────────────────────────────
 	//
-	// Simulates /api/apps/{id}/logs/stream.
+	// Simulates /api/v1/apps/{id}/logs/stream.
 	// On connect: sends a snapshot of 5 seed lines.
 	// Every 2 s: sends one incremental container_log line.
 
@@ -4108,7 +4109,7 @@ export const handlers = [
 
 	// ── WebSocket: System log stream ──────────────────────────────────────────
 	//
-	// Simulates /api/system/logs/stream.
+	// Simulates /api/v1/system/logs/stream.
 	// On connect: sends a snapshot of recent deploy logs across all mock apps.
 	// Every 3 s: sends one incremental deploy or container log line.
 
@@ -4167,19 +4168,19 @@ export const handlers = [
 
 	// ── GitHub Apps (Phase 4.4) ────────────────────────────────────────────
 
-	http.get('/api/github-apps', async () => {
+	http.get('/api/v1/github-apps', async () => {
 		await delay(LATENCY);
 		return ok(githubApps);
 	}),
 
-	http.post('/api/github-apps/complete', async ({ request }) => {
+	http.post('/api/v1/github-apps/complete', async ({ request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as { state?: string | null };
 		if (!body.state) return err('missing_state', 400);
 		return ok({ completed: true });
 	}),
 
-	http.post('/api/github-apps/manifest', async () => {
+	http.post('/api/v1/github-apps/manifest', async () => {
 		await delay(LATENCY);
 		// In mock mode: simulate the manifest flow — return a github_url that points
 		// back to the integrations page (triggering the ?mock_github_connected=1 handler)
@@ -4190,7 +4191,7 @@ export const handlers = [
 		});
 	}),
 
-	http.post('/api/github-apps/:id/install', async ({ params }) => {
+	http.post('/api/v1/github-apps/:id/install', async ({ params }) => {
 		await delay(LATENCY);
 		const app = githubApps.find((a) => a.id === params.id);
 		if (!app) return err('GitHub App not found', 404);
@@ -4200,7 +4201,7 @@ export const handlers = [
 		});
 	}),
 
-	http.patch('/api/github-apps/:id', async ({ params, request }) => {
+	http.patch('/api/v1/github-apps/:id', async ({ params, request }) => {
 		await delay(LATENCY);
 		const idx = githubApps.findIndex((a) => a.id === params.id);
 		if (idx === -1) return err('GitHub App not found', 404);
@@ -4212,20 +4213,20 @@ export const handlers = [
 		return ok(githubApps[idx]);
 	}),
 
-	http.get('/api/github-apps/:id/repos', async ({ params }) => {
+	http.get('/api/v1/github-apps/:id/repos', async ({ params }) => {
 		await delay(LATENCY);
 		const repos = MOCK_GITHUB_REPOS[params.id as string] ?? [];
 		return ok(repos);
 	}),
 
-	http.get('/api/github-apps/:id/repos/:owner/:repo/branches', async ({ params }) => {
+	http.get('/api/v1/github-apps/:id/repos/:owner/:repo/branches', async ({ params }) => {
 		await delay(LATENCY);
 		const key = `${params.owner}/${params.repo}`;
 		const branches = MOCK_GITHUB_BRANCHES[key] ?? [{ name: 'main' }];
 		return ok(branches);
 	}),
 
-	http.put('/api/apps/:id/github-app', async ({ params, request }) => {
+	http.put('/api/v1/apps/:id/github-app', async ({ params, request }) => {
 		await delay(LATENCY);
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx === -1) return err('App not found', 404);
@@ -4238,7 +4239,7 @@ export const handlers = [
 		return ok(apps[idx]);
 	}),
 
-	http.get('/api/apps/:id/github-prs', async ({ params }) => {
+	http.get('/api/v1/apps/:id/github-prs', async ({ params }) => {
 		await delay(LATENCY);
 		const app = apps.find((a) => a.id === params.id);
 		if (!app) return err('App not found', 404);
@@ -4270,7 +4271,7 @@ export const handlers = [
 		return ok(mockPRs);
 	}),
 
-	http.delete('/api/github-apps/:id', async ({ params }) => {
+	http.delete('/api/v1/github-apps/:id', async ({ params }) => {
 		await delay(LATENCY);
 		githubApps = githubApps.filter((a) => a.id !== params.id);
 		return ok(null);
@@ -4278,12 +4279,12 @@ export const handlers = [
 
 	// ── Notification Integrations ──────────────────────────────────────────────
 
-	http.get('/api/integrations', async () => {
+	http.get('/api/v1/integrations', async () => {
 		await delay(LATENCY);
 		return ok(integrations);
 	}),
 
-	http.post('/api/integrations', async ({ request }) => {
+	http.post('/api/v1/integrations', async ({ request }) => {
 		await delay(LATENCY * 2);
 		const body = (await request.json()) as {
 			name: string;
@@ -4320,17 +4321,17 @@ export const handlers = [
 			updated_at: new Date().toISOString()
 		};
 		integrations = [...integrations, newIntegration];
-		return HttpResponse.json({ success: true, data: newIntegration, error: null }, { status: 201 });
+		return HttpResponse.json({ success: true, data: newIntegration }, { status: 201 });
 	}),
 
-	http.get('/api/integrations/:id', async ({ params }) => {
+	http.get('/api/v1/integrations/:id', async ({ params }) => {
 		await delay(LATENCY);
 		const integration = integrations.find((i) => i.id === params.id);
 		if (!integration) return err('Integration not found', 404);
 		return ok(integration);
 	}),
 
-	http.patch('/api/integrations/:id', async ({ params, request }) => {
+	http.patch('/api/v1/integrations/:id', async ({ params, request }) => {
 		await delay(LATENCY);
 		const idx = integrations.findIndex((i) => i.id === params.id);
 		if (idx === -1) return err('Integration not found', 404);
@@ -4346,7 +4347,7 @@ export const handlers = [
 		return ok(integrations[idx]);
 	}),
 
-	http.delete('/api/integrations/:id', async ({ params }) => {
+	http.delete('/api/v1/integrations/:id', async ({ params }) => {
 		await delay(LATENCY);
 		const exists = integrations.some((i) => i.id === params.id);
 		if (!exists) return err('Integration not found', 404);
@@ -4359,7 +4360,7 @@ export const handlers = [
 		return ok({ deleted: params.id });
 	}),
 
-	http.post('/api/integrations/:id/test', async ({ params }) => {
+	http.post('/api/v1/integrations/:id/test', async ({ params }) => {
 		await delay(LATENCY * 3);
 		const integration = integrations.find((i) => i.id === params.id);
 		if (!integration) return err('Integration not found', 404);
@@ -4374,7 +4375,7 @@ export const handlers = [
 
 	// ── WebSocket: All-databases log stream ───────────────────────────────────
 	//
-	// Simulates /api/databases/logs/stream.
+	// Simulates /api/v1/databases/logs/stream.
 	// On connect: sends a snapshot of container log lines tagged with db_id/db_name.
 	// Every 3 s: sends one incremental container log line cycling through mock dbs.
 
@@ -4483,7 +4484,7 @@ export const handlers = [
 
 	// ── WebSocket: Database log stream ────────────────────────────────────────
 	//
-	// Simulates /api/databases/{id}/logs/stream.
+	// Simulates /api/v1/databases/{id}/logs/stream.
 	// On connect: sends a snapshot of 3 seed container log lines.
 	// Every 3 s: sends one incremental container log line.
 
@@ -4518,12 +4519,12 @@ export const handlers = [
 
 	// ── Storage Providers ────────────────────────────────────────────────────
 
-	http.get('/api/storage-providers', async () => {
+	http.get('/api/v1/storage-providers', async () => {
 		await delay(LATENCY);
 		return ok(storageProviders);
 	}),
 
-	http.post('/api/storage-providers', async ({ request }) => {
+	http.post('/api/v1/storage-providers', async ({ request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as any;
 		const now = new Date().toISOString();
@@ -4545,7 +4546,7 @@ export const handlers = [
 		return ok(provider);
 	}),
 
-	http.patch('/api/storage-providers/:id', async ({ params, request }) => {
+	http.patch('/api/v1/storage-providers/:id', async ({ params, request }) => {
 		await delay(LATENCY);
 		const idx = storageProviders.findIndex((p) => p.id === params.id);
 		if (idx === -1) return err('Storage provider not found', 404);
@@ -4560,7 +4561,7 @@ export const handlers = [
 		return ok(updated);
 	}),
 
-	http.delete('/api/storage-providers/:id', async ({ params }) => {
+	http.delete('/api/v1/storage-providers/:id', async ({ params }) => {
 		await delay(LATENCY);
 		const exists = storageProviders.some((p) => p.id === params.id);
 		if (!exists) return err('Storage provider not found', 404);
@@ -4568,7 +4569,7 @@ export const handlers = [
 		return ok({ deleted: params.id });
 	}),
 
-	http.post('/api/storage-providers/:id/test', async ({ params }) => {
+	http.post('/api/v1/storage-providers/:id/test', async ({ params }) => {
 		await delay(LATENCY * 3);
 		const p = storageProviders.find((sp) => sp.id === params.id);
 		if (!p) return err('Storage provider not found', 404);
@@ -4577,7 +4578,7 @@ export const handlers = [
 
 	// ── Snapshots ────────────────────────────────────────────────────────────
 
-	http.get('/api/snapshots', async ({ request }) => {
+	http.get('/api/v1/snapshots', async ({ request }) => {
 		await delay(LATENCY);
 		const url = new URL(request.url);
 		const app = url.searchParams.get('app');
@@ -4590,7 +4591,7 @@ export const handlers = [
 		return ok(result);
 	}),
 
-	http.post('/api/snapshots', async ({ request }) => {
+	http.post('/api/v1/snapshots', async ({ request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as any;
 		const now = new Date().toISOString();
@@ -4621,7 +4622,7 @@ export const handlers = [
 		return ok(snap);
 	}),
 
-	http.delete('/api/snapshots/:id', async ({ params }) => {
+	http.delete('/api/v1/snapshots/:id', async ({ params }) => {
 		await delay(LATENCY);
 		const exists = snapshots.some((s) => s.id === params.id);
 		if (!exists) return err('Snapshot not found', 404);
@@ -4629,7 +4630,7 @@ export const handlers = [
 		return ok({ deleted: params.id });
 	}),
 
-	http.post('/api/snapshots/:id/restore', async ({ params }) => {
+	http.post('/api/v1/snapshots/:id/restore', async ({ params }) => {
 		await delay(LATENCY * 2);
 		const snap = snapshots.find((s) => s.id === params.id);
 		if (!snap) return err('Snapshot not found', 404);
@@ -4664,7 +4665,7 @@ export const handlers = [
 		});
 	}),
 
-	http.post('/api/snapshots/:id/restore-app', async ({ params, request }) => {
+	http.post('/api/v1/snapshots/:id/restore-app', async ({ params, request }) => {
 		await delay(LATENCY * 2);
 		const snap = snapshots.find((s) => s.id === params.id);
 		if (!snap) return err('Snapshot not found', 404);
@@ -4672,7 +4673,7 @@ export const handlers = [
 		return ok({ message: `App '${body.app_name}' rolled back successfully.` });
 	}),
 
-	http.post('/api/snapshots/:id/restore-database', async ({ params, request }) => {
+	http.post('/api/v1/snapshots/:id/restore-database', async ({ params, request }) => {
 		await delay(LATENCY * 2);
 		const snap = snapshots.find((s) => s.id === params.id);
 		if (!snap) return err('Snapshot not found', 404);
@@ -4692,12 +4693,12 @@ export const handlers = [
 		});
 	}),
 
-	http.get('/api/snapshots/config', async () => {
+	http.get('/api/v1/snapshots/config', async () => {
 		await delay(LATENCY);
 		return ok(backupConfig);
 	}),
 
-	http.put('/api/snapshots/config', async ({ request }) => {
+	http.put('/api/v1/snapshots/config', async ({ request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as Partial<BackupConfig>;
 		backupConfig = { ...backupConfig, ...body };

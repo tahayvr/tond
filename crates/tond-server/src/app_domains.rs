@@ -74,8 +74,8 @@ impl DomainContext {
     }
 }
 
-fn invalid(msg: impl Into<String>) -> TondError {
-    TondError::InvalidInput(msg.into())
+fn invalid_domain(msg: impl Into<String>) -> TondError {
+    TondError::invalid_field("domain", msg)
 }
 
 /// Domains of an app: primary, then aliases, then redirects, oldest first.
@@ -108,7 +108,7 @@ async fn check_new_domain(
     raw: &str,
 ) -> Result<(String, Option<AppDomain>), TondError> {
     let domain = normalize_domain(raw);
-    check_custom_app_domain(&domain, &ctx.dashboard, &ctx.preview).map_err(invalid)?;
+    check_custom_app_domain(&domain, &ctx.dashboard, &ctx.preview).map_err(invalid_domain)?;
     let existing = get_in(tx, &domain).await?;
     if let Some(row) = &existing
         && row.app_id != app_id
@@ -117,10 +117,11 @@ async fn check_new_domain(
             .bind(&row.app_id)
             .fetch_optional(&mut **tx)
             .await?;
-        return Err(invalid(format!(
-            "{domain} is already used by the app '{}'. Remove it there first.",
+        return Err(TondError::Conflict(format!(
+            "{domain} is already used by the app '{}'",
             other.unwrap_or_else(|| row.app_id.clone())
-        )));
+        ))
+        .with_hint("Remove it from that app first, then add it here."));
     }
     Ok((domain, existing))
 }
@@ -128,9 +129,10 @@ async fn check_new_domain(
 fn check_code(code: Option<u16>) -> Result<i64, TondError> {
     let code = code.unwrap_or(308);
     if !REDIRECT_CODES.contains(&code) {
-        return Err(invalid(format!(
-            "Redirects answer with 301 or 308, not {code}"
-        )));
+        return Err(TondError::invalid_field(
+            "redirect_code",
+            format!("Redirects answer with 301 or 308, not {code}"),
+        ));
     }
     Ok(i64::from(code))
 }
@@ -144,22 +146,30 @@ async fn check_redirect_target(
 ) -> Result<String, TondError> {
     let target = normalize_domain(target.unwrap_or_default());
     if target.is_empty() {
-        return Err(invalid(format!(
-            "Choose the domain {domain} should redirect to"
-        )));
+        return Err(TondError::invalid_field(
+            "redirect_to",
+            format!("Choose the domain {domain} should redirect to"),
+        ));
     }
     if target == domain {
-        return Err(invalid(format!("{domain} can't redirect to itself")));
+        return Err(TondError::invalid_field(
+            "redirect_to",
+            format!("{domain} can't redirect to itself"),
+        ));
     }
     match get_in(tx, &target).await? {
         Some(t) if t.app_id == app_id && t.kind() != DomainKind::Redirect => Ok(target),
-        Some(t) if t.app_id == app_id => Err(invalid(format!(
-            "{target} is itself a redirect; point {domain} at the domain it redirects to"
-        ))),
-        _ => Err(invalid(format!(
-            "{target} isn't a domain of this app. Redirects can only point at the app's own \
-             domains; add {target} first."
-        ))),
+        Some(t) if t.app_id == app_id => Err(TondError::invalid_field(
+            "redirect_to",
+            format!("{target} is itself a redirect; point {domain} at the domain it redirects to"),
+        )),
+        _ => Err(TondError::invalid_field(
+            "redirect_to",
+            format!(
+                "{target} isn't a domain of this app. Redirects can only point at the app's own \
+                 domains; add {target} first."
+            ),
+        )),
     }
 }
 
@@ -304,7 +314,9 @@ pub async fn add(
     let mut tx = db.begin().await?;
     let (domain, existing) = check_new_domain(&mut tx, ctx, app_id, &req.domain).await?;
     if existing.is_some() {
-        return Err(invalid(format!("{domain} is already a domain of this app")));
+        return Err(TondError::Conflict(format!(
+            "{domain} is already a domain of this app"
+        )));
     }
     let service = req
         .service
@@ -314,7 +326,10 @@ pub async fn add(
     if let Some(port) = req.port
         && !(1..=65535).contains(&port)
     {
-        return Err(invalid("port must be between 1 and 65535"));
+        return Err(TondError::invalid_field(
+            "port",
+            "port must be between 1 and 65535",
+        ));
     }
     let kind = match req.kind {
         Some(kind) => kind,
@@ -360,19 +375,20 @@ pub async fn update(
         .ok_or_else(|| TondError::NotFound(format!("{domain} is not a domain of this app")))?;
     let kind = req.kind.unwrap_or(current.kind());
     if current.kind() == DomainKind::Primary && kind != DomainKind::Primary {
-        return Err(invalid(format!(
-            "{domain} is the primary domain. Make another domain primary first."
-        )));
+        return Err(
+            TondError::Conflict(format!("{domain} is the primary domain"))
+                .with_hint("Make another domain primary first."),
+        );
     }
     let (redirect_to, code) = if kind == DomainKind::Redirect {
         let pointing = redirects_to(&mut tx, &domain).await?;
         if !pointing.is_empty() {
-            return Err(invalid(format!(
-                "{} redirect{} to {domain}; point {} at another domain first",
+            return Err(TondError::Conflict(format!(
+                "{} redirect{} to {domain}",
                 pointing.join(", "),
                 if pointing.len() == 1 { "s" } else { "" },
-                if pointing.len() == 1 { "it" } else { "them" }
-            )));
+            ))
+            .with_hint("Point those redirects at another domain first."));
         }
         let target = req
             .redirect_to
@@ -412,13 +428,12 @@ pub async fn remove(db: &SqlitePool, app_id: &str, domain: &str) -> Result<AppDo
         .ok_or_else(|| TondError::NotFound(format!("{domain} is not a domain of this app")))?;
     let pointing = redirects_to(&mut tx, &domain).await?;
     if !pointing.is_empty() {
-        return Err(invalid(format!(
-            "{} redirect{} to {domain}. Remove {} or point {} at another domain first.",
+        return Err(TondError::Conflict(format!(
+            "{} redirect{} to {domain}",
             pointing.join(", "),
             if pointing.len() == 1 { "s" } else { "" },
-            if pointing.len() == 1 { "it" } else { "them" },
-            if pointing.len() == 1 { "it" } else { "them" }
-        )));
+        ))
+        .with_hint("Remove those redirects or point them at another domain first."));
     }
     sqlx::query("DELETE FROM app_domains WHERE domain = ?")
         .bind(&domain)
@@ -460,9 +475,11 @@ pub async fn www_pair(
         .is_some_and(|r| r.kind() == DomainKind::Primary)
         && canonical_kind != DomainKind::Primary
     {
-        return Err(invalid(format!(
-            "{other} is the primary domain; make {canonical} primary to redirect {other} to it"
-        )));
+        return Err(
+            TondError::Conflict(format!("{other} is the primary domain")).with_hint(format!(
+                "Make {canonical} primary to redirect {other} to it."
+            )),
+        );
     }
     let service = canonical_row.as_ref().and_then(|r| r.service.clone());
     let port = canonical_row.as_ref().and_then(|r| r.port);
@@ -677,7 +694,7 @@ mod tests {
         ok(add(&db, &ctx(), "a1", &req("shop.example.org", None, None)).await);
         let taken = add(&db, &ctx(), "a2", &req("shop.example.org", None, None)).await;
         assert!(
-            matches!(&taken, Err(TondError::InvalidInput(m)) if m.contains("already used by the app 'web'")),
+            matches!(&taken, Err(e) if e.code() == "CONFLICT" && e.message().contains("already used by the app 'web'")),
             "got {taken:?}"
         );
         for bad in ["dash.example.com", "x.example-previews.com", "not a domain"] {
@@ -746,7 +763,7 @@ mod tests {
 
         let target_removed = remove(&db, "a1", "shop.example.org").await;
         assert!(
-            matches!(&target_removed, Err(TondError::InvalidInput(m)) if m.contains("old.example.org redirects")),
+            matches!(&target_removed, Err(e) if e.code() == "CONFLICT" && e.message().contains("old.example.org redirects") && e.hint().is_some()),
             "got {target_removed:?}"
         );
         let bad_code = UpdateAppDomainRequest {

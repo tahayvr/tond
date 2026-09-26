@@ -368,7 +368,10 @@ pub fn retry_after_secs(wait: Duration) -> u64 {
 pub fn too_many_requests(message: &str, wait: Duration) -> Response {
     let mut response = (
         StatusCode::TOO_MANY_REQUESTS,
-        Json(ApiResponse::<()>::err(message)),
+        Json(ApiResponse::<()>::err(
+            tond_common::code::RATE_LIMITED,
+            message,
+        )),
     )
         .into_response();
     if let Ok(value) = HeaderValue::from_str(&retry_after_secs(wait).to_string()) {
@@ -397,7 +400,7 @@ mod tests {
 
     fn parts_with(peer: Option<&str>, xff: Option<&str>) -> Parts {
         let mut parts = Request::builder()
-            .uri("/api/auth/login")
+            .uri("/api/v1/auth/login")
             .body(())
             .unwrap_or_else(|err| panic!("failed to build request: {err}"))
             .into_parts()

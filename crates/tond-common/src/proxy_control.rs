@@ -61,6 +61,7 @@ pub const MAX_LINE_BYTES: usize = 256 * 1024;
 pub const FALLBACK_POLL_SECS: u64 = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ProxyRequest {
     Sync {
@@ -98,6 +99,7 @@ pub enum ProxyRequest {
 
 /// What a dns_txt message asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum DnsTxtAction {
     Set,
@@ -105,6 +107,7 @@ pub enum DnsTxtAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProxyMessage {
     Hello {
@@ -129,6 +132,7 @@ pub enum ProxyMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReplyBody {
     Synced { route_version: i64, routes: u64 },
@@ -141,6 +145,7 @@ pub enum ReplyBody {
 
 /// An uploaded certificate the proxy validated and now serves.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct InstalledCert {
     pub domain: String,
     pub cert_path: String,
@@ -156,6 +161,7 @@ pub struct InstalledCert {
 /// Outcome of one certificate issuance attempt, as tond-server stores it in
 /// the `certificates` table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CertReport {
     pub domain: String,
     pub cert_path: String,
@@ -169,6 +175,7 @@ pub struct CertReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum CertOutcome {
     /// A certificate was issued; retry state is cleared.

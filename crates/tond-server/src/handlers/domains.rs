@@ -1,6 +1,6 @@
 // handlers/domains.rs — live DNS check for the dashboard's domain card
 //
-// GET /api/domains/check?domain=app.example.com
+// GET /api/v1/domains/check?domain=app.example.com
 //
 //   Resolves the domain (A/AAAA), compares the answer with this server's
 //   public addresses (tond_common::dns, the same logic tond-proxy uses before
@@ -49,12 +49,14 @@ const DNS_TIMEOUT: Duration = Duration::from_secs(3);
 const PUBLIC_IP_TTL: Duration = Duration::from_secs(3600);
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct DomainCheckQuery {
     pub domain: String,
 }
 
 /// A DNS record to create.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct DnsRecord {
     /// "A" | "AAAA"
     #[serde(rename = "type")]
@@ -67,6 +69,7 @@ pub struct DnsRecord {
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct DnsStatus {
     /// "ok" | "mismatch" | "missing" | "inconclusive"
     pub status: &'static str,
@@ -80,6 +83,7 @@ pub struct DnsStatus {
 
 /// The certificate fields the domain card shows.
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct CertificateSummary {
     /// The certificate's own domain (`*.apps.example.com` for a wildcard).
     pub domain: String,
@@ -116,6 +120,7 @@ impl From<Certificate> for CertificateSummary {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct DomainCheckResponse {
     pub domain: String,
     /// Registrable domain (the DNS zone the records go in), if known

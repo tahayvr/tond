@@ -1,8 +1,8 @@
 <script lang="ts">
 	// Tond health: the services Tond depends on (tond-server, tond-proxy,
 	// Docker, the database, the outbound heartbeat) and every background loop.
-	// Polls GET /api/system/self itself; Docker and heartbeat come from the
-	// page (GET /api/system/host, /api/system/heartbeat).
+	// Polls GET /api/v1/system/self itself; Docker and heartbeat come from the
+	// page (GET /api/v1/system/host, /api/v1/system/heartbeat).
 	import { untrack } from 'svelte';
 	import {
 		getSystemSelf,

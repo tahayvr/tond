@@ -1,6 +1,6 @@
 // runtime/selfstats.rs — assemble "Tond measuring itself"
 //
-// collect() builds the GET /api/system/self response from the pieces in this
+// collect() builds the GET /api/v1/system/self response from the pieces in this
 // module tree (process sample, loops, DB statement counters, HTTP histograms,
 // build queue) plus tond-proxy's own report over the control socket.
 // prometheus() renders the same numbers in the Prometheus text format for
@@ -485,7 +485,7 @@ mod tests {
             http_bucket_bounds_ms: vec![10.0, 100.0],
             http: vec![RouteLatency {
                 method: "GET".into(),
-                route: "/api/apps/{id}".into(),
+                route: "/api/v1/apps/{id}".into(),
                 count: 3,
                 errors: 0,
                 sum_ms: 30.0,
@@ -499,11 +499,11 @@ mod tests {
         assert!(text.contains("tond_loop_wakeups_total{loop=\"health\"} 3"));
         assert!(text.contains("tond_loop_last_duration_seconds{loop=\"health\"} 0.012"));
         assert!(text.contains(
-            "tond_http_request_duration_seconds_bucket{method=\"GET\",route=\"/api/apps/{id}\",le=\"0.1\"} 2"
+            "tond_http_request_duration_seconds_bucket{method=\"GET\",route=\"/api/v1/apps/{id}\",le=\"0.1\"} 2"
         ));
         assert!(text.contains("le=\"+Inf\"} 3"));
         assert!(text.contains(
-            "tond_http_request_duration_seconds_count{method=\"GET\",route=\"/api/apps/{id}\"} 3"
+            "tond_http_request_duration_seconds_count{method=\"GET\",route=\"/api/v1/apps/{id}\"} 3"
         ));
         assert!(text.contains("tond_proxy_connected 0"));
         assert_eq!(label("a\"b"), "a\\\"b");

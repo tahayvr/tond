@@ -1,10 +1,10 @@
 // handlers/dns_providers.rs — DNS providers for ACME DNS-01 (wildcards)
 //
-//   GET    /api/dns-providers            list (tokens are never returned)
-//   POST   /api/dns-providers            create {name, kind, zones, token, config}
-//   PATCH  /api/dns-providers/{id}       update; `token` replaced only when sent
-//   DELETE /api/dns-providers/{id}
-//   POST   /api/dns-providers/{id}/test  check the token can see every zone
+//   GET    /api/v1/dns-providers            list (tokens are never returned)
+//   POST   /api/v1/dns-providers            create {name, kind, zones, token, config}
+//   PATCH  /api/v1/dns-providers/{id}       update; `token` replaced only when sent
+//   DELETE /api/v1/dns-providers/{id}
+//   POST   /api/v1/dns-providers/{id}/test  check the token can see every zone
 //
 // Adding, changing or removing a provider bumps route_state (SQL triggers on
 // dns_providers), so tond-proxy reloads the zone list and orders (or stops
@@ -30,6 +30,10 @@ fn invalid(msg: impl Into<String>) -> AppError {
     AppError(TondError::InvalidInput(msg.into()))
 }
 
+fn field(name: &str, msg: impl Into<String>) -> AppError {
+    AppError(TondError::invalid_field(name, msg))
+}
+
 async fn fetch(state: &AppState, id: &str) -> Result<DnsProvider, AppError> {
     sqlx::query_as::<_, DnsProvider>("SELECT * FROM dns_providers WHERE id = ?")
         .bind(id)
@@ -45,15 +49,19 @@ fn check_config(kind: DnsProviderKind, config: &DnsProviderConfig) -> Result<(),
             .as_deref()
             .is_none_or(|k| k.trim().is_empty())
     {
-        return Err(invalid(
+        return Err(AppError(TondError::invalid_field(
+            "config.access_key_id",
             "Route 53 needs the access key id (the secret access key goes in the token field)",
-        ));
+        )));
     }
     if let Some(url) = &config.url
         && !url.is_empty()
         && !(url.starts_with("http://") || url.starts_with("https://"))
     {
-        return Err(invalid("The URL must start with http:// or https://"));
+        return Err(AppError(TondError::invalid_field(
+            "config.url",
+            "The URL must start with http:// or https://",
+        )));
     }
     Ok(())
 }
@@ -71,10 +79,13 @@ async fn check_zone_overlap(
         }
         let theirs = dns_providers::parse_zones(&other.zones);
         if let Some(z) = zones.iter().find(|z| theirs.contains(z)) {
-            return Err(invalid(format!(
-                "{z} is already handled by the DNS provider '{}'",
-                other.name
-            )));
+            return Err(AppError(
+                TondError::Conflict(format!(
+                    "{z} is already handled by the DNS provider '{}'",
+                    other.name
+                ))
+                .with_hint("Add the zone to that provider, or remove it there first."),
+            ));
         }
     }
     Ok(())
@@ -101,7 +112,7 @@ pub async fn create_dns_provider(
 ) -> Result<impl IntoResponse, AppError> {
     let name = req.name.trim();
     if name.is_empty() {
-        return Err(invalid("Give the provider a name"));
+        return Err(field("name", "Give the provider a name"));
     }
     if !kind_allowed(req.kind) {
         return Err(invalid(format!(
@@ -110,10 +121,10 @@ pub async fn create_dns_provider(
         )));
     }
     if req.token.trim().is_empty() && req.kind != DnsProviderKind::Challtestsrv {
-        return Err(invalid("Paste the API token"));
+        return Err(field("token", "Paste the API token"));
     }
     check_config(req.kind, &req.config)?;
-    let zones = clean_zones(&req.zones).map_err(invalid)?;
+    let zones = clean_zones(&req.zones).map_err(|m| field("zones", m))?;
     check_zone_overlap(&state, &zones, None).await?;
 
     let id = uuid::Uuid::new_v4().to_string();
@@ -159,13 +170,13 @@ pub async fn update_dns_provider(
     let row = fetch(&state, &id).await?;
     let kind = DnsProviderKind::parse(&row.kind).unwrap_or(DnsProviderKind::Cloudflare);
     let name = match &req.name {
-        Some(n) if n.trim().is_empty() => return Err(invalid("Give the provider a name")),
+        Some(n) if n.trim().is_empty() => return Err(field("name", "Give the provider a name")),
         Some(n) => n.trim().to_string(),
         None => row.name.clone(),
     };
     let zones = match &req.zones {
         Some(z) => {
-            let z = clean_zones(z).map_err(invalid)?;
+            let z = clean_zones(z).map_err(|m| field("zones", m))?;
             check_zone_overlap(&state, &z, Some(&id)).await?;
             serde_json::to_string(&z).unwrap_or_else(|_| "[]".into())
         }
@@ -369,8 +380,6 @@ mod tests {
             }),
         )
         .await;
-        assert!(
-            matches!(&r53, Err(AppError(TondError::InvalidInput(m))) if m.contains("access key id"))
-        );
+        assert!(matches!(&r53, Err(AppError(e)) if e.field() == Some("config.access_key_id")));
     }
 }

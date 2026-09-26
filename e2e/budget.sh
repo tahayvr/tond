@@ -24,7 +24,7 @@ set -euo pipefail
 #   requests reported by the API             ≥ what was sent (roughly)
 #
 # Wakeups are the background loops' own wakeups as reported by
-# GET /api/system/self (server) and the proxy's control-socket stats. The OS
+# GET /api/v1/system/self (server) and the proxy's control-socket stats. The OS
 # context-switch rate is printed too, for information: it includes Tokio's
 # and Pingora's internal timers, which Tond does not control.
 #
@@ -125,12 +125,12 @@ calc() { python3 -c "print(round($1, 3))"; }
 
 [[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
 for tool in curl jq python3 journalctl; do command -v "$tool" > /dev/null || { echo "missing tool: $tool" >&2; exit 1; }; done
-api /api/system/self > /dev/null || { echo "tond-server does not answer GET /api/system/self on ${SOCK}" >&2; exit 1; }
+api /api/v1/system/self > /dev/null || { echo "tond-server does not answer GET /api/v1/system/self on ${SOCK}" >&2; exit 1; }
 
 # Let startup work finish (the janitor's first pass runs 2 minutes after start).
 settle() {
     local up
-    up=$(api /api/system/self | jq -r .data.server.uptime_secs)
+    up=$(api /api/v1/system/self | jq -r .data.server.uptime_secs)
     if (( up < 150 )); then
         info "waiting $((150 - up))s for startup work to finish (uptime ${up}s)"
         sleep $((150 - up))
@@ -144,7 +144,7 @@ sample() {
     local server proxy
     server=$(pid_of tond-server)
     proxy=$(pid_of tond-proxy)
-    api /api/system/self | jq -c \
+    api /api/v1/system/self | jq -c \
         --argjson t "$(date +%s.%N)" \
         --argjson srss "$(rss_bytes "$server" | cut -d' ' -f1)" --argjson prss "$(rss_bytes "$proxy" | cut -d' ' -f1)" \
         --argjson srosetta "$(rss_bytes "$server" | cut -d' ' -f2)" --argjson prosetta "$(rss_bytes "$proxy" | cut -d' ' -f2)" \
@@ -292,7 +292,7 @@ for i in range(n):
     s.connect(path)
     key = base64.b64encode(os.urandom(16)).decode()
     s.sendall((
-        "GET /api/system/logs/stream HTTP/1.1\r\nHost: localhost\r\n"
+        "GET /api/v1/system/logs/stream HTTP/1.1\r\nHost: localhost\r\n"
         "Upgrade: websocket\r\nConnection: Upgrade\r\n"
         f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
     ).encode())
@@ -353,8 +353,8 @@ PY
 # Requests the API reports for the traffic apps over the last hour.
 reported_requests() {
     local total=0 n name
-    for name in $(api /api/apps | jq -r '.data[] | select(.name | startswith("budget-traffic-")) | .name'); do
-        n=$(api "/api/apps/${name}/requests?range=1h" | jq '.data.summary.requests')
+    for name in $(api /api/v1/apps | jq -r '.data[] | select(.name | startswith("budget-traffic-")) | .name'); do
+        n=$(api "/api/v1/apps/${name}/requests?range=1h" | jq '.data.summary.requests')
         total=$((total + n))
     done
     echo "$total"
@@ -396,7 +396,7 @@ traffic_phase() {
     # The earlier phase's rows were removed behind tond-server's back: wait
     # for the proxy's fallback check to drop them.
     for _ in $(seq 1 30); do
-        (( $(api /api/system/self | jq '.data.proxy.stats.routes // 0') == 0 )) && break
+        (( $(api /api/v1/system/self | jq '.data.proxy.stats.routes // 0') == 0 )) && break
         sleep 3
     done
 
@@ -420,7 +420,7 @@ traffic_phase() {
     upstream=$!
     seed_traffic_apps "$n"
     for _ in $(seq 1 30); do
-        routes=$(api /api/system/self | jq '.data.proxy.stats.routes // 0')
+        routes=$(api /api/v1/system/self | jq '.data.proxy.stats.routes // 0')
         (( routes >= n )) && break
         sleep 3
     done
@@ -484,7 +484,7 @@ traffic_phase() {
 
 # ── Phase 1: idle, no apps ────────────────────────────────────────────────────
 
-apps=$(api /api/apps | jq '.data | length')
+apps=$(api /api/v1/apps | jq '.data | length')
 if (( apps > 0 )) && [[ "$ASSERT" == 1 ]]; then
     echo "This host has ${apps} app(s); the idle budgets are defined for a fresh install (0 apps)." >&2
     echo "Run it on a fresh install (just vm-budget does that)." >&2
@@ -494,11 +494,11 @@ step "Idle, ${apps} apps"
 measure "0 apps" 15 12
 
 step "Log WebSocket soak"
-baseline=$(api /api/system/self | jq .data.server.tokio_alive_tasks)
+baseline=$(api /api/v1/system/self | jq .data.server.tokio_alive_tasks)
 websocket_soak 200 | sed 's/^/  /'
 # Closed streams wind down asynchronously; give them a few seconds.
 for _ in $(seq 1 10); do
-    after=$(api /api/system/self | jq .data.server.tokio_alive_tasks)
+    after=$(api /api/v1/system/self | jq .data.server.tokio_alive_tasks)
     (( after <= baseline )) && break
     sleep 1
 done
@@ -514,7 +514,7 @@ if (( APPS > 0 )); then
     # Written behind tond-server's back: its hook did not see it, so the
     # proxy picks the routes up with its fallback check (≤ 60 s).
     for _ in $(seq 1 30); do
-        routes=$(api /api/system/self | jq '.data.proxy.stats.routes // 0')
+        routes=$(api /api/v1/system/self | jq '.data.proxy.stats.routes // 0')
         (( routes >= APPS )) && break
         sleep 3
     done
@@ -533,9 +533,9 @@ if (( APPS > 0 )); then
     # are only seen after a restart. Restart so the phase really probes every
     # dummy app each minute (one TLS handshake per app through the proxy).
     systemctl restart tond-server
-    for _ in $(seq 1 30); do api /api/system/self > /dev/null 2>&1 && break; sleep 1; done
+    for _ in $(seq 1 30); do api /api/v1/system/self > /dev/null 2>&1 && break; sleep 1; done
     settle
-    checks=$(api /api/uptime | jq "[.data[]? | select(.status != \"paused\")] | length")
+    checks=$(api /api/v1/uptime | jq "[.data[]? | select(.status != \"paused\")] | length")
     info "uptime checks active: ${checks}"
     (( checks >= APPS )) || FAILURES+=("expected ≥ ${APPS} active uptime checks, found ${checks}")
     sleep 60

@@ -3,14 +3,14 @@
 // Creates and manages scheduled jobs that run Docker containers on a cron schedule.
 //
 // Routes (all require RateLimit + an Authz scope, see each handler):
-//   GET    /api/cron                      — list all cron jobs
-//   POST   /api/cron                      — create a new cron job
-//   GET    /api/cron/{id}                 — get cron job details
-//   PATCH  /api/cron/{id}                 — update fields
-//   DELETE /api/cron/{id}                 — delete cron job
-//   POST   /api/cron/{id}/trigger         — manually trigger a run immediately
-//   GET    /api/cron/{id}/runs            — get execution history (supports ?limit=&offset=)
-//   GET    /api/cron/schedule-preview     — validate a schedule, list its next runs
+//   GET    /api/v1/cron                      — list all cron jobs
+//   POST   /api/v1/cron                      — create a new cron job
+//   GET    /api/v1/cron/{id}                 — get cron job details
+//   PATCH  /api/v1/cron/{id}                 — update fields
+//   DELETE /api/v1/cron/{id}                 — delete cron job
+//   POST   /api/v1/cron/{id}/trigger         — manually trigger a run immediately
+//   GET    /api/v1/cron/{id}/runs            — get execution history (supports ?limit=&offset=)
+//   GET    /api/v1/cron/schedule-preview     — validate a schedule, list its next runs
 //                                           (?schedule=&timezone=&count=)
 
 use std::collections::BTreeMap;
@@ -90,6 +90,7 @@ fn validate_env_keys<'a>(keys: impl IntoIterator<Item = &'a String>) -> Result<(
 // ── Schedule preview ──
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct SchedulePreviewQuery {
     pub schedule: String,
     pub timezone: Option<String>,
@@ -557,6 +558,7 @@ pub async fn trigger_cron_job(
 
 /// Query parameters for the runs endpoint.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct CronRunsQuery {
     /// Maximum number of runs to return (default 50, max 200).
     pub limit: Option<i64>,

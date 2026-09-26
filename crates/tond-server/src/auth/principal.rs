@@ -24,7 +24,7 @@
 // `Authz<R>` authenticates, checks that the principal holds every scope in
 // `R` (403 SCOPE_DENIED otherwise) and, for resource-limited tokens, that the
 // route targets an allowed app or project (403 RESOURCE_DENIED). A limited
-// token may only use routes under /api/apps/{id} and /api/projects/{id} for
+// token may only use routes under /api/v1/apps/{id} and /api/v1/projects/{id} for
 // its own resources plus the app and project lists (which the handlers
 // filter); every other route is refused. `Principal` itself is also an
 // extractor, for self-service routes that only need *someone* signed in.
@@ -42,7 +42,9 @@ use axum::{
 };
 use chrono::Utc;
 use sqlx::SqlitePool;
-use tond_common::{ApiResponse, Role, Scope, ScopeGroup, ScopeSet, TokenKind, TondError, User};
+use tond_common::{
+    ApiErrorBody, ApiResponse, Role, Scope, ScopeGroup, ScopeSet, TokenKind, TondError, User,
+};
 
 use super::LocalSocket;
 use super::rate_limit::client_ip;
@@ -357,7 +359,14 @@ impl IntoResponse for AuthFailure {
     fn into_response(self) -> Response {
         (
             self.status,
-            Json(ApiResponse::<()>::err_code(self.code, self.message)),
+            Json(ApiResponse::<()>::error(ApiErrorBody {
+                code: self.code.to_string(),
+                message: self.message,
+                hint: tond_common::error_code_info(self.code)
+                    .and_then(|c| c.hint)
+                    .map(str::to_string),
+                field: None,
+            })),
         )
             .into_response()
     }
@@ -649,7 +658,7 @@ impl<R: ScopeReq> Deref for Authz<R> {
 /// What a route acts on, for resource-limited tokens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceTarget {
-    /// GET /api/apps or /api/projects: allowed, the handler filters.
+    /// GET /api/v1/apps or /api/v1/projects: allowed, the handler filters.
     List,
     App(String),
     Project(String),
@@ -657,18 +666,18 @@ pub enum ResourceTarget {
     Other,
 }
 
-/// Classify a route by its pattern (e.g. `/api/apps/{id}/deploy`).
+/// Classify a route by its pattern (e.g. `/api/v1/apps/{id}/deploy`).
 pub fn resource_target(method: &Method, pattern: &str, id_param: Option<&str>) -> ResourceTarget {
     let id = || id_param.map(str::to_string);
-    if (pattern == "/api/apps" || pattern == "/api/projects") && method == Method::GET {
+    if (pattern == "/api/v1/apps" || pattern == "/api/v1/projects") && method == Method::GET {
         return ResourceTarget::List;
     }
-    if pattern.starts_with("/api/apps/{id}")
+    if pattern.starts_with("/api/v1/apps/{id}")
         && let Some(id) = id()
     {
         return ResourceTarget::App(id);
     }
-    if pattern.starts_with("/api/projects/{id}")
+    if pattern.starts_with("/api/v1/projects/{id}")
         && let Some(id) = id()
     {
         return ResourceTarget::Project(id);
@@ -828,7 +837,7 @@ mod tests {
             .err()
             .unwrap_or_else(|| panic!("viewers can't deploy"));
         assert_eq!(err.0.status_code(), 403);
-        assert_eq!(err.0.code(), Some("SCOPE_DENIED"));
+        assert_eq!(err.0.code(), "SCOPE_DENIED");
         assert!(err.0.to_string().contains("apps:deploy"));
         assert!(
             Authz::<(scope::AppsRead, scope::EnvReadValues)>::check(viewer).is_err(),
@@ -845,27 +854,27 @@ mod tests {
         let get = Method::GET;
         let post = Method::POST;
         assert_eq!(
-            resource_target(&get, "/api/apps", None),
+            resource_target(&get, "/api/v1/apps", None),
             ResourceTarget::List
         );
         assert_eq!(
-            resource_target(&post, "/api/apps", None),
+            resource_target(&post, "/api/v1/apps", None),
             ResourceTarget::Other
         );
         assert_eq!(
-            resource_target(&post, "/api/apps/{id}/deploy", Some("web")),
+            resource_target(&post, "/api/v1/apps/{id}/deploy", Some("web")),
             ResourceTarget::App("web".into())
         );
         assert_eq!(
-            resource_target(&get, "/api/projects/{id}", Some("p1")),
+            resource_target(&get, "/api/v1/projects/{id}", Some("p1")),
             ResourceTarget::Project("p1".into())
         );
         assert_eq!(
-            resource_target(&get, "/api/databases", None),
+            resource_target(&get, "/api/v1/databases", None),
             ResourceTarget::Other
         );
         assert_eq!(
-            resource_target(&get, "/api/settings", None),
+            resource_target(&get, "/api/v1/settings", None),
             ResourceTarget::Other
         );
     }
@@ -887,7 +896,7 @@ mod tests {
     #[test]
     fn query_tokens_are_read_and_decoded() {
         let parts = axum::http::Request::builder()
-            .uri("/api/apps/x/logs/stream?foo=1&token=tond_pat_abc%3D")
+            .uri("/api/v1/apps/x/logs/stream?foo=1&token=tond_pat_abc%3D")
             .body(())
             .unwrap_or_else(|e| panic!("{e}"))
             .into_parts()

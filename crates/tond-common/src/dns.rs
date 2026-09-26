@@ -2,7 +2,7 @@
 //
 // Shared by tond-proxy (the pre-check before ordering a certificate, see
 // tond-proxy/src/issuance.rs) and tond-server (the dashboard's domain card,
-// GET /api/domains/check). Pure functions only; the async lookup lives with
+// GET /api/v1/domains/check). Pure functions only; the async lookup lives with
 // each caller.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};

@@ -13,7 +13,7 @@
 //     confirms it routes the new port. This replaced a fixed 3 s sleep;
 //   - receives certificate results (cert events) and stores them — the proxy
 //     opens tond.db read-only — then acks them;
-//   - asks for the proxy's own stats for GET /api/system/self;
+//   - asks for the proxy's own stats for GET /api/v1/system/self;
 //   - reads its per-route request counters on the metrics tick (`traffic`);
 //   - publishes and clears ACME DNS-01 TXT records the proxy asks for
 //     (`dns_txt`; the DNS provider tokens stay here, see dns_providers/);
@@ -37,12 +37,12 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::{Notify, oneshot};
-use tond_common::ProxyStats;
 use tond_common::proxy_control::{
     CertOutcome, CertReport, FALLBACK_POLL_SECS, InstalledCert, MAX_LINE_BYTES, PROXY_SOCKET_NAME,
     ProxyMessage, ProxyRequest, ReplyBody, encode_line,
 };
 use tond_common::traffic::TrafficSnapshot;
+use tond_common::{ProxyStats, TondError};
 
 use crate::runtime::changes::{Table, Watch};
 use crate::runtime::{loops, shutdown};
@@ -263,13 +263,9 @@ pub async fn install_cert(
     domain: &str,
     cert_pem: String,
     key_pem: String,
-) -> Result<InstalledCert, String> {
+) -> Result<InstalledCert, TondError> {
     if !is_connected() {
-        return Err(
-            "tond-proxy isn't running, so the certificate can't be installed. Start it \
-                    (systemctl start tond-proxy) and try again."
-                .into(),
-        );
+        return Err(proxy_down());
     }
     let domain = domain.to_string();
     match request(
@@ -284,23 +280,49 @@ pub async fn install_cert(
     .await
     {
         Ok(ReplyBody::CertInstalled { cert }) => Ok(cert),
-        Ok(ReplyBody::Error { message }) => Err(message),
-        Ok(other) => Err(format!("unexpected answer from tond-proxy: {other:?}")),
-        Err(e) => Err(format!("tond-proxy did not answer: {e}")),
+        // The proxy's validation messages name what is wrong.
+        Ok(ReplyBody::Error { message }) => Err(TondError::invalid_field(
+            upload_error_field(&message),
+            message,
+        )),
+        Ok(other) => Err(TondError::Unavailable(format!(
+            "unexpected answer from tond-proxy: {other:?}"
+        ))),
+        Err(e) => Err(TondError::Unavailable(format!(
+            "tond-proxy did not answer: {e}"
+        ))),
     }
 }
 
+/// Which upload field a validation message from tond-proxy is about.
+pub fn upload_error_field(message: &str) -> &'static str {
+    if message.to_ascii_lowercase().contains("private key") {
+        "key_pem"
+    } else {
+        "cert_pem"
+    }
+}
+
+fn proxy_down() -> TondError {
+    TondError::Unavailable("tond-proxy isn't running, so certificates can't be changed".into())
+        .with_hint("Start it (systemctl start tond-proxy) and try again.")
+}
+
 /// Stop serving an uploaded certificate (the proxy deletes its files).
-pub async fn remove_cert(domain: &str) -> Result<(), String> {
+pub async fn remove_cert(domain: &str) -> Result<(), TondError> {
     if !is_connected() {
-        return Err("tond-proxy isn't running; start it and try again".into());
+        return Err(proxy_down());
     }
     let domain = domain.to_string();
     match request(|id| ProxyRequest::RemoveCert { id, domain }, SYNC_TIMEOUT).await {
         Ok(ReplyBody::Ok) => Ok(()),
-        Ok(ReplyBody::Error { message }) => Err(message),
-        Ok(other) => Err(format!("unexpected answer from tond-proxy: {other:?}")),
-        Err(e) => Err(format!("tond-proxy did not answer: {e}")),
+        Ok(ReplyBody::Error { message }) => Err(TondError::Internal(message)),
+        Ok(other) => Err(TondError::Unavailable(format!(
+            "unexpected answer from tond-proxy: {other:?}"
+        ))),
+        Err(e) => Err(TondError::Unavailable(format!(
+            "tond-proxy did not answer: {e}"
+        ))),
     }
 }
 

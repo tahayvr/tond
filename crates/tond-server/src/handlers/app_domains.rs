@@ -1,14 +1,14 @@
 // handlers/app_domains.rs — the domains of an app
 //
-//   GET    /api/apps/{id}/domains                    list (primary, aliases, redirects)
-//   POST   /api/apps/{id}/domains                    add {domain, kind?, redirect_to?, redirect_code?, service?, port?}
-//   POST   /api/apps/{id}/domains/www-pair           add example.com + www.example.com, one redirecting
-//   PATCH  /api/apps/{id}/domains/{domain}           {kind?, redirect_to?, redirect_code?} (set primary, redirect)
-//   DELETE /api/apps/{id}/domains/{domain}           remove
+//   GET    /api/v1/apps/{id}/domains                    list (primary, aliases, redirects)
+//   POST   /api/v1/apps/{id}/domains                    add {domain, kind?, redirect_to?, redirect_code?, service?, port?}
+//   POST   /api/v1/apps/{id}/domains/www-pair           add example.com + www.example.com, one redirecting
+//   PATCH  /api/v1/apps/{id}/domains/{domain}           {kind?, redirect_to?, redirect_code?} (set primary, redirect)
+//   DELETE /api/v1/apps/{id}/domains/{domain}           remove
 //
 // Rules live in app_domains.rs. Every change bumps route_state (SQL
 // triggers), which nudges tond-proxy, and new domains get a certificate pass.
-// Per-domain DNS / TLS status comes from GET /api/domains/check.
+// Per-domain DNS / TLS status comes from GET /api/v1/domains/check.
 
 use axum::{
     Json,

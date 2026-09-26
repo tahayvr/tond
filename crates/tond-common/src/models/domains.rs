@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 
 /// What a domain does for its app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum DomainKind {
     Primary,
@@ -55,6 +56,7 @@ pub const REDIRECT_CODES: [u16; 2] = [301, 308];
 
 /// Raw row from `app_domains`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AppDomain {
     pub domain: String,
     pub app_id: String,
@@ -79,6 +81,7 @@ impl AppDomain {
 
 /// One domain of an app, as the API returns it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AppDomainResponse {
     pub domain: String,
     pub kind: DomainKind,
@@ -95,6 +98,7 @@ pub struct AppDomainResponse {
 
 /// POST /api/apps/{id}/domains
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AddAppDomainRequest {
     pub domain: String,
     /// "primary" | "alias" (default; primary when the app has none) | "redirect"
@@ -115,6 +119,7 @@ pub struct AddAppDomainRequest {
 
 /// PATCH /api/apps/{id}/domains/{domain}
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateAppDomainRequest {
     #[serde(default)]
     pub kind: Option<DomainKind>,
@@ -126,6 +131,7 @@ pub struct UpdateAppDomainRequest {
 
 /// Which of the two names a www/apex pair serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum CanonicalHost {
     /// example.com serves, www.example.com redirects to it.
@@ -137,6 +143,7 @@ pub enum CanonicalHost {
 /// POST /api/apps/{id}/domains/www-pair: add `example.com` and
 /// `www.example.com` in one go, one redirecting to the other.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WwwPairRequest {
     /// Either name of the pair (with or without `www.`).
     pub domain: String,
@@ -158,6 +165,7 @@ pub fn www_pair(domain: &str) -> (String, String) {
 
 /// A DNS hosting API Tond can publish `_acme-challenge` TXT records with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum DnsProviderKind {
     Cloudflare,
@@ -230,6 +238,7 @@ pub struct DnsProvider {
 
 /// Non-secret provider settings.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DnsProviderConfig {
     /// Route 53: the IAM access key id (the secret key is the token).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -241,6 +250,7 @@ pub struct DnsProviderConfig {
 
 /// A provider as the API returns it: never the token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DnsProviderResponse {
     pub id: String,
     pub name: String,
@@ -257,6 +267,7 @@ pub struct DnsProviderResponse {
 
 /// POST /api/dns-providers
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreateDnsProviderRequest {
     pub name: String,
     pub kind: DnsProviderKind,
@@ -270,6 +281,7 @@ pub struct CreateDnsProviderRequest {
 /// PATCH /api/dns-providers/{id}: omitted fields are unchanged; `token` is
 /// replaced only when sent (it is never returned).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateDnsProviderRequest {
     #[serde(default)]
     pub name: Option<String>,
@@ -283,6 +295,7 @@ pub struct UpdateDnsProviderRequest {
 
 /// Result of POST /api/dns-providers/{id}/test.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DnsProviderTestResult {
     pub ok: bool,
     /// One line per zone: found, or why not.
@@ -290,6 +303,7 @@ pub struct DnsProviderTestResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DnsZoneCheck {
     pub zone: String,
     pub ok: bool,
@@ -300,6 +314,7 @@ pub struct DnsZoneCheck {
 
 /// POST /api/certs/custom
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UploadCertificateRequest {
     /// The domain the certificate serves (may be a wildcard `*.example.com`).
     pub domain: String,

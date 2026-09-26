@@ -472,19 +472,19 @@ describe('apps/[id] page', () => {
 
 	function webhookConfig(secret: string) {
 		const paths = {
-			github: '/api/webhooks/github/app_1',
-			gitlab: '/api/webhooks/gitlab/app_1',
-			gitea: '/api/webhooks/gitea/app_1',
-			generic: '/api/webhooks/generic/app_1'
+			github: '/api/v1/webhooks/github/app_1',
+			gitlab: '/api/v1/webhooks/gitlab/app_1',
+			gitea: '/api/v1/webhooks/gitea/app_1',
+			generic: '/api/v1/webhooks/generic/app_1'
 		};
 		return {
 			app_id: 'app_1',
 			paths,
 			urls: {
-				github: 'https://dash.example.com/api/webhooks/github/app_1',
-				gitlab: 'https://dash.example.com/api/webhooks/gitlab/app_1',
-				gitea: 'https://dash.example.com/api/webhooks/gitea/app_1',
-				generic: 'https://dash.example.com/api/webhooks/generic/app_1'
+				github: 'https://dash.example.com/api/v1/webhooks/github/app_1',
+				gitlab: 'https://dash.example.com/api/v1/webhooks/gitlab/app_1',
+				gitea: 'https://dash.example.com/api/v1/webhooks/gitea/app_1',
+				generic: 'https://dash.example.com/api/v1/webhooks/generic/app_1'
 			},
 			has_secret: true,
 			secret,
@@ -503,7 +503,7 @@ describe('apps/[id] page', () => {
 		await goToTab('?tab=settings&section=git');
 
 		const url = (await screen.findByLabelText(/payload url/i)) as HTMLInputElement;
-		expect(url.value).toBe('https://dash.example.com/api/webhooks/github/app_1');
+		expect(url.value).toBe('https://dash.example.com/api/v1/webhooks/github/app_1');
 		const secretField = screen.getByLabelText(/^secret$/i) as HTMLInputElement;
 		expect(secretField.value).not.toContain('generated-secret');
 		expect(api.revealWebhookSecret).not.toHaveBeenCalled();
@@ -514,13 +514,13 @@ describe('apps/[id] page', () => {
 
 		await user.click(screen.getByRole('tab', { name: /^gitlab$/i }));
 		expect((screen.getByLabelText(/^url$/i) as HTMLInputElement).value).toBe(
-			'https://dash.example.com/api/webhooks/gitlab/app_1'
+			'https://dash.example.com/api/v1/webhooks/gitlab/app_1'
 		);
 		expect(screen.getByLabelText(/secret token/i)).toBeInTheDocument();
 
 		await user.click(screen.getByRole('tab', { name: /gitea/i }));
 		expect((screen.getByLabelText(/target url/i) as HTMLInputElement).value).toBe(
-			'https://dash.example.com/api/webhooks/gitea/app_1'
+			'https://dash.example.com/api/v1/webhooks/gitea/app_1'
 		);
 	});
 
@@ -657,7 +657,7 @@ describe('apps/[id] page', () => {
 
 			await goToTab('?tab=logs');
 			expect(FakeWebSocket.instances).toHaveLength(1);
-			expect(FakeWebSocket.instances[0].url).toMatch(/\/api\/apps\/app_1\/logs\/stream$/);
+			expect(FakeWebSocket.instances[0].url).toMatch(/\/api\/v1\/apps\/app_1\/logs\/stream$/);
 
 			// Restarting reloads the app data, which used to tear everything down.
 			await user.click(screen.getByRole('button', { name: /^restart$/i }));

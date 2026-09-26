@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 // ── Certificate (TLS cert tracking) ──
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Certificate {
     pub id: String,
     pub domain: String,
@@ -38,6 +39,7 @@ pub struct Certificate {
 
 /// Which CA family issued a certificate, from its issuer name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum IssuerKind {
     /// Let's Encrypt production: trusted by browsers.
@@ -71,6 +73,7 @@ impl IssuerKind {
 
 /// What a certificate's domain is used for right now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CertificateTarget {
     /// The Tond dashboard (`dashboard_domain`).
@@ -93,6 +96,7 @@ pub enum CertificateTarget {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CertificateResponse {
     /// Empty for a served domain that has no certificate row yet.
     pub id: String,

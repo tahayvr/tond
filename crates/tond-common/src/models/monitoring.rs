@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 /// Query parameters for `GET /api/{apps,databases,cron}/{id}/metrics?range=`
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MetricsQuery {
     /// Time window: "1h" | "24h" | "7d" | "30d" (default "1h")
     #[serde(default = "default_range")]
@@ -19,6 +20,7 @@ fn default_range() -> String {
 /// Downsampled time series, one entry per bucket, as parallel arrays (about
 /// half the JSON of an array of objects). Rates are computed server-side.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MetricSeries {
     /// Bucket start, unix seconds.
     pub t: Vec<i64>,
@@ -40,6 +42,7 @@ pub struct MetricSeries {
 
 /// A restart, crash or OOM kill.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MetricEventResponse {
     /// Unix seconds.
     pub t: i64,
@@ -50,6 +53,7 @@ pub struct MetricEventResponse {
 
 /// The most recent sample (not averaged).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MetricCurrentResponse {
     pub t: i64,
     pub cpu: f64,
@@ -63,6 +67,7 @@ pub struct MetricCurrentResponse {
 
 /// Response of the metrics endpoints.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MetricsResponse {
     pub range: String,
     /// Bucket width in seconds.
@@ -80,8 +85,9 @@ pub struct MetricsResponse {
 // ── SystemMetrics (host-level snapshot, not persisted) ──
 
 /// Point-in-time snapshot of host-level system resources, sampled by the
-/// metrics collector every tick. Returned by `GET /api/system/metrics`.
+/// metrics collector every tick. Returned by `GET /api/v1/system/metrics`.
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SystemMetrics {
     /// Host CPU usage as a percentage of all cores (0.0 – 100.0)
     pub cpu_percent: f64,
@@ -118,6 +124,7 @@ pub struct SystemMetrics {
 /// API token, the root-only local socket) or is `system` for background work;
 /// it is never taken from a client-supplied field.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AuditLog {
     /// Position in the chain (1, 2, 3, … with no gaps).
     pub seq: i64,
@@ -149,6 +156,7 @@ pub struct AuditLog {
 
 /// API response for an audit log entry.
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AuditLogResponse {
     pub seq: i64,
     pub created_at: String,
@@ -183,8 +191,9 @@ impl From<AuditLog> for AuditLogResponse {
     }
 }
 
-/// One page of GET /api/audit-log.
+/// One page of GET /api/v1/audit-log.
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AuditLogPage {
     pub entries: Vec<AuditLogResponse>,
     /// Pass as `before` to get the next (older) page; None on the last page.
@@ -193,6 +202,7 @@ pub struct AuditLogPage {
 
 /// Result of verifying the audit log's hash chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AuditVerifyReport {
     pub ok: bool,
     /// Entries checked.

@@ -15,20 +15,20 @@
 // Handler summary:
 //
 //   health()            GET  /health              — liveness probe, no auth
-//   list_apps()         GET  /api/apps             — all apps ordered by created_at
-//   get_app()           GET  /api/apps/{id}        — single app by ID or name
-//   create_app()        POST /api/apps             — validate name, insert, 409 on duplicate
-//   delete_app()        DEL  /api/apps/{id}        — remove container (best-effort) then DB row
-//   deploy_app()        POST /api/apps/{id}/deploy — spawns background deploy task, returns 202
-//   stop_app()          POST /api/apps/{id}/stop   — Docker stop + set status=stopped
-//   start_app()         POST /api/apps/{id}/start  — Docker start + set status=running
-//   restart_app()       POST /api/apps/{id}/restart— sequential stop+start
-//   app_logs()          GET  /api/apps/{id}/logs   — last 50 deploy_logs + 100 container lines
+//   list_apps()         GET  /api/v1/apps             — all apps ordered by created_at
+//   get_app()           GET  /api/v1/apps/{id}        — single app by ID or name
+//   create_app()        POST /api/v1/apps             — validate name, insert, 409 on duplicate
+//   delete_app()        DEL  /api/v1/apps/{id}        — remove container (best-effort) then DB row
+//   deploy_app()        POST /api/v1/apps/{id}/deploy — spawns background deploy task, returns 202
+//   stop_app()          POST /api/v1/apps/{id}/stop   — Docker stop + set status=stopped
+//   start_app()         POST /api/v1/apps/{id}/start  — Docker start + set status=running
+//   restart_app()       POST /api/v1/apps/{id}/restart— sequential stop+start
+//   app_logs()          GET  /api/v1/apps/{id}/logs   — last 50 deploy_logs + 100 container lines
 //   (env vars live in handlers/env.rs: masked GET, PATCH, per-key reveal)
-//   update_domain()     PUT  /api/apps/{id}/domain — set domain, upsert 'pending' cert record
-//   update_port()       PUT  /api/apps/{id}/port   — container port (next deploy)
+//   update_domain()     PUT  /api/v1/apps/{id}/domain — set domain, upsert 'pending' cert record
+//   update_port()       PUT  /api/v1/apps/{id}/port   — container port (next deploy)
 //   (certificates live in handlers/certificates.rs)
-//   upload_deploy()     POST /api/apps/{id}/upload — accept .tar.gz, extract, build,
+//   upload_deploy()     POST /api/v1/apps/{id}/upload — accept .tar.gz, extract, build,
 //                                                    then deploy — all in background, returns 202
 //
 // Deploy flow for git source (triggered by deploy_app or upload_deploy):
@@ -156,6 +156,7 @@ async fn fetch_app(db: &sqlx::SqlitePool, id_or_name: &str) -> Result<App, AppEr
 // name-based lookup. When present, returns only the matching app (or 404).
 
 #[derive(Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ListAppsQuery {
     pub name: Option<String>,
 }
@@ -245,8 +246,9 @@ pub async fn create_app(
 
     // Validate name (alphanumeric + hyphens)
     if !req.name.chars().all(|c| c.is_alphanumeric() || c == '-') {
-        return Err(AppError(TondError::InvalidInput(
-            "App name must be alphanumeric (hyphens allowed)".to_string(),
+        return Err(AppError(TondError::invalid_field(
+            "name",
+            "App name must be alphanumeric (hyphens allowed)",
         )));
     }
 
@@ -255,8 +257,9 @@ pub async fn create_app(
         req.source_type.as_str(),
         "git" | "image" | "tarball" | "dockerfile" | "compose"
     ) {
-        return Err(AppError(TondError::InvalidInput(
-            "source_type must be one of: git, image, tarball, dockerfile, compose".to_string(),
+        return Err(AppError(TondError::invalid_field(
+            "source_type",
+            "source_type must be one of: git, image, tarball, dockerfile, compose",
         )));
     }
 
@@ -269,8 +272,9 @@ pub async fn create_app(
             .trim()
             .is_empty()
     {
-        return Err(AppError(TondError::InvalidInput(
-            "dockerfile_content is required when source_type is 'dockerfile'".to_string(),
+        return Err(AppError(TondError::invalid_field(
+            "dockerfile_content",
+            "dockerfile_content is required when source_type is 'dockerfile'",
         )));
     }
     if req.source_type == "compose"
@@ -281,8 +285,9 @@ pub async fn create_app(
             .trim()
             .is_empty()
     {
-        return Err(AppError(TondError::InvalidInput(
-            "compose_content is required when source_type is 'compose'".to_string(),
+        return Err(AppError(TondError::invalid_field(
+            "compose_content",
+            "compose_content is required when source_type is 'compose'",
         )));
     }
     // Reject host-level compose options up front (privileged, host binds, …) so
@@ -292,9 +297,10 @@ pub async fn create_app(
     {
         let volume_dir = volumes::app_volume_dir(&volumes::data_dir(), &req.name);
         compose_policy::validate(content, &volume_dir).map_err(|errors| {
-            AppError(TondError::InvalidInput(compose_policy::format_errors(
-                &errors,
-            )))
+            AppError(TondError::invalid_field(
+                "compose_content",
+                compose_policy::format_errors(&errors),
+            ))
         })?;
     }
 
@@ -302,8 +308,9 @@ pub async fn create_app(
     if let Some(build_method) = requested_build_method.as_deref()
         && !matches!(build_method, "dockerfile" | "tbuild")
     {
-        return Err(AppError(TondError::InvalidInput(
-            "build_method must be one of: tbuild, dockerfile".to_string(),
+        return Err(AppError(TondError::invalid_field(
+            "build_method",
+            "build_method must be one of: tbuild, dockerfile",
         )));
     }
 
@@ -312,18 +319,18 @@ pub async fn create_app(
             if let Some(build_method) = requested_build_method.as_deref()
                 && build_method != "dockerfile"
             {
-                return Err(AppError(TondError::InvalidInput(
-                    "build_method must be 'dockerfile' when source_type is 'dockerfile'"
-                        .to_string(),
+                return Err(AppError(TondError::invalid_field(
+                    "build_method",
+                    "build_method must be 'dockerfile' when source_type is 'dockerfile'",
                 )));
             }
         }
         "git" | "tarball" => {}
         _ => {
             if requested_build_method.is_some() {
-                return Err(AppError(TondError::InvalidInput(
-                    "build_method is only supported for git, tarball, and dockerfile sources"
-                        .to_string(),
+                return Err(AppError(TondError::invalid_field(
+                    "build_method",
+                    "build_method is only supported for git, tarball, and dockerfile sources",
                 )));
             }
         }
@@ -503,10 +510,11 @@ pub async fn create_app(
 
 // ── Validate Compose ──
 //
-// POST /api/compose/validate — lets the dashboard show compose policy problems
+// POST /api/v1/compose/validate — lets the dashboard show compose policy problems
 // under the editor while the user types, before they create the app.
 
 #[derive(Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ValidateComposeRequest {
     /// App name, used to show where bind mounts will be stored (default "app")
     pub app_name: Option<String>,
@@ -599,7 +607,7 @@ pub(crate) fn deployment_started(
     message: &str,
     app_id: &str,
     queued: &deploy::queue::Enqueued,
-) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+) -> (StatusCode, Json<ApiResponse<QueuedDeploymentResponse>>) {
     (
         StatusCode::ACCEPTED,
         Json(ApiResponse::ok(queued_response(message, app_id, queued))),
@@ -635,23 +643,50 @@ pub async fn deploy_app(
 }
 
 /// Body of a 202 answer to a queued deployment (deploy/queue.rs).
+#[derive(Debug, Clone, serde::Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct QueuedDeploymentResponse {
+    /// Human summary, with the place in line when it waits.
+    pub message: String,
+    pub app_id: String,
+    /// Follow it at /api/v1/apps/{app_id}/deployments/{deployment_id}(/stream).
+    pub deployment_id: String,
+    /// `queued` (waits for a build slot or the app's running deploy).
+    pub status: String,
+    /// 1-based place in line.
+    pub queue_position: usize,
+    /// The waiting deployment this one replaced, if any.
+    pub superseded: Option<String>,
+    /// Rollbacks: the image being redeployed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_tag: Option<String>,
+    /// Rollbacks: the deployment whose image is redeployed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_deployment_id: Option<String>,
+}
+
 pub(crate) fn queued_response(
     message: &str,
     app_id: &str,
     queued: &deploy::queue::Enqueued,
-) -> serde_json::Value {
-    json!({
-        "message": if queued.queue_position > 1 {
-            format!("{message} (position {} in the queue)", queued.queue_position)
+) -> QueuedDeploymentResponse {
+    QueuedDeploymentResponse {
+        message: if queued.queue_position > 1 {
+            format!(
+                "{message} (position {} in the queue)",
+                queued.queue_position
+            )
         } else {
             message.to_string()
         },
-        "app_id": app_id,
-        "deployment_id": queued.deployment_id,
-        "status": queued.status,
-        "queue_position": queued.queue_position,
-        "superseded": queued.superseded,
-    })
+        app_id: app_id.to_string(),
+        deployment_id: queued.deployment_id.clone(),
+        status: queued.status.to_string(),
+        queue_position: queued.queue_position,
+        superseded: queued.superseded.clone(),
+        image_tag: None,
+        target_deployment_id: None,
+    }
 }
 
 // ── Stop App ──
@@ -1208,8 +1243,9 @@ pub(crate) fn apply_readiness(
     Ok(())
 }
 
-/// PUT /api/apps/{id}/readiness body.
+/// PUT /api/v1/apps/{id}/readiness body.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct UpdateReadinessRequest {
     /// "http" | "tcp" | "none"
     pub readiness: String,
@@ -1217,7 +1253,7 @@ pub struct UpdateReadinessRequest {
     pub ready_after_secs: Option<i64>,
 }
 
-// PUT /api/apps/{id}/readiness
+// PUT /api/v1/apps/{id}/readiness
 // How deploys decide the new container is ready. Switching to a background
 // worker ("none") removes the app's domain and health check path: a worker
 // serves no traffic and is never routed. Takes effect on the next deploy.
@@ -1278,11 +1314,12 @@ pub async fn update_readiness(
 
 // ── Update Container Port ──
 //
-// PUT /api/apps/{id}/port  { "container_port": 80 }
+// PUT /api/v1/apps/{id}/port  { "container_port": 80 }
 // The port the app listens on inside its container (also passed as $PORT).
 // Takes effect on the next deploy.
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct UpdatePortRequest {
     pub container_port: i64,
 }
@@ -1393,7 +1430,7 @@ pub async fn upload_deploy(
 
 // ── Assign / Remove Project ──
 //
-// PUT /api/apps/{id}/project
+// PUT /api/v1/apps/{id}/project
 //   { "project_id": "<uuid>" }  — assign app to project
 //   { "project_id": null }      — remove app from project
 

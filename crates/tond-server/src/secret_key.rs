@@ -80,6 +80,9 @@ pub enum Purpose {
     AuditWebhookSecret,
     /// dns_providers.token_enc (DNS API token / Route 53 secret key)
     DnsProviderToken,
+    /// idempotency_keys.response (a stored response can hold a new token or
+    /// database password). A cache: key rotation drops it instead.
+    IdempotentResponse,
 }
 
 impl Purpose {
@@ -105,6 +108,7 @@ impl Purpose {
             Purpose::HeartbeatUrl => b"tond:heartbeat_config.url_enc",
             Purpose::AuditWebhookSecret => b"tond:audit_shipping.webhook_secret",
             Purpose::DnsProviderToken => b"tond:dns_providers.token_enc",
+            Purpose::IdempotentResponse => b"tond:idempotency_keys.response",
         }
     }
 }
@@ -454,6 +458,12 @@ pub async fn reencrypt_stored_secrets(
             }
         }
     }
+
+    // Stored idempotent responses are a 24 h cache: drop them rather than
+    // re-encrypt (a retry then simply runs again).
+    sqlx::query("DELETE FROM idempotency_keys")
+        .execute(&mut *tx)
+        .await?;
 
     tx.commit().await?;
     Ok(report)

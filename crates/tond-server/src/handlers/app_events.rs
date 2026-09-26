@@ -1,6 +1,6 @@
 // handlers/app_events.rs — one timeline of what happened to an app
 //
-//   list_app_events()  GET /api/apps/{id}/events?limit=50&before=<RFC 3339>
+//   list_app_events()  GET /api/v1/apps/{id}/events?limit=50&before=<RFC 3339>
 //
 // Built on request from the tables that already hold each fact, newest first:
 //
@@ -92,6 +92,7 @@ const AUDIT_ACTIONS: &[(&str, AppEventKind, &str)] = &[
 ];
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct EventsQuery {
     pub limit: Option<i64>,
     pub before: Option<String>,
