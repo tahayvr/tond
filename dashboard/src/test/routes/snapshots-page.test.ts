@@ -47,6 +47,9 @@ const fullSnapshot: Snapshot = {
 	remote_key: null,
 	storage_provider_id: null,
 	checksum_sha256: null,
+	remote_status: null,
+	remote_error: null,
+	archive_bytes: null,
 	error_message: null,
 	notes: null,
 	created_at: '2026-01-01T00:00:00.000Z'
@@ -68,6 +71,9 @@ const preDeploySnapshot: Snapshot = {
 	remote_key: null,
 	storage_provider_id: null,
 	checksum_sha256: null,
+	remote_status: null,
+	remote_error: null,
+	archive_bytes: null,
 	error_message: null,
 	notes: null,
 	created_at: '2026-01-01T01:00:00.000Z'

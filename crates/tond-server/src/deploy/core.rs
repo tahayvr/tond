@@ -39,7 +39,7 @@
 //   pull_image()               — stream a docker pull with bollard
 
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use tond_common::{App, DeployFailure, DeployPhase, PreviewDeployment, Volume};
 use uuid::Uuid;
 
@@ -48,7 +48,9 @@ use crate::backup::{self, SnapshotTrigger};
 use crate::docker;
 use crate::handlers::{github_apps, gitlab_tokens};
 use crate::log_bus::{self, DeployLogEvent};
+use crate::log_scrub;
 use crate::secret_key::{self, Purpose};
+use crate::secrets;
 use crate::state::AppState;
 use crate::volumes;
 
@@ -164,18 +166,15 @@ fn auto_domain(base_domain: &str, app_name: &str) -> String {
 }
 
 fn preview_env_vars(
-    base_env: &str,
+    base_env: BTreeMap<String, String>,
     excluded_keys_json: &str,
-    preview_overrides_json: &str,
+    preview_overrides: BTreeMap<String, String>,
 ) -> HashMap<String, String> {
-    let mut env_vars: HashMap<String, String> = serde_json::from_str(base_env).unwrap_or_default();
+    let mut env_vars: HashMap<String, String> = base_env.into_iter().collect();
     let excluded_keys: Vec<String> = serde_json::from_str(excluded_keys_json).unwrap_or_default();
     for key in &excluded_keys {
         env_vars.remove(key);
     }
-
-    let preview_overrides: HashMap<String, String> =
-        serde_json::from_str(preview_overrides_json).unwrap_or_default();
     env_vars.extend(preview_overrides);
     env_vars
 }
@@ -314,7 +313,7 @@ pub async fn run(
             let error = format!("{e:#}");
             let recent = progress::recent_lines(&app_id);
             let phase = progress::current_phase(&app_id);
-            let failure = failure::classify(&FailureContext {
+            let mut failure = failure::classify(&FailureContext {
                 phase: facts.probe.as_ref().map(|_| DeployPhase::Health).or(phase),
                 error: &error,
                 recent_lines: &recent,
@@ -327,6 +326,13 @@ pub async fn run(
                 memory_limit: app.memory_limit,
                 has_registry_credential: app.registry_credential_id.is_some(),
             });
+            // The excerpt may quote the app's own output: keep its secrets out.
+            for line in failure.excerpt.iter_mut() {
+                *line = log_scrub::scrub_for_app(&state.db, &app_id, line).await;
+            }
+            if let Some(detail) = failure.detail.as_mut() {
+                *detail = log_scrub::scrub_for_app(&state.db, &app_id, detail).await;
+            }
             let _ = log_deploy(
                 state,
                 &app_id,
@@ -562,12 +568,8 @@ async fn pipeline(
     let new_host_port = docker::find_free_port(&state.docker, 8100).await?;
     let container_port = app.container_port as u16;
 
-    // Parse env vars (production deploy — no preview filtering)
-    let env_vars: HashMap<String, String> = app
-        .env_vars
-        .as_ref()
-        .and_then(|e| serde_json::from_str(e).ok())
-        .unwrap_or_default();
+    // Decrypt env vars (production deploy — no preview filtering)
+    let env_vars: HashMap<String, String> = secrets::app_env(app)?.into_iter().collect();
 
     // Host paths are re-derived from volume names and verified to stay inside
     // <data>/volumes/<app> (no symlink escapes) right before the mount.
@@ -1111,9 +1113,9 @@ pub async fn deploy_preview(
     let container_port = app.container_port as u16;
 
     let env_vars = preview_env_vars(
-        app.env_vars.as_deref().unwrap_or("{}"),
+        secrets::app_env(app)?,
         app.preview_excluded_keys.as_str(),
-        app.preview_env_vars.as_str(),
+        secrets::app_preview_env(app)?,
     );
 
     // Host paths are re-derived from volume names and verified to stay inside
@@ -1482,8 +1484,8 @@ pub(super) async fn log_deploy(
     trigger_source: &str,
     message: &str,
 ) -> Result<()> {
-    let redacted = redact_url_credentials(message);
-    let message = redacted.as_str();
+    let scrubbed = log_scrub::scrub_for_app(&state.db, app_id, message).await;
+    let message = scrubbed.as_str();
     let id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
     // Preview builds share the app id but are not part of its deployment.
@@ -1708,10 +1710,20 @@ mod tests {
 
     #[test]
     fn preview_env_vars_removes_excluded_keys_and_applies_overrides() {
+        let map = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
         let env = preview_env_vars(
-            r#"{"DATABASE_URL":"prod","PUBLIC_FLAG":"1","KEEP":"yes"}"#,
+            map(&[
+                ("DATABASE_URL", "prod"),
+                ("PUBLIC_FLAG", "1"),
+                ("KEEP", "yes"),
+            ]),
             r#"["DATABASE_URL","MISSING"]"#,
-            r#"{"PUBLIC_FLAG":"preview","NEW_KEY":"value"}"#,
+            map(&[("PUBLIC_FLAG", "preview"), ("NEW_KEY", "value")]),
         );
 
         assert_eq!(

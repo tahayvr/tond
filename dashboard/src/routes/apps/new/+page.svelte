@@ -10,8 +10,8 @@
 		deleteProject,
 		deployApp,
 		getSystemMetrics,
+		type DatabaseCredentials,
 		type DeployStarted,
-		type ManagedDatabaseDetail,
 		type Project,
 		type RegistryCredential,
 		type TemplateCatalogEntry,
@@ -381,7 +381,9 @@
 			}
 
 			if (selectedTemplate) {
-				const dependencyDetails = new SvelteMap<string, ManagedDatabaseDetail>();
+				// Creation returns the generated credentials once; the template
+				// interpolates the plaintext connection strings into the app env.
+				const dependencyDetails = new SvelteMap<string, DatabaseCredentials>();
 				for (const dependency of selectedTemplate.dependencies) {
 					if (dependency.kind !== 'database' || !dependency.name || !dependency.engine) continue;
 					createStage = `Creating database ${dependency.name}…`;
@@ -393,7 +395,7 @@
 							: {})
 					});
 					created.push({ kind: 'database', id: database.id, name: database.name });
-					dependencyDetails.set(dependency.name, database);
+					dependencyDetails.set(dependency.name, database.credentials);
 				}
 
 				for (const env of selectedTemplate.required_env) {
@@ -496,7 +498,7 @@
 
 	function interpolateTemplateValue(
 		value: string,
-		dependencies: Pick<SvelteMap<string, ManagedDatabaseDetail>, 'get'>
+		dependencies: Pick<SvelteMap<string, DatabaseCredentials>, 'get'>
 	): string {
 		if (!value.startsWith('${db.') || !value.endsWith('}')) {
 			return value;

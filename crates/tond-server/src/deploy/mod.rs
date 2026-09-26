@@ -26,4 +26,4 @@ pub use core::{
     DeployKind, DeployRequest, create, deploy_preview, fetch_registry_credentials, pull_image, run,
     start,
 };
-pub use git::GitHttpAuth;
+pub use git::{GitHttpAuth, redact_url_credentials};

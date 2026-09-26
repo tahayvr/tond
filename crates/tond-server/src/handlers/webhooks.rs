@@ -53,6 +53,7 @@ use crate::{
     domains::preview_host,
     error::AppError,
     handlers::{github_apps, gitlab_tokens},
+    secrets,
     state::AppState,
 };
 
@@ -396,9 +397,13 @@ async fn authenticate_webhook(
     body: &[u8],
 ) -> Result<Result<App, Response>, AppError> {
     let app = fetch_app_for_webhook(&state.db, app_id).await?;
-    let secret = app.webhook_secret.as_deref().unwrap_or("");
+    // A secret that cannot be decrypted verifies nothing (fail closed).
+    let secret = secrets::app_webhook_secret(&app)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
 
-    if !verify_request(provider, headers, body, secret) {
+    if !verify_request(provider, headers, body, &secret) {
         tracing::warn!(
             "[webhook/{}/{}] rejected: missing or invalid signature",
             provider.as_str(),
@@ -929,8 +934,9 @@ async fn find_signing_github_app(
     };
 
     Ok(candidates.into_iter().find(|gh_app| {
-        !gh_app.webhook_secret.is_empty()
-            && verify_github_signature(signature, body, &gh_app.webhook_secret)
+        secrets::github_webhook_secret(gh_app).is_ok_and(|secret| {
+            !secret.is_empty() && verify_github_signature(signature, body, &secret)
+        })
     }))
 }
 
@@ -1453,7 +1459,10 @@ mod tests {
         .bind(&app.branch)
         .bind(app.container_port)
         .bind(&app.status)
-        .bind(&app.webhook_secret)
+        .bind(
+            crate::secrets::seal_webhook_secret(&secret_of(&app))
+                .unwrap_or_else(|err| panic!("seal: {err}")),
+        )
         .bind(&app.created_at)
         .bind(&app.updated_at)
         .execute(&state.db)
@@ -2035,13 +2044,17 @@ mod tests {
     // ── GitHub App events ──
 
     async fn seed_github_app(state: &AppState, id: &str, app_id: i64, secret: &str) {
+        let sealed = crate::secrets::seal_github_credentials("csecret", secret, "pem")
+            .unwrap_or_else(|err| panic!("seal: {err}"));
         sqlx::query(
             "INSERT INTO github_apps (id, name, app_id, client_id, client_secret, webhook_secret, private_key, slug)
-             VALUES (?, 'gh', ?, 'cid', 'csecret', ?, 'pem', 'slug')",
+             VALUES (?, 'gh', ?, 'cid', ?, ?, ?, 'slug')",
         )
         .bind(id)
         .bind(app_id)
-        .bind(secret)
+        .bind(sealed.0)
+        .bind(sealed.1)
+        .bind(sealed.2)
         .execute(&state.db)
         .await
         .unwrap_or_else(|err| panic!("failed to seed GitHub App: {err}"));

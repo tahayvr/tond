@@ -50,7 +50,8 @@ import {
 	MOCK_PREVIEW_ENV_VARS,
 	MOCK_CERTIFICATES,
 	makeMockSystemMetrics,
-	makeMockMetrics
+	makeMockMetrics,
+	MOCK_DATABASE_SECRETS
 } from './fixtures';
 import type {
 	AlertRule,
@@ -77,7 +78,9 @@ import type {
 	ProjectPreview,
 	RegistryCredential,
 	Snapshot,
-	StorageProvider
+	StorageProvider,
+	EnvVarEntry,
+	DatabaseCredentials
 } from '$lib/api';
 import { MOCK_ALERT_RULES } from './fixtures';
 
@@ -201,13 +204,13 @@ function mockComposeProblems(content: string): string[] {
 	return problems;
 }
 
-/** Public connection string (only when public access is on). */
-function mockPublicUrl(db: ManagedDatabase): string | null {
+/** Public connection string (only when public access is on), plaintext. */
+function mockPublicUrl(db: ManagedDatabase, password: string | null): string | null {
 	if (!db.public_access || !db.host_port) return null;
 	const isRedisLike = db.db_type === 'redis' || db.db_type === 'keydb';
 	return isRedisLike
-		? `redis://${db.db_user}:${db.db_password}@tond.example.com:${db.host_port}`
-		: `${db.db_type}://${db.db_user}:${db.db_password}@tond.example.com:${db.host_port}/${db.db_name}`;
+		? `redis://${db.db_user}:${password}@tond.example.com:${db.host_port}`
+		: `${db.db_type}://${db.db_user}:${password}@tond.example.com:${db.host_port}/${db.db_name}`;
 }
 
 // Mirrors tond-server's domains.rs: previews need a preview domain on a different
@@ -305,6 +308,122 @@ let githubApps: GitHubApp[] = structuredClone(MOCK_GITHUB_APPS);
 // Per-app webhook secrets (the real server generates one at app creation).
 const webhookSecrets: Record<string, string> = {};
 
+// Stored secrets live beside the rows, like the server's encrypted columns:
+// responses only ever carry masked values or `has_*` flags.
+const ENV_MASK = '••••••••';
+
+function urlHost(url: string): string | null {
+	try {
+		return new URL(url).host || null;
+	} catch {
+		return null;
+	}
+}
+
+/** Mirrors tond_common::mask_url_password. */
+function maskUrlPassword(url: string): string {
+	return url.replace(/(:\/\/[^:/@\s]+):[^/\s]+@/g, `$1:${ENV_MASK}@`);
+}
+
+const INTEGRATION_SECRET_FIELDS = ['bot_token', 'webhook_url', 'smtp_password'] as const;
+const integrationSecrets: Record<string, Record<string, string>> = {};
+
+/** Split a submitted integration config into its plain part and saved secrets. */
+function storeIntegrationConfig(
+	id: string,
+	config: Record<string, unknown>
+): { config: Integration['config']; saved_secrets: string[] } {
+	const saved = (integrationSecrets[id] ??= {});
+	const plain: Record<string, unknown> = { ...config };
+	for (const field of INTEGRATION_SECRET_FIELDS) {
+		const value = plain[field];
+		delete plain[field];
+		if (typeof value === 'string' && value.trim()) saved[field] = value.trim();
+	}
+	return {
+		config: plain as unknown as Integration['config'],
+		saved_secrets: INTEGRATION_SECRET_FIELDS.filter((f) => saved[f])
+	};
+}
+
+const cronEnv: Record<string, Record<string, string>> = Object.fromEntries(
+	cronJobs.map((job) => [job.id, Object.fromEntries(job.env.map((e) => [e.key, 'mock-value']))])
+);
+const projectEnv: Record<string, Record<string, string>> = {};
+
+// Managed database secrets, stored beside the rows (see MOCK_DATABASE_SECRETS).
+const dbSecrets: Record<string, { db_password: string | null; root_password: string | null }> =
+	structuredClone(MOCK_DATABASE_SECRETS);
+/** Plaintext connection-string overrides (rows carry the masked form). */
+const dbCustomUrls: Record<string, { external: string | null; internal: string | null }> = {};
+
+/** Plaintext connection strings, as the credentials reveal returns them. */
+function dbCredentials(db: ManagedDatabase): DatabaseCredentials {
+	const password = dbSecrets[db.id]?.db_password ?? null;
+	const isRedisLike = db.db_type === 'redis' || db.db_type === 'keydb';
+	const port = db.db_type === 'mysql' || db.db_type === 'mariadb' ? 3306 : 5432;
+	const auth = db.db_user && password ? `${db.db_user}:${password}@` : '';
+	const computedExternal = db.host_port
+		? isRedisLike
+			? `redis://${auth}localhost:${db.host_port}`
+			: `${db.db_type}://${auth}localhost:${db.host_port}/${db.db_name}`
+		: null;
+	const computedInternal = db.project_id
+		? isRedisLike
+			? `redis://${auth}tond-db-${db.name}:6379`
+			: `${db.db_type}://${auth}tond-db-${db.name}:${port}/${db.db_name}`
+		: null;
+	const custom = dbCustomUrls[db.id];
+	return {
+		db_user: db.db_user,
+		db_password: password,
+		root_password: dbSecrets[db.id]?.root_password ?? null,
+		connection_string: custom?.external ?? computedExternal,
+		public_connection_string: mockPublicUrl(db, password),
+		internal_connection_string: custom?.internal ?? computedInternal
+	};
+}
+
+/** A database detail response: connection strings with the password masked. */
+function dbDetail(db: ManagedDatabase) {
+	const creds = dbCredentials(db);
+	const mask = (url: string | null) => (url ? maskUrlPassword(url) : null);
+	return {
+		...db,
+		connection_string: mask(creds.connection_string),
+		public_connection_string: mask(creds.public_connection_string),
+		internal_connection_string: mask(creds.internal_connection_string)
+	};
+}
+
+function mockDatabaseSnapshot(dbName: string, trigger: 'manual' | 'pre_restore'): Snapshot {
+	const now = new Date().toISOString();
+	const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
+	return {
+		id: `snap_${trigger}_${Date.now()}`,
+		name: trigger === 'manual' ? `${dbName} ${stamp}` : `pre-restore ${dbName} ${stamp}`,
+		status: 'completed',
+		trigger,
+		scope: `database:${dbName}`,
+		trigger_app: null,
+		deployment_id: null,
+		parent_snapshot_id: null,
+		created_at: now,
+		completed_at: now,
+		delta_bytes: 3_145_728,
+		total_bytes: 3_145_728,
+		local_path: `/opt/tond/data/backups/snapshots/snap_${Date.now()}`,
+		remote_key: null,
+		storage_provider_id: null,
+		checksum_sha256: null,
+		error_message: null,
+		notes: null,
+		remote_status: backupConfig.storage_provider_id ? 'uploading' : null,
+		remote_error: null,
+		archive_bytes: null
+	};
+}
+
 function randomHex(bytes: number): string {
 	const buf = new Uint8Array(bytes);
 	crypto.getRandomValues(buf);
@@ -332,7 +451,7 @@ function webhookConfig(app: App) {
 		app_id: app.id,
 		paths,
 		urls,
-		secret: webhookSecrets[app.id],
+		has_secret: true,
 		auto_deploy: app.auto_deploy,
 		watch_branch: app.watch_branch
 	};
@@ -358,7 +477,7 @@ function previewStore(appId: string) {
 	return (previewEnvVars[appId] ??= {});
 }
 
-function maskedEntries(vars: Record<string, string>) {
+function maskedEntries(vars: Record<string, string>): EnvVarEntry[] {
 	return Object.keys(vars)
 		.sort()
 		.map((key) => ({ key, masked: vars[key] ? '••••••••' : '' }));
@@ -1346,11 +1465,13 @@ export const handlers = [
 			description?: string;
 			env_vars?: Record<string, string>;
 		};
+		const newProjectId = `proj_${Date.now()}`;
+		projectEnv[newProjectId] = body.env_vars ?? {};
 		const newProject: Project = {
-			id: `proj_${Date.now()}`,
+			id: newProjectId,
 			name: body.name,
 			description: body.description ?? null,
-			env_vars: body.env_vars ?? {},
+			env: maskedEntries(body.env_vars ?? {}),
 			active_preview_count: 0,
 			created_at: new Date().toISOString(),
 			updated_at: new Date().toISOString()
@@ -1371,10 +1492,16 @@ export const handlers = [
 		await delay(LATENCY);
 		const idx = projects.findIndex((p) => p.id === params.id || p.name === params.id);
 		if (idx === -1) return err('Project not found', 404);
-		const body = (await request.json()) as Partial<
-			Pick<Project, 'name' | 'description' | 'env_vars'>
+		const { env_vars, ...body } = (await request.json()) as Partial<
+			Pick<Project, 'name' | 'description'> & { env_vars: Record<string, string> }
 		>;
-		projects[idx] = { ...projects[idx], ...body, updated_at: new Date().toISOString() };
+		if (env_vars) projectEnv[projects[idx].id] = env_vars;
+		projects[idx] = {
+			...projects[idx],
+			...body,
+			...(env_vars && { env: maskedEntries(env_vars) }),
+			updated_at: new Date().toISOString()
+		};
 		return ok(projects[idx]);
 	}),
 
@@ -1900,12 +2027,20 @@ export const handlers = [
 		return ok(webhookConfig(app));
 	}),
 
+	http.get('/api/apps/:id/webhook-secret', async ({ params }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
+		if (!app) return err('App not found', 404);
+		webhookConfig(app);
+		return ok({ secret: webhookSecrets[app.id] });
+	}),
+
 	http.post('/api/apps/:id/webhook-secret/rotate', async ({ params }) => {
 		await delay(LATENCY);
 		const app = apps.find((a) => a.id === params.id || a.name === params.id);
 		if (!app) return err('App not found', 404);
 		webhookSecrets[app.id] = randomHex(32);
-		return ok(webhookConfig(app));
+		return ok({ secret: webhookSecrets[app.id] });
 	}),
 
 	http.put('/api/apps/:id/auto-deploy', async ({ params, request }) => {
@@ -2240,8 +2375,14 @@ export const handlers = [
 		await delay(LATENCY);
 		const body = (await request.json()) as Omit<
 			AlertRule,
-			'id' | 'enabled' | 'last_fired_at' | 'created_at' | 'updated_at'
-		>;
+			| 'id'
+			| 'enabled'
+			| 'last_fired_at'
+			| 'created_at'
+			| 'updated_at'
+			| 'has_webhook_url'
+			| 'webhook_host'
+		> & { webhook_url?: string };
 		const validMetrics = ['cpu', 'memory', 'app_down', 'disk_usage'];
 		const validEvents = [
 			'deployment_success',
@@ -2268,7 +2409,8 @@ export const handlers = [
 			name: body.name,
 			metric: body.metric ?? null,
 			threshold: body.threshold ?? 0,
-			webhook_url: body.webhook_url,
+			has_webhook_url: !!body.webhook_url?.trim(),
+			webhook_host: urlHost(body.webhook_url?.trim() ?? ''),
 			enabled: true,
 			events: body.events ?? [],
 			last_fired_at: null,
@@ -2283,9 +2425,18 @@ export const handlers = [
 		await delay(LATENCY);
 		const idx = alertRules.findIndex((r) => r.id === params.id);
 		if (idx === -1) return err('Alert rule not found', 404);
-		const body = (await request.json()) as Partial<
-			Pick<AlertRule, 'name' | 'metric' | 'threshold' | 'webhook_url' | 'enabled' | 'events'>
+		const { webhook_url, ...body } = (await request.json()) as Partial<
+			Pick<AlertRule, 'name' | 'metric' | 'threshold' | 'enabled' | 'events'> & {
+				webhook_url: string;
+			}
 		>;
+		if (webhook_url !== undefined) {
+			alertRules[idx] = {
+				...alertRules[idx],
+				has_webhook_url: !!webhook_url.trim(),
+				webhook_host: urlHost(webhook_url.trim())
+			};
+		}
 		if (body.metric) {
 			const validMetrics = ['cpu', 'memory', 'app_down', 'disk_usage'];
 			if (!validMetrics.includes(body.metric)) {
@@ -2400,6 +2551,9 @@ export const handlers = [
 	}),
 
 	// ── Managed Databases (Phase 6.3) ─────────────────────────────────────────
+	// Passwords and connection-string overrides are write-only, like the
+	// server: responses carry has_password flags and masked strings, and the
+	// plaintext comes only from the (audited) credentials reveal.
 
 	http.get('/api/databases', async () => {
 		await delay(LATENCY);
@@ -2434,8 +2588,8 @@ export const handlers = [
 			status: 'running',
 			db_name: isRedisLike ? null : body.name.replace(/-/g, '_'),
 			db_user: isRedisLike ? 'default' : body.name.replace(/-/g, '_') + '_user',
-			db_password: 'mock_password_new',
-			root_password: isMysqlLike ? 'mock_root_password_new' : null,
+			has_password: true,
+			has_root_password: isMysqlLike,
 			memory_limit: body.memory_limit ?? null,
 			custom_external_url: null,
 			custom_internal_url: null,
@@ -2445,44 +2599,46 @@ export const handlers = [
 			updated_at: new Date().toISOString(),
 			public_access: body.public_access ?? false
 		};
+		dbSecrets[newDb.id] = {
+			db_password: randomHex(12),
+			root_password: isMysqlLike ? randomHex(12) : null
+		};
 		databases = [...databases, newDb];
-		const newDbUser = newDb.db_user!;
-		const newDbPass = newDb.db_password!;
-		const newConnectionString = isRedisLike
-			? `redis://${newDbUser}:${newDbPass}@localhost:${newDb.host_port}`
-			: `${body.db_type}://${newDbUser}:${newDbPass}@localhost:${newDb.host_port}/${newDb.db_name}`;
-		return ok({
-			...newDb,
-			connection_string: newConnectionString,
-			public_connection_string: mockPublicUrl(newDb),
-			internal_connection_string: null
-		});
+		// The creator gets the generated credentials once.
+		return ok({ ...dbDetail(newDb), credentials: dbCredentials(newDb) });
 	}),
 
 	http.get('/api/databases/:id', async ({ params }) => {
 		await delay(LATENCY);
 		const db = databases.find((d) => d.id === params.id || d.name === params.id);
 		if (!db) return err('Database not found', 404);
-		const isRedisLike = db.db_type === 'redis' || db.db_type === 'keydb';
-		const redisPort = 6379;
-		const computedExternal = db.host_port
-			? isRedisLike
-				? db.db_user && db.db_password
-					? `redis://${db.db_user}:${db.db_password}@localhost:${db.host_port}`
-					: `redis://localhost:${db.host_port}`
-				: `${db.db_type}://${db.db_user}:${db.db_password}@localhost:${db.host_port}/${db.db_name}`
-			: null;
-		const computedInternal = isRedisLike
-			? db.db_user && db.db_password
-				? `redis://${db.db_user}:${db.db_password}@tond-db-${db.name}:${redisPort}`
-				: `redis://tond-db-${db.name}:${redisPort}`
-			: `${db.db_type}://${db.db_user}:${db.db_password}@tond-db-${db.name}:${db.db_type === 'mysql' || db.db_type === 'mariadb' ? 3306 : 5432}/${db.db_name}`;
-		return ok({
-			...db,
-			connection_string: db.custom_external_url ?? computedExternal,
-			public_connection_string: mockPublicUrl(db),
-			internal_connection_string: db.custom_internal_url ?? computedInternal
-		});
+		return ok(dbDetail(db));
+	}),
+
+	http.get('/api/databases/:id/credentials', async ({ params }) => {
+		await delay(LATENCY);
+		const db = databases.find((d) => d.id === params.id || d.name === params.id);
+		if (!db) return err('Database not found', 404);
+		if (currentMockUser().role !== 'admin') {
+			return err('Forbidden: only admins can reveal database credentials', 403);
+		}
+		return ok(dbCredentials(db));
+	}),
+
+	http.get('/api/databases/:id/backups', async ({ params }) => {
+		await delay(LATENCY);
+		const db = databases.find((d) => d.id === params.id || d.name === params.id);
+		if (!db) return err(`database '${params.id}' not found`, 404);
+		return ok(snapshots.filter((s) => s.scope === 'full' || s.scope === `database:${db.name}`));
+	}),
+
+	http.post('/api/databases/:id/backups', async ({ params }) => {
+		await delay(LATENCY * 4);
+		const db = databases.find((d) => d.id === params.id || d.name === params.id);
+		if (!db) return err(`database '${params.id}' not found`, 404);
+		const snap = mockDatabaseSnapshot(db.name, 'manual');
+		snapshots = [snap, ...snapshots];
+		return HttpResponse.json({ success: true, data: snap, error: null }, { status: 201 });
 	}),
 
 	http.delete('/api/databases/:id', async ({ params }) => {
@@ -2504,17 +2660,15 @@ export const handlers = [
 		};
 		// Apply updates — empty string clears the override (mirrors backend behaviour)
 		const updated = { ...databases[idx] };
+		const urls = (dbCustomUrls[updated.id] ??= { external: null, internal: null });
+		const clean = (v: string | null) => (v === null || v.trim() === '' ? null : v.trim());
 		if (body.custom_external_url !== undefined) {
-			updated.custom_external_url =
-				body.custom_external_url === '' || body.custom_external_url === null
-					? null
-					: body.custom_external_url;
+			urls.external = clean(body.custom_external_url);
+			updated.custom_external_url = urls.external && maskUrlPassword(urls.external);
 		}
 		if (body.custom_internal_url !== undefined) {
-			updated.custom_internal_url =
-				body.custom_internal_url === '' || body.custom_internal_url === null
-					? null
-					: body.custom_internal_url;
+			urls.internal = clean(body.custom_internal_url);
+			updated.custom_internal_url = urls.internal && maskUrlPassword(urls.internal);
 		}
 		if (body.custom_image !== undefined) {
 			updated.custom_image =
@@ -2528,28 +2682,7 @@ export const handlers = [
 		}
 		updated.updated_at = new Date().toISOString();
 		databases[idx] = updated;
-		const db = databases[idx];
-		// Return ManagedDatabaseDetail with resolved connection strings
-		const isRedisLike2 = db.db_type === 'redis' || db.db_type === 'keydb';
-		const redisPort2 = 6379;
-		const computedExternal = db.host_port
-			? isRedisLike2
-				? db.db_user && db.db_password
-					? `redis://${db.db_user}:${db.db_password}@localhost:${db.host_port}`
-					: `redis://localhost:${db.host_port}`
-				: `${db.db_type}://${db.db_user}:${db.db_password}@localhost:${db.host_port}/${db.db_name}`
-			: null;
-		const computedInternal = isRedisLike2
-			? db.db_user && db.db_password
-				? `redis://${db.db_user}:${db.db_password}@tond-db-${db.name}:${redisPort2}`
-				: `redis://tond-db-${db.name}:${redisPort2}`
-			: `${db.db_type}://${db.db_user}:${db.db_password}@tond-db-${db.name}:${db.db_type === 'mysql' || db.db_type === 'mariadb' ? 3306 : 5432}/${db.db_name}`;
-		return ok({
-			...db,
-			connection_string: db.custom_external_url ?? computedExternal,
-			public_connection_string: mockPublicUrl(db),
-			internal_connection_string: db.custom_internal_url ?? computedInternal
-		});
+		return ok(dbDetail(updated));
 	}),
 
 	http.patch('/api/databases/:id/credentials', async ({ params, request }) => {
@@ -2565,6 +2698,7 @@ export const handlers = [
 		// Mirrors the server: passwords change inside the running engine; renames,
 		// Redis/KeyDB and stopped databases are refused and nothing is saved.
 		const current = databases[idx];
+		const secrets = (dbSecrets[current.id] ??= { db_password: null, root_password: null });
 		const renamed = (next: string | null | undefined, now: string | null) =>
 			!!next?.trim() && next.trim() !== now;
 		if (renamed(body.db_name, current.db_name) || renamed(body.db_user, current.db_user)) {
@@ -2573,17 +2707,10 @@ export const handlers = [
 			);
 		}
 		const changed: string[] = [];
-		const updated = { ...current };
 		const nextPw = body.db_password?.trim();
-		if (nextPw && nextPw !== current.db_password) {
-			updated.db_password = nextPw;
-			changed.push('db_password');
-		}
+		if (nextPw && nextPw !== secrets.db_password) changed.push('db_password');
 		const nextRoot = body.root_password?.trim();
-		if (nextRoot && nextRoot !== current.root_password) {
-			updated.root_password = nextRoot;
-			changed.push('root_password');
-		}
+		if (nextRoot && nextRoot !== secrets.root_password) changed.push('root_password');
 		if (changed.length === 0) return err('Invalid input: Nothing to change: enter a new password.');
 		if (current.db_type === 'redis' || current.db_type === 'keydb') {
 			return err(
@@ -2596,32 +2723,16 @@ export const handlers = [
 			);
 		}
 		await delay(LATENCY * 3); // simulate the docker exec
-		updated.updated_at = new Date().toISOString();
+		if (changed.includes('db_password')) secrets.db_password = nextPw!;
+		if (changed.includes('root_password')) secrets.root_password = nextRoot!;
+		const updated = {
+			...current,
+			has_password: !!secrets.db_password,
+			has_root_password: !!secrets.root_password,
+			updated_at: new Date().toISOString()
+		};
 		databases[idx] = updated;
-		const db = databases[idx];
-		const isRedisLikeC = db.db_type === 'redis' || db.db_type === 'keydb';
-		const redisPortC = 6379;
-		const computedExternalC = db.host_port
-			? isRedisLikeC
-				? db.db_user && db.db_password
-					? `redis://${db.db_user}:${db.db_password}@localhost:${db.host_port}`
-					: `redis://localhost:${db.host_port}`
-				: `${db.db_type}://${db.db_user}:${db.db_password}@localhost:${db.host_port}/${db.db_name}`
-			: null;
-		const computedInternalC = isRedisLikeC
-			? db.db_user && db.db_password
-				? `redis://${db.db_user}:${db.db_password}@tond-db-${db.name}:${redisPortC}`
-				: `redis://tond-db-${db.name}:${redisPortC}`
-			: `${db.db_type}://${db.db_user}:${db.db_password}@tond-db-${db.name}:${db.db_type === 'mysql' || db.db_type === 'mariadb' ? 3306 : 5432}/${db.db_name}`;
-		return ok({
-			database: {
-				...db,
-				connection_string: db.custom_external_url ?? computedExternalC,
-				public_connection_string: mockPublicUrl(db),
-				internal_connection_string: db.custom_internal_url ?? computedInternalC
-			},
-			changed
-		});
+		return ok({ database: dbDetail(updated), changed });
 	}),
 
 	http.post('/api/databases/:id/stop', async ({ params }) => {
@@ -2672,26 +2783,7 @@ export const handlers = [
 			updated_at: new Date().toISOString()
 		};
 		databases[idx] = updated;
-		const isRedisLike = updated.db_type === 'redis' || updated.db_type === 'keydb';
-		const redisPort = 6379;
-		const computedExternal = updated.host_port
-			? isRedisLike
-				? updated.db_user && updated.db_password
-					? `redis://${updated.db_user}:${updated.db_password}@localhost:${updated.host_port}`
-					: `redis://localhost:${updated.host_port}`
-				: `${updated.db_type}://${updated.db_user}:${updated.db_password}@localhost:${updated.host_port}/${updated.db_name}`
-			: null;
-		const computedInternal = isRedisLike
-			? updated.db_user && updated.db_password
-				? `redis://${updated.db_user}:${updated.db_password}@tond-db-${updated.name}:${redisPort}`
-				: `redis://tond-db-${updated.name}:${redisPort}`
-			: `${updated.db_type}://${updated.db_user}:${updated.db_password}@tond-db-${updated.name}:${updated.db_type === 'mysql' || updated.db_type === 'mariadb' ? 3306 : 5432}/${updated.db_name}`;
-		return ok({
-			...updated,
-			connection_string: updated.custom_external_url ?? computedExternal,
-			public_connection_string: mockPublicUrl(updated),
-			internal_connection_string: updated.custom_internal_url ?? computedInternal
-		});
+		return ok(dbDetail(updated));
 	}),
 
 	// ── Cron Jobs (Phase 6.4) ──────────────────────────────────────────────────
@@ -2733,7 +2825,7 @@ export const handlers = [
 			created_at: new Date().toISOString(),
 			updated_at: new Date().toISOString(),
 			timeout_seconds: body.timeout_seconds ?? null,
-			env: body.env && Object.keys(body.env).length > 0 ? body.env : null,
+			env: maskedEntries(body.env ?? {}),
 			last_run_status: null,
 			concurrency_policy: body.concurrency_policy ?? 'skip',
 			memory_mb: body.memory_mb ?? null,
@@ -2744,6 +2836,7 @@ export const handlers = [
 			volumes: mockCronVolumes(`cron_${Date.now()}`, body.volumes)
 		};
 		cronJobs = [...cronJobs, newJob];
+		cronEnv[newJob.id] = body.env ?? {};
 		cronRuns[newJob.id] = [];
 		return ok(newJob);
 	}),
@@ -2768,6 +2861,8 @@ export const handlers = [
 			enabled: boolean;
 			timeout_seconds: number | null;
 			env: Record<string, string>;
+			env_set: Record<string, string>;
+			env_unset: string[];
 			concurrency_policy: string;
 			memory_mb: number | null;
 			cpu_shares: number | null;
@@ -2776,6 +2871,11 @@ export const handlers = [
 			retry_delay_seconds: number;
 			volumes: CronVolumeInput[] | null;
 		}>;
+		// Env: full replace, then set/unset patches (values stay write-only)
+		const jobId = cronJobs[idx].id;
+		const nextEnv = { ...(body.env ?? cronEnv[jobId] ?? {}), ...(body.env_set ?? {}) };
+		for (const key of body.env_unset ?? []) delete nextEnv[key];
+		cronEnv[jobId] = nextEnv;
 		// Check for name conflict
 		if (body.name !== undefined && body.name !== cronJobs[idx].name) {
 			const conflict = cronJobs.some((j, i) => i !== idx && j.name === body.name);
@@ -2790,9 +2890,7 @@ export const handlers = [
 			...(body.command !== undefined && { command: JSON.stringify(body.command) }),
 			...(body.enabled !== undefined && { enabled: body.enabled }),
 			...('timeout_seconds' in body && { timeout_seconds: body.timeout_seconds ?? null }),
-			...('env' in body && {
-				env: body.env && Object.keys(body.env).length > 0 ? body.env : null
-			}),
+			env: maskedEntries(nextEnv),
 			...(body.concurrency_policy !== undefined && {
 				concurrency_policy: body.concurrency_policy
 			}),
@@ -3134,12 +3232,27 @@ export const handlers = [
 
 	http.post('/api/integrations', async ({ request }) => {
 		await delay(LATENCY * 2);
-		const body = (await request.json()) as { name: string; kind: string; config: unknown };
+		const body = (await request.json()) as {
+			name: string;
+			kind: string;
+			config: Record<string, unknown>;
+		};
+		const newId = `int_${Date.now()}`;
+		const stored = storeIntegrationConfig(newId, body.config ?? {});
+		const needed: Record<string, string> = {
+			telegram: 'bot_token',
+			discord: 'webhook_url',
+			slack: 'webhook_url',
+			email: 'smtp_password'
+		};
+		if (!stored.saved_secrets.includes(needed[body.kind])) {
+			return err(`invalid config for ${body.kind}: missing field \`${needed[body.kind]}\``, 400);
+		}
 		const newIntegration: Integration = {
-			id: `int_${Date.now()}`,
+			id: newId,
 			name: body.name,
 			kind: body.kind as Integration['kind'],
-			config: body.config as Integration['config'],
+			...stored,
 			enabled: true,
 			created_at: new Date().toISOString(),
 			updated_at: new Date().toISOString()
@@ -3159,10 +3272,15 @@ export const handlers = [
 		await delay(LATENCY);
 		const idx = integrations.findIndex((i) => i.id === params.id);
 		if (idx === -1) return err('Integration not found', 404);
-		const body = (await request.json()) as Partial<
-			Pick<Integration, 'name' | 'config' | 'enabled'>
+		const { config, ...body } = (await request.json()) as Partial<
+			Pick<Integration, 'name' | 'enabled'> & { config: Record<string, unknown> }
 		>;
-		integrations[idx] = { ...integrations[idx], ...body, updated_at: new Date().toISOString() };
+		integrations[idx] = {
+			...integrations[idx],
+			...body,
+			...(config && storeIntegrationConfig(integrations[idx].id, config)),
+			updated_at: new Date().toISOString()
+		};
 		return ok(integrations[idx]);
 	}),
 
@@ -3479,7 +3597,10 @@ export const handlers = [
 			storage_provider_id: null,
 			checksum_sha256: null,
 			error_message: null,
-			notes: null
+			notes: null,
+			remote_status: backupConfig.storage_provider_id ? 'uploading' : null,
+			remote_error: null,
+			archive_bytes: null
 		};
 		snapshots = [snap, ...snapshots];
 		return ok(snap);
@@ -3516,7 +3637,10 @@ export const handlers = [
 			storage_provider_id: null,
 			checksum_sha256: null,
 			error_message: null,
-			notes: null
+			notes: null,
+			remote_status: backupConfig.storage_provider_id ? 'uploading' : null,
+			remote_error: null,
+			archive_bytes: null
 		};
 		snapshots = [preRestore, ...snapshots];
 		return ok({
@@ -3537,8 +3661,20 @@ export const handlers = [
 		await delay(LATENCY * 2);
 		const snap = snapshots.find((s) => s.id === params.id);
 		if (!snap) return err('Snapshot not found', 404);
-		const body = (await request.json()) as any;
-		return ok({ message: `Database '${body.db_name}' restored successfully.` });
+		const body = (await request.json()) as { db_name: string };
+		if (snap.scope !== 'full' && snap.scope !== `database:${body.db_name}`) {
+			return err(
+				`Database restore failed: This snapshot doesn't include the database '${body.db_name}'`,
+				500
+			);
+		}
+		await delay(LATENCY * 3);
+		const safetyNet = mockDatabaseSnapshot(body.db_name, 'pre_restore');
+		snapshots = [safetyNet, ...snapshots];
+		return ok({
+			message: `Database '${body.db_name}' restored. The data it held just before is saved as a backup.`,
+			pre_restore_snapshot_id: safetyNet.id
+		});
 	}),
 
 	http.get('/api/snapshots/config', async () => {

@@ -10,6 +10,7 @@ pub struct GitLabToken {
     pub id: String,
     pub name: String,
     /// AES-256-GCM encrypted PAT value, base64(nonce || ciphertext)
+    #[serde(skip_serializing)]
     pub token_enc: String,
     /// GitLab instance URL (default: https://gitlab.com)
     pub gitlab_url: String,

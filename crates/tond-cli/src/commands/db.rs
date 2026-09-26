@@ -28,8 +28,14 @@ pub enum DbAction {
         memory_mb: Option<i64>,
     },
 
-    /// Show details for a managed database
+    /// Show details for a managed database (passwords masked)
     Info {
+        /// Database name or ID
+        name: String,
+    },
+
+    /// Reveal a database's passwords and connection strings (audit-logged)
+    Credentials {
         /// Database name or ID
         name: String,
     },
@@ -93,9 +99,10 @@ pub async fn handle(client: &TondClient, action: DbAction) -> Result<()> {
             memory_mb,
         } => {
             let memory_limit = memory_mb.map(|m| m * 1_048_576);
-            let db = client
+            let created = client
                 .create_database(&name, &db_type, project.as_deref(), memory_limit)
                 .await?;
+            let db = &created.detail;
             println!(
                 "Database created: {} (ID: {})",
                 db.database.name, db.database.id
@@ -105,8 +112,16 @@ pub async fn handle(client: &TondClient, action: DbAction) -> Result<()> {
             if let Some(port) = db.database.host_port {
                 println!("Port:   {}", port);
             }
-            if let Some(ref cs) = db.connection_string {
+            if let Some(ref cs) = created
+                .credentials
+                .as_ref()
+                .and_then(|c| c.connection_string.as_ref())
+            {
                 println!("Conn:   {}", cs);
+                println!(
+                    "The password is shown once. Later: tond db credentials {}",
+                    db.database.name
+                );
             }
         }
 
@@ -135,6 +150,24 @@ pub async fn handle(client: &TondClient, action: DbAction) -> Result<()> {
                 println!("Internal:{}", ics);
             }
             println!("Created: {}", db.database.created_at);
+        }
+
+        DbAction::Credentials { name } => {
+            let creds = client.get_database_credentials(&name).await?;
+            println!("User:     {}", creds.db_user.as_deref().unwrap_or("-"));
+            println!("Password: {}", creds.db_password.as_deref().unwrap_or("-"));
+            if let Some(ref root) = creds.root_password {
+                println!("Root:     {root}");
+            }
+            if let Some(ref cs) = creds.connection_string {
+                println!("Conn:     {cs}");
+            }
+            if let Some(ref cs) = creds.internal_connection_string {
+                println!("Internal: {cs}");
+            }
+            if let Some(ref cs) = creds.public_connection_string {
+                println!("Public:   {cs}");
+            }
         }
 
         DbAction::Delete { name, yes } => {
