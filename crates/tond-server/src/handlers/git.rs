@@ -7,8 +7,11 @@
 //     filter. Returns the updated app.
 //
 //   GET  /api/apps/{id}/webhook
-//     Webhook URLs (per provider) and the app's webhook secret, for setting up
-//     GitHub/GitLab/Gitea/generic webhooks.
+//     Webhook URLs (per provider) and whether a secret is set, for setting up
+//     GitHub/GitLab/Gitea/generic webhooks. The secret itself is write-only.
+//
+//   GET  /api/apps/{id}/webhook-secret
+//     Reveal the webhook secret (admin only, audit-logged).
 //
 //   PUT  /api/apps/{id}/webhook-secret
 //     Replace the webhook secret with a caller-chosen value ({ "secret": "..." },
@@ -16,7 +19,8 @@
 //     disabled: every webhook must be signed.
 //
 //   POST /api/apps/{id}/webhook-secret/rotate
-//     Replace the webhook secret with a fresh random one; returns the new config.
+//     Replace the webhook secret with a fresh random one; returns the new
+//     secret once (audit-logged).
 //
 //   POST /api/apps/{id}/deploy-key
 //     Generate (or regenerate) an Ed25519 SSH deploy key for the app.
@@ -35,12 +39,14 @@ use axum::{
 use tond_common::{
     ApiResponse, AppResponse, DeployKeyResponse, MIN_WEBHOOK_SECRET_LEN, TondError,
     UpdateAutoDeployRequest, UpdateSourceRequest, UpdateWebhookSecretRequest,
-    WebhookConfigResponse, WebhookUrls, generate_raw_key,
+    WebhookConfigResponse, WebhookSecretResponse, WebhookUrls, generate_raw_key,
 };
 
 use crate::{
-    auth::{AuthRole, RateLimit, RequireAuth},
+    audit_log::{AuthActor, write_audit_log},
+    auth::{AuthRole, RateLimit, RequireAdmin, RequireAuth},
     error::AppError,
+    secrets,
     state::AppState,
 };
 
@@ -99,12 +105,7 @@ async fn webhook_config(
     state: &AppState,
     app: tond_common::App,
 ) -> Result<WebhookConfigResponse, AppError> {
-    let secret = app.webhook_secret.clone().ok_or_else(|| {
-        AppError(TondError::Internal(format!(
-            "app {} has no webhook secret",
-            app.name
-        )))
-    })?;
+    let has_secret = app.webhook_secret.as_deref().is_some_and(|s| !s.is_empty());
     let domain = state.settings.read().await.dashboard_domain.clone();
     let paths = WebhookUrls::for_app(&app.id);
     let urls = (!domain.is_empty()).then(|| {
@@ -120,7 +121,7 @@ async fn webhook_config(
         app_id: app.id,
         paths,
         urls,
-        secret,
+        has_secret,
         auto_deploy: app.auto_deploy != 0,
         watch_branch: app.watch_branch,
     })
@@ -128,7 +129,7 @@ async fn webhook_config(
 
 /// GET /api/apps/{id}/webhook
 ///
-/// Returns the webhook URLs for every provider and the current secret.
+/// Returns the webhook URLs for every provider and whether a secret is set.
 pub async fn get_webhook_config(
     _rate: RateLimit,
     _auth: RequireAuth,
@@ -138,6 +139,39 @@ pub async fn get_webhook_config(
     let app = fetch_app(&state.db, &app_id).await?;
     let config = webhook_config(&state, app).await?;
     Ok((StatusCode::OK, Json(ApiResponse::ok(config))))
+}
+
+/// GET /api/apps/{id}/webhook-secret
+///
+/// Reveals the current secret, for pasting into a provider's webhook form.
+/// Admin only; every reveal is audit-logged.
+pub async fn reveal_webhook_secret(
+    _rate: RateLimit,
+    _admin: RequireAdmin,
+    actor: AuthActor,
+    State(state): State<AppState>,
+    Path(app_id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let app = fetch_app(&state.db, &app_id).await?;
+    let secret = secrets::app_webhook_secret(&app)?.ok_or_else(|| {
+        AppError(TondError::NotFound(format!(
+            "webhook secret of app '{}'",
+            app.name
+        )))
+    })?;
+    write_audit_log(
+        &state.db,
+        Some(&app.id),
+        Some(&app.name),
+        "webhook_secret_reveal",
+        &actor.0,
+        None,
+    )
+    .await;
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(WebhookSecretResponse { secret })),
+    ))
 }
 
 /// PUT /api/apps/{id}/webhook-secret
@@ -158,7 +192,7 @@ pub async fn update_webhook_secret(
     validate_webhook_secret(&secret)?;
 
     sqlx::query("UPDATE apps SET webhook_secret = ?, updated_at = datetime('now') WHERE id = ?")
-        .bind(&secret)
+        .bind(secrets::seal_webhook_secret(&secret)?)
         .bind(&app.id)
         .execute(&state.db)
         .await?;
@@ -188,26 +222,39 @@ fn validate_webhook_secret(secret: &str) -> Result<(), AppError> {
 /// POST /api/apps/{id}/webhook-secret/rotate
 ///
 /// Generates a new random secret. The old one stops working immediately, so
-/// the provider's webhook settings must be updated with the returned value.
+/// the provider's webhook settings must be updated with the returned value,
+/// which is shown only in this response.
 pub async fn rotate_webhook_secret(
     _rate: RateLimit,
     _auth: RequireAuth,
+    actor: AuthActor,
     State(state): State<AppState>,
     Path(app_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let app = fetch_app(&state.db, &app_id).await?;
+    let secret = generate_raw_key();
 
     sqlx::query("UPDATE apps SET webhook_secret = ?, updated_at = datetime('now') WHERE id = ?")
-        .bind(generate_raw_key())
+        .bind(secrets::seal_webhook_secret(&secret)?)
         .bind(&app.id)
         .execute(&state.db)
         .await?;
 
     tracing::info!("Rotated webhook secret for app {}", app.name);
+    write_audit_log(
+        &state.db,
+        Some(&app.id),
+        Some(&app.name),
+        "webhook_secret_rotate",
+        &actor.0,
+        None,
+    )
+    .await;
 
-    let updated = fetch_app(&state.db, &app.id).await?;
-    let config = webhook_config(&state, updated).await?;
-    Ok((StatusCode::OK, Json(ApiResponse::ok(config))))
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(WebhookSecretResponse { secret })),
+    ))
 }
 
 // ── Deploy keys ─────────────────────────────────────────────────────────────

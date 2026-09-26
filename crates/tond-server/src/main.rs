@@ -66,9 +66,11 @@ mod handlers;
 mod health;
 mod janitor;
 mod log_bus;
+mod log_scrub;
 mod metrics;
 mod notifications;
 mod secret_key;
+mod secrets;
 mod security_headers;
 mod state;
 mod storage;
@@ -312,7 +314,7 @@ async fn main() -> Result<()> {
         )
         .route(
             "/api/apps/{id}/webhook-secret",
-            put(handlers::git::update_webhook_secret),
+            put(handlers::git::update_webhook_secret).get(handlers::git::reveal_webhook_secret),
         )
         .route(
             "/api/apps/{id}/webhook-secret/rotate",
@@ -579,7 +581,8 @@ async fn main() -> Result<()> {
         )
         .route(
             "/api/databases/{id}/credentials",
-            axum::routing::patch(handlers::databases::update_database_credentials),
+            axum::routing::patch(handlers::databases::update_database_credentials)
+                .get(handlers::databases::reveal_database_credentials),
         )
         .route(
             "/api/databases/{id}/logs/stream",

@@ -11,6 +11,8 @@
 //   POST   /api/cron/{id}/trigger         — manually trigger a run immediately
 //   GET    /api/cron/{id}/runs            — get execution history (supports ?limit=&offset=)
 
+use std::collections::BTreeMap;
+
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -26,6 +28,7 @@ use crate::{
     cron,
     cron::compute_next_run,
     error::AppError,
+    secrets,
     state::AppState,
     volumes,
 };
@@ -64,6 +67,24 @@ async fn confined_cron_volumes(
     })?))
 }
 
+/// API view of a job: env keys with masked values.
+fn cron_response(job: CronJob) -> Result<CronJobResponse, AppError> {
+    let env = secrets::cron_env(job.env.as_deref())?;
+    Ok(CronJobResponse::new(job, &env))
+}
+
+fn validate_env_keys<'a>(keys: impl IntoIterator<Item = &'a String>) -> Result<(), AppError> {
+    for key in keys {
+        if !is_valid_env_key(key) {
+            return Err(AppError(TondError::InvalidInput(format!(
+                "'{key}' is not a valid variable name: use letters, digits and underscores, \
+                 not starting with a digit"
+            ))));
+        }
+    }
+    Ok(())
+}
+
 // ── List cron jobs ──
 
 pub async fn list_cron_jobs(
@@ -74,7 +95,10 @@ pub async fn list_cron_jobs(
     let jobs: Vec<CronJob> = sqlx::query_as("SELECT * FROM cron_jobs ORDER BY created_at DESC")
         .fetch_all(&state.db)
         .await?;
-    let responses: Vec<CronJobResponse> = jobs.into_iter().map(CronJobResponse::from).collect();
+    let mut responses: Vec<CronJobResponse> = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        responses.push(cron_response(job)?);
+    }
     Ok((StatusCode::OK, Json(ApiResponse::ok(responses))))
 }
 
@@ -87,10 +111,7 @@ pub async fn get_cron_job(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let job = fetch_cron_job(&state.db, &id).await?;
-    Ok((
-        StatusCode::OK,
-        Json(ApiResponse::ok(CronJobResponse::from(job))),
-    ))
+    Ok((StatusCode::OK, Json(ApiResponse::ok(cron_response(job)?))))
 }
 
 // ── Create cron job ──
@@ -143,12 +164,10 @@ pub async fn create_cron_job(
         .filter(|cmd| !cmd.is_empty())
         .map(|cmd| serde_json::to_string(cmd).unwrap_or_default());
 
-    // Serialize env map → JSON string for storage
-    let env_str = req
-        .env
-        .as_ref()
-        .filter(|m| !m.is_empty())
-        .map(|m| serde_json::to_string(m).unwrap_or_default());
+    // Env map → encrypted JSON for storage
+    let env: BTreeMap<String, String> = req.env.clone().unwrap_or_default().into_iter().collect();
+    validate_env_keys(env.keys())?;
+    let env_str = secrets::seal_cron_env(&env)?;
 
     let mut job = CronJob::new(
         req.name.clone(),
@@ -224,7 +243,7 @@ pub async fn create_cron_job(
 
     Ok((
         StatusCode::CREATED,
-        Json(ApiResponse::ok(CronJobResponse::from(job))),
+        Json(ApiResponse::ok(CronJobResponse::new(job, &env))),
     ))
 }
 
@@ -293,13 +312,18 @@ pub async fn update_cron_job(
         job.timeout_seconds = new_timeout;
     }
 
-    // ── env ───────────────────────────────────────────────────────────────────
-    if let Some(ref new_env) = req.env {
-        job.env = if new_env.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_string(new_env).unwrap_or_default())
+    // ── env: full replace, then set/unset patches ─────────────────────────────
+    if req.env.is_some() || !req.env_set.is_empty() || !req.env_unset.is_empty() {
+        let mut env: BTreeMap<String, String> = match req.env {
+            Some(ref new_env) => new_env.clone().into_iter().collect(),
+            None => secrets::cron_env(job.env.as_deref())?,
         };
+        validate_env_keys(env.keys().chain(req.env_set.keys()))?;
+        env.extend(req.env_set.clone());
+        for key in &req.env_unset {
+            env.remove(key);
+        }
+        job.env = secrets::seal_cron_env(&env)?;
     }
 
     // ── project_id: Option<Option<String>> — None=no change, Some(None)=unlink ──
@@ -415,7 +439,7 @@ pub async fn update_cron_job(
     let updated = fetch_cron_job(&state.db, &job.id).await?;
     Ok((
         StatusCode::OK,
-        Json(ApiResponse::ok(CronJobResponse::from(updated))),
+        Json(ApiResponse::ok(cron_response(updated)?)),
     ))
 }
 
@@ -595,7 +619,8 @@ mod tests {
             Some("[\"echo\",\"hello\"]".to_string()),
             None,
             Some(60),
-            Some("{\"MODE\":\"prod\"}".to_string()),
+            secrets::seal_cron_env(&BTreeMap::from([("MODE".to_string(), "prod".to_string())]))
+                .unwrap_or_else(|err| panic!("seal: {err}")),
             "skip".to_string(),
             Some(256),
             Some(1024),
@@ -927,6 +952,8 @@ mod tests {
                 enabled: None,
                 timeout_seconds: None,
                 env: None,
+                env_set: Default::default(),
+                env_unset: vec![],
                 project_id: None,
                 concurrency_policy: None,
                 memory_mb: None,
@@ -960,6 +987,8 @@ mod tests {
                 enabled: None,
                 timeout_seconds: None,
                 env: None,
+                env_set: Default::default(),
+                env_unset: vec![],
                 project_id: None,
                 concurrency_policy: None,
                 memory_mb: None,
@@ -993,6 +1022,8 @@ mod tests {
                 enabled: None,
                 timeout_seconds: None,
                 env: None,
+                env_set: Default::default(),
+                env_unset: vec![],
                 project_id: None,
                 concurrency_policy: Some("queue".to_string()),
                 memory_mb: None,
@@ -1035,6 +1066,8 @@ mod tests {
                 enabled: Some(false),
                 timeout_seconds: Some(None),
                 env: Some(HashMap::new()),
+                env_set: Default::default(),
+                env_unset: vec![],
                 project_id: Some(Some("project-1".to_string())),
                 concurrency_policy: Some("allow".to_string()),
                 memory_mb: Some(None),
@@ -1072,7 +1105,7 @@ mod tests {
         );
         assert_eq!(
             body["data"]["env"],
-            serde_json::Value::Null,
+            serde_json::json!([]),
             "empty env maps should clear stored env vars"
         );
         assert_eq!(
@@ -1146,6 +1179,8 @@ mod tests {
                 enabled: None,
                 timeout_seconds: None,
                 env: None,
+                env_set: Default::default(),
+                env_unset: vec![],
                 project_id: Some(Some("missing-project".to_string())),
                 concurrency_policy: None,
                 memory_mb: None,

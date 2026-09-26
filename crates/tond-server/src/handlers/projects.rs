@@ -26,6 +26,8 @@ use crate::{
     auth::{RateLimit, RequireAuth},
     deploy, docker,
     error::AppError,
+    handlers::env_map_from_json,
+    secrets,
     state::AppState,
 };
 
@@ -77,22 +79,19 @@ pub async fn list_projects(
     .fetch_all(&state.db)
     .await?;
 
-    let responses: Vec<ProjectResponse> = rows
-        .into_iter()
-        .map(|r| {
-            let env_vars: serde_json::Value = serde_json::from_str(&r.env_vars)
-                .unwrap_or(serde_json::Value::Object(Default::default()));
-            ProjectResponse {
-                id: r.id,
-                name: r.name,
-                description: r.description,
-                env_vars,
-                created_at: r.created_at,
-                updated_at: r.updated_at,
-                active_preview_count: r.active_preview_count,
-            }
-        })
-        .collect();
+    let mut responses: Vec<ProjectResponse> = Vec::with_capacity(rows.len());
+    for r in rows {
+        let env = secrets::project_env(&r.env_vars)?;
+        let project = Project {
+            id: r.id,
+            name: r.name,
+            description: r.description,
+            env_vars: r.env_vars,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        };
+        responses.push(ProjectResponse::new(project, &env, r.active_preview_count));
+    }
 
     Ok(Json(ApiResponse::ok(responses)))
 }
@@ -123,8 +122,9 @@ pub async fn get_project(
 
     let app_responses: Vec<AppResponse> = apps.into_iter().map(AppResponse::from).collect();
 
+    let env = secrets::project_env(&project.env_vars)?;
     Ok(Json(ApiResponse::ok(ProjectDetailResponse {
-        project: ProjectResponse::from(project),
+        project: ProjectResponse::new(project, &env, 0),
         apps: app_responses,
     })))
 }
@@ -159,12 +159,12 @@ pub async fn create_project(
 
     let project = Project::new(name.clone(), req.description.clone());
 
-    // Use caller-supplied env_vars if provided
-    let env_vars_str = if let Some(ev) = req.env_vars {
-        serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_string())
-    } else {
-        "{}".to_string()
+    // Use caller-supplied env_vars if provided (stored encrypted)
+    let env = match req.env_vars {
+        Some(ref ev) => env_map_from_json(ev)?,
+        None => Default::default(),
     };
+    let env_vars_str = secrets::seal_project_env(&env)?;
 
     sqlx::query(
         "INSERT INTO projects (id, name, description, env_vars, created_at, updated_at)
@@ -193,7 +193,7 @@ pub async fn create_project(
     project.env_vars = env_vars_str;
     Ok((
         StatusCode::CREATED,
-        Json(ApiResponse::ok(ProjectResponse::from(project))),
+        Json(ApiResponse::ok(ProjectResponse::new(project, &env, 0))),
     ))
 }
 
@@ -218,10 +218,15 @@ pub async fn update_project(
 
     let new_name = req.name.as_deref().unwrap_or(&project.name).to_string();
     let new_desc = req.description.or(project.description.clone());
-    let new_env_str = if let Some(ev) = req.env_vars {
-        serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_string())
-    } else {
-        project.env_vars.clone()
+    let (new_env_str, env) = match req.env_vars {
+        Some(ref ev) => {
+            let env = env_map_from_json(ev)?;
+            (secrets::seal_project_env(&env)?, env)
+        }
+        None => (
+            project.env_vars.clone(),
+            secrets::project_env(&project.env_vars)?,
+        ),
     };
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -254,7 +259,9 @@ pub async fn update_project(
         updated_at: now,
         ..project
     };
-    Ok(Json(ApiResponse::ok(ProjectResponse::from(updated))))
+    Ok(Json(ApiResponse::ok(ProjectResponse::new(
+        updated, &env, 0,
+    ))))
 }
 
 // ── Delete project ──

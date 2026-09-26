@@ -28,41 +28,11 @@ use crate::{
     audit_log::{AuthActor, write_audit_log},
     auth::{RateLimit, RequireAdmin, RequireAuth},
     error::AppError,
+    log_scrub, secrets,
     state::AppState,
 };
 
 // ── Pure helpers ──
-
-/// Parse a stored env JSON object. A missing or corrupt column reads as empty
-/// only when it is blank; corrupt JSON is an error so a patch never silently
-/// replaces data it could not read.
-fn parse_env_map(raw: Option<&str>) -> Result<BTreeMap<String, String>, AppError> {
-    let raw = raw.map(str::trim).unwrap_or_default();
-    if raw.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
-        AppError(TondError::Internal(format!(
-            "stored environment is not valid JSON: {e}"
-        )))
-    })?;
-    let object = value.as_object().ok_or_else(|| {
-        AppError(TondError::Internal(
-            "stored environment is not a JSON object".to_string(),
-        ))
-    })?;
-    Ok(object
-        .iter()
-        .map(|(k, v)| {
-            let value = match v {
-                serde_json::Value::String(s) => s.clone(),
-                serde_json::Value::Null => String::new(),
-                other => other.to_string(),
-            };
-            (k.clone(), value)
-        })
-        .collect())
-}
 
 fn parse_key_list(raw: &str) -> Vec<String> {
     serde_json::from_str(raw).unwrap_or_default()
@@ -126,8 +96,8 @@ fn apply_exclusions(
 }
 
 fn env_response(app: &App) -> Result<AppEnvResponse, AppError> {
-    let vars = parse_env_map(app.env_vars.as_deref())?;
-    let overrides = parse_env_map(Some(&app.preview_env_vars))?;
+    let vars = secrets::app_env(app)?;
+    let overrides = secrets::app_preview_env(app)?;
     Ok(AppEnvResponse {
         vars: masked_env_entries(&vars),
         preview: PreviewEnvResponse {
@@ -136,10 +106,6 @@ fn env_response(app: &App) -> Result<AppEnvResponse, AppError> {
             overrides: masked_env_entries(&overrides),
         },
     })
-}
-
-fn to_json(map: &BTreeMap<String, String>) -> Result<String, AppError> {
-    serde_json::to_string(map).map_err(|e| AppError(TondError::Internal(e.to_string())))
 }
 
 async fn fetch_app_in_tx(tx: &mut sqlx::SqliteConnection, app_id: &str) -> Result<App, AppError> {
@@ -170,7 +136,7 @@ pub async fn reveal_env_var(
     Path((id, key)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
     let app = fetch_app(&state.db, &id).await?;
-    let vars = parse_env_map(app.env_vars.as_deref())?;
+    let vars = secrets::app_env(&app)?;
     let value = vars
         .get(&key)
         .cloned()
@@ -209,18 +175,15 @@ pub async fn patch_env(
 
     let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
     let app = fetch_app_in_tx(&mut tx, &app_id).await?;
-    let next = apply_patch(
-        parse_env_map(app.env_vars.as_deref())?,
-        &req.set,
-        &req.unset,
-    )?;
+    let next = apply_patch(secrets::app_env(&app)?, &req.set, &req.unset)?;
     sqlx::query("UPDATE apps SET env_vars = ?, updated_at = datetime('now') WHERE id = ?")
-        .bind(to_json(&next)?)
+        .bind(secrets::seal_app_env(&next)?)
         .bind(&app.id)
         .execute(&mut *tx)
         .await?;
     let updated = fetch_app_in_tx(&mut tx, &app.id).await?;
     tx.commit().await?;
+    log_scrub::forget_app(&updated.id);
 
     // Record which keys changed, never their values.
     let detail = format!(
@@ -252,7 +215,7 @@ pub async fn reveal_preview_env_var(
     Path((id, key)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
     let app = fetch_app(&state.db, &id).await?;
-    let overrides = parse_env_map(Some(&app.preview_env_vars))?;
+    let overrides = secrets::app_preview_env(&app)?;
     let value = overrides
         .get(&key)
         .cloned()
@@ -295,11 +258,7 @@ pub async fn patch_preview_env(
 
     let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
     let app = fetch_app_in_tx(&mut tx, &app_id).await?;
-    let overrides = apply_patch(
-        parse_env_map(Some(&app.preview_env_vars))?,
-        &req.set,
-        &req.unset,
-    )?;
+    let overrides = apply_patch(secrets::app_preview_env(&app)?, &req.set, &req.unset)?;
     let excluded = apply_exclusions(
         parse_key_list(&app.preview_excluded_keys),
         &req.exclude,
@@ -310,13 +269,14 @@ pub async fn patch_preview_env(
     sqlx::query(
         "UPDATE apps SET preview_env_vars = ?, preview_excluded_keys = ?, updated_at = datetime('now') WHERE id = ?",
     )
-    .bind(to_json(&overrides)?)
+    .bind(secrets::seal_app_preview_env(&overrides)?)
     .bind(excluded_json)
     .bind(&app.id)
     .execute(&mut *tx)
     .await?;
     let updated = fetch_app_in_tx(&mut tx, &app.id).await?;
     tx.commit().await?;
+    log_scrub::forget_app(&updated.id);
 
     let detail = format!(
         "set={} unset={} exclude={} include={}",
@@ -372,7 +332,15 @@ mod tests {
         }
     }
 
+    fn seal(purpose: crate::secret_key::Purpose, json: &str) -> String {
+        let map: BTreeMap<String, String> =
+            serde_json::from_str(json).unwrap_or_else(|err| panic!("bad fixture JSON: {err}"));
+        crate::secret_key::seal_map(purpose, &map).unwrap_or_else(|err| panic!("seal: {err}"))
+    }
+
     async fn seed_app(state: &AppState, env: &str, preview_env: &str, excluded: &str) -> App {
+        let env = seal(crate::secret_key::Purpose::AppEnv, env);
+        let preview_env = seal(crate::secret_key::Purpose::AppPreviewEnv, preview_env);
         let app = App::new("demo".to_string(), "image".to_string(), None, None, 3000);
         sqlx::query(
             "INSERT INTO apps (id, name, source_type, container_port, status, env_vars, preview_env_vars, preview_excluded_keys, created_at, updated_at)
@@ -383,8 +351,8 @@ mod tests {
         .bind(&app.source_type)
         .bind(app.container_port)
         .bind(&app.status)
-        .bind(env)
-        .bind(preview_env)
+        .bind(&env)
+        .bind(&preview_env)
         .bind(excluded)
         .bind(&app.created_at)
         .bind(&app.updated_at)
@@ -400,7 +368,8 @@ mod tests {
             .fetch_one(&state.db)
             .await
             .unwrap_or_else(|err| panic!("failed to read env_vars: {err}"));
-        parse_env_map(raw.as_deref()).unwrap_or_else(|err| panic!("bad env JSON: {}", err.0))
+        crate::secret_key::open_map(crate::secret_key::Purpose::AppEnv, raw.as_deref())
+            .unwrap_or_else(|err| panic!("bad stored env: {err}"))
     }
 
     async fn body_json(response: axum::response::Response) -> serde_json::Value {
@@ -549,13 +518,40 @@ mod tests {
     }
 
     #[test]
-    fn parse_env_map_refuses_corrupt_json_instead_of_reading_it_as_empty() {
-        assert!(parse_env_map(Some("not json")).is_err());
-        assert!(parse_env_map(Some("[1,2]")).is_err());
-        assert_eq!(
-            parse_env_map(None).map_err(|e| e.0.to_string()),
-            Ok(BTreeMap::new())
+    fn stored_env_that_does_not_decrypt_is_an_error_not_an_empty_map() {
+        use crate::secret_key::{Purpose, open_map};
+        assert!(open_map(Purpose::AppEnv, Some("not json")).is_err());
+        assert!(open_map(Purpose::AppEnv, Some(r#"{"A":"plaintext"}"#)).is_err());
+        assert_eq!(open_map(Purpose::AppEnv, None).ok(), Some(BTreeMap::new()));
+    }
+
+    #[tokio::test]
+    async fn patch_env_stores_values_encrypted() {
+        let state = test_state().await;
+        let app = seed_app(&state, "{}", "{}", "[]").await;
+        patch_env(
+            RateLimit,
+            RequireAuth,
+            actor(),
+            State(state.clone()),
+            Path(app.id.clone()),
+            Json(PatchEnvRequest {
+                set: BTreeMap::from([("API_KEY".to_string(), "sk-very-secret".to_string())]),
+                unset: vec![],
+            }),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("patch_env should succeed: {}", err.0));
+        let raw: String = sqlx::query_scalar("SELECT env_vars FROM apps WHERE id = ?")
+            .bind(&app.id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_else(|err| panic!("failed to read env_vars: {err}"));
+        assert!(
+            raw.starts_with("v1."),
+            "env must be stored encrypted: {raw}"
         );
+        assert!(!raw.contains("sk-very-secret") && !raw.contains("API_KEY"));
     }
 
     #[test]
@@ -739,8 +735,12 @@ mod tests {
                 .await
                 .unwrap_or_else(|err| panic!("failed to read preview env: {err}"));
         assert_eq!(
-            parse_env_map(Some(&overrides)).map_err(|e| e.0.to_string()),
-            Ok(BTreeMap::from([
+            crate::secret_key::open_map(
+                crate::secret_key::Purpose::AppPreviewEnv,
+                Some(&overrides)
+            )
+            .ok(),
+            Some(BTreeMap::from([
                 ("KEEP".to_string(), "k".to_string()),
                 ("MODE".to_string(), "staging".to_string()),
             ]))

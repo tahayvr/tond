@@ -37,10 +37,12 @@ use serde_json::{Map, Value};
 use tokio_tungstenite::tungstenite::Message;
 use tond_common::{
     ApiResponse, AppResponse, BackupConfigResponse, CreateAppRequest, CreateCronJobRequest,
-    CreateDatabaseRequest, CronJobResponse, CronJobRun, DeployKeyResponse, DeploymentResponse,
-    IntegrationResponse, ManagedDatabaseDetail, ManagedDatabaseResponse, PreviewDeploymentResponse,
+    CreateDatabaseRequest, CreatedDatabaseResponse, CronJobResponse, CronJobRun,
+    DatabaseCredentialsResponse, DeployKeyResponse, DeploymentResponse, IntegrationResponse,
+    ManagedDatabaseDetail, ManagedDatabaseResponse, PreviewDeploymentResponse,
     ProjectPreviewResponse, ProjectResponse, ServerSettings, SnapshotResponse, SnapshotStarted,
     StorageProviderResponse, UpdateCronJobRequest, UpdateSettingsRequest, WebhookConfigResponse,
+    WebhookSecretResponse,
 };
 
 /// Body and response of `/api/settings/host-terminal`.
@@ -583,7 +585,7 @@ impl TondClient {
         }
     }
 
-    /// Webhook URLs and secret for an app.
+    /// Webhook URLs for an app (the secret is revealed separately).
     pub async fn get_webhook_config(&self, id: &str) -> Result<WebhookConfigResponse> {
         let req = self
             .client
@@ -611,13 +613,27 @@ impl TondClient {
         Ok(())
     }
 
-    /// Replace the webhook secret with a freshly generated one.
-    pub async fn rotate_webhook_secret(&self, id: &str) -> Result<WebhookConfigResponse> {
+    /// Reveal the app's webhook secret (admin only, audit-logged).
+    pub async fn reveal_webhook_secret(&self, id: &str) -> Result<WebhookSecretResponse> {
+        let req = self
+            .client
+            .get(format!("{}/api/apps/{}/webhook-secret", self.base_url, id));
+        let resp: ApiResponse<WebhookSecretResponse> =
+            self.auth_header(req).send().await?.json().await?;
+        if resp.success {
+            resp.data.context("No data returned")
+        } else {
+            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
+        }
+    }
+
+    /// Replace the webhook secret with a freshly generated one; returns it.
+    pub async fn rotate_webhook_secret(&self, id: &str) -> Result<WebhookSecretResponse> {
         let req = self.client.post(format!(
             "{}/api/apps/{}/webhook-secret/rotate",
             self.base_url, id
         ));
-        let resp: ApiResponse<WebhookConfigResponse> =
+        let resp: ApiResponse<WebhookSecretResponse> =
             self.auth_header(req).send().await?.json().await?;
         if resp.success {
             resp.data.context("No data returned")
@@ -856,7 +872,7 @@ impl TondClient {
         db_type: &str,
         project_id: Option<&str>,
         memory_limit: Option<i64>,
-    ) -> Result<ManagedDatabaseDetail> {
+    ) -> Result<CreatedDatabaseResponse> {
         let body = CreateDatabaseRequest {
             name: name.to_string(),
             db_type: db_type.to_string(),
@@ -868,7 +884,23 @@ impl TondClient {
             .client
             .post(format!("{}/api/databases", self.base_url))
             .json(&body);
-        let resp: ApiResponse<ManagedDatabaseDetail> =
+        let resp: ApiResponse<CreatedDatabaseResponse> =
+            self.auth_header(req).send().await?.json().await?;
+        if resp.success {
+            resp.data.context("No data returned")
+        } else {
+            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
+        }
+    }
+
+    /// Reveal a database's passwords and connection strings (admin only,
+    /// audit-logged).
+    pub async fn get_database_credentials(&self, id: &str) -> Result<DatabaseCredentialsResponse> {
+        let req = self.client.get(format!(
+            "{}/api/databases/{}/credentials",
+            self.base_url, id
+        ));
+        let resp: ApiResponse<DatabaseCredentialsResponse> =
             self.auth_header(req).send().await?.json().await?;
         if resp.success {
             resp.data.context("No data returned")
@@ -1000,6 +1032,8 @@ impl TondClient {
             enabled,
             timeout_seconds: None,
             env: None,
+            env_set: Default::default(),
+            env_unset: vec![],
             project_id: None,
             concurrency_policy: None,
             memory_mb: None,
@@ -1894,8 +1928,7 @@ mod tests {
                                 "status": "running",
                                 "db_name": "tond_analytics",
                                 "db_user": "tond_analytics",
-                                "db_password": "secret",
-                                "root_password": null,
+                                "has_password": true,
                                 "memory_limit": null,
                                 "custom_external_url": null,
                                 "custom_internal_url": null,
@@ -1903,8 +1936,16 @@ mod tests {
                                 "custom_image": null,
                                 "created_at": "2026-01-01T00:00:00Z",
                                 "updated_at": "2026-01-01T00:00:00Z",
-                                "connection_string": "postgres://tond_analytics:secret@localhost:5432/tond_analytics",
-                                "internal_connection_string": "postgres://tond_analytics:secret@analytics-db:5432/tond_analytics"
+                                "connection_string": "postgres://tond_analytics:••••••••@localhost:5432/tond_analytics",
+                                "internal_connection_string": "postgres://tond_analytics:••••••••@analytics-db:5432/tond_analytics",
+                                "credentials": {
+                                    "db_user": "tond_analytics",
+                                    "db_password": "secret",
+                                    "root_password": null,
+                                    "connection_string": "postgres://tond_analytics:secret@localhost:5432/tond_analytics",
+                                    "public_connection_string": null,
+                                    "internal_connection_string": "postgres://tond_analytics:secret@analytics-db:5432/tond_analytics"
+                                }
                             },
                             "error": null
                         })))
@@ -1929,7 +1970,7 @@ mod tests {
             "project creation should return the server id"
         );
         assert_eq!(
-            db.database.project_id.as_deref(),
+            db.detail.database.project_id.as_deref(),
             Some("project-1"),
             "database creation should preserve the supplied project id"
         );

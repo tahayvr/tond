@@ -258,23 +258,30 @@ pub struct ManagedDatabase {
     pub db_name: Option<String>,
     /// Database user (postgres / mysql only)
     pub db_user: Option<String>,
-    /// Database password (stored in plain text so apps can inject it)
+    /// Database password. Stored encrypted; the server decrypts it only where
+    /// it is needed (container env, `docker exec`, the credentials reveal).
+    #[serde(skip_serializing)]
     pub db_password: Option<String>,
     /// Separate root/admin password for MySQL and MariaDB.
     /// These engines require a distinct `MYSQL_ROOT_PASSWORD` /
     /// `MARIADB_ROOT_PASSWORD` in addition to the application-user password.
     /// `None` for engines that do not use a separate root credential
-    /// (postgres, redis, keydb, mongodb).
+    /// (postgres, redis, keydb, mongodb). Stored encrypted.
+    #[serde(skip_serializing)]
     pub root_password: Option<String>,
     /// Absolute host path for the persistent data volume
     pub volume_path: Option<String>,
     /// Optional memory cap in bytes (None = no limit)
     pub memory_limit: Option<i64>,
-    /// User-supplied override for the external connection string.
+    /// User-supplied override for the external connection string (stored
+    /// encrypted: it may embed a password).
     /// When set, supersedes the auto-computed `host_port`-based string.
+    #[serde(skip_serializing)]
     pub custom_external_url: Option<String>,
-    /// User-supplied override for the internal (project-network) connection string.
+    /// User-supplied override for the internal (project-network) connection
+    /// string (stored encrypted).
     /// When set, supersedes the auto-computed container-alias-based string.
+    #[serde(skip_serializing)]
     pub custom_internal_url: Option<String>,
     /// The Docker image actually used when the container was last created or redeployed.
     /// Populated on create and on every redeploy; `None` for rows created before this
@@ -356,8 +363,9 @@ impl ManagedDatabase {
     }
 }
 
-/// Full API view for a managed database.
-/// Password is included so callers can build connection strings.
+/// API view of a managed database. Passwords are write-only: the response
+/// says whether they are set, and connection strings are masked. Read the
+/// plaintext with GET /api/databases/{id}/credentials (audit-logged).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ManagedDatabaseResponse {
     pub id: String,
@@ -368,12 +376,16 @@ pub struct ManagedDatabaseResponse {
     pub status: String,
     pub db_name: Option<String>,
     pub db_user: Option<String>,
-    pub db_password: Option<String>,
-    /// Separate root/admin password for MySQL and MariaDB.
-    /// `None` for engines that do not use a separate root credential.
-    pub root_password: Option<String>,
+    /// Whether the database has an application password
+    #[serde(default)]
+    pub has_password: bool,
+    /// Whether the database has a separate root/admin password (MySQL, MariaDB)
+    #[serde(default)]
+    pub has_root_password: bool,
     pub memory_limit: Option<i64>,
+    /// Connection-string override, with any password masked
     pub custom_external_url: Option<String>,
+    /// Connection-string override, with any password masked
     pub custom_internal_url: Option<String>,
     /// Docker image used for the running container (populated on create/redeploy)
     pub image_used: Option<String>,
@@ -397,11 +409,11 @@ impl From<ManagedDatabase> for ManagedDatabaseResponse {
             status: d.status,
             db_name: d.db_name,
             db_user: d.db_user,
-            db_password: d.db_password,
-            root_password: d.root_password,
+            has_password: d.db_password.as_deref().is_some_and(|p| !p.is_empty()),
+            has_root_password: d.root_password.as_deref().is_some_and(|p| !p.is_empty()),
             memory_limit: d.memory_limit,
-            custom_external_url: d.custom_external_url,
-            custom_internal_url: d.custom_internal_url,
+            custom_external_url: d.custom_external_url.as_deref().map(mask_url_password),
+            custom_internal_url: d.custom_internal_url.as_deref().map(mask_url_password),
             image_used: d.image_used,
             custom_image: d.custom_image,
             created_at: d.created_at,
@@ -411,18 +423,80 @@ impl From<ManagedDatabase> for ManagedDatabaseResponse {
     }
 }
 
-/// GET /api/databases/{id} response — includes generated connection strings.
+/// GET /api/databases/{id} response — includes generated connection strings,
+/// with the password masked (`mask_url_password`).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ManagedDatabaseDetail {
     #[serde(flatten)]
     pub database: ManagedDatabaseResponse,
-    /// External connection string (using host port on localhost)
+    /// External connection string (using host port on localhost), masked
     pub connection_string: Option<String>,
-    /// Connection string via the server's public address; only set when
-    /// `public_access` is on
+    /// Connection string via the server's public address, masked; only set
+    /// when `public_access` is on
     pub public_connection_string: Option<String>,
-    /// Internal connection string (using container alias within the project network)
+    /// Internal connection string (using container alias within the project
+    /// network), masked
     pub internal_connection_string: Option<String>,
+}
+
+/// GET /api/databases/{id}/credentials — the plaintext credentials and
+/// connection strings (admin only, audit-logged).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseCredentialsResponse {
+    pub db_user: Option<String>,
+    pub db_password: Option<String>,
+    /// Separate root/admin password for MySQL and MariaDB
+    pub root_password: Option<String>,
+    pub connection_string: Option<String>,
+    pub public_connection_string: Option<String>,
+    pub internal_connection_string: Option<String>,
+}
+
+/// POST /api/databases response: the (masked) detail plus the freshly
+/// generated credentials, returned once so the creator can wire them into an
+/// app (templates interpolate `${db.<name>.internal_connection_string}`).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreatedDatabaseResponse {
+    #[serde(flatten)]
+    pub detail: ManagedDatabaseDetail,
+    pub credentials: DatabaseCredentialsResponse,
+}
+
+/// Shown in place of a password.
+pub const PASSWORD_MASK: &str = "••••••••";
+
+/// Mask the password of every `scheme://user:password@host` in `url`:
+/// `postgres://app:s3cret@h:5432/db` → `postgres://app:••••••••@h:5432/db`.
+/// Userinfo without a password is kept; text without `://` is unchanged.
+pub fn mask_url_password(url: &str) -> String {
+    let mut out = String::with_capacity(url.len());
+    let mut rest = url;
+    while let Some(pos) = rest.find("://") {
+        let (before, after) = rest.split_at(pos + 3);
+        out.push_str(before);
+        let end = after
+            .find(|c: char| matches!(c, '/' | '?' | '#') || c.is_whitespace())
+            .unwrap_or(after.len());
+        let authority = &after[..end];
+        match authority.rfind('@') {
+            Some(at) => {
+                let userinfo = &authority[..at];
+                match userinfo.find(':') {
+                    Some(colon) => {
+                        out.push_str(&userinfo[..colon]);
+                        out.push(':');
+                        out.push_str(PASSWORD_MASK);
+                    }
+                    None => out.push_str(userinfo),
+                }
+                out.push_str(&authority[at..]);
+            }
+            None => out.push_str(authority),
+        }
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// POST /api/databases request body
@@ -678,5 +752,33 @@ mod tests {
             redis.root_password, None,
             "redis should not allocate a separate root password"
         );
+    }
+
+    #[test]
+    fn mask_url_password_hides_only_the_password() {
+        assert_eq!(
+            mask_url_password("postgres://app:s3cr@t@db.example.com:5432/app"),
+            format!("postgres://app:{PASSWORD_MASK}@db.example.com:5432/app")
+        );
+        assert_eq!(
+            mask_url_password("redis://default@cache:6379"),
+            "redis://default@cache:6379"
+        );
+        assert_eq!(mask_url_password("not a url"), "not a url");
+    }
+
+    #[test]
+    fn database_response_never_carries_passwords() {
+        let mut db = ManagedDatabase::new("shop".to_string(), "mysql".to_string(), None);
+        db.custom_external_url = Some("mysql://u:hunter2@h/db".to_string());
+        let password = db.db_password.clone().unwrap_or_default();
+        let root = db.root_password.clone().unwrap_or_default();
+
+        let response = ManagedDatabaseResponse::from(db);
+        let json = serde_json::to_string(&response).unwrap_or_default();
+
+        assert!(response.has_password && response.has_root_password);
+        assert!(!json.contains(&password) && !json.contains(&root));
+        assert!(!json.contains("hunter2"), "override must be masked: {json}");
     }
 }

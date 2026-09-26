@@ -15,6 +15,13 @@
 //   POST   /api/databases/{id}/start              — start container (existing container)
 //   POST   /api/databases/{id}/redeploy           — recreate container (picks up custom_image)
 //   PATCH  /api/databases/{id}/credentials        — change passwords inside the running database
+//   GET    /api/databases/{id}/credentials        — reveal passwords + connection strings (admin, audited)
+//
+// Secrets at rest: passwords and connection-string overrides are stored
+// encrypted (`secrets::seal_database`); `fetch_db` returns them decrypted for
+// use inside this module. Responses never carry them: passwords become
+// `has_password` and connection strings are masked, except in the audited
+// credentials reveal.
 //
 // Network exposure (H6): database ports are published on 127.0.0.1 unless an
 // admin turns on `public_access`, which publishes on 0.0.0.0. Docker's iptables
@@ -31,15 +38,17 @@ use tond_common::*;
 
 use crate::{
     audit_log::{AuthActor, write_audit_log},
-    auth::{AuthRole, RateLimit, RequireAuth},
+    auth::{AuthRole, RateLimit, RequireAdmin, RequireAuth},
     db_credentials::{CredentialField, container_running, password_change_step, run_step},
     docker,
     error::AppError,
+    secrets,
     state::AppState,
 };
 
 // ── Shared lookup helper ──
 
+/// Load a database with its secret columns decrypted.
 async fn fetch_db(pool: &sqlx::SqlitePool, id_or_name: &str) -> Result<ManagedDatabase, AppError> {
     let db: Option<ManagedDatabase> =
         sqlx::query_as("SELECT * FROM databases WHERE id = ? OR name = ? LIMIT 1")
@@ -47,7 +56,8 @@ async fn fetch_db(pool: &sqlx::SqlitePool, id_or_name: &str) -> Result<ManagedDa
             .bind(id_or_name)
             .fetch_optional(pool)
             .await?;
-    db.ok_or_else(|| fetch_db_error(id_or_name))
+    let db = db.ok_or_else(|| fetch_db_error(id_or_name))?;
+    Ok(secrets::open_database(db)?)
 }
 
 // ── List databases ──
@@ -61,8 +71,10 @@ pub async fn list_databases(
         sqlx::query_as("SELECT * FROM databases ORDER BY created_at DESC")
             .fetch_all(&state.db)
             .await?;
-    let responses: Vec<ManagedDatabaseResponse> =
-        dbs.into_iter().map(ManagedDatabaseResponse::from).collect();
+    let mut responses: Vec<ManagedDatabaseResponse> = Vec::with_capacity(dbs.len());
+    for db in dbs {
+        responses.push(ManagedDatabaseResponse::from(secrets::open_database(db)?));
+    }
     Ok((StatusCode::OK, Json(ApiResponse::ok(responses))))
 }
 
@@ -77,6 +89,30 @@ pub async fn get_database(
     let db = fetch_db(&state.db, &id).await?;
     let detail = build_detail(db, public_host(&state).await.as_deref());
     Ok((StatusCode::OK, Json(ApiResponse::ok(detail))))
+}
+
+/// GET /api/databases/{id}/credentials — the plaintext passwords and
+/// connection strings, for copying into an app or a client. Admin only;
+/// every reveal is audit-logged.
+pub async fn reveal_database_credentials(
+    _rate: RateLimit,
+    _admin: RequireAdmin,
+    actor: AuthActor,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let db = fetch_db(&state.db, &id).await?;
+    let credentials = credentials_response(&db, public_host(&state).await.as_deref());
+    write_audit_log(
+        &state.db,
+        None,
+        None,
+        "db_credentials_reveal",
+        &actor.0,
+        Some(&format!("name={}", db.name)),
+    )
+    .await;
+    Ok((StatusCode::OK, Json(ApiResponse::ok(credentials))))
 }
 
 /// Placeholder host shown in public connection strings when the server has no
@@ -196,12 +232,31 @@ fn exposure_for(db: &ManagedDatabase) -> docker::Exposure {
     }
 }
 
-/// Build a `ManagedDatabaseDetail` from a `ManagedDatabase` row,
-/// computing both external and internal connection strings.
+/// Plaintext connection strings of a (decrypted) database.
+struct ConnectionStrings {
+    external: Option<String>,
+    public: Option<String>,
+    internal: Option<String>,
+}
+
+/// Build a `ManagedDatabaseDetail` from a decrypted `ManagedDatabase` row,
+/// with masked connection strings (see `connection_strings`).
+fn build_detail(db: ManagedDatabase, public_host: Option<&str>) -> ManagedDatabaseDetail {
+    let strings = connection_strings(&db, public_host);
+    let mask = |s: Option<String>| s.as_deref().map(mask_url_password);
+    ManagedDatabaseDetail {
+        database: ManagedDatabaseResponse::from(db),
+        connection_string: mask(strings.external),
+        public_connection_string: mask(strings.public),
+        internal_connection_string: mask(strings.internal),
+    }
+}
+
+/// Compute the external, public and internal connection strings.
 /// If the database row has custom URL overrides set, those take precedence
 /// over the auto-computed strings. `public_host` is the server's public
 /// address, used for the public connection string when public access is on.
-fn build_detail(db: ManagedDatabase, public_host: Option<&str>) -> ManagedDatabaseDetail {
+fn connection_strings(db: &ManagedDatabase, public_host: Option<&str>) -> ConnectionStrings {
     let public_connection_string = if db.public_access {
         db.host_port.and_then(|port| {
             engine_for(&db.db_type).map(|eng| {
@@ -250,11 +305,10 @@ fn build_detail(db: ManagedDatabase, public_host: Option<&str>) -> ManagedDataba
         None
     };
 
-    ManagedDatabaseDetail {
-        database: ManagedDatabaseResponse::from(db),
-        connection_string,
-        public_connection_string,
-        internal_connection_string,
+    ConnectionStrings {
+        external: connection_string,
+        public: public_connection_string,
+        internal: internal_connection_string,
     }
 }
 
@@ -419,7 +473,8 @@ pub async fn create_database(
     db.status = "running".to_string();
     db.image_used = Some(image.to_string());
 
-    // Insert into DB
+    // Insert into DB (secret columns encrypted)
+    let sealed = secrets::seal_database(&db)?;
     sqlx::query(
         "INSERT INTO databases
             (id, name, db_type, project_id, container_id, host_port, status,
@@ -436,8 +491,8 @@ pub async fn create_database(
     .bind(&db.status)
     .bind(&db.db_name)
     .bind(&db.db_user)
-    .bind(&db.db_password)
-    .bind(&db.root_password)
+    .bind(&sealed.db_password)
+    .bind(&sealed.root_password)
     .bind(&db.volume_path)
     .bind(db.memory_limit)
     .bind(&db.image_used)
@@ -467,8 +522,32 @@ pub async fn create_database(
     )
     .await;
 
-    let detail = build_detail(db, public_host(&state).await.as_deref());
-    Ok((StatusCode::CREATED, Json(ApiResponse::ok(detail))))
+    // The creator gets the generated credentials once; later reads are masked.
+    let host = public_host(&state).await;
+    let credentials = credentials_response(&db, host.as_deref());
+    let detail = build_detail(db, host.as_deref());
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiResponse::ok(CreatedDatabaseResponse {
+            detail,
+            credentials,
+        })),
+    ))
+}
+
+fn credentials_response(
+    db: &ManagedDatabase,
+    public_host: Option<&str>,
+) -> DatabaseCredentialsResponse {
+    let strings = connection_strings(db, public_host);
+    DatabaseCredentialsResponse {
+        db_user: db.db_user.clone(),
+        db_password: db.db_password.clone(),
+        root_password: db.root_password.clone(),
+        connection_string: strings.external,
+        public_connection_string: strings.public,
+        internal_connection_string: strings.internal,
+    }
 }
 
 // ── Delete database ──
@@ -661,8 +740,8 @@ pub async fn update_database(
              updated_at           = datetime('now')
          WHERE id = ?",
     )
-    .bind(&ext_url)
-    .bind(&int_url)
+    .bind(secrets::seal_db_external_url(ext_url.as_deref())?)
+    .bind(secrets::seal_db_internal_url(int_url.as_deref())?)
     .bind(&cust_image)
     .bind(mem_limit)
     .bind(public_access)
@@ -945,8 +1024,8 @@ pub async fn update_database_credentials(
                 sqlx::query(
                     "UPDATE databases SET db_password = ?, root_password = ?, updated_at = datetime('now') WHERE id = ?",
                 )
-                .bind(password)
-                .bind(root)
+                .bind(secrets::seal_db_password(Some(password))?)
+                .bind(secrets::seal_db_root_password(root.as_deref())?)
                 .bind(&db.id)
                 .execute(&state.db)
                 .await?;
@@ -956,7 +1035,7 @@ pub async fn update_database_credentials(
                 sqlx::query(
                     "UPDATE databases SET root_password = ?, updated_at = datetime('now') WHERE id = ?",
                 )
-                .bind(password)
+                .bind(secrets::seal_db_root_password(Some(password))?)
                 .bind(&db.id)
                 .execute(&state.db)
                 .await?;
@@ -1033,6 +1112,7 @@ mod tests {
     }
 
     async fn seed_database_row(state: &AppState, db: &ManagedDatabase) {
+        let sealed = secrets::seal_database(db).unwrap_or_else(|err| panic!("seal: {err}"));
         sqlx::query(
             "INSERT INTO databases (id, name, db_type, project_id, container_id, host_port, status, db_name, db_user, db_password, root_password, volume_path, memory_limit, custom_external_url, custom_internal_url, image_used, custom_image, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1046,12 +1126,12 @@ mod tests {
         .bind(&db.status)
         .bind(&db.db_name)
         .bind(&db.db_user)
-        .bind(&db.db_password)
-        .bind(&db.root_password)
+        .bind(&sealed.db_password)
+        .bind(&sealed.root_password)
         .bind(&db.volume_path)
         .bind(db.memory_limit)
-        .bind(&db.custom_external_url)
-        .bind(&db.custom_internal_url)
+        .bind(&sealed.custom_external_url)
+        .bind(&sealed.custom_internal_url)
         .bind(&db.image_used)
         .bind(&db.custom_image)
         .bind(&db.created_at)
@@ -1096,15 +1176,21 @@ mod tests {
 
     #[test]
     fn build_detail_prefers_custom_urls_and_computes_engine_urls_when_missing() {
+        let strings = connection_strings(&sample_db(), None);
+        assert_eq!(
+            strings.external.as_deref(),
+            Some("postgres://appuser:secret@localhost:5433/appdb"),
+            "the plaintext string (reveal) carries the password"
+        );
         let detail = build_detail(sample_db(), None);
         assert_eq!(
             detail.connection_string.as_deref(),
-            Some("postgres://appuser:secret@localhost:5433/appdb"),
+            Some("postgres://appuser:••••••••@localhost:5433/appdb"),
             "build_detail should compute an external connection string from the engine config when no override is set"
         );
         assert_eq!(
             detail.internal_connection_string.as_deref(),
-            Some("postgres://appuser:secret@postgres-main:5432/appdb"),
+            Some("postgres://appuser:••••••••@postgres-main:5432/appdb"),
             "build_detail should compute an internal project-network connection string when the database belongs to a project"
         );
 
@@ -1202,12 +1288,12 @@ mod tests {
         let detail = build_detail(db.clone(), Some("tond.example.com"));
         assert_eq!(
             detail.public_connection_string.as_deref(),
-            Some("postgres://appuser:secret@tond.example.com:5433/appdb")
+            Some("postgres://appuser:••••••••@tond.example.com:5433/appdb")
         );
         let detail = build_detail(db, None);
         assert_eq!(
             detail.public_connection_string.as_deref(),
-            Some("postgres://appuser:secret@<server-ip>:5433/appdb"),
+            Some("postgres://appuser:••••••••@<server-ip>:5433/appdb"),
             "without a dashboard domain the host is an obvious placeholder"
         );
     }
@@ -1407,11 +1493,70 @@ mod tests {
     }
 
     async fn stored_password(state: &AppState, id: &str) -> Option<String> {
-        sqlx::query_scalar("SELECT db_password FROM databases WHERE id = ?")
-            .bind(id)
-            .fetch_one(&state.db)
-            .await
-            .unwrap_or_else(|err| panic!("failed to read stored password: {err}"))
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT db_password FROM databases WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap_or_else(|err| panic!("failed to read stored password: {err}"));
+        crate::secret_key::decrypt_opt(
+            crate::secret_key::Purpose::DatabasePassword,
+            stored.as_deref(),
+        )
+        .unwrap_or_else(|err| panic!("stored password does not decrypt: {err}"))
+    }
+
+    #[tokio::test]
+    async fn database_secrets_are_encrypted_at_rest_and_revealed_only_on_request() {
+        let state = test_state().await;
+        let mut db = standalone_db();
+        db.custom_external_url = Some("postgres://appuser:secret@db.example.com/appdb".to_string());
+        seed_database_row(&state, &db).await;
+
+        let raw: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT db_password, custom_external_url FROM databases WHERE id = ?")
+                .bind(&db.id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap_or_else(|err| panic!("read raw row: {err}"));
+        assert!(raw.0.as_deref().is_some_and(|v| v.starts_with("v1.")));
+        assert!(raw.1.as_deref().is_some_and(|v| v.starts_with("v1.")));
+
+        let shown = get_database(
+            RateLimit,
+            RequireAuth,
+            State(state.clone()),
+            Path(db.id.clone()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("get_database should succeed"))
+        .into_response();
+        let shown = response_json(shown).await.to_string();
+        assert!(!shown.contains("secret"), "detail must be masked: {shown}");
+
+        let revealed = reveal_database_credentials(
+            RateLimit,
+            RequireAdmin,
+            AuthActor("admin@example.com".to_string()),
+            State(state.clone()),
+            Path(db.id.clone()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("reveal should succeed"))
+        .into_response();
+        let revealed = response_json(revealed).await;
+        assert_eq!(revealed["data"]["db_password"], "secret");
+        assert_eq!(
+            revealed["data"]["connection_string"],
+            "postgres://appuser:secret@db.example.com/appdb"
+        );
+        let audits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log WHERE action = 'db_credentials_reveal'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or_else(|err| panic!("count audits: {err}"));
+        assert_eq!(audits, 1, "every reveal is audit-logged");
     }
 
     #[tokio::test]

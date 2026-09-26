@@ -7,6 +7,10 @@
 //   PATCH  /api/integrations/:id          — update integration (partial)
 //   DELETE /api/integrations/:id          — delete integration (cascades links)
 //   POST   /api/integrations/:id/test     — send a test notification
+//
+// Secret config fields (bot tokens, webhook URLs, SMTP passwords) are stored
+// encrypted and never returned: responses list them in `saved_secrets`, and a
+// PATCH that omits one keeps the saved value (see `secrets::seal_integration_config`).
 
 use axum::{
     Json,
@@ -20,7 +24,7 @@ use uuid::Uuid;
 use crate::{
     auth::{RateLimit, RequireAuth},
     error::AppError,
-    notifications,
+    notifications, secrets,
     state::AppState,
 };
 
@@ -36,28 +40,18 @@ fn validate_kind(kind: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Validate + serialise the config JSON for the given kind.
-/// Returns the canonical JSON string to store in the DB.
-fn validate_and_serialise_config(
+/// Validate the config for `kind` (merging in saved secrets from `existing`)
+/// and return the stored form, secrets encrypted.
+fn validate_and_seal_config(
     kind: &str,
     config: &serde_json::Value,
+    existing: Option<&str>,
 ) -> Result<String, AppError> {
-    let config_str = serde_json::to_string(config).map_err(|e| {
+    secrets::seal_integration_config(kind, config, existing).map_err(|e| {
         AppError(TondError::InvalidInput(format!(
-            "invalid config JSON: {}",
-            e
+            "invalid config for {kind}: {e:#}"
         )))
-    })?;
-
-    // Parse through the typed config to catch missing / wrong fields early.
-    IntegrationConfig::parse(kind, &config_str).map_err(|e| {
-        AppError(TondError::InvalidInput(format!(
-            "invalid config for {}: {}",
-            kind, e
-        )))
-    })?;
-
-    Ok(config_str)
+    })
 }
 
 // ── List ──────────────────────────────────────────────────────────────────────
@@ -105,7 +99,7 @@ pub async fn create_integration(
         )));
     }
     validate_kind(&req.kind)?;
-    let config_str = validate_and_serialise_config(&req.kind, &req.config)?;
+    let config_str = validate_and_seal_config(&req.kind, &req.config, None)?;
 
     let id = Uuid::new_v4().to_string();
 
@@ -146,7 +140,7 @@ pub async fn update_integration(
     }
 
     let config_str = match req.config {
-        Some(ref cfg) => validate_and_serialise_config(&row.kind, cfg)?,
+        Some(ref cfg) => validate_and_seal_config(&row.kind, cfg, Some(&row.config))?,
         None => row.config,
     };
 
@@ -215,8 +209,8 @@ pub async fn test_integration(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let row = fetch_integration(&state.db, &id).await?;
-    let config = IntegrationConfig::parse(&row.kind, &row.config)
-        .map_err(|e| AppError(TondError::Internal(e.to_string())))?;
+    let config = secrets::open_integration_config(&row.kind, &row.config)
+        .map_err(|e| AppError(TondError::Internal(format!("{e:#}"))))?;
 
     let payload = notifications::NotificationPayload {
         rule_name: "Test".to_string(),

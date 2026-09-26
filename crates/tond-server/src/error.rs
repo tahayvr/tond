@@ -34,6 +34,13 @@ impl From<sqlx::Error> for AppError {
     }
 }
 
+// Allow `?` on internal helpers (e.g. secret decryption) → 500 with the chain.
+impl From<anyhow::Error> for AppError {
+    fn from(e: anyhow::Error) -> Self {
+        AppError(TondError::Internal(format!("{e:#}")))
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
         let status =

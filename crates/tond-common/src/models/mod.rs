@@ -22,6 +22,9 @@ pub mod settings;
 pub mod storage;
 pub mod templates;
 
+#[cfg(test)]
+mod secret_fields_test;
+
 pub use api::*;
 pub use apps::*;
 pub use auth::*;
