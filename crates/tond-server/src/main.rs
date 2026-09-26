@@ -101,6 +101,7 @@ mod snapshot_archive;
 mod state;
 mod static_files;
 mod storage;
+mod updates;
 mod upload;
 mod uptime;
 mod volumes;
@@ -224,6 +225,10 @@ async fn run() -> Result<()> {
     // Finish what a previous process left behind (and resume queued deploys)
     // before anything new starts.
     reconcile::at_startup(&state).await;
+
+    // An update or rollback that finished while the server was down (or
+    // restored an older database) gets its audit entry now.
+    updates::audit_finished_run(&state.db, &updates::run::Paths::from_env()).await;
 
     // Background loops. Each sleeps until its next deadline or until a table
     // it watches changes (runtime/changes.rs), so an idle server barely wakes.
@@ -640,6 +645,8 @@ async fn run() -> Result<()> {
         // Host history, disk, Docker, heartbeat; uptime checks
         .merge(handlers::host::routes())
         .merge(handlers::uptime::routes())
+        // Tond updating itself: version, changelog, update/rollback runs
+        .merge(handlers::updates::routes())
         .route("/metrics", get(handlers::system_self::metrics))
         // Alerts: rules, live alerts, history, snooze, quiet hours
         .route("/api/alerts", get(handlers::alerts::list_alerts))

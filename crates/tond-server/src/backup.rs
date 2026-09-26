@@ -86,6 +86,10 @@ pub enum SnapshotTrigger {
     PreRestoreDatabase {
         db_name: String,
     },
+    /// Taken before Tond updates (or rolls back) itself (updates/run.rs)
+    PreUpdate {
+        to_version: String,
+    },
 }
 
 impl SnapshotTrigger {
@@ -95,12 +99,16 @@ impl SnapshotTrigger {
             Self::Scheduled => "scheduled",
             Self::PreDeploy { .. } => "pre_deploy",
             Self::PreRestore { .. } | Self::PreRestoreDatabase { .. } => "pre_restore",
+            Self::PreUpdate { .. } => "pre_update",
         }
     }
 
     fn scope(&self) -> String {
         match self {
-            Self::Manual { .. } | Self::Scheduled | Self::PreRestore { .. } => "full".to_string(),
+            Self::Manual { .. }
+            | Self::Scheduled
+            | Self::PreRestore { .. }
+            | Self::PreUpdate { .. } => "full".to_string(),
             Self::PreDeploy { app_name, .. } => format!("app:{}", app_name),
             Self::ManualDatabase { db_name } | Self::PreRestoreDatabase { db_name } => {
                 format!("database:{db_name}")
@@ -145,6 +153,12 @@ impl SnapshotTrigger {
             Self::PreRestoreDatabase { db_name } => {
                 format!(
                     "pre-restore {db_name} {}",
+                    Utc::now().format("%Y-%m-%d %H:%M")
+                )
+            }
+            Self::PreUpdate { to_version } => {
+                format!(
+                    "pre-update to {to_version} {}",
                     Utc::now().format("%Y-%m-%d %H:%M")
                 )
             }

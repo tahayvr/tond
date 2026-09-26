@@ -46,6 +46,11 @@ pub enum TondError {
     /// The request body (e.g. an uploaded archive) exceeds a configured limit.
     #[error("Too large: {0}")]
     PayloadTooLarge(String),
+
+    /// The action clashes with work already in progress (e.g. a second
+    /// update while one runs). The message is shown as is.
+    #[error("{0}")]
+    Conflict(String),
 }
 
 impl TondError {
@@ -57,6 +62,7 @@ impl TondError {
             TondError::InvalidInput(_) => 400,
             TondError::Forbidden(_) => 403,
             TondError::PayloadTooLarge(_) => 413,
+            TondError::Conflict(_) => 409,
             TondError::ScopeDenied { .. } => 403,
             _ => 500,
         }
@@ -96,6 +102,16 @@ mod tests {
             TondError::InvalidInput("bad".to_string()).status_code(),
             400,
             "InvalidInput should map to HTTP 400"
+        );
+        assert_eq!(
+            TondError::Conflict("busy".to_string()).status_code(),
+            409,
+            "Conflict should map to HTTP 409"
+        );
+        assert_eq!(
+            TondError::Conflict("An update is running.".to_string()).to_string(),
+            "An update is running.",
+            "Conflict messages are shown as is"
         );
         assert_eq!(
             TondError::Forbidden("admins only".to_string()).status_code(),
