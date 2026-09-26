@@ -7,11 +7,16 @@
 		listSessions,
 		revokeSession,
 		revokeAllSessions,
+		type ApiToken,
 		type SessionInfo,
 		type TotpSetup,
 		type User
 	} from '$lib/api';
 	import { getUser, setAuthenticated } from '$lib/auth.svelte';
+	import { page } from '$app/state';
+	import { passwordProblem, ROLE_LABELS } from '$lib/access';
+	import TokenList from '$lib/components/tokens/token-list.svelte';
+	import KeyIcon from '~icons/ri/key-line';
 	import { untrack } from 'svelte';
 	import { setUiContext, clearUiContext, projectsContext } from '$lib/ui-context.svelte';
 	import { Badge } from '$lib/components/ui/badge/index.js';
@@ -43,8 +48,9 @@
 			pwError = 'New passwords do not match';
 			return;
 		}
-		if (newPassword.length < 8) {
-			pwError = 'New password must be at least 8 characters';
+		const problem = passwordProblem(newPassword);
+		if (problem) {
+			pwError = problem;
 			return;
 		}
 		pwSaving = true;
@@ -211,11 +217,13 @@
 				{user?.email ?? ''}
 			</p>
 		</div>
-		<Badge variant="outline" class="font-mono text-xs uppercase">{user?.role ?? ''}</Badge>
+		<Badge variant="outline" class="font-mono text-xs uppercase">
+			{user ? (ROLE_LABELS[user.role] ?? user.role) : ''}
+		</Badge>
 	</div>
 
-	<Tabs.Root value="password">
-		<Tabs.List class="mb-6">
+	<Tabs.Root value={page.url.searchParams.get('tab') ?? 'password'}>
+		<Tabs.List class="mb-6 h-auto max-w-full flex-wrap justify-start">
 			<Tabs.Trigger value="password">
 				<KeyRound class="mr-1.5 h-3.5 w-3.5" />
 				Password
@@ -227,6 +235,10 @@
 			<Tabs.Trigger value="sessions" onclick={loadSessions}>
 				<Monitor class="mr-1.5 h-3.5 w-3.5" />
 				Sessions
+			</Tabs.Trigger>
+			<Tabs.Trigger value="tokens">
+				<KeyIcon class="mr-1.5 h-3.5 w-3.5" />
+				API tokens
 			</Tabs.Trigger>
 		</Tabs.List>
 
@@ -277,6 +289,10 @@
 				onRevoke={handleRevokeSession}
 				onRevokeAll={handleRevokeAll}
 			/>
+		</Tabs.Content>
+
+		<Tabs.Content value="tokens">
+			<TokenList initialTokens={(data.tokens as ApiToken[] | undefined) ?? []} />
 		</Tabs.Content>
 	</Tabs.Root>
 </div>

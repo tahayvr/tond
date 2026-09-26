@@ -1,62 +1,23 @@
-// auth.rs — User, Session, API keys, credentials, and all auth/TOTP request types
+// auth.rs — User, Session, password links, and all auth/TOTP request types
 
-use chrono::Utc;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use uuid::Uuid;
 
-// ── API Key ──
+use super::access::{Role, Scope};
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-pub struct ApiKey {
-    pub id: String,
-    pub name: String,
-    pub key_hash: String,
-    pub created_at: String,
-    pub last_used_at: Option<String>,
-}
-
-impl ApiKey {
-    /// Generate a new API key. Returns (ApiKey, raw_key) where raw_key is the
-    /// plaintext key that must be shown to the user exactly once.
-    pub fn generate(name: &str) -> (Self, String) {
-        let raw_key = generate_raw_key();
-        let key_hash = hash_key(&raw_key);
-        let now = Utc::now().to_rfc3339();
-
-        let api_key = Self {
-            id: Uuid::new_v4().to_string(),
-            name: name.to_string(),
-            key_hash,
-            created_at: now,
-            last_used_at: None,
-        };
-
-        (api_key, raw_key)
-    }
-}
-
-/// Generate a cryptographically random 32-byte API key, hex-encoded (64 chars).
+/// Generate a cryptographically random 32-byte secret, hex-encoded (64 chars).
 pub fn generate_raw_key() -> String {
     let mut bytes = [0u8; 32];
     rand::rng().fill(&mut bytes);
     hex::encode(bytes)
 }
 
-/// Hash an API key with SHA-256 for storage.
+/// Hash a secret (session, token, link) with SHA-256 for storage.
 pub fn hash_key(raw_key: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(raw_key.as_bytes());
     hex::encode(hasher.finalize())
-}
-
-// ── CLI credentials ──
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Credentials {
-    pub server: String,
-    pub api_key: String,
 }
 
 // ── User (dashboard account) ──
@@ -67,7 +28,7 @@ pub struct User {
     pub email: String,
     #[serde(skip_serializing)]
     pub password_hash: String,
-    pub role: String, // "admin" | "member"
+    pub role: String, // "admin" | "deployer" | "viewer" (see access.rs)
     pub created_at: String,
     pub updated_at: String,
     /// AES-GCM encrypted TOTP secret (None until 2FA is set up)
@@ -75,6 +36,24 @@ pub struct User {
     pub totp_secret_enc: Option<String>,
     /// Whether TOTP 2FA is currently active for this user (0/1 in SQLite)
     pub totp_enabled: bool,
+    /// Set while an admin has disabled the account (no sign-in, no tokens).
+    #[sqlx(default)]
+    pub disabled_at: Option<String>,
+    /// Last successful sign-in.
+    #[sqlx(default)]
+    pub last_login_at: Option<String>,
+}
+
+impl User {
+    /// The user's role (unknown values are treated as viewer).
+    pub fn role(&self) -> Role {
+        Role::from_db(&self.role)
+    }
+
+    /// Whether the account has a password yet (invited users set theirs via a link).
+    pub fn has_password(&self) -> bool {
+        !self.password_hash.is_empty()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -85,14 +64,30 @@ pub struct UserResponse {
     /// Whether TOTP 2FA is active, so the dashboard can offer "disable"
     pub totp_enabled: bool,
     pub created_at: String,
+    /// Whether an admin has disabled the account.
+    #[serde(default)]
+    pub disabled: bool,
+    /// False while an invited user hasn't set a password yet.
+    #[serde(default)]
+    pub password_set: bool,
+    #[serde(default)]
+    pub last_login_at: Option<String>,
+    /// The scopes the role grants (lets the dashboard hide what the user can't do).
+    #[serde(default)]
+    pub scopes: Vec<Scope>,
 }
 
 impl From<User> for UserResponse {
     fn from(u: User) -> Self {
+        let role = u.role();
         Self {
+            disabled: u.disabled_at.is_some(),
+            password_set: u.has_password(),
+            last_login_at: u.last_login_at,
+            scopes: role.scopes().to_vec(),
             id: u.id,
             email: u.email,
-            role: u.role,
+            role: role.as_str().to_string(),
             totp_enabled: u.totp_enabled,
             created_at: u.created_at,
         }
@@ -120,16 +115,49 @@ pub struct LoginRequest {
     pub password: String,
 }
 
-#[derive(Debug, Deserialize)]
+/// Body of POST /api/users: invite a user. No password: the response carries a
+/// one-time set-password link valid for 24 hours.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CreateUserRequest {
     pub email: String,
-    pub password: String,
     #[serde(default = "default_role")]
-    pub role: String,
+    pub role: Role,
 }
 
-fn default_role() -> String {
-    "member".to_string()
+fn default_role() -> Role {
+    Role::Viewer
+}
+
+/// Body of PATCH /api/users/{id}.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct UpdateUserRequest {
+    #[serde(default)]
+    pub role: Option<Role>,
+    #[serde(default)]
+    pub disabled: Option<bool>,
+}
+
+/// A one-time set-password link (invite or reset).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PasswordLinkResponse {
+    pub user: UserResponse,
+    /// Path + token for the dashboard, e.g. `/set-password?token=…`.
+    pub path: String,
+    pub token: String,
+    pub expires_at: String,
+}
+
+/// Body of POST /api/auth/password-link/check.
+#[derive(Debug, Deserialize)]
+pub struct PasswordLinkCheckRequest {
+    pub token: String,
+}
+
+/// Body of POST /api/auth/password-link/complete.
+#[derive(Debug, Deserialize)]
+pub struct PasswordLinkCompleteRequest {
+    pub token: String,
+    pub password: String,
 }
 
 // ── Session (dashboard login session) ──
@@ -160,6 +188,9 @@ pub struct SessionResponse {
     pub expires_at: String,
     /// Whether this is the session that made the current request
     pub is_current: bool,
+    /// When the session will end for inactivity (idle timeout).
+    #[serde(default)]
+    pub idle_expires_at: Option<String>,
 }
 
 // ── Phase 7.1 — Password & 2FA request types ──
@@ -250,25 +281,6 @@ mod tests {
     }
 
     #[test]
-    fn api_key_generate_hashes_returned_raw_key() {
-        let (api_key, raw_key) = ApiKey::generate("root");
-
-        assert_eq!(
-            api_key.name, "root",
-            "ApiKey::generate should preserve the provided key name"
-        );
-        assert_eq!(
-            api_key.key_hash,
-            hash_key(&raw_key),
-            "ApiKey::generate should store the hash of the returned raw key"
-        );
-        assert_eq!(
-            api_key.last_used_at, None,
-            "newly generated API keys should not have a last_used_at timestamp"
-        );
-    }
-
-    #[test]
     fn user_serialization_omits_password_hash() {
         let user = User {
             id: "user-1".to_string(),
@@ -279,6 +291,8 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             totp_secret_enc: Some("encrypted".to_string()),
             totp_enabled: true,
+            disabled_at: None,
+            last_login_at: None,
         };
 
         let serialized = serde_json::to_value(&user)
@@ -292,16 +306,16 @@ mod tests {
     }
 
     #[test]
-    fn create_user_request_defaults_role_to_member() {
+    fn create_user_request_defaults_role_to_viewer() {
         let request: CreateUserRequest = serde_json::from_value(serde_json::json!({
-            "email": "member@example.com",
-            "password": "hunter2"
+            "email": "viewer@example.com"
         }))
         .unwrap_or_else(|err| panic!("failed to deserialize CreateUserRequest: {err}"));
 
         assert_eq!(
-            request.role, "member",
-            "CreateUserRequest should default role to member"
+            request.role,
+            Role::Viewer,
+            "CreateUserRequest should default role to viewer"
         );
     }
 
@@ -316,6 +330,8 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             totp_secret_enc: Some("encrypted".to_string()),
             totp_enabled: true,
+            disabled_at: None,
+            last_login_at: None,
         };
 
         let response = UserResponse::from(user);
@@ -353,6 +369,7 @@ mod tests {
             last_used_at: Some("2026-01-01T01:00:00Z".to_string()),
             expires_at: "2026-01-08T00:00:00Z".to_string(),
             is_current: true,
+            idle_expires_at: None,
         };
 
         let roundtrip: SessionResponse = serde_json::from_value(

@@ -42,11 +42,13 @@
 	interface Props {
 		dbId: string;
 		dbName: string;
-		/** Admins can restore; everyone can back up */
+		/** snapshots:restore */
 		canRestore: boolean;
+		/** snapshots:create */
+		canBackup?: boolean;
 	}
 
-	let { dbId, dbName, canRestore }: Props = $props();
+	let { dbId, dbName, canRestore, canBackup = true }: Props = $props();
 
 	let backups = $state<Snapshot[]>([]);
 	let loading = $state(true);
@@ -145,7 +147,7 @@
 				data in {dbName}; the current data is backed up first, so a restore can be undone.
 			</p>
 		</div>
-		<Button size="sm" disabled={backingUp} onclick={handleBackup}>
+		<Button size="sm" disabled={backingUp || !canBackup} onclick={handleBackup}>
 			<ArchiveIcon class="size-4" />
 			{backingUp ? 'Backing up…' : 'Back up now'}
 		</Button>
@@ -220,7 +222,7 @@
 		</ul>
 		{#if !canRestore}
 			<p class="flex items-center gap-1.5 text-xs text-muted-foreground">
-				<LockIcon class="size-3.5" /> Only admins can restore a database.
+				<LockIcon class="size-3.5" /> Your role can't restore databases.
 			</p>
 		{/if}
 	{/if}

@@ -34,6 +34,7 @@
 	import Breadcrumb from '$lib/components/nav/breadcrumb.svelte';
 	import ConfirmDeleteDialog from '$lib/components/dialogs/confirm-delete-dialog.svelte';
 	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
+	import MetricsPanel from '$lib/components/metrics/metrics-panel.svelte';
 	import { SvelteSet } from 'svelte/reactivity';
 	import { untrack } from 'svelte';
 	import Eye from '~icons/ri/eye-line';
@@ -44,7 +45,7 @@
 	import GlobeIcon from '~icons/ri/global-line';
 	import LockIcon from '~icons/ri/lock-line';
 	import AlertIcon from '~icons/ri/alert-line';
-	import { isAdmin } from '$lib/auth.svelte';
+	import { can, isAdmin } from '$lib/auth.svelte';
 	import type { PageProps } from './$types';
 
 	let { data, params }: PageProps = $props();
@@ -54,6 +55,7 @@
 	};
 
 	let db = $state<ManagedDatabaseDetail | null>(null);
+	let activeTab = $state('overview');
 	let error = $state('');
 	let projects = $state<Project[]>([]);
 	let showDeleteDialog = $state(false);
@@ -677,12 +679,13 @@
 		<Separator />
 
 		<!-- Tabs -->
-		<Tabs.Root value="overview">
-			<Tabs.List>
+		<Tabs.Root bind:value={activeTab}>
+			<Tabs.List class="max-w-full justify-start overflow-x-auto">
 				<Tabs.Trigger value="overview">Overview</Tabs.Trigger>
 				<Tabs.Trigger value="environment">Environment</Tabs.Trigger>
 				<Tabs.Trigger value="backups">Backups</Tabs.Trigger>
 				<Tabs.Trigger value="limits">Limits</Tabs.Trigger>
+				<Tabs.Trigger value="metrics">Metrics</Tabs.Trigger>
 			</Tabs.List>
 
 			<!-- ── Overview tab ── -->
@@ -764,7 +767,7 @@
 										value={db.connection_string}
 										plain={creds?.connection_string}
 										reveal={revealCreds}
-										canReveal={isAdmin()}
+										canReveal={can('db:credentials')}
 									/>
 									{#if db.custom_external_url}
 										<span class="mt-1 block text-xs text-muted-foreground/60">custom override</span>
@@ -835,7 +838,7 @@
 										value={db.internal_connection_string}
 										plain={creds?.internal_connection_string}
 										reveal={revealCreds}
-										canReveal={isAdmin()}
+										canReveal={can('db:credentials')}
 									/>
 									{#if db.custom_internal_url}
 										<span class="mt-1 block text-xs text-muted-foreground/60">custom override</span>
@@ -978,7 +981,7 @@
 									value={db.public_connection_string}
 									plain={creds?.public_connection_string}
 									reveal={revealCreds}
-									canReveal={isAdmin()}
+									canReveal={can('db:credentials')}
 								/>
 								{#if db.public_connection_string.includes('<server-ip>')}
 									<p class="text-xs text-muted-foreground/70">
@@ -1101,10 +1104,10 @@
 					>
 						<p class="mb-1">
 							Passwords are stored encrypted and stay hidden.
-							{#if isAdmin()}
+							{#if can('db:credentials')}
 								Revealing or copying one is recorded in Activity.
 							{:else}
-								Only admins can reveal them.
+								Your role can't reveal them.
 							{/if}
 						</p>
 						{#if isRedisLike}
@@ -1156,7 +1159,7 @@
 										</td>
 										<td class="px-3 py-2">
 											<div class="flex items-center justify-end gap-1">
-												{#if v.value || (v.secret && isAdmin())}
+												{#if v.value || (v.secret && can('db:credentials'))}
 													<Button
 														variant="ghost"
 														size="icon"
@@ -1225,7 +1228,8 @@
 								variant="ghost"
 								size="sm"
 								class="h-6 px-2 text-xs"
-								disabled={revealingCreds || (!isAdmin() && envVars.some((v) => v.secret))}
+								disabled={revealingCreds ||
+									(!can('db:credentials') && envVars.some((v) => v.secret))}
 								onclick={() =>
 									copyEnvVar(
 										() => envVars.map((v) => `${v.envKey}=${v.value ?? ''}`).join('\n'),
@@ -1251,7 +1255,12 @@
 
 			<!-- ── Backups tab ── -->
 			<Tabs.Content value="backups" class="mt-4">
-				<DatabaseBackups dbId={db.id} dbName={db.name} canRestore={isAdmin()} />
+				<DatabaseBackups
+					dbId={db.id}
+					dbName={db.name}
+					canRestore={can('snapshots:restore')}
+					canBackup={can('snapshots:create')}
+				/>
 			</Tabs.Content>
 
 			<!-- ── Limits tab ── -->
@@ -1300,6 +1309,15 @@
 						{/if}
 					</div>
 				</div>
+			</Tabs.Content>
+
+			<!-- ── Metrics tab (mounted only while open, so it polls only then) ── -->
+			<Tabs.Content value="metrics">
+				{#if activeTab === 'metrics'}
+					{#key db.id}
+						<MetricsPanel owner="databases" id={db.id} noun="database" />
+					{/key}
+				{/if}
 			</Tabs.Content>
 		</Tabs.Root>
 	</div>

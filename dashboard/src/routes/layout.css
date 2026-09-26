@@ -2,13 +2,10 @@
 
 @import 'tw-animate-css';
 
-@font-face {
-	font-family: 'JetBrains Mono';
-	src: url('$lib/assets/fonts/JetBrainsMonoNerdFontMono-Regular.ttf') format('truetype');
-	font-weight: 400;
-	font-style: normal;
-	font-display: swap;
-}
+/* JetBrains Mono as a variable WOFF2 split by unicode-range: browsers fetch
+   only the subsets a page uses (Latin is ~40 KB) instead of the 2.5 MB Nerd
+   Font TTF this replaced. */
+@import '@fontsource-variable/jetbrains-mono/index.css';
 
 @custom-variant dark (&:is(.dark *));
 
@@ -86,8 +83,8 @@
 }
 
 @theme inline {
-	--font-sans: 'JetBrains Mono', ui-monospace, monospace;
-	--font-mono: 'JetBrains Mono', ui-monospace, monospace;
+	--font-sans: 'JetBrains Mono Variable', ui-monospace, monospace;
+	--font-mono: 'JetBrains Mono Variable', ui-monospace, monospace;
 	--radius-sm: calc(var(--radius) - 4px);
 	--radius-md: calc(var(--radius) - 2px);
 	--radius-lg: var(--radius);

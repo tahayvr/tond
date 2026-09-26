@@ -14,7 +14,7 @@
 		id: string;
 		/** Fetch the plaintext from the server */
 		reveal: () => Promise<string>;
-		/** Whether the current user may reveal (admins) */
+		/** Whether the current user may reveal (holds the reveal scope) */
 		canReveal: boolean;
 		/** A plaintext value the parent already holds (e.g. just rotated) */
 		value?: string | null;
@@ -28,7 +28,7 @@
 		reveal,
 		canReveal,
 		value = $bindable(null),
-		lockedHint = 'Only admins can reveal this.',
+		lockedHint = "Your role can't reveal this.",
 		class: className
 	}: Props = $props();
 

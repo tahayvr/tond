@@ -112,13 +112,17 @@ pub async fn handle(client: &TondClient, action: DbAction) -> Result<()> {
             if let Some(port) = db.database.host_port {
                 println!("Port:   {}", port);
             }
-            if let Some(ref cs) = created.credentials.connection_string {
+            if let Some(ref cs) = created
+                .credentials
+                .as_ref()
+                .and_then(|c| c.connection_string.as_ref())
+            {
                 println!("Conn:   {}", cs);
+                println!(
+                    "The password is shown once. Later: tond db credentials {}",
+                    db.database.name
+                );
             }
-            println!(
-                "The password is shown once. Later: tond db credentials {}",
-                db.database.name
-            );
         }
 
         DbAction::Info { name } => {

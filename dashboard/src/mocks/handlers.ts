@@ -29,6 +29,8 @@ import {
 	MOCK_PREVIEWS,
 	MOCK_PROJECT_PREVIEWS,
 	MOCK_AUDIT_LOG,
+	MOCK_TOKEN_CATALOG,
+	MOCK_TOKENS,
 	MOCK_DATABASES,
 	MOCK_CRON_JOBS,
 	MOCK_CRON_RUNS,
@@ -44,7 +46,7 @@ import {
 	MOCK_PREVIEW_ENV_VARS,
 	MOCK_CERTIFICATES,
 	makeMockSystemMetrics,
-	makeMockAppMetrics,
+	makeMockMetrics,
 	MOCK_DATABASE_SECRETS
 } from './fixtures';
 import type {
@@ -82,9 +84,28 @@ function ok<T>(data: T) {
 	return HttpResponse.json({ success: true, data, error: null });
 }
 
-function err(message: string, status = 400) {
-	return HttpResponse.json({ success: false, data: null, error: message }, { status });
+function err(message: string, status = 400, code?: string) {
+	return HttpResponse.json(
+		{ success: false, data: null, error: message, ...(code ? { code } : {}) },
+		{ status }
+	);
 }
+
+/** The mock password policy: 12–256 characters, no common passwords. */
+function mockPasswordProblem(password: string): string | null {
+	const n = [...password].length;
+	if (n < 12)
+		return "Use at least 12 characters. A few random words make a strong password that's easy to remember.";
+	if (n > 256) return 'Use at most 256 characters.';
+	const core = password.toLowerCase().replace(/^[\d\W]+|[\d\W]+$/g, '');
+	if (['password', 'qwerty', 'iloveyou', 'welcome', 'admin', 'letmein'].includes(core)) {
+		return "This password is too common: it's on lists of breached passwords that attackers try first. Pick something unique, like a few random words.";
+	}
+	return null;
+}
+
+/** Valid set-password link token in the mock (any other token is refused). */
+const MOCK_PASSWORD_LINK = 'mock-link';
 
 // ── Mock helpers mirroring server-side confinement rules ─────────────────────
 
@@ -429,6 +450,8 @@ function webhookConfig(app: App) {
 	};
 }
 let users = structuredClone(MOCK_USERS);
+let apiTokens = structuredClone(MOCK_TOKENS);
+const auditLog = structuredClone(MOCK_AUDIT_LOG);
 let integrations: Integration[] = structuredClone(MOCK_INTEGRATIONS);
 let storageProviders: StorageProvider[] = structuredClone(MOCK_STORAGE_PROVIDERS);
 let snapshots: Snapshot[] = structuredClone(MOCK_SNAPSHOTS);
@@ -619,9 +642,243 @@ export const handlers = [
 		return ok({ user: MOCK_USER });
 	}),
 
-	http.get('/api/auth/users', async () => {
+	// ── Users (users:admin) ───────────────────────────────────────────────────
+
+	http.get('/api/users', async () => {
 		await delay(LATENCY);
 		return ok(users);
+	}),
+
+	http.post('/api/users', async ({ request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as { email?: string; role?: string };
+		const email = body.email?.trim() ?? '';
+		if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+			return err('Invalid input: Enter a valid email address, like name@example.com.', 400);
+		}
+		if (users.some((u) => u.email.toLowerCase() === email.toLowerCase())) {
+			return err(`App already exists: a user with the email ${email}`, 409);
+		}
+		const role = (body.role ?? 'viewer') as 'admin' | 'deployer' | 'viewer';
+		const newUser = {
+			id: `usr_${Date.now()}`,
+			email,
+			role,
+			totp_enabled: false,
+			created_at: new Date().toISOString(),
+			disabled: false,
+			password_set: false,
+			last_login_at: null,
+			scopes: [],
+			active_sessions: 0,
+			is_you: false
+		};
+		users = [...users, newUser];
+		return HttpResponse.json(
+			{
+				success: true,
+				data: {
+					user: newUser,
+					token: MOCK_PASSWORD_LINK,
+					path: `/set-password?token=${MOCK_PASSWORD_LINK}`,
+					expires_at: new Date(Date.now() + 86400_000).toISOString()
+				},
+				error: null
+			},
+			{ status: 201 }
+		);
+	}),
+
+	http.patch('/api/users/:id', async ({ params, request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as { role?: string; disabled?: boolean };
+		const target = users.find((u) => u.id === params.id);
+		if (!target) return err('Not found: user', 404);
+		if (target.is_you) {
+			return err(
+				"Invalid input: You can't change your own role or disable yourself. Ask another admin."
+			);
+		}
+		users = users.map((u) =>
+			u.id === params.id
+				? {
+						...u,
+						role: (body.role as typeof u.role) ?? u.role,
+						disabled: body.disabled ?? u.disabled,
+						active_sessions: 0
+					}
+				: u
+		);
+		return ok(users.find((u) => u.id === params.id));
+	}),
+
+	http.delete('/api/users/:id', async ({ params }) => {
+		await delay(LATENCY);
+		const target = users.find((u) => u.id === params.id);
+		if (!target) return err('Not found: user', 404);
+		if (target.is_you)
+			return err("Invalid input: You can't delete your own account. Ask another admin.");
+		users = users.filter((u) => u.id !== params.id);
+		return ok({ deleted: params.id });
+	}),
+
+	http.post('/api/users/:id/password-link', async ({ params }) => {
+		await delay(LATENCY);
+		const target = users.find((u) => u.id === params.id);
+		if (!target) return err('Not found: user', 404);
+		return HttpResponse.json(
+			{
+				success: true,
+				data: {
+					user: target,
+					token: MOCK_PASSWORD_LINK,
+					path: `/set-password?token=${MOCK_PASSWORD_LINK}`,
+					expires_at: new Date(Date.now() + 86400_000).toISOString()
+				},
+				error: null
+			},
+			{ status: 201 }
+		);
+	}),
+
+	http.get('/api/users/:id/sessions', async ({ params }) => {
+		await delay(LATENCY);
+		const target = users.find((u) => u.id === params.id);
+		if (!target) return err('Not found: user', 404);
+		return ok(
+			Array.from({ length: target.active_sessions }, (_, i) => ({
+				id: `sess_${target.id}_${i}`,
+				user_agent:
+					i === 0
+						? 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/128.0'
+						: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5) Safari/604.1',
+				ip_address: i === 0 ? '198.51.100.7' : '192.0.2.18',
+				created_at: new Date(Date.now() - (i + 1) * 5 * 3600_000).toISOString(),
+				last_used_at: new Date(Date.now() - (i + 1) * 20 * 60_000).toISOString(),
+				expires_at: new Date(Date.now() + 29 * 86400_000).toISOString(),
+				idle_expires_at: new Date(Date.now() + 11 * 3600_000).toISOString(),
+				is_current: target.is_you && i === 0
+			}))
+		);
+	}),
+
+	http.delete('/api/users/:id/sessions', async ({ params }) => {
+		await delay(LATENCY);
+		const target = users.find((u) => u.id === params.id);
+		if (!target) return err('Not found: user', 404);
+		const revoked = target.is_you ? target.active_sessions - 1 : target.active_sessions;
+		users = users.map((u) =>
+			u.id === params.id ? { ...u, active_sessions: u.active_sessions - revoked } : u
+		);
+		return ok({ revoked });
+	}),
+
+	http.delete('/api/users/:id/sessions/:sessionId', async ({ params }) => {
+		await delay(LATENCY);
+		users = users.map((u) =>
+			u.id === params.id ? { ...u, active_sessions: Math.max(0, u.active_sessions - 1) } : u
+		);
+		return ok({ revoked: 1 });
+	}),
+
+	// ── Set-password links (public) ───────────────────────────────────────────
+
+	http.post('/api/auth/password-link/check', async ({ request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as { token?: string };
+		if (body.token !== MOCK_PASSWORD_LINK) {
+			return err(
+				'This link is invalid, has expired or was already used. Ask an admin of this server for a new one.',
+				403
+			);
+		}
+		return ok({
+			email: 'victor@example.com',
+			purpose: 'invite',
+			expires_at: new Date(Date.now() + 20 * 3600_000).toISOString()
+		});
+	}),
+
+	http.post('/api/auth/password-link/complete', async ({ request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as { token?: string; password?: string };
+		if (body.token !== MOCK_PASSWORD_LINK) {
+			return err(
+				'This link is invalid, has expired or was already used. Ask an admin of this server for a new one.',
+				403
+			);
+		}
+		const problem = mockPasswordProblem(body.password ?? '');
+		if (problem) return err(problem, 400);
+		mockSignedIn = true;
+		return ok({ signed_in: true, user: currentMockUser() });
+	}),
+
+	// ── API tokens ────────────────────────────────────────────────────────────
+
+	http.get('/api/tokens/catalog', async () => {
+		await delay(LATENCY);
+		return ok(MOCK_TOKEN_CATALOG);
+	}),
+
+	http.get('/api/tokens', async () => {
+		await delay(LATENCY);
+		return ok(apiTokens);
+	}),
+
+	http.post('/api/tokens', async ({ request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as {
+			name?: string;
+			kind?: string;
+			scopes?: string[];
+			app_ids?: string[];
+			project_ids?: string[];
+			allowed_ips?: string[];
+			expires_in_hours?: number;
+		};
+		if (!body.name?.trim()) {
+			return err(
+				'Invalid input: Give the token a name, e.g. the machine or workflow that uses it.'
+			);
+		}
+		if (!body.scopes?.length) return err('Invalid input: Choose at least one scope or a preset.');
+		const hex = Array.from({ length: 64 }, () => Math.floor(Math.random() * 16).toString(16)).join(
+			''
+		);
+		const secret = `tond_pat_${hex}`;
+		const hours = body.expires_in_hours ?? 24 * 90;
+		const token = {
+			id: `tok_${Date.now()}`,
+			name: body.name.trim(),
+			prefix: secret.slice(0, 17),
+			kind: (body.kind ?? 'personal') as 'personal' | 'service' | 'agent' | 'ci',
+			scopes: body.scopes,
+			app_ids: body.app_ids ?? [],
+			project_ids: body.project_ids ?? [],
+			allowed_ips: body.allowed_ips ?? [],
+			owner_id: MOCK_USER.id,
+			owner_label: MOCK_USER.email,
+			expires_at: hours === 0 ? null : new Date(Date.now() + hours * 3600_000).toISOString(),
+			last_used_at: null,
+			last_used_ip: null,
+			revoked_at: null,
+			created_at: new Date().toISOString()
+		};
+		apiTokens = [token, ...apiTokens];
+		return HttpResponse.json(
+			{ success: true, data: { token, secret }, error: null },
+			{ status: 201 }
+		);
+	}),
+
+	http.delete('/api/tokens/:id', async ({ params }) => {
+		await delay(LATENCY);
+		const token = apiTokens.find((t) => t.id === params.id);
+		if (!token) return err('Not found: token', 404);
+		const updated = { ...token, revoked_at: token.revoked_at ?? new Date().toISOString() };
+		apiTokens = apiTokens.map((t) => (t.id === params.id ? updated : t));
+		return ok(updated);
 	}),
 
 	http.get('/api/terminal/targets', async () => {
@@ -704,20 +961,6 @@ export const handlers = [
 		);
 	}),
 
-	http.post('/api/auth/users', async ({ request }) => {
-		await delay(LATENCY);
-		const body = (await request.json()) as { email: string; role?: string };
-		const newUser = {
-			id: `usr_${Date.now()}`,
-			email: body.email,
-			role: body.role ?? 'member',
-			totp_enabled: false,
-			created_at: new Date().toISOString()
-		};
-		users = [...users, newUser];
-		return ok(newUser);
-	}),
-
 	// ── Phase 7.1 — Password Management ─────────────────────────────────────
 
 	http.post('/api/auth/change-password', async ({ request }) => {
@@ -729,9 +972,8 @@ export const handlers = [
 		if (body.current_password === 'wrong') {
 			return err('Current password is incorrect', 401);
 		}
-		if ((body.new_password?.length ?? 0) < 8) {
-			return err('New password must be at least 8 characters', 400);
-		}
+		const problem = mockPasswordProblem(body.new_password ?? '');
+		if (problem) return err(problem, 400);
 		return ok({ message: 'Password changed successfully' });
 	}),
 
@@ -744,7 +986,8 @@ export const handlers = [
 				ip_address: '127.0.0.1',
 				created_at: new Date(Date.now() - 3600_000).toISOString(),
 				last_used_at: new Date().toISOString(),
-				expires_at: new Date(Date.now() + 82800_000).toISOString(),
+				expires_at: new Date(Date.now() + 29 * 86400_000).toISOString(),
+				idle_expires_at: new Date(Date.now() + 12 * 3600_000).toISOString(),
 				is_current: true
 			},
 			{
@@ -753,7 +996,8 @@ export const handlers = [
 				ip_address: '192.168.1.42',
 				created_at: new Date(Date.now() - 86400_000).toISOString(),
 				last_used_at: new Date(Date.now() - 7200_000).toISOString(),
-				expires_at: new Date(Date.now() + 3600_000).toISOString(),
+				expires_at: new Date(Date.now() + 20 * 86400_000).toISOString(),
+				idle_expires_at: new Date(Date.now() + 10 * 3600_000).toISOString(),
 				is_current: false
 			}
 		]);
@@ -1560,11 +1804,23 @@ export const handlers = [
 
 	// ── Metrics ───────────────────────────────────────────────────────────────
 
-	http.get('/api/apps/:id/metrics', async ({ request }) => {
+	// Stopped / never-deployed apps have no samples (shows the empty state).
+	http.get('/api/apps/:id/metrics', async ({ request, params }) => {
 		await delay(LATENCY);
-		const url = new URL(request.url);
-		const period = url.searchParams.get('period') ?? '1h';
-		return ok(makeMockAppMetrics(period));
+		const range = new URL(request.url).searchParams.get('range') ?? '1h';
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
+		const measured = app?.status === 'running' || app?.status === 'unhealthy';
+		return ok(makeMockMetrics(range, !measured));
+	}),
+
+	http.get('/api/databases/:id/metrics', async ({ request }) => {
+		await delay(LATENCY);
+		return ok(makeMockMetrics(new URL(request.url).searchParams.get('range') ?? '1h'));
+	}),
+
+	http.get('/api/cron/:id/metrics', async ({ request }) => {
+		await delay(LATENCY);
+		return ok(makeMockMetrics(new URL(request.url).searchParams.get('range') ?? '1h', true));
 	}),
 
 	http.get('/api/system/metrics', async () => {
@@ -1750,14 +2006,51 @@ export const handlers = [
 
 	// ── Audit Log ─────────────────────────────────────────────────────────────
 
+	// Same filters as the server, applied before the limit.
 	http.get('/api/audit-log', async ({ request }) => {
 		await delay(LATENCY);
-		const url = new URL(request.url);
-		const appId = url.searchParams.get('app_id');
-		const limit = parseInt(url.searchParams.get('limit') ?? '50', 10);
-		let entries = MOCK_AUDIT_LOG;
-		if (appId) entries = entries.filter((e) => e.app_id === appId);
-		return ok(entries.slice(0, limit));
+		const p = new URL(request.url).searchParams;
+		const limit = Math.min(Math.max(parseInt(p.get('limit') ?? '50', 10) || 50, 1), 200);
+		const before = p.get('before') ? Number(p.get('before')) : null;
+		const actor = p.get('actor');
+		const action = p.get('action');
+		const resourceType = p.get('resource_type');
+		const resourceId = p.get('resource_id');
+		const outcome = p.get('outcome');
+		const q = p.get('q')?.toLowerCase();
+		const matches = auditLog.filter(
+			(e) =>
+				(before === null || e.seq < before) &&
+				(!actor || e.actor_label === actor) &&
+				(!action ||
+					(action.endsWith('*')
+						? e.action.startsWith(action.slice(0, -1))
+						: e.action === action)) &&
+				(!resourceType || e.resource_type === resourceType) &&
+				(!resourceId || e.resource_id === resourceId) &&
+				(!outcome || e.outcome === outcome) &&
+				(!q ||
+					[e.actor_label, e.action, e.resource_name ?? '', e.detail ?? ''].some((f) =>
+						f.toLowerCase().includes(q)
+					))
+		);
+		const entries = matches.slice(0, limit);
+		const nextBefore = matches.length > limit ? entries[entries.length - 1].seq : null;
+		return ok({ entries, next_before: nextBefore });
+	}),
+
+	http.get('/api/audit-log/verify', async () => {
+		await delay(LATENCY * 2);
+		const seqs = auditLog.map((e) => e.seq);
+		return ok({
+			ok: true,
+			checked: auditLog.length,
+			checkpoint_seq: Math.min(...seqs) - 1,
+			first_seq: Math.min(...seqs),
+			last_seq: Math.max(...seqs),
+			broken_at: null,
+			problem: null
+		});
 	}),
 
 	// ── App Logs (REST fallback — real traffic uses WebSocket) ────────────────

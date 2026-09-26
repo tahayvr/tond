@@ -72,17 +72,16 @@ describe('setup page', () => {
 		expect(screen.queryByLabelText('email')).not.toBeInTheDocument();
 	});
 
-	it('shows password requirement feedback as the password becomes valid', async () => {
+	it('shows the length-based policy without composition rules', async () => {
 		const user = userEvent.setup();
 		render(SetupPage);
 
-		await user.type(await screen.findByLabelText('password'), 'StrongPassword1!');
+		await user.type(await screen.findByLabelText('password'), 'purple otter lamp');
 
 		expect(screen.getByText(/at least 12 characters/i)).toBeInTheDocument();
-		expect(screen.getByText(/one uppercase letter/i)).toBeInTheDocument();
-		expect(screen.getByText(/one lowercase letter/i)).toBeInTheDocument();
-		expect(screen.getByText(/one number/i)).toBeInTheDocument();
-		expect(screen.getByText(/one special character/i)).toBeInTheDocument();
+		expect(screen.getByText(/common or breached password/i)).toBeInTheDocument();
+		expect(screen.queryByText(/uppercase/i)).not.toBeInTheDocument();
+		expect(screen.queryByText(/special character/i)).not.toBeInTheDocument();
 	});
 
 	it('blocks submission when the password is too weak', async () => {
@@ -94,7 +93,9 @@ describe('setup page', () => {
 		await user.type(screen.getByLabelText(/confirm password/i), 'weak');
 		await user.click(screen.getByRole('button', { name: /create admin account/i }));
 
-		expect(await screen.findByText(/password does not meet all requirements/i)).toBeInTheDocument();
+		expect(
+			await screen.findByText(/at least 12 characters\. a few random words/i)
+		).toBeInTheDocument();
 		expect(setupAdmin).not.toHaveBeenCalled();
 	});
 

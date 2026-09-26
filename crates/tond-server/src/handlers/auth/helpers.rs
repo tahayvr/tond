@@ -12,8 +12,6 @@ use tond_common::{generate_raw_key, hash_key};
 use super::session::{MFA_PENDING_COOKIE, SESSION_COOKIE};
 use crate::secret_key::{self, Purpose};
 
-/// Session lifetime (cookie Max-Age and DB expiry).
-pub(super) const SESSION_TTL_SECS: i64 = 24 * 60 * 60;
 /// How long a password-verified login may wait for its 2FA code.
 pub(super) const MFA_PENDING_TTL_SECS: i64 = 10 * 60;
 /// Wrong 2FA codes allowed per pending login before the password is needed again.
@@ -108,20 +106,22 @@ pub(super) fn normalize_email(email: &str) -> String {
 }
 
 /// Create a session for a user and return the session token.
-/// Only the SHA-256 hash of the token is stored.
+/// Only the SHA-256 hash of the token is stored. `expires_at` is the absolute
+/// limit (`max_age_days`); the idle timeout is enforced on validation.
 /// Captures the optional User-Agent and IP address for session listing.
 pub(super) async fn create_session<'e, E>(
     executor: E,
     user_id: &str,
     user_agent: Option<&str>,
     ip_address: Option<&str>,
+    max_age_days: i64,
 ) -> Result<String, sqlx::Error>
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
     let token = generate_raw_key();
     let now = Utc::now();
-    let expires = now + Duration::seconds(SESSION_TTL_SECS);
+    let expires = now + Duration::days(max_age_days.max(1));
 
     sqlx::query(
         "INSERT INTO sessions (id, user_id, expires_at, created_at, user_agent, ip_address, last_used_at)
@@ -173,9 +173,10 @@ fn host_cookie(name: &str, value: &str, max_age_secs: i64) -> String {
     format!("{name}={value}; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age_secs}")
 }
 
-/// Build a Set-Cookie header value for the session token.
-pub(super) fn session_cookie(token: &str) -> String {
-    host_cookie(SESSION_COOKIE, token, SESSION_TTL_SECS)
+/// Build a Set-Cookie header value for the session token (lives as long as
+/// the session's absolute limit; the server ends idle sessions earlier).
+pub(super) fn session_cookie(token: &str, max_age_days: i64) -> String {
+    host_cookie(SESSION_COOKIE, token, max_age_days.max(1) * 24 * 60 * 60)
 }
 
 /// Build a Set-Cookie header that clears the session cookie.
@@ -345,7 +346,7 @@ mod tests {
         .await
         .unwrap_or_else(|err| panic!("failed to seed user for session test: {err}"));
 
-        let token = create_session(&pool, "user-1", Some("curl/8.0"), Some("127.0.0.1"))
+        let token = create_session(&pool, "user-1", Some("curl/8.0"), Some("127.0.0.1"), 30)
             .await
             .unwrap_or_else(|err| panic!("failed to create session: {err}"));
 
@@ -412,7 +413,7 @@ mod tests {
     #[test]
     fn session_cookie_helpers_generate_host_prefixed_strict_cookies() {
         assert_eq!(
-            session_cookie("token-123"),
+            session_cookie("token-123", 1),
             "__Host-tond_session=token-123; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400"
         );
         assert_eq!(

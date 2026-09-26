@@ -957,10 +957,13 @@ async fn create_template_dependencies(
                 None,
             )
             .await?;
-        created.push(CreatedTemplateDependency {
-            name,
-            credentials: created_db.credentials,
-        });
+        let credentials = created_db.credentials.ok_or_else(|| {
+            anyhow::anyhow!(
+                "created database '{name}', but this token may not read database credentials \
+                 (db:credentials), which the template needs"
+            )
+        })?;
+        created.push(CreatedTemplateDependency { name, credentials });
     }
 
     Ok(created)

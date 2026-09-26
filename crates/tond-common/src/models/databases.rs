@@ -455,11 +455,12 @@ pub struct DatabaseCredentialsResponse {
 /// POST /api/databases response: the (masked) detail plus the freshly
 /// generated credentials, returned once so the creator can wire them into an
 /// app (templates interpolate `${db.<name>.internal_connection_string}`).
+/// `credentials` is null for callers without `db:credentials`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreatedDatabaseResponse {
     #[serde(flatten)]
     pub detail: ManagedDatabaseDetail,
-    pub credentials: DatabaseCredentialsResponse,
+    pub credentials: Option<DatabaseCredentialsResponse>,
 }
 
 /// Shown in place of a password.

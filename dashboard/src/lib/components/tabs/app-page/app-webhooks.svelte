@@ -7,7 +7,7 @@
 		type WebhookConfig,
 		type WebhookUrls
 	} from '$lib/api';
-	import { isAdmin } from '$lib/auth.svelte';
+	import { can } from '$lib/auth.svelte';
 	import RevealableSecret from '$lib/components/secrets/revealable-secret.svelte';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
@@ -209,9 +209,9 @@
 				<RevealableSecret
 					id="webhook-secret-value"
 					reveal={handleReveal}
-					canReveal={isAdmin()}
+					canReveal={can('env:read-values')}
 					bind:value={revealedSecret}
-					lockedHint="Only admins can reveal the secret. Rotate it to get a new one you can copy."
+					lockedHint="Your role can't reveal the secret. Rotate it to get a new one you can copy."
 				/>
 			</div>
 		</div>

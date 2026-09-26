@@ -2,7 +2,7 @@
 //
 // TondClient wraps reqwest::Client and provides one async method per API
 // endpoint. All methods:
-//   - Attach the Authorization: Bearer <key> header if an API key is set
+//   - Attach the Authorization: Bearer <token> header if an API token is set
 //   - Deserialise the response into ApiResponse<T>
 //   - Return the inner data on success, or bail with the error message
 //
@@ -18,7 +18,8 @@
 // Transports:
 //   TondClient::local(socket) talks to tond-server over its root-only Unix
 //   socket, where no credentials are needed (the CLI's default).
-//   TondClient::new(url, api_key) talks HTTP(S) and sends the API key.
+//   TondClient::new(url, token) talks HTTP(S) and sends the API token
+//   (`tond_pat_…`, created with `tond token create` or in the dashboard).
 //
 // stream_logs():
 //   Opens a WebSocket to GET /api/apps/{id}/logs/stream?token=<key> and
@@ -36,13 +37,14 @@ use futures::StreamExt;
 use serde_json::{Map, Value};
 use tokio_tungstenite::tungstenite::Message;
 use tond_common::{
-    ApiResponse, AppResponse, BackupConfigResponse, CreateAppRequest, CreateCronJobRequest,
-    CreateDatabaseRequest, CreatedDatabaseResponse, CronJobResponse, CronJobRun,
+    ApiResponse, AppResponse, AuditLogPage, AuditVerifyReport, BackupConfigResponse,
+    CreateAppRequest, CreateCronJobRequest, CreateDatabaseRequest, CreateTokenRequest,
+    CreatedDatabaseResponse, CreatedTokenResponse, CronJobResponse, CronJobRun,
     DatabaseCredentialsResponse, DeployKeyResponse, DeploymentResponse, IntegrationResponse,
-    ManagedDatabaseDetail, ManagedDatabaseResponse, PreviewDeploymentResponse,
-    ProjectPreviewResponse, ProjectResponse, ServerSettings, SnapshotResponse,
-    StorageProviderResponse, UpdateCronJobRequest, UpdateSettingsRequest, WebhookConfigResponse,
-    WebhookSecretResponse,
+    ManagedDatabaseDetail, ManagedDatabaseResponse, PasswordLinkResponse,
+    PreviewDeploymentResponse, ProjectPreviewResponse, ProjectResponse, ServerSettings,
+    SnapshotResponse, StorageProviderResponse, TokenResponse, UpdateCronJobRequest,
+    UpdateSettingsRequest, UserResponse, WebhookConfigResponse, WebhookSecretResponse,
 };
 
 /// Body and response of `/api/settings/host-terminal`.
@@ -63,7 +65,7 @@ pub struct TondClient {
 const LOCAL_BASE_URL: &str = "http://localhost";
 
 impl TondClient {
-    /// Client for a server reached over HTTP(S), authenticated with `api_key`.
+    /// Client for a server reached over HTTP(S), authenticated with the API token `api_key`.
     pub fn new(base_url: &str, api_key: Option<&str>) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -79,7 +81,7 @@ impl TondClient {
         // produce an actionable message instead of a generic request error.
         if let Err(err) = std::os::unix::net::UnixStream::connect(socket_path) {
             let hint = "Run the CLI on the Tond server as root, or connect remotely with \
-                        --server <url> --api-key <key>.";
+                        --server <url> --token <tond_pat_…>.";
             return Err(match err.kind() {
                 std::io::ErrorKind::NotFound => anyhow::anyhow!(
                     "tond-server socket not found at {}. Is tond-server running? {hint}",
@@ -106,7 +108,7 @@ impl TondClient {
         })
     }
 
-    /// Add the Authorization header if an API key is configured.
+    /// Add the Authorization header if an API token is configured.
     fn auth_header(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         if let Some(ref key) = self.api_key {
             req.header("Authorization", format!("Bearer {}", key))
@@ -1446,6 +1448,80 @@ impl TondClient {
             anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
         }
     }
+
+    // ── API tokens ──
+
+    /// Unwrap an API envelope into its data.
+    fn into_data<T: serde::Serialize>(resp: ApiResponse<T>) -> Result<T> {
+        if resp.success {
+            resp.data.context("No data returned")
+        } else {
+            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
+        }
+    }
+
+    /// Create an API token; the response carries the secret (shown once).
+    pub async fn create_token(&self, body: &CreateTokenRequest) -> Result<CreatedTokenResponse> {
+        let req = self
+            .client
+            .post(format!("{}/api/tokens", self.base_url))
+            .json(body);
+        Self::into_data(self.auth_header(req).send().await?.json().await?)
+    }
+
+    /// List API tokens (every user's when `all`).
+    pub async fn list_tokens(&self, all: bool) -> Result<Vec<TokenResponse>> {
+        let req = self
+            .client
+            .get(format!("{}/api/tokens?all={all}", self.base_url));
+        Self::into_data(self.auth_header(req).send().await?.json().await?)
+    }
+
+    /// Revoke an API token by id.
+    pub async fn revoke_token(&self, id: &str) -> Result<TokenResponse> {
+        let req = self
+            .client
+            .delete(format!("{}/api/tokens/{}", self.base_url, id));
+        Self::into_data(self.auth_header(req).send().await?.json().await?)
+    }
+
+    // ── Users ──
+
+    pub async fn list_users(&self) -> Result<Vec<UserResponse>> {
+        let req = self.client.get(format!("{}/api/users", self.base_url));
+        Self::into_data(self.auth_header(req).send().await?.json().await?)
+    }
+
+    /// Issue a one-time set-password link for a user (invite or reset).
+    pub async fn create_password_link(&self, user_id: &str) -> Result<PasswordLinkResponse> {
+        let req = self.client.post(format!(
+            "{}/api/users/{}/password-link",
+            self.base_url, user_id
+        ));
+        Self::into_data(self.auth_header(req).send().await?.json().await?)
+    }
+
+    // ── Audit log ──
+
+    /// Verify the audit log's hash chain.
+    pub async fn verify_audit_log(&self) -> Result<AuditVerifyReport> {
+        let req = self
+            .client
+            .get(format!("{}/api/audit-log/verify", self.base_url));
+        Self::into_data(self.auth_header(req).send().await?.json().await?)
+    }
+
+    /// One page of the audit log, newest first.
+    pub async fn list_audit_log(&self, query: &[(&str, String)]) -> Result<AuditLogPage> {
+        let qs: Vec<String> = query
+            .iter()
+            .map(|(k, v)| format!("{k}={}", urlencoding::encode(v)))
+            .collect();
+        let req = self
+            .client
+            .get(format!("{}/api/audit-log?{}", self.base_url, qs.join("&")));
+        Self::into_data(self.auth_header(req).send().await?.json().await?)
+    }
 }
 
 #[cfg(test)]
@@ -1580,7 +1656,7 @@ mod tests {
         assert_eq!(
             request_without_key.headers().get("authorization"),
             None,
-            "auth_header should leave requests untouched when no API key is configured"
+            "auth_header should leave requests untouched when no API token is configured"
         );
     }
 
@@ -1766,7 +1842,7 @@ mod tests {
         assert_eq!(
             auth_header.as_deref(),
             Some("Bearer secret-key"),
-            "create_app should attach the bearer token when an API key is configured"
+            "create_app should attach the bearer token when an API token is configured"
         );
 
         let body = capture

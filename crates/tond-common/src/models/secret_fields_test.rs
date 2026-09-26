@@ -14,6 +14,7 @@
 // Adding a secret to a response therefore needs a conscious allowlist entry.
 
 const MODEL_SOURCES: &[(&str, &str)] = &[
+    ("access.rs", include_str!("access.rs")),
     ("api.rs", include_str!("api.rs")),
     ("apps.rs", include_str!("apps.rs")),
     ("auth.rs", include_str!("auth.rs")),
@@ -111,9 +112,19 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "inbound payload (client → server)",
     ),
     (
-        "Credentials",
-        "api_key",
-        "the CLI's local credentials file, never an API response",
+        "CreatedTokenResponse",
+        "token",
+        "token metadata (TokenResponse: name, scopes, expiry), not the secret",
+    ),
+    (
+        "CreatedTokenResponse",
+        "secret",
+        "a new API token's secret, shown once to its creator",
+    ),
+    (
+        "PasswordLinkResponse",
+        "token",
+        "a one-time set-password link, shown once to the admin who made it",
     ),
     (
         "TelegramConfig",
@@ -168,6 +179,7 @@ fn looks_secret(field: &str) -> bool {
 /// Types that cannot hold a plaintext secret value.
 fn safe_type(ty: &str) -> bool {
     let ty = ty.replace(' ', "");
+    let ty = ty.trim_end_matches(',');
     ty == "bool" || ty.contains("EnvVarEntry")
 }
 

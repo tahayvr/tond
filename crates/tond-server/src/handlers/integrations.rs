@@ -21,8 +21,9 @@ use axum::{
 use tond_common::*;
 use uuid::Uuid;
 
+use crate::audit_log::{AuditEntry, record};
 use crate::{
-    auth::{RateLimit, RequireAuth},
+    auth::{Authz, RateLimit, scope},
     error::AppError,
     notifications, secrets,
     state::AppState,
@@ -58,7 +59,7 @@ fn validate_and_seal_config(
 
 pub async fn list_integrations(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     let rows =
@@ -74,7 +75,7 @@ pub async fn list_integrations(
 
 pub async fn get_integration(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -89,7 +90,7 @@ pub async fn get_integration(
 
 pub async fn create_integration(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Json(req): Json<CreateIntegrationRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -115,6 +116,14 @@ pub async fn create_integration(
     .await?;
 
     let row = fetch_integration(&state.db, &id).await?;
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("integration_create")
+            .resource("integration", &row.id, &row.name)
+            .detail(format!("kind={}", row.kind)),
+    )
+    .await;
     Ok((
         StatusCode::CREATED,
         Json(ApiResponse::ok(IntegrationResponse::from(row))),
@@ -125,7 +134,7 @@ pub async fn create_integration(
 
 pub async fn update_integration(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateIntegrationRequest>,
@@ -162,6 +171,12 @@ pub async fn update_integration(
     .await?;
 
     let updated = fetch_integration(&state.db, &id).await?;
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("integration_update").resource("integration", &updated.id, &updated.name),
+    )
+    .await;
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(IntegrationResponse::from(updated))),
@@ -172,7 +187,7 @@ pub async fn update_integration(
 
 pub async fn delete_integration(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -194,6 +209,12 @@ pub async fn delete_integration(
         ))));
     }
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("integration_delete").resource("integration", &id, &id),
+    )
+    .await;
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(serde_json::json!({ "deleted": id }))),
@@ -204,7 +225,7 @@ pub async fn delete_integration(
 
 pub async fn test_integration(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {

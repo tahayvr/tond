@@ -5,7 +5,7 @@
 // optional connection to a project Docker network for internal service-to-service
 // communication.
 //
-// Routes (all require RequireAuth + RateLimit):
+// Routes (all require RateLimit + an Authz scope, see each handler):
 //   GET    /api/databases                         — list all managed databases
 //   POST   /api/databases                         — create and start a new database container
 //   GET    /api/databases/{id}                    — get database details + connection strings
@@ -37,8 +37,8 @@ use axum::{
 use tond_common::*;
 
 use crate::{
-    audit_log::{AuthActor, write_audit_log},
-    auth::{AuthRole, RateLimit, RequireAdmin, RequireAuth},
+    audit_log::write_audit_log,
+    auth::{Authz, RateLimit, scope},
     db_credentials::{CredentialField, container_running, password_change_step, run_step},
     docker,
     error::AppError,
@@ -64,7 +64,7 @@ async fn fetch_db(pool: &sqlx::SqlitePool, id_or_name: &str) -> Result<ManagedDa
 
 pub async fn list_databases(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::DbRead>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     let dbs: Vec<ManagedDatabase> =
@@ -82,7 +82,7 @@ pub async fn list_databases(
 
 pub async fn get_database(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::DbRead>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -91,13 +91,16 @@ pub async fn get_database(
     Ok((StatusCode::OK, Json(ApiResponse::ok(detail))))
 }
 
+// Responses never carry passwords, whatever the caller's scopes: they are
+// write-only (`build_detail` masks connection strings) and readable only
+// through the audited `reveal_database_credentials` (db:credentials).
+
 /// GET /api/databases/{id}/credentials — the plaintext passwords and
-/// connection strings, for copying into an app or a client. Admin only;
-/// every reveal is audit-logged.
+/// connection strings, for copying into an app or a client. Needs
+/// db:credentials; every reveal is audit-logged.
 pub async fn reveal_database_credentials(
     _rate: RateLimit,
-    _admin: RequireAdmin,
-    actor: AuthActor,
+    auth: Authz<scope::DbCredentials>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -108,7 +111,7 @@ pub async fn reveal_database_credentials(
         None,
         None,
         "db_credentials_reveal",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("name={}", db.name)),
     )
     .await;
@@ -353,13 +356,12 @@ fn next_credential(current: Option<String>, requested: Option<String>) -> Option
 
 pub async fn create_database(
     _rate: RateLimit,
-    auth: AuthRole,
-    actor: AuthActor,
+    auth: Authz<scope::DbWrite>,
     State(state): State<AppState>,
     Json(req): Json<CreateDatabaseRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     if req.public_access {
-        auth.ensure_admin("expose a database to the internet")?;
+        auth.require_to(Scope::SettingsWrite, "expose a database to the internet")?;
     }
 
     // Validate name (alphanumeric + hyphens)
@@ -517,7 +519,7 @@ pub async fn create_database(
         None,
         None,
         "db_create",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!(
             "name={} type={} image={} public_access={}",
             db.name, db.db_type, image, db.public_access
@@ -525,9 +527,12 @@ pub async fn create_database(
     )
     .await;
 
-    // The creator gets the generated credentials once; later reads are masked.
+    // The creator gets the generated credentials once (when allowed to read
+    // credentials at all); later reads are masked.
     let host = public_host(&state).await;
-    let credentials = credentials_response(&db, host.as_deref());
+    let credentials = auth
+        .has(Scope::DbCredentials)
+        .then(|| credentials_response(&db, host.as_deref()));
     let detail = build_detail(db, host.as_deref());
     Ok((
         StatusCode::CREATED,
@@ -557,8 +562,7 @@ fn credentials_response(
 
 pub async fn delete_database(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::DbDelete>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -585,7 +589,7 @@ pub async fn delete_database(
         None,
         None,
         "db_delete",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("name={}", db.name)),
     )
     .await;
@@ -600,8 +604,7 @@ pub async fn delete_database(
 
 pub async fn stop_database(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::DbWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -629,7 +632,7 @@ pub async fn stop_database(
         None,
         None,
         "db_stop",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("name={}", db.name)),
     )
     .await;
@@ -646,8 +649,7 @@ pub async fn stop_database(
 
 pub async fn start_database(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::DbWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -675,7 +677,7 @@ pub async fn start_database(
         None,
         None,
         "db_start",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("name={}", db.name)),
     )
     .await;
@@ -692,8 +694,7 @@ pub async fn start_database(
 
 pub async fn update_database(
     _rate: RateLimit,
-    auth: AuthRole,
-    actor: AuthActor,
+    auth: Authz<scope::DbWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateDatabaseRequest>,
@@ -703,11 +704,11 @@ pub async fn update_database(
     // A custom image runs arbitrary code with the database volume mounted, and
     // public access opens the port to the internet: both are admin decisions.
     if req.custom_image.is_some() {
-        auth.ensure_admin("change a database's Docker image")?;
+        auth.require_to(Scope::SettingsWrite, "change a database's Docker image")?;
     }
     let exposure_changed = req.public_access.is_some_and(|p| p != db.public_access);
     if exposure_changed {
-        auth.ensure_admin("change a database's public access")?;
+        auth.require_to(Scope::SettingsWrite, "change a database's public access")?;
     }
     let public_access = req.public_access.unwrap_or(db.public_access);
 
@@ -757,7 +758,7 @@ pub async fn update_database(
         None,
         None,
         "db_update",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("name={} public_access={}", db.name, public_access)),
     )
     .await;
@@ -790,8 +791,7 @@ pub async fn update_database(
 ///   5. Updates `container_id`, `host_port`, `status`, and `image_used` in the DB.
 pub async fn redeploy_database(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    _actor: AuthActor,
+    _auth: Authz<scope::DbWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -936,8 +936,7 @@ fn refuse_rename(
 /// database isn't running, for renames, and for engines that can't do it.
 pub async fn update_database_credentials(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::DbCredentials>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateDatabaseCredentials>,
@@ -1052,7 +1051,7 @@ pub async fn update_database_credentials(
         None,
         None,
         "db_credentials_update",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("name={} changed={}", db.name, applied.join(","))),
     )
     .await;
@@ -1085,7 +1084,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        auth::{RateLimiter, RequireAuth, extractor::Role, rate_limit::RateLimit},
+        auth::{Authz, Principal, RateLimiter, rate_limit::RateLimit},
         state::AppState,
     };
 
@@ -1326,8 +1325,7 @@ mod tests {
         ] {
             let err = update_database(
                 RateLimit,
-                AuthRole(Role::Member),
-                AuthActor("member@example.com".to_string()),
+                Authz::unchecked(Principal::test_user(Role::Deployer)),
                 State(state.clone()),
                 Path(db.id.clone()),
                 Json(req),
@@ -1340,8 +1338,7 @@ mod tests {
 
         let err = create_database(
             RateLimit,
-            AuthRole(Role::Member),
-            AuthActor("member@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Deployer)),
             State(state.clone()),
             Json(CreateDatabaseRequest {
                 name: "public-db".to_string(),
@@ -1429,8 +1426,7 @@ mod tests {
 
         let response = update_database(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(db.id.clone()),
             Json(UpdateDatabaseRequest {
@@ -1475,8 +1471,7 @@ mod tests {
     ) -> Result<axum::response::Response, String> {
         update_database_credentials(
             RateLimit,
-            RequireAuth,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(id.to_string()),
             Json(req),
@@ -1527,7 +1522,7 @@ mod tests {
 
         let shown = get_database(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Viewer)),
             State(state.clone()),
             Path(db.id.clone()),
         )
@@ -1539,8 +1534,7 @@ mod tests {
 
         let revealed = reveal_database_credentials(
             RateLimit,
-            RequireAdmin,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(db.id.clone()),
         )

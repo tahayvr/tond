@@ -19,6 +19,7 @@
 	import Server from '~icons/ri/server-line';
 	import Box from '~icons/ri/box-3-line';
 	import { cn } from '$lib/utils';
+	import { actorLabel } from '$lib/access';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();
@@ -393,7 +394,7 @@
 				</p>
 			{:else}
 				<div class="space-y-2">
-					{#each recentActivity.slice(0, 5) as entry (entry.id)}
+					{#each recentActivity.slice(0, 5) as entry (entry.seq)}
 						<div class="flex items-center gap-3 text-xs">
 							<span class="font-mono text-muted-foreground/60">
 								{new Date(entry.created_at).toLocaleTimeString()}
@@ -401,8 +402,9 @@
 							<Badge variant={actionVariant(entry.action)} class="font-mono text-[10px]">
 								{entry.action.toUpperCase()}
 							</Badge>
-							<span class="text-muted-foreground">
-								{entry.app_name ?? entry.detail ?? 'System'}
+							<span class="truncate text-muted-foreground">
+								{entry.resource_name ?? entry.detail ?? 'System'}
+								<span class="text-muted-foreground/60">· {actorLabel(entry)}</span>
 							</span>
 						</div>
 					{/each}

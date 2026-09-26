@@ -1,3 +1,5 @@
+import { connectWithRetry, wsUrl } from './reconnecting-socket';
+
 export interface DeployLog {
 	level: string;
 	message: string;
@@ -138,13 +140,26 @@ export interface TemplateCatalogEntry {
 	setup_notes: string | null;
 }
 
+/** A user's role. Admin is the owner; see `Role::scopes` on the server. */
+export type Role = 'admin' | 'deployer' | 'viewer';
+
+/** A permission, e.g. `apps:deploy` (full list: GET /api/tokens/catalog). */
+export type Scope = string;
+
 export interface User {
 	id: string;
 	email: string;
-	role: string;
+	role: Role;
 	/** Whether TOTP two-factor auth is active for this user */
 	totp_enabled: boolean;
 	created_at: string;
+	/** Whether an admin has disabled the account */
+	disabled?: boolean;
+	/** False while an invited user hasn't set a password yet */
+	password_set?: boolean;
+	last_login_at?: string | null;
+	/** The scopes the user's role grants (drives what the UI offers) */
+	scopes?: Scope[];
 }
 
 export interface AuthStatus {
@@ -156,6 +171,8 @@ interface ApiResponse<T> {
 	success: boolean;
 	data: T | null;
 	error: string | null;
+	/** Stable error code on some failures, e.g. SCOPE_DENIED, TOKEN_EXPIRED */
+	code?: string;
 }
 
 const BASE = '/api';
@@ -177,12 +194,20 @@ export class ApiError extends Error {
 	readonly status: number;
 	/** Seconds to wait before retrying, from a 429's Retry-After header. */
 	readonly retryAfter: number | null;
+	/** Stable error code from the server (e.g. `SCOPE_DENIED`), when it sent one. */
+	readonly code: string | null;
 
-	constructor(message: string, status: number, retryAfter: number | null = null) {
+	constructor(
+		message: string,
+		status: number,
+		retryAfter: number | null = null,
+		code: string | null = null
+	) {
 		super(message);
 		this.name = 'ApiError';
 		this.status = status;
 		this.retryAfter = retryAfter;
+		this.code = code;
 	}
 }
 
@@ -201,6 +226,8 @@ const CREDENTIAL_ENDPOINTS = [
 	'/auth/2fa/confirm',
 	'/auth/2fa/disable',
 	'/auth/change-password',
+	'/auth/password-link/check',
+	'/auth/password-link/complete',
 	'/terminal/tickets'
 ];
 
@@ -259,7 +286,12 @@ async function parseResponse<T>(path: string, res: Response): Promise<T> {
 		throw notApi();
 	}
 	if (!res.ok || !json.success) {
-		throw new ApiError(json.error || `Request failed (HTTP ${res.status})`, res.status);
+		throw new ApiError(
+			json.error || `Request failed (HTTP ${res.status})`,
+			res.status,
+			null,
+			json.code ?? null
+		);
 	}
 	return json.data as T;
 }
@@ -559,19 +591,179 @@ export async function getMe(): Promise<User> {
 	return request<User>('/auth/me');
 }
 
-export async function createUser(
-	email: string,
-	password: string,
-	role: string = 'member'
-): Promise<User> {
-	return request<User>('/auth/users', {
+// ── Users (admins: users:admin) ──
+
+export interface AdminUser extends User {
+	/** Live (not expired, not idle) sessions */
+	active_sessions: number;
+	/** Whether this row is the signed-in admin */
+	is_you: boolean;
+}
+
+/** A one-time set-password link (invite or reset), valid 24 hours. */
+export interface PasswordLink {
+	user: User;
+	/** Dashboard path with the token, e.g. `/set-password?token=…` */
+	path: string;
+	token: string;
+	expires_at: string;
+}
+
+export async function listUsers(): Promise<AdminUser[]> {
+	return request<AdminUser[]>('/users');
+}
+
+/** Invite a user: no password is chosen for them, the response carries a set-password link. */
+export async function inviteUser(email: string, role: Role): Promise<PasswordLink> {
+	return request<PasswordLink>('/users', {
 		method: 'POST',
-		body: JSON.stringify({ email, password, role })
+		body: JSON.stringify({ email, role })
 	});
 }
 
-export async function listUsers(): Promise<User[]> {
-	return request<User[]>('/auth/users');
+/** Change a user's role and/or disable or enable them. Signs them out everywhere. */
+export async function updateUser(
+	id: string,
+	changes: { role?: Role; disabled?: boolean }
+): Promise<User> {
+	return request<User>(`/users/${id}`, { method: 'PATCH', body: JSON.stringify(changes) });
+}
+
+export async function deleteUser(id: string): Promise<void> {
+	await request(`/users/${id}`, { method: 'DELETE' });
+}
+
+/** New one-time set-password link for a user (replaces older links). */
+export async function createPasswordLink(id: string): Promise<PasswordLink> {
+	return request<PasswordLink>(`/users/${id}/password-link`, { method: 'POST' });
+}
+
+export async function listUserSessions(id: string): Promise<SessionInfo[]> {
+	return request<SessionInfo[]>(`/users/${id}/sessions`);
+}
+
+export async function revokeUserSessions(id: string): Promise<{ revoked: number }> {
+	return request<{ revoked: number }>(`/users/${id}/sessions`, { method: 'DELETE' });
+}
+
+export async function revokeUserSession(id: string, sessionId: string): Promise<void> {
+	await request(`/users/${id}/sessions/${sessionId}`, { method: 'DELETE' });
+}
+
+// ── Set-password links (public) ──
+
+export interface PasswordLinkInfo {
+	email: string;
+	/** "invite" | "reset" */
+	purpose: string;
+	expires_at: string;
+}
+
+export async function checkPasswordLink(token: string): Promise<PasswordLinkInfo> {
+	return request<PasswordLinkInfo>('/auth/password-link/check', {
+		method: 'POST',
+		body: JSON.stringify({ token })
+	});
+}
+
+export async function completePasswordLink(
+	token: string,
+	password: string
+): Promise<{ signed_in: boolean; user?: User; message?: string }> {
+	return request<{ signed_in: boolean; user?: User; message?: string }>(
+		'/auth/password-link/complete',
+		{ method: 'POST', body: JSON.stringify({ token, password }) }
+	);
+}
+
+// ── API tokens ──
+
+export type TokenKind = 'personal' | 'service' | 'agent' | 'ci';
+
+export interface ScopeInfo {
+	id: Scope;
+	description: string;
+}
+
+export interface ScopeGroupInfo {
+	id: 'apps' | 'secrets' | 'data' | 'ops' | 'admin';
+	label: string;
+	scopes: ScopeInfo[];
+}
+
+export interface TokenPreset {
+	id: string;
+	label: string;
+	description: string;
+	scopes: Scope[];
+}
+
+export interface RoleInfo {
+	id: Role;
+	description: string;
+	scopes: Scope[];
+}
+
+/** Everything the token form needs, from GET /api/tokens/catalog. */
+export interface TokenCatalog {
+	groups: ScopeGroupInfo[];
+	presets: TokenPreset[];
+	roles: RoleInfo[];
+	/** Scopes the caller may grant (a token never exceeds its creator) */
+	grantable: Scope[];
+}
+
+export interface ApiToken {
+	id: string;
+	name: string;
+	/** Visible start of the token, e.g. `tond_pat_1a2b3c4d` */
+	prefix: string;
+	kind: TokenKind;
+	scopes: Scope[];
+	app_ids: string[];
+	project_ids: string[];
+	allowed_ips: string[];
+	owner_id: string | null;
+	owner_label: string;
+	expires_at: string | null;
+	last_used_at: string | null;
+	last_used_ip: string | null;
+	revoked_at: string | null;
+	created_at: string;
+}
+
+export interface CreateTokenInput {
+	name: string;
+	kind: TokenKind;
+	preset?: string;
+	scopes: Scope[];
+	app_ids: string[];
+	project_ids: string[];
+	allowed_ips: string[];
+	/** Lifetime in hours; 0 = never expires (not for agent tokens) */
+	expires_in_hours: number;
+}
+
+export async function getTokenCatalog(): Promise<TokenCatalog> {
+	return request<TokenCatalog>('/tokens/catalog');
+}
+
+export async function listTokens(all = false): Promise<ApiToken[]> {
+	return request<ApiToken[]>(`/tokens${all ? '?all=true' : ''}`);
+}
+
+/** Create a token. The secret is only in this response: show it once. */
+export async function createToken(
+	input: CreateTokenInput
+): Promise<{ token: ApiToken; secret: string }> {
+	return request<{ token: ApiToken; secret: string }>('/tokens', {
+		method: 'POST',
+		body: JSON.stringify(input)
+	});
+}
+
+export async function revokeToken(id: string): Promise<ApiToken> {
+	return request<ApiToken>(`/tokens/${id}`, { method: 'DELETE' });
 }
 
 // ── Phase 7.1 — Password Management & Session Management ──
@@ -591,6 +783,8 @@ export interface SessionInfo {
 	last_used_at: string | null;
 	expires_at: string;
 	is_current: boolean;
+	/** When the session ends if unused (idle timeout) */
+	idle_expires_at?: string | null;
 }
 
 export async function listSessions(): Promise<SessionInfo[]> {
@@ -656,6 +850,10 @@ export interface ServerSettings {
 	 * different registrable domain from `dashboard_domain`; empty = previews disabled.
 	 */
 	preview_domain: string;
+	/** Sessions end after this many hours without a request (1–720, default 12) */
+	session_idle_timeout_hours?: number;
+	/** Sessions end this many days after sign-in (1–365, default 30) */
+	session_max_age_days?: number;
 }
 
 export interface OnboardingStatus {
@@ -1036,17 +1234,56 @@ export async function updatePreviewConfig(id: string, preview_enabled: boolean):
 	});
 }
 
-// ── Metrics (Phase 5) ──
+// ── Metrics ──
 
-export interface MetricPoint {
-	cpu_percent: number;
-	mem_used: number;
-	mem_limit: number;
-	mem_percent: number;
-	net_rx: number;
-	net_tx: number;
-	restarts: number;
-	collected_at: string;
+export type MetricsRange = '1h' | '24h' | '7d' | '30d';
+
+/** Downsampled series as parallel arrays (one entry per bucket). */
+export interface MetricSeries {
+	/** Bucket start, unix seconds. */
+	t: number[];
+	/** Average CPU, percent of one core (100 = one full core). */
+	cpu: number[];
+	cpu_max: number[];
+	/** Average working-set memory in bytes. */
+	mem: number[];
+	mem_max: number[];
+	/** Bytes per second. */
+	rx: number[];
+	tx: number[];
+	pids: number[];
+}
+
+export type MetricEventKind = 'restart' | 'crash' | 'oom';
+
+export interface MetricEvent {
+	/** Unix seconds. */
+	t: number;
+	kind: MetricEventKind;
+	detail: string | null;
+}
+
+export interface MetricCurrent {
+	t: number;
+	cpu: number;
+	mem: number;
+	mem_peak: number | null;
+	rx: number;
+	tx: number;
+	pids: number;
+}
+
+export interface MetricsResponse {
+	range: MetricsRange;
+	/** Bucket width in seconds. */
+	step: number;
+	from: number;
+	to: number;
+	/** Memory limit in bytes, null when unlimited. */
+	mem_limit: number | null;
+	series: MetricSeries;
+	events: MetricEvent[];
+	current: MetricCurrent | null;
 }
 
 export interface SystemMetrics {
@@ -1054,20 +1291,29 @@ export interface SystemMetrics {
 	mem_used: number;
 	mem_total: number;
 	mem_percent: number;
+	/** Filesystem holding Tond's data directory (what the disk alert watches). */
 	disk_used: number;
 	disk_total: number;
 	disk_percent: number;
+	disk_mount: string;
+	/** Running containers Tond manages. */
 	containers_running: number;
 	apps_total: number;
 	apps_running: number;
 	collected_at: string;
 }
 
-export async function getAppMetrics(
+export type MetricsOwner = 'apps' | 'databases' | 'cron';
+
+/** Resource metrics of an app, database or cron job. */
+export async function getMetrics(
+	owner: MetricsOwner,
 	id: string,
-	period: '1h' | '24h' | '7d' = '1h'
-): Promise<MetricPoint[]> {
-	return request<MetricPoint[]>(`/apps/${id}/metrics?period=${period}`);
+	range: MetricsRange = '1h'
+): Promise<MetricsResponse> {
+	return request<MetricsResponse>(
+		`/${owner}/${encodeURIComponent(id)}/metrics?range=${encodeURIComponent(range)}`
+	);
 }
 
 export async function getSystemMetrics(): Promise<SystemMetrics> {
@@ -1081,7 +1327,12 @@ export type AlertMetric = 'cpu' | 'memory' | 'app_down' | 'disk_usage';
 
 /** Valid event slugs for event-based alert subscriptions. */
 export type AlertEvent =
-	'deployment_success' | 'deployment_failure' | 'cron_success' | 'cron_failure';
+	| 'deployment_success'
+	| 'deployment_failure'
+	| 'cron_success'
+	| 'cron_failure'
+	| 'container_restart'
+	| 'container_oom';
 
 /** Groups of alert events/metrics shown in the UI. */
 export interface AlertGroup {
@@ -1118,6 +1369,15 @@ export const ALERT_GROUPS: AlertGroup[] = [
 		events: [
 			{ value: 'deployment_success', label: 'Deployment Success' },
 			{ value: 'deployment_failure', label: 'Deployment Failure' }
+		]
+	},
+	{
+		id: 'containers',
+		label: 'Crashes',
+		metrics: [],
+		events: [
+			{ value: 'container_restart', label: 'Crashed or restarted unexpectedly' },
+			{ value: 'container_oom', label: 'Process killed for running out of memory' }
 		]
 	},
 	{
@@ -1194,27 +1454,71 @@ export async function deleteAlertRule(id: string): Promise<void> {
 	await request(`/alerts/${id}`, { method: 'DELETE' });
 }
 
-// ── Audit Log (Phase 5.5) ──
+// ── Audit log ──
 
+/** One entry of the append-only, hash-chained audit log. */
 export interface AuditLogEntry {
-	id: string;
-	app_id: string | null;
-	app_name: string | null;
-	action: string;
-	actor: string;
-	detail: string | null;
+	/** Position in the chain; also the pagination cursor */
+	seq: number;
 	created_at: string;
+	/** "user" | "token" | "local_socket" | "system" | "anonymous" */
+	actor_kind: string;
+	actor_id: string | null;
+	/** Email, token name, "local-socket", … */
+	actor_label: string;
+	action: string;
+	/** "app" | "database" | "user" | "token" | "settings" | … */
+	resource_type: string | null;
+	resource_id: string | null;
+	resource_name: string | null;
+	/** "success" | "failure" */
+	outcome: string;
+	ip: string | null;
+	detail: string | null;
 }
 
-export async function listAuditLog(params?: {
-	app_id?: string;
+export interface AuditLogPage {
+	entries: AuditLogEntry[];
+	/** Pass as `before` to load the next (older) page; null on the last page */
+	next_before: number | null;
+}
+
+export interface AuditLogQuery {
+	actor?: string;
+	/** Exact action, or a prefix ending in `*` (e.g. `login*`) */
+	action?: string;
+	resource_type?: string;
+	resource_id?: string;
+	/** Free-text search over actor, action, resource and detail */
+	q?: string;
+	outcome?: 'success' | 'failure';
+	before?: number;
 	limit?: number;
-}): Promise<AuditLogEntry[]> {
+}
+
+/** Filtered, paginated audit log (filters run on the server, before the limit). */
+export async function listAuditLog(params: AuditLogQuery = {}): Promise<AuditLogPage> {
 	const qs = new URLSearchParams();
-	if (params?.app_id) qs.set('app_id', params.app_id);
-	if (params?.limit) qs.set('limit', String(params.limit));
+	for (const [key, value] of Object.entries(params)) {
+		if (value !== undefined && value !== null && value !== '') qs.set(key, String(value));
+	}
 	const query = qs.toString() ? `?${qs.toString()}` : '';
-	return request<AuditLogEntry[]>(`/audit-log${query}`);
+	return request<AuditLogPage>(`/audit-log${query}`);
+}
+
+export interface AuditVerifyReport {
+	ok: boolean;
+	checked: number;
+	checkpoint_seq: number;
+	first_seq: number | null;
+	last_seq: number | null;
+	broken_at: number | null;
+	problem: string | null;
+}
+
+/** Walk the audit log's hash chain on the server. */
+export async function verifyAuditLog(): Promise<AuditVerifyReport> {
+	return request<AuditVerifyReport>('/audit-log/verify');
 }
 
 // ── Projects (Phase 6.1) ──
@@ -1634,8 +1938,11 @@ export interface LogLine {
 
 export interface LogStreamCallbacks {
 	onLine: (line: LogLine) => void;
-	onError?: (e: Event) => void;
-	onClose?: () => void;
+	/** Connected; `reconnected` is true after a drop. The server then sends a
+	 *  fresh snapshot, so callers should clear what they show. */
+	onOpen?: (reconnected: boolean) => void;
+	/** Connection lost; the stream reconnects by itself in `retryInMs`. */
+	onDisconnect?: (retryInMs: number) => void;
 }
 
 export type TerminalTargetKind = 'server' | 'app' | 'database';
@@ -1713,69 +2020,69 @@ function emitCronRun(
 
 /**
  * Opens a WebSocket to `wsUrl` and invokes `callbacks.onLine` for every
- * incoming log line.  Returns a `close()` function — call it in $effect cleanup.
+ * incoming log line. Reconnects with backoff when the connection drops (e.g.
+ * tond-server restarted). Returns a `close()` function — call it in $effect
+ * cleanup.
  *
  * Pass a relative URL like `/api/apps/{id}/logs/stream`; it will be resolved
  * to `ws://` or `wss://` automatically based on the current page protocol.
  */
-export function openLogStream(wsUrl: string, callbacks: LogStreamCallbacks): () => void {
-	const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-	const url = `${protocol}://${window.location.host}${wsUrl}`;
-	const ws = new WebSocket(url);
+export function openLogStream(path: string, callbacks: LogStreamCallbacks): () => void {
+	const socket = connectWithRetry(() => wsUrl(path), {
+		onOpen: (reconnected) => callbacks.onOpen?.(reconnected),
+		onDisconnect: (retryInMs) => callbacks.onDisconnect?.(retryInMs),
+		onMessage: (ev) => handleLogFrame(ev, callbacks)
+	});
+	return () => socket.close();
+}
 
-	ws.onmessage = (ev) => {
-		let frame: any;
-		try {
-			frame = JSON.parse(ev.data as string);
-		} catch {
-			// Raw text line (shouldn't happen with this backend, but be defensive)
-			callbacks.onLine({ source: 'container', text: ev.data as string });
-			return;
-		}
+function handleLogFrame(ev: MessageEvent, callbacks: LogStreamCallbacks) {
+	let frame: any;
+	try {
+		frame = JSON.parse(ev.data as string);
+	} catch {
+		// Raw text line (shouldn't happen with this backend, but be defensive)
+		callbacks.onLine({ source: 'container', text: ev.data as string });
+		return;
+	}
 
-		if (frame.type === 'snapshot') {
-			// App/database log snapshot: deploy_logs + container_logs arrays
-			for (const dl of frame.deploy_logs ?? []) {
-				callbacks.onLine({
-					source: 'deploy',
-					level: dl.level,
-					text: dl.message,
-					ts: dl.ts,
-					appName: dl.app_name
-				});
-			}
-			for (const line of frame.container_logs ?? []) {
-				callbacks.onLine({ source: 'container', text: line.line, ts: line.ts ?? undefined });
-			}
-			// Cron run snapshot: single run object (may be null)
-			if (frame.run) {
-				emitCronRun(frame.run, callbacks);
-			}
-		} else if (frame.type === 'deploy') {
+	if (frame.type === 'snapshot') {
+		// App/database log snapshot: deploy_logs + container_logs arrays
+		for (const dl of frame.deploy_logs ?? []) {
 			callbacks.onLine({
 				source: 'deploy',
-				level: frame.level,
-				text: frame.message,
-				ts: frame.ts,
-				appName: frame.app_name
+				level: dl.level,
+				text: dl.message,
+				ts: dl.ts,
+				appName: dl.app_name
 			});
-		} else if (frame.type === 'container') {
-			callbacks.onLine({
-				source: 'container',
-				text: frame.line,
-				ts: frame.ts ?? undefined,
-				appName: frame.app_name
-			});
-		} else if (frame.type === 'run') {
-			// Cron run completed frame
+		}
+		for (const line of frame.container_logs ?? []) {
+			callbacks.onLine({ source: 'container', text: line.line, ts: line.ts ?? undefined });
+		}
+		// Cron run snapshot: single run object (may be null)
+		if (frame.run) {
 			emitCronRun(frame.run, callbacks);
 		}
-	};
-
-	ws.onerror = (e) => callbacks.onError?.(e);
-	ws.onclose = () => callbacks.onClose?.();
-
-	return () => ws.close();
+	} else if (frame.type === 'deploy') {
+		callbacks.onLine({
+			source: 'deploy',
+			level: frame.level,
+			text: frame.message,
+			ts: frame.ts,
+			appName: frame.app_name
+		});
+	} else if (frame.type === 'container') {
+		callbacks.onLine({
+			source: 'container',
+			text: frame.line,
+			ts: frame.ts ?? undefined,
+			appName: frame.app_name
+		});
+	} else if (frame.type === 'run') {
+		// Cron run completed frame
+		emitCronRun(frame.run, callbacks);
+	}
 }
 
 export async function listTerminalTargets(): Promise<TerminalTarget[]> {

@@ -151,13 +151,18 @@ const data = {
 	],
 	recentActivity: [
 		{
-			id: 'log_1',
-			app_id: 'app_running',
-			app_name: 'api-service',
+			seq: 7,
+			created_at: '2026-01-01T12:00:00.000Z',
+			actor_kind: 'user',
+			actor_id: 'usr_1',
+			actor_label: 'admin@example.com',
 			action: 'deploy',
-			actor: 'admin@example.com',
-			detail: 'Deployed sha-123',
-			created_at: '2026-01-01T12:00:00.000Z'
+			resource_type: 'app',
+			resource_id: 'app_running',
+			resource_name: 'api-service',
+			outcome: 'success',
+			ip: null,
+			detail: 'Deployed sha-123'
 		}
 	],
 	serverName: 'Tond Server'

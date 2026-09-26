@@ -52,12 +52,13 @@ use axum::{
 use serde::Serialize;
 use tond_common::{
     ApiResponse, CompleteGitHubFlowRequest, GitHubApp, GitHubAppResponse, GitHubBranchResponse,
-    GitHubCallbackQuery, GitHubInstallQuery, GitHubRepoResponse, SetGitHubAppRequest, TondError,
-    UpdateGitHubAppRequest, User, generate_raw_key,
+    GitHubCallbackQuery, GitHubInstallQuery, GitHubRepoResponse, Scope, SetGitHubAppRequest,
+    TondError, UpdateGitHubAppRequest, User, generate_raw_key,
 };
 
+use crate::audit_log::{AuditEntry, record};
 use crate::{
-    auth::{RateLimit, RequireAdmin, RequireAuth},
+    auth::{Authz, RateLimit, scope},
     error::AppError,
     handlers::auth::{extract_session_token, validate_session},
     secrets,
@@ -276,7 +277,7 @@ pub async fn post_or_update_pr_comment(
 
 pub async fn list_github_apps(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsRead>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     // Exclude pending stub rows (app_id = 0 means not yet confirmed by GitHub)
@@ -299,12 +300,15 @@ const FLOW_TTL_MINUTES: i64 = 60;
 
 /// The admin logged in to the dashboard in this browser, from the session
 /// cookie. GitHub App flows are browser round-trips through github.com, so
-/// they are bound to a dashboard session rather than an API key or the CLI
+/// they are bound to a dashboard session rather than an API token or the CLI
 /// socket: the callback must come back from the same admin's browser.
 async fn session_admin(state: &AppState, headers: &HeaderMap) -> Option<User> {
     let token = extract_session_token(headers)?;
-    let user = validate_session(&state.db, &token).await.ok()??;
-    (user.role == "admin").then_some(user)
+    let user = validate_session(state, &token).await.ok()??;
+    user.role()
+        .scopes()
+        .contains(Scope::SettingsWrite)
+        .then_some(user)
 }
 
 /// Create a pending flow owned by `user_id`; returns its state token.
@@ -386,7 +390,7 @@ async fn redirect_to_integrations(state: &AppState, error: Option<&str>) -> Resp
 /// complete the registration, once, within FLOW_TTL_MINUTES.
 pub async fn get_manifest_url(
     _rate: RateLimit,
-    _admin: RequireAdmin,
+    _auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
@@ -771,7 +775,7 @@ async fn finish_install_flow(
 /// a single-use state bound to the logged-in admin.
 pub async fn get_install_url(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
@@ -799,7 +803,7 @@ pub async fn get_install_url(
 
 pub async fn update_github_app(
     _rate: RateLimit,
-    _admin: RequireAdmin,
+    auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(payload): Json<UpdateGitHubAppRequest>,
@@ -825,6 +829,12 @@ pub async fn update_github_app(
     }
 
     let updated = fetch_github_app(&state.db, &app.id).await?;
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("github_app_update").resource("github_app", &updated.id, &updated.name),
+    )
+    .await;
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(GitHubAppResponse::from_app(updated))),
@@ -835,7 +845,7 @@ pub async fn update_github_app(
 
 pub async fn delete_github_app(
     _rate: RateLimit,
-    _admin: RequireAdmin,
+    auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -854,6 +864,12 @@ pub async fn delete_github_app(
 
     tracing::info!("Deleted GitHub App registration {} ({})", app.name, app.id);
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("github_app_delete").resource("github_app", &app.id, &app.name),
+    )
+    .await;
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(serde_json::json!({
@@ -868,7 +884,7 @@ pub async fn delete_github_app(
 /// List repositories accessible via the GitHub App installation.
 pub async fn list_repos(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -951,7 +967,7 @@ pub async fn list_repos(
 
 pub async fn list_branches(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Path((id, owner, repo)): Path<(String, String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -1041,7 +1057,7 @@ fn parse_github_owner_repo(source_url: &str) -> Option<(String, String)> {
 /// List open pull requests for the GitHub repo linked to an app.
 pub async fn list_open_prs(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsRead>,
     State(state): State<AppState>,
     Path(app_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -1132,7 +1148,7 @@ pub async fn list_open_prs(
 /// Link or unlink a GitHub App from an app.
 pub async fn set_app_github_app(
     _rate: RateLimit,
-    _admin: RequireAdmin,
+    auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Path(app_id): Path<String>,
     Json(payload): Json<SetGitHubAppRequest>,
@@ -1171,6 +1187,12 @@ pub async fn set_app_github_app(
         .fetch_one(&state.db)
         .await?;
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("github_app_assign").resource("app", &updated.id, &updated.name),
+    )
+    .await;
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(tond_common::AppResponse::from(updated))),
@@ -1196,10 +1218,12 @@ mod tests {
     use tond_common::GitHubApp;
 
     use super::*;
+    use crate::auth::Principal;
     use crate::{
         auth::{RateLimiter, rate_limit::RateLimit},
         state::AppState,
     };
+    use tond_common::Role;
 
     async fn test_state() -> AppState {
         let db = SqlitePool::connect("sqlite::memory:")
@@ -1218,6 +1242,7 @@ mod tests {
                 server_name: "tond".to_string(),
                 dashboard_domain: "dashboard.example.com".to_string(),
                 preview_domain: String::new(),
+                ..ServerSettings::default()
             })),
         }
     }
@@ -1460,10 +1485,15 @@ mod tests {
     }
 
     async fn manifest_state_for(state: &AppState, headers: HeaderMap) -> String {
-        let response = get_manifest_url(RateLimit, RequireAdmin, State(state.clone()), headers)
-            .await
-            .unwrap_or_else(|_| panic!("get_manifest_url should succeed for an admin session"))
-            .into_response();
+        let response = get_manifest_url(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            State(state.clone()),
+            headers,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("get_manifest_url should succeed for an admin session"))
+        .into_response();
         let body = response_json(response).await;
         body["data"]["github_url"]
             .as_str()
@@ -1493,13 +1523,18 @@ mod tests {
             "no github_apps row may exist before GitHub confirms the registration"
         );
 
-        // API keys / the CLI socket (no session) and non-admin users cannot start it.
+        // API tokens / the CLI socket (no session) and non-admin users cannot start it.
         let member = seed_session(&state, "member-1", "member").await;
         for headers in [HeaderMap::new(), member] {
             assert!(
-                get_manifest_url(RateLimit, RequireAdmin, State(state.clone()), headers)
-                    .await
-                    .is_err()
+                get_manifest_url(
+                    RateLimit,
+                    Authz::unchecked(Principal::test_user(Role::Admin)),
+                    State(state.clone()),
+                    headers
+                )
+                .await
+                .is_err()
             );
         }
     }
@@ -1620,7 +1655,7 @@ mod tests {
     async fn install_state_for(state: &AppState, headers: HeaderMap, id: &str) -> String {
         let response = get_install_url(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             headers,
             Path(id.to_string()),
@@ -1739,7 +1774,7 @@ mod tests {
 
         let response = set_app_github_app(
             RateLimit,
-            RequireAdmin,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path("app-1".to_string()),
             Json(SetGitHubAppRequest {
@@ -1760,7 +1795,7 @@ mod tests {
 
         delete_github_app(
             RateLimit,
-            RequireAdmin,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path("gh-app-1".to_string()),
         )

@@ -23,8 +23,9 @@ use serde_json::json;
 use tond_common::*;
 use uuid::Uuid;
 
+use crate::audit_log::{AuditEntry, record};
 use crate::{
-    auth::{RateLimit, RequireAdmin, RequireAuth},
+    auth::{Authz, RateLimit, scope},
     error::AppError,
     secret_key::{self, Purpose},
     state::AppState,
@@ -35,7 +36,7 @@ use crate::{
 
 pub async fn list_storage_providers(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::SnapshotsRead>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     let rows = sqlx::query_as::<_, StorageProvider>(
@@ -52,7 +53,7 @@ pub async fn list_storage_providers(
 
 pub async fn get_storage_provider(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -64,7 +65,7 @@ pub async fn get_storage_provider(
 
 pub async fn create_storage_provider(
     _rate: RateLimit,
-    _admin: RequireAdmin,
+    auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Json(req): Json<CreateStorageProviderRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -94,6 +95,12 @@ pub async fn create_storage_provider(
     .await?;
 
     let row = fetch_provider(&state.db, &id).await?;
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("storage_provider_create").resource("storage_provider", &row.id, &row.name),
+    )
+    .await;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(to_response(row)))))
 }
 
@@ -101,7 +108,7 @@ pub async fn create_storage_provider(
 
 pub async fn update_storage_provider(
     _rate: RateLimit,
-    _admin: RequireAdmin,
+    auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateStorageProviderRequest>,
@@ -135,6 +142,16 @@ pub async fn update_storage_provider(
     .await?;
 
     let updated = fetch_provider(&state.db, &id).await?;
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("storage_provider_update").resource(
+            "storage_provider",
+            &updated.id,
+            &updated.name,
+        ),
+    )
+    .await;
     Ok((StatusCode::OK, Json(ApiResponse::ok(to_response(updated)))))
 }
 
@@ -142,7 +159,7 @@ pub async fn update_storage_provider(
 
 pub async fn delete_storage_provider(
     _rate: RateLimit,
-    _admin: RequireAdmin,
+    auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -173,6 +190,12 @@ pub async fn delete_storage_provider(
         ))));
     }
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("storage_provider_delete").resource("storage_provider", &id, &id),
+    )
+    .await;
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(json!({ "deleted": id }))),
@@ -183,7 +206,7 @@ pub async fn delete_storage_provider(
 
 pub async fn test_storage_provider(
     _rate: RateLimit,
-    _admin: RequireAdmin,
+    _auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {

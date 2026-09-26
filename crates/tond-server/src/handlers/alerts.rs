@@ -19,8 +19,9 @@ use axum::{
 use tond_common::*;
 use uuid::Uuid;
 
+use crate::audit_log::{AuditEntry, record};
 use crate::{
-    auth::{RateLimit, RequireAuth},
+    auth::{Authz, RateLimit, scope},
     error::AppError,
     secrets,
     state::AppState,
@@ -35,7 +36,7 @@ fn rule_response(rule: AlertRule) -> Result<AlertRuleResponse, AppError> {
 
 pub async fn list_alerts(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::MetricsRead>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     let rules =
@@ -54,7 +55,7 @@ pub async fn list_alerts(
 
 pub async fn get_alert(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::MetricsRead>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -102,7 +103,7 @@ fn events_to_json(events: &Option<Vec<String>>) -> Option<String> {
 
 pub async fn create_alert(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Json(req): Json<CreateAlertRuleRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -144,6 +145,12 @@ pub async fn create_alert(
         .fetch_one(&state.db)
         .await?;
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("alert_create").resource("alert", &rule.id, &rule.name),
+    )
+    .await;
     Ok((
         StatusCode::CREATED,
         Json(ApiResponse::ok(rule_response(rule)?)),
@@ -154,7 +161,7 @@ pub async fn create_alert(
 
 pub async fn update_alert(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateAlertRuleRequest>,
@@ -213,6 +220,12 @@ pub async fn update_alert(
         .fetch_one(&state.db)
         .await?;
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("alert_update").resource("alert", &updated.id, &updated.name),
+    )
+    .await;
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(rule_response(updated)?)),
@@ -223,7 +236,7 @@ pub async fn update_alert(
 
 pub async fn delete_alert(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -245,6 +258,12 @@ pub async fn delete_alert(
         ))));
     }
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("alert_delete").resource("alert", &id, &id),
+    )
+    .await;
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(serde_json::json!({ "deleted": id }))),
@@ -255,7 +274,7 @@ pub async fn delete_alert(
 
 pub async fn list_alert_integrations(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::MetricsRead>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -286,7 +305,7 @@ pub async fn list_alert_integrations(
 
 pub async fn link_alert_integration(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<LinkAlertIntegrationRequest>,
@@ -352,7 +371,7 @@ pub async fn link_alert_integration(
 
 pub async fn unlink_alert_integration(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Path((rule_id, integration_id)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {

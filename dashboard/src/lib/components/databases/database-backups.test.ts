@@ -101,7 +101,7 @@ describe('DatabaseBackups', () => {
 
 	it('hides restore from members', async () => {
 		render(DatabaseBackups, { props: { dbId: 'db1', dbName: 'shop', canRestore: false } });
-		expect(await screen.findByText(/only admins can restore/i)).toBeInTheDocument();
+		expect(await screen.findByText(/can't restore databases/i)).toBeInTheDocument();
 		expect(screen.queryByRole('button', { name: /restore…/i })).not.toBeInTheDocument();
 	});
 });

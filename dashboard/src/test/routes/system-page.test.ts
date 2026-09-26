@@ -35,6 +35,7 @@ describe('system page', () => {
 						disk_used: 10 * 1024 * 1024 * 1024,
 						disk_total: 100 * 1024 * 1024 * 1024,
 						disk_percent: 10,
+						disk_mount: '/',
 						containers_running: 3,
 						apps_total: 5,
 						apps_running: 4,
