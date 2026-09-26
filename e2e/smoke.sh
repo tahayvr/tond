@@ -197,9 +197,10 @@ pass "tond-proxy runs as tond-proxy (pid ${PROXY_PID})"
 cap_eff=$(awk '/^CapEff:/ { print $2 }' "/proc/${PROXY_PID}/status")
 [[ "$cap_eff" == 0000000000000400 ]] || fail "tond-proxy must only hold CAP_NET_BIND_SERVICE, CapEff=${cap_eff}"
 pass "tond-proxy holds only CAP_NET_BIND_SERVICE"
-# Root-only secrets in the shared data dir: the encryption key, the root API
-# key and (until setup completes) the setup token.
-for f in "$SECRET_ENV" "${DATA_DIR}/root-api-key" "${DATA_DIR}/setup-token"; do
+# Root-only secrets in the shared data dir: the encryption key and (until
+# setup completes) the setup token. There is no root API key any more.
+[[ ! -e "${DATA_DIR}/root-api-key" ]] || fail "no root API key file may be written (use tond token create)"
+for f in "$SECRET_ENV" "${DATA_DIR}/setup-token"; do
     [[ -e "$f" ]] || continue
     [[ "$(perms "$f")" == "600 root "* ]] || fail "${f} must be 0600 root, got: $(perms "$f")"
     if runuser -u tond-proxy -- cat "$f" > /dev/null 2>&1; then
@@ -212,7 +213,7 @@ fi
 if runuser -u tond-proxy -- rm -f "$SECRET_ENV" 2> /dev/null || [[ ! -f "$SECRET_ENV" ]]; then
     fail "tond-proxy must not be able to remove root's files from the data directory"
 fi
-pass "tond-proxy cannot read tond.env, root-api-key or setup-token, remove root's files, or reach Docker"
+pass "tond-proxy cannot read tond.env or setup-token, remove root's files, or reach Docker"
 # Container runtimes (OrbStack/LXC machines) may ship a drop-in that resets
 # sandboxing directives; there, check the unit's configuration instead of the
 # effective value. Real VMs (CI runners, Hetzner) check the effective value.
@@ -256,32 +257,27 @@ if runuser -u nobody -- tond apps list > /dev/null 2>&1; then
 fi
 pass "non-root user is refused by the CLI socket"
 
-ROOT_KEY_FILE="${DATA_DIR}/root-api-key"
-ROOT_KEY=""
-if [[ -f "$ROOT_KEY_FILE" ]]; then
-    [[ "$(stat -c '%a %U' "$ROOT_KEY_FILE")" == "600 root" ]] \
-        || fail "root API key file must be 0600 root, got: $(stat -c '%a %U' "$ROOT_KEY_FILE")"
-    ROOT_KEY=$(tr -d '[:space:]' < "$ROOT_KEY_FILE")
-    [[ "$ROOT_KEY" =~ ^[0-9a-f]{64}$ ]] || fail "root API key file must hold a 64-hex key"
-    pass "root API key stored in ${ROOT_KEY_FILE} (0600 root)"
-    # Capture first: with pipefail, `journalctl | grep -q` can report SIGPIPE instead of a match.
-    journal="$(journalctl -u tond-server --no-pager -o cat)"
-    if grep -qF "$ROOT_KEY" <<< "$journal"; then
-        fail "the root API key must never appear in the journal"
-    fi
-    pass "root API key is not in the journal"
+# Automation gets scoped tokens from the root CLI socket; the secret is printed once.
+for name in e2e-readonly e2e-admin e2e-ci e2e-env e2e-revoked e2e-expired e2e-ip-ok e2e-ip-other; do
+    tond token revoke "$name" > /dev/null 2>&1 || true # re-runs on a long-lived VM
+done
+RO_TOKEN=$(tond token create --name e2e-readonly --preset readonly --expires 1d 2> /dev/null)
+[[ "$RO_TOKEN" =~ ^tond_pat_[0-9a-f]{64}$ ]] || fail "tond token create must print a tond_pat_ token, got: ${RO_TOKEN}"
+pass "tond token create prints a scoped tond_pat_ token once"
+journal="$(journalctl -u tond-server --no-pager -o cat)"
+if grep -qF "$RO_TOKEN" <<< "$journal"; then
+    fail "API tokens must never appear in the journal"
 fi
-if [[ -n "$ROOT_KEY" ]]; then
-    tond --server http://127.0.0.1:3001 --api-key "$ROOT_KEY" apps list > /dev/null \
-        || fail "root API key must work over TCP"
-    pass "root API key accepted over TCP"
-    if tond --server http://127.0.0.1:3001 --api-key "$(printf '0%.0s' {1..64})" apps list > /dev/null 2>&1; then
-        fail "a wrong API key must be rejected"
-    fi
-    pass "wrong API key rejected"
-else
-    echo "  - ${ROOT_KEY_FILE} not found (reused install?); skipping key checks"
+pass "the token is not in the journal"
+tond --server http://127.0.0.1:3001 --token "$RO_TOKEN" apps list > /dev/null \
+    || fail "a read-only token must list apps over TCP"
+pass "read-only token accepted over TCP"
+if tond --server http://127.0.0.1:3001 --token "tond_pat_$(printf '0%.0s' {1..64})" apps list > /dev/null 2>&1; then
+    fail "a wrong token must be rejected"
 fi
+pass "wrong token rejected"
+# An admin-scoped token, used below to prove tokens can't reach root-only switches.
+ADMIN_TOKEN=$(tond token create --name e2e-admin --scope settings:write --scope terminal:host --expires 1d 2> /dev/null)
 
 step "Auth hardening"
 # Requests to the dashboard through tond-proxy, as a browser on the dashboard origin would send them.
@@ -394,11 +390,9 @@ if [[ "$signed_in" == true ]]; then
     pass "host terminal is off by default and says how to enable it"
     code=$(dash_code PUT /api/settings/host-terminal "${csrf[@]}" -d '{"enabled":true}')
     [[ "$code" == 403 ]] || fail "the dashboard must not be able to enable the host terminal, got ${code}"
-    if [[ -n "$ROOT_KEY" ]]; then
-        code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "Authorization: Bearer ${ROOT_KEY}" \
-            -H 'Content-Type: application/json' -d '{"enabled":true}' http://127.0.0.1:3001/api/settings/host-terminal)
-        [[ "$code" == 403 ]] || fail "an API key must not be able to enable the host terminal, got ${code}"
-    fi
+    code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+        -H 'Content-Type: application/json' -d '{"enabled":true}' http://127.0.0.1:3001/api/settings/host-terminal)
+    [[ "$code" == 403 ]] || fail "an API token must not be able to enable the host terminal, got ${code}"
     pass "only the root CLI socket can switch the host terminal"
 
     tond settings host-terminal on > /dev/null
@@ -420,12 +414,10 @@ if [[ "$signed_in" == true ]]; then
     code=$(ws_code "$DASH_ORIGIN" "$ticket")
     [[ "$code" == 401 ]] || fail "a terminal ticket must be single-use, got ${code}"
     pass "host terminal: step-up password, single-use ticket"
-    if [[ -n "$ROOT_KEY" ]]; then
-        code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer ${ROOT_KEY}" \
-            -H 'Content-Type: application/json' -d "$ticket_body" http://127.0.0.1:3001/api/terminal/tickets)
-        [[ "$code" == 403 ]] || fail "API keys must not get terminal tickets, got ${code}"
-        pass "API keys are refused terminal tickets"
-    fi
+    code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+        -H 'Content-Type: application/json' -d "$ticket_body" http://127.0.0.1:3001/api/terminal/tickets)
+    [[ "$code" == 403 ]] || fail "API tokens must not get terminal tickets, even with terminal:host, got ${code}"
+    pass "API tokens are refused terminal tickets"
     tond settings host-terminal off > /dev/null
     audit="$(api '/api/audit-log?limit=20')"
     grep -q 'terminal_opened' <<< "$audit" || fail "terminal sessions must be audited"
@@ -456,6 +448,54 @@ done
 pass "failed logins back off (got: ${codes% })"
 rm -f "$COOKIES"
 
+step "Users, roles and the password policy"
+# Invite over the root socket (users:admin), set the password through the
+# one-time link, act as a viewer, then disable and delete the account.
+VIEWER_EMAIL="e2e-viewer@tond.test"
+old_id=$(api /api/users | jq -r --arg e "$VIEWER_EMAIL" '.data[] | select(.email == $e) | .id')
+[[ -z "$old_id" ]] || api_req DELETE "/api/users/${old_id}" '{}' > /dev/null
+code=$(api_req POST /api/users "{\"email\":\"${VIEWER_EMAIL}\",\"role\":\"viewer\"}")
+[[ "$code" == 201 ]] || fail "inviting a user must succeed, got ${code}: $(cat "$API_BODY")"
+VIEWER_ID=$(jq -r '.data.user.id' "$API_BODY")
+LINK_TOKEN=$(jq -r '.data.token' "$API_BODY")
+[[ "$(jq -r '.data.user.password_set' "$API_BODY")" == false ]] || fail "invited users have no password until they use the link"
+pass "invite creates a passwordless user and a one-time set-password link"
+VIEWER_COOKIES="$(mktemp)"
+link_complete() {
+    curl -sk --resolve "${DASH}:443:${IP}" -b "$VIEWER_COOKIES" -c "$VIEWER_COOKIES" -o "$API_BODY" -w '%{http_code}' \
+        -X POST -H "Origin: https://${DASH}" -H 'X-Tond-CSRF: 1' -H 'Content-Type: application/json' \
+        -d "{\"token\":\"${LINK_TOKEN}\",\"password\":\"$1\"}" "https://${DASH}/api/auth/password-link/complete"
+}
+code=$(link_complete 'Password1234!')
+[[ "$code" == 400 ]] && grep -q breached "$API_BODY" || fail "a breached password must be refused with a clear message, got ${code}: $(cat "$API_BODY")"
+code=$(link_complete 'short')
+[[ "$code" == 400 ]] && grep -q '12 characters' "$API_BODY" || fail "passwords under 12 characters must be refused, got ${code}"
+pass "password policy: 12+ characters, breached passwords refused with a friendly message"
+code=$(link_complete 'violet otter lamp 42')
+[[ "$code" == 200 && "$(jq -r '.data.signed_in' "$API_BODY")" == true ]] || fail "a good password must be set and sign in, got ${code}: $(cat "$API_BODY")"
+[[ "$(link_complete 'another good passphrase')" == 403 ]] || fail "set-password links must be single-use"
+pass "the link sets the password once and signs the user in"
+viewer_code() {
+    curl -sk --resolve "${DASH}:443:${IP}" -b "$VIEWER_COOKIES" -o "$API_BODY" -w '%{http_code}' \
+        -X "$1" -H "Origin: https://${DASH}" -H 'X-Tond-CSRF: 1' -H 'Content-Type: application/json' \
+        ${3:+-d "$3"} "https://${DASH}$2"
+}
+[[ "$(viewer_code GET /api/apps)" == 200 ]] || fail "viewers can read apps"
+code=$(viewer_code PUT /api/settings '{"server_name":"viewer-was-here"}')
+[[ "$code" == 403 && "$(jq -r '.code' "$API_BODY")" == SCOPE_DENIED ]] || fail "viewers must get 403 SCOPE_DENIED for settings, got ${code}"
+[[ "$(viewer_code GET /api/users)" == 403 ]] || fail "viewers can't list users"
+pass "a viewer can read but gets 403 SCOPE_DENIED for writes"
+code=$(api_req PATCH "/api/users/${VIEWER_ID}" '{"disabled":true}')
+[[ "$code" == 200 ]] || fail "disabling a user must succeed, got ${code}"
+[[ "$(viewer_code GET /api/apps)" == 401 ]] || fail "disabling a user must end their sessions"
+pass "disabling a user signs them out everywhere"
+[[ "$(api_req DELETE "/api/users/${VIEWER_ID}" '{}')" == 200 ]] || fail "deleting a user must succeed"
+api "/api/audit-log?resource_type=user&resource_id=${VIEWER_ID}" \
+    | jq -e '[.data.entries[].action] | (index("user_invite") and index("user_disable") and index("user_delete") and index("invite_accepted"))' > /dev/null \
+    || fail "user lifecycle events must be audited"
+pass "invite, password set, disable and delete are audited"
+rm -f "$VIEWER_COOKIES"
+
 step "Image app (pull + run + route)"
 tond apps create e2e-whoami --source-type image --source traefik/whoami:v1.10 \
     --port 80 --domain "$WHOAMI_DOMAIN" > /dev/null
@@ -478,9 +518,11 @@ status_of() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
 WHOAMI_ID=$(app_field e2e-whoami id)
 [[ "$WHOAMI_ID" =~ ^[0-9a-f-]{36}$ ]] || fail "could not read the e2e-whoami app id (got: ${WHOAMI_ID})"
 WEBHOOK_JSON=$(api "/api/apps/${WHOAMI_ID}/webhook")
-WEBHOOK_SECRET=$(jq -r '.data.secret // empty' <<< "$WEBHOOK_JSON")
+[[ "$(jq -r '.data.has_secret' <<< "$WEBHOOK_JSON")" == true && "$(jq -r '.data.secret // empty' <<< "$WEBHOOK_JSON")" == "" ]] \
+    || fail "the webhook config must say a secret is set without returning it"
+WEBHOOK_SECRET=$(api "/api/apps/${WHOAMI_ID}/webhook-secret" | jq -r '.data.secret // empty')
 [[ ${#WEBHOOK_SECRET} -ge 32 ]] || fail "every app must get a generated webhook secret"
-pass "app has a generated webhook secret"
+pass "app has a generated webhook secret (write-only; revealed on request)"
 [[ "$(jq -r '.data.paths.github' <<< "$WEBHOOK_JSON")" == "/api/webhooks/github/${WHOAMI_ID}" ]] \
     || fail "webhook URLs must be addressed by app UUID"
 pass "webhook URLs are addressed by app UUID"
@@ -577,6 +619,87 @@ wait_for_app_running e2e-static 600
 wait_for 60 "route for ${STATIC_DOMAIN}" bash -c "curl -sk --resolve '${STATIC_DOMAIN}:443:${IP}' 'https://${STATIC_DOMAIN}/' | grep -q tond-e2e-static-ok"
 pass "pushed static site is built, running and routed"
 
+step "API token scopes, filters and audit"
+# api_as <token> <METHOD> <path> [json]: HTTP status over loopback TCP; body in $API_BODY.
+api_as() {
+    curl -s -o "$API_BODY" -w '%{http_code}' -X "$2" -H "Authorization: Bearer $1" \
+        -H 'Content-Type: application/json' ${4:+-d "$4"} "http://127.0.0.1:3001$3"
+}
+body_code() { jq -r '.code // empty' "$API_BODY"; }
+CI_TOKEN=$(tond token create --name e2e-ci --kind ci --preset deployer --app e2e-whoami --expires 1d 2> /dev/null)
+[[ "$(api_as "$CI_TOKEN" GET /api/apps/e2e-whoami)" == 200 ]] || fail "the CI token must read its own app"
+api_as "$CI_TOKEN" GET /api/apps > /dev/null
+[[ "$(jq -r '.data | map(.name) | join(",")' "$API_BODY")" == e2e-whoami ]] \
+    || fail "a token limited to e2e-whoami must only list e2e-whoami, got: $(cat "$API_BODY")"
+pass "a resource-limited token sees only its app"
+code=$(api_as "$CI_TOKEN" GET /api/apps/e2e-static)
+[[ "$code" == 403 && "$(body_code)" == RESOURCE_DENIED ]] \
+    || fail "the CI token must be refused other apps with 403 RESOURCE_DENIED, got ${code} $(cat "$API_BODY")"
+pass "resource filter blocks other apps (403 RESOURCE_DENIED)"
+code=$(api_as "$RO_TOKEN" PUT /api/settings '{"server_name":"hijacked"}')
+[[ "$code" == 403 && "$(body_code)" == SCOPE_DENIED ]] \
+    || fail "a read-only token must get 403 SCOPE_DENIED for settings, got ${code} $(cat "$API_BODY")"
+code=$(api_as "$CI_TOKEN" DELETE /api/apps/e2e-whoami)
+[[ "$code" == 403 && "$(body_code)" == SCOPE_DENIED ]] \
+    || fail "a deployer token must get 403 SCOPE_DENIED for apps:delete, got ${code}"
+pass "missing scopes → 403 with the stable code SCOPE_DENIED"
+
+REVOKED=$(tond token create --name e2e-revoked --preset readonly --expires 1d 2> /dev/null)
+[[ "$(api_as "$REVOKED" GET /api/apps)" == 200 ]] || fail "a fresh token must work"
+tond token revoke e2e-revoked > /dev/null
+code=$(api_as "$REVOKED" GET /api/apps)
+[[ "$code" == 401 && "$(body_code)" == TOKEN_REVOKED ]] || fail "a revoked token must get 401 TOKEN_REVOKED, got ${code}"
+pass "revoked token → 401 TOKEN_REVOKED"
+EXPIRED=$(tond token create --name e2e-expired --preset readonly --expires 1h 2> /dev/null)
+expire_sql="UPDATE api_tokens SET expires_at = '2000-01-01T00:00:00Z' WHERE name = 'e2e-expired'"
+if command -v sqlite3 > /dev/null; then
+    sqlite3 "${DATA_DIR}/tond.db" "$expire_sql"
+elif command -v python3 > /dev/null; then
+    python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(sys.argv[2]); c.commit()" \
+        "${DATA_DIR}/tond.db" "$expire_sql"
+else
+    expire_sql=""
+fi
+if [[ -n "$expire_sql" ]]; then
+    code=$(api_as "$EXPIRED" GET /api/apps)
+    [[ "$code" == 401 && "$(body_code)" == TOKEN_EXPIRED ]] || fail "an expired token must get 401 TOKEN_EXPIRED, got ${code}"
+    pass "expired token → 401 TOKEN_EXPIRED"
+else
+    echo "  - neither sqlite3 nor python3 available; skipping the expired-token check"
+fi
+if tond token create --name e2e-agent --kind agent --preset readonly --expires never > /dev/null 2>&1; then
+    fail "agent tokens must expire"
+fi
+if tond token create --name e2e-agent --kind agent --scope users:admin > /dev/null 2>&1; then
+    fail "agent tokens must never hold admin scopes"
+fi
+pass "agent tokens must expire and can't hold admin scopes"
+
+# The API over loopback TCP sees 127.0.0.1; through the proxy, X-Forwarded-For
+# is replaced with the real peer, so it can't be spoofed to pass an allow-list.
+IP_OK=$(tond token create --name e2e-ip-ok --preset readonly --allow-ip 127.0.0.1 --expires 1d 2> /dev/null)
+IP_OTHER=$(tond token create --name e2e-ip-other --preset readonly --allow-ip 10.255.255.1 --expires 1d 2> /dev/null)
+[[ "$(api_as "$IP_OK" GET /api/apps)" == 200 ]] || fail "a token allowed from 127.0.0.1 must work over loopback"
+code=$(api_as "$IP_OTHER" GET /api/apps)
+[[ "$code" == 403 && "$(body_code)" == IP_NOT_ALLOWED ]] || fail "a token pinned to another IP must get 403 IP_NOT_ALLOWED, got ${code}"
+code=$(curl -sk -o /dev/null -w '%{http_code}' --resolve "${DASH}:443:${IP}" -H "Authorization: Bearer ${IP_OTHER}" \
+    -H 'X-Forwarded-For: 10.255.255.1' "https://${DASH}/api/apps")
+[[ "$code" == 403 ]] || fail "a spoofed X-Forwarded-For through the proxy must not satisfy the allow-list, got ${code}"
+pass "allowed-IP filter works and can't be spoofed through the proxy"
+
+ENV_TOKEN=$(tond token create --name e2e-env --scope env:write --app e2e-whoami --expires 1d 2> /dev/null)
+[[ "$(api_as "$ENV_TOKEN" PATCH /api/apps/e2e-whoami/env '{"set":{"E2E_TOKEN_AUDIT":"1"},"unset":[]}')" == 200 ]] \
+    || fail "an env:write token must patch env vars: $(cat "$API_BODY")"
+entry=$(api '/api/audit-log?actor=e2e-env&action=env_update&limit=1' | jq -c '.data.entries[0]')
+[[ "$(jq -r '.actor_kind' <<< "$entry")" == token && "$(jq -r '.actor_id' <<< "$entry")" != null ]] \
+    || fail "token calls must be audited with the token's id and name as actor, got: ${entry}"
+api_as "$ENV_TOKEN" PATCH /api/apps/e2e-whoami/env '{"set":{},"unset":["E2E_TOKEN_AUDIT"]}' > /dev/null
+[[ "$(api '/api/audit-log?action=token_create&actor=local-socket&limit=1' | jq -r '.data.entries[0].actor_kind')" == local_socket ]] \
+    || fail "tokens created on the host must be audited as local-socket"
+pass "token calls are audited as the token (id + name); CLI actions as local-socket"
+tond audit verify > /dev/null || fail "the audit log hash chain must verify"
+pass "tond audit verify: the hash chain is intact"
+
 step "TLS certificate issuance (ACME HTTP-01)"
 if [[ -n "$CA_FILE" ]]; then
     wait_for 240 "a certificate for ${WHOAMI_DOMAIN} signed by ${CA_FILE}" \
@@ -660,8 +783,10 @@ wait_for 240 "e2e-redis running" \
     bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/databases | jq -e '.data[] | select(.name == \"e2e-redis\" and .status == \"running\")'"
 pass "e2e-redis is running"
 REDIS_DETAIL=$(api /api/databases/e2e-redis)
-REDIS_USER=$(jq -r '.data.db_user' <<<"$REDIS_DETAIL")
-REDIS_PASS=$(jq -r '.data.db_password' <<<"$REDIS_DETAIL")
+REDIS_CREDS=$(api /api/databases/e2e-redis/credentials)
+REDIS_USER=$(jq -r '.data.db_user' <<<"$REDIS_CREDS")
+REDIS_PASS=$(jq -r '.data.db_password' <<<"$REDIS_CREDS")
+[[ ${#REDIS_PASS} -ge 16 ]] || fail "the credentials reveal must return the Redis password"
 # The server may still be loading right after "running"; retry the auth check briefly.
 wait_for 30 "e2e-redis answering authenticated PING" \
     bash -c "docker exec -e REDISCLI_AUTH='${REDIS_PASS}' tond-db-e2e-redis redis-cli --no-auth-warning --user '${REDIS_USER}' PING | grep -qx PONG"
@@ -669,9 +794,60 @@ noauth=$(docker exec tond-db-e2e-redis redis-cli PING 2>&1 || true)
 [[ "$noauth" == *NOAUTH* ]] || fail "managed Redis must refuse unauthenticated clients, got: ${noauth}"
 wrong=$(docker exec -e REDISCLI_AUTH=wrong tond-db-e2e-redis redis-cli --no-auth-warning --user "$REDIS_USER" PING 2>&1 || true)
 [[ "$wrong" != *PONG* ]] || fail "managed Redis must refuse a wrong password"
-jq -e --arg u "$REDIS_USER" --arg p "$REDIS_PASS" '.data.connection_string | contains($u + ":" + $p + "@")' <<<"$REDIS_DETAIL" > /dev/null \
-    || fail "the Redis connection string must carry the credentials"
-pass "managed Redis requires auth (NOAUTH without, PONG with the ACL user); connection string carries credentials"
+jq -e --arg u "$REDIS_USER" --arg p "$REDIS_PASS" '.data.connection_string | contains($u + ":" + $p + "@")' <<<"$REDIS_CREDS" > /dev/null \
+    || fail "the revealed Redis connection string must carry the credentials"
+pass "managed Redis requires auth (NOAUTH without, PONG with the ACL user); revealed connection string carries credentials"
+
+step "Secrets at rest and write-only API secrets"
+# The database detail never carries the password; its connection string is masked.
+[[ "$(jq -r '.data.db_password // empty' <<<"$REDIS_DETAIL")" == "" && "$(jq -r '.data.has_password' <<<"$REDIS_DETAIL")" == true ]] \
+    || fail "the database detail must report has_password without the password"
+grep -qF "$REDIS_PASS" <<<"$REDIS_DETAIL" && fail "the database detail must not contain the password"
+jq -e '.data.connection_string | contains("••••••••")' <<<"$REDIS_DETAIL" > /dev/null \
+    || fail "the database detail's connection string must be masked"
+pass "database detail: has_password, masked connection string, no password"
+
+# An env var value is stored encrypted: neither the database file (nor its
+# WAL) nor the env listing contains it; an explicit reveal returns it.
+CANARY="e2e-canary-$(date +%s)-${RANDOM}${RANDOM}"
+[[ "$(api_req PATCH "/api/apps/${WHOAMI_ID}/env" "{\"set\":{\"E2E_CANARY\":\"${CANARY}\"}}")" == 200 ]] \
+    || fail "setting an env var must succeed: $(cat "$API_BODY")"
+grep -qF "$CANARY" "$API_BODY" && fail "the env patch response must not echo the value"
+api "/api/apps/${WHOAMI_ID}/env" | grep -qF "$CANARY" && fail "the env listing must mask values"
+[[ "$(api "/api/apps/${WHOAMI_ID}/env/E2E_CANARY" | jq -r '.data.value')" == "$CANARY" ]] \
+    || fail "revealing an env var must return its value"
+for f in "${DATA_DIR}"/tond.db*; do
+    grep -qaF "$CANARY" "$f" && fail "env var value found in plaintext in ${f}"
+    grep -qaF "$REDIS_PASS" "$f" && fail "database password found in plaintext in ${f}"
+    grep -qaF "$WEBHOOK_SECRET" "$f" && fail "webhook secret found in plaintext in ${f}"
+done
+pass "env values, database passwords and webhook secrets are not stored in plaintext"
+
+for action in env_reveal webhook_secret_reveal db_credentials_reveal; do
+    api "/api/audit-log?action=${action}&limit=1" | jq -e '.data.entries | length > 0' > /dev/null \
+        || fail "a ${action} must be audit-logged"
+done
+pass "every secret reveal is audit-logged"
+
+step "Per-database backup"
+[[ "$(api_req POST /api/databases/e2e-redis/backups '{}')" == 201 ]] \
+    || fail "backing up a database must succeed: $(cat "$API_BODY")"
+[[ "$(jq -r '.data.status + " " + .data.scope' "$API_BODY")" == "completed database:e2e-redis" ]] \
+    || fail "a database backup must complete with the database scope: $(cat "$API_BODY")"
+DB_BACKUP_ID=$(jq -r '.data.id' "$API_BODY")
+api /api/databases/e2e-redis/backups | jq -e --arg id "$DB_BACKUP_ID" '.data[] | select(.id == $id)' > /dev/null \
+    || fail "the database backup must be listed for the database"
+[[ -d "${DATA_DIR}/backups/snapshots/${DB_BACKUP_ID}/databases/e2e-redis" ]] \
+    || fail "the database backup must hold the database's data"
+pass "database backed up and listed"
+[[ "$(api_req POST "/api/snapshots/${DB_BACKUP_ID}/restore-database" '{"db_name":"e2e-redis"}')" == 200 ]] \
+    || fail "restoring the database must succeed: $(cat "$API_BODY")"
+SAFETY_ID=$(jq -r '.data.pre_restore_snapshot_id // empty' "$API_BODY")
+api /api/snapshots | jq -e --arg id "$SAFETY_ID" '.data[] | select(.id == $id and .scope == "database:e2e-redis" and .trigger == "pre_restore")' > /dev/null \
+    || fail "a database restore must back up the current data first"
+wait_for 60 "e2e-redis answering after the restore" \
+    bash -c "docker exec -e REDISCLI_AUTH='${REDIS_PASS}' tond-db-e2e-redis redis-cli --no-auth-warning --user '${REDIS_USER}' PING | grep -qx PONG"
+pass "database restored from its backup (safety-net backup taken first)"
 
 step "Cron job"
 tond cron create e2e-cron --schedule "0 0 1 1 *" --image alpine:3 --command "echo tond-e2e-cron-ok" > /dev/null

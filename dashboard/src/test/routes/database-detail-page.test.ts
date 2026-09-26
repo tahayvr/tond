@@ -10,11 +10,15 @@ const api = vi.hoisted(() => ({
 	deleteDatabase: vi.fn(),
 	updateDatabase: vi.fn(),
 	updateDatabaseCredentials: vi.fn(),
+	revealDatabaseCredentials: vi.fn(),
+	listDatabaseBackups: vi.fn(),
+	createDatabaseBackup: vi.fn(),
+	restoreDatabase: vi.fn(),
 	redeployDatabase: vi.fn(),
 	listProjects: vi.fn()
 }));
 
-vi.mock('$lib/auth.svelte', () => ({ isAdmin: () => true }));
+vi.mock('$lib/auth.svelte', () => ({ isAdmin: () => true, can: () => true }));
 
 vi.mock('$lib/api', () => ({ ...api }));
 vi.mock('$app/navigation', () => ({ goto: vi.fn() }));
@@ -39,8 +43,8 @@ const pg: ManagedDatabaseDetail = {
 	status: 'running',
 	db_name: 'app_db',
 	db_user: 'app_user',
-	db_password: 'old_password',
-	root_password: null,
+	has_password: true,
+	has_root_password: false,
 	memory_limit: null,
 	custom_external_url: null,
 	custom_internal_url: null,
@@ -65,6 +69,7 @@ describe('databases/[id] credentials', () => {
 	beforeEach(() => {
 		for (const fn of Object.values(api)) fn.mockReset();
 		document.body.style.pointerEvents = '';
+		api.listDatabaseBackups.mockResolvedValue([]);
 	});
 
 	it('explains that password changes apply inside the running database', async () => {
@@ -78,7 +83,7 @@ describe('databases/[id] credentials', () => {
 
 	it('changes the password and reports success', async () => {
 		api.updateDatabaseCredentials.mockResolvedValue({
-			database: { ...pg, db_password: 'new_password' },
+			database: { ...pg },
 			changed: ['db_password']
 		});
 		const user = await openEnvironment(pg);
@@ -115,6 +120,24 @@ describe('databases/[id] credentials', () => {
 
 		expect(screen.getByRole('button', { name: /change password/i })).toBeDisabled();
 		expect(screen.getByText(/start the database to change a password/i)).toBeInTheDocument();
+	});
+
+	it('keeps the password hidden until an explicit, audited reveal', async () => {
+		api.revealDatabaseCredentials.mockResolvedValue({
+			db_user: 'app_user',
+			db_password: 'plain-password-123',
+			root_password: null,
+			connection_string: 'postgres://app_user:plain-password-123@localhost:5401/app_db',
+			public_connection_string: null,
+			internal_connection_string: null
+		});
+		const user = await openEnvironment(pg);
+
+		expect(screen.queryByText('plain-password-123')).not.toBeInTheDocument();
+		expect(api.revealDatabaseCredentials).not.toHaveBeenCalled();
+		await user.click(screen.getByRole('button', { name: /reveal postgres_password/i }));
+		expect(api.revealDatabaseCredentials).toHaveBeenCalledWith('db_pg1');
+		expect(await screen.findByText('plain-password-123')).toBeInTheDocument();
 	});
 
 	it('offers no password change for Redis', async () => {

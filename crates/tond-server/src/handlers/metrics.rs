@@ -24,7 +24,7 @@ use sqlx::AssertSqlSafe;
 use tond_common::*;
 
 use crate::{
-    auth::{RateLimit, RequireAuth},
+    auth::{Authz, RateLimit, scope},
     error::AppError,
     metrics::{self, Owner, TargetKind, host, store},
     state::AppState,
@@ -116,7 +116,7 @@ async fn lookup(state: &AppState, table: &str, id_or_name: &str) -> sqlx::Result
 
 pub async fn get_app_metrics(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::MetricsRead>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(query): Query<MetricsQuery>,
@@ -129,7 +129,7 @@ pub async fn get_app_metrics(
 
 pub async fn get_database_metrics(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::MetricsRead>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(query): Query<MetricsQuery>,
@@ -142,7 +142,7 @@ pub async fn get_database_metrics(
 
 pub async fn get_cron_metrics(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::MetricsRead>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(query): Query<MetricsQuery>,
@@ -191,7 +191,7 @@ pub async fn system_metrics(state: &AppState) -> SystemMetrics {
 
 pub async fn get_system_metrics(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::MetricsRead>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     let body = system_metrics(&state).await;

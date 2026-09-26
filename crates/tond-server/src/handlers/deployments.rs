@@ -27,8 +27,8 @@ use tond_common::*;
 
 use crate::{
     alerts,
-    audit_log::{AuthActor, write_audit_log},
-    auth::{RateLimit, RequireAuth},
+    audit_log::write_audit_log,
+    auth::{Authz, RateLimit, scope},
     deploy::{self, images},
     error::AppError,
     state::AppState,
@@ -155,7 +155,7 @@ fn deployment_responses(app: &App, deployments: Vec<Deployment>) -> Vec<Deployme
 
 pub async fn list_deployments(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsRead>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -178,8 +178,7 @@ pub async fn list_deployments(
 
 pub async fn rollback_app(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::AppsRollback>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     body: Bytes,
@@ -216,7 +215,7 @@ pub async fn rollback_app(
     let app_name_for_spawn = app_name.clone();
     let app_id_clone = app.id.clone();
     let image_tag_for_spawn = image_tag.clone();
-    let actor_str = actor.0.clone();
+    let actor_str = auth.audit_actor();
     let state_clone = state.clone();
 
     tokio::spawn(async move {
@@ -270,7 +269,7 @@ pub async fn rollback_app(
 
 pub async fn get_generated_dockerfile(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsRead>,
     State(state): State<AppState>,
     Path((id, deployment_id)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -309,6 +308,7 @@ mod tests {
     use tond_common::ServerSettings;
 
     use super::*;
+    use crate::auth::Principal;
     use crate::{auth::RateLimiter, state::AppState};
 
     async fn test_state() -> AppState {
@@ -516,7 +516,7 @@ mod tests {
 
         let response = get_generated_dockerfile(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Path(("app-1".to_string(), "dep-1".to_string())),
         )

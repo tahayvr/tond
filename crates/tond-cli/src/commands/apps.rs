@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::{Args, Subcommand};
 use serde_json::Value;
-use tond_common::{ManagedDatabaseDetail, TemplateManifest, load_template_manifests};
+use tond_common::{DatabaseCredentialsResponse, TemplateManifest, load_template_manifests};
 
 use crate::client::TondClient;
 
@@ -679,8 +679,9 @@ pub async fn handle(client: &TondClient, action: AppsAction) -> Result<()> {
                 client.set_webhook_secret(&app, s).await?;
                 println!("Webhook secret set for {}", app);
             }
+            let mut shown_secret: Option<String> = None;
             if rotate_secret {
-                client.rotate_webhook_secret(&app).await?;
+                shown_secret = Some(client.rotate_webhook_secret(&app).await?.secret);
                 println!(
                     "Webhook secret rotated for {} — update it in your git provider",
                     app
@@ -723,9 +724,12 @@ pub async fn handle(client: &TondClient, action: AppsAction) -> Result<()> {
             if config.urls.is_none() {
                 println!("  (set dashboard_domain in Settings to get absolute URLs)");
             }
-            if show_secret || rotate_secret {
+            if show_secret && shown_secret.is_none() {
+                shown_secret = Some(client.reveal_webhook_secret(&info.id).await?.secret);
+            }
+            if let Some(secret) = shown_secret {
                 println!();
-                println!("Webhook secret: {}", config.secret);
+                println!("Webhook secret: {secret}");
             } else {
                 println!();
                 println!("Webhook secret: hidden (use --show-secret)");
@@ -906,7 +910,8 @@ fn resolve_template_env(
 #[derive(Debug)]
 struct CreatedTemplateDependency {
     name: String,
-    detail: ManagedDatabaseDetail,
+    /// Returned once when the database is created
+    credentials: DatabaseCredentialsResponse,
 }
 
 async fn create_template_project(
@@ -944,7 +949,7 @@ async fn create_template_dependencies(
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("database template dependencies require an engine"))?;
 
-        let detail = client
+        let created_db = client
             .create_database(
                 &name,
                 engine,
@@ -952,7 +957,13 @@ async fn create_template_dependencies(
                 None,
             )
             .await?;
-        created.push(CreatedTemplateDependency { name, detail });
+        let credentials = created_db.credentials.ok_or_else(|| {
+            anyhow::anyhow!(
+                "created database '{name}', but this token may not read database credentials \
+                 (db:credentials), which the template needs"
+            )
+        })?;
+        created.push(CreatedTemplateDependency { name, credentials });
     }
 
     Ok(created)
@@ -978,11 +989,15 @@ fn interpolate_template_value(
         .ok_or_else(|| anyhow::anyhow!("unknown template dependency '{dependency_name}'"))?;
 
     match field {
-        "connection_string" => dependency.detail.connection_string.clone().ok_or_else(|| {
-            anyhow::anyhow!("dependency '{dependency_name}' has no connection string")
-        }),
+        "connection_string" => dependency
+            .credentials
+            .connection_string
+            .clone()
+            .ok_or_else(|| {
+                anyhow::anyhow!("dependency '{dependency_name}' has no connection string")
+            }),
         "internal_connection_string" => dependency
-            .detail
+            .credentials
             .internal_connection_string
             .clone()
             .ok_or_else(|| {
@@ -1141,27 +1156,10 @@ required = true
             "${db.analytics-db.internal_connection_string}",
             &[CreatedTemplateDependency {
                 name: "analytics-db".to_string(),
-                detail: ManagedDatabaseDetail {
-                    database: tond_common::ManagedDatabaseResponse {
-                        id: "db-1".to_string(),
-                        name: "analytics-db".to_string(),
-                        db_type: "postgres".to_string(),
-                        project_id: Some("project-1".to_string()),
-                        host_port: Some(5432),
-                        status: "running".to_string(),
-                        db_name: Some("tond_analytics".to_string()),
-                        db_user: Some("tond_analytics".to_string()),
-                        db_password: Some("secret".to_string()),
-                        root_password: None,
-                        memory_limit: None,
-                        custom_external_url: None,
-                        custom_internal_url: None,
-                        image_used: None,
-                        custom_image: None,
-                        created_at: "2026-01-01T00:00:00Z".to_string(),
-                        updated_at: "2026-01-01T00:00:00Z".to_string(),
-                        public_access: false,
-                    },
+                credentials: DatabaseCredentialsResponse {
+                    db_user: Some("tond_analytics".to_string()),
+                    db_password: Some("secret".to_string()),
+                    root_password: None,
                     public_connection_string: None,
                     connection_string: Some(
                         "postgres://tond_analytics:secret@localhost:5432/tond_analytics"
@@ -1242,8 +1240,7 @@ required = true
                                     "status": "running",
                                     "db_name": "tond_plausible",
                                     "db_user": "tond_plausible",
-                                    "db_password": "secret",
-                                    "root_password": null,
+                                    "has_password": true,
                                     "memory_limit": null,
                                     "custom_external_url": null,
                                     "custom_internal_url": null,
@@ -1251,8 +1248,16 @@ required = true
                                     "custom_image": null,
                                     "created_at": "2026-01-01T00:00:00Z",
                                     "updated_at": "2026-01-01T00:00:00Z",
-                                    "connection_string": "postgres://tond_plausible:secret@localhost:5432/tond_plausible",
-                                    "internal_connection_string": "postgres://tond_plausible:secret@plausible-db:5432/tond_plausible"
+                                    "connection_string": "postgres://tond_plausible:••••••••@localhost:5432/tond_plausible",
+                                    "internal_connection_string": "postgres://tond_plausible:••••••••@plausible-db:5432/tond_plausible",
+                                    "credentials": {
+                                        "db_user": "tond_plausible",
+                                        "db_password": "secret",
+                                        "root_password": null,
+                                        "connection_string": "postgres://tond_plausible:secret@localhost:5432/tond_plausible",
+                                        "public_connection_string": null,
+                                        "internal_connection_string": "postgres://tond_plausible:secret@plausible-db:5432/tond_plausible"
+                                    }
                                 },
                                 "error": null
                             })),

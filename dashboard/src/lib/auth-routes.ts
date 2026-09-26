@@ -2,7 +2,11 @@
 // list both to decide where to redirect and whether to render the app shell,
 // so the two can never disagree (e.g. /login/2fa bouncing back to /login).
 
-export const AUTH_ROUTES = ['/login', '/login/2fa', '/setup'] as const;
+export const AUTH_ROUTES = ['/login', '/login/2fa', '/setup', '/set-password'] as const;
+
+// Auth routes that stay put even for a signed-in visitor: opening someone's
+// set-password link must not bounce to the dashboard.
+const OPEN_ROUTES = ['/set-password'];
 
 // There is no 'setup' status: /setup is reached through the installer's one-time
 // link and validates its token itself, so signed-out visitors may stay on it.
@@ -54,6 +58,7 @@ export function authRedirect(status: AuthStatus, url: URL): string | null {
 		case 'login':
 			return isAuthRoute(path) ? null : loginUrl(url);
 		case 'authenticated':
+			if (OPEN_ROUTES.includes(path.replace(/\/+$/, ''))) return null;
 			return isAuthRoute(path) ? safeNextPath(url.searchParams.get('next')) : null;
 	}
 }

@@ -11,6 +11,13 @@ const api = vi.hoisted(() => ({
 	listApps: vi.fn()
 }));
 
+const auth = vi.hoisted(() => ({ canWrite: true }));
+
+vi.mock('$lib/auth.svelte', () => ({
+	can: (scope: string) => auth.canWrite || !scope.endsWith(':write'),
+	isAdmin: () => auth.canWrite
+}));
+
 vi.mock('$lib/api', async () => {
 	const actual = await vi.importActual<typeof import('$lib/api')>('$lib/api');
 	return { ...actual, ...api };
@@ -41,6 +48,7 @@ describe('DatabaseAccess', () => {
 	beforeEach(() => {
 		for (const fn of Object.values(api)) fn.mockReset();
 		document.body.style.pointerEvents = '';
+		auth.canWrite = true;
 		api.listApps.mockResolvedValue([app('app_1', 'web'), app('app_2', 'api')]);
 	});
 
@@ -111,5 +119,16 @@ describe('DatabaseAccess', () => {
 		expect(await screen.findByText('Server unavailable')).toBeInTheDocument();
 		await user.click(screen.getByRole('button', { name: /retry/i }));
 		expect(await screen.findByText('No app can reach main-db yet.')).toBeInTheDocument();
+	});
+
+	it('hides linking from users without db:write and apps:write', async () => {
+		auth.canWrite = false;
+		api.getDatabaseAccess.mockResolvedValue(access({ linked_apps: [ref('app_1', 'web')] }));
+		render(DatabaseAccessCard, { props: { databaseId: 'db_1', databaseName: 'main-db' } });
+
+		expect(await screen.findByRole('link', { name: 'web' })).toBeInTheDocument();
+		expect(screen.queryByRole('button', { name: 'Unlink web' })).not.toBeInTheDocument();
+		expect(screen.queryByRole('button', { name: /link app/i })).not.toBeInTheDocument();
+		expect(screen.getByText(/Only admins can link and unlink databases/)).toBeInTheDocument();
 	});
 });

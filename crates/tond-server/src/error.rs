@@ -12,6 +12,7 @@
 //   AppAlreadyExists → 409 Conflict
 //   InvalidInput     → 400 Bad Request
 //   Forbidden        → 403 Forbidden
+//   ScopeDenied      → 403 Forbidden, with `code` (SCOPE_DENIED / RESOURCE_DENIED)
 //   DatabaseError    → 500 Internal Server Error
 //   DockerError      → 500 Internal Server Error
 //   Internal         → 500 Internal Server Error
@@ -35,11 +36,21 @@ impl From<sqlx::Error> for AppError {
     }
 }
 
+// Allow `?` on internal helpers (e.g. secret decryption) → 500 with the chain.
+impl From<anyhow::Error> for AppError {
+    fn from(e: anyhow::Error) -> Self {
+        AppError(TondError::Internal(format!("{e:#}")))
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
         let status =
             StatusCode::from_u16(self.0.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        let body = Json(ApiResponse::<()>::err(self.0.to_string()));
+        let body = Json(match self.0.code() {
+            Some(code) => ApiResponse::<()>::err_code(code, self.0.to_string()),
+            None => ApiResponse::<()>::err(self.0.to_string()),
+        });
         (status, body).into_response()
     }
 }

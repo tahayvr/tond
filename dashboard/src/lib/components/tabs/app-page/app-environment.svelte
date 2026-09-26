@@ -9,7 +9,7 @@
 	import EnvImportDialog from '$lib/components/env/env-import-dialog.svelte';
 	import { SvelteMap } from 'svelte/reactivity';
 	import { untrack } from 'svelte';
-	import { isAdmin } from '$lib/auth.svelte';
+	import { can } from '$lib/auth.svelte';
 	import {
 		getAppEnv,
 		patchAppEnv,
@@ -87,7 +87,7 @@
 	let shared = $derived(new Set(env?.preview.shared_keys ?? []));
 	let isImage = $derived(sourceType === 'image');
 	// The server only reveals values to admins; don't offer it to anyone else.
-	let canReveal = $derived(isAdmin());
+	let canReveal = $derived(can('env:read-values'));
 	let selectedCredentialId = $derived(registryCredentialId ?? '');
 
 	function noun(target: Target) {

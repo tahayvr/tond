@@ -16,7 +16,6 @@ DATA_DIR="${INSTALL_DIR}/data"
 DASHBOARD_DIR="${INSTALL_DIR}/dashboard"
 SECRET_ENV_FILE="${DATA_DIR}/tond.env"
 # Written by tond-server on first start, root-only (0600), never logged:
-ROOT_KEY_FILE="${DATA_DIR}/root-api-key"      # root API key for automation
 SETUP_TOKEN_FILE="${DATA_DIR}/setup-token"    # one-time admin setup token (removed after setup)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 NON_INTERACTIVE=false
@@ -704,7 +703,7 @@ ensure_terminal_user() {
 #                                             replace root's (tond.env, tond.sock, ...)
 #   tond.db, -wal, -shm root:tond-proxy 0660  shared by tond-server and tond-proxy
 #   certs/, acme_account.json  tond-proxy     0700 dirs / 0600 files (TLS + ACME keys)
-#   tond.env, root-api-key, setup-token   root 0600 (written by tond-server/install.sh)
+#   tond.env, setup-token                 root 0600 (written by tond-server/install.sh)
 #   everything else     root only: top-level entries lose group/other access;
 #                       builds/ compose/ volumes/ databases/ keys/ backups/
 #                       docker-config/ are 0700 (the parents are what keep their
@@ -794,7 +793,7 @@ ensure_secret_key() {
     mv -f "${SECRET_ENV_FILE}.tmp" "$SECRET_ENV_FILE"
 
     info "Encryption key stored in ${SECRET_ENV_FILE} (mode 0600)"
-    warn "Back this file up: without it, stored credentials, tokens and 2FA secrets cannot be decrypted"
+    warn "Back this file up: without it, stored secrets and remote snapshot copies cannot be decrypted"
 }
 
 install_binaries() {
@@ -1030,8 +1029,10 @@ read_setup_token() {
             tr -d '[:space:]' < "$SETUP_TOKEN_FILE"
             return 0
         fi
-        # Setup already done: the server removes the token file and never recreates it.
-        if [[ -s "$ROOT_KEY_FILE" && $i -ge 5 ]]; then
+        # Setup already done: the server writes the token (if needed) before it
+        # opens its socket, so a listening server without a token file means
+        # the admin account exists.
+        if [[ -S "${DATA_DIR}/tond.sock" && $i -ge 2 ]]; then
             return 0
         fi
         sleep 1
@@ -1090,11 +1091,17 @@ print_summary() {
         echo ""
     fi
 
-    if [[ -s "$ROOT_KEY_FILE" ]]; then
-        echo -e "${BOLD}Root API key${NC} (advanced / automation access) is stored in ${ROOT_KEY_FILE} (root only)."
-        echo "  Show it with: sudo cat ${ROOT_KEY_FILE}"
-        echo ""
-    fi
+    echo -e "${YELLOW}${BOLD}Back up your encryption key${NC}"
+    echo "  ${SECRET_ENV_FILE} holds TOND_SECRET_KEY. Every stored secret (env vars, database"
+    echo "  passwords, tokens) and every snapshot copy in remote storage is encrypted with it."
+    echo "  Keep a copy somewhere safe off this server: restoring on a new server needs the"
+    echo "  same key, and without it that data cannot be recovered."
+    echo "  Show it with: sudo cat ${SECRET_ENV_FILE}"
+    echo ""
+
+    echo -e "${BOLD}Automation:${NC} Create a scoped API token for CI or scripts (shown once):"
+    echo "            sudo tond token create --name ci --preset deployer --app <app> --expires 30d"
+    echo ""
 
     if [[ "$APPS_DOMAIN" == *.nip.io || "$APPS_DOMAIN" == *.sslip.io ]]; then
         echo -e "${BOLD}Apps:${NC}       Served at <app>.${APPS_DOMAIN} (already resolves to this server)."

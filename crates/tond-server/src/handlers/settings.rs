@@ -21,7 +21,8 @@ use tond_common::*;
 use uuid::Uuid;
 
 use crate::{
-    auth::{RateLimit, RequireAdmin, RequireAuth},
+    audit_log::{AuditEntry, record},
+    auth::{Authz, Principal, RateLimit, scope},
     domains::{is_valid_hostname, normalize_domain, validate_apps_domain, validate_preview_domain},
     state::AppState,
     upload::{MAX_UPLOAD_MAX_BYTES, MIN_UPLOAD_MAX_BYTES, format_size},
@@ -64,7 +65,7 @@ fn invalid(msg: String) -> axum::response::Response {
 
 pub async fn get_settings(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Principal,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     let settings = state.settings.read().await.clone();
@@ -75,7 +76,7 @@ pub async fn get_settings(
 
 pub async fn update_settings(
     _rate: RateLimit,
-    _admin: RequireAdmin,
+    auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Json(req): Json<UpdateSettingsRequest>,
 ) -> impl IntoResponse {
@@ -145,6 +146,20 @@ pub async fn update_settings(
         }
         pairs.push(("upload_max_bytes", max.to_string()));
     }
+    if let Some(hours) = req.session_idle_timeout_hours {
+        if !SESSION_IDLE_HOURS_RANGE.contains(&hours) {
+            return invalid(
+                "The idle timeout must be between 1 hour and 720 hours (30 days).".to_string(),
+            );
+        }
+        pairs.push(("session_idle_timeout_hours", hours.to_string()));
+    }
+    if let Some(days) = req.session_max_age_days {
+        if !SESSION_MAX_AGE_DAYS_RANGE.contains(&days) {
+            return invalid("The session lifetime must be between 1 and 365 days.".to_string());
+        }
+        pairs.push(("session_max_age_days", days.to_string()));
+    }
 
     // Write-through: persist each changed key to the DB first so that
     // tond-proxy (separate process) picks it up on its next 5-second poll.
@@ -177,6 +192,18 @@ pub async fn update_settings(
         queue_dashboard_certificate(&state.db, dashboard_domain, &data_dir).await;
     }
 
+    if !pairs.is_empty() {
+        let changed: Vec<String> = pairs.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        record(
+            &state.db,
+            &auth.audit_actor(),
+            AuditEntry::new("settings_update")
+                .kind("settings")
+                .detail(changed.join(" ")),
+        )
+        .await;
+    }
+
     // Update the in-memory cache.
     {
         let mut s = state.settings.write().await;
@@ -188,6 +215,13 @@ pub async fn update_settings(
                 "apps_domain" => s.apps_domain = value,
                 "upload_max_bytes" => {
                     s.upload_max_bytes = value.parse().unwrap_or(s.upload_max_bytes)
+                }
+                "session_idle_timeout_hours" => {
+                    s.session_idle_timeout_hours =
+                        value.parse().unwrap_or(s.session_idle_timeout_hours)
+                }
+                "session_max_age_days" => {
+                    s.session_max_age_days = value.parse().unwrap_or(s.session_max_age_days)
                 }
                 _ => {}
             }
@@ -240,7 +274,7 @@ mod tests {
 
         let response = update_settings(
             RateLimit,
-            RequireAdmin,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Json(UpdateSettingsRequest {
                 dashboard_domain: Some("dash.example.com".to_string()),
@@ -286,7 +320,7 @@ mod tests {
     ) -> axum::response::Response {
         update_settings(
             RateLimit,
-            RequireAdmin,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Json(UpdateSettingsRequest {
                 dashboard_domain: dashboard_domain.map(str::to_string),
@@ -428,7 +462,7 @@ mod tests {
             async move {
                 update_settings(
                     RateLimit,
-                    RequireAdmin,
+                    Authz::unchecked(Principal::test_user(Role::Admin)),
                     State(state),
                     Json(UpdateSettingsRequest {
                         upload_max_bytes: Some(max),
@@ -465,7 +499,7 @@ mod tests {
     async fn put_apps(state: &AppState, apps_domain: &str) -> axum::response::Response {
         update_settings(
             RateLimit,
-            RequireAdmin,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Json(UpdateSettingsRequest {
                 apps_domain: Some(apps_domain.to_string()),

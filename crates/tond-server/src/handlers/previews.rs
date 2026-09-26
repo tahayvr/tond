@@ -31,8 +31,9 @@ use tond_common::{
     UpdatePreviewConfigRequest,
 };
 
+use crate::audit_log::{AuditEntry, record};
 use crate::{
-    auth::{RateLimit, RequireAuth},
+    auth::{Authz, RateLimit, scope},
     deploy, docker,
     domains::{preview_host, require_preview_domain},
     error::AppError,
@@ -67,7 +68,7 @@ fn random_slug() -> String {
 /// Returns 202 immediately with the preview row (status = "building").
 pub async fn create_preview(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::PreviewsWrite>,
     State(state): State<AppState>,
     Path(app_id): Path<String>,
     body: Option<Json<CreatePreviewRequest>>,
@@ -163,6 +164,15 @@ pub async fn create_preview(
         }
     };
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("preview_create")
+            .app(&app.id, &app.name)
+            .detail(format!("slug={}", preview.slug)),
+    )
+    .await;
+
     let response_preview = preview.clone();
     let state_clone = state.clone();
     let app_clone = app.clone();
@@ -190,7 +200,7 @@ pub async fn create_preview(
 /// List active (non-expired) preview deployments for an app.
 pub async fn list_previews(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsRead>,
     State(state): State<AppState>,
     Path(app_id): Path<String>,
 ) -> Response {
@@ -231,7 +241,7 @@ pub async fn list_previews(
 /// Stop and remove a specific preview deployment.
 pub async fn delete_preview(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::PreviewsWrite>,
     State(state): State<AppState>,
     Path((app_id, preview_id)): Path<(String, String)>,
 ) -> Response {
@@ -278,6 +288,14 @@ pub async fn delete_preview(
         .await;
 
     tracing::info!("Preview {} deleted for app {}", preview.slug, app.name);
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("preview_delete")
+            .app(&app.id, &app.name)
+            .detail(format!("slug={}", preview.slug)),
+    )
+    .await;
 
     (
         StatusCode::OK,
@@ -295,7 +313,7 @@ pub async fn delete_preview(
 /// Body: `{ "preview_enabled": true }`
 pub async fn update_preview_config(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Path(app_id): Path<String>,
     Json(body): Json<UpdatePreviewConfigRequest>,
@@ -313,6 +331,14 @@ pub async fn update_preview_config(
 
     let enabled: i64 = if body.preview_enabled { 1 } else { 0 };
     let now = chrono::Utc::now().to_rfc3339();
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("preview_config_update")
+            .app(&app.id, &app.name)
+            .detail(format!("preview_enabled={}", body.preview_enabled)),
+    )
+    .await;
 
     // Update preview_enabled
     if let Err(e) = sqlx::query("UPDATE apps SET preview_enabled = ?, updated_at = ? WHERE id = ?")
@@ -365,9 +391,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        auth::{RateLimiter, RequireAuth, rate_limit::RateLimit},
+        auth::{Authz, Principal, RateLimiter, rate_limit::RateLimit},
         state::AppState,
     };
+    use tond_common::Role;
 
     async fn test_state() -> AppState {
         let db = SqlitePool::connect("sqlite::memory:")
@@ -466,7 +493,7 @@ mod tests {
 
         let response = create_preview(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.id.clone()),
             Some(Json(CreatePreviewRequest {
@@ -494,7 +521,7 @@ mod tests {
 
         let response = create_preview(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.id.clone()),
             Some(Json(CreatePreviewRequest {
@@ -620,7 +647,13 @@ mod tests {
         .await
         .unwrap_or_else(|err| panic!("failed to seed expired preview: {err}"));
 
-        let response = list_previews(RateLimit, RequireAuth, State(state), Path(app.id)).await;
+        let response = list_previews(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            State(state),
+            Path(app.id),
+        )
+        .await;
 
         assert_eq!(
             response.status(),
@@ -657,7 +690,7 @@ mod tests {
 
         let response = update_preview_config(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.id.clone()),
             Json(UpdatePreviewConfigRequest {
@@ -697,7 +730,7 @@ mod tests {
 
         let response = create_preview(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.id.clone()),
             None,
@@ -723,7 +756,7 @@ mod tests {
 
         let response = update_preview_config(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(app.id.clone()),
             Json(UpdatePreviewConfigRequest {
@@ -767,7 +800,7 @@ mod tests {
 
         let response = delete_preview(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path((app.id.clone(), "preview-1".to_string())),
         )

@@ -22,6 +22,8 @@
 	import Settings2 from '~icons/ri/equalizer-line';
 	import Plus from '~icons/ri/add-line';
 	import ChevronDown from '~icons/ri/arrow-down-s-line';
+	import KeyIcon from '~icons/ri/key-2-line';
+	import CloudIcon from '~icons/ri/cloud-line';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();
@@ -222,11 +224,28 @@
 	});
 
 	function triggerLabel(snap: Snapshot): string {
+		const what = snap.scope.startsWith('database:')
+			? `Database ${snap.scope.slice('database:'.length)}`
+			: 'Full';
 		if (snap.trigger === 'scheduled') return 'Scheduled · Full';
 		if (snap.trigger === 'pre_deploy') return `Pre-deploy: ${snap.trigger_app ?? snap.scope}`;
-		if (snap.trigger === 'manual') return 'Manual · Full';
-		if (snap.trigger === 'pre_restore') return 'Pre-restore · Full';
+		if (snap.trigger === 'manual') return `Manual · ${what}`;
+		if (snap.trigger === 'pre_restore') return `Pre-restore · ${what}`;
 		return snap.trigger;
+	}
+
+	/** Remote copy state of a snapshot, or null when it is local only. */
+	function remoteLabel(snap: Snapshot): { text: string; failed: boolean } | null {
+		switch (snap.remote_status) {
+			case 'uploaded':
+				return { text: 'Encrypted copy in remote storage', failed: false };
+			case 'uploading':
+				return { text: 'Uploading encrypted copy…', failed: false };
+			case 'failed':
+				return { text: 'Remote upload failed', failed: true };
+			default:
+				return null;
+		}
 	}
 
 	function isFullScope(snap: Snapshot): boolean {
@@ -368,6 +387,21 @@
 		</div>
 	{/if}
 
+	<!-- Remote copies can only be restored with this server's secret key -->
+	<div
+		class="flex items-start gap-3 rounded border border-border bg-muted/30 px-4 py-3 text-xs text-muted-foreground"
+		data-testid="snapshot-key-warning"
+	>
+		<KeyIcon class="mt-0.5 size-4 shrink-0 text-foreground" />
+		<p>
+			<span class="font-semibold text-foreground">Back up your secret key.</span>
+			Copies in remote storage, and the secrets inside every snapshot, are encrypted with this server's
+			<code class="font-mono">TOND_SECRET_KEY</code> (in
+			<code class="font-mono">/opt/tond/data/tond.env</code>). Keep a copy of it somewhere safe off
+			this server: restoring on a new server needs the same key.
+		</p>
+	</div>
+
 	<!-- Timeline -->
 	{#if snapshots.length === 0}
 		<div class="border border-dashed py-16 text-center text-xs text-muted-foreground">
@@ -420,6 +454,18 @@
 													<Badge variant="destructive" class="h-4 px-1 text-[10px]">Failed</Badge>
 												{/if}
 											</div>
+											{#if remoteLabel(snap)}
+												{@const remote = remoteLabel(snap)!}
+												<span
+													class="flex items-center gap-1 {remote.failed
+														? 'text-destructive'
+														: 'text-muted-foreground'}"
+													title={snap.remote_error ?? ''}
+												>
+													<CloudIcon class="size-3" />
+													{remote.text}{#if remote.failed && snap.remote_error}: {snap.remote_error}{/if}
+												</span>
+											{/if}
 											{#if snap.deployment_id}
 												<span class="text-muted-foreground">
 													before deploy #{snap.deployment_id}

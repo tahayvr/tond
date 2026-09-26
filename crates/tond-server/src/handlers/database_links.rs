@@ -5,10 +5,14 @@
 // project is explicit: a link attaches the database container to the app's
 // network, where the app reaches it by the database's name.
 //
-//   GET    /api/databases/{id}/access            — project apps + linked apps
-//   PUT    /api/databases/{id}/links/{app}       — link an app (idempotent)
-//   DELETE /api/databases/{id}/links/{app}       — unlink an app (idempotent)
-//   GET    /api/apps/{id}/databases              — databases an app can reach
+//   GET    /api/databases/{id}/access       db:read + apps:read   project apps + linked apps
+//   PUT    /api/databases/{id}/links/{app}  db:write + apps:write link an app (idempotent)
+//   DELETE /api/databases/{id}/links/{app}  db:write + apps:write unlink an app (idempotent)
+//   GET    /api/apps/{id}/databases         apps:read + db:read   databases an app can reach
+//
+// A link changes both sides' network reach, so it needs write access to
+// databases and to apps. Resource-limited API tokens are refused on the
+// /databases routes (they only reach /apps/{id} and /projects/{id}).
 //
 // Link and unlink return the refreshed access list. Both are audit-logged.
 
@@ -22,8 +26,8 @@ use tond_common::*;
 
 use super::fetch_app;
 use crate::{
-    audit_log::{AuthActor, write_audit_log},
-    auth::{RateLimit, RequireAuth},
+    audit_log::write_audit_log,
+    auth::{Authz, RateLimit, scope},
     error::AppError,
     networks,
     state::AppState,
@@ -115,7 +119,7 @@ fn link_refusal(db: &ManagedDatabase, app: &App) -> Option<String> {
 
 pub async fn get_database_access(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<(scope::DbRead, scope::AppsRead)>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -128,8 +132,7 @@ pub async fn get_database_access(
 
 pub async fn link_app(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<(scope::DbWrite, scope::AppsWrite)>,
     State(state): State<AppState>,
     Path((id, app_id)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -172,7 +175,7 @@ pub async fn link_app(
             Some(&app.id),
             Some(&app.name),
             "db_link",
-            &actor.0,
+            &auth.audit_actor(),
             Some(&format!("database={}", db.name)),
         )
         .await;
@@ -186,8 +189,7 @@ pub async fn link_app(
 
 pub async fn unlink_app(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<(scope::DbWrite, scope::AppsWrite)>,
     State(state): State<AppState>,
     Path((id, app_id)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -217,7 +219,7 @@ pub async fn unlink_app(
             Some(&app.id),
             Some(&app.name),
             "db_unlink",
-            &actor.0,
+            &auth.audit_actor(),
             Some(&format!("database={}", db.name)),
         )
         .await;
@@ -231,7 +233,7 @@ pub async fn unlink_app(
 
 pub async fn list_app_databases(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<(scope::AppsRead, scope::DbRead)>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -281,7 +283,7 @@ mod tests {
     use tokio::sync::RwLock;
 
     use super::*;
-    use crate::auth::RateLimiter;
+    use crate::auth::{Principal, RateLimiter};
 
     async fn test_state() -> AppState {
         let db = SqlitePool::connect("sqlite::memory:")
@@ -364,8 +366,21 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap_or_else(|err| panic!("json: {err}"))
     }
 
-    fn actor() -> AuthActor {
-        AuthActor("tester".to_string())
+    fn admin<R: crate::auth::principal::ScopeReq>() -> Authz<R> {
+        Authz::unchecked(Principal::test_user(Role::Admin))
+    }
+
+    #[test]
+    fn linking_needs_db_write_and_apps_write() {
+        type Link = (scope::DbWrite, scope::AppsWrite);
+        assert!(Authz::<Link>::check(Principal::test_user(Role::Admin)).is_ok());
+        assert!(
+            Authz::<Link>::check(Principal::test_user(Role::Deployer)).is_err(),
+            "deployers can't change which apps reach a database"
+        );
+        assert!(Authz::<Link>::check(Principal::test_user(Role::Viewer)).is_err());
+        type Read = (scope::DbRead, scope::AppsRead);
+        assert!(Authz::<Read>::check(Principal::test_user(Role::Viewer)).is_ok());
     }
 
     #[tokio::test]
@@ -376,8 +391,7 @@ mod tests {
 
         let response = link_app(
             RateLimit,
-            RequireAuth,
-            actor(),
+            admin(),
             State(state.clone()),
             Path((db.name.clone(), web.name.clone())),
         )
@@ -392,8 +406,7 @@ mod tests {
         // Linking twice is a no-op.
         let again = link_app(
             RateLimit,
-            RequireAuth,
-            actor(),
+            admin(),
             State(state.clone()),
             Path((db.id.clone(), web.id.clone())),
         )
@@ -409,7 +422,7 @@ mod tests {
 
         let apps = list_app_databases(
             RateLimit,
-            RequireAuth,
+            admin(),
             State(state.clone()),
             Path(web.id.clone()),
         )
@@ -422,8 +435,7 @@ mod tests {
 
         let response = unlink_app(
             RateLimit,
-            RequireAuth,
-            actor(),
+            admin(),
             State(state.clone()),
             Path((db.id.clone(), web.id.clone())),
         )
@@ -458,7 +470,7 @@ mod tests {
 
         let access = get_database_access(
             RateLimit,
-            RequireAuth,
+            admin(),
             State(state.clone()),
             Path(db.id.clone()),
         )
@@ -477,8 +489,7 @@ mod tests {
 
         let err = link_app(
             RateLimit,
-            RequireAuth,
-            actor(),
+            admin(),
             State(state.clone()),
             Path((db.id.clone(), api.id.clone())),
         )
@@ -490,7 +501,7 @@ mod tests {
 
         let apps = list_app_databases(
             RateLimit,
-            RequireAuth,
+            admin(),
             State(state.clone()),
             Path(api.id.clone()),
         )
@@ -507,8 +518,7 @@ mod tests {
         let stack = seed_app(&state, "stack", None, "compose").await;
         let err = link_app(
             RateLimit,
-            RequireAuth,
-            actor(),
+            admin(),
             State(state.clone()),
             Path((db.id.clone(), stack.id.clone())),
         )

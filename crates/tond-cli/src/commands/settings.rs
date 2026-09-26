@@ -47,7 +47,7 @@ pub enum SettingsAction {
     /// Turn the dashboard's host terminal (a shell on this server) on or off
     ///
     /// Off by default. It can only be switched from the server itself (this
-    /// command, run as root), never from the dashboard or with an API key. When
+    /// command, run as root), never from the dashboard or with an API token. When
     /// on, only admins can use it and every session asks for their password
     /// (and 2FA code).
     HostTerminal {
@@ -113,7 +113,9 @@ pub async fn handle(client: &TondClient, action: Option<SettingsAction>) -> Resu
             let s = client
                 .update_settings(UpdateSettingsRequest {
                     server_name: Some(name.clone()),
-                    ..Default::default()
+                    dashboard_domain: None,
+                    preview_domain: None,
+                    ..UpdateSettingsRequest::default()
                 })
                 .await?;
             if name.is_empty() {
@@ -126,7 +128,8 @@ pub async fn handle(client: &TondClient, action: Option<SettingsAction>) -> Resu
             let s = client
                 .update_settings(UpdateSettingsRequest {
                     dashboard_domain: Some(domain.clone()),
-                    ..Default::default()
+                    preview_domain: None,
+                    ..UpdateSettingsRequest::default()
                 })
                 .await?;
             if domain.is_empty() {
@@ -159,7 +162,7 @@ pub async fn handle(client: &TondClient, action: Option<SettingsAction>) -> Resu
             let s = client
                 .update_settings(UpdateSettingsRequest {
                     preview_domain: Some(domain.clone()),
-                    ..Default::default()
+                    ..UpdateSettingsRequest::default()
                 })
                 .await?;
             if domain.is_empty() {
@@ -180,18 +183,19 @@ pub async fn handle(client: &TondClient, action: Option<SettingsAction>) -> Resu
 /// Prompts for current password and new password (+ confirmation),
 /// then calls POST /api/auth/change-password.
 ///
-/// Note: The change-password endpoint uses a session cookie for auth.
-/// The CLI sends the API key in the Authorization header — the server
-/// accepts both. Input is read from stdin (characters are visible; pipe
-/// a password manager's output for non-interactive use).
+/// Note: The change-password endpoint needs a dashboard session; API tokens
+/// and the root socket can't change a user's password. Root on the host can
+/// instead issue a one-time reset link: `tond users reset-link <email>`.
+/// Input is read from stdin (characters are visible; pipe a password
+/// manager's output for non-interactive use).
 pub async fn handle_passwd(client: &TondClient) -> Result<()> {
     use std::io::{self, Write};
 
     let current = read_line_prompt("Current password: ")?;
     let new_pw = read_line_prompt("New password: ")?;
 
-    if new_pw.len() < 8 {
-        anyhow::bail!("New password must be at least 8 characters");
+    if new_pw.chars().count() < 12 {
+        anyhow::bail!("New password must be at least 12 characters");
     }
 
     let confirm = read_line_prompt("Confirm new password: ")?;

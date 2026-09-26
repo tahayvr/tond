@@ -19,17 +19,24 @@ use axum::{
 use tond_common::*;
 use uuid::Uuid;
 
+use crate::audit_log::{AuditEntry, record};
 use crate::{
-    auth::{RateLimit, RequireAuth},
+    auth::{Authz, RateLimit, scope},
     error::AppError,
+    secrets,
     state::AppState,
 };
+
+fn rule_response(rule: AlertRule) -> Result<AlertRuleResponse, AppError> {
+    let url = secrets::alert_webhook_url(&rule.webhook_url)?;
+    Ok(AlertRuleResponse::new(rule, &url))
+}
 
 // ── List ──
 
 pub async fn list_alerts(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::MetricsRead>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     let rules =
@@ -37,7 +44,10 @@ pub async fn list_alerts(
             .fetch_all(&state.db)
             .await?;
 
-    let resp: Vec<AlertRuleResponse> = rules.into_iter().map(AlertRuleResponse::from).collect();
+    let mut resp: Vec<AlertRuleResponse> = Vec::with_capacity(rules.len());
+    for rule in rules {
+        resp.push(rule_response(rule)?);
+    }
     Ok((StatusCode::OK, Json(ApiResponse::ok(resp))))
 }
 
@@ -45,7 +55,7 @@ pub async fn list_alerts(
 
 pub async fn get_alert(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::MetricsRead>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -55,10 +65,7 @@ pub async fn get_alert(
         .await?
         .ok_or_else(|| AppError(TondError::NotFound(format!("Alert rule {id} not found"))))?;
 
-    Ok((
-        StatusCode::OK,
-        Json(ApiResponse::ok(AlertRuleResponse::from(rule))),
-    ))
+    Ok((StatusCode::OK, Json(ApiResponse::ok(rule_response(rule)?))))
 }
 
 // ── Helpers ──
@@ -96,7 +103,7 @@ fn events_to_json(events: &Option<Vec<String>>) -> Option<String> {
 
 pub async fn create_alert(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Json(req): Json<CreateAlertRuleRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -128,7 +135,7 @@ pub async fn create_alert(
     .bind(&req.name)
     .bind(&req.metric)
     .bind(threshold)
-    .bind(&req.webhook_url)
+    .bind(secrets::seal_alert_webhook_url(req.webhook_url.trim())?)
     .bind(&events_json)
     .execute(&state.db)
     .await?;
@@ -138,9 +145,15 @@ pub async fn create_alert(
         .fetch_one(&state.db)
         .await?;
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("alert_create").resource("alert", &rule.id, &rule.name),
+    )
+    .await;
     Ok((
         StatusCode::CREATED,
-        Json(ApiResponse::ok(AlertRuleResponse::from(rule))),
+        Json(ApiResponse::ok(rule_response(rule)?)),
     ))
 }
 
@@ -148,7 +161,7 @@ pub async fn create_alert(
 
 pub async fn update_alert(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateAlertRuleRequest>,
@@ -169,7 +182,11 @@ pub async fn update_alert(
         None => rule.metric,
     };
     let threshold = req.threshold.unwrap_or(rule.threshold);
-    let webhook_url = req.webhook_url.unwrap_or(rule.webhook_url);
+    // Write-only: absent keeps the saved URL, "" clears it.
+    let webhook_url = match req.webhook_url {
+        Some(url) => secrets::seal_alert_webhook_url(url.trim())?,
+        None => rule.webhook_url,
+    };
     let enabled: i64 = req
         .enabled
         .map(|b| if b { 1 } else { 0 })
@@ -203,9 +220,15 @@ pub async fn update_alert(
         .fetch_one(&state.db)
         .await?;
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("alert_update").resource("alert", &updated.id, &updated.name),
+    )
+    .await;
     Ok((
         StatusCode::OK,
-        Json(ApiResponse::ok(AlertRuleResponse::from(updated))),
+        Json(ApiResponse::ok(rule_response(updated)?)),
     ))
 }
 
@@ -213,7 +236,7 @@ pub async fn update_alert(
 
 pub async fn delete_alert(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -235,6 +258,12 @@ pub async fn delete_alert(
         ))));
     }
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("alert_delete").resource("alert", &id, &id),
+    )
+    .await;
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(serde_json::json!({ "deleted": id }))),
@@ -245,7 +274,7 @@ pub async fn delete_alert(
 
 pub async fn list_alert_integrations(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::MetricsRead>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -276,7 +305,7 @@ pub async fn list_alert_integrations(
 
 pub async fn link_alert_integration(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<LinkAlertIntegrationRequest>,
@@ -342,7 +371,7 @@ pub async fn link_alert_integration(
 
 pub async fn unlink_alert_integration(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Path((rule_id, integration_id)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {

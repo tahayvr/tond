@@ -42,6 +42,31 @@ pub struct ServerSettings {
     /// The compressed upload is capped at the same size.
     #[serde(default = "default_upload_max_bytes")]
     pub upload_max_bytes: u64,
+    /// Dashboard sessions end after this many hours without a request
+    /// (settings key `session_idle_timeout_hours`).
+    #[serde(default = "default_session_idle_hours")]
+    pub session_idle_timeout_hours: i64,
+    /// Dashboard sessions end this many days after sign-in, however active
+    /// (settings key `session_max_age_days`).
+    #[serde(default = "default_session_max_age_days")]
+    pub session_max_age_days: i64,
+}
+
+/// Default idle timeout for dashboard sessions.
+pub const DEFAULT_SESSION_IDLE_HOURS: i64 = 12;
+/// Default absolute lifetime of dashboard sessions.
+pub const DEFAULT_SESSION_MAX_AGE_DAYS: i64 = 30;
+/// Accepted range for `session_idle_timeout_hours` (1 hour … 30 days).
+pub const SESSION_IDLE_HOURS_RANGE: std::ops::RangeInclusive<i64> = 1..=720;
+/// Accepted range for `session_max_age_days` (1 day … 1 year).
+pub const SESSION_MAX_AGE_DAYS_RANGE: std::ops::RangeInclusive<i64> = 1..=365;
+
+fn default_session_idle_hours() -> i64 {
+    DEFAULT_SESSION_IDLE_HOURS
+}
+
+fn default_session_max_age_days() -> i64 {
+    DEFAULT_SESSION_MAX_AGE_DAYS
 }
 
 impl Default for ServerSettings {
@@ -52,6 +77,8 @@ impl Default for ServerSettings {
             preview_domain: String::new(),
             apps_domain: String::new(),
             upload_max_bytes: DEFAULT_UPLOAD_MAX_BYTES,
+            session_idle_timeout_hours: DEFAULT_SESSION_IDLE_HOURS,
+            session_max_age_days: DEFAULT_SESSION_MAX_AGE_DAYS,
         }
     }
 }
@@ -75,4 +102,7 @@ pub struct UpdateSettingsRequest {
     pub apps_domain: Option<String>,
     #[serde(default)]
     pub upload_max_bytes: Option<u64>,
+    pub session_idle_timeout_hours: Option<i64>,
+    #[serde(default)]
+    pub session_max_age_days: Option<i64>,
 }

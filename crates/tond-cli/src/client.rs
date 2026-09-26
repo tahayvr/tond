@@ -2,7 +2,7 @@
 //
 // TondClient wraps reqwest::Client and provides one async method per API
 // endpoint. All methods:
-//   - Attach the Authorization: Bearer <key> header if an API key is set
+//   - Attach the Authorization: Bearer <token> header if an API token is set
 //   - Deserialise the response into ApiResponse<T>
 //   - Return the inner data on success, or bail with the error message
 //
@@ -18,7 +18,8 @@
 // Transports:
 //   TondClient::local(socket) talks to tond-server over its root-only Unix
 //   socket, where no credentials are needed (the CLI's default).
-//   TondClient::new(url, api_key) talks HTTP(S) and sends the API key.
+//   TondClient::new(url, token) talks HTTP(S) and sends the API token
+//   (`tond_pat_…`, created with `tond token create` or in the dashboard).
 //
 // stream_logs():
 //   Opens a WebSocket to GET /api/apps/{id}/logs/stream?token=<key> and
@@ -36,11 +37,14 @@ use futures::StreamExt;
 use serde_json::{Map, Value};
 use tokio_tungstenite::tungstenite::Message;
 use tond_common::{
-    ApiResponse, AppResponse, BackupConfigResponse, CreateAppRequest, CreateCronJobRequest,
-    CreateDatabaseRequest, CronJobResponse, CronJobRun, DeployKeyResponse, DeploymentResponse,
-    IntegrationResponse, ManagedDatabaseDetail, ManagedDatabaseResponse, PreviewDeploymentResponse,
-    ProjectPreviewResponse, ProjectResponse, ServerSettings, SnapshotResponse, SnapshotStarted,
-    StorageProviderResponse, UpdateCronJobRequest, UpdateSettingsRequest, WebhookConfigResponse,
+    ApiResponse, AppResponse, AuditLogPage, AuditVerifyReport, BackupConfigResponse,
+    CreateAppRequest, CreateCronJobRequest, CreateDatabaseRequest, CreateTokenRequest,
+    CreatedDatabaseResponse, CreatedTokenResponse, CronJobResponse, CronJobRun,
+    DatabaseCredentialsResponse, DeployKeyResponse, DeploymentResponse, IntegrationResponse,
+    ManagedDatabaseDetail, ManagedDatabaseResponse, PasswordLinkResponse,
+    PreviewDeploymentResponse, ProjectPreviewResponse, ProjectResponse, ServerSettings,
+    SnapshotResponse, StorageProviderResponse, TokenResponse, UpdateCronJobRequest,
+    UpdateSettingsRequest, UserResponse, WebhookConfigResponse, WebhookSecretResponse,
 };
 
 /// Body and response of `/api/settings/host-terminal`.
@@ -61,7 +65,7 @@ pub struct TondClient {
 const LOCAL_BASE_URL: &str = "http://localhost";
 
 impl TondClient {
-    /// Client for a server reached over HTTP(S), authenticated with `api_key`.
+    /// Client for a server reached over HTTP(S), authenticated with the API token `api_key`.
     pub fn new(base_url: &str, api_key: Option<&str>) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -77,7 +81,7 @@ impl TondClient {
         // produce an actionable message instead of a generic request error.
         if let Err(err) = std::os::unix::net::UnixStream::connect(socket_path) {
             let hint = "Run the CLI on the Tond server as root, or connect remotely with \
-                        --server <url> --api-key <key>.";
+                        --server <url> --token <tond_pat_…>.";
             return Err(match err.kind() {
                 std::io::ErrorKind::NotFound => anyhow::anyhow!(
                     "tond-server socket not found at {}. Is tond-server running? {hint}",
@@ -104,7 +108,7 @@ impl TondClient {
         })
     }
 
-    /// Add the Authorization header if an API key is configured.
+    /// Add the Authorization header if an API token is configured.
     fn auth_header(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         if let Some(ref key) = self.api_key {
             req.header("Authorization", format!("Bearer {}", key))
@@ -583,7 +587,7 @@ impl TondClient {
         }
     }
 
-    /// Webhook URLs and secret for an app.
+    /// Webhook URLs for an app (the secret is revealed separately).
     pub async fn get_webhook_config(&self, id: &str) -> Result<WebhookConfigResponse> {
         let req = self
             .client
@@ -611,13 +615,27 @@ impl TondClient {
         Ok(())
     }
 
-    /// Replace the webhook secret with a freshly generated one.
-    pub async fn rotate_webhook_secret(&self, id: &str) -> Result<WebhookConfigResponse> {
+    /// Reveal the app's webhook secret (admin only, audit-logged).
+    pub async fn reveal_webhook_secret(&self, id: &str) -> Result<WebhookSecretResponse> {
+        let req = self
+            .client
+            .get(format!("{}/api/apps/{}/webhook-secret", self.base_url, id));
+        let resp: ApiResponse<WebhookSecretResponse> =
+            self.auth_header(req).send().await?.json().await?;
+        if resp.success {
+            resp.data.context("No data returned")
+        } else {
+            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
+        }
+    }
+
+    /// Replace the webhook secret with a freshly generated one; returns it.
+    pub async fn rotate_webhook_secret(&self, id: &str) -> Result<WebhookSecretResponse> {
         let req = self.client.post(format!(
             "{}/api/apps/{}/webhook-secret/rotate",
             self.base_url, id
         ));
-        let resp: ApiResponse<WebhookConfigResponse> =
+        let resp: ApiResponse<WebhookSecretResponse> =
             self.auth_header(req).send().await?.json().await?;
         if resp.success {
             resp.data.context("No data returned")
@@ -856,7 +874,7 @@ impl TondClient {
         db_type: &str,
         project_id: Option<&str>,
         memory_limit: Option<i64>,
-    ) -> Result<ManagedDatabaseDetail> {
+    ) -> Result<CreatedDatabaseResponse> {
         let body = CreateDatabaseRequest {
             name: name.to_string(),
             db_type: db_type.to_string(),
@@ -868,7 +886,23 @@ impl TondClient {
             .client
             .post(format!("{}/api/databases", self.base_url))
             .json(&body);
-        let resp: ApiResponse<ManagedDatabaseDetail> =
+        let resp: ApiResponse<CreatedDatabaseResponse> =
+            self.auth_header(req).send().await?.json().await?;
+        if resp.success {
+            resp.data.context("No data returned")
+        } else {
+            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
+        }
+    }
+
+    /// Reveal a database's passwords and connection strings (admin only,
+    /// audit-logged).
+    pub async fn get_database_credentials(&self, id: &str) -> Result<DatabaseCredentialsResponse> {
+        let req = self.client.get(format!(
+            "{}/api/databases/{}/credentials",
+            self.base_url, id
+        ));
+        let resp: ApiResponse<DatabaseCredentialsResponse> =
             self.auth_header(req).send().await?.json().await?;
         if resp.success {
             resp.data.context("No data returned")
@@ -1000,6 +1034,8 @@ impl TondClient {
             enabled,
             timeout_seconds: None,
             env: None,
+            env_set: Default::default(),
+            env_unset: vec![],
             project_id: None,
             concurrency_policy: None,
             memory_mb: None,
@@ -1289,13 +1325,15 @@ impl TondClient {
 
     // ── Snapshots ─────────────────────────────────────────────────────────────
 
-    /// Start a snapshot. It runs in the background; poll `list_snapshots` for its status.
-    pub async fn create_snapshot(&self, name: Option<&str>) -> Result<SnapshotStarted> {
+    /// Take a full snapshot. Returns once the local copy is complete; a remote
+    /// upload (when configured) continues in the background.
+    pub async fn create_snapshot(&self, name: Option<&str>) -> Result<SnapshotResponse> {
         let req = self
             .client
             .post(format!("{}/api/snapshots", self.base_url))
             .json(&serde_json::json!({ "name": name }));
-        let resp: ApiResponse<SnapshotStarted> = self.auth_header(req).send().await?.json().await?;
+        let resp: ApiResponse<SnapshotResponse> =
+            self.auth_header(req).send().await?.json().await?;
         if resp.success {
             resp.data.context("No data returned")
         } else {
@@ -1409,6 +1447,80 @@ impl TondClient {
         } else {
             anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
         }
+    }
+
+    // ── API tokens ──
+
+    /// Unwrap an API envelope into its data.
+    fn into_data<T: serde::Serialize>(resp: ApiResponse<T>) -> Result<T> {
+        if resp.success {
+            resp.data.context("No data returned")
+        } else {
+            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
+        }
+    }
+
+    /// Create an API token; the response carries the secret (shown once).
+    pub async fn create_token(&self, body: &CreateTokenRequest) -> Result<CreatedTokenResponse> {
+        let req = self
+            .client
+            .post(format!("{}/api/tokens", self.base_url))
+            .json(body);
+        Self::into_data(self.auth_header(req).send().await?.json().await?)
+    }
+
+    /// List API tokens (every user's when `all`).
+    pub async fn list_tokens(&self, all: bool) -> Result<Vec<TokenResponse>> {
+        let req = self
+            .client
+            .get(format!("{}/api/tokens?all={all}", self.base_url));
+        Self::into_data(self.auth_header(req).send().await?.json().await?)
+    }
+
+    /// Revoke an API token by id.
+    pub async fn revoke_token(&self, id: &str) -> Result<TokenResponse> {
+        let req = self
+            .client
+            .delete(format!("{}/api/tokens/{}", self.base_url, id));
+        Self::into_data(self.auth_header(req).send().await?.json().await?)
+    }
+
+    // ── Users ──
+
+    pub async fn list_users(&self) -> Result<Vec<UserResponse>> {
+        let req = self.client.get(format!("{}/api/users", self.base_url));
+        Self::into_data(self.auth_header(req).send().await?.json().await?)
+    }
+
+    /// Issue a one-time set-password link for a user (invite or reset).
+    pub async fn create_password_link(&self, user_id: &str) -> Result<PasswordLinkResponse> {
+        let req = self.client.post(format!(
+            "{}/api/users/{}/password-link",
+            self.base_url, user_id
+        ));
+        Self::into_data(self.auth_header(req).send().await?.json().await?)
+    }
+
+    // ── Audit log ──
+
+    /// Verify the audit log's hash chain.
+    pub async fn verify_audit_log(&self) -> Result<AuditVerifyReport> {
+        let req = self
+            .client
+            .get(format!("{}/api/audit-log/verify", self.base_url));
+        Self::into_data(self.auth_header(req).send().await?.json().await?)
+    }
+
+    /// One page of the audit log, newest first.
+    pub async fn list_audit_log(&self, query: &[(&str, String)]) -> Result<AuditLogPage> {
+        let qs: Vec<String> = query
+            .iter()
+            .map(|(k, v)| format!("{k}={}", urlencoding::encode(v)))
+            .collect();
+        let req = self
+            .client
+            .get(format!("{}/api/audit-log?{}", self.base_url, qs.join("&")));
+        Self::into_data(self.auth_header(req).send().await?.json().await?)
     }
 }
 
@@ -1601,7 +1713,7 @@ mod tests {
         assert_eq!(
             request_without_key.headers().get("authorization"),
             None,
-            "auth_header should leave requests untouched when no API key is configured"
+            "auth_header should leave requests untouched when no API token is configured"
         );
     }
 
@@ -1787,7 +1899,7 @@ mod tests {
         assert_eq!(
             auth_header.as_deref(),
             Some("Bearer secret-key"),
-            "create_app should attach the bearer token when an API key is configured"
+            "create_app should attach the bearer token when an API token is configured"
         );
 
         let body = capture
@@ -1951,8 +2063,7 @@ mod tests {
                                 "status": "running",
                                 "db_name": "tond_analytics",
                                 "db_user": "tond_analytics",
-                                "db_password": "secret",
-                                "root_password": null,
+                                "has_password": true,
                                 "memory_limit": null,
                                 "custom_external_url": null,
                                 "custom_internal_url": null,
@@ -1960,8 +2071,16 @@ mod tests {
                                 "custom_image": null,
                                 "created_at": "2026-01-01T00:00:00Z",
                                 "updated_at": "2026-01-01T00:00:00Z",
-                                "connection_string": "postgres://tond_analytics:secret@localhost:5432/tond_analytics",
-                                "internal_connection_string": "postgres://tond_analytics:secret@analytics-db:5432/tond_analytics"
+                                "connection_string": "postgres://tond_analytics:••••••••@localhost:5432/tond_analytics",
+                                "internal_connection_string": "postgres://tond_analytics:••••••••@analytics-db:5432/tond_analytics",
+                                "credentials": {
+                                    "db_user": "tond_analytics",
+                                    "db_password": "secret",
+                                    "root_password": null,
+                                    "connection_string": "postgres://tond_analytics:secret@localhost:5432/tond_analytics",
+                                    "public_connection_string": null,
+                                    "internal_connection_string": "postgres://tond_analytics:secret@analytics-db:5432/tond_analytics"
+                                }
                             },
                             "error": null
                         })))
@@ -1986,7 +2105,7 @@ mod tests {
             "project creation should return the server id"
         );
         assert_eq!(
-            db.database.project_id.as_deref(),
+            db.detail.database.project_id.as_deref(),
             Some("project-1"),
             "database creation should preserve the supplied project id"
         );

@@ -24,6 +24,7 @@ futures = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-tungstenite = { workspace = true }
 minisign-verify = { workspace = true }
+urlencoding = { workspace = true }
 
 [dev-dependencies]
 minisign = { workspace = true }

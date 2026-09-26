@@ -2,6 +2,8 @@
 	import { updateSettings } from '$lib/api';
 	import { setUiContext, clearUiContext, projectsContext } from '$lib/ui-context.svelte';
 	import SettingsForm from '$lib/components/forms/settings-form.svelte';
+	import SessionSettingsForm from '$lib/components/forms/session-settings-form.svelte';
+	import { can } from '$lib/auth.svelte';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();
@@ -96,4 +98,6 @@
 		error={accessError}
 		onSubmit={handleSaveAccess}
 	/>
+
+	<SessionSettingsForm settings={data.settings} canEdit={can('settings:write')} />
 </div>

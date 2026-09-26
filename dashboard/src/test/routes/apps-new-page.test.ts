@@ -69,7 +69,7 @@ const data = {
 			id: 'proj_1',
 			name: 'Existing Project',
 			description: 'Already created',
-			env_vars: {},
+			env: [],
 			active_preview_count: 0,
 			created_at: '2026-01-01T00:00:00.000Z',
 			updated_at: '2026-01-01T00:00:00.000Z'
@@ -135,7 +135,7 @@ describe('new app page', () => {
 			id: 'proj_template',
 			name: 'plausible',
 			description: 'Plausible app and supporting services',
-			env_vars: {},
+			env: [],
 			active_preview_count: 0,
 			created_at: '2026-01-01T00:00:00.000Z',
 			updated_at: '2026-01-01T00:00:00.000Z'
@@ -149,8 +149,8 @@ describe('new app page', () => {
 			status: 'running',
 			db_name: 'plausible',
 			db_user: 'plausible',
-			db_password: 'secret',
-			root_password: null,
+			has_password: true,
+			has_root_password: false,
 			memory_limit: null,
 			custom_external_url: null,
 			custom_internal_url: null,
@@ -158,8 +158,21 @@ describe('new app page', () => {
 			custom_image: null,
 			created_at: '2026-01-01T00:00:00.000Z',
 			updated_at: '2026-01-01T00:00:00.000Z',
-			connection_string: 'postgres://plausible:secret@localhost:5401/plausible',
-			internal_connection_string: 'postgres://plausible:secret@tond-db-plausible-db:5432/plausible'
+			public_access: false,
+			connection_string: 'postgres://plausible:••••••••@localhost:5401/plausible',
+			public_connection_string: null,
+			internal_connection_string:
+				'postgres://plausible:••••••••@tond-db-plausible-db:5432/plausible',
+			// Creation returns the generated credentials once; the template uses them.
+			credentials: {
+				db_user: 'plausible',
+				db_password: 'secret',
+				root_password: null,
+				connection_string: 'postgres://plausible:secret@localhost:5401/plausible',
+				public_connection_string: null,
+				internal_connection_string:
+					'postgres://plausible:secret@tond-db-plausible-db:5432/plausible'
+			}
 		});
 		createApp.mockResolvedValue({ id: 'app_created' });
 		deployApp.mockResolvedValue(undefined);

@@ -10,7 +10,7 @@
 //   is root-only (0600) and requests on it need no credentials, so run the CLI
 //   on the server as root (e.g. over SSH).
 //   To reach a server over HTTP(S) instead, pass --server / TOND_SERVER and an
-//   API key via --api-key / TOND_API_KEY. Loopback TCP is not trusted.
+//   API token via --token / TOND_TOKEN. Loopback TCP is not trusted.
 //
 // Command summary:
 //   apps <subcommand>              — manage apps (list/create/deploy/push/info/logs/…)
@@ -20,6 +20,10 @@
 //   integrations <subcommand>      — manage notification integrations (list/info/test/enable/disable/delete)
 //   settings [subcommand]          — view or update server-wide settings
 //                                    (incl. `settings host-terminal on|off`)
+//   token <subcommand>             — API tokens (create/list/revoke); `create` over
+//                                    the socket bootstraps automation
+//   audit <subcommand>             — audit log (verify the hash chain, show entries)
+//   users <subcommand>             — list users, print a one-time password reset link
 //   setup-link                     — print the first-run admin setup link again
 //   update [options]               — update tond-server to a newer version
 //   passwd                         — change dashboard account password
@@ -34,21 +38,22 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use client::TondClient;
 use commands::{
-    apps::AppsAction, cron::CronAction, db::DbAction, integrations::IntegrationsAction,
-    projects::ProjectsAction, scanner::ScannerAction, settings::SettingsAction,
-    snapshots::SnapshotAction, storage_providers::StorageProviderAction,
+    apps::AppsAction, audit::AuditAction, cron::CronAction, db::DbAction,
+    integrations::IntegrationsAction, projects::ProjectsAction, scanner::ScannerAction,
+    settings::SettingsAction, snapshots::SnapshotAction, storage_providers::StorageProviderAction,
+    tokens::TokenAction, users::UsersAction,
 };
 
 #[derive(Parser)]
 #[command(name = "tond", about = "Tond CLI - Deploy apps with ease", version)]
 struct Cli {
-    /// Server URL to connect to over HTTP(S) instead of the local socket (requires --api-key)
+    /// Server URL to connect to over HTTP(S) instead of the local socket (requires --token)
     #[arg(long, global = true, env = "TOND_SERVER")]
     server: Option<String>,
 
-    /// API key for --server connections
-    #[arg(long, global = true, env = "TOND_API_KEY", hide_env_values = true)]
-    api_key: Option<String>,
+    /// API token (tond_pat_…) for --server connections
+    #[arg(long, global = true, env = "TOND_TOKEN", hide_env_values = true)]
+    token: Option<String>,
 
     /// Path to tond-server's local Unix socket (used when --server is not set)
     #[arg(
@@ -138,6 +143,24 @@ enum Commands {
         action: SnapshotAction,
     },
 
+    /// Manage API tokens (scoped, expiring credentials for automation)
+    Token {
+        #[command(subcommand)]
+        action: TokenAction,
+    },
+
+    /// Manage dashboard users (list, one-time password reset links)
+    Users {
+        #[command(subcommand)]
+        action: UsersAction,
+    },
+
+    /// Inspect the audit log
+    Audit {
+        #[command(subcommand)]
+        action: AuditAction,
+    },
+
     /// Change your dashboard account password (prompts for current and new password)
     Passwd,
 
@@ -153,7 +176,7 @@ async fn main() -> Result<()> {
     // Connect lazily: `scanner` and `update` don't use the API, so they must work
     // without a reachable server.
     let connect = || match cli.server.as_deref() {
-        Some(url) => Ok(TondClient::new(url, cli.api_key.as_deref())),
+        Some(url) => Ok(TondClient::new(url, cli.token.as_deref())),
         None => TondClient::local(&cli.socket),
     };
 
@@ -179,6 +202,9 @@ async fn main() -> Result<()> {
             commands::storage_providers::handle(&connect()?, action).await?
         }
         Commands::Snapshot { action } => commands::snapshots::handle(&connect()?, action).await?,
+        Commands::Token { action } => commands::tokens::handle(&connect()?, action).await?,
+        Commands::Audit { action } => commands::audit::handle(&connect()?, action).await?,
+        Commands::Users { action } => commands::users::handle(&connect()?, action).await?,
         Commands::Passwd => commands::settings::handle_passwd(&connect()?).await?,
         Commands::SetupLink => {
             let data_dir = cli

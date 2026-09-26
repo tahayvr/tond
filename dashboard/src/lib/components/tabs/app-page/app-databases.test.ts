@@ -12,6 +12,13 @@ const api = vi.hoisted(() => ({
 	unlinkDatabaseApp: vi.fn()
 }));
 
+const auth = vi.hoisted(() => ({ canWrite: true }));
+
+vi.mock('$lib/auth.svelte', () => ({
+	can: (scope: string) => auth.canWrite || !scope.endsWith(':write'),
+	isAdmin: () => auth.canWrite
+}));
+
 vi.mock('$lib/api', async () => {
 	const actual = await vi.importActual<typeof import('$lib/api')>('$lib/api');
 	return { ...actual, ...api };
@@ -49,6 +56,7 @@ describe('AppDatabases', () => {
 	beforeEach(() => {
 		for (const fn of Object.values(api)) fn.mockReset();
 		document.body.style.pointerEvents = '';
+		auth.canWrite = true;
 		api.listDatabases.mockResolvedValue([db('db_1', 'main'), db('db_2', 'cache')]);
 		api.listProjects.mockResolvedValue([{ id: 'p1', name: 'shop' }]);
 	});

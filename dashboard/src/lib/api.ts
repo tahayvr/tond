@@ -145,13 +145,26 @@ export interface TemplateCatalogEntry {
 	setup_notes: string | null;
 }
 
+/** A user's role. Admin is the owner; see `Role::scopes` on the server. */
+export type Role = 'admin' | 'deployer' | 'viewer';
+
+/** A permission, e.g. `apps:deploy` (full list: GET /api/tokens/catalog). */
+export type Scope = string;
+
 export interface User {
 	id: string;
 	email: string;
-	role: string;
+	role: Role;
 	/** Whether TOTP two-factor auth is active for this user */
 	totp_enabled: boolean;
 	created_at: string;
+	/** Whether an admin has disabled the account */
+	disabled?: boolean;
+	/** False while an invited user hasn't set a password yet */
+	password_set?: boolean;
+	last_login_at?: string | null;
+	/** The scopes the user's role grants (drives what the UI offers) */
+	scopes?: Scope[];
 }
 
 export interface AuthStatus {
@@ -163,6 +176,8 @@ interface ApiResponse<T> {
 	success: boolean;
 	data: T | null;
 	error: string | null;
+	/** Stable error code on some failures, e.g. SCOPE_DENIED, TOKEN_EXPIRED */
+	code?: string;
 }
 
 const BASE = '/api';
@@ -184,12 +199,20 @@ export class ApiError extends Error {
 	readonly status: number;
 	/** Seconds to wait before retrying, from a 429's Retry-After header. */
 	readonly retryAfter: number | null;
+	/** Stable error code from the server (e.g. `SCOPE_DENIED`), when it sent one. */
+	readonly code: string | null;
 
-	constructor(message: string, status: number, retryAfter: number | null = null) {
+	constructor(
+		message: string,
+		status: number,
+		retryAfter: number | null = null,
+		code: string | null = null
+	) {
 		super(message);
 		this.name = 'ApiError';
 		this.status = status;
 		this.retryAfter = retryAfter;
+		this.code = code;
 	}
 }
 
@@ -208,6 +231,8 @@ const CREDENTIAL_ENDPOINTS = [
 	'/auth/2fa/confirm',
 	'/auth/2fa/disable',
 	'/auth/change-password',
+	'/auth/password-link/check',
+	'/auth/password-link/complete',
 	'/terminal/tickets'
 ];
 
@@ -266,7 +291,12 @@ async function parseResponse<T>(path: string, res: Response): Promise<T> {
 		throw notApi();
 	}
 	if (!res.ok || !json.success) {
-		throw new ApiError(json.error || `Request failed (HTTP ${res.status})`, res.status);
+		throw new ApiError(
+			json.error || `Request failed (HTTP ${res.status})`,
+			res.status,
+			null,
+			json.code ?? null
+		);
 	}
 	return json.data as T;
 }
@@ -578,19 +608,179 @@ export async function getMe(): Promise<User> {
 	return request<User>('/auth/me');
 }
 
-export async function createUser(
-	email: string,
-	password: string,
-	role: string = 'member'
-): Promise<User> {
-	return request<User>('/auth/users', {
+// ── Users (admins: users:admin) ──
+
+export interface AdminUser extends User {
+	/** Live (not expired, not idle) sessions */
+	active_sessions: number;
+	/** Whether this row is the signed-in admin */
+	is_you: boolean;
+}
+
+/** A one-time set-password link (invite or reset), valid 24 hours. */
+export interface PasswordLink {
+	user: User;
+	/** Dashboard path with the token, e.g. `/set-password?token=…` */
+	path: string;
+	token: string;
+	expires_at: string;
+}
+
+export async function listUsers(): Promise<AdminUser[]> {
+	return request<AdminUser[]>('/users');
+}
+
+/** Invite a user: no password is chosen for them, the response carries a set-password link. */
+export async function inviteUser(email: string, role: Role): Promise<PasswordLink> {
+	return request<PasswordLink>('/users', {
 		method: 'POST',
-		body: JSON.stringify({ email, password, role })
+		body: JSON.stringify({ email, role })
 	});
 }
 
-export async function listUsers(): Promise<User[]> {
-	return request<User[]>('/auth/users');
+/** Change a user's role and/or disable or enable them. Signs them out everywhere. */
+export async function updateUser(
+	id: string,
+	changes: { role?: Role; disabled?: boolean }
+): Promise<User> {
+	return request<User>(`/users/${id}`, { method: 'PATCH', body: JSON.stringify(changes) });
+}
+
+export async function deleteUser(id: string): Promise<void> {
+	await request(`/users/${id}`, { method: 'DELETE' });
+}
+
+/** New one-time set-password link for a user (replaces older links). */
+export async function createPasswordLink(id: string): Promise<PasswordLink> {
+	return request<PasswordLink>(`/users/${id}/password-link`, { method: 'POST' });
+}
+
+export async function listUserSessions(id: string): Promise<SessionInfo[]> {
+	return request<SessionInfo[]>(`/users/${id}/sessions`);
+}
+
+export async function revokeUserSessions(id: string): Promise<{ revoked: number }> {
+	return request<{ revoked: number }>(`/users/${id}/sessions`, { method: 'DELETE' });
+}
+
+export async function revokeUserSession(id: string, sessionId: string): Promise<void> {
+	await request(`/users/${id}/sessions/${sessionId}`, { method: 'DELETE' });
+}
+
+// ── Set-password links (public) ──
+
+export interface PasswordLinkInfo {
+	email: string;
+	/** "invite" | "reset" */
+	purpose: string;
+	expires_at: string;
+}
+
+export async function checkPasswordLink(token: string): Promise<PasswordLinkInfo> {
+	return request<PasswordLinkInfo>('/auth/password-link/check', {
+		method: 'POST',
+		body: JSON.stringify({ token })
+	});
+}
+
+export async function completePasswordLink(
+	token: string,
+	password: string
+): Promise<{ signed_in: boolean; user?: User; message?: string }> {
+	return request<{ signed_in: boolean; user?: User; message?: string }>(
+		'/auth/password-link/complete',
+		{ method: 'POST', body: JSON.stringify({ token, password }) }
+	);
+}
+
+// ── API tokens ──
+
+export type TokenKind = 'personal' | 'service' | 'agent' | 'ci';
+
+export interface ScopeInfo {
+	id: Scope;
+	description: string;
+}
+
+export interface ScopeGroupInfo {
+	id: 'apps' | 'secrets' | 'data' | 'ops' | 'admin';
+	label: string;
+	scopes: ScopeInfo[];
+}
+
+export interface TokenPreset {
+	id: string;
+	label: string;
+	description: string;
+	scopes: Scope[];
+}
+
+export interface RoleInfo {
+	id: Role;
+	description: string;
+	scopes: Scope[];
+}
+
+/** Everything the token form needs, from GET /api/tokens/catalog. */
+export interface TokenCatalog {
+	groups: ScopeGroupInfo[];
+	presets: TokenPreset[];
+	roles: RoleInfo[];
+	/** Scopes the caller may grant (a token never exceeds its creator) */
+	grantable: Scope[];
+}
+
+export interface ApiToken {
+	id: string;
+	name: string;
+	/** Visible start of the token, e.g. `tond_pat_1a2b3c4d` */
+	prefix: string;
+	kind: TokenKind;
+	scopes: Scope[];
+	app_ids: string[];
+	project_ids: string[];
+	allowed_ips: string[];
+	owner_id: string | null;
+	owner_label: string;
+	expires_at: string | null;
+	last_used_at: string | null;
+	last_used_ip: string | null;
+	revoked_at: string | null;
+	created_at: string;
+}
+
+export interface CreateTokenInput {
+	name: string;
+	kind: TokenKind;
+	preset?: string;
+	scopes: Scope[];
+	app_ids: string[];
+	project_ids: string[];
+	allowed_ips: string[];
+	/** Lifetime in hours; 0 = never expires (not for agent tokens) */
+	expires_in_hours: number;
+}
+
+export async function getTokenCatalog(): Promise<TokenCatalog> {
+	return request<TokenCatalog>('/tokens/catalog');
+}
+
+export async function listTokens(all = false): Promise<ApiToken[]> {
+	return request<ApiToken[]>(`/tokens${all ? '?all=true' : ''}`);
+}
+
+/** Create a token. The secret is only in this response: show it once. */
+export async function createToken(
+	input: CreateTokenInput
+): Promise<{ token: ApiToken; secret: string }> {
+	return request<{ token: ApiToken; secret: string }>('/tokens', {
+		method: 'POST',
+		body: JSON.stringify(input)
+	});
+}
+
+export async function revokeToken(id: string): Promise<ApiToken> {
+	return request<ApiToken>(`/tokens/${id}`, { method: 'DELETE' });
 }
 
 // ── Phase 7.1 — Password Management & Session Management ──
@@ -610,6 +800,8 @@ export interface SessionInfo {
 	last_used_at: string | null;
 	expires_at: string;
 	is_current: boolean;
+	/** When the session ends if unused (idle timeout) */
+	idle_expires_at?: string | null;
 }
 
 export async function listSessions(): Promise<SessionInfo[]> {
@@ -683,6 +875,10 @@ export interface ServerSettings {
 	apps_domain: string;
 	/** Max unpacked size in bytes of an uploaded source archive (`tond push`) */
 	upload_max_bytes: number;
+	/** Sessions end after this many hours without a request (1–720, default 12) */
+	session_idle_timeout_hours?: number;
+	/** Sessions end this many days after sign-in (1–365, default 30) */
+	session_max_age_days?: number;
 }
 
 export interface OnboardingStatus {
@@ -792,10 +988,22 @@ export interface WebhookConfig {
 	paths: WebhookUrls;
 	/** Absolute URLs when the dashboard domain is configured, else null */
 	urls: WebhookUrls | null;
-	/** Shared secret: HMAC key for GitHub/Gitea/generic, token for GitLab */
-	secret: string;
+	/**
+	 * Whether a shared secret (HMAC key for GitHub/Gitea/generic, token for
+	 * GitLab) is set. The secret is write-only: see `revealWebhookSecret`.
+	 */
+	has_secret: boolean;
 	auto_deploy: boolean;
 	watch_branch: string | null;
+}
+
+export interface WebhookSecret {
+	secret: string;
+}
+
+/** Reveal the webhook secret (admin only; every reveal is audit-logged). */
+export async function revealWebhookSecret(id: string): Promise<WebhookSecret> {
+	return request<WebhookSecret>(`/apps/${id}/webhook-secret`);
 }
 
 export async function getWebhookConfig(id: string): Promise<WebhookConfig> {
@@ -810,9 +1018,12 @@ export async function setWebhookSecret(id: string, secret: string): Promise<Webh
 	});
 }
 
-/** Generate a new webhook secret; the old one stops working immediately. */
-export async function rotateWebhookSecret(id: string): Promise<WebhookConfig> {
-	return request<WebhookConfig>(`/apps/${id}/webhook-secret/rotate`, { method: 'POST' });
+/**
+ * Generate a new webhook secret; the old one stops working immediately. The
+ * new secret is returned once, in this response.
+ */
+export async function rotateWebhookSecret(id: string): Promise<WebhookSecret> {
+	return request<WebhookSecret>(`/apps/${id}/webhook-secret/rotate`, { method: 'POST' });
 }
 
 export async function setAutoDeploy(
@@ -1212,7 +1423,10 @@ export interface AlertRule {
 	/** Threshold-based metric, null for pure event-based rules */
 	metric: AlertMetric | null;
 	threshold: number;
-	webhook_url: string;
+	/** Whether a webhook URL is set (the URL itself is write-only) */
+	has_webhook_url: boolean;
+	/** Host of the saved webhook URL, e.g. "hooks.slack.com" */
+	webhook_host: string | null;
 	enabled: boolean;
 	/** Event slugs this rule subscribes to */
 	events: AlertEvent[];
@@ -1249,6 +1463,7 @@ export async function updateAlertRule(
 		name: string;
 		metric: AlertMetric | null;
 		threshold: number;
+		/** Omit to keep the saved URL, "" to remove it */
 		webhook_url: string;
 		enabled: boolean;
 		events: AlertEvent[];
@@ -1264,27 +1479,71 @@ export async function deleteAlertRule(id: string): Promise<void> {
 	await request(`/alerts/${id}`, { method: 'DELETE' });
 }
 
-// ── Audit Log (Phase 5.5) ──
+// ── Audit log ──
 
+/** One entry of the append-only, hash-chained audit log. */
 export interface AuditLogEntry {
-	id: string;
-	app_id: string | null;
-	app_name: string | null;
-	action: string;
-	actor: string;
-	detail: string | null;
+	/** Position in the chain; also the pagination cursor */
+	seq: number;
 	created_at: string;
+	/** "user" | "token" | "local_socket" | "system" | "anonymous" */
+	actor_kind: string;
+	actor_id: string | null;
+	/** Email, token name, "local-socket", … */
+	actor_label: string;
+	action: string;
+	/** "app" | "database" | "user" | "token" | "settings" | … */
+	resource_type: string | null;
+	resource_id: string | null;
+	resource_name: string | null;
+	/** "success" | "failure" */
+	outcome: string;
+	ip: string | null;
+	detail: string | null;
 }
 
-export async function listAuditLog(params?: {
-	app_id?: string;
+export interface AuditLogPage {
+	entries: AuditLogEntry[];
+	/** Pass as `before` to load the next (older) page; null on the last page */
+	next_before: number | null;
+}
+
+export interface AuditLogQuery {
+	actor?: string;
+	/** Exact action, or a prefix ending in `*` (e.g. `login*`) */
+	action?: string;
+	resource_type?: string;
+	resource_id?: string;
+	/** Free-text search over actor, action, resource and detail */
+	q?: string;
+	outcome?: 'success' | 'failure';
+	before?: number;
 	limit?: number;
-}): Promise<AuditLogEntry[]> {
+}
+
+/** Filtered, paginated audit log (filters run on the server, before the limit). */
+export async function listAuditLog(params: AuditLogQuery = {}): Promise<AuditLogPage> {
 	const qs = new URLSearchParams();
-	if (params?.app_id) qs.set('app_id', params.app_id);
-	if (params?.limit) qs.set('limit', String(params.limit));
+	for (const [key, value] of Object.entries(params)) {
+		if (value !== undefined && value !== null && value !== '') qs.set(key, String(value));
+	}
 	const query = qs.toString() ? `?${qs.toString()}` : '';
-	return request<AuditLogEntry[]>(`/audit-log${query}`);
+	return request<AuditLogPage>(`/audit-log${query}`);
+}
+
+export interface AuditVerifyReport {
+	ok: boolean;
+	checked: number;
+	checkpoint_seq: number;
+	first_seq: number | null;
+	last_seq: number | null;
+	broken_at: number | null;
+	problem: string | null;
+}
+
+/** Walk the audit log's hash chain on the server. */
+export async function verifyAuditLog(): Promise<AuditVerifyReport> {
+	return request<AuditVerifyReport>('/audit-log/verify');
 }
 
 // ── Projects (Phase 6.1) ──
@@ -1293,7 +1552,8 @@ export interface Project {
 	id: string;
 	name: string;
 	description: string | null;
-	env_vars: Record<string, string>;
+	/** Shared env var keys; values are masked (write-only) */
+	env: EnvVarEntry[];
 	created_at: string;
 	updated_at: string;
 	/** Number of active (non-expired) project previews. Returned by GET /projects. */
@@ -1398,11 +1658,14 @@ export interface ManagedDatabase {
 	status: string;
 	db_name: string | null;
 	db_user: string | null;
-	db_password: string | null;
-	/** Separate root/admin password for MySQL and MariaDB. Null for other engines. */
-	root_password: string | null;
+	/** Whether the database has an application password (never returned) */
+	has_password: boolean;
+	/** Whether there is a separate root/admin password (MySQL and MariaDB) */
+	has_root_password: boolean;
 	memory_limit: number | null;
+	/** Connection-string override, password masked */
 	custom_external_url: string | null;
+	/** Connection-string override, password masked */
 	custom_internal_url: string | null;
 	/** Docker image actually used when the container was last created/redeployed */
 	image_used: string | null;
@@ -1414,6 +1677,7 @@ export interface ManagedDatabase {
 	public_access: boolean;
 }
 
+/** Connection strings in a detail response have the password masked. */
 export interface ManagedDatabaseDetail extends ManagedDatabase {
 	connection_string: string | null;
 	/** Connection string via the server's public address; only when public_access is on */
@@ -1477,6 +1741,36 @@ export async function listAppDatabases(appId: string): Promise<AppDatabaseAccess
 	return request<AppDatabaseAccess[]>(`/apps/${appId}/databases`);
 }
 
+/** Plaintext credentials: GET /databases/{id}/credentials (admin, audit-logged). */
+export interface DatabaseCredentials {
+	db_user: string | null;
+	db_password: string | null;
+	root_password: string | null;
+	connection_string: string | null;
+	public_connection_string: string | null;
+	internal_connection_string: string | null;
+}
+
+/** POST /databases: the detail plus the generated credentials, shown once. */
+export interface CreatedDatabase extends ManagedDatabaseDetail {
+	credentials: DatabaseCredentials;
+}
+
+/** Reveal a database's passwords and connection strings (admin only; audit-logged). */
+export async function revealDatabaseCredentials(id: string): Promise<DatabaseCredentials> {
+	return request<DatabaseCredentials>(`/databases/${id}/credentials`);
+}
+
+/** A database's own backups plus the full snapshots (which hold every database). */
+export async function listDatabaseBackups(id: string): Promise<Snapshot[]> {
+	return request<Snapshot[]>(`/databases/${id}/backups`);
+}
+
+/** Back up one database now. Resolves when the local copy is complete. */
+export async function createDatabaseBackup(id: string): Promise<Snapshot> {
+	return request<Snapshot>(`/databases/${id}/backups`, { method: 'POST' });
+}
+
 export async function listDatabases(): Promise<ManagedDatabase[]> {
 	return request<ManagedDatabase[]>('/databases');
 }
@@ -1490,8 +1784,8 @@ export async function createDatabase(data: {
 	db_type: string;
 	project_id?: string;
 	memory_limit?: number;
-}): Promise<ManagedDatabaseDetail> {
-	return request<ManagedDatabaseDetail>('/databases', {
+}): Promise<CreatedDatabase> {
+	return request<CreatedDatabase>('/databases', {
 		method: 'POST',
 		body: JSON.stringify(data)
 	});
@@ -1571,8 +1865,8 @@ export interface CronJob {
 	updated_at: string;
 	/** Maximum wall-clock seconds the container may run. null = no timeout. */
 	timeout_seconds: number | null;
-	/** Environment variables. null = none defined. */
-	env: Record<string, string> | null;
+	/** Environment variable keys; values are masked (write-only). */
+	env: EnvVarEntry[];
 	/** Denormalised last-run outcome: "success" | "failed" | null (never run). */
 	last_run_status: string | null;
 	/** Concurrency policy: "skip" (default) or "allow". */
@@ -1654,7 +1948,12 @@ export async function updateCronJob(
 		enabled: boolean;
 		/** Pass null to clear, a number to set, omit to leave unchanged */
 		timeout_seconds: number | null;
+		/** Replace all environment variables */
 		env: Record<string, string>;
+		/** Add or overwrite these variables (keeps the others) */
+		env_set: Record<string, string>;
+		/** Remove these variables */
+		env_unset: string[];
 		/** "skip" or "allow" */
 		concurrency_policy: string;
 		/** Memory limit in MiB. null = no limit. */
@@ -1943,18 +2242,22 @@ export function openTerminalSession(
 
 export type IntegrationKind = 'telegram' | 'discord' | 'slack' | 'email';
 
+// Secret fields (bot_token, webhook_url, smtp_password) are write-only: the
+// server never returns them (see `Integration.saved_secrets`), and an update
+// that omits one, or sends "", keeps the saved value.
+
 export interface TelegramConfig {
-	bot_token: string;
+	bot_token?: string;
 	chat_id: string;
 	thread_id?: string;
 }
 
 export interface DiscordConfig {
-	webhook_url: string;
+	webhook_url?: string;
 }
 
 export interface SlackConfig {
-	webhook_url: string;
+	webhook_url?: string;
 }
 
 export interface EmailConfig {
@@ -1963,7 +2266,7 @@ export interface EmailConfig {
 	smtp_host: string;
 	smtp_port: number;
 	smtp_user: string;
-	smtp_password: string;
+	smtp_password?: string;
 	/** "tls" | "starttls" | "none" */
 	smtp_encryption: string;
 	to_addrs: string[];
@@ -1975,7 +2278,10 @@ export interface Integration {
 	id: string;
 	name: string;
 	kind: IntegrationKind;
+	/** Config without its secret fields */
 	config: IntegrationConfig;
+	/** Secret fields that have a saved value, e.g. ["bot_token"] */
+	saved_secrets: string[];
 	enabled: boolean;
 	created_at: string;
 	updated_at: string;
@@ -2122,9 +2428,16 @@ export interface Snapshot {
 	local_path: string | null;
 	remote_key: string | null;
 	storage_provider_id: string | null;
+	/** SHA-256 of the encrypted archive in remote storage */
 	checksum_sha256: string | null;
 	error_message: string | null;
 	notes: string | null;
+	/** null (local only) | "uploading" | "uploaded" | "failed" */
+	remote_status: 'uploading' | 'uploaded' | 'failed' | null;
+	/** Why the last remote upload failed */
+	remote_error: string | null;
+	/** Size of the encrypted archive in remote storage */
+	archive_bytes: number | null;
 }
 
 export interface BackupConfig {
@@ -2179,11 +2492,21 @@ export async function rollbackAppToSnapshot(
 	});
 }
 
+export interface RestoreDatabaseResult {
+	message: string;
+	/** Backup of the data as it was just before the restore */
+	pre_restore_snapshot_id: string;
+}
+
+/**
+ * Restore one database from a snapshot that holds it. The server backs up the
+ * current data first and returns that backup's id.
+ */
 export async function restoreDatabase(
 	snapshotId: string,
 	dbName: string
-): Promise<{ message: string }> {
-	return request<{ message: string }>(`/snapshots/${snapshotId}/restore-database`, {
+): Promise<RestoreDatabaseResult> {
+	return request<RestoreDatabaseResult>(`/snapshots/${snapshotId}/restore-database`, {
 		method: 'POST',
 		body: JSON.stringify({ db_name: dbName })
 	});

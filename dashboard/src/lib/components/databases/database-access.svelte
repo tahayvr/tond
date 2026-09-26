@@ -17,6 +17,7 @@
 	import * as Dialog from '$lib/components/ui/dialog/index.js';
 	import * as Select from '$lib/components/ui/select/index.js';
 	import { untrack } from 'svelte';
+	import { can } from '$lib/auth.svelte';
 	import LinkIcon from '~icons/ri/link';
 	import LinkUnlinkIcon from '~icons/ri/link-unlink';
 	import FolderIcon from '~icons/ri/folder-3-line';
@@ -38,6 +39,9 @@
 
 	let selectedAppId = $state('');
 	let linking = $state(false);
+
+	/** Linking changes network reach on both sides: db:write + apps:write. */
+	let canLink = $derived(can('db:write') && can('apps:write'));
 
 	let unlinkTarget = $state<DatabaseAppRef | null>(null);
 	let unlinkOpen = $state(false);
@@ -187,15 +191,17 @@
 							>
 							<Badge variant="secondary" class="gap-1"><LinkIcon /> linked</Badge>
 						</div>
-						<Button
-							variant="ghost"
-							size="sm"
-							class="h-7 text-muted-foreground hover:text-destructive"
-							aria-label={`Unlink ${app.name}`}
-							onclick={() => openUnlink(app)}
-						>
-							<LinkUnlinkIcon class="size-3.5" /> Unlink
-						</Button>
+						{#if canLink}
+							<Button
+								variant="ghost"
+								size="sm"
+								class="h-7 text-muted-foreground hover:text-destructive"
+								aria-label={`Unlink ${app.name}`}
+								onclick={() => openUnlink(app)}
+							>
+								<LinkUnlinkIcon class="size-3.5" /> Unlink
+							</Button>
+						{/if}
 					</li>
 				{/each}
 			</ul>
@@ -208,23 +214,29 @@
 			</div>
 		{/if}
 
-		<div class="flex flex-col gap-2 sm:flex-row sm:items-center">
-			<Select.Root type="single" bind:value={selectedAppId} disabled={candidates.length === 0}>
-				<Select.Trigger class="w-full sm:w-72" aria-label="App to link">
-					{selectedApp?.name ??
-						(candidates.length === 0 ? 'Every eligible app has access' : 'Choose an app to link')}
-				</Select.Trigger>
-				<Select.Content>
-					{#each candidates as app (app.id)}
-						<Select.Item value={app.id}>{app.name}</Select.Item>
-					{/each}
-				</Select.Content>
-			</Select.Root>
-			<Button size="sm" onclick={handleLink} disabled={!selectedApp || linking}>
-				<LinkIcon class="size-3.5" />
-				{linking ? 'Linking…' : 'Link app'}
-			</Button>
-		</div>
+		{#if canLink}
+			<div class="flex flex-col gap-2 sm:flex-row sm:items-center">
+				<Select.Root type="single" bind:value={selectedAppId} disabled={candidates.length === 0}>
+					<Select.Trigger class="w-full sm:w-72" aria-label="App to link">
+						{selectedApp?.name ??
+							(candidates.length === 0 ? 'Every eligible app has access' : 'Choose an app to link')}
+					</Select.Trigger>
+					<Select.Content>
+						{#each candidates as app (app.id)}
+							<Select.Item value={app.id}>{app.name}</Select.Item>
+						{/each}
+					</Select.Content>
+				</Select.Root>
+				<Button size="sm" onclick={handleLink} disabled={!selectedApp || linking}>
+					<LinkIcon class="size-3.5" />
+					{linking ? 'Linking…' : 'Link app'}
+				</Button>
+			</div>
+		{:else}
+			<p class="text-xs text-muted-foreground/70">
+				Only admins can link and unlink databases: it changes which apps can reach them.
+			</p>
+		{/if}
 		<p class="text-xs text-muted-foreground/70">
 			Linking takes effect immediately; the app keeps running. Compose apps can't be linked (they
 			run on their own compose network).

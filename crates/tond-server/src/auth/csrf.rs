@@ -16,9 +16,9 @@
 //     otherwise.
 //   * A WebSocket upgrade without an `Origin` header (CLI, scripts) has its
 //     Cookie header removed: such clients must authenticate explicitly
-//     (API key or terminal ticket), never with ambient browser cookies.
+//     (API token or terminal ticket), never with ambient browser cookies.
 //
-// Requests on the root-only Unix socket and API-key requests without cookies
+// Requests on the root-only Unix socket and API-token requests without cookies
 // are not affected. There is intentionally no CORS layer: the dashboard is
 // same-origin, so cross-origin browser access is simply not offered.
 

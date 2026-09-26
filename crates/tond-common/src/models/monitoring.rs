@@ -153,7 +153,9 @@ pub struct AlertRule {
     ///
     /// Ignored when metric is NULL.
     pub threshold: f64,
-    /// Webhook URL to POST to when the condition fires
+    /// Webhook URL to POST to when the condition fires. Stored encrypted by
+    /// the server (such URLs are bearer secrets); `""` = none.
+    #[serde(skip_serializing)]
     pub webhook_url: String,
     /// Whether this rule is active (1 = active, 0 = paused)
     pub enabled: i64,
@@ -176,7 +178,8 @@ impl AlertRule {
     }
 }
 
-/// API response for an alert rule (same shape, with `enabled` as bool)
+/// API response for an alert rule. The webhook URL is write-only: the
+/// response says whether one is set and shows its host.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AlertRuleResponse {
     pub id: String,
@@ -184,7 +187,12 @@ pub struct AlertRuleResponse {
     pub name: String,
     pub metric: Option<String>,
     pub threshold: f64,
-    pub webhook_url: String,
+    /// Whether a webhook URL is set
+    #[serde(default)]
+    pub has_webhook_url: bool,
+    /// Host of the webhook URL (e.g. `hooks.slack.com`), for recognition
+    #[serde(default)]
+    pub webhook_host: Option<String>,
     pub enabled: bool,
     /// Parsed event slugs (never null in the response — empty array if none).
     pub events: Vec<String>,
@@ -193,8 +201,17 @@ pub struct AlertRuleResponse {
     pub updated_at: String,
 }
 
-impl From<AlertRule> for AlertRuleResponse {
-    fn from(r: AlertRule) -> Self {
+/// Host part of a URL (`https://hooks.slack.com/x` → `hooks.slack.com`).
+pub fn url_host(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map(|(_, r)| r)?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+impl AlertRuleResponse {
+    /// Build a response from a rule and its decrypted webhook URL.
+    pub fn new(r: AlertRule, webhook_url: &str) -> Self {
         let events = r.parse_events();
         Self {
             id: r.id,
@@ -202,7 +219,8 @@ impl From<AlertRule> for AlertRuleResponse {
             name: r.name,
             metric: r.metric,
             threshold: r.threshold,
-            webhook_url: r.webhook_url,
+            has_webhook_url: !webhook_url.is_empty(),
+            webhook_host: url_host(webhook_url),
             enabled: r.enabled != 0,
             events,
             last_fired_at: r.last_fired_at,
@@ -231,6 +249,7 @@ pub struct UpdateAlertRuleRequest {
     pub name: Option<String>,
     pub metric: Option<String>,
     pub threshold: Option<f64>,
+    /// New webhook URL: omit (or null) to keep the saved one, `""` to clear.
     pub webhook_url: Option<String>,
     pub enabled: Option<bool>,
     /// Replace the full events list (None = leave unchanged)
@@ -251,60 +270,101 @@ pub struct AlertRuleNotification {
     pub created_at: String,
 }
 
-// ── AuditLog (state-changing operation record) ──
+// ── AuditLog (hash-chained security and change record) ──
 
-/// A single entry in the immutable audit log.
+/// A single entry in the append-only, hash-chained audit log.
+///
+/// The actor is always derived from the request's authentication (a user, an
+/// API token, the root-only local socket) or is `system` for background work;
+/// it is never taken from a client-supplied field.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct AuditLog {
-    pub id: String,
-    /// Which app this action affected (None for server-wide actions)
-    pub app_id: Option<String>,
-    /// Name of the app at the time of the action (denormalised for readability)
-    pub app_name: Option<String>,
-    /// Short verb: "create" | "deploy" | "delete" | "stop" | "start" | "restart"
-    ///   | "env_update" | "domain_update" | "health_update" | "volume_add"
-    ///   | "volume_remove" | "rollback" | "settings_update"
-    pub action: String,
-    /// Who performed the action: "api_key:<name>" | "session:<email>" | "system"
-    pub actor: String,
-    /// Optional extra context (JSON blob, e.g. changed keys)
-    pub detail: Option<String>,
+    /// Position in the chain (1, 2, 3, … with no gaps).
+    pub seq: i64,
     pub created_at: String,
+    /// "user" | "token" | "local_socket" | "system" | "anonymous"
+    pub actor_kind: String,
+    /// User id or token id (None for local_socket/system/anonymous)
+    pub actor_id: Option<String>,
+    /// Human-readable actor: an email, a token name, "local-socket", …
+    pub actor_label: String,
+    /// Short verb, e.g. "deploy", "login", "login_failed", "token_create"
+    pub action: String,
+    /// "app" | "database" | "cron" | "project" | "user" | "token" | "snapshot" | "settings" | …
+    pub resource_type: Option<String>,
+    pub resource_id: Option<String>,
+    /// Name at the time of the action (denormalised for readability)
+    pub resource_name: Option<String>,
+    /// "success" | "failure"
+    pub outcome: String,
+    /// Client address the request came from (None for the socket/system)
+    pub ip: Option<String>,
+    /// Optional extra context
+    pub detail: Option<String>,
+    /// Hash of the previous entry (or the retention checkpoint)
+    pub prev_hash: String,
+    /// sha256(prev_hash || canonical row)
+    pub hash: String,
 }
 
 /// API response for an audit log entry.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AuditLogResponse {
-    pub id: String,
-    pub app_id: Option<String>,
-    pub app_name: Option<String>,
-    pub action: String,
-    pub actor: String,
-    pub detail: Option<String>,
+    pub seq: i64,
     pub created_at: String,
+    pub actor_kind: String,
+    pub actor_id: Option<String>,
+    pub actor_label: String,
+    pub action: String,
+    pub resource_type: Option<String>,
+    pub resource_id: Option<String>,
+    pub resource_name: Option<String>,
+    pub outcome: String,
+    pub ip: Option<String>,
+    pub detail: Option<String>,
 }
 
 impl From<AuditLog> for AuditLogResponse {
     fn from(e: AuditLog) -> Self {
         Self {
-            id: e.id,
-            app_id: e.app_id,
-            app_name: e.app_name,
-            action: e.action,
-            actor: e.actor,
-            detail: e.detail,
+            seq: e.seq,
             created_at: e.created_at,
+            actor_kind: e.actor_kind,
+            actor_id: e.actor_id,
+            actor_label: e.actor_label,
+            action: e.action,
+            resource_type: e.resource_type,
+            resource_id: e.resource_id,
+            resource_name: e.resource_name,
+            outcome: e.outcome,
+            ip: e.ip,
+            detail: e.detail,
         }
     }
 }
 
-/// Query parameters for `GET /api/audit-log`
-#[derive(Debug, Deserialize)]
-pub struct AuditLogQuery {
-    /// Filter by app_id (optional)
-    pub app_id: Option<String>,
-    /// Maximum number of rows to return (default 50, max 200)
-    pub limit: Option<i64>,
+/// One page of GET /api/audit-log.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AuditLogPage {
+    pub entries: Vec<AuditLogResponse>,
+    /// Pass as `before` to get the next (older) page; None on the last page.
+    pub next_before: Option<i64>,
+}
+
+/// Result of verifying the audit log's hash chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditVerifyReport {
+    pub ok: bool,
+    /// Entries checked.
+    pub checked: i64,
+    /// Entries before this sequence number were removed by retention.
+    pub checkpoint_seq: i64,
+    pub first_seq: Option<i64>,
+    pub last_seq: Option<i64>,
+    /// The first entry that failed verification, if any.
+    pub broken_at: Option<i64>,
+    /// Why verification failed.
+    pub problem: Option<String>,
 }
 
 #[cfg(test)]
@@ -376,7 +436,15 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         };
 
-        let response = AlertRuleResponse::from(rule);
+        let response =
+            AlertRuleResponse::new(rule, "https://hooks.example.com/services/T0/B0/secret");
+        let json = serde_json::to_string(&response).unwrap_or_default();
+        assert!(
+            !json.contains("secret"),
+            "webhook URL must not be returned: {json}"
+        );
+        assert!(response.has_webhook_url);
+        assert_eq!(response.webhook_host.as_deref(), Some("hooks.example.com"));
 
         assert!(
             response.enabled,

@@ -10,6 +10,11 @@
 //   POST   /api/snapshots/{id}/restore           — Full restore (server restart)
 //   POST   /api/snapshots/{id}/restore-app       — App-scope rollback (no restart)
 //   POST   /api/snapshots/{id}/restore-database  — Database-scope restore (no restart)
+//   GET    /api/databases/{id}/backups           — snapshots that hold one database
+//   POST   /api/databases/{id}/backups           — back up one database now
+//
+// Remote copies of snapshots are encrypted with a key derived from
+// TOND_SECRET_KEY: restoring them on another server needs the same key.
 
 use axum::{
     Json,
@@ -27,44 +32,102 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tond_common::*;
 
+use crate::audit_log::{AuditEntry, record};
 use crate::{
-    auth::{RateLimit, RequireAdmin, RequireAuth},
+    auth::{Authz, RateLimit, scope},
     backup::{self, SnapshotTrigger},
     error::AppError,
-    handlers::storage_providers::decrypt_provider_secret,
     state::AppState,
-    storage,
 };
 
 // ── Create snapshot ───────────────────────────────────────────────────────────
 
 pub async fn create_snapshot(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::SnapshotsCreate>,
     State(state): State<AppState>,
     Json(req): Json<CreateSnapshotRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let trigger = SnapshotTrigger::Manual { name: req.name };
+    let snapshot = run_snapshot(&state, trigger).await?;
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("snapshot_create").resource("snapshot", &snapshot.id, &snapshot.name),
+    )
+    .await;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(snapshot))))
+}
 
-    // Spawn in background; return the snapshot ID immediately
-    let state_clone = state.clone();
+/// Take a snapshot (the local copy; a remote upload continues in the
+/// background) and return its row.
+async fn run_snapshot(
+    state: &AppState,
+    trigger: SnapshotTrigger,
+) -> Result<SnapshotResponse, AppError> {
     let (tx, _rx) = mpsc::channel(32);
-    let id = backup::create_snapshot(&state_clone, trigger.clone(), Some(tx))
+    let id = backup::create_snapshot(state, trigger, Some(tx))
         .await
-        .map_err(|e| {
-            AppError(TondError::Internal(format!(
-                "Failed to start snapshot: {}",
-                e
-            )))
-        })?;
-
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(ApiResponse::ok(SnapshotStarted {
-            id,
-            message: "Snapshot started".to_string(),
-        })),
+        .map_err(|e| AppError(TondError::Internal(format!("Snapshot failed: {e:#}"))))?;
+    Ok(SnapshotResponse::from(
+        fetch_snapshot_row(state, &id).await?,
     ))
+}
+
+// ── Per-database backups ──────────────────────────────────────────────────────
+
+async fn database_name(state: &AppState, id_or_name: &str) -> Result<String, AppError> {
+    sqlx::query_scalar("SELECT name FROM databases WHERE id = ? OR name = ? LIMIT 1")
+        .bind(id_or_name)
+        .bind(id_or_name)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError(TondError::NotFound(format!("database '{id_or_name}'"))))
+}
+
+/// GET /api/databases/{id}/backups — this database's own backups and the
+/// full snapshots (which hold every database), newest first.
+pub async fn list_database_backups(
+    _rate: RateLimit,
+    _auth: Authz<scope::SnapshotsRead>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let name = database_name(&state, &id).await?;
+    let rows = sqlx::query_as::<_, Snapshot>(
+        "SELECT * FROM snapshots WHERE scope = ? OR scope = 'full' ORDER BY created_at DESC",
+    )
+    .bind(format!("database:{name}"))
+    .fetch_all(&state.db)
+    .await?;
+    let resp: Vec<SnapshotResponse> = rows.into_iter().map(SnapshotResponse::from).collect();
+    Ok((StatusCode::OK, Json(ApiResponse::ok(resp))))
+}
+
+/// POST /api/databases/{id}/backups — back up one database now.
+pub async fn create_database_backup(
+    _rate: RateLimit,
+    auth: Authz<scope::SnapshotsCreate>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let name = database_name(&state, &id).await?;
+    let snapshot = run_snapshot(
+        &state,
+        SnapshotTrigger::ManualDatabase {
+            db_name: name.clone(),
+        },
+    )
+    .await?;
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("db_backup")
+            .resource("snapshot", &snapshot.id, &snapshot.name)
+            .detail(format!("database={name}")),
+    )
+    .await;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(snapshot))))
 }
 
 // ── List snapshots ────────────────────────────────────────────────────────────
@@ -78,7 +141,7 @@ pub struct ListSnapshotsQuery {
 
 pub async fn list_snapshots(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::SnapshotsRead>,
     State(state): State<AppState>,
     Query(query): Query<ListSnapshotsQuery>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -117,37 +180,20 @@ pub async fn list_snapshots(
 
 pub async fn delete_snapshot(
     _rate: RateLimit,
-    _admin: RequireAdmin,
+    auth: Authz<scope::SnapshotsRestore>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let snap = fetch_snapshot_row(&state, &id).await?;
+    // Local directory, remote archive and row.
+    backup::delete_snapshot_files_and_row(&state, &snap).await;
 
-    // Delete local directory
-    if let Some(ref path) = snap.local_path {
-        let _ = tokio::fs::remove_dir_all(path).await;
-    }
-
-    // Delete remote object
-    if let (Some(key), Some(sp_id)) = (&snap.remote_key, &snap.storage_provider_id) {
-        let provider =
-            sqlx::query_as::<_, StorageProvider>("SELECT * FROM storage_providers WHERE id = ?")
-                .bind(sp_id)
-                .fetch_optional(&state.db)
-                .await?;
-
-        if let Some(raw) = provider
-            && let Ok(dec) = decrypt_provider_secret(raw)
-        {
-            let _ = storage::delete(&dec, key).await;
-        }
-    }
-
-    sqlx::query("DELETE FROM snapshots WHERE id = ?")
-        .bind(&id)
-        .execute(&state.db)
-        .await?;
-
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("snapshot_delete").resource("snapshot", &snap.id, &snap.name),
+    )
+    .await;
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(json!({ "deleted": id }))),
@@ -158,7 +204,7 @@ pub async fn delete_snapshot(
 
 pub async fn get_backup_config(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::SnapshotsRead>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     let cfg = backup::get_backup_config(&state)
@@ -175,7 +221,7 @@ pub async fn get_backup_config(
 
 pub async fn update_backup_config(
     _rate: RateLimit,
-    _admin: RequireAdmin,
+    auth: Authz<scope::SettingsWrite>,
     State(state): State<AppState>,
     Json(req): Json<UpdateBackupConfigRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -241,6 +287,12 @@ pub async fn update_backup_config(
         .await
         .map_err(|e| AppError(TondError::Internal(e.to_string())))?;
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("backup_config_update").kind("backup_config"),
+    )
+    .await;
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(BackupConfigResponse::from(updated))),
@@ -251,7 +303,7 @@ pub async fn update_backup_config(
 
 pub async fn stream_snapshot_logs(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::SnapshotsRead>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<axum::response::Response, AppError> {
@@ -339,10 +391,18 @@ pub async fn stream_snapshot_logs(
 
 pub async fn restore_snapshot(
     _rate: RateLimit,
-    _admin: RequireAdmin,
+    auth: Authz<scope::SnapshotsRestore>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
+    // Recorded before starting: a full restore replaces the database (and
+    // this log with it) and restarts the server.
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("snapshot_restore_full").resource("snapshot", &id, &id),
+    )
+    .await;
     let pre_restore_id = backup::restore_full(&state, id)
         .await
         .map_err(|e| AppError(TondError::Internal(format!("Restore failed: {}", e))))?;
@@ -360,7 +420,7 @@ pub async fn restore_snapshot(
 
 pub async fn restore_app(
     _rate: RateLimit,
-    _admin: RequireAdmin,
+    auth: Authz<scope::SnapshotsRestore>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<RestoreAppRequest>,
@@ -369,6 +429,14 @@ pub async fn restore_app(
         .await
         .map_err(|e| AppError(TondError::Internal(format!("App restore failed: {}", e))))?;
 
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("snapshot_restore_app")
+            .resource("snapshot", &id, &id)
+            .detail(format!("app={}", req.app_name)),
+    )
+    .await;
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(json!({
@@ -384,28 +452,35 @@ pub async fn restore_app(
 
 pub async fn restore_database(
     _rate: RateLimit,
-    _admin: RequireAdmin,
+    auth: Authz<scope::SnapshotsRestore>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<RestoreDatabaseRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    backup::restore_database(&state, &id, &req.db_name)
+    let pre_restore_snapshot_id = backup::restore_database(&state, &id, &req.db_name)
         .await
         .map_err(|e| {
             AppError(TondError::Internal(format!(
-                "Database restore failed: {}",
-                e
+                "Database restore failed: {e:#}"
             )))
         })?;
-
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("snapshot_restore_database")
+            .resource("snapshot", &id, &id)
+            .detail(format!("database={}", req.db_name)),
+    )
+    .await;
     Ok((
         StatusCode::OK,
-        Json(ApiResponse::ok(json!({
-            "message": format!(
-                "Database '{}' restored from snapshot {}.",
-                req.db_name, id
-            )
-        }))),
+        Json(ApiResponse::ok(RestoreDatabaseResponse {
+            message: format!(
+                "Database '{}' restored. The data it held just before is saved as a backup.",
+                req.db_name
+            ),
+            pre_restore_snapshot_id,
+        })),
     ))
 }
 
@@ -417,4 +492,94 @@ async fn fetch_snapshot_row(state: &AppState, id: &str) -> Result<Snapshot, AppE
         .fetch_optional(&state.db)
         .await?
         .ok_or_else(|| AppError(TondError::NotFound(format!("Snapshot {id} not found"))))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::body::to_bytes;
+    use bollard::{API_DEFAULT_VERSION, Docker};
+    use sqlx::SqlitePool;
+    use tokio::sync::RwLock;
+
+    use super::*;
+    use crate::auth::{Principal, RateLimiter};
+
+    async fn test_state() -> AppState {
+        let db = SqlitePool::connect("sqlite::memory:")
+            .await
+            .unwrap_or_else(|err| panic!("sqlite: {err}"));
+        crate::db::migrate(&db)
+            .await
+            .unwrap_or_else(|err| panic!("migrate: {err}"));
+        AppState {
+            db,
+            docker: Docker::connect_with_http("http://127.0.0.1:2375", 5, API_DEFAULT_VERSION)
+                .unwrap_or_else(|err| panic!("docker client: {err}")),
+            rate_limiter: RateLimiter::new(60, 10.0),
+            settings: Arc::new(RwLock::new(ServerSettings::default())),
+        }
+    }
+
+    #[tokio::test]
+    async fn database_backups_list_its_own_backups_and_full_snapshots() {
+        let state = test_state().await;
+        sqlx::query("INSERT INTO databases (id, name, db_type) VALUES ('d1', 'shop', 'postgres')")
+            .execute(&state.db)
+            .await
+            .unwrap_or_else(|err| panic!("seed db: {err}"));
+        for (id, scope, created) in [
+            ("s1", "database:shop", "2026-01-03"),
+            ("s2", "full", "2026-01-02"),
+            ("s3", "database:other", "2026-01-04"),
+            ("s4", "app:web", "2026-01-05"),
+        ] {
+            sqlx::query(
+                "INSERT INTO snapshots (id, name, status, scope, created_at) VALUES (?, ?, 'completed', ?, ?)",
+            )
+            .bind(id)
+            .bind(id)
+            .bind(scope)
+            .bind(created)
+            .execute(&state.db)
+            .await
+            .unwrap_or_else(|err| panic!("seed snapshot: {err}"));
+        }
+
+        let response = list_database_backups(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Viewer)),
+            State(state.clone()),
+            Path("d1".to_string()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("list should succeed"))
+        .into_response();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_else(|err| panic!("body: {err}"));
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or_else(|err| panic!("json: {err}"));
+        let ids: Vec<&str> = json["data"]
+            .as_array()
+            .unwrap_or_else(|| panic!("array"))
+            .iter()
+            .filter_map(|s| s["id"].as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["s1", "s2"],
+            "newest first, own backups + full snapshots"
+        );
+
+        let missing = list_database_backups(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Viewer)),
+            State(state.clone()),
+            Path("nope".to_string()),
+        )
+        .await;
+        assert!(missing.is_err());
+    }
 }

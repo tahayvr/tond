@@ -34,6 +34,12 @@ pub enum TondError {
     #[error("Forbidden: {0}")]
     Forbidden(String),
 
+    /// The caller is authenticated but its role or token lacks a scope (or
+    /// the resource is outside the token's filter). Carries a stable error
+    /// code for clients: `SCOPE_DENIED` or `RESOURCE_DENIED`.
+    #[error("{message}")]
+    ScopeDenied { code: &'static str, message: String },
+
     #[error("Internal error: {0}")]
     Internal(String),
 
@@ -51,7 +57,16 @@ impl TondError {
             TondError::InvalidInput(_) => 400,
             TondError::Forbidden(_) => 403,
             TondError::PayloadTooLarge(_) => 413,
+            TondError::ScopeDenied { .. } => 403,
             _ => 500,
+        }
+    }
+
+    /// Stable machine-readable error code, when the variant has one.
+    pub fn code(&self) -> Option<&'static str> {
+        match self {
+            TondError::ScopeDenied { code, .. } => Some(code),
+            _ => None,
         }
     }
 }

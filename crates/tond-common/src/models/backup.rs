@@ -40,10 +40,16 @@ pub struct Snapshot {
     pub remote_key: Option<String>,
     /// FK → storage_providers.id (set if remote upload happened)
     pub storage_provider_id: Option<String>,
-    /// SHA-256 of the exported .tar.gz (if uploaded)
+    /// SHA-256 of the encrypted archive in remote storage (if uploaded)
     pub checksum_sha256: Option<String>,
     pub error_message: Option<String>,
     pub notes: Option<String>,
+    /// NULL (local only) | "uploading" | "uploaded" | "failed"
+    pub remote_status: Option<String>,
+    /// Why the last remote upload failed
+    pub remote_error: Option<String>,
+    /// Size of the encrypted archive in remote storage
+    pub archive_bytes: Option<i64>,
 }
 
 /// Raw row from the `backup_config` table (always id = 1).
@@ -61,13 +67,6 @@ pub struct BackupConfig {
 }
 
 // ── API response shapes ───────────────────────────────────────────────────────
-
-/// Reply to starting a snapshot. The snapshot itself runs in the background.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnapshotStarted {
-    pub id: String,
-    pub message: String,
-}
 
 /// Outbound representation of a snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +89,14 @@ pub struct SnapshotResponse {
     pub checksum_sha256: Option<String>,
     pub error_message: Option<String>,
     pub notes: Option<String>,
+    /// null (local only) | "uploading" | "uploaded" | "failed"
+    #[serde(default)]
+    pub remote_status: Option<String>,
+    #[serde(default)]
+    pub remote_error: Option<String>,
+    /// Size of the encrypted archive in remote storage
+    #[serde(default)]
+    pub archive_bytes: Option<i64>,
 }
 
 impl From<Snapshot> for SnapshotResponse {
@@ -113,6 +120,9 @@ impl From<Snapshot> for SnapshotResponse {
             checksum_sha256: s.checksum_sha256,
             error_message: s.error_message,
             notes: s.notes,
+            remote_status: s.remote_status,
+            remote_error: s.remote_error,
+            archive_bytes: s.archive_bytes,
         }
     }
 }
@@ -174,4 +184,12 @@ pub struct RestoreAppRequest {
 #[derive(Debug, Deserialize)]
 pub struct RestoreDatabaseRequest {
     pub db_name: String,
+}
+
+/// Reply to a database restore.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestoreDatabaseResponse {
+    pub message: String,
+    /// Backup of the data as it was just before the restore (to undo it)
+    pub pre_restore_snapshot_id: String,
 }
