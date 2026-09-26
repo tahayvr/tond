@@ -1,0 +1,35 @@
+id = "metabase"
+name = "Metabase"
+description = "Business intelligence: ask questions of your data and build dashboards."
+about = "Metabase lets anyone query databases with a visual question builder or SQL, then share charts and dashboards. It runs on the JVM, so it needs about a gigabyte of memory; its own settings live in a bundled PostgreSQL database."
+category = "analytics"
+tags = ["bi", "dashboards", "sql", "reporting", "charts"]
+logo = "metabase"
+version = "0.58 LTS"
+website = "https://www.metabase.com"
+docs = "https://www.metabase.com/docs/latest/installation-and-operation/running-metabase-on-docker"
+repository = "https://github.com/metabase/metabase"
+ram_mb = 1200
+setup_notes = "The first start takes two or three minutes. Then open the app and complete the setup wizard to create the admin account and connect your first database."
+upgrade_notes = "Metabase 0.58 is a long-term support release. To upgrade, change the image tag, snapshot the app first and redeploy; the application database is migrated on start and can't be downgraded."
+post_deploy_checks = ["Complete the setup wizard", "Connect a database and build a question"]
+
+[public]
+service = "metabase"
+port = 3000
+health_path = "/api/health"
+
+[[inputs]]
+key = "MB_SITE_URL"
+label = "Site URL"
+value = "{app_url}"
+
+[[inputs]]
+key = "DB_PASSWORD"
+label = "Database password"
+generate = "password"
+
+[[volumes]]
+service = "db"
+path = "./postgres"
+description = "Metabase's own settings, questions and dashboards"

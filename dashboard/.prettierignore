@@ -8,3 +8,6 @@ bun.lockb
 # Miscellaneous
 /static/
 /dev/mockServiceWorker.js
+
+# Generated from templates/ by a tond-common test
+/src/mocks/templates.json

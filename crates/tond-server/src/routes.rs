@@ -111,6 +111,12 @@ api_routes! {
     POST "/api/v1/apps/{id}/stop" => handlers::stop_app;
     POST "/api/v1/apps/{id}/start" => handlers::start_app;
     POST "/api/v1/apps/{id}/restart" => handlers::restart_app;
+    // Docker Compose apps: services, per-service domains and ports, the file
+    GET "/api/v1/apps/{id}/services" => handlers::compose::list_services;
+    PUT "/api/v1/apps/{id}/services/{service}" => handlers::compose::update_service;
+    GET "/api/v1/apps/{id}/services/{service}/logs" => handlers::compose::service_logs;
+    POST "/api/v1/apps/{id}/services/{service}/{action}" => handlers::compose::service_action;
+    PUT "/api/v1/apps/{id}/compose" => handlers::compose::update_compose;
     GET "/api/v1/apps/{id}/logs" => handlers::app_logs;
     GET "/api/v1/apps/{id}/logs/stream" => handlers::logs::stream_logs;
     GET "/api/v1/system/logs/stream" => handlers::logs::stream_system_logs;
@@ -170,6 +176,7 @@ api_routes! {
     GET "/api/v1/settings/host-terminal" => handlers::terminal::get_host_terminal;
     PUT "/api/v1/settings/host-terminal" => handlers::terminal::set_host_terminal;
     GET "/api/v1/templates" => handlers::templates::list_templates;
+    POST "/api/v1/templates/{id}/deploy" => handlers::templates::deploy_template;
     // Git integration — auto-deploy toggle, webhook secret, deploy keys, source
     PUT "/api/v1/apps/{id}/auto-deploy" => handlers::git::update_auto_deploy;
     GET "/api/v1/apps/{id}/webhook" => handlers::git::get_webhook_config;

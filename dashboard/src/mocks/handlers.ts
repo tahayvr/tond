@@ -23,6 +23,8 @@ import {
 	MOCK_APPS,
 	MOCK_PROJECTS,
 	MOCK_TEMPLATES,
+	MOCK_TEMPLATE_MEMORY,
+	MOCK_SERVER_ARCH,
 	MOCK_SETTINGS,
 	MOCK_RETENTION,
 	MOCK_AUDIT_SHIPPING,
@@ -86,7 +88,8 @@ import type {
 	GithubPR,
 	Integration,
 	ManagedDatabase,
-	TemplateCatalogEntry,
+	Template,
+	TemplateDeployRequest,
 	Volume,
 	VolumeInput,
 	CronVolume,
@@ -115,6 +118,14 @@ import {
 } from './fixtures';
 import { observeHandlers } from './observe';
 import { updateHandlers } from './updates';
+import {
+	MOCK_COMPOSE_APP,
+	MOCK_COMPOSE_DEPLOYMENTS,
+	MOCK_COMPOSE_SERVICES,
+	mockComposeSpecs,
+	mockReleaseServices
+} from './compose-fixtures';
+import type { ComposeService, DeploymentService } from '$lib/api';
 import { errorBody, okBody } from './envelope';
 import { MOCK_OPENAPI } from './openapi';
 
@@ -123,6 +134,13 @@ const LATENCY = 200;
 
 function ok<T>(data: T) {
 	return HttpResponse.json(okBody(data));
+}
+
+/** 24 random letters and digits, like the server's generated passwords. */
+function mockGeneratedSecret(): string {
+	const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+	const bytes = crypto.getRandomValues(new Uint8Array(24));
+	return Array.from(bytes, (b) => alphabet[b % alphabet.length]).join('');
 }
 
 function err(message: string, status = 400, code?: string) {
@@ -546,14 +564,19 @@ function mockNextRuns(schedule: string, count: number): string[] | null {
 const MOCK_STEP_UP_PASSWORD = 'ValidPass123!';
 // ticket → target, consumed by the terminal WebSocket mock
 const terminalTickets = new Map<string, { kind: string; id: string }>();
-let apps: App[] = structuredClone(MOCK_APPS);
+let apps: App[] = structuredClone([...MOCK_APPS, MOCK_COMPOSE_APP]);
+/** Services of compose apps (app id → services). */
+const composeServices: Record<string, ComposeService[]> = structuredClone(MOCK_COMPOSE_SERVICES);
 let projects: Project[] = structuredClone(MOCK_PROJECTS);
-const templates: TemplateCatalogEntry[] = structuredClone(MOCK_TEMPLATES);
+const templates: Template[] = structuredClone(MOCK_TEMPLATES);
 let alertRules: AlertRule[] = structuredClone(MOCK_ALERT_RULES);
 let activeAlerts: ActiveAlert[] = structuredClone(MOCK_ACTIVE_ALERTS);
 const alertHistory: AlertEpisode[] = structuredClone(MOCK_ALERT_HISTORY);
 let alertSettings: AlertSettings = structuredClone(MOCK_ALERT_SETTINGS);
-const deployments: Record<string, Deployment[]> = structuredClone(MOCK_DEPLOYMENTS);
+const deployments: Record<string, Deployment[]> = structuredClone({
+	...MOCK_DEPLOYMENTS,
+	...MOCK_COMPOSE_DEPLOYMENTS
+});
 let previews: Record<string, PreviewDeployment[]> = structuredClone(MOCK_PREVIEWS);
 /** Opt-in access logs per app id (the first running app starts with one). */
 let accessLogs: Record<string, { enabled: boolean; include_query: boolean; lines: string[] }> = {
@@ -966,7 +989,20 @@ function mockPhasePlan(plan: string, healthPath: string | null): PhaseRecord[] {
 		image: ['Pull image', null, 'Start container', health, 'Switch traffic'],
 		tarball: [null, 'Build uploaded source', 'Start container', health, 'Switch traffic'],
 		dockerfile: [null, 'Build image', 'Start container', health, 'Switch traffic'],
-		compose: [null, 'docker compose up', 'Find the service port', null, 'Switch traffic'],
+		compose: [
+			null,
+			'Build and pull service images',
+			'Start services',
+			'Wait for services to be ready',
+			'Switch traffic'
+		],
+		'compose-rollback': [
+			null,
+			"Reuse the deployment's images",
+			'Start services',
+			'Wait for services to be ready',
+			'Switch traffic'
+		],
 		rollback: [null, null, 'Start container', health, 'Switch traffic']
 	};
 	const labels = table[plan] ?? table.rollback;
@@ -992,7 +1028,9 @@ function startMockDeploy(
 ): Deployment {
 	const id = `dep_${Date.now().toString(36)}`;
 	const now = new Date().toISOString();
-	const plan = opts.rollbackOf ? 'rollback' : app.source_type;
+	const isCompose = app.source_type === 'compose';
+	const plan = opts.rollbackOf ? (isCompose ? 'compose-rollback' : 'rollback') : app.source_type;
+	const release = id.slice(4, 16).padEnd(12, '0');
 	const deployment: Deployment = {
 		id,
 		app_id: app.id,
@@ -1022,15 +1060,25 @@ function startMockDeploy(
 		image_pruned: false,
 		is_current: false,
 		rollback_available: false,
-		rollback_unavailable_reason: null
+		rollback_unavailable_reason: null,
+		...(isCompose
+			? {
+					services: opts.rollbackOf?.services
+						? opts.rollbackOf.services.map((s) => ({ ...s, source: 'reuse', status: 'pending' }))
+						: mockReleaseServices(release, 'pending')
+				}
+			: {})
 	};
 	deployments[app.id] = [deployment, ...(deployments[app.id] ?? [])];
 	deploymentLogs[id] = [];
 	const appIdx = apps.findIndex((a) => a.id === app.id);
-	if (appIdx !== -1) apps[appIdx] = { ...apps[appIdx], status: 'building' };
+	// Like the server: a serving app keeps its status (and its route) while it
+	// redeploys; only an app with nothing running shows 'building'.
+	const serving = app.status === 'running' || app.status === 'unhealthy';
+	if (appIdx !== -1 && !serving) apps[appIdx] = { ...apps[appIdx], status: 'building' };
 
 	const fail = app.name === 'worker-queue';
-	const tag = `tond-${app.name}:${id.slice(4, 16).padEnd(12, '0')}`;
+	const tag = `tond-${app.name}:${release}`;
 	const log = (level: string, message: string) => {
 		const line = { level, message, ts: new Date().toISOString() };
 		deploymentLogs[id].push(line);
@@ -1076,7 +1124,7 @@ function startMockDeploy(
 					]
 				}
 			}));
-			if (appIdx !== -1) apps[appIdx] = { ...apps[appIdx], status: 'failed' };
+			if (appIdx !== -1 && !serving) apps[appIdx] = { ...apps[appIdx], status: 'failed' };
 			return;
 		}
 		log('info', `Deployed successfully! Container: ${id.slice(4, 16)}`);
@@ -1141,6 +1189,47 @@ function startMockDeploy(
 			[300, () => log('info', `Pulling image: ${app.source_url ?? 'image'}`)],
 			[2000, () => log('info', `Pinned ${app.source_url} as ${tag}`)]
 		);
+	} else if (isCompose) {
+		const setServices = (status: (s: DeploymentService) => string) =>
+			updateDeployment(app.id, id, (d) => ({
+				...d,
+				services: (d.services ?? []).map((s) => ({ ...s, status: status(s) }))
+			}));
+		script.push([400, () => phase('build')]);
+		if (!opts.rollbackOf) {
+			script.push(
+				[300, () => setServices((s) => (s.source === 'build' ? 'building' : 'pulling'))],
+				[700, () => log('info', '[admin] Building image tond-shop-stack/admin:' + release)],
+				[900, () => log('info', '[cache] Pulling redis:7-alpine')],
+				[800, () => setServices((s) => (s.source === 'pull' ? 'ready' : s.status))],
+				[1200, () => log('info', '[admin] #8 exporting to image')],
+				[400, () => setServices(() => 'ready')]
+			);
+		} else {
+			script.push([300, () => setServices(() => 'ready')]);
+		}
+		script.push(
+			[500, () => phase('start')],
+			[200, () => setServices(() => 'starting')],
+			[300, () => log('info', 'Starting services with docker compose up...')],
+			[800, () => phase('health')],
+			[
+				900,
+				() =>
+					setServices((s) => (s.service === 'cache' || s.service === 'db' ? 'healthy' : s.status))
+			],
+			[900, () => setServices(() => 'healthy')],
+			[300, () => log('info', '[web] Ready')],
+			[300, () => phase('release')],
+			[500, () => setServices(() => 'running')],
+			[300, finish]
+		);
+		let waitC = 0;
+		for (const [ms, action] of script) {
+			waitC += ms;
+			setTimeout(action, waitC);
+		}
+		return deployment;
 	} else if (plan !== 'rollback') {
 		script.push(
 			[400, () => phase('build')],
@@ -1862,7 +1951,106 @@ export const handlers = [
 
 	http.get('/api/v1/templates', async () => {
 		await delay(LATENCY);
-		return ok(templates);
+		return ok({
+			templates,
+			memory: MOCK_TEMPLATE_MEMORY,
+			apps_domain: MOCK_SETTINGS.apps_domain,
+			architecture: MOCK_SERVER_ARCH
+		});
+	}),
+
+	http.post('/api/v1/templates/:id/deploy', async ({ params, request }) => {
+		await delay(LATENCY * 2);
+		const template = templates.find((t) => t.id === params.id);
+		if (!template) return err(`No template named ${params.id}`, 404);
+		const body = (await request.json()) as TemplateDeployRequest;
+		const name = (body.name ?? '').trim().toLowerCase();
+		if (!/^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/.test(name)) {
+			return HttpResponse.json(
+				errorBody('App name must be 1–40 lowercase letters, digits and hyphens', 400, undefined, {
+					field: 'name'
+				}),
+				{ status: 400 }
+			);
+		}
+		if (!template.architectures.includes(MOCK_SERVER_ARCH)) {
+			return err(
+				`${template.name} isn't available on ARM64: its images are published for x86_64 only.`,
+				409,
+				'CONFLICT'
+			);
+		}
+		if (apps.some((a) => a.name === name))
+			return err(`App already exists: ${name}`, 409, 'APP_ALREADY_EXISTS');
+		if (template.ram_mb > MOCK_TEMPLATE_MEMORY.available_mb && !body.allow_low_memory) {
+			return err(
+				`${template.name} needs about ${template.ram_mb} MB of memory and this server has ${MOCK_TEMPLATE_MEMORY.available_mb} MB free.`,
+				409,
+				'INSUFFICIENT_MEMORY'
+			);
+		}
+		const credentials: { key: string; label: string; value: string }[] = [];
+		for (const input of template.inputs) {
+			const given = (body.inputs?.[input.key] ?? '').trim();
+			const problem =
+				!given && input.required
+					? `${input.label} is required`
+					: given && input.kind === 'email' && !given.includes('@')
+						? `${input.label} must be an email address`
+						: null;
+			if (problem) {
+				return HttpResponse.json(
+					errorBody(problem, 400, undefined, { field: `inputs.${input.key}` }),
+					{ status: 400 }
+				);
+			}
+			const value = given || (input.generated ? mockGeneratedSecret() : (input.default ?? ''));
+			if (input.credential) credentials.push({ key: input.key, label: input.label, value });
+		}
+		const domain =
+			body.domain?.trim() ||
+			(MOCK_SETTINGS.apps_domain ? `${name}.${MOCK_SETTINGS.apps_domain}` : null);
+		const now = new Date().toISOString();
+		const newApp: App = {
+			...structuredClone(MOCK_APPS[0]),
+			id: `app_${Date.now()}`,
+			name,
+			domain,
+			source_type: 'compose',
+			source_url: null,
+			status: 'deploying',
+			container_port: template.public.port,
+			host_port: null,
+			health_check_path: template.public.health_path,
+			volumes: [],
+			build_method: null,
+			auto_deploy: false,
+			watch_branch: null,
+			project_id: body.project_id ?? null,
+			compose_content: template.compose,
+			dockerfile_content: null,
+			readiness: template.public.health_path ? 'http' : 'tcp',
+			template_id: template.id,
+			template_version: template.version,
+			created_at: now,
+			updated_at: now
+		};
+		apps = [...apps, newApp];
+		const d = startMockDeploy(newApp, {
+			trigger_source: 'manual',
+			trigger_detail: MOCK_USER.email
+		});
+		return HttpResponse.json(
+			okBody({
+				app_id: newApp.id,
+				app_name: name,
+				domain,
+				deployment_id: d.id,
+				credentials,
+				setup_notes: template.setup_notes
+			}),
+			{ status: 202 }
+		);
 	}),
 
 	http.post('/api/v1/projects', async ({ request }) => {
@@ -2017,6 +2205,31 @@ export const handlers = [
 			updated_at: new Date().toISOString()
 		};
 		apps = [...apps, newApp];
+		if (newApp.source_type === 'compose') {
+			const specs = mockComposeSpecs(body.compose_content ?? '');
+			const port = newApp.container_port;
+			const wanted = (body as { compose_service?: string }).compose_service;
+			const web =
+				specs.find((s) => s.name === wanted) ??
+				specs.find((s) => s.ports.includes(port)) ??
+				specs.find((s) => s.ports.length > 0);
+			composeServices[newApp.id] = specs.map((spec) => ({
+				...spec,
+				published_port:
+					spec === web ? (spec.ports.includes(port) ? port : (spec.ports[0] ?? port)) : null,
+				host_port: null,
+				redeploy_required: spec === web,
+				domains: spec === web && newApp.domain ? [newApp.domain] : [],
+				status: 'pending',
+				health: null,
+				exit_code: null,
+				container_id: null,
+				running_image: null,
+				image_digest: null,
+				cpu: null,
+				mem: null
+			}));
+		}
 		return ok(newApp);
 	}),
 
@@ -2803,7 +3016,154 @@ export const handlers = [
 		await delay(LATENCY);
 		const body = (await request.json()) as { compose_content: string };
 		const errors = mockComposeProblems(body.compose_content);
-		return ok({ valid: errors.length === 0, errors });
+		return ok({
+			valid: errors.length === 0,
+			errors,
+			services: mockComposeSpecs(body.compose_content)
+		});
+	}),
+
+	// ── Compose services ──────────────────────────────────────────────────────
+
+	http.get('/api/v1/apps/:id/services', async ({ params }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
+		if (!app) return err('App not found', 404);
+		if (app.source_type !== 'compose')
+			return err(`Invalid input: '${app.name}' is not a Docker Compose app`, 400);
+		return ok(composeServices[app.id] ?? []);
+	}),
+
+	http.put('/api/v1/apps/:id/services/:service', async ({ params, request }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id);
+		if (!app) return err('App not found', 404);
+		const list = composeServices[app.id] ?? [];
+		const svc = list.find((s) => s.name === params.service);
+		if (!svc) return err(`Not found: service '${params.service}' in app '${app.name}'`, 404);
+		const body = (await request.json()) as { published_port: number | null; domains: string[] };
+		if (body.domains.length && body.published_port == null) {
+			return err(
+				`Invalid input: Publish a container port of service '${svc.name}' before routing domains to it`
+			);
+		}
+		for (const d of body.domains) {
+			const owner =
+				apps.find((a) => a.domain === d && a.id !== app.id) ??
+				apps.find(
+					(a) => a.id !== app.id && (composeServices[a.id] ?? []).some((s) => s.domains.includes(d))
+				);
+			if (owner) return err(`Invalid input: ${d} is already used by the app '${owner.name}'`);
+		}
+		const portChanged = svc.published_port !== body.published_port;
+		const updated: ComposeService = {
+			...svc,
+			published_port: body.published_port,
+			host_port: body.published_port == null ? null : svc.host_port,
+			redeploy_required: body.published_port != null && (portChanged || svc.redeploy_required),
+			domains: [...new Set(body.domains)]
+		};
+		composeServices[app.id] = list.map((s) => (s.name === svc.name ? updated : s));
+		return ok({
+			service: updated,
+			port_changed: portChanged,
+			redeploy_required: updated.redeploy_required,
+			warnings: []
+		});
+	}),
+
+	http.post('/api/v1/apps/:id/services/:service/:action', async ({ params }) => {
+		await delay(LATENCY * 2);
+		const app = apps.find((a) => a.id === params.id);
+		if (!app) return err('App not found', 404);
+		const list = composeServices[app.id] ?? [];
+		const svc = list.find((s) => s.name === params.service);
+		if (!svc) return err(`Not found: service '${params.service}'`, 404);
+		const action = params.action as string;
+		const status = action === 'stop' ? 'exited' : 'running';
+		const updated: ComposeService = {
+			...svc,
+			status,
+			exit_code: action === 'stop' ? 143 : null,
+			health: svc.has_healthcheck && action !== 'stop' ? 'healthy' : null
+		};
+		composeServices[app.id] = list.map((s) => (s.name === svc.name ? updated : s));
+		const past = action === 'restart' ? 'restarted' : action === 'stop' ? 'stopped' : 'started';
+		return ok({ message: `Service ${svc.name} ${past}`, service: updated });
+	}),
+
+	http.get('/api/v1/apps/:id/services/:service/logs', async ({ params }) => {
+		await delay(LATENCY);
+		const now = Date.now();
+		const lines = Array.from({ length: 40 }, (_, i) => {
+			const ts = new Date(now - (40 - i) * 15_000).toISOString();
+			const text =
+				params.service === 'cache'
+					? i % 10 === 0
+						? '1:M * Background saving started by pid 42'
+						: '1:M * DB saved on disk'
+					: params.service === 'db'
+						? 'LOG:  checkpoint complete: wrote 12 buffers (0.1%)'
+						: `GET /products?page=${i % 5} 200 ${10 + (i % 7)}ms`;
+			return `${ts} ${text}`;
+		});
+		return ok({ service: params.service, lines });
+	}),
+
+	http.put('/api/v1/apps/:id/compose', async ({ params, request }) => {
+		await delay(LATENCY * 2);
+		const idx = apps.findIndex((a) => a.id === params.id);
+		if (idx === -1) return err('App not found', 404);
+		const body = (await request.json()) as {
+			compose_content?: string;
+			source_url?: string;
+			branch?: string;
+			compose_path?: string;
+		};
+		if (body.source_url) {
+			apps[idx] = {
+				...apps[idx],
+				compose_content: null,
+				source_url: body.source_url,
+				branch: body.branch ?? 'main',
+				compose_path: body.compose_path ?? 'docker-compose.yml'
+			};
+		} else {
+			const problems = mockComposeProblems(body.compose_content ?? '');
+			if (problems.length) return err(`Compose file rejected: ${problems[0]}`, 400);
+			const specs = mockComposeSpecs(body.compose_content ?? '');
+			const old = composeServices[apps[idx].id] ?? [];
+			composeServices[apps[idx].id] = specs.map((spec) => {
+				const prev = old.find((s) => s.name === spec.name);
+				return prev
+					? { ...prev, ...spec }
+					: {
+							...spec,
+							published_port: null,
+							host_port: null,
+							redeploy_required: false,
+							domains: [],
+							status: 'pending',
+							health: null,
+							exit_code: null,
+							container_id: null,
+							running_image: null,
+							image_digest: null,
+							cpu: null,
+							mem: null
+						};
+			});
+			apps[idx] = {
+				...apps[idx],
+				compose_content: body.compose_content ?? '',
+				source_url: null,
+				compose_path: null
+			};
+		}
+		return ok({
+			message: 'Compose file saved. Deploy to apply it.',
+			services: composeServices[apps[idx].id] ?? []
+		});
 	}),
 
 	// ── Git Integration ───────────────────────────────────────────────────────
@@ -4546,7 +4906,52 @@ export const handlers = [
 	// On connect: sends a snapshot of 5 seed lines.
 	// Every 2 s: sends one incremental container_log line.
 
-	appLogStream.addEventListener('connection', ({ client }) => {
+	appLogStream.addEventListener('connection', ({ client, params }) => {
+		// Compose apps: every service's output, tagged with the service.
+		const services = composeServices[params.id as string];
+		if (services) {
+			const names = services.filter((s) => s.status === 'running').map((s) => s.name);
+			const lineFor = (service: string, n: number) =>
+				service === 'cache'
+					? `1:M * ${n} changes in 60 seconds. Saving...`
+					: service === 'db'
+						? `LOG:  checkpoint starting: time (${n})`
+						: `GET /products?page=${n % 5} 200 ${8 + (n % 9)}ms`;
+			client.send(
+				JSON.stringify({
+					type: 'snapshot',
+					deploy_logs: [
+						{
+							level: 'info',
+							message: 'Deployed successfully! 5 service(s) running',
+							ts: new Date().toISOString()
+						}
+					],
+					container_logs: names.flatMap((service, i) => [
+						{
+							ts: new Date(Date.now() - (10 - i) * 1000).toISOString(),
+							service,
+							line: lineFor(service, i)
+						}
+					])
+				})
+			);
+			let counter = 0;
+			const timer = setInterval(() => {
+				counter += 1;
+				const service = names[counter % names.length];
+				client.send(
+					JSON.stringify({
+						type: 'container',
+						ts: new Date().toISOString(),
+						service,
+						line: lineFor(service, counter)
+					})
+				);
+			}, 1500);
+			client.addEventListener('close', () => clearInterval(timer));
+			return;
+		}
 		// Send initial snapshot
 		client.send(
 			JSON.stringify({

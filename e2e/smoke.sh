@@ -51,6 +51,7 @@ ADMIN_PASSWORD="${E2E_ADMIN_PASSWORD:-E2e-Smoke-Passw0rd!}"
 
 WHOAMI_DOMAIN="whoami.${BASE}"
 STATIC_DOMAIN="static.${BASE}"
+VAULT_DOMAIN="vault.${BASE}"
 
 # ── Output helpers ────────────────────────────────────────────────────────────
 
@@ -118,6 +119,26 @@ wait_for() {
     done
 }
 
+# watch_availability <domain> <file>: request https://<domain>/ every 0.2 s
+# until killed, one HTTP status per line (000 when nothing answered).
+watch_availability() {
+    while true; do
+        curl -sk -o /dev/null -w '%{http_code}\n' --max-time 5 \
+            --resolve "$1:443:${IP}" "https://$1/" >> "$2" 2> /dev/null || true
+        sleep 0.2
+    done
+}
+
+# assert_no_downtime <file> <label>: every recorded status was 2xx.
+assert_no_downtime() {
+    local total bad
+    total=$(wc -l < "$1" | tr -d ' ')
+    bad=$(grep -cv '^2' "$1" || true)
+    (( total >= 5 )) || fail "$2: only ${total} requests were made during the redeploy"
+    (( bad == 0 )) || fail "$2: ${bad} of ${total} requests during the redeploy were not 2xx: $(sort "$1" | uniq -c | tr '\n' ' ')"
+    pass "$2: ${total} requests during the redeploy, all 2xx"
+}
+
 app_field() { api /api/v1/apps | jq -r --arg n "$1" ".data[] | select(.name == \$n) | .$2"; }
 
 # Wait until an app is running; fail fast (with deploy logs) if it fails.
@@ -140,9 +161,11 @@ wait_for_app_running() {
 }
 
 delete_e2e_resources() {
-    for app in e2e-whoami e2e-static e2e-rooted e2e-compose e2e-badport e2e-worker e2e-worker-domain e2e-auto e2e-wild; do
+    for app in e2e-whoami e2e-static e2e-rooted e2e-compose e2e-stack e2e-badport e2e-worker e2e-worker-domain e2e-auto e2e-wild e2e-vault; do
         tond apps delete "$app" -y > /dev/null 2>&1 || true
     done
+    # A template refuses a name whose volume directory still holds data.
+    rm -rf "${DATA_DIR}/volumes/e2e-vault"
     for db in e2e-redis e2e-redis-copy e2e-pg e2e-pg-copy; do
         tond db delete "$db" -y > /dev/null 2>&1 || true
     done
@@ -1528,7 +1551,21 @@ FIRST_TAG=$(deployments | jq -r '[.data[] | select(.status == "succeeded")][0].i
 [[ "$FIRST_TAG" =~ ^tond-e2e-whoami:[0-9a-f]{12}$ ]] || fail "deployments must run a per-deployment tag, got ${FIRST_TAG}"
 docker image inspect "$FIRST_TAG" > /dev/null || fail "image ${FIRST_TAG} must exist on the host"
 pass "deployment runs ${FIRST_TAG}"
+# A redeploy of a serving app keeps serving the old container until the
+# cutover: no failed request, and the app never leaves 'running'.
+AVAIL=$(mktemp)
+STATUSES=$(mktemp)
+watch_availability "$WHOAMI_DOMAIN" "$AVAIL" &
+AVAIL_PID=$!
+( while kill -0 "$AVAIL_PID" 2> /dev/null; do app_field e2e-whoami status >> "$STATUSES" 2> /dev/null || true; sleep 1; done ) &
+STATUS_PID=$!
 tond apps deploy e2e-whoami > /dev/null
+kill "$AVAIL_PID" "$STATUS_PID" 2> /dev/null || true
+wait "$AVAIL_PID" "$STATUS_PID" 2> /dev/null || true
+assert_no_downtime "$AVAIL" "redeploying e2e-whoami"
+! grep -qv '^running$' "$STATUSES" \
+    || fail "a serving app must stay 'running' while it redeploys, saw: $(sort -u "$STATUSES" | tr '\n' ' ')"
+pass "e2e-whoami stayed 'running' during the redeploy"
 wait_for 300 "a second successful e2e-whoami deployment" \
     bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/apps/e2e-whoami/deployments | jq -e '[.data[] | select(.status == \"succeeded\")] | length >= 2'"
 wait_for_app_running e2e-whoami 120
@@ -1649,6 +1686,159 @@ jq -e '.data.phases[] | select(.phase == "health") | .label == "Stay up for 5s" 
 docker logs tond-e2e-worker 2>&1 | grep -q tick || fail "the worker container should be running its loop"
 pass "a background worker deploys to running with no domain (readiness step: stay up 5s)"
 
+step "One-click templates (catalog, generated credentials, encrypted inputs, volume owners)"
+CATALOG=$(api /api/v1/templates)
+jq -e '(.data.templates | length) >= 25' <<< "$CATALOG" > /dev/null \
+    || fail "the template catalog should ship 25+ templates: $(jq -c '.data.templates | length' <<< "$CATALOG")"
+jq -e '[.data.templates[].services[].image | select(test(":latest$") or (test(":") | not))] | length == 0' <<< "$CATALOG" > /dev/null \
+    || fail "every template image must be pinned"
+jq -e '.data.memory.total_mb > 0 and .data.memory.available_mb > 0' <<< "$CATALOG" > /dev/null \
+    || fail "the catalog should report host memory: $(jq -c '.data.memory' <<< "$CATALOG")"
+pass "catalog: $(jq '.data.templates | length' <<< "$CATALOG") templates, images pinned, free memory reported"
+case "$(uname -m)" in x86_64) HOST_ARCH=amd64 ;; aarch64) HOST_ARCH=arm64 ;; *) HOST_ARCH=$(uname -m) ;; esac
+[[ "$(jq -r '.data.architecture' <<< "$CATALOG")" == "$HOST_ARCH" ]] \
+    || fail "the catalog should report the server's architecture (${HOST_ARCH}): $(jq -c '.data.architecture' <<< "$CATALOG")"
+if [[ "$HOST_ARCH" == arm64 ]]; then
+    code=$(api_req POST /api/v1/templates/mattermost/deploy '{"name":"e2e-mm","inputs":{},"allow_low_memory":true}')
+    [[ "$code" == 409 ]] && jq -e '.error.message | test("ARM64")' "$API_BODY" > /dev/null \
+        || fail "an x86_64-only template must be refused on ARM64, got ${code}: $(cat "$API_BODY")"
+    pass "x86_64-only templates are refused on ARM64"
+fi
+code=$(api_req POST /api/v1/templates/vaultwarden/deploy '{"name":"Bad Name","inputs":{}}')
+[[ "$code" == 400 ]] && jq -e '.error.code == "INVALID_INPUT" and .error.field == "name"' "$API_BODY" > /dev/null \
+    || fail "a template deploy with an invalid name must be 400 INVALID_INPUT on field name, got ${code}: $(cat "$API_BODY")"
+code=$(api_req POST /api/v1/templates/nope/deploy '{"name":"e2e-nope","inputs":{}}')
+[[ "$code" == 404 ]] || fail "an unknown template must be 404, got ${code}"
+code=$(api_req POST /api/v1/templates/vaultwarden/deploy \
+    "{\"name\":\"e2e-vault\",\"domain\":\"${VAULT_DOMAIN}\",\"inputs\":{},\"allow_low_memory\":true}")
+[[ "$code" == 202 ]] || fail "deploying the vaultwarden template should be accepted, got ${code}: $(cat "$API_BODY")"
+VAULT_TOKEN=$(jq -r '.data.credentials[] | select(.key == "ADMIN_TOKEN") | .value' "$API_BODY")
+[[ ${#VAULT_TOKEN} -eq 24 ]] || fail "the deploy should return the generated admin token once: $(jq -c '.data.credentials | map(.key)' "$API_BODY")"
+jq -e '.data.deployment_id | length > 0' "$API_BODY" > /dev/null || fail "the deploy response needs a deployment id"
+[[ "$(app_field e2e-vault template_id)" == vaultwarden ]] || fail "the app should record the template it came from"
+[[ "$(app_field e2e-vault domain)" == "$VAULT_DOMAIN" ]] || fail "the template's domain should be the app's primary domain"
+pass "template deploy → 202 with a generated 24-character admin token; template and domain recorded"
+wait_for_app_running e2e-vault 300
+VAULT_CID=$(docker ps -q --filter label=com.docker.compose.project=e2e-vault --filter label=com.docker.compose.service=vaultwarden)
+[[ -n "$VAULT_CID" ]] || fail "the vaultwarden compose service should be running"
+docker inspect "$VAULT_CID" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -qx "ADMIN_TOKEN=${VAULT_TOKEN}" \
+    || fail "\${ADMIN_TOKEN} in the compose file should be filled from the app's env"
+docker inspect "$VAULT_CID" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -qx "DOMAIN=https://${VAULT_DOMAIN}" \
+    || fail "{app_url} should expand to the app's domain"
+! grep -q "$VAULT_TOKEN" "${DATA_DIR}/compose/e2e-vault/docker-compose.yml" \
+    || fail "the generated token must not be written into the compose file on disk"
+! sqlite3 "${DATA_DIR}/tond.db" "SELECT env_vars FROM apps WHERE name = 'e2e-vault'" 2> /dev/null | grep -q "$VAULT_TOKEN" \
+    || fail "the generated token must be stored encrypted"
+[[ -d "${DATA_DIR}/volumes/e2e-vault/data" ]] || fail "the template's declared volume should be created"
+pass "inputs reach the container through the app env, never plaintext on disk; volume created"
+wait_for 90 "vaultwarden answering at https://${VAULT_DOMAIN}/alive" \
+    bash -c "[[ \$(curl -sk -o /dev/null -w '%{http_code}' --resolve '${VAULT_DOMAIN}:443:${IP}' 'https://${VAULT_DOMAIN}/alive') == 200 ]]"
+pass "https://${VAULT_DOMAIN}/alive → 200 through the proxy"
+code=$(api_req POST /api/v1/templates/vaultwarden/deploy '{"name":"e2e-vault","inputs":{}}')
+[[ "$code" == 409 ]] && jq -e '.error.code == "APP_ALREADY_EXISTS"' "$API_BODY" > /dev/null \
+    || fail "a second app with the same name must be refused with APP_ALREADY_EXISTS, got ${code}: $(cat "$API_BODY")"
+tond apps delete e2e-vault -y > /dev/null
+code=$(api_req POST /api/v1/templates/vaultwarden/deploy '{"name":"e2e-vault","inputs":{},"allow_low_memory":true}')
+[[ "$code" == 400 ]] && grep -q "earlier app named e2e-vault" "$API_BODY" \
+    || fail "a template must refuse a name whose volume directory still holds data, got ${code}: $(cat "$API_BODY")"
+(( $(api /api/v1/apps | jq '[.data[] | select(.name == "e2e-vault")] | length') == 0 )) \
+    || fail "a refused template deploy must not leave an app behind"
+rm -rf "${DATA_DIR}/volumes/e2e-vault"
+pass "same name → 409; leftover data → 400 and nothing is created"
+
+
+step "Docker Compose app (per-service routing, status, logs, rollback, cleanup)"
+# A two-service compose app: whoami gets a domain, redis stays internal with
+# a healthcheck and a named volume. Tond pins each service's image per
+# deployment, publishes only the routed port (on 127.0.0.1) and tond-proxy
+# routes the domain to that service.
+STACK_DOMAIN="stack.${BASE}"
+STACK_FILE=$'services:\n  web:\n    image: traefik/whoami:v1.10\n    expose: ["80"]\n  cache:\n    image: redis:7-alpine\n    volumes: ["cache-data:/data"]\n    healthcheck:\n      test: ["CMD", "redis-cli", "ping"]\n      interval: 2s\n      timeout: 2s\n      retries: 15\nvolumes:\n  cache-data: {}\n'
+stack_services() { api /api/v1/apps/e2e-stack/services; }
+code=$(api_req POST /api/v1/apps "$(jq -n --arg f "$STACK_FILE" --arg d "$STACK_DOMAIN" \
+    '{name: "e2e-stack", source_type: "compose", container_port: 80, domain: $d, compose_content: $f}')")
+[[ "$code" == 201 ]] || fail "creating the compose app should succeed, got ${code}: $(cat "$API_BODY")"
+stack_services | jq -e --arg d "$STACK_DOMAIN" \
+    '[.data[] | {name, published_port, domains}] == [{name: "web", published_port: 80, domains: [$d]}, {name: "cache", published_port: null, domains: []}]' \
+    > /dev/null || fail "the web service should get the port and domain: $(stack_services)"
+pass "created: web publishes :80 with ${STACK_DOMAIN}, cache stays internal"
+tond apps deploy e2e-stack > /dev/null
+wait_for_app_running e2e-stack 300
+stack_services | jq -e '[.data[] | .status] == ["running", "running"] and (.data[] | select(.name == "cache") | .health) == "healthy"' \
+    > /dev/null || fail "both services should run and redis be healthy: $(stack_services)"
+pass "both services running, the redis healthcheck passed"
+tond --json apps services e2e-stack | jq -e '[.[].name] == ["web", "cache"]' > /dev/null \
+    || fail "tond apps services should list both services: $(tond --json apps services e2e-stack)"
+pass "tond apps services lists them"
+wait_for 60 "route for ${STACK_DOMAIN}" bash -c "curl -sk --resolve '${STACK_DOMAIN}:443:${IP}' 'https://${STACK_DOMAIN}/' | grep -q Hostname:"
+pass "https://${STACK_DOMAIN} is routed to the web service"
+STACK_WEB=$(stack_services | jq -r '.data[] | select(.name == "web") | .container_id')
+web_image=$(docker inspect "$STACK_WEB" | jq -r '.[0].Config.Image')
+[[ "$web_image" =~ ^tond-e2e-stack/web:[0-9a-f]{12}$ ]] || fail "services must run a pinned per-deployment image, got ${web_image}"
+assert_hardened "$STACK_WEB" "compose service web"
+STACK_CACHE=$(stack_services | jq -r '.data[] | select(.name == "cache") | .container_id')
+[[ "$(docker inspect "$STACK_CACHE" | jq -c '.[0].HostConfig.PortBindings // {}')" == "{}" ]] \
+    || fail "an unpublished service must not publish ports"
+pass "web runs ${web_image}, hardened; cache publishes nothing"
+api /api/v1/apps/e2e-stack/services/cache/logs | jq -e '.data.lines | length > 0' > /dev/null \
+    || fail "per-service logs should return redis's output"
+api /api/v1/apps/e2e-stack/logs | jq -e '.data.container_logs | any(contains("[cache]"))' > /dev/null \
+    || fail "the combined log should tag each line with its service"
+pass "per-service and combined logs"
+code=$(api_req POST /api/v1/apps/e2e-stack/services/cache/restart)
+[[ "$code" == 200 ]] || fail "restarting one service should work, got ${code}: $(cat "$API_BODY")"
+wait_for 60 "cache running after restart" bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/apps/e2e-stack/services | jq -e '.data[] | select(.name == \"cache\") | .status == \"running\"'"
+pass "POST /services/cache/restart restarts only redis"
+code=$(api_req PUT /api/v1/apps/e2e-stack/services/web "$(jq -n --arg d "$STACK_DOMAIN" '{published_port: 80, domains: [$d, "www.\($d)"]}')")
+[[ "$code" == 200 ]] || fail "adding a second domain should work, got ${code}: $(cat "$API_BODY")"
+wait_for 60 "route for www.${STACK_DOMAIN}" bash -c "curl -sk --resolve 'www.${STACK_DOMAIN}:443:${IP}' 'https://www.${STACK_DOMAIN}/' | grep -q Hostname:"
+pass "a second domain on the same service is routed at once"
+docker volume inspect e2e-stack_cache-data > /dev/null || fail "the named volume should exist"
+
+# Redeploying an unchanged file: images are pinned by content, so compose
+# keeps every container, the service port stays and nothing fails.
+STACK_WEB_BEFORE=$(stack_services | jq -r '.data[] | select(.name == "web") | .container_id')
+AVAIL=$(mktemp)
+watch_availability "$STACK_DOMAIN" "$AVAIL" &
+AVAIL_PID=$!
+tond apps deploy e2e-stack > /dev/null
+kill "$AVAIL_PID" 2> /dev/null || true
+wait "$AVAIL_PID" 2> /dev/null || true
+assert_no_downtime "$AVAIL" "redeploying e2e-stack"
+[[ "$(app_field e2e-stack status)" == running ]] || fail "the compose app should still be running"
+[[ "$(stack_services | jq -r '.data[] | select(.name == "web") | .container_id')" == "$STACK_WEB_BEFORE" ]] \
+    || fail "an unchanged service must keep its container across a redeploy"
+pass "an unchanged service keeps its container across a redeploy"
+
+# Edit the file (web reads WHOAMI_NAME from the app's environment), redeploy,
+# then roll back to the first deployment: its compose file and images come back.
+STACK_FIRST=$(api /api/v1/apps/e2e-stack/deployments | jq -r '[.data[] | select(.status == "succeeded")][0].id')
+STACK_FILE_V2=$'services:\n  web:\n    image: traefik/whoami:v1.10\n    expose: ["80"]\n    environment: ["WHOAMI_NAME=${STACK_NAME}"]\n  cache:\n    image: redis:7-alpine\n    volumes: ["cache-data:/data"]\n    healthcheck:\n      test: ["CMD", "redis-cli", "ping"]\n      interval: 2s\n      timeout: 2s\n      retries: 15\nvolumes:\n  cache-data: {}\n'
+code=$(api_req PUT /api/v1/apps/e2e-stack/compose "$(jq -n --arg f "$STACK_FILE_V2" '{compose_content: $f}')")
+[[ "$code" == 200 ]] || fail "saving the compose file should work, got ${code}: $(cat "$API_BODY")"
+code=$(api_req PATCH /api/v1/apps/e2e-stack/env '{"set":{"STACK_NAME":"v2"},"unset":[]}')
+[[ "$code" == 200 ]] || fail "setting an app variable should work, got ${code}: $(cat "$API_BODY")"
+tond apps deploy e2e-stack > /dev/null
+wait_for 300 "a third compose deployment" \
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/apps/e2e-stack/deployments | jq -e '[.data[] | select(.status == \"succeeded\")] | length >= 3'"
+wait_for 60 "the edited web service" bash -c "curl -sk --resolve '${STACK_DOMAIN}:443:${IP}' 'https://${STACK_DOMAIN}/' | grep -q 'Name: v2'"
+pass "an edited compose file redeploys; \${STACK_NAME} came from the app's environment (Name: v2)"
+api "/api/v1/apps/e2e-stack/deployments/${STACK_FIRST}" | jq -e '.data.services | length == 2 and all(.image | test("^tond-e2e-stack/"))' > /dev/null \
+    || fail "a compose deployment should list its pinned service images"
+code=$(api_req POST /api/v1/apps/e2e-stack/rollback "{\"deployment_id\":\"${STACK_FIRST}\"}")
+[[ "$code" == 202 ]] || fail "compose rollback should be accepted, got ${code}: $(cat "$API_BODY")"
+wait_for 300 "compose rollback" \
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/apps/e2e-stack/deployments | jq -e '.data[0] | select(.trigger_source == \"rollback\" and .status == \"succeeded\")'"
+wait_for 60 "the restored web service" bash -c "! curl -sk --resolve '${STACK_DOMAIN}:443:${IP}' 'https://${STACK_DOMAIN}/' | grep -q 'Name: v2'"
+[[ "$(app_field e2e-stack compose_content)" != *WHOAMI_NAME* ]] || fail "rollback must restore the compose file too"
+pass "rollback restored the first deployment's compose file and images"
+
+tond apps delete e2e-stack -y > /dev/null
+wait_for 30 "e2e-stack containers gone" bash -c "[[ -z \"\$(docker ps -aq --filter label=com.docker.compose.project=e2e-stack)\" ]]"
+! docker volume inspect e2e-stack_cache-data > /dev/null 2>&1 || fail "deleting the app must remove its named volumes"
+[[ -z "$(docker images -q 'tond-e2e-stack/*')" ]] || fail "deleting the app must remove its pinned images"
+wait_for 30 "route for ${STACK_DOMAIN} removed" bash -c "[[ \$(curl -sk -o /dev/null -w '%{http_code}' --resolve '${STACK_DOMAIN}:443:${IP}' 'https://${STACK_DOMAIN}/') != 200 ]]"
+pass "deleting the compose app removes its containers, volume, images and routes"
 
 step "Resource metrics (cgroup sampling, restarts, cached host stats)"
 # The collector samples every 30 s; the first reading only primes the rates.

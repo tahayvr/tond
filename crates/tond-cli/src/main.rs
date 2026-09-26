@@ -66,7 +66,7 @@ use commands::{
     apps::AppsAction, audit::AuditAction, cron::CronAction, db::DbAction,
     integrations::IntegrationsAction, projects::ProjectsAction, scanner::ScannerAction,
     settings::SettingsAction, snapshots::SnapshotAction, storage_providers::StorageProviderAction,
-    tokens::TokenAction, users::UsersAction,
+    templates::TemplatesAction, tokens::TokenAction, users::UsersAction,
 };
 use error::CliError;
 use output::{Output, outln};
@@ -133,6 +133,13 @@ enum Commands {
     Apps {
         #[command(subcommand)]
         action: AppsAction,
+    },
+
+    /// Browse the one-click template catalog
+    #[command(visible_alias = "template")]
+    Templates {
+        #[command(subcommand)]
+        action: TemplatesAction,
     },
 
     /// Manage projects (app groups)
@@ -403,6 +410,9 @@ async fn run(cli: Cli, out: &Output) -> Result<()> {
 
     match cli.command {
         Commands::Apps { action } => commands::apps::handle(&connect()?, out, action).await,
+        Commands::Templates { action } => {
+            commands::templates::handle(&connect()?, out, action).await
+        }
         Commands::Projects { action } => commands::projects::handle(&connect()?, out, action).await,
         Commands::Db { action } => commands::db::handle(&connect()?, out, action).await,
         Commands::Cron { action } => commands::cron::handle(&connect()?, out, action).await,
@@ -546,6 +556,27 @@ mod tests {
 
     use super::*;
     use crate::client::tests::{app_response_json, spawn_test_server};
+
+    #[test]
+    fn compose_service_commands_parse_and_refuse_unknown_actions() {
+        let cli = Cli::try_parse_from(["tond", "apps", "service", "shop", "web", "restart"])
+            .unwrap_or_else(|err| panic!("apps service should parse: {err}"));
+        assert!(matches!(
+            cli.command,
+            Commands::Apps {
+                action: AppsAction::Service { ref app, ref service, ref action }
+            } if app == "shop" && service == "web" && action == "restart"
+        ));
+        assert!(Cli::try_parse_from(["tond", "apps", "service", "shop", "web", "nuke"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["tond", "apps", "services", "shop"])
+                .unwrap_or_else(|err| panic!("apps services should parse: {err}"))
+                .command,
+            Commands::Apps {
+                action: AppsAction::Services { .. }
+            }
+        ));
+    }
 
     #[test]
     fn cli_uses_default_server_for_simple_command() {

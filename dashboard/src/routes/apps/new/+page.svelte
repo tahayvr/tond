@@ -5,19 +5,12 @@
 	import {
 		getSettings,
 		createApp,
-		createDatabase,
-		createProject,
-		deleteApp,
-		deleteDatabase,
-		deleteProject,
 		deployApp,
 		getSystemMetrics,
-		type DatabaseCredentials,
 		type DeployStarted,
 		type Readiness,
 		type Project,
 		type RegistryCredential,
-		type TemplateCatalogEntry,
 		type VolumeInput
 	} from '$lib/api';
 	import { Button } from '$lib/components/ui/button/index.js';
@@ -25,7 +18,6 @@
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
 	import * as Select from '$lib/components/ui/select/index.js';
-	import { SvelteMap } from 'svelte/reactivity';
 	import { isAdmin } from '$lib/auth.svelte';
 	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import { setUiContext, clearUiContext, projectsContext } from '$lib/ui-context.svelte';
@@ -68,8 +60,6 @@
 	let error = $state('');
 	let projects = $derived(data.projects as Project[]);
 	let registryCredentials = $derived(data.registryCredentials as RegistryCredential[]);
-	let templates = $derived(data.templates as TemplateCatalogEntry[]);
-	let selectedTemplateId = $state('');
 
 	// Step 1: Source
 	let name = $state('');
@@ -80,6 +70,10 @@
 	let githubAppId = $state<string | null>(null);
 	let dockerfileContent = $state('');
 	let composeContent = $state('');
+	let composeMode = $state<'inline' | 'git'>('inline');
+	let composePath = $state('docker-compose.yml');
+	let composeService = $state('');
+	let composeErrors = $state<string[]>([]);
 
 	// Step 2: Build
 	let buildMethod = $state<'dockerfile' | 'tbuild'>('tbuild');
@@ -94,7 +88,6 @@
 	let autoDeploy = $state(false);
 	/** Branch to deploy; auto-deploy watches it too. Empty until the repo's default is known. */
 	let branch = $state('');
-	let templateSourceRef = $state('');
 	let baseDir = $state('');
 	let staticBuild = $state(false);
 
@@ -134,25 +127,8 @@
 	let envVars = $state<Record<string, string>>({});
 	let registryCredentialId = $state<string>('');
 
-	let selectedTemplate = $derived(
-		sourceSubType === 'template' && selectedTemplateId
-			? (templates.find((template) => template.id === selectedTemplateId) ?? null)
-			: null
-	);
-	let templateRequiredInputs = $derived(
-		selectedTemplate
-			? selectedTemplate.required_env.filter(
-					(env: TemplateCatalogEntry['required_env'][number]) => !env.value
-				)
-			: []
-	);
-
-	/** Git-based source (including git templates): branch and auto-deploy apply. */
-	let isGitSource = $derived(
-		sourceSubType === 'git-public' ||
-			sourceSubType === 'git-github-app' ||
-			(sourceSubType === 'template' && selectedTemplate?.source.kind === 'git')
-	);
+	/** Git-based source: branch and auto-deploy apply. */
+	let isGitSource = $derived(sourceSubType === 'git-public' || sourceSubType === 'git-github-app');
 	/** What the Deploy button is doing right now. */
 	let createStage = $state('');
 	/** Total server memory, to explain the default memory cap. */
@@ -175,58 +151,10 @@
 			.catch(() => {});
 	});
 
-	function applyTemplate(templateId: string) {
-		selectedTemplateId = templateId;
-		const template = templates.find((entry) => entry.id === templateId);
-		if (!template) {
-			templateSourceRef = '';
-			return;
-		}
-
-		sourceSubType = 'template';
-		sourceUrl = template.source.url;
-		templateSourceRef = template.source.ref ?? '';
-		containerPort = template.deploy.default_port;
-		healthCheckPath = template.deploy.health_check_path ?? '';
-		buildMethod = template.deploy.method === 'dockerfile' ? 'dockerfile' : 'tbuild';
-		if (template.source.kind === 'git') {
-			branch = template.source.ref ?? '';
-		}
-		volumes = template.deploy.volumes.map(
-			(volume: TemplateCatalogEntry['deploy']['volumes'][number]) => ({
-				container_path: volume.container_path
-			})
-		);
-		if (!nameManuallyEdited) {
-			name = template.id;
-		}
-		if (!domain.trim() && template.recommended_domains.length > 0) {
-			domain = template.recommended_domains[0];
-		}
-		envVars = Object.fromEntries(
-			template.required_env
-				.filter((env: TemplateCatalogEntry['required_env'][number]) => !env.value)
-				.map((env: TemplateCatalogEntry['required_env'][number]) => [
-					env.key,
-					envVars[env.key] ?? ''
-				])
-		);
-	}
-
 	// Build step (index 1) is irrelevant for docker source types
-	let isBuildStepSkipped = $derived.by(() => {
-		if (
-			sourceSubType === 'dockerfile' ||
-			sourceSubType === 'compose' ||
-			sourceSubType === 'image'
-		) {
-			return true;
-		}
-		if (sourceSubType !== 'template' || !selectedTemplate) {
-			return false;
-		}
-		return selectedTemplate.source.kind !== 'git';
-	});
+	let isBuildStepSkipped = $derived(
+		sourceSubType === 'dockerfile' || sourceSubType === 'compose' || sourceSubType === 'image'
+	);
 
 	// Visible steps for the indicator — hide Build when skipped
 	let visibleSteps = $derived(isBuildStepSkipped ? steps.filter((s) => s.id !== 'build') : steps);
@@ -272,22 +200,6 @@
 	}
 
 	function validateSourceStep(): boolean {
-		if (sourceSubType === 'template' && !selectedTemplateId) {
-			error = 'Please select a template';
-			return false;
-		}
-		if (
-			selectedTemplate &&
-			templateRequiredInputs.some(
-				(env: TemplateCatalogEntry['required_env'][number]) => !(envVars[env.key] ?? '').trim()
-			)
-		) {
-			const missing = templateRequiredInputs.find(
-				(env: TemplateCatalogEntry['required_env'][number]) => !(envVars[env.key] ?? '').trim()
-			);
-			error = `${missing?.key ?? 'Template env'} is required for ${selectedTemplate.name}`;
-			return false;
-		}
 		if (sourceSubType === 'git-public') {
 			if (!sourceUrl.trim()) {
 				error = 'Git URL is required';
@@ -307,19 +219,22 @@
 				error = 'Docker image is required';
 				return false;
 			}
-		} else if (sourceSubType === 'template') {
-			if (!selectedTemplate) {
-				error = 'Please select a template';
-				return false;
-			}
 		} else if (sourceSubType === 'dockerfile') {
 			if (!dockerfileContent.trim()) {
 				error = 'Dockerfile content is required';
 				return false;
 			}
 		} else if (sourceSubType === 'compose') {
-			if (!composeContent.trim()) {
-				error = 'docker-compose.yml content is required';
+			if (composeMode === 'git') {
+				if (!sourceUrl.trim()) {
+					error = 'Enter the repository that holds the compose file';
+					return false;
+				}
+			} else if (!composeContent.trim()) {
+				error = 'Paste your docker-compose.yml';
+				return false;
+			} else if (composeErrors.length > 0) {
+				error = 'Fix the problems listed under the compose file first';
 				return false;
 			}
 		}
@@ -379,9 +294,6 @@
 		loading = true;
 		createStage = 'Creating the app…';
 
-		// Everything this attempt creates, so a failure can undo it (newest first).
-		const created: { kind: 'project' | 'database' | 'app'; id: string; name: string }[] = [];
-
 		try {
 			// Calculate memory limit in bytes
 			let memoryLimitBytes: number | undefined;
@@ -396,44 +308,8 @@
 				cpuLimitNano = Math.round(cpuLimit * 1e9);
 			}
 
-			let parsedEnv = { ...envVars };
-			let templateProjectId: string | undefined;
+			const parsedEnv = { ...envVars };
 			const effectiveProjectId = selectedProjectId || undefined;
-
-			if (selectedTemplate?.project) {
-				createStage = `Creating project ${selectedTemplate.project.name}…`;
-				const createdProject = await createProject({
-					name: selectedTemplate.project.name,
-					description: selectedTemplate.project.description ?? undefined
-				});
-				created.push({ kind: 'project', id: createdProject.id, name: createdProject.name });
-				templateProjectId = createdProject.id;
-				projects = [createdProject, ...projects];
-			}
-
-			if (selectedTemplate) {
-				// Creation returns the generated credentials once; the template
-				// interpolates the plaintext connection strings into the app env.
-				const dependencyDetails = new SvelteMap<string, DatabaseCredentials>();
-				for (const dependency of selectedTemplate.dependencies) {
-					if (dependency.kind !== 'database' || !dependency.name || !dependency.engine) continue;
-					createStage = `Creating database ${dependency.name}…`;
-					const database = await createDatabase({
-						name: dependency.name,
-						db_type: dependency.engine,
-						...(templateProjectId || effectiveProjectId
-							? { project_id: templateProjectId ?? effectiveProjectId }
-							: {})
-					});
-					created.push({ kind: 'database', id: database.id, name: database.name });
-					dependencyDetails.set(dependency.name, database.credentials);
-				}
-
-				for (const env of selectedTemplate.required_env) {
-					if (!env.value) continue;
-					parsedEnv[env.key] = interpolateTemplateValue(env.value, dependencyDetails);
-				}
-			}
 
 			// Map sourceSubType to the API source_type value
 			const sourceTypeMap: Record<SourceSubType, string> = {
@@ -441,24 +317,23 @@
 				'git-github-app': 'git',
 				dockerfile: 'dockerfile',
 				compose: 'compose',
-				image: 'image',
-				template: selectedTemplate?.source.kind ?? 'image'
+				image: 'image'
 			};
 			const apiSourceType = sourceTypeMap[sourceSubType];
-			const deployBranch = (branch.trim() || templateSourceRef || 'main').trim();
+			const deployBranch = (branch.trim() || 'main').trim();
 
 			const appData: Parameters<typeof createApp>[0] = {
 				name: name.trim(),
 				source_type: apiSourceType,
 				container_port: containerPort,
 				...(apiSourceType === 'git' ? { build_method: buildMethod } : {}),
-				...(sourceUrl.trim() ? { source_url: sourceUrl.trim() } : {}),
+				...(sourceUrl.trim() && !(sourceSubType === 'compose' && composeMode === 'inline')
+					? { source_url: sourceUrl.trim() }
+					: {}),
 				...(domain.trim() && !isWorker ? { domain: domain.trim() } : {}),
 				readiness,
 				...(isWorker ? { ready_after_secs: readyAfterSecs } : {}),
-				...(templateProjectId || effectiveProjectId
-					? { project_id: templateProjectId ?? effectiveProjectId }
-					: {}),
+				...(effectiveProjectId ? { project_id: effectiveProjectId } : {}),
 				...(isGitSource
 					? { branch: deployBranch, auto_deploy: autoDeploy, watch_branch: deployBranch }
 					: {}),
@@ -475,14 +350,24 @@
 				...(registryCredentialId ? { registry_credential_id: registryCredentialId } : {}),
 				...(githubAppId ? { github_app_id: githubAppId } : {}),
 				...(sourceSubType === 'dockerfile' ? { dockerfile_content: dockerfileContent } : {}),
-				...(sourceSubType === 'compose' ? { compose_content: composeContent } : {}),
+				...(sourceSubType === 'compose' && composeMode === 'inline'
+					? { compose_content: composeContent }
+					: {}),
+				...(sourceSubType === 'compose' && composeMode === 'git'
+					? {
+							branch: branch.trim() || 'main',
+							compose_path: composePath.trim() || 'docker-compose.yml'
+						}
+					: {}),
+				...(sourceSubType === 'compose' && composeService.trim()
+					? { compose_service: composeService.trim() }
+					: {}),
 				...(baseDir.trim() ? { base_dir: baseDir.trim() } : {}),
 				...(staticBuild ? { static_build: true } : {})
 			};
 
 			createStage = 'Creating the app…';
 			const app = await createApp(appData);
-			created.push({ kind: 'app', id: app.id, name: app.name });
 
 			// Start the first deployment and follow it live.
 			createStage = 'Starting the first deploy…';
@@ -496,68 +381,10 @@
 			}
 			await goto(`/apps/${app.id}/deployments/${started.deployment_id}`);
 		} catch (e: any) {
-			const message = e.message ?? 'Failed to create app';
-			const leftovers = await rollBackCreated(created);
-			error = leftovers.length
-				? `${message}. Tond couldn't remove what it had created: ${leftovers.join(', ')}. Delete ${leftovers.length === 1 ? 'it' : 'them'} before trying again.`
-				: created.length
-					? `${message}. Nothing was left behind; fix the problem and try again.`
-					: message;
+			error = e.message ?? 'Failed to create app';
 			loading = false;
 			createStage = '';
 		}
-	}
-
-	/**
-	 * Undo a failed create: delete what was created, newest first. Returns the
-	 * names of anything that couldn't be deleted.
-	 */
-	async function rollBackCreated(
-		created: { kind: 'project' | 'database' | 'app'; id: string; name: string }[]
-	): Promise<string[]> {
-		const leftovers: string[] = [];
-		for (const item of [...created].reverse()) {
-			try {
-				if (item.kind === 'app') await deleteApp(item.id);
-				else if (item.kind === 'database') await deleteDatabase(item.id);
-				else {
-					await deleteProject(item.id);
-					projects = projects.filter((p) => p.id !== item.id);
-				}
-			} catch {
-				leftovers.push(`${item.kind} ${item.name}`);
-			}
-		}
-		return leftovers;
-	}
-
-	function interpolateTemplateValue(
-		value: string,
-		dependencies: Pick<SvelteMap<string, DatabaseCredentials>, 'get'>
-	): string {
-		if (!value.startsWith('${db.') || !value.endsWith('}')) {
-			return value;
-		}
-
-		const reference = value.slice(5, -1);
-		const [dependencyName, field] = reference.split('.');
-		const dependency = dependencies.get(dependencyName);
-		if (!dependency) {
-			throw new Error(`Unknown template dependency: ${dependencyName}`);
-		}
-		if (field === 'connection_string') {
-			if (!dependency.connection_string) {
-				throw new Error(`Dependency ${dependencyName} has no external connection string`);
-			}
-			return dependency.connection_string;
-		}
-		if (field === 'internal_connection_string') {
-			if (!dependency.internal_connection_string) {
-				throw new Error(`Dependency ${dependencyName} has no internal connection string`);
-			}
-			return dependency.internal_connection_string;
-		}
-		throw new Error(`Unsupported template dependency field: ${field}`);
 	}
 </script>
 
@@ -649,10 +476,11 @@
 					bind:branch
 					bind:dockerfileContent
 					bind:composeContent
-					bind:selectedTemplateId
-					bind:envVars
-					{templates}
-					onTemplateSelect={applyTemplate}
+					bind:composeMode
+					bind:composePath
+					bind:composeService
+					bind:composeErrors
+					{containerPort}
 				/>
 			{:else if currentStep === 1}
 				<AppWizardBuild
@@ -685,7 +513,6 @@
 					{composeContent}
 					{registryCredentialId}
 					{buildMethod}
-					templatePort={selectedTemplate?.deploy.default_port ?? null}
 				/>
 			{:else if currentStep === 3}
 				<AppWizardResources
@@ -721,7 +548,7 @@
 					{readiness}
 					{readyAfterSecs}
 					{autoDeploy}
-					branch={isGitSource ? branch || templateSourceRef : ''}
+					branch={isGitSource ? branch : ''}
 					{baseDir}
 					{staticBuild}
 					{domain}

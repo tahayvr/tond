@@ -534,54 +534,6 @@ pub async fn rename_container(
     Ok(())
 }
 
-/// Find the host port that Docker Compose bound for `container_port` inside
-/// the compose project named `project_name`.
-///
-/// Docker Compose labels every container it manages with
-/// `com.docker.compose.project=<project>`. We list those containers and look
-/// for a port binding whose `private_port` matches `container_port`.
-///
-/// Returns an error (with a helpful message) if no such binding is found —
-/// most likely because the compose file does not have a `ports:` entry for
-/// the main service.
-pub async fn find_compose_host_port(
-    docker: &Docker,
-    project_name: &str,
-    container_port: u16,
-) -> anyhow::Result<u16> {
-    let filters = compose_project_filter(project_name);
-
-    let containers = docker
-        .list_containers(Some(
-            ListContainersOptionsBuilder::default()
-                .filters(&filters)
-                .build(),
-        ))
-        .await?;
-
-    for container in &containers {
-        if let Some(ref ports) = container.ports {
-            for port in ports {
-                if port.private_port == container_port
-                    && let Some(public) = port.public_port
-                {
-                    return Ok(public);
-                }
-            }
-        }
-    }
-
-    anyhow::bail!(
-        "No host port found for compose project '{}' on container port {}. \
-         Ensure the compose file has a 'ports' mapping for the main service \
-         (e.g. ports: [\"{}:{}\"]).",
-        project_name,
-        container_port,
-        container_port,
-        container_port,
-    )
-}
-
 /// Force-remove every container of a compose project and its default network.
 /// Best-effort, like `docker compose down` without touching named volumes.
 pub async fn remove_compose_project(docker: &Docker, project_name: &str) {
@@ -599,9 +551,99 @@ pub async fn remove_compose_project(docker: &Docker, project_name: &str) {
             let _ = remove_container(docker, &id).await;
         }
     }
+    // The default network and any network the file declares.
     let _ = docker
         .remove_network(&format!("{project_name}_default"))
         .await;
+    if let Ok(networks) = docker
+        .list_networks(Some(
+            ListNetworksOptionsBuilder::default()
+                .filters(&filters)
+                .build(),
+        ))
+        .await
+    {
+        for name in networks.into_iter().filter_map(|n| n.name) {
+            let _ = docker.remove_network(&name).await;
+        }
+    }
+}
+
+/// Named volumes of a compose project (`<project>_<volume>`, labelled by
+/// compose) with their mount points: `(volume name, mountpoint)`.
+pub async fn compose_volumes(
+    docker: &Docker,
+    project_name: &str,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let filters = compose_project_filter(project_name);
+    let list = docker
+        .list_volumes(Some(
+            bollard::query_parameters::ListVolumesOptionsBuilder::default()
+                .filters(&filters)
+                .build(),
+        ))
+        .await?;
+    Ok(list
+        .volumes
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|v| v.driver == "local")
+        .map(|v| (v.name, v.mountpoint))
+        .collect())
+}
+
+/// Remove the named volumes of a compose project (app deletion).
+pub async fn remove_compose_volumes(docker: &Docker, project_name: &str) {
+    for (name, _) in compose_volumes(docker, project_name)
+        .await
+        .unwrap_or_default()
+    {
+        let _ = docker
+            .remove_volume(
+                &name,
+                Some(
+                    bollard::query_parameters::RemoveVolumeOptionsBuilder::default()
+                        .force(true)
+                        .build(),
+                ),
+            )
+            .await;
+    }
+}
+
+/// Host ports published by live containers, except those of the compose
+/// project `exclude_project` (its containers are about to be recreated).
+pub async fn used_host_ports(
+    docker: &Docker,
+    exclude_project: Option<&str>,
+) -> anyhow::Result<Vec<u16>> {
+    let containers = docker
+        .list_containers(Some(
+            ListContainersOptionsBuilder::default().all(true).build(),
+        ))
+        .await?;
+    Ok(containers
+        .iter()
+        .filter(|c| {
+            exclude_project.is_none_or(|p| {
+                c.labels
+                    .as_ref()
+                    .and_then(|l| l.get("com.docker.compose.project"))
+                    .map(String::as_str)
+                    != Some(p)
+            })
+        })
+        .flat_map(|c| {
+            c.ports.as_ref().map_or(vec![], |ports| {
+                ports.iter().filter_map(|p| p.public_port).collect()
+            })
+        })
+        .collect())
+}
+
+/// The first port at or above `start` not in `used`.
+pub fn first_free_port(start: u16, used: &[u16]) -> anyhow::Result<u16> {
+    next_free_port(start, used)
 }
 
 /// Find a free host port starting from a base

@@ -49,9 +49,10 @@ use tond_common::{
     CronJobResponse, CronJobRun, DatabaseCredentialsResponse, DeployKeyResponse,
     DeploymentResponse, IntegrationResponse, ManagedDatabaseDetail, ManagedDatabaseResponse,
     PasswordLinkResponse, PreviewDeploymentResponse, ProjectPreviewResponse, ProjectResponse,
-    ServerSettings, SnapshotResponse, StorageProviderResponse, TokenResponse,
-    UpdateAppDomainRequest, UpdateCronJobRequest, UpdateSettingsRequest, UserResponse,
-    WebhookConfigResponse, WebhookSecretResponse, WwwPairRequest, code,
+    ServerSettings, SnapshotResponse, StorageProviderResponse, TemplateCatalogResponse,
+    TemplateDeployRequest, TemplateDeployResponse, TokenResponse, UpdateAppDomainRequest,
+    UpdateCronJobRequest, UpdateSettingsRequest, UserResponse, WebhookConfigResponse,
+    WebhookSecretResponse, WwwPairRequest, code,
 };
 
 use crate::error::CliError;
@@ -370,6 +371,25 @@ impl TondClient {
         Ok(Some(serde_json::to_value(body)?))
     }
 
+    /// GET /api/v1/templates — the one-click catalog.
+    pub async fn list_templates(&self) -> Result<TemplateCatalogResponse> {
+        self.call(Method::GET, "/templates", None).await
+    }
+
+    /// POST /api/v1/templates/{id}/deploy — create the app and queue its first deploy.
+    pub async fn deploy_template(
+        &self,
+        id: &str,
+        body: &TemplateDeployRequest,
+    ) -> Result<TemplateDeployResponse> {
+        self.call(
+            Method::POST,
+            &format!("/templates/{id}/deploy"),
+            Self::to_body(body)?,
+        )
+        .await
+    }
+
     pub async fn list_apps(&self) -> Result<Vec<AppResponse>> {
         self.list("/apps").await
     }
@@ -416,6 +436,8 @@ impl TondClient {
             github_app_id: None,
             dockerfile_content: None,
             compose_content: None,
+            compose_path: None,
+            compose_service: None,
             base_dir: None,
             static_build: false,
             readiness: None,
@@ -715,6 +737,34 @@ impl TondClient {
             Method::PUT,
             &format!("/apps/{id}/drain-timeout"),
             Some(json!({ "drain_timeout": seconds })),
+        )
+        .await
+    }
+
+    /// Services of a Docker Compose app.
+    pub async fn list_services(
+        &self,
+        id: &str,
+    ) -> Result<Vec<tond_common::ComposeServiceResponse>> {
+        self.list(&format!("/apps/{id}/services")).await
+    }
+
+    /// Restart, stop or start one compose service.
+    pub async fn service_action(&self, id: &str, service: &str, action: &str) -> Result<Value> {
+        self.value(
+            Method::POST,
+            &format!("/apps/{id}/services/{service}/{action}"),
+            None,
+        )
+        .await
+    }
+
+    /// Recent log lines of one compose service: `{service, lines}`.
+    pub async fn service_logs(&self, id: &str, service: &str) -> Result<Value> {
+        self.call(
+            Method::GET,
+            &format!("/apps/{id}/services/{service}/logs"),
+            None,
         )
         .await
     }

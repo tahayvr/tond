@@ -26,7 +26,9 @@
 // security-relevant field, and `docker compose` runs with a cleared
 // environment (see deploy/build.rs) so values like `${TOND_SECRET_KEY}` can't
 // leak into containers. `environment:`, `image:`, `command:` etc. may still use
-// `${VAR:-default}`.
+// `${VAR:-default}`; the variables come from the app's own env, and only the
+// ones the file references (`interpolation_env`) — never names that steer the
+// docker CLI itself (DOCKER_HOST, COMPOSE_*, LD_PRELOAD, PATH, …).
 
 use std::path::{Component, Path, PathBuf};
 
@@ -153,6 +155,24 @@ pub fn format_errors(errors: &[String]) -> String {
         msg.push_str(e);
     }
     msg
+}
+
+/// The variables `docker compose` may interpolate from: the app env vars the
+/// file references, minus names that change how the docker CLI runs
+/// (`tond_common::is_reserved_env_key`). Nothing else from the app env is
+/// handed to the host process.
+pub fn interpolation_env(
+    content: &str,
+    app_env: &std::collections::BTreeMap<String, String>,
+) -> Vec<(String, String)> {
+    let Ok(referenced) = tond_common::compose_variables(content) else {
+        return Vec::new();
+    };
+    referenced
+        .into_iter()
+        .filter(|key| !tond_common::is_reserved_env_key(key))
+        .filter_map(|key| app_env.get(&key).map(|v| (key, v.clone())))
+        .collect()
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -756,7 +776,31 @@ fn check_top_level_volumes(root: &Mapping, ctx: &mut Ctx) {
     };
     for (name, def) in vols {
         let name = key_str(name);
-        let Some(opts) = untag(def).get("driver_opts").map(untag) else {
+        let def = untag(def);
+        // A named volume is private to this app (compose names it
+        // <app>_<volume>, and snapshots back it up). `external` or a fixed
+        // `name` would mount another app's volume.
+        if def
+            .get("external")
+            .is_some_and(|v| !matches!(untag(v), Value::Bool(false) | Value::Null))
+        {
+            ctx.err(format!(
+                "volume \"{name}\": 'external' is not allowed — it mounts a volume outside this app; leave it out and compose creates the volume for this app"
+            ));
+        }
+        if def.get("name").is_some() {
+            ctx.err(format!(
+                "volume \"{name}\": 'name' is not allowed — a fixed name can mount another app's volume; leave it out and compose names the volume for this app"
+            ));
+        }
+        if let Some(driver) = def.get("driver").and_then(scalar_str)
+            && !driver.trim().eq_ignore_ascii_case("local")
+        {
+            ctx.err(format!(
+                "volume \"{name}\": 'driver: {driver}' is not allowed — only local volumes can be used (Tond backs them up with the app)"
+            ));
+        }
+        let Some(opts) = def.get("driver_opts").map(untag) else {
             continue;
         };
         let Value::Mapping(opts) = opts else { continue };
@@ -835,6 +879,25 @@ fn check_file_references(root: &Mapping, section: &str, ctx: &mut Ctx) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interpolation_env_passes_only_referenced_safe_vars() {
+        let env: std::collections::BTreeMap<String, String> = [
+            ("DB_PASSWORD", "s3cret"),
+            ("UNUSED", "x"),
+            ("DOCKER_HOST", "tcp://evil:2375"),
+            ("LD_PRELOAD", "/tmp/x.so"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let compose = "services:\n  web:\n    image: x:1\n    environment:\n      P: ${DB_PASSWORD}\n      H: ${DOCKER_HOST}\n      L: $LD_PRELOAD\n";
+        assert_eq!(
+            interpolation_env(compose, &env),
+            vec![("DB_PASSWORD".to_string(), "s3cret".to_string())],
+            "only referenced vars reach docker compose, and never ones that steer the docker CLI"
+        );
+    }
 
     const VOL: &str = "/opt/tond/data/volumes/web";
 
@@ -923,6 +986,29 @@ mod tests {
             )
             .is_empty(),
             "private bridge networks declared in the file stay allowed"
+        );
+    }
+
+    #[test]
+    fn named_volumes_must_belong_to_the_app() {
+        assert_rejected(
+            "services:\n  a:\n    image: x\n    volumes: [d:/d]\nvolumes:\n  d:\n    external: true\n",
+            "volume \"d\": 'external' is not allowed",
+        );
+        assert_rejected(
+            "services:\n  a:\n    image: x\n    volumes: [d:/d]\nvolumes:\n  d:\n    name: shop_data\n",
+            "volume \"d\": 'name' is not allowed",
+        );
+        assert_rejected(
+            "services:\n  a:\n    image: x\nvolumes:\n  d:\n    driver: rexray/ebs\n",
+            "only local volumes",
+        );
+        assert!(
+            errors(
+                "services:\n  a:\n    image: x\n    volumes: [d:/d]\nvolumes:\n  d:\n    driver: local\n    external: false\n"
+            )
+            .is_empty(),
+            "plain local volumes stay allowed"
         );
     }
 

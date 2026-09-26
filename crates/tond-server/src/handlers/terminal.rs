@@ -902,7 +902,7 @@ async fn collect_terminal_targets(
     }];
 
     let apps: Vec<TerminalWorkloadRow> = sqlx::query_as(
-		"SELECT id, name, container_id, status FROM apps WHERE container_id IS NOT NULL AND status = 'running' ORDER BY name ASC",
+		"SELECT * FROM (SELECT a.id, a.name, CASE WHEN a.source_type = 'compose' THEN (SELECT s.container_id FROM compose_services s WHERE s.app_id = a.id AND s.status = 'running' ORDER BY s.published_port IS NULL, s.position LIMIT 1) ELSE a.container_id END AS container_id, a.status FROM apps a WHERE a.status = 'running') WHERE container_id IS NOT NULL ORDER BY name ASC",
 	)
 	.fetch_all(db)
 	.await?;
@@ -955,7 +955,7 @@ async fn resolve_terminal_session(
         }
         TerminalTargetKind::App => {
             let row: Option<TerminalWorkloadRow> = sqlx::query_as(
-                "SELECT id, name, container_id, status FROM apps WHERE id = ? LIMIT 1",
+                "SELECT a.id, a.name, CASE WHEN a.source_type = 'compose' THEN (SELECT s.container_id FROM compose_services s WHERE s.app_id = a.id AND s.status = 'running' ORDER BY s.published_port IS NULL, s.position LIMIT 1) ELSE a.container_id END AS container_id, a.status FROM apps a WHERE a.id = ? LIMIT 1",
             )
             .bind(target_id)
             .fetch_optional(db)

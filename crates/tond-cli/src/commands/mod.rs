@@ -12,6 +12,7 @@ pub mod settings;
 pub mod setup;
 pub mod snapshots;
 pub mod storage_providers;
+pub mod templates;
 pub mod tokens;
 pub mod update;
 pub mod users;

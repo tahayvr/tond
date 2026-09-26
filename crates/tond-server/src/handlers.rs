@@ -44,6 +44,7 @@ pub mod audit_shipping;
 pub mod auth;
 pub mod backups;
 pub mod certificates;
+pub mod compose;
 pub mod cron;
 pub mod database_links;
 pub mod database_ops;
@@ -239,6 +240,20 @@ pub async fn create_app(
     State(state): State<AppState>,
     Json(req): Json<CreateAppRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    let app = insert_app(&state, &auth, req).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiResponse::ok(AppResponse::from(app))),
+    ))
+}
+
+/// Validate a create request and insert the app (POST /api/apps and template
+/// deploys). `auth` must already hold `apps:write`.
+pub(crate) async fn insert_app(
+    state: &AppState,
+    auth: &Principal,
+    req: CreateAppRequest,
+) -> Result<App, AppError> {
     // Volumes and compose files reach the host: they also need an admin scope.
     if req.volumes.as_ref().is_some_and(|v| !v.is_empty()) {
         auth.require_to(Scope::SettingsWrite, "configure volumes")?;
@@ -280,7 +295,15 @@ pub async fn create_app(
             "dockerfile_content is required when source_type is 'dockerfile'",
         )));
     }
+    // Compose apps: an inline file, or a git repository with a compose file
+    // path (read at deploy time).
+    let compose_from_git = req.source_type == "compose"
+        && req
+            .source_url
+            .as_deref()
+            .is_some_and(|u| !u.trim().is_empty());
     if req.source_type == "compose"
+        && !compose_from_git
         && req
             .compose_content
             .as_deref()
@@ -290,12 +313,23 @@ pub async fn create_app(
     {
         return Err(AppError(TondError::invalid_field(
             "compose_content",
-            "compose_content is required when source_type is 'compose'",
+            "compose_content (or a git source_url with compose_path) is required when source_type is 'compose'",
         )));
     }
+    let compose_path = if compose_from_git {
+        Some(
+            deploy::compose_path_in_repo(req.compose_path.as_deref())
+                .map_err(|e| AppError(TondError::InvalidInput(e.to_string())))?
+                .to_string_lossy()
+                .into_owned(),
+        )
+    } else {
+        None
+    };
     // Reject host-level compose options up front (privileged, host binds, …) so
     // the user sees every problem now instead of at deploy time.
     if req.source_type == "compose"
+        && !compose_from_git
         && let Some(content) = req.compose_content.as_deref()
     {
         let volume_dir = volumes::app_volume_dir(&volumes::data_dir(), &req.name);
@@ -348,7 +382,7 @@ pub async fn create_app(
     );
 
     if let Some(domain) = req.domain.filter(|d| !d.trim().is_empty()) {
-        let domain = check_app_domain(&state, &domain).await?.0;
+        let domain = check_app_domain(state, &domain).await?.0;
         let taken: Option<String> = sqlx::query_scalar(
             "SELECT a.name FROM app_domains d JOIN apps a ON a.id = d.app_id WHERE d.domain = ?",
         )
@@ -362,6 +396,35 @@ pub async fn create_app(
         }
         app.domain = Some(domain);
     }
+    app.compose_path = compose_path;
+    // Compose apps: the services of an inline file, and the web service that
+    // gets the app's port and domain.
+    let compose_plan = match (app.source_type.as_str(), req.compose_content.as_deref()) {
+        ("compose", Some(content)) if !compose_from_git => {
+            let specs = crate::compose::service_specs(content)
+                .map_err(|e| AppError(TondError::InvalidInput(e)))?;
+            let port = u16::try_from(app.container_port).unwrap_or(80);
+            let web =
+                crate::compose::pick_web_service(&specs, req.compose_service.as_deref(), port);
+            if web.is_none()
+                && let Some(name) = req.compose_service.as_deref().filter(|n| !n.is_empty())
+            {
+                return Err(AppError(TondError::InvalidInput(format!(
+                    "The compose file has no service named '{name}'"
+                ))));
+            }
+            Some((specs, web))
+        }
+        ("compose", _) => req
+            .compose_service
+            .as_deref()
+            .filter(|n| !n.trim().is_empty())
+            .map(|name| {
+                let port = u16::try_from(app.container_port).unwrap_or(80);
+                (Vec::new(), Some((name.trim().to_string(), port)))
+            }),
+        _ => None,
+    };
 
     let env = match req.env_vars {
         Some(value) => env_map_from_json(&value)?,
@@ -449,8 +512,8 @@ pub async fn create_app(
     )?;
 
     sqlx::query(
-		"INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, status, env_vars, memory_limit, cpu_limit, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, project_id, github_app_id, registry_credential_id, dockerfile_content, compose_content, base_dir, static_build, readiness, ready_after_secs, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		"INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, status, env_vars, memory_limit, cpu_limit, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, project_id, github_app_id, registry_credential_id, dockerfile_content, compose_content, compose_path, base_dir, static_build, readiness, ready_after_secs, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 	)
 	.bind(&app.id)
 	.bind(&app.name)
@@ -479,6 +542,7 @@ pub async fn create_app(
 	.bind(&app.registry_credential_id)
 	.bind(&app.dockerfile_content)
 	.bind(&app.compose_content)
+	.bind(&app.compose_path)
 	.bind(&app.base_dir)
 	.bind(app.static_build)
 	.bind(&app.readiness)
@@ -495,6 +559,10 @@ pub async fn create_app(
 		}
 	})?;
 
+    if let Some((specs, web)) = compose_plan {
+        apply_compose_plan(state, &mut app, &specs, web).await?;
+    }
+
     write_audit_log(
         &state.db,
         Some(&app.id),
@@ -505,10 +573,49 @@ pub async fn create_app(
     )
     .await;
 
-    Ok((
-        StatusCode::CREATED,
-        Json(ApiResponse::ok(AppResponse::from(app))),
-    ))
+    Ok(app)
+}
+
+/// A new compose app: store its services, publish the web service's port and
+/// move the requested domain onto that service.
+async fn apply_compose_plan(
+    state: &AppState,
+    app: &mut App,
+    specs: &[ComposeServiceSpec],
+    web: Option<(String, u16)>,
+) -> Result<(), AppError> {
+    let from_file = !specs.is_empty();
+    let specs: Vec<ComposeServiceSpec> = if !from_file {
+        // From a repository: the file is read at deploy time; remember the
+        // choice (the first deploy moves the domain once it knows the services).
+        web.iter()
+            .map(|(name, _)| ComposeServiceSpec {
+                name: name.clone(),
+                image: None,
+                builds: false,
+                ports: Vec::new(),
+                has_healthcheck: false,
+            })
+            .collect()
+    } else {
+        specs.to_vec()
+    };
+    crate::compose::sync_specs(&state.db, &app.id, &specs).await?;
+    let Some((service, port)) = web else {
+        return Ok(());
+    };
+    sqlx::query("UPDATE compose_services SET published_port = ? WHERE app_id = ? AND name = ?")
+        .bind(port as i64)
+        .bind(&app.id)
+        .bind(&service)
+        .execute(&state.db)
+        .await?;
+    // The domain given at creation was seeded as the app's primary domain
+    // (apps_domain_seed): it belongs to the web service.
+    if from_file {
+        crate::app_domains::attach_to_service(&state.db, &app.id, &service, port as i64).await?;
+    }
+    Ok(())
 }
 
 // ── Validate Compose ──
@@ -540,10 +647,12 @@ pub async fn validate_compose(
         Ok(()) => Vec::new(),
         Err(errors) => errors,
     };
+    // The services (for picking the web service), when the file parses.
+    let services = crate::compose::service_specs(&req.compose_content).unwrap_or_default();
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(
-            json!({ "valid": errors.is_empty(), "errors": errors }),
+            json!({ "valid": errors.is_empty(), "errors": errors, "services": services }),
         )),
     ))
 }
@@ -561,8 +670,12 @@ pub async fn delete_app(
     // Stop and remove container if running (best-effort). Compose apps store a
     // sentinel instead of a container id, so remove the whole compose project.
     if app.source_type == "compose" {
-        docker::remove_compose_project(&state.docker, &deploy::compose_project_name(&app.name))
-            .await;
+        // Containers, networks, named volumes and the pinned service images.
+        let project = deploy::compose_project_name(&app.name);
+        docker::remove_compose_project(&state.docker, &project).await;
+        docker::remove_compose_volumes(&state.docker, &project).await;
+        deploy::images::remove_compose_images(&state, &app.name).await;
+        let _ = tokio::fs::remove_dir_all(deploy::compose_work_dir_for(&app.name)).await;
     } else if let Some(container_id) = &app.container_id {
         let _ = docker::remove_container(&state.docker, container_id).await;
     }
@@ -694,6 +807,44 @@ pub(crate) fn queued_response(
 
 // ── Stop App ──
 
+/// Stop / start / restart every service of a compose app.
+async fn compose_control(
+    state: &AppState,
+    app: &App,
+    auth: &Principal,
+    action: &str,
+) -> Result<(StatusCode, Json<ApiResponse<serde_json::Value>>), AppError> {
+    compose::control_all(state, app, action).await?;
+    let status = if action == "stop" {
+        "stopped"
+    } else {
+        "running"
+    };
+    sqlx::query("UPDATE apps SET status = ?, updated_at = datetime('now') WHERE id = ?")
+        .bind(status)
+        .bind(&app.id)
+        .execute(&state.db)
+        .await?;
+    write_audit_log(
+        &state.db,
+        Some(&app.id),
+        Some(&app.name),
+        action,
+        &auth.audit_actor(),
+        None,
+    )
+    .await;
+    let message = match action {
+        "stop" => "App stopped",
+        "start" => "App started",
+        _ => "App restarted",
+    };
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(json!({ "message": message }))),
+    ))
+}
+
 pub async fn stop_app(
     _rate: RateLimit,
     auth: Authz<scope::AppsControl>,
@@ -701,6 +852,9 @@ pub async fn stop_app(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let app = fetch_app(&state.db, &id).await?;
+    if app.source_type == "compose" {
+        return compose_control(&state, &app, &auth, "stop").await;
+    }
 
     let container_id = app
         .container_id
@@ -741,6 +895,9 @@ pub async fn start_app(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let app = fetch_app(&state.db, &id).await?;
+    if app.source_type == "compose" {
+        return compose_control(&state, &app, &auth, "start").await;
+    }
 
     let container_id = app
         .container_id
@@ -781,6 +938,9 @@ pub async fn restart_app(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let app = fetch_app(&state.db, &id).await?;
+    if app.source_type == "compose" {
+        return compose_control(&state, &app, &auth, "restart").await;
+    }
 
     let container_id = app
         .container_id
@@ -834,8 +994,11 @@ pub async fn app_logs(
     .await
     .unwrap_or_default();
 
-    // Get container logs if running, without the app's secrets
-    let container_logs = if let Some(container_id) = &app.container_id {
+    // Get container logs if running, without the app's secrets (compose
+    // apps: every service, prefixed with its name).
+    let container_logs = if app.source_type == "compose" {
+        compose::combined_logs(&state, &app, 100).await
+    } else if let Some(container_id) = &app.container_id {
         docker::get_logs(&state.docker, container_id, 100)
             .await
             .unwrap_or_default()
@@ -867,6 +1030,11 @@ pub async fn update_domain(
     Json(req): Json<UpdateDomainRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let app = fetch_app(&state.db, &id).await?;
+    if app.source_type == "compose" {
+        return Err(AppError(TondError::InvalidInput(
+            "Compose apps route domains per service: add the domain to a service in the app's Services list".to_string(),
+        )));
+    }
     let (_, warning) = check_app_domain(&state, &req.domain).await?;
     let ctx = crate::app_domains::DomainContext::load(&state).await;
     let row = crate::app_domains::set_primary(&state.db, &ctx, &app.id, &req.domain).await?;
@@ -1649,6 +1817,8 @@ mod tests {
                 build_method: None,
                 dockerfile_content: None,
                 compose_content: None,
+                compose_path: None,
+                compose_service: None,
                 base_dir: None,
                 static_build: false,
                 readiness: None,
@@ -1697,6 +1867,8 @@ mod tests {
                 build_method: None,
                 dockerfile_content: None,
                 compose_content: None,
+                compose_path: None,
+                compose_service: None,
                 base_dir: None,
                 static_build: false,
                 readiness: None,
@@ -1745,6 +1917,8 @@ mod tests {
                 build_method: None,
                 dockerfile_content: None,
                 compose_content: None,
+                compose_path: None,
+                compose_service: None,
                 base_dir: None,
                 static_build: false,
                 readiness: None,
@@ -1793,6 +1967,8 @@ mod tests {
                 build_method: Some("manual".to_string()),
                 dockerfile_content: None,
                 compose_content: None,
+                compose_path: None,
+                compose_service: None,
                 base_dir: None,
                 static_build: false,
                 readiness: None,
@@ -1841,6 +2017,8 @@ mod tests {
                 build_method: Some("auto".to_string()),
                 dockerfile_content: None,
                 compose_content: None,
+                compose_path: None,
+                compose_service: None,
                 base_dir: None,
                 static_build: false,
                 readiness: None,
@@ -1889,6 +2067,8 @@ mod tests {
                 build_method: Some("nixpacks".to_string()),
                 dockerfile_content: None,
                 compose_content: None,
+                compose_path: None,
+                compose_service: None,
                 base_dir: None,
                 static_build: false,
                 readiness: None,
@@ -1937,6 +2117,8 @@ mod tests {
                 build_method: Some("tbuild".to_string()),
                 dockerfile_content: None,
                 compose_content: None,
+                compose_path: None,
+                compose_service: None,
                 base_dir: None,
                 static_build: false,
                 readiness: None,
@@ -1985,6 +2167,8 @@ mod tests {
                 build_method: Some("tbuild".to_string()),
                 dockerfile_content: Some("FROM nginx:alpine".to_string()),
                 compose_content: None,
+                compose_path: None,
+                compose_service: None,
                 base_dir: None,
                 static_build: false,
                 readiness: None,
@@ -2032,6 +2216,8 @@ mod tests {
                 build_method: None,
                 dockerfile_content: Some("FROM nginx:alpine".to_string()),
                 compose_content: None,
+                compose_path: None,
+                compose_service: None,
                 base_dir: None,
                 static_build: false,
                 readiness: None,
@@ -2082,6 +2268,8 @@ mod tests {
                 build_method: None,
                 dockerfile_content: None,
                 compose_content: None,
+                compose_path: None,
+                compose_service: None,
                 base_dir: None,
                 static_build: false,
                 readiness: None,
@@ -2135,6 +2323,8 @@ mod tests {
                 build_method: Some("tbuild".to_string()),
                 dockerfile_content: None,
                 compose_content: None,
+                compose_path: None,
+                compose_service: None,
                 base_dir: Some("services/api".to_string()),
                 static_build: true,
                 readiness: None,
@@ -2615,6 +2805,8 @@ mod tests {
             github_app_id: None,
             dockerfile_content: None,
             compose_content: None,
+            compose_path: None,
+            compose_service: None,
             base_dir: None,
             static_build: false,
             readiness: None,
@@ -2666,6 +2858,8 @@ mod tests {
             github_app_id: None,
             dockerfile_content: None,
             compose_content: None,
+            compose_path: None,
+            compose_service: None,
             base_dir: None,
             static_build: false,
             readiness: None,
@@ -2707,6 +2901,8 @@ mod tests {
             github_app_id: None,
             dockerfile_content: None,
             compose_content: Some(content.to_string()),
+            compose_path: None,
+            compose_service: None,
             base_dir: None,
             static_build: false,
             readiness: None,

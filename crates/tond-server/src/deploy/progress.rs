@@ -57,6 +57,9 @@ pub fn health_label(
 /// The phase plan for an app: [`plan_for`] with the health and release steps
 /// named after its readiness mode (workers have no traffic to switch).
 pub fn plan_for_app(plan_source: &str, app: &App) -> Vec<PhaseRecord> {
+    if app.source_type == "compose" {
+        return compose_plan(plan_source == "rollback", app.source_url.is_some());
+    }
     let readiness = app.readiness();
     let mut phases = plan_for(plan_source, app.health_check_path.as_deref());
     for p in phases.iter_mut() {
@@ -119,9 +122,9 @@ pub fn plan_for(source_type: &str, health_path: Option<&str>) -> Vec<PhaseRecord
         ],
         "compose" => [
             (Clone, None),
-            (Build, Some("docker compose up")),
-            (Start, Some("Find the service port")),
-            (Health, None),
+            (Build, Some("Build and pull service images")),
+            (Start, Some("Start services")),
+            (Health, Some("Wait for services to be ready")),
             (Release, Some("Switch traffic")),
         ],
         // "rollback" and anything unknown: re-run an existing image.
@@ -147,6 +150,25 @@ pub fn plan_for(source_type: &str, health_path: Option<&str>) -> Vec<PhaseRecord
             finished_at: None,
         })
         .collect()
+}
+
+/// The phase plan of a compose deployment: clone only for a repository,
+/// no build for a rollback (the pinned images exist).
+pub fn compose_plan(rollback: bool, from_git: bool) -> Vec<PhaseRecord> {
+    let mut phases = plan_for("compose", None);
+    for p in phases.iter_mut() {
+        match p.phase {
+            DeployPhase::Clone if from_git && !rollback => {
+                p.status = PhaseStatus::Pending;
+                p.label = Some("Clone repository".to_string());
+            }
+            DeployPhase::Build if rollback => {
+                p.label = Some("Reuse the deployment's images".to_string());
+            }
+            _ => {}
+        }
+    }
+    phases
 }
 
 async fn persist(state: &AppState, app_id: &str, deployment_id: &str, phases: &[PhaseRecord]) {
@@ -495,7 +517,19 @@ mod tests {
         assert_eq!(rollback[0].status, Skipped);
         assert_eq!(rollback[1].status, Skipped);
         let compose = plan_for("compose", None);
-        assert_eq!(compose[3].status, Skipped);
+        assert_eq!(compose[0].status, Skipped);
+        assert_eq!(compose[3].status, Pending);
+        let mut app = App::new("s".into(), "compose".into(), None, None, 80);
+        assert_eq!(plan_for_app("compose", &app)[0].status, Skipped);
+        app.source_url = Some("https://example.com/r.git".into());
+        let from_git = plan_for_app("compose", &app);
+        assert_eq!(from_git[0].label.as_deref(), Some("Clone repository"));
+        let rollback = plan_for_app("rollback", &app);
+        assert_eq!(rollback[0].status, Skipped);
+        assert_eq!(
+            rollback[1].label.as_deref(),
+            Some("Reuse the deployment's images")
+        );
     }
 
     #[test]

@@ -77,8 +77,7 @@
 		'git-github-app': 'Git — Private Repo (GitHub App)',
 		dockerfile: 'Docker — Dockerfile',
 		compose: 'Docker — Docker Compose',
-		image: 'Docker — Image',
-		template: 'Template'
+		image: 'Docker — Image'
 	};
 
 	const BUILD_METHOD_LABELS: Record<string, string> = {
@@ -125,11 +124,6 @@
 				{:else if sourceSubType === 'image'}
 					<div class="truncate">
 						<span class="text-muted-foreground">Image:</span>
-						<span class="font-mono text-xs">{sourceUrl}</span>
-					</div>
-				{:else if sourceSubType === 'template'}
-					<div class="truncate">
-						<span class="text-muted-foreground">Template Source:</span>
 						<span class="font-mono text-xs">{sourceUrl}</span>
 					</div>
 				{:else if sourceSubType === 'dockerfile'}

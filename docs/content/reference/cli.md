@@ -59,6 +59,8 @@ tond apps <COMMAND>
 | `tond apps deployments` | Show deployment history for an app |
 | `tond apps rollback` | Roll back an app to its previous deployment (asks first; --yes to skip) |
 | `tond apps git-key` | Show or generate the SSH deploy key for an app |
+| `tond apps services` | List the services of a Docker Compose app (state, image, ports, domains) |
+| `tond apps service` | Restart, stop or start one service of a Docker Compose app, or show its logs |
 | `tond apps git-webhook` | Manage webhook URL and auto-deploy settings for an app |
 | `tond apps volume` | Manage persistent volumes for an app |
 | `tond apps previews` | Manage preview deployments for an app |
@@ -85,7 +87,8 @@ tond apps create [OPTIONS] <NAME>
 
 | Option | Description |
 | --- | --- |
-| `--template <TEMPLATE>` | Curated in-repo template to use for app creation. |
+| `--template <TEMPLATE>` | Create the app from a one-click template (see `tond templates list`) and deploy it. Template inputs are given with --env KEY=VALUE. |
+| `--allow-low-memory` | With --template: deploy even if the server has less free memory than the template needs. |
 | `-t, --source-type <SOURCE_TYPE>` | Source type: git, image. Default: `git`. |
 | `-s, --source <SOURCE>` | Git URL or Docker image. |
 | `-b, --branch <BRANCH>` | Git branch. Default: `main`. |
@@ -413,6 +416,32 @@ tond apps git-key [OPTIONS] <APP>
 | --- | --- |
 | `--generate` | Generate (or regenerate) a new Ed25519 deploy key. |
 
+### tond apps services
+
+List the services of a Docker Compose app (state, image, ports, domains)
+
+```text
+tond apps services <APP>
+```
+
+| Argument | Description |
+| --- | --- |
+| `<APP>` | App name or ID. |
+
+### tond apps service
+
+Restart, stop or start one service of a Docker Compose app, or show its logs
+
+```text
+tond apps service <APP> <SERVICE> <ACTION>
+```
+
+| Argument | Description |
+| --- | --- |
+| `<APP>` | App name or ID. |
+| `<SERVICE>` | Service name (as in the compose file). |
+| `<ACTION>` | restart \| stop \| start \| logs. One of `restart`, `stop`, `start`, `logs`. |
+
 ### tond apps git-webhook
 
 Manage webhook URL and auto-deploy settings for an app
@@ -552,6 +581,39 @@ tond apps previews delete [OPTIONS] <APP> <PREVIEW_ID>
 | Option | Description |
 | --- | --- |
 | `-y, --yes` | Don't ask for confirmation (required when stdin is not a terminal). |
+
+## tond templates
+
+Browse the one-click template catalog
+
+```text
+tond templates <COMMAND>
+```
+
+| Command | Description |
+| --- | --- |
+| `tond templates list` | List the templates, with their memory needs |
+| `tond templates show` | Show a template's services, inputs and notes |
+
+### tond templates list
+
+List the templates, with their memory needs
+
+```text
+tond templates list
+```
+
+### tond templates show
+
+Show a template's services, inputs and notes
+
+```text
+tond templates show <ID>
+```
+
+| Argument | Description |
+| --- | --- |
+| `<ID>` | Template id (see `tond templates list`). |
 
 ## tond projects
 
