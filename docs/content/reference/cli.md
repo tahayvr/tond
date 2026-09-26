@@ -87,7 +87,7 @@ tond apps create [OPTIONS] <NAME>
 
 | Option | Description |
 | --- | --- |
-| `--template <TEMPLATE>` | Create the app from a one-click template (see `tond templates list`) and deploy it. Template inputs are given with --env KEY=VALUE. |
+| `--template <TEMPLATE>` | Create the app from a one-click template (see `tond templates list`) and deploy it. Template inputs are given with --env KEY=VALUE; the template decides the source, port, resource limits and health checks, so those options are refused with it (--domain is allowed). |
 | `--allow-low-memory` | With --template: deploy even if the server has less free memory than the template needs. |
 | `-t, --source-type <SOURCE_TYPE>` | Source type: git (build a repository), image (run a registry image), tarball (deploy later with `tond apps push`), dockerfile (build the Dockerfile given with --source), compose (a compose file: a git URL or a local file given with --source). One of `git`, `image`, `tarball`, `dockerfile`, `compose`. Default: `git`. |
 | `-s, --source <SOURCE>` | Git URL (git, compose), Docker image (image), or path to a local Dockerfile (dockerfile) or compose file (compose). |

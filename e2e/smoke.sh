@@ -1727,6 +1727,10 @@ code=$(api_req POST /api/v1/templates/vaultwarden/deploy '{"name":"Bad Name","in
     || fail "a template deploy with an invalid name must be 400 INVALID_INPUT on field name, got ${code}: $(cat "$API_BODY")"
 code=$(api_req POST /api/v1/templates/nope/deploy '{"name":"e2e-nope","inputs":{}}')
 [[ "$code" == 404 ]] || fail "an unknown template must be 404, got ${code}"
+# The CLI refuses options a template decides itself instead of ignoring them.
+rc=0; tond apps create e2e-nope --template vaultwarden --port 8080 -y > /dev/null 2>&1 || rc=$?
+[[ "$rc" == 2 ]] || fail "tond apps create --template with --port must be a usage error (exit 2), got ${rc}"
+pass "tond apps create --template refuses --port and the other template-decided options (exit 2)"
 code=$(api_req POST /api/v1/templates/vaultwarden/deploy \
     "{\"name\":\"e2e-vault\",\"domain\":\"${VAULT_DOMAIN}\",\"inputs\":{},\"allow_low_memory\":true}")
 [[ "$code" == 202 ]] || fail "deploying the vaultwarden template should be accepted, got ${code}: $(cat "$API_BODY")"

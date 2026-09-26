@@ -755,6 +755,50 @@ mod tests {
     }
 
     #[test]
+    fn apps_create_template_refuses_options_the_template_decides() {
+        for extra in [
+            &["--port", "8080"][..],
+            &["--memory-mb", "512"],
+            &["--cpus", "1"],
+            &["--health-path", "/up"],
+            &["--health-interval", "10"],
+            &["--health-threshold", "5"],
+            &["--drain-timeout", "60"],
+            &["--source", "nginx"],
+            &["--branch", "dev"],
+        ] {
+            let mut args = vec![
+                "tond",
+                "apps",
+                "create",
+                "vault",
+                "--template",
+                "vaultwarden",
+            ];
+            args.extend_from_slice(extra);
+            let err = Cli::try_parse_from(&args)
+                .err()
+                .unwrap_or_else(|| panic!("--template with {extra:?} must be refused"));
+            assert_eq!(err.exit_code(), 2, "{extra:?}: usage error");
+        }
+        // What a template does take: a domain, inputs and --yes.
+        Cli::try_parse_from([
+            "tond",
+            "apps",
+            "create",
+            "vault",
+            "--template",
+            "vaultwarden",
+            "--domain",
+            "vault.example.com",
+            "--env",
+            "ADMIN_EMAIL=a@b.c",
+            "--yes",
+        ])
+        .unwrap_or_else(|err| panic!("template with domain and inputs: {err}"));
+    }
+
+    #[test]
     fn cli_parses_apps_create_defaults() {
         let cli = Cli::try_parse_from(["tond", "apps", "create", "demo"])
             .unwrap_or_else(|err| panic!("failed to parse apps create command: {err}"));

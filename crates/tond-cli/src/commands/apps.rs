@@ -27,8 +27,13 @@ pub struct CreateAppOptions {
     pub name: String,
 
     /// Create the app from a one-click template (see `tond templates list`)
-    /// and deploy it. Template inputs are given with --env KEY=VALUE.
-    #[arg(long, conflicts_with_all = ["source_type", "source", "branch", "build_method"])]
+    /// and deploy it. Template inputs are given with --env KEY=VALUE; the
+    /// template decides the source, port, resource limits and health checks,
+    /// so those options are refused with it (--domain is allowed).
+    #[arg(long, conflicts_with_all = [
+        "source_type", "source", "branch", "build_method", "port", "memory_mb", "cpus",
+        "health_path", "health_interval", "health_threshold", "drain_timeout",
+    ])]
     pub template: Option<String>,
 
     /// With --template: deploy even if the server has less free memory than
