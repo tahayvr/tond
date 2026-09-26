@@ -307,6 +307,52 @@ install_docker() {
     fi
 }
 
+# Default log rotation for every container on the host. Tond sets rotation on
+# each container it starts; this covers everything else (and containers that
+# compose files start). Existing settings win: we only fill in missing keys,
+# and a non-rotating driver choice (journald, syslog, ...) is left untouched.
+DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
+configure_docker_daemon() {
+    step "Configuring Docker log rotation"
+
+    local defaults='{"log-driver":"json-file","log-opts":{"max-size":"10m","max-file":"3"}}'
+    local current='{}'
+    if [[ -s "$DOCKER_DAEMON_JSON" ]]; then
+        if ! current=$(jq -S -c . "$DOCKER_DAEMON_JSON" 2>/dev/null); then
+            warn "${DOCKER_DAEMON_JSON} is not valid JSON; leaving it untouched"
+            warn "Tond still rotates logs of the containers it starts"
+            return 0
+        fi
+    fi
+
+    local merged
+    merged=$(jq -S -c --argjson d "$defaults" '
+        if (has("log-driver") and (.["log-driver"] | IN("json-file", "local") | not)) then .
+        else .["log-driver"] = (.["log-driver"] // $d["log-driver"])
+             | .["log-opts"] = ($d["log-opts"] + (.["log-opts"] // {}))
+        end' <<<"$current")
+
+    if [[ "$merged" == "$current" ]]; then
+        info "Docker log rotation already configured"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$DOCKER_DAEMON_JSON")"
+    if [[ -f "$DOCKER_DAEMON_JSON" ]]; then
+        cp -p "$DOCKER_DAEMON_JSON" "${DOCKER_DAEMON_JSON}.bak.$(date +%Y%m%d%H%M%S)"
+    fi
+    jq . <<<"$merged" > "${DOCKER_DAEMON_JSON}.tmp"
+    mv "${DOCKER_DAEMON_JSON}.tmp" "$DOCKER_DAEMON_JSON"
+    info "Wrote container log rotation defaults to ${DOCKER_DAEMON_JSON}"
+
+    # dockerd only reads daemon.json at start. Restart it now, during install,
+    # so the defaults apply before any Tond container exists.
+    if systemctl is-active --quiet docker; then
+        info "Restarting Docker to apply the new defaults..."
+        systemctl restart docker
+    fi
+}
+
 create_directories() {
     step "Creating directory structure"
     
@@ -652,6 +698,7 @@ main() {
     check_prerequisites
     install_dependencies
     install_docker
+    configure_docker_daemon
     create_directories
     ensure_secret_key
     install_binaries
