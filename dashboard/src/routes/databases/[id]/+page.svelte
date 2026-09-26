@@ -31,6 +31,7 @@
 	import Breadcrumb from '$lib/components/nav/breadcrumb.svelte';
 	import ConfirmDeleteDialog from '$lib/components/dialogs/confirm-delete-dialog.svelte';
 	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
+	import StreamLogViewer from '$lib/components/logs/stream-log-viewer.svelte';
 	import { SvelteSet } from 'svelte/reactivity';
 	import { untrack } from 'svelte';
 	import Eye from '~icons/ri/eye-line';
@@ -51,6 +52,21 @@
 	};
 
 	let db = $state<ManagedDatabaseDetail | null>(null);
+	/** Selected tab; the Logs tab pauses the feed panel's stream (one socket per database). */
+	let dbTab = $state('overview');
+
+	/** UI context for this database, with the feed paused while the Logs tab streams. */
+	function dbContext(d: ManagedDatabaseDetail) {
+		const ctx = databaseContext(d);
+		return dbTab === 'logs' ? { ...ctx, feed: { ...ctx.feed, wsUrl: null } } : ctx;
+	}
+
+	$effect(() => {
+		void dbTab;
+		untrack(() => {
+			if (db) setUiContext(dbContext(db));
+		});
+	});
 	let error = $state('');
 	let projects = $state<Project[]>([]);
 	let showDeleteDialog = $state(false);
@@ -119,7 +135,7 @@
 		try {
 			[db, projects] = await Promise.all([getDatabase(dbId), listProjects()]);
 			if (db) {
-				setUiContext(databaseContext(db));
+				setUiContext(dbContext(db));
 				initLimitsDraft();
 			}
 		} catch (e: any) {
@@ -175,7 +191,7 @@
 		openFeedPanel();
 		try {
 			db = await redeployDatabase(dbId);
-			if (db) setUiContext(databaseContext(db));
+			if (db) setUiContext(dbContext(db));
 		} catch (e: any) {
 			error = e.message ?? 'Failed to redeploy database';
 		} finally {
@@ -344,7 +360,7 @@
 			const field = editingCredField;
 			const res = await updateDatabaseCredentials(dbId, { [field]: credDraft });
 			db = res.database;
-			if (db) setUiContext(databaseContext(db));
+			if (db) setUiContext(dbContext(db));
 			credSuccess = `${credLabel(field)} changed inside the database and saved. Update any app that still connects with the old password, then redeploy it.`;
 			credDialogOpen = false;
 			editingCredField = null;
@@ -402,7 +418,7 @@
 						: memoryLimitDraft * 1024 * 1024;
 			}
 			db = await updateDatabase(dbId, { memory_limit: memoryLimitBytes });
-			if (db) setUiContext(databaseContext(db));
+			if (db) setUiContext(dbContext(db));
 			limitsSaved = true;
 			if (limitsSavedTimeout) clearTimeout(limitsSavedTimeout);
 			limitsSavedTimeout = setTimeout(() => (limitsSaved = false), 2000);
@@ -550,7 +566,7 @@
 			db = routeData.db;
 			projects = routeData.projects;
 			if (db) {
-				setUiContext(databaseContext(db));
+				setUiContext(dbContext(db));
 				initLimitsDraft();
 			}
 		});
@@ -625,12 +641,25 @@
 		<Separator />
 
 		<!-- Tabs -->
-		<Tabs.Root value="overview">
+		<Tabs.Root bind:value={dbTab}>
 			<Tabs.List>
 				<Tabs.Trigger value="overview">Overview</Tabs.Trigger>
+				<Tabs.Trigger value="logs">Logs</Tabs.Trigger>
 				<Tabs.Trigger value="environment">Environment</Tabs.Trigger>
 				<Tabs.Trigger value="limits">Limits</Tabs.Trigger>
 			</Tabs.List>
+
+			<!-- ── Logs tab (streams only while open) ── -->
+			<Tabs.Content value="logs" class="mt-4">
+				{#if dbTab === 'logs'}
+					<StreamLogViewer
+						wsUrl="/api/databases/{db.id}/logs/stream"
+						downloadName="{db.name}-logs"
+						label="{db.name} logs"
+						showPrefix={false}
+					/>
+				{/if}
+			</Tabs.Content>
 
 			<!-- ── Overview tab ── -->
 			<Tabs.Content value="overview" class="mt-4 space-y-4">
