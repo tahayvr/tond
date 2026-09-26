@@ -785,6 +785,20 @@ pub async fn queue_certificate(db: &sqlx::SqlitePool, domain: &str) {
     .await;
 }
 
+/// The first domain of each compose app (its first service with a domain,
+/// in file order): `app id -> domain`.
+pub async fn primary_domains(db: &sqlx::SqlitePool) -> sqlx::Result<HashMap<String, String>> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT d.app_id, d.domain FROM app_domains d
+         JOIN compose_services s ON s.app_id = d.app_id AND s.name = d.service
+         ORDER BY s.position DESC, d.created_at DESC, d.domain DESC",
+    )
+    .fetch_all(db)
+    .await?;
+    // Later rows overwrite earlier ones: the first in order wins.
+    Ok(rows.into_iter().collect())
+}
+
 /// Domains routed to each service of an app.
 pub async fn domains_by_service(
     db: &sqlx::SqlitePool,

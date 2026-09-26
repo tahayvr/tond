@@ -171,21 +171,37 @@ pub async fn list_apps(
         if !auth.can_see_app(&app.id, app.project_id.as_deref()) {
             return Err(AppError(TondError::AppNotFound(name)));
         }
-        let responses = vec![AppResponse::from(app)];
+        let primary = crate::compose::primary_domains(&state.db).await?;
+        let responses = vec![app_response(app, &primary)];
         return Ok((StatusCode::OK, Json(ApiResponse::ok(responses))));
     }
 
     let apps = sqlx::query_as::<_, App>("SELECT * FROM apps ORDER BY created_at DESC")
         .fetch_all(&state.db)
         .await?;
+    let primary = crate::compose::primary_domains(&state.db).await?;
 
     // Tokens limited to some apps only see those.
     let responses: Vec<AppResponse> = apps
         .into_iter()
         .filter(|a| auth.can_see_app(&a.id, a.project_id.as_deref()))
-        .map(AppResponse::from)
+        .map(|a| app_response(a, &primary))
         .collect();
     Ok((StatusCode::OK, Json(ApiResponse::ok(responses))))
+}
+
+/// The API view of an app. A compose app shows the first domain of its
+/// services (its web service's) as `domain`, for display: its domains are
+/// managed per service.
+fn app_response(app: App, compose_domains: &std::collections::HashMap<String, String>) -> AppResponse {
+    let domain = (app.source_type == "compose")
+        .then(|| compose_domains.get(&app.id).cloned())
+        .flatten();
+    let mut response = AppResponse::from(app);
+    if domain.is_some() {
+        response.domain = domain;
+    }
+    response
 }
 
 // ── Get App ──
@@ -197,7 +213,8 @@ pub async fn get_app(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let app = fetch_app(&state.db, &id).await?;
-    let mut response = AppResponse::from(app);
+    let primary = crate::compose::primary_domains(&state.db).await?;
+    let mut response = app_response(app, &primary);
     response.domain_warning = domain_warning(&state, response.domain.as_deref()).await;
     Ok((StatusCode::OK, Json(ApiResponse::ok(response))))
 }

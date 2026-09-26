@@ -269,6 +269,13 @@ async fn syncing_keeps_user_choices_and_drops_services_that_left_the_file() {
         !domains.contains_key("cache"),
         "domains of a removed service go too"
     );
+    let primary = primary_domains(&db)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        primary.get("a1").map(String::as_str),
+        Some("shop.example.com")
+    );
 
     // Docker reports web running and api missing.
     store_states(
