@@ -119,12 +119,15 @@ const MAX_BLOCKING_THREADS: usize = 64;
 const HTTP_DRAIN: Duration = Duration::from_secs(5);
 
 fn main() -> Result<()> {
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .max_blocking_threads(MAX_BLOCKING_THREADS)
         .thread_keep_alive(Duration::from_secs(10))
-        .build()?
-        .block_on(run())
+        .build()?;
+    let result = runtime.block_on(run());
+    // Don't wait on blocking threads still parked in a read (terminal PTYs).
+    runtime.shutdown_timeout(Duration::from_secs(2));
+    result
 }
 
 async fn run() -> Result<()> {
