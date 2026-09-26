@@ -422,14 +422,13 @@ if [[ "$signed_in" == true ]]; then
 fi
 
 # Rotating X-Forwarded-For must not create fresh rate-limit buckets: the proxy
-# replaces it with the real peer. Up to 200 quick requests exceed the 60-request
-# burst plus the 10/s refill.
+# replaces it with the real peer. 200 requests, 25 at a time (fast enough to
+# beat the 10/s refill even on a slow or emulated host), exceed the 60-request
+# burst.
 limited=false
-for i in $(seq 1 200); do
-    code=$(curl -sk --resolve "${DASH}:443:${IP}" -o /dev/null -w '%{http_code}' \
-        -H "X-Forwarded-For: 198.51.100.$((i % 250))" "https://${DASH}/api/auth/status")
-    if [[ "$code" == 429 ]]; then limited=true; break; fi
-done
+codes=$(seq 1 200 | xargs -P 25 -I{} curl -sk --resolve "${DASH}:443:${IP}" -o /dev/null \
+    -w '%{http_code}\n' -H "X-Forwarded-For: 198.51.100.{}" "https://${DASH}/api/auth/status")
+[[ "$codes" == *429* ]] && limited=true
 [[ "$limited" == true ]] || fail "a spoofed X-Forwarded-For must not bypass the rate limiter"
 pass "spoofed X-Forwarded-For does not bypass the rate limiter"
 sleep 7 # let the bucket refill

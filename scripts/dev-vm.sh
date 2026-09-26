@@ -19,11 +19,10 @@ set -euo pipefail
 #
 #   create    create the machine (idempotent)
 #   install   install/upgrade Tond from dist/tond-linux-<arch> (dashboard at
-#             https://<name>.orb.local once the proxy's cert is trusted, or
-#             http://<name>.orb.local)
-#   e2e       install + smoke test with a local Pebble ACME CA and the preview
-#             domain preview.test (resets the machine's ACME state; the VM is
-#             meant to be disposable)
+#             https://<name>.orb.local once the proxy's cert is trusted)
+#   e2e       wipe Tond's data and containers, then install + smoke test with a
+#             local Pebble ACME CA and the preview domain preview.test (the VM
+#             is meant to be disposable)
 #   shell     open a root shell in the machine
 #   destroy   delete the machine
 
@@ -56,6 +55,18 @@ command -v orb > /dev/null || {
 
 in_vm() { orb -m "$NAME" -u root "$@"; }
 
+# An amd64 machine on Apple Silicon runs under Rosetta, which needs
+# /proc/sys/vm/mmap_min_addr; the units' ProcSubset=pid hides it and the
+# services die on start. Real x86_64 hosts don't need this, so it lives only
+# in the VM (in /etc, so it survives reinstalls).
+rosetta_workaround() {
+    [[ "$ORB_ARCH" == amd64 && "$(uname -m)" == arm64 ]] || return 0
+    in_vm bash -c 'for unit in tond-server tond-proxy; do
+        mkdir -p /etc/systemd/system/${unit}.service.d
+        printf "[Service]\nProcSubset=all\n" > /etc/systemd/system/${unit}.service.d/zz-rosetta.conf
+    done; systemctl daemon-reload'
+}
+
 require_bundle() {
     [[ -f "${BUNDLE}/install.sh" ]] || {
         echo "No bundle at ${BUNDLE}. Run: just arch=${BUNDLE_ARCH} package" >&2
@@ -73,11 +84,18 @@ case "$CMD" in
         ;;
     install)
         require_bundle
+        rosetta_workaround
         in_vm "${BUNDLE}/install.sh" --non-interactive --dashboard-domain "${NAME}.orb.local"
         echo "Tond installed in ${NAME}. Deploy changes with: just server=root@${NAME}@orb deploy"
         ;;
     e2e)
         require_bundle
+        # Start from a clean slate: a database from an older build may carry
+        # migrations this build no longer has, and leftover apps would collide.
+        in_vm bash -c 'systemctl stop tond-server tond-proxy 2> /dev/null || true
+            docker ps -aq --filter label=managed-by=tond | xargs -r docker rm -f > /dev/null
+            rm -rf /opt/tond/data'
+        rosetta_workaround
         in_vm "${ROOT}/e2e/run.sh" --bundle "$BUNDLE" --acme pebble \
             --base-domain tond.test --preview-domain preview.test
         ;;
