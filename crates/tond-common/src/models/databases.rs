@@ -433,14 +433,15 @@ pub struct UpdateDatabaseRequest {
 
 /// PATCH /api/databases/{id}/credentials request body
 ///
-/// Updates the stored credentials (username, password, database name).
-/// The changes take effect on the next redeploy — the running container is not
-/// restarted automatically.  Send `null` or omit a field to leave it unchanged.
+/// PATCH /api/databases/{id}/credentials — change passwords inside the running
+/// database (ALTER ROLE / ALTER USER via docker exec), then persist them.
+/// Send `null`, omit a field or send `""` to leave it unchanged. Renaming the
+/// database or user is refused: engines ignore those once data exists.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateDatabaseCredentials {
-    /// New database name (postgres / mysql / mongodb only).
+    /// Must equal the current database name if sent (renames are refused).
     pub db_name: Option<String>,
-    /// New database username.
+    /// Must equal the current username if sent (renames are refused).
     pub db_user: Option<String>,
     /// New database password.  Send `""` to leave the current value unchanged.
     pub db_password: Option<String>,

@@ -45,6 +45,7 @@ mod auth;
 mod backup;
 mod cron;
 mod db;
+mod db_credentials;
 mod deploy;
 mod docker;
 mod error;
