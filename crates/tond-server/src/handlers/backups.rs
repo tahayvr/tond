@@ -254,17 +254,14 @@ pub async fn update_backup_config(
         None => current.storage_provider_id,
     };
 
-    // Validate cron expression
-    {
-        use ::cron::Schedule;
-        use std::str::FromStr;
-        Schedule::from_str(&full_schedule_cron).map_err(|e| {
-            AppError(TondError::InvalidInput(format!(
-                "Invalid cron expression: {}",
-                e
-            )))
-        })?;
-    }
+    // Validate with the same parser the scheduler uses (standard 5-field cron,
+    // 0/7 = Sunday, @daily-style macros).
+    crate::cron::parse_schedule(&full_schedule_cron).map_err(|e| {
+        AppError(TondError::InvalidInput(format!(
+            "Invalid cron expression: {}",
+            e
+        )))
+    })?;
 
     sqlx::query(
         "UPDATE backup_config
@@ -520,6 +517,20 @@ mod tests {
             rate_limiter: RateLimiter::new(60, 10.0),
             settings: Arc::new(RwLock::new(ServerSettings::default())),
         }
+    }
+
+    #[tokio::test]
+    async fn default_backup_schedule_is_accepted_by_the_scheduler_parser() {
+        // The default is standard 5-field cron; the raw `cron` crate rejects
+        // it, which silently disabled scheduled backups.
+        let state = test_state().await;
+        let (schedule,): (String,) =
+            sqlx::query_as("SELECT full_schedule_cron FROM backup_config WHERE id = 1")
+                .fetch_one(&state.db)
+                .await
+                .unwrap_or_else(|err| panic!("read default: {err}"));
+        assert_eq!(schedule, "0 3 * * *");
+        assert!(crate::cron::parse_schedule(&schedule).is_ok());
     }
 
     #[tokio::test]
