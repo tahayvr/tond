@@ -91,6 +91,7 @@
 	import RequestMetricsPanel from '$lib/components/metrics/request-metrics-panel.svelte';
 	import AppHistory from '$lib/components/tabs/app-page/app-history.svelte';
 	import AppWebhooks from '$lib/components/tabs/app-page/app-webhooks.svelte';
+	import AppGitReporting from '$lib/components/tabs/app-page/app-git-reporting.svelte';
 	import { safeUrl } from '$lib/utils';
 	import { SecretInput } from '$lib/components/ui/secret-input/index.js';
 	import Github from '~icons/ri/github-fill';
@@ -1556,6 +1557,9 @@
 
 						{#if canEditApp}
 							<AppWebhooks appId={app.id} />
+							{#if app.source_type === 'git'}
+								<AppGitReporting {app} />
+							{/if}
 						{:else}
 							<p class="text-sm text-muted-foreground">
 								Webhook URLs and secrets are shown to users who can change this app's settings.
