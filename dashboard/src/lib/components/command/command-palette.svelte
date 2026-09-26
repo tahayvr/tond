@@ -1,5 +1,6 @@
 <!-- Cmd/Ctrl+K palette: jump to any page or resource, or run a common action. -->
 <script lang="ts">
+	import { docsUrl } from '$lib/docs';
 	import { goto } from '$app/navigation';
 	import { toggleMode } from 'mode-watcher';
 	import * as Command from '$lib/components/ui/command/index.js';
@@ -75,6 +76,9 @@
 				break;
 			case 'shortcuts':
 				onShowShortcuts();
+				break;
+			case 'docs':
+				window.open(docsUrl(), '_blank', 'noopener');
 				break;
 			case 'deploy': {
 				let deploymentId = '';

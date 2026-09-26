@@ -1,6 +1,6 @@
 [Unit]
 Description=Tond Server
-Documentation=https://docs.tond.io
+Documentation=https://tond.io/docs
 After=network.target docker.service tondbuild.slice
 Requires=docker.service
 # The build slice must be active (its cgroup created with the memory cap)

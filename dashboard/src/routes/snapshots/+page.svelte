@@ -226,10 +226,12 @@
 		const what = snap.scope.startsWith('database:')
 			? `Database ${snap.scope.slice('database:'.length)}`
 			: 'Full';
-		if (snap.trigger === 'scheduled') return 'Scheduled · Full';
+		if (snap.trigger === 'scheduled') return `Scheduled · ${what}`;
 		if (snap.trigger === 'pre_deploy') return `Pre-deploy: ${snap.trigger_app ?? snap.scope}`;
 		if (snap.trigger === 'manual') return `Manual · ${what}`;
 		if (snap.trigger === 'pre_restore') return `Pre-restore · ${what}`;
+		if (snap.trigger === 'pre_update') return 'Before a Tond update · Full';
+		if (snap.trigger === 'pre_upgrade') return `Before an upgrade · ${what}`;
 		return snap.trigger;
 	}
 

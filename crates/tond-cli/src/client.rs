@@ -1362,6 +1362,47 @@ impl TondClient {
         self.call(Method::GET, &format!("/audit-log?{}", qs.join("&")), None)
             .await
     }
+
+    // ── Tond updates (System → Updates) ──
+
+    /// Versions, changelog, the current or last run, the rollback offer.
+    pub async fn get_update(&self) -> Result<Value> {
+        self.call(Method::GET, "/system/update", None).await
+    }
+
+    /// Look for new releases now.
+    pub async fn check_updates(&self) -> Result<Value> {
+        self.call(Method::POST, "/system/update/check", None).await
+    }
+
+    /// Snapshot, then update in the background (returns the run's status).
+    pub async fn start_update(
+        &self,
+        version: Option<&str>,
+        skip_snapshot: bool,
+        force: bool,
+    ) -> Result<Value> {
+        self.call(
+            Method::POST,
+            "/system/update",
+            Some(serde_json::json!({
+                "version": version,
+                "skip_snapshot": skip_snapshot,
+                "force": force,
+            })),
+        )
+        .await
+    }
+
+    /// Roll back to the version before the last update.
+    pub async fn start_rollback(&self, skip_snapshot: bool) -> Result<Value> {
+        self.call(
+            Method::POST,
+            "/system/update/rollback",
+            Some(serde_json::json!({ "skip_snapshot": skip_snapshot })),
+        )
+        .await
+    }
 }
 
 /// Turn the upload endpoint's reply into the queued deployment. The server

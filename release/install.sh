@@ -2,7 +2,10 @@
 set -euo pipefail
 
 # Tond Installer
-# Run on a fresh Ubuntu 22.04/24.04 server (x86_64 or aarch64) as root
+# Run as root on a fresh server running Debian 12, Debian 13, Ubuntu 24.04 LTS
+# or Ubuntu 26.04 LTS (x86_64 or aarch64); see the support matrix at
+# https://tond.io/docs/support-matrix. Other systems are refused unless you pass
+# --allow-unsupported-os.
 #
 # Quick install: curl -fsSL https://tond.io/install | sudo bash
 #
@@ -18,7 +21,16 @@ SECRET_ENV_FILE="${DATA_DIR}/tond.env"
 # Written by tond-server on first start, root-only (0600), never logged:
 SETUP_TOKEN_FILE="${DATA_DIR}/setup-token"    # one-time admin setup token (removed after setup)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# `su` without `-` (common on Debian) keeps a PATH without the sbin
+# directories that useradd, groupadd and ufw live in.
+export PATH="${PATH}:/usr/local/sbin:/usr/sbin:/sbin"
 NON_INTERACTIVE=false
+# --allow-unsupported-os (or TOND_ALLOW_UNSUPPORTED_OS=1): install on a
+# distribution outside the support matrix, with a warning. Recorded in
+# UNSUPPORTED_OS_MARKER so updates don't refuse the same system later.
+ALLOW_UNSUPPORTED_OS=false
+[[ "${TOND_ALLOW_UNSUPPORTED_OS:-}" == "1" ]] && ALLOW_UNSUPPORTED_OS=true
+UNSUPPORTED_OS_MARKER="${INSTALL_DIR}/ALLOW_UNSUPPORTED_OS"
 DASHBOARD_DOMAIN=""
 PREVIEW_DOMAIN=""
 APPS_DOMAIN=""
@@ -243,6 +255,94 @@ latest_release_tag() {
 }
 # ── end release signatures ──
 
+# ── Supported systems (keep in sync: install.sh, update.sh; documented in
+# docs/content/support-matrix.md) ──
+#
+# Tond supports these distributions, on x86_64 and aarch64, written as
+# "<os-release ID>:<VERSION_ID>:<codename>". Anything else is refused unless
+# the operator explicitly allows it (install.sh --allow-unsupported-os).
+TOND_SUPPORTED_SYSTEMS="debian:12:bookworm debian:13:trixie ubuntu:24.04:noble ubuntu:26.04:resolute"
+TOND_SUPPORTED_SYSTEMS_TEXT="Debian 12, Debian 13, Ubuntu 24.04 LTS and Ubuntu 26.04 LTS (x86_64 or aarch64)"
+# Docker's apt repository publishes a new distribution release some time
+# after it ships; until then, use the previous release's packages.
+TOND_DOCKER_CODENAME_FALLBACK="trixie:bookworm resolute:noble"
+
+# os_release_value FILE KEY — one value from an os-release file. The file is
+# parsed, never sourced: sourcing would overwrite this script's variables.
+os_release_value() {
+    [ -r "$1" ] || return 0
+    sed -n "s/^$2=//p" "$1" | head -n 1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/"
+}
+
+# detect_system [OS_RELEASE_FILE] — sets SYSTEM_ID, SYSTEM_VERSION,
+# SYSTEM_CODENAME, SYSTEM_NAME, SYSTEM_LIKE, SYSTEM_UBUNTU_CODENAME,
+# SYSTEM_DEBIAN_CODENAME and SYSTEM_SUPPORTED (yes|no).
+detect_system() {
+    _ds_file="${1:-/etc/os-release}"
+    [ -r "$_ds_file" ] || _ds_file="/usr/lib/os-release"
+    SYSTEM_ID="$(os_release_value "$_ds_file" ID)"
+    SYSTEM_VERSION="$(os_release_value "$_ds_file" VERSION_ID)"
+    SYSTEM_CODENAME="$(os_release_value "$_ds_file" VERSION_CODENAME)"
+    SYSTEM_NAME="$(os_release_value "$_ds_file" PRETTY_NAME)"
+    SYSTEM_LIKE="$(os_release_value "$_ds_file" ID_LIKE)"
+    SYSTEM_UBUNTU_CODENAME="$(os_release_value "$_ds_file" UBUNTU_CODENAME)"
+    SYSTEM_DEBIAN_CODENAME="$(os_release_value "$_ds_file" DEBIAN_CODENAME)"
+    [ -n "$SYSTEM_NAME" ] || SYSTEM_NAME="${SYSTEM_ID:-an unknown system} ${SYSTEM_VERSION}"
+    SYSTEM_SUPPORTED=no
+    for _ds_entry in $TOND_SUPPORTED_SYSTEMS; do
+        _ds_id="${_ds_entry%%:*}"
+        _ds_rest="${_ds_entry#*:}"
+        _ds_version="${_ds_rest%%:*}"
+        if [ "$_ds_id" = "$SYSTEM_ID" ] && [ "$_ds_version" = "$SYSTEM_VERSION" ]; then
+            SYSTEM_SUPPORTED=yes
+            [ -n "$SYSTEM_CODENAME" ] || SYSTEM_CODENAME="${_ds_rest#*:}"
+        fi
+    done
+}
+
+# unsupported_system_message — why this system is refused and what to do.
+unsupported_system_message() {
+    echo "Tond supports ${TOND_SUPPORTED_SYSTEMS_TEXT}. This server runs ${SYSTEM_NAME}."
+    echo "Install on a supported system, or rerun with --allow-unsupported-os to try anyway (not supported: things may break)."
+}
+
+# docker_apt_target — "<os> <codename>" of Docker's apt repository for this
+# system (download.docker.com/linux/<os> <codename>). Derivatives map to the
+# release they are based on. Fails when there is no sensible repository.
+docker_apt_target() {
+    case "$SYSTEM_ID" in
+        ubuntu|debian)
+            [ -n "$SYSTEM_CODENAME" ] || return 1
+            echo "$SYSTEM_ID $SYSTEM_CODENAME"
+            ;;
+        *)
+            case " $SYSTEM_LIKE " in
+                *" ubuntu "*)
+                    [ -n "$SYSTEM_UBUNTU_CODENAME" ] || return 1
+                    echo "ubuntu $SYSTEM_UBUNTU_CODENAME"
+                    ;;
+                *" debian "*)
+                    [ -n "$SYSTEM_DEBIAN_CODENAME" ] || return 1
+                    echo "debian $SYSTEM_DEBIAN_CODENAME"
+                    ;;
+                *) return 1 ;;
+            esac
+            ;;
+    esac
+}
+
+# docker_codename_fallback CODENAME — the codename to use when Docker's
+# repository doesn't have CODENAME yet (empty when there is none).
+docker_codename_fallback() {
+    for _dc_pair in $TOND_DOCKER_CODENAME_FALLBACK; do
+        if [ "${_dc_pair%%:*}" = "$1" ]; then
+            echo "${_dc_pair#*:}"
+            return 0
+        fi
+    done
+}
+# ── end supported systems ──
+
 # Check if we're in bundled mode or need to download
 is_bundled() {
     [[ -f "${SCRIPT_DIR}/tond-server" && -f "${SCRIPT_DIR}/tond-proxy" && -f "${SCRIPT_DIR}/tond" && -d "${SCRIPT_DIR}/dashboard" ]]
@@ -381,6 +481,24 @@ print_banner() {
 # Pre-flight checks
 # -------------------------------------------------------------------
 
+# The support matrix: refuse other systems unless explicitly allowed.
+check_supported_system() {
+    [[ "$(uname -s)" == "Linux" ]] || fatal "Tond runs on Linux servers (${TOND_SUPPORTED_SYSTEMS_TEXT}). This is $(uname -s)."
+    detect_system "${TOND_OS_RELEASE:-/etc/os-release}"
+    if [[ "$SYSTEM_SUPPORTED" == yes ]]; then
+        return 0
+    fi
+    if [[ "$ALLOW_UNSUPPORTED_OS" == true ]]; then
+        warn "${SYSTEM_NAME} is not a supported system (${TOND_SUPPORTED_SYSTEMS_TEXT})."
+        warn "Installing anyway because --allow-unsupported-os was given. Things may break, and bug reports for this system may be closed."
+        return 0
+    fi
+    error "$(unsupported_system_message | head -n 1)"
+    error "$(unsupported_system_message | tail -n 1)"
+    error "Supported systems: https://tond.io/docs/support-matrix"
+    exit 1
+}
+
 check_prerequisites() {
     step "Checking prerequisites"
 
@@ -393,11 +511,9 @@ check_prerequisites() {
     local port_80_busy=false
     local port_443_busy=false
 
-    if [[ -f /etc/os-release ]]; then
-        source /etc/os-release
-        os_id="${ID:-unknown}"
-        os_version="${VERSION_ID:-unknown}"
-    fi
+    detect_system "${TOND_OS_RELEASE:-/etc/os-release}"
+    os_id="${SYSTEM_ID:-unknown}"
+    os_version="${SYSTEM_VERSION:-unknown}"
 
     if command -v free &> /dev/null; then
         mem_mb=$(free -m | awk '/^Mem:/ {print $2}')
@@ -426,12 +542,10 @@ check_prerequisites() {
         mark_fail "Unsupported OS: ${os_name}"
     fi
 
-    if [[ "$os_id" == "ubuntu" && "$os_version" =~ ^(22|24)\. ]]; then
-        mark_pass "Ubuntu ${os_version}"
-    elif [[ "$os_id" == "ubuntu" ]]; then
-        mark_warn "Ubuntu ${os_version} detected; tested on 22.04 and 24.04"
+    if [[ "$SYSTEM_SUPPORTED" == yes ]]; then
+        mark_pass "${SYSTEM_NAME} (supported)"
     else
-        mark_warn "Detected ${os_id} ${os_version}; Ubuntu is the supported target"
+        mark_warn "${SYSTEM_NAME} is not supported; installing anyway (--allow-unsupported-os)"
     fi
 
     if [[ -n "$(host_arch)" ]]; then
@@ -488,28 +602,6 @@ check_prerequisites() {
         fatal "Tond only supports Linux servers. Detected: $(uname -s)"
     fi
 
-    # Ubuntu version check (recommended but not enforced)
-    if [[ -f /etc/os-release ]]; then
-        source /etc/os-release
-        if [[ "$ID" != "ubuntu" ]]; then
-            warn "Tond is tested on Ubuntu. Detected: $ID"
-            warn "Installation may still work, but is not officially supported."
-            echo ""
-            if [[ "$NON_INTERACTIVE" == false ]]; then
-                read -p "Continue anyway? [y/N] " -n 1 -r
-                echo
-                if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-                    exit 1
-                fi
-            fi
-        fi
-
-        # Version check
-        if [[ "$ID" == "ubuntu" && ! "$VERSION_ID" =~ ^(22|24)\. ]]; then
-            warn "Ubuntu $VERSION_ID detected. Tond is tested on 22.04 and 24.04."
-        fi
-    fi
-
     # Architecture check
     if [[ -z "$(host_arch)" ]]; then
         fatal "Unsupported architecture: $arch. Tond supports x86_64 (amd64) and aarch64 (arm64)."
@@ -543,7 +635,7 @@ install_dependencies() {
     spinner $!
 
     info "Installing required packages..."
-    apt-get install -y -qq curl git ca-certificates gnupg openssl jq ufw > /dev/null 2>&1 &
+    apt-get install -y -qq curl git ca-certificates gnupg openssl jq ufw iproute2 procps > /dev/null 2>&1 &
     spinner $!
 
     info "Dependencies installed"
@@ -553,11 +645,12 @@ install_dependencies() {
     local git_version
     git_version=$(git --version | grep -oE '[0-9]+\.[0-9]+' | head -1)
     if ! printf '2.31\n%s\n' "$git_version" | sort -V -C; then
-        fatal "git ${git_version} is too old; Tond needs git 2.31 or newer (Ubuntu 22.04+, Debian 12+)"
+        fatal "git ${git_version} is too old; Tond needs git 2.31 or newer (${TOND_SUPPORTED_SYSTEMS_TEXT} all have it)"
     fi
 }
 
-# Docker's apt signing key ("Docker Release (CE deb)"), as published at
+# Docker's apt signing key ("Docker Release (CE deb)", the same for the Debian
+# and Ubuntu repositories), as published at
 # https://docs.docker.com/engine/install/ubuntu/ — the downloaded key must
 # have exactly this fingerprint before apt trusts it.
 DOCKER_APT_KEY_FINGERPRINT="9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
@@ -573,17 +666,25 @@ install_docker() {
         return 0
     fi
 
-    local os_id="" codename=""
-    if [[ -f /etc/os-release ]]; then
-        # shellcheck disable=SC1091
-        os_id="$(. /etc/os-release && echo "${ID:-}")"
-        codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-}")"
+    detect_system "${TOND_OS_RELEASE:-/etc/os-release}"
+    local target os_id codename
+    target="$(docker_apt_target)" \
+        || fatal "Tond installs Docker from Docker's apt repository, which has no packages for ${SYSTEM_NAME}. Install Docker Engine (https://docs.docker.com/engine/install/) and run this installer again."
+    os_id="${target%% *}"
+    codename="${target#* }"
+    # Docker publishes a new distribution release some time after it ships:
+    # until then, use the previous release's packages.
+    if ! curl -fsI "https://download.docker.com/linux/${os_id}/dists/${codename}/Release" > /dev/null 2>&1; then
+        local fallback
+        fallback="$(docker_codename_fallback "$codename")"
+        if [[ -n "$fallback" ]] \
+            && curl -fsI "https://download.docker.com/linux/${os_id}/dists/${fallback}/Release" > /dev/null 2>&1; then
+            warn "Docker's apt repository has no ${codename} packages yet; using the ${fallback} ones"
+            codename="$fallback"
+        else
+            fatal "Docker's apt repository has no packages for ${os_id} ${codename} (https://download.docker.com/linux/${os_id}/dists/). Install Docker Engine by hand (https://docs.docker.com/engine/install/) and run this installer again."
+        fi
     fi
-    case "$os_id" in
-        ubuntu|debian) ;;
-        *) fatal "Tond installs Docker automatically on Ubuntu and Debian only. Install Docker Engine (https://docs.docker.com/engine/install/) and run this installer again." ;;
-    esac
-    [[ -n "$codename" ]] || fatal "Could not determine the ${os_id} release codename for Docker's apt repository"
 
     info "Adding Docker's apt repository (signed by ${DOCKER_APT_KEY_FINGERPRINT})..."
     install -m 0755 -d "$(dirname "$DOCKER_APT_KEYRING")"
@@ -1197,7 +1298,7 @@ print_summary() {
     echo "  journalctl -fu tond-server"
     echo ""
 
-    echo -e "${BOLD}Documentation:${NC} https://docs.tond.io"
+    echo -e "${BOLD}Documentation:${NC} https://tond.io/docs"
     echo ""
 }
 
@@ -1275,8 +1376,12 @@ main() {
                 APPS_DOMAIN_SET=true
                 shift 2
                 ;;
+            --allow-unsupported-os)
+                ALLOW_UNSUPPORTED_OS=true
+                shift
+                ;;
             --help|-h)
-                echo "Usage: install.sh [--non-interactive|-y] [--dashboard-domain <domain>] [--apps-domain <domain>] [--preview-domain <domain>]"
+                echo "Usage: install.sh [--non-interactive|-y] [--dashboard-domain <domain>] [--apps-domain <domain>] [--preview-domain <domain>] [--allow-unsupported-os]"
                 echo ""
                 echo "  --non-interactive, -y   Skip all prompts and apply safe defaults"
                 echo "                          (enables UFW and prints browser-first next steps)"
@@ -1292,6 +1397,11 @@ main() {
                 echo "                          domain or on the same registrable domain — with a"
                 echo "                          wildcard DNS record *.<domain>. Previews stay disabled"
                 echo "                          until one is set."
+                echo "  --allow-unsupported-os  Install on a Linux distribution outside the support matrix"
+                echo "                          (${TOND_SUPPORTED_SYSTEMS_TEXT})."
+                echo "                          Not supported: things may break. Also TOND_ALLOW_UNSUPPORTED_OS=1."
+                echo ""
+                echo "Docs: https://tond.io/docs/quickstart"
                 exit 0
                 ;;
             *)
@@ -1301,6 +1411,9 @@ main() {
     done
 
     print_banner
+
+    # Refuse an unsupported system before asking anything or downloading.
+    check_supported_system
 
     choose_dashboard_domain
 
@@ -1331,6 +1444,12 @@ main() {
     check_prerequisites
     install_dependencies
     install_docker
+    if [[ "$SYSTEM_SUPPORTED" != yes ]]; then
+        mkdir -p "$INSTALL_DIR"
+        echo "Installed with --allow-unsupported-os on ${SYSTEM_NAME}" > "$UNSUPPORTED_OS_MARKER"
+    else
+        rm -f "$UNSUPPORTED_OS_MARKER"
+    fi
     configure_docker_daemon
     configure_journald
     ensure_proxy_user
@@ -1361,5 +1480,8 @@ main() {
 # Handle script interruption
 trap 'echo; error "Installation interrupted"; exit 130' INT TERM
 
-# Run main function
-main "$@"
+# Run main function (release/tests/distro-containers.sh sources this file for
+# its functions only).
+if [[ "${TOND_INSTALL_SOURCE_ONLY:-}" != "1" ]]; then
+    main "$@"
+fi

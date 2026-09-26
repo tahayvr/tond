@@ -117,6 +117,7 @@ import {
 	MOCK_ALERT_SETTINGS
 } from './fixtures';
 import { observeHandlers } from './observe';
+import { updateHandlers } from './updates';
 import {
 	MOCK_COMPOSE_APP,
 	MOCK_COMPOSE_DEPLOYMENTS,
@@ -1430,6 +1431,8 @@ function mockImagePorts(image: string): { exposed: number[]; env: number | null 
 export const handlers = [
 	// Host history, disk, Docker, heartbeat, uptime (./observe.ts)
 	...observeHandlers,
+	// System → Updates (./updates.ts)
+	...updateHandlers,
 
 	// The OpenAPI document is plain JSON, not an envelope.
 	http.get('/api/v1/openapi.json', () => HttpResponse.json(MOCK_OPENAPI)),

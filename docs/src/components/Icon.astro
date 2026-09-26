@@ -1,0 +1,28 @@
+---
+// A Remix icon (the dashboard's icon set), inlined as SVG at build time.
+import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+
+interface Props {
+	name: string;
+	class?: string;
+	label?: string;
+}
+
+const require = createRequire(import.meta.url);
+const set = JSON.parse(readFileSync(require.resolve('@iconify-json/ri/icons.json'), 'utf8'));
+const { name, class: className, label } = Astro.props;
+const icon = set.icons[name];
+if (!icon) throw new Error(`Unknown Remix icon: ${name}`);
+const size = icon.width ?? set.width ?? 24;
+---
+
+<svg
+	class:list={['icon', className]}
+	viewBox={`0 0 ${size} ${icon.height ?? set.height ?? 24}`}
+	aria-hidden={label ? undefined : 'true'}
+	aria-label={label}
+	role={label ? 'img' : undefined}
+	fill="currentColor"
+	set:html={icon.body}
+/>

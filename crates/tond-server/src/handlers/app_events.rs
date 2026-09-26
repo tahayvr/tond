@@ -541,9 +541,16 @@ mod tests {
     async fn events_merge_every_source_newest_first() {
         let state = AppState::for_tests().await;
         let app = seed(&state.db).await;
-        let res = app_events(&state.db, &app, true, true, Utc::now(), 50)
-            .await
-            .unwrap_or_else(|e| panic!("events: {e}"));
+        let res = app_events(
+            &state.db,
+            &app,
+            true,
+            true,
+            Utc::now() + chrono::Duration::minutes(1),
+            50,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("events: {e}"));
         let kinds: Vec<AppEventKind> = res.events.iter().map(|e| e.kind).collect();
         assert_eq!(
             kinds,
@@ -573,9 +580,16 @@ mod tests {
         assert_eq!(res.next_before, None);
 
         // Without events:read, audit-derived events are left out.
-        let res = app_events(&state.db, &app, false, false, Utc::now(), 50)
-            .await
-            .unwrap_or_else(|e| panic!("events: {e}"));
+        let res = app_events(
+            &state.db,
+            &app,
+            false,
+            false,
+            Utc::now() + chrono::Duration::minutes(1),
+            50,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("events: {e}"));
         assert!(!res.events.iter().any(|e| matches!(
             e.kind,
             AppEventKind::ResourcesChanged | AppEventKind::AlertFired
@@ -586,9 +600,16 @@ mod tests {
     async fn events_page_backwards() {
         let state = AppState::for_tests().await;
         let app = seed(&state.db).await;
-        let first = app_events(&state.db, &app, true, true, Utc::now(), 2)
-            .await
-            .unwrap_or_else(|e| panic!("events: {e}"));
+        let first = app_events(
+            &state.db,
+            &app,
+            true,
+            true,
+            Utc::now() + chrono::Duration::minutes(1),
+            2,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("events: {e}"));
         assert_eq!(first.events.len(), 2);
         let before = first
             .next_before
@@ -630,9 +651,16 @@ mod tests {
         crate::uptime::store::close_incident(&state.db, id, start + 180)
             .await
             .unwrap_or_else(|e| panic!("close: {e}"));
-        let res = app_events(&state.db, &app, false, true, Utc::now(), 50)
-            .await
-            .unwrap_or_else(|e| panic!("events: {e}"));
+        let res = app_events(
+            &state.db,
+            &app,
+            false,
+            true,
+            Utc::now() + chrono::Duration::minutes(1),
+            50,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("events: {e}"));
         let up = res
             .events
             .iter()
@@ -646,9 +674,16 @@ mod tests {
             .unwrap_or_else(|| panic!("no down event"));
         assert_eq!(down.title, "Went down: server error (5xx)");
         assert_eq!(down.severity, "danger");
-        let hidden = app_events(&state.db, &app, false, false, Utc::now(), 50)
-            .await
-            .unwrap_or_else(|e| panic!("events: {e}"));
+        let hidden = app_events(
+            &state.db,
+            &app,
+            false,
+            false,
+            Utc::now() + chrono::Duration::minutes(1),
+            50,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("events: {e}"));
         assert!(
             !hidden
                 .events

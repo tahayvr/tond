@@ -254,6 +254,12 @@ api_routes! {
     GET "/api/v1/system/heartbeat" => handlers::host::get_heartbeat;
     PUT "/api/v1/system/heartbeat" => handlers::host::update_heartbeat;
     POST "/api/v1/system/heartbeat/test" => handlers::host::test_heartbeat;
+    // Tond updating itself: version, changelog, update and rollback runs
+    GET "/api/v1/system/update" => handlers::updates::get_update;
+    POST "/api/v1/system/update" => handlers::updates::start_update;
+    POST "/api/v1/system/update/rollback" => handlers::updates::start_rollback;
+    POST "/api/v1/system/update/check" => handlers::updates::check_now;
+    PUT "/api/v1/system/update/settings" => handlers::updates::update_settings;
     GET "/api/v1/uptime" => handlers::uptime::list_checks;
     GET "/api/v1/apps/{id}/uptime" => handlers::uptime::get_app_check;
     PUT "/api/v1/apps/{id}/uptime" => handlers::uptime::update_app_check;

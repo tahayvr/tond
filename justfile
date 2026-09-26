@@ -59,8 +59,8 @@ build-server:
     @echo "--- Building tond-server ---"
     cargo zigbuild -p tond-server --target {{ target }} --profile {{ profile }}
 
-# Run all checks: formatting, linting, and type checking for Rust and dashboard
-check: check-dashboard
+# Run all checks: formatting, linting, and type checking for Rust and dashboard; the docs build (with its link check)
+check: check-dashboard docs-build
     cargo fmt
     cargo check --quiet
     cargo clippy --all-targets --all-features -- -D warnings
@@ -93,6 +93,29 @@ test PKG="":
 openapi:
     TOND_UPDATE_OPENAPI=1 cargo nextest run -p tond-server openapi::generate --no-fail-fast
     cargo nextest run -p tond-server openapi
+
+# Docs site (tond.io/docs): live preview at http://localhost:4321/docs
+[working-directory('docs')]
+docs:
+    pnpm install --frozen-lockfile --silent
+    pnpm dev
+
+# Build the docs to docs/dist (static; API pages from docs/openapi.json, Pagefind search, link check)
+[working-directory('docs')]
+docs-build:
+    pnpm install --frozen-lockfile --silent
+    pnpm build
+
+# Regenerate the docs pages that come from the CLI (CLI reference, exit codes); tests fail when they're stale
+docs-gen:
+    cargo run -q -p tond-cli -- docs cli > docs/content/reference/cli.md
+    cargo run -q -p tond-cli -- help exit-codes --json > docs/src/data/exit-codes.json
+
+# Retake the dashboard screenshots in the docs (light + dark), from the mock dashboard; needs Chrome
+[working-directory('docs')]
+docs-screenshots:
+    pnpm install --frozen-lockfile --silent
+    pnpm screenshots
 
 # Run dev server for Dashboard
 [working-directory('dashboard')]

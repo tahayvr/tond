@@ -76,6 +76,7 @@ pub mod system_self;
 pub mod templates;
 pub mod terminal;
 pub mod tokens;
+pub mod updates;
 pub mod uptime;
 pub mod users;
 pub mod webhooks;

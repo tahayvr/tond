@@ -127,6 +127,7 @@ case "$TEST" in
         E2E_APPS_DOMAIN="$APPS_DOMAIN" \
         E2E_TARGET_IP="$IP" \
         E2E_CA_FILE="$CA_FILE" \
+        E2E_BUNDLE="$(cd "$BUNDLE" && pwd)" \
             "${HERE}/smoke.sh"
         ;;
     budget) "${HERE}/budget.sh" ${BUDGET_ARGS:-} ;;

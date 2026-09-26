@@ -1,6 +1,6 @@
 [Unit]
 Description=Tond Reverse Proxy
-Documentation=https://docs.tond.io
+Documentation=https://tond.io/docs
 After=network.target tond-server.service
 Wants=tond-server.service
 

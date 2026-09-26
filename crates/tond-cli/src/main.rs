@@ -44,7 +44,7 @@
 //   users <subcommand>             — list users, print a one-time password reset link
 //   scanner explain <path>         — show how TBuild would build a repository
 //   setup-link                     — print the first-run admin setup link again
-//   update [options]               — update tond-server to a newer version
+//   update [options]               — update Tond (snapshot first), --rollback, --check
 //   passwd                         — change dashboard account password
 //   completions <shell>            — shell completion script (bash, zsh, fish, …)
 //   help [command…|exit-codes]     — help for a command, or the exit-code table
@@ -82,7 +82,9 @@ Automation:
 Exit codes:
   0 ok  1 error  2 usage  3 not found  4 denied  5 conflict
   6 build/deploy failed  7 approval required  8 server unavailable
-  Details and the error codes behind each: tond help exit-codes";
+  Details and the error codes behind each: tond help exit-codes
+
+Docs: https://tond.io/docs (CLI reference: https://tond.io/docs/reference/cli)";
 
 #[derive(Parser)]
 #[command(
@@ -171,23 +173,57 @@ enum Commands {
         action: ScannerAction,
     },
 
-    /// Update Tond server to the latest version
+    /// Update Tond (takes a full snapshot first), roll it back, or check for a new release
+    #[command(
+        long_about = "Update Tond to the latest release (or --version), exactly like System → \
+                      Updates in the dashboard: tond-server takes a full snapshot, then \
+                      installs the release in the background, migrates the database, checks \
+                      that everything is healthy and rolls back automatically if not. This \
+                      command follows the progress and exits non-zero unless the update \
+                      succeeded.\n\nFor 7 days after an update, --rollback returns to the \
+                      previous version."
+    )]
     Update {
-        /// Update to specific version, without the v prefix (default: latest)
-        #[arg(short, long)]
+        /// Update to this release, without the v prefix (default: the latest)
+        #[arg(short, long, conflicts_with_all = ["rollback", "check"])]
         version: Option<String>,
 
-        /// Preview changes without applying them
+        /// Go back to the version before the last update (within 7 days)
+        #[arg(long, conflicts_with = "check")]
+        rollback: bool,
+
+        /// Only report the running and the latest version, and the changelog
+        #[arg(long)]
+        check: bool,
+
+        /// Don't take a snapshot first (not recommended)
+        #[arg(long, alias = "skip-backup")]
+        skip_snapshot: bool,
+
+        /// Reinstall the running version, or install an older release
+        #[arg(long)]
+        force: bool,
+
+        /// Update without tond-server: download, verify and run update.sh here
+        /// (also used when tond-server is down; no snapshot is taken)
+        #[arg(long)]
+        direct: bool,
+
+        /// Show what update.sh would do, without changing anything (implies --direct)
         #[arg(long)]
         dry_run: bool,
 
-        /// Skip database backup (not recommended)
-        #[arg(long)]
-        skip_backup: bool,
+        /// Run id to report progress under (set by tond-server)
+        #[arg(long, hide = true)]
+        run_id: Option<String>,
 
-        /// Force update even if already on latest version
-        #[arg(long)]
-        force: bool,
+        /// Who asked for the update (set by tond-server)
+        #[arg(long, hide = true)]
+        actor: Option<String>,
+
+        /// The snapshot taken before the update (set by tond-server)
+        #[arg(long, hide = true)]
+        snapshot_id: Option<String>,
     },
 
     /// View or update server-wide settings
@@ -247,6 +283,19 @@ enum Commands {
         /// Command path, or `exit-codes`
         topic: Vec<String>,
     },
+
+    /// Generate documentation from the CLI itself (used by `just docs-gen`)
+    #[command(hide = true)]
+    Docs {
+        #[command(subcommand)]
+        what: DocsTarget,
+    },
+}
+
+#[derive(Subcommand)]
+enum DocsTarget {
+    /// The CLI reference as Markdown (docs/content/reference/cli.md)
+    Cli,
 }
 
 /// The exit-code table with the error codes behind each exit code.
@@ -373,10 +422,36 @@ async fn run(cli: Cli, out: &Output) -> Result<()> {
         Commands::Scanner { action } => commands::scanner::handle(out, action).await,
         Commands::Update {
             version,
-            dry_run,
-            skip_backup,
+            rollback,
+            check,
+            skip_snapshot,
             force,
-        } => commands::update::handle(out, version, dry_run, skip_backup, force),
+            direct,
+            dry_run,
+            run_id,
+            actor,
+            snapshot_id,
+        } => {
+            let remote = cli.server.is_some();
+            commands::update::handle(
+                connect,
+                remote,
+                out,
+                commands::update::UpdateArgs {
+                    version,
+                    dry_run,
+                    skip_snapshot,
+                    force,
+                    rollback,
+                    check,
+                    direct,
+                    run_id,
+                    actor,
+                    snapshot_id,
+                },
+            )
+            .await
+        }
         Commands::Settings { action } => commands::settings::handle(&connect()?, out, action).await,
         Commands::StorageProvider { action } => {
             commands::storage_providers::handle(&connect()?, out, action).await
@@ -406,6 +481,12 @@ async fn run(cli: Cli, out: &Output) -> Result<()> {
             }
         }
         Commands::Help { topic } => print_help(out, &topic),
+        Commands::Docs {
+            what: DocsTarget::Cli,
+        } => {
+            out.raw(&commands::docs::cli_markdown(&Cli::command()));
+            Ok(())
+        }
     }
 }
 
@@ -558,8 +639,10 @@ mod tests {
             Commands::Update {
                 version,
                 dry_run,
-                skip_backup,
+                skip_snapshot,
                 force,
+                rollback,
+                ..
             } => {
                 assert_eq!(
                     version,
@@ -567,11 +650,44 @@ mod tests {
                     "update should preserve the requested target version"
                 );
                 assert!(dry_run, "update should parse --dry-run as true");
-                assert!(skip_backup, "update should parse --skip-backup as true");
+                assert!(
+                    skip_snapshot,
+                    "--skip-backup is an alias of --skip-snapshot"
+                );
                 assert!(force, "update should parse --force as true");
+                assert!(!rollback);
             }
             _ => panic!("expected Update command"),
         }
+    }
+
+    #[test]
+    fn cli_update_rollback_and_check_exclude_a_version() {
+        assert!(Cli::try_parse_from(["tond", "update", "--rollback"]).is_ok());
+        assert!(Cli::try_parse_from(["tond", "update", "--check"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["tond", "update", "--rollback", "--version", "1.0.0"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["tond", "update", "--check", "--rollback"]).is_err());
+        // What tond-server's unit runs.
+        let cli = Cli::try_parse_from([
+            "tond",
+            "update",
+            "--direct",
+            "--version",
+            "0.4.0",
+            "--run-id",
+            "r1",
+            "--actor",
+            "admin@example.com",
+            "--snapshot-id",
+            "s1",
+        ])
+        .unwrap_or_else(|err| panic!("{err}"));
+        assert!(matches!(
+            cli.command,
+            Commands::Update { direct: true, run_id: Some(ref r), .. } if r == "r1"
+        ));
     }
 
     #[test]

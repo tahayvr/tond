@@ -2274,6 +2274,32 @@
           }
         ]
       },
+      "CheckResponse": {
+        "properties": {
+          "checked_at": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "enabled",
+          "checked_at",
+          "error"
+        ],
+        "type": "object"
+      },
       "CheckSettingsResponse": {
         "properties": {
           "enabled": {
@@ -8664,6 +8690,41 @@
         ],
         "type": "object"
       },
+      "ReleaseResponse": {
+        "properties": {
+          "body": {
+            "description": "Release notes (Markdown).",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "published_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tag": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "version",
+          "tag",
+          "name",
+          "url",
+          "published_at",
+          "body"
+        ],
+        "type": "object"
+      },
       "RemoteBranchesRequest": {
         "description": "POST /api/v1/git/branches request body.",
         "properties": {
@@ -9286,6 +9347,36 @@
         ],
         "type": "object"
       },
+      "RollbackOption": {
+        "description": "What \"Roll back\" would do.",
+        "properties": {
+          "available_until": {
+            "description": "The offer ends then (Unix seconds).",
+            "format": "int64",
+            "type": "integer"
+          },
+          "backup_created_at": {
+            "description": "When the update being undone started (the database copy's age).",
+            "format": "int64",
+            "type": "integer"
+          },
+          "restores_database": {
+            "description": "Rolling back also puts back the database from before the update\n(changes made since are lost; a snapshot is taken first).",
+            "type": "boolean"
+          },
+          "to_version": {
+            "description": "The version it goes back to.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "to_version",
+          "backup_created_at",
+          "available_until",
+          "restores_database"
+        ],
+        "type": "object"
+      },
       "RouteLatency": {
         "description": "Latency histogram of one HTTP route.",
         "properties": {
@@ -9338,6 +9429,230 @@
           "buckets",
           "p50_ms",
           "p95_ms"
+        ],
+        "type": "object"
+      },
+      "RunKind": {
+        "enum": [
+          "update",
+          "rollback"
+        ],
+        "type": "string"
+      },
+      "RunResponse": {
+        "description": "<data>/update/status.json. update.sh writes the same fields.",
+        "properties": {
+          "actor": {
+            "default": "",
+            "type": "string"
+          },
+          "database_restored": {
+            "default": false,
+            "description": "The automatic rollback put the pre-update database back.",
+            "type": "boolean"
+          },
+          "effective_state": {
+            "$ref": "#/components/schemas/RunState",
+            "description": "`state` as written, except a run whose process vanished is `interrupted`."
+          },
+          "finished_at": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "from_version": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/RunKind"
+          },
+          "log": {
+            "description": "The last lines of the run's output.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "default": "",
+            "type": "string"
+          },
+          "pid": {
+            "default": null,
+            "description": "The process doing the current step (tond-server during the snapshot,\nthen update.sh).",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "snapshot_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "started_at": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "state": {
+            "$ref": "#/components/schemas/RunState"
+          },
+          "step": {
+            "description": "snapshot, download, backup, install, migrate, health, proxy, rollback, done",
+            "type": "string"
+          },
+          "to_version": {
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "state",
+          "step",
+          "from_version",
+          "to_version",
+          "actor",
+          "snapshot_id",
+          "started_at",
+          "updated_at",
+          "finished_at",
+          "message",
+          "pid",
+          "database_restored",
+          "effective_state",
+          "log"
+        ],
+        "type": "object"
+      },
+      "RunState": {
+        "oneOf": [
+          {
+            "enum": [
+              "running"
+            ],
+            "type": "string"
+          },
+          {
+            "const": "succeeded",
+            "description": "The new version (or, for a rollback, the previous one) is running.",
+            "type": "string"
+          },
+          {
+            "const": "failed",
+            "description": "Nothing was changed, or the rollback itself failed (the message says which).",
+            "type": "string"
+          },
+          {
+            "const": "rolled_back",
+            "description": "The update failed and the previous version is running again.",
+            "type": "string"
+          },
+          {
+            "const": "interrupted",
+            "description": "The process doing the work disappeared (never written to the file).",
+            "type": "string"
+          }
+        ]
+      },
+      "RunStatus": {
+        "description": "<data>/update/status.json. update.sh writes the same fields.",
+        "properties": {
+          "actor": {
+            "default": "",
+            "type": "string"
+          },
+          "database_restored": {
+            "default": false,
+            "description": "The automatic rollback put the pre-update database back.",
+            "type": "boolean"
+          },
+          "finished_at": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "from_version": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/RunKind"
+          },
+          "message": {
+            "default": "",
+            "type": "string"
+          },
+          "pid": {
+            "default": null,
+            "description": "The process doing the current step (tond-server during the snapshot,\nthen update.sh).",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "snapshot_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "started_at": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "state": {
+            "$ref": "#/components/schemas/RunState"
+          },
+          "step": {
+            "description": "snapshot, download, backup, install, migrate, health, proxy, rollback, done",
+            "type": "string"
+          },
+          "to_version": {
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "state",
+          "step",
+          "from_version",
+          "to_version",
+          "actor",
+          "snapshot_id",
+          "started_at",
+          "updated_at",
+          "finished_at",
+          "message",
+          "pid",
+          "database_restored"
         ],
         "type": "object"
       },
@@ -9941,6 +10256,40 @@
             "default": false,
             "description": "… or until the alert resolves",
             "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "StartRollbackRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "skip_snapshot": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "StartUpdateRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "force": {
+            "default": false,
+            "description": "Reinstall the running version, or install an older one.",
+            "type": "boolean"
+          },
+          "skip_snapshot": {
+            "default": false,
+            "description": "Don't take a snapshot first (not recommended).",
+            "type": "boolean"
+          },
+          "version": {
+            "default": null,
+            "description": "The version to install (default: the latest release).",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "type": "object"
@@ -11721,6 +12070,85 @@
         },
         "type": "object"
       },
+      "UpdateOverview": {
+        "properties": {
+          "changelog": {
+            "description": "Releases newer than the running version, newest first.",
+            "items": {
+              "$ref": "#/components/schemas/ReleaseResponse"
+            },
+            "type": "array"
+          },
+          "check": {
+            "$ref": "#/components/schemas/CheckResponse"
+          },
+          "current_version": {
+            "type": "string"
+          },
+          "latest": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReleaseResponse"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The newest published release (may equal the current version)."
+          },
+          "rollback": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RollbackOption"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "\"Roll back to the previous version\", when offered."
+          },
+          "run": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunResponse"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The current or last update/rollback run."
+          },
+          "schema_version": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "unsupported_reason": {
+            "description": "Why the dashboard can't run updates on this server (no systemd, …).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "update_available": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "current_version",
+          "schema_version",
+          "latest",
+          "update_available",
+          "changelog",
+          "check",
+          "run",
+          "rollback",
+          "unsupported_reason"
+        ],
+        "type": "object"
+      },
       "UpdatePortRequest": {
         "properties": {
           "container_port": {
@@ -11842,6 +12270,18 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "UpdateSettingsRequest2": {
+        "additionalProperties": false,
+        "properties": {
+          "check_enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "check_enabled"
+        ],
         "type": "object"
       },
       "UpdateSourceRequest": {
@@ -28573,7 +29013,7 @@
         "x-tond-scopes": []
       },
       "put": {
-        "operationId": "update_settings",
+        "operationId": "settings_update_settings",
         "parameters": [
           {
             "$ref": "#/components/parameters/IdempotencyKey"
@@ -31112,6 +31552,394 @@
         ],
         "x-tond-scopes": [
           "metrics:read"
+        ]
+      }
+    },
+    "/api/v1/system/update": {
+      "get": {
+        "operationId": "get_update",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/UpdateOverview"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Running version, latest release, changelog, update run and rollback offer",
+        "tags": [
+          "System"
+        ],
+        "x-tond-scopes": [
+          "metrics:read"
+        ]
+      },
+      "post": {
+        "operationId": "start_update",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StartUpdateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/RunStatus"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Accepted: the work continues in the background."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Update Tond: a full snapshot, then the update in tond-update.service (automatic rollback on failure)",
+        "tags": [
+          "System"
+        ],
+        "x-tond-scopes": [
+          "settings:write"
+        ]
+      }
+    },
+    "/api/v1/system/update/check": {
+      "post": {
+        "operationId": "check_now",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/UpdateOverview"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Look for new Tond releases now (at most once a minute)",
+        "tags": [
+          "System"
+        ],
+        "x-tond-scopes": [
+          "settings:write"
+        ]
+      }
+    },
+    "/api/v1/system/update/rollback": {
+      "post": {
+        "operationId": "start_rollback",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StartRollbackRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/RunStatus"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Accepted: the work continues in the background."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Roll back to the version before the last update (within 7 days)",
+        "tags": [
+          "System"
+        ],
+        "x-tond-scopes": [
+          "settings:write"
+        ]
+      }
+    },
+    "/api/v1/system/update/settings": {
+      "put": {
+        "operationId": "updates_update_settings",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateSettingsRequest2"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/UpdateOverview"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Turn the daily update check on or off",
+        "tags": [
+          "System"
+        ],
+        "x-tond-scopes": [
+          "settings:write"
         ]
       }
     },

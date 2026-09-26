@@ -114,6 +114,7 @@ mod snapshot_archive;
 mod state;
 mod static_files;
 mod storage;
+mod updates;
 mod upload;
 mod uptime;
 mod volumes;
@@ -236,6 +237,10 @@ async fn run() -> Result<()> {
     // Finish what a previous process left behind (and resume queued deploys)
     // before anything new starts.
     reconcile::at_startup(&state).await;
+
+    // An update or rollback that finished while the server was down (or
+    // restored an older database) gets its audit entry now.
+    updates::audit_finished_run(&state.db, &updates::run::Paths::from_env()).await;
 
     // Background loops. Each sleeps until its next deadline or until a table
     // it watches changes (runtime/changes.rs), so an idle server barely wakes.

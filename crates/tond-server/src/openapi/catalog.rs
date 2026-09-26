@@ -19,7 +19,7 @@ use tond_common::*;
 
 use crate::handlers::{
     self, domains::DomainCheckResponse, git::RemoteBranchesResponse, host, images,
-    onboarding::OnboardingStatusResponse, terminal, tokens::WhoAmIResponse, uptime,
+    onboarding::OnboardingStatusResponse, terminal, tokens::WhoAmIResponse, updates, uptime,
     users::AdminUserResponse,
 };
 use crate::metrics::{docker_host, host_history};
@@ -354,6 +354,11 @@ pub fn entries() -> Vec<Doc> {
         e("GET /api/v1/system/heartbeat", "Outbound heartbeat settings and status").returns::<host::HeartbeatResponse>(),
         e("PUT /api/v1/system/heartbeat", "Configure the outbound heartbeat").returns::<host::HeartbeatResponse>(),
         e("POST /api/v1/system/heartbeat/test", "Send a test heartbeat").returns::<host::HeartbeatTestResponse>(),
+        e("GET /api/v1/system/update", "Running version, latest release, changelog, update run and rollback offer").returns::<updates::UpdateOverview>(),
+        e("POST /api/v1/system/update", "Update Tond: a full snapshot, then the update in tond-update.service (automatic rollback on failure)").accepted().returns::<crate::updates::run::RunStatus>(),
+        e("POST /api/v1/system/update/rollback", "Roll back to the version before the last update (within 7 days)").accepted().returns::<crate::updates::run::RunStatus>(),
+        e("POST /api/v1/system/update/check", "Look for new Tond releases now (at most once a minute)").returns::<updates::UpdateOverview>(),
+        e("PUT /api/v1/system/update/settings", "Turn the daily update check on or off").returns::<updates::UpdateOverview>(),
         e("GET /api/v1/uptime", "Uptime of every check").returns::<Vec<uptime::UptimeSummaryResponse>>(),
         e("GET /api/v1/apps/{id}/uptime", "An app's uptime check").returns::<uptime::UptimeCheckResponse>(),
         e("PUT /api/v1/apps/{id}/uptime", "Configure an app's uptime check").returns::<uptime::UptimeCheckResponse>(),

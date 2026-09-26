@@ -2866,6 +2866,104 @@ export async function testHeartbeat(): Promise<HeartbeatOutcome & { heartbeat: H
 	});
 }
 
+// ── Tond updates (System → Updates) ──
+
+/** A published Tond release. */
+export interface TondRelease {
+	version: string;
+	tag: string;
+	name: string;
+	url: string;
+	published_at: string | null;
+	/** Release notes (Markdown). */
+	body: string;
+}
+
+export type UpdateRunKind = 'update' | 'rollback';
+export type UpdateRunState = 'running' | 'succeeded' | 'failed' | 'rolled_back' | 'interrupted';
+
+/** An update or rollback run (status.json on the server). */
+export interface UpdateRun {
+	id: string;
+	kind: UpdateRunKind;
+	/** As written by the run; see `effective_state`. */
+	state: UpdateRunState;
+	/** snapshot, download, backup, install, migrate, health, proxy, rollback, done */
+	step: string;
+	from_version: string;
+	to_version: string;
+	actor: string;
+	snapshot_id: string | null;
+	/** Unix seconds. */
+	started_at: number;
+	updated_at: number;
+	finished_at: number | null;
+	message: string;
+	pid: number | null;
+	/** The automatic rollback put the pre-update database back. */
+	database_restored: boolean;
+	/** `state`, except a run whose process vanished is `interrupted`. */
+	effective_state: UpdateRunState;
+	/** The last lines of the run's output. */
+	log: string[];
+}
+
+export interface UpdateRollbackOption {
+	to_version: string;
+	backup_created_at: number;
+	available_until: number;
+	/** Rolling back also restores the database from before the update. */
+	restores_database: boolean;
+}
+
+export interface UpdateOverview {
+	current_version: string;
+	schema_version: number | null;
+	latest: TondRelease | null;
+	update_available: boolean;
+	/** Releases newer than the running version, newest first. */
+	changelog: TondRelease[];
+	check: { enabled: boolean; checked_at: number | null; error: string | null };
+	run: UpdateRun | null;
+	rollback: UpdateRollbackOption | null;
+	/** Why updates can't run from the dashboard on this server. */
+	unsupported_reason: string | null;
+}
+
+export async function getUpdateOverview(): Promise<UpdateOverview> {
+	return request<UpdateOverview>('/system/update');
+}
+
+/** Look for new releases now (throttled to once a minute by the server). */
+export async function checkForUpdates(): Promise<UpdateOverview> {
+	return request<UpdateOverview>('/system/update/check', { method: 'POST' });
+}
+
+/** Snapshot, then update in the background. Returns the new run. */
+export async function startUpdate(
+	options: { version?: string; skip_snapshot?: boolean; force?: boolean } = {}
+): Promise<UpdateRun> {
+	return request<UpdateRun>('/system/update', {
+		method: 'POST',
+		body: JSON.stringify(options)
+	});
+}
+
+/** Roll back to the version before the last update. */
+export async function startRollback(options: { skip_snapshot?: boolean } = {}): Promise<UpdateRun> {
+	return request<UpdateRun>('/system/update/rollback', {
+		method: 'POST',
+		body: JSON.stringify(options)
+	});
+}
+
+export async function setUpdateCheck(checkEnabled: boolean): Promise<UpdateOverview> {
+	return request<UpdateOverview>('/system/update/settings', {
+		method: 'PUT',
+		body: JSON.stringify({ check_enabled: checkEnabled })
+	});
+}
+
 // ── Uptime checks ──
 
 export type UptimeStatus = 'up' | 'down' | 'paused' | 'pending';
@@ -4477,7 +4575,7 @@ export interface Snapshot {
 	id: string;
 	name: string;
 	status: string; // "pending" | "running" | "completed" | "failed"
-	trigger: string; // "scheduled" | "manual" | "pre_deploy" | "pre_restore"
+	trigger: string; // "scheduled" | "manual" | "pre_deploy" | "pre_restore" | "pre_update" | "pre_upgrade"
 	scope: string; // "full" | "app:name" | "database:name"
 	trigger_app: string | null;
 	deployment_id: string | null;

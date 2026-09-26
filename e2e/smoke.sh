@@ -32,6 +32,8 @@ set -euo pipefail
 #   E2E_CLEANUP           1 to delete the created resources at the end (default: 0)
 #   E2E_ADMIN_EMAIL       admin account the auth checks create (via the setup token)
 #   E2E_ADMIN_PASSWORD    or sign in with on re-runs (defaults below)
+#   E2E_BUNDLE            the installed release bundle (set by run.sh); enables the
+#                         update.sh install/rollback checks of the self-update step
 
 BASE="${E2E_BASE_DOMAIN:?E2E_BASE_DOMAIN is required}"
 DASH="${E2E_DASHBOARD_DOMAIN:-dash.${BASE}}"
@@ -2148,6 +2150,109 @@ if (( proxy_lines > 20 )); then
     fail "tond-proxy wrote ${proxy_lines} journal lines for 200 requests (expected ≤ 20)"
 fi
 pass "tond-proxy journal stays quiet under traffic (${proxy_lines} lines for 200 requests)"
+
+step "Self-update: version check, update runs, automatic rollback (System → Updates)"
+UPDATE_STATUS="${DATA_DIR}/update/status.json"
+overview=$(api /api/v1/system/update)
+CURRENT_VERSION=$(jq -r .data.current_version <<<"$overview")
+[[ -n "$CURRENT_VERSION" && "$CURRENT_VERSION" != null ]] || fail "GET /system/update must report the running version"
+jq -e '.data.schema_version >= 60' <<<"$overview" > /dev/null || fail "GET /system/update must report the schema version"
+jq -e '.data.unsupported_reason == null' <<<"$overview" > /dev/null \
+    || fail "updates must be possible from the dashboard here: $(jq -r .data.unsupported_reason <<<"$overview")"
+pass "GET /system/update reports Tond ${CURRENT_VERSION} and that it can update itself"
+# The release check, against a local releases file instead of GitHub.
+cat > "${DATA_DIR}/e2e-releases.json" <<'JSON'
+[{"tag_name":"v99.0.0","name":"Tond 99.0.0","body":"## Highlights\n- e2e release notes","html_url":"https://github.com/tahayvr/tond/releases/tag/v99.0.0","published_at":"2026-09-20T10:00:00Z","draft":false,"prerelease":false},
+ {"tag_name":"v99.1.0-rc.1","name":"rc","body":"","html_url":"x","published_at":null,"draft":false,"prerelease":true}]
+JSON
+printf '[Service]\nEnvironment=TOND_UPDATE_RELEASES_URL=file://%s/e2e-releases.json\n' "$DATA_DIR" \
+    > /etc/systemd/system/tond-server.service.d/e2e-releases.conf
+systemctl daemon-reload
+systemctl restart tond-server
+wait_for 30 "API health after restart" curl -sf http://127.0.0.1:3001/health
+[[ "$(api_req POST /api/v1/system/update/check '{}')" == 200 ]] || fail "POST /system/update/check failed: $(cat "$API_BODY")"
+jq -e '.data.update_available and .data.latest.version == "99.0.0" and (.data.changelog | length == 1) and (.data.changelog[0].body | contains("e2e release notes"))' "$API_BODY" > /dev/null \
+    || fail "the release check must find 99.0.0 (and skip the pre-release): $(cat "$API_BODY")"
+pass "the release check finds a newer release with its notes and skips pre-releases"
+[[ "$(api_req PUT /api/v1/system/update/settings '{"check_enabled":false}')" == 200 ]] || fail "turning the daily check off failed"
+jq -e '.data.check.enabled == false' "$API_BODY" > /dev/null || fail "the daily check must be off"
+api_req PUT /api/v1/system/update/settings '{"check_enabled":true}' > /dev/null
+pass "the daily update check can be turned off and on"
+code=$(api_req POST /api/v1/system/update/rollback '{}')
+[[ "$code" == 400 ]] && jq -e '.error.message | test("7 days")' "$API_BODY" > /dev/null \
+    || fail "rollback without a previous version must be refused (${code}): $(cat "$API_BODY")"
+pass "no rollback is offered before an update"
+code=$(api_req POST /api/v1/system/update '{"version":"0.0.1"}')
+[[ "$code" == 400 ]] || fail "installing an older release without force must be refused (${code})"
+pass "an older release is refused without force"
+
+# An update that can't be downloaded: snapshot, transient unit, failure,
+# nothing changed.
+[[ "$(api_req POST /api/v1/system/update '{"version":"99.0.0"}')" == 202 ]] || fail "POST /system/update failed: $(cat "$API_BODY")"
+RUN_ID=$(jq -r .data.id "$API_BODY")
+code=$(api_req POST /api/v1/system/update '{"version":"99.0.0"}')
+[[ "$code" == 409 ]] || fail "a second update while one runs must be refused with 409 (got ${code})"
+wait_for 300 "the 99.0.0 update run to finish" \
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/system/update | jq -e --arg id '$RUN_ID' '.data.run.id == \$id and .data.run.effective_state != \"running\"'"
+run=$(api /api/v1/system/update | jq -c .data.run)
+[[ "$(jq -r .effective_state <<<"$run")" == failed ]] || fail "an update that can't be downloaded must fail: $run"
+jq -e '.message | test("Nothing was changed")' <<<"$run" > /dev/null || fail "the failure must say nothing changed: $run"
+jq -e '.snapshot_id != null' <<<"$run" > /dev/null || fail "the run must record its pre-update snapshot: $run"
+api /api/v1/snapshots | jq -e '.data[] | select(.trigger == "pre_update" and .status == "completed")' > /dev/null \
+    || fail "a completed pre_update snapshot must exist"
+[[ "$(api /api/v1/system/update | jq -r .data.current_version)" == "$CURRENT_VERSION" ]] || fail "the running version must not change"
+systemctl is-active --quiet tond-update.service && fail "tond-update.service must be gone after the run"
+wait_for 30 "the update's audit entries" bash -c "curl -sf --unix-socket '$SOCK' 'http://localhost/api/v1/audit-log?action=tond_update&limit=1' | jq -e '.data.entries[0].detail | test(\"99.0.0\")'"
+api '/api/v1/audit-log?action=tond_update_start&limit=1' | jq -e '.data.entries | length == 1' > /dev/null \
+    || fail "starting an update must be audited"
+pass "an update that can't be downloaded: pre-update snapshot, tond-update.service, failed with nothing changed, audited"
+
+if [[ -n "${E2E_BUNDLE:-}" && -d "${E2E_BUNDLE}" ]]; then
+    # update.sh with a local bundle, as the unit runs it after verifying a download.
+    TOND_UPDATE_HEALTH_TIMEOUT=60 /opt/tond/bin/update.sh --bundle "$E2E_BUNDLE" --force \
+        --run-id e2e-reinstall --actor e2e > /tmp/e2e-update.log 2>&1 \
+        || { cat /tmp/e2e-update.log >&2; fail "update.sh --bundle --force must succeed"; }
+    jq -e '.state == "succeeded"' "$UPDATE_STATUS" > /dev/null || fail "the reinstall must end succeeded: $(cat "$UPDATE_STATUS")"
+    wait_for 30 "API health after the reinstall" curl -sf http://127.0.0.1:3001/health
+    systemctl is-active --quiet tond-proxy || fail "tond-proxy must run after the reinstall"
+    wait_for 60 "route after the reinstall" bash -c "curl -sk --resolve '${WHOAMI_DOMAIN}:443:${IP}' 'https://${WHOAMI_DOMAIN}/' | grep -q Hostname:"
+    backup=$(find "${DATA_DIR}/backups" -maxdepth 1 -name 'tond_backup_*' | sort | tail -n 1)
+    [[ -f "${backup}/tond.db" && -f "${backup}/bin/tond-server" ]] || fail "the update must back up the database and binaries (${backup})"
+    grep -q '^MIGRATED=0$' "${backup}/info.env" || fail "reinstalling the same version must record no migration: $(cat "${backup}/info.env")"
+    [[ "$(perms "${DATA_DIR}/update")" == "700 root root" ]] || fail "the update directory must be root-only ($(perms "${DATA_DIR}/update"))"
+    pass "update.sh reinstalls from a bundle: backup with the database, services and routes back, status succeeded"
+
+    # A "new version" whose tond-server never comes up: the health check fails
+    # and the previous version comes back on its own.
+    NEXT="$(mktemp -d)/bundle"
+    cp -a "$E2E_BUNDLE" "$NEXT"
+    printf '#!/bin/sh\necho "e2e: this tond-server never starts" >&2\nexit 1\n' > "${NEXT}/tond-server"
+    chmod +x "${NEXT}/tond-server"
+    before_db=$(sha256sum "${DATA_DIR}/tond.db" | awk '{print $1}')
+    rc=0
+    TOND_UPDATE_HEALTH_TIMEOUT=20 /opt/tond/bin/update.sh --bundle "$NEXT" --force \
+        --run-id e2e-rollback --actor e2e > /tmp/e2e-update.log 2>&1 || rc=$?
+    [[ "$rc" == 1 ]] || { cat /tmp/e2e-update.log >&2; fail "an unhealthy update must exit 1 after rolling back (got ${rc})"; }
+    jq -e '.state == "rolled_back" and (.message | test("did not become healthy"))' "$UPDATE_STATUS" > /dev/null \
+        || fail "the update must be rolled back: $(cat "$UPDATE_STATUS")"
+    wait_for 30 "API health after the rollback" curl -sf http://127.0.0.1:3001/health
+    [[ "$(api /api/v1/system/update | jq -r .data.current_version)" == "$CURRENT_VERSION" ]] || fail "the previous version must run again"
+    [[ "$(tr -d 'v[:space:]' < /opt/tond/VERSION)" == "$(tr -d 'v[:space:]' < "${E2E_BUNDLE}/VERSION")" ]] || fail "VERSION must be restored"
+    systemctl is-active --quiet tond-proxy || fail "tond-proxy must run after the rollback"
+    wait_for 60 "route after the rollback" bash -c "curl -sk --resolve '${WHOAMI_DOMAIN}:443:${IP}' 'https://${WHOAMI_DOMAIN}/' | grep -q Hostname:"
+    [[ "$(app_field e2e-whoami status)" == running ]] || fail "apps must keep running through a failed update"
+    after_db=$(sha256sum "${DATA_DIR}/tond.db" | awk '{print $1}')
+    jq -e '.database_restored == true' "$UPDATE_STATUS" > /dev/null \
+        || fail "a server that never started may have half-migrated: the database copy must come back"
+    [[ -n "$before_db" && -n "$after_db" ]] || fail "could not hash tond.db"
+    cmp -s /opt/tond/bin/tond-server "${E2E_BUNDLE}/tond-server" || fail "the working tond-server binary must be back"
+    pass "an update whose server never starts rolls back by itself: binaries and database back, services and routes up, status rolled_back"
+    rm -rf "$(dirname "$NEXT")"
+fi
+rm -f /etc/systemd/system/tond-server.service.d/e2e-releases.conf "${DATA_DIR}/e2e-releases.json"
+systemctl daemon-reload
+systemctl restart tond-server
+wait_for 30 "API health after restart" curl -sf http://127.0.0.1:3001/health
 
 if [[ "$CLEANUP" == 1 ]]; then
     step "Cleanup"
