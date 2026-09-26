@@ -27,10 +27,10 @@ use axum::{
     Json,
     body::Bytes,
     extract::{
-        Path, Query, State,
+        Path, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
 };
 use serde::Deserialize;
@@ -39,8 +39,8 @@ use tokio::sync::broadcast;
 use tond_common::*;
 
 use crate::{
-    audit_log::{AuthActor, write_audit_log},
-    auth::{LocalPeer, RateLimit, RequireAuth},
+    audit_log::write_audit_log,
+    auth::{Authz, MaybePrincipal, Principal, RateLimit, principal::AuthFailure, scope},
     deploy::{self, images},
     error::AppError,
     handlers,
@@ -49,7 +49,7 @@ use crate::{
 };
 
 use super::fetch_app;
-use super::logs::{self, LogStreamQuery};
+use super::logs;
 
 /// POST /api/apps/{id}/rollback body (optional).
 #[derive(Debug, Default, Deserialize)]
@@ -170,7 +170,7 @@ fn deployment_responses(app: &App, deployments: Vec<Deployment>) -> Vec<Deployme
 
 pub async fn list_deployments(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsRead>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -193,9 +193,7 @@ pub async fn list_deployments(
 
 pub async fn rollback_app(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
-    LocalPeer(local): LocalPeer,
+    auth: Authz<scope::AppsRollback>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     body: Bytes,
@@ -230,7 +228,7 @@ pub async fn rollback_app(
 
     let app_name = app.name.clone();
     let app_id = app.id.clone();
-    let detail = handlers::deploy_trigger(local, &actor.0).1;
+    let detail = handlers::deploy_trigger(&auth).1;
     let deployment_id = deploy::start(
         &state,
         app,
@@ -251,7 +249,7 @@ pub async fn rollback_app(
         Some(&app_id),
         Some(&app_name),
         "rollback",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!(
             "deployment={} image_tag={} rollback_deployment={}",
             target_id, image_tag, deployment_id
@@ -337,7 +335,7 @@ async fn deployment_logs(
 /// GET /api/apps/{id}/deployments/{deployment_id}
 pub async fn get_deployment(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<(scope::AppsRead, scope::LogsRead)>,
     State(state): State<AppState>,
     Path((id, deployment_id)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -371,13 +369,9 @@ pub async fn stream_deployment(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     Path((id, deployment_id)): Path<(String, String)>,
-    Query(query): Query<LogStreamQuery>,
-    headers: HeaderMap,
-    LocalPeer(local): LocalPeer,
+    MaybePrincipal(auth): MaybePrincipal,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| {
-        handle_deployment_socket(socket, state, id, deployment_id, query, headers, local)
-    })
+    ws.on_upgrade(move |socket| handle_deployment_socket(socket, state, id, deployment_id, auth))
 }
 
 fn is_finished(status: &str) -> bool {
@@ -389,12 +383,10 @@ async fn handle_deployment_socket(
     state: AppState,
     id: String,
     deployment_id: String,
-    query: LogStreamQuery,
-    headers: HeaderMap,
-    local: bool,
+    auth: Result<Principal, AuthFailure>,
 ) {
-    if !logs::authenticate(&state, &query, &headers, local).await {
-        logs::close_with(&mut socket, 4001, "Authentication required").await;
+    if let Err((code, reason)) = logs::authorize(&state, auth, Scope::LogsRead, Some(&id)).await {
+        logs::close_with(&mut socket, code, reason).await;
         return;
     }
     let Ok(app) = fetch_app(&state.db, &id).await else {
@@ -492,7 +484,7 @@ async fn handle_deployment_socket(
 
 pub async fn get_generated_dockerfile(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsRead>,
     State(state): State<AppState>,
     Path((id, deployment_id)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -531,6 +523,7 @@ mod tests {
     use tond_common::ServerSettings;
 
     use super::*;
+    use crate::auth::Principal;
     use crate::{auth::RateLimiter, state::AppState};
 
     async fn test_state() -> AppState {
@@ -758,7 +751,7 @@ mod tests {
 
         let response = get_deployment(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Path(("frontend".to_string(), "dep-1".to_string())),
         )
@@ -804,7 +797,7 @@ mod tests {
 
         let response = get_generated_dockerfile(
             RateLimit,
-            RequireAuth,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state),
             Path(("app-1".to_string(), "dep-1".to_string())),
         )

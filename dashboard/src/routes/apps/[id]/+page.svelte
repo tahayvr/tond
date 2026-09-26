@@ -47,7 +47,7 @@
 		openLogStream
 	} from '$lib/api';
 	import { goto } from '$app/navigation';
-	import { isAdmin } from '$lib/auth.svelte';
+	import { can, isAdmin } from '$lib/auth.svelte';
 	import { setUiContext, clearUiContext, appContext, openFeedPanel } from '$lib/ui-context.svelte';
 	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import ConfirmDeleteDialog from '$lib/components/dialogs/confirm-delete-dialog.svelte';
@@ -842,7 +842,7 @@
 
 	// Log stream only while the Logs tab is open; restarts for a different app.
 	$effect(() => {
-		if (activeTab !== 'logs') return;
+		if (activeTab !== 'logs' || !can('logs:read')) return;
 		void appId;
 		untrack(startLogStream);
 		return stopLogStream;
@@ -920,7 +920,12 @@
 						<SpinnerIcon class="animate-spin" /> View deploy
 					</Button>
 				{/if}
-				<Button size="sm" onclick={handleDeploy} disabled={deploying}>
+				<Button
+					size="sm"
+					onclick={handleDeploy}
+					disabled={deploying || !can('apps:deploy')}
+					title={can('apps:deploy') ? undefined : "Your role can't deploy apps"}
+				>
 					{deploying ? 'Starting…' : 'Re-deploy'}
 				</Button>
 				<Button variant="destructive" size="sm" onclick={() => (showDeleteDialog = true)}>
@@ -955,14 +960,18 @@
 
 			<!-- Logs tab -->
 			<Tabs.Content value="logs">
-				<AppLogs
-					appName={app.name}
-					{logLines}
-					streaming={logStreaming}
-					onConnect={startLogStream}
-					onStop={stopLogStream}
-					onClear={() => logBuffer.clear()}
-				/>
+				{#if can('logs:read')}
+					<AppLogs
+						appName={app.name}
+						{logLines}
+						streaming={logStreaming}
+						onConnect={startLogStream}
+						onStop={stopLogStream}
+						onClear={() => logBuffer.clear()}
+					/>
+				{:else}
+					<p class="pt-4 text-sm text-muted-foreground">Your role can't read logs.</p>
+				{/if}
 			</Tabs.Content>
 
 			<!-- Deployments tab -->
@@ -974,6 +983,7 @@
 					loading={deploymentsLoading}
 					error={rollbackError}
 					onRollback={handleRollback}
+					canRollback={can('apps:rollback')}
 					onViewGeneratedDockerfile={handleViewGeneratedDockerfile}
 				/>
 			</Tabs.Content>
@@ -993,13 +1003,24 @@
 
 			<!-- Domain tab -->
 			<Tabs.Content value="domain">
-				<AppDomain {app} {certRefreshKey} onUpdate={handleUpdateDomain} />
+				<AppDomain
+					{app}
+					{certRefreshKey}
+					onUpdate={handleUpdateDomain}
+					canEdit={can('apps:write')}
+				/>
 			</Tabs.Content>
 
 			<!-- Health tab (port, health check, deploy timeout) -->
 			<Tabs.Content value="health" class="space-y-6">
 				<div class="pt-4">
-					<AppPort {app} onSaved={(updated) => (app = updated)} onRedeploy={startDeploy} />
+					<AppPort
+						{app}
+						onSaved={(updated) => (app = updated)}
+						onRedeploy={startDeploy}
+						canEdit={can('apps:write')}
+						canDeploy={can('apps:deploy')}
+					/>
 				</div>
 				<Separator />
 				<AppHealth

@@ -23,6 +23,7 @@ uuid = { workspace = true }
 futures = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-tungstenite = { workspace = true }
+urlencoding = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }

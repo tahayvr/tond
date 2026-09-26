@@ -36,6 +36,8 @@
 		/** Restore a deployment's exact image */
 		onRollback: (deploymentId: string) => void | Promise<void>;
 		onViewGeneratedDockerfile: (deploymentId: string) => Promise<string>;
+		/** The user may roll back (apps:rollback). */
+		canRollback?: boolean;
 	}
 
 	let {
@@ -45,7 +47,8 @@
 		loading,
 		error,
 		onRollback,
-		onViewGeneratedDockerfile
+		onViewGeneratedDockerfile,
+		canRollback = true
 	}: Props = $props();
 	let dockerfileDialogOpen = $state(false);
 	let dockerfileLoading = $state(false);
@@ -115,7 +118,7 @@
 						<Button
 							variant="outline"
 							size="sm"
-							disabled={!previousTarget}
+							disabled={!previousTarget || !canRollback}
 							onclick={() => previousTarget && handleAskRestore(previousTarget)}
 						>
 							<HistoryIcon class="size-4" />
@@ -267,7 +270,9 @@
 								Dockerfile
 							</Button>
 						{/if}
-						{#if d.rollback_available}
+						{#if !canRollback}
+							<!-- This role cannot roll back. -->
+						{:else if d.rollback_available}
 							<Button
 								variant="outline"
 								size="sm"

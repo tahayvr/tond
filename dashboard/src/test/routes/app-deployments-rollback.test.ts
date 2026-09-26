@@ -118,4 +118,12 @@ describe('app deployments', () => {
 		});
 		expect(screen.getByRole('button', { name: /roll back to previous/i })).toBeDisabled();
 	});
+
+	it('offers no rollback to roles without apps:rollback', () => {
+		render(AppDeploymentsHarness, {
+			props: { deployments, onRollback: vi.fn(), canRollback: false }
+		});
+		expect(screen.queryByRole('button', { name: /roll back to this/i })).not.toBeInTheDocument();
+		expect(screen.getByRole('button', { name: /roll back to previous/i })).toBeDisabled();
+	});
 });

@@ -12,9 +12,13 @@
 		onSaved: (app: App) => void;
 		/** Start a deploy after saving (the port applies on the next deploy). */
 		onRedeploy: () => Promise<void>;
+		/** The user may change app settings (apps:write). */
+		canEdit?: boolean;
+		/** The user may deploy (apps:deploy). */
+		canDeploy?: boolean;
 	}
 
-	let { app, onSaved, onRedeploy }: Props = $props();
+	let { app, onSaved, onRedeploy, canEdit = true, canDeploy = true }: Props = $props();
 
 	let port = $state<number | null>(untrack(() => app.container_port));
 	let saving = $state(false);
@@ -68,14 +72,21 @@
 				min={1}
 				max={65535}
 				class="w-32"
-				disabled={saving}
+				disabled={saving || !canEdit}
 			/>
 		</div>
-		<Button variant="outline" onclick={() => save(false)} disabled={saving || !changed}>
+		<Button variant="outline" onclick={() => save(false)} disabled={saving || !changed || !canEdit}>
 			{saving ? 'Saving…' : 'Save'}
 		</Button>
-		<Button onclick={() => save(true)} disabled={saving || !changed}>Save and redeploy</Button>
+		{#if canDeploy}
+			<Button onclick={() => save(true)} disabled={saving || !changed || !canEdit}
+				>Save and redeploy</Button
+			>
+		{/if}
 	</div>
+	{#if !canEdit}
+		<p class="text-xs text-muted-foreground">Your role can't change app settings.</p>
+	{/if}
 	{#if error}
 		<p class="rounded bg-destructive/10 px-3 py-2 text-xs text-destructive" role="alert">{error}</p>
 	{:else if saved}

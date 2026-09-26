@@ -43,7 +43,7 @@
 	import GlobeIcon from '~icons/ri/global-line';
 	import LockIcon from '~icons/ri/lock-line';
 	import AlertIcon from '~icons/ri/alert-line';
-	import { isAdmin } from '$lib/auth.svelte';
+	import { can, isAdmin } from '$lib/auth.svelte';
 	import type { PageProps } from './$types';
 
 	let { data, params }: PageProps = $props();
@@ -653,7 +653,9 @@
 
 			<!-- ── Logs tab (streams only while open) ── -->
 			<Tabs.Content value="logs" class="mt-4">
-				{#if activeTab === 'logs'}
+				{#if activeTab === 'logs' && !can('logs:read')}
+					<p class="text-sm text-muted-foreground">Your role can't read logs.</p>
+				{:else if activeTab === 'logs'}
 					<StreamLogViewer
 						wsUrl="/api/databases/{db.id}/logs/stream"
 						downloadName="{db.name}-logs"

@@ -24,6 +24,7 @@
 	} from '$lib/deploy-view';
 	import { setUiContext, clearUiContext, appContext } from '$lib/ui-context.svelte';
 	import { cn } from '$lib/utils';
+	import { can } from '$lib/auth.svelte';
 	import Breadcrumb from '$lib/components/nav/breadcrumb.svelte';
 	import LogViewer from '$lib/components/logs/log-viewer.svelte';
 	import DeploySteps from '$lib/components/deploy/deploy-steps.svelte';
@@ -219,7 +220,7 @@
 			{deployment}
 			appId={app.id}
 			domain={app.domain}
-			onRedeploy={handleRedeploy}
+			onRedeploy={can('apps:deploy') ? handleRedeploy : undefined}
 			{redeploying}
 		/>
 	{/if}

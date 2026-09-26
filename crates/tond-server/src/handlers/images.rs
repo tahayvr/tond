@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use tond_common::{ApiResponse, TondError};
 
 use crate::{
-    auth::{RateLimit, RequireAuth},
+    auth::{Authz, RateLimit, scope},
     deploy,
     error::AppError,
     state::AppState,
@@ -83,7 +83,7 @@ pub fn suggest_port(exposed: &[u16], env_port: Option<u16>) -> Option<u16> {
 
 pub async fn inspect_image(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsWrite>,
     State(state): State<AppState>,
     Json(req): Json<InspectImageRequest>,
 ) -> Result<impl IntoResponse, AppError> {

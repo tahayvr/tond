@@ -8,7 +8,7 @@ import {
 } from '$lib/api';
 
 export async function load() {
-	const [projects, apps, databases, cronJobs, recentActivity, settings] = await Promise.all([
+	const [projects, apps, databases, cronJobs, activity, settings] = await Promise.all([
 		listProjects(),
 		listApps(),
 		listDatabases(),
@@ -16,6 +16,7 @@ export async function load() {
 		listAuditLog({ limit: 5 }),
 		getSettings()
 	]);
+	const recentActivity = activity.entries;
 
 	return {
 		projects,

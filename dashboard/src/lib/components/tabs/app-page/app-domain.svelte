@@ -55,9 +55,11 @@
 		onUpdate: (domain: string) => Promise<void>;
 		/** Bumped after a save so the certificate status re-fetches. */
 		certRefreshKey?: number;
+		/** The user may change the domain (apps:write). */
+		canEdit?: boolean;
 	}
 
-	let { app, onUpdate, certRefreshKey = 0 }: Props = $props();
+	let { app, onUpdate, certRefreshKey = 0, canEdit = true }: Props = $props();
 
 	/** Re-check DNS this often while it isn't pointing here yet. */
 	const DNS_POLL_MS = 30_000;
@@ -289,7 +291,7 @@
 							<ExternalIcon /> Open
 						</Button>
 					{/if}
-					{#if !editing}
+					{#if !editing && canEdit}
 						<Button variant="outline" size="sm" onclick={startEditing}>Change domain</Button>
 					{/if}
 				</div>
@@ -325,8 +327,10 @@
 					</p>
 					{#if editing}
 						{@render editForm()}
-					{:else}
+					{:else if canEdit}
 						<Button variant="outline" size="sm" onclick={startEditing}>Add a domain</Button>
+					{:else}
+						<p class="text-xs text-muted-foreground">Ask an admin or deployer to add one.</p>
 					{/if}
 				</div>
 			</div>

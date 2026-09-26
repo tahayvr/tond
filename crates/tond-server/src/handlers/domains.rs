@@ -33,7 +33,7 @@ use tond_common::dns::{DnsCheck, classify_dns, is_public_ip, join_ips, server_ad
 use tond_common::{ApiResponse, Certificate, TondError};
 
 use crate::{
-    auth::{RateLimit, RequireAuth},
+    auth::{Authz, RateLimit, scope},
     domains::{is_valid_hostname, normalize_domain, registrable_domain},
     error::AppError,
     handlers::onboarding,
@@ -252,7 +252,7 @@ async fn apps_domain(state: &AppState) -> Option<String> {
 
 pub async fn check_domain(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _auth: Authz<scope::AppsRead>,
     State(state): State<AppState>,
     Query(query): Query<DomainCheckQuery>,
 ) -> Result<impl IntoResponse, AppError> {

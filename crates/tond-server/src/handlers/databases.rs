@@ -5,7 +5,7 @@
 // optional connection to a project Docker network for internal service-to-service
 // communication.
 //
-// Routes (all require RequireAuth + RateLimit):
+// Routes (all require RateLimit + an Authz scope, see each handler):
 //   GET    /api/databases                         — list all managed databases
 //   POST   /api/databases                         — create and start a new database container
 //   GET    /api/databases/{id}                    — get database details + connection strings
@@ -30,8 +30,8 @@ use axum::{
 use tond_common::*;
 
 use crate::{
-    audit_log::{AuthActor, write_audit_log},
-    auth::{AuthRole, RateLimit, RequireAuth},
+    audit_log::write_audit_log,
+    auth::{Authz, Principal, RateLimit, scope},
     db_credentials::{CredentialField, container_running, password_change_step, run_step},
     docker,
     error::AppError,
@@ -54,15 +54,17 @@ async fn fetch_db(pool: &sqlx::SqlitePool, id_or_name: &str) -> Result<ManagedDa
 
 pub async fn list_databases(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::DbRead>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
     let dbs: Vec<ManagedDatabase> =
         sqlx::query_as("SELECT * FROM databases ORDER BY created_at DESC")
             .fetch_all(&state.db)
             .await?;
-    let responses: Vec<ManagedDatabaseResponse> =
-        dbs.into_iter().map(ManagedDatabaseResponse::from).collect();
+    let responses: Vec<ManagedDatabaseResponse> = dbs
+        .into_iter()
+        .map(|d| redact_response(ManagedDatabaseResponse::from(d), &auth))
+        .collect();
     Ok((StatusCode::OK, Json(ApiResponse::ok(responses))))
 }
 
@@ -70,13 +72,56 @@ pub async fn list_databases(
 
 pub async fn get_database(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: Authz<scope::DbRead>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let db = fetch_db(&state.db, &id).await?;
     let detail = build_detail(db, public_host(&state).await.as_deref());
-    Ok((StatusCode::OK, Json(ApiResponse::ok(detail))))
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(redact_detail(detail, &auth))),
+    ))
+}
+
+/// Shown in place of passwords to callers without `db:credentials`.
+const MASKED_PASSWORD: &str = "********";
+
+/// Drop passwords from a database response unless the caller holds
+/// `db:credentials` (viewers and deployers see databases, not their secrets).
+fn redact_response(mut db: ManagedDatabaseResponse, auth: &Principal) -> ManagedDatabaseResponse {
+    if !auth.has(Scope::DbCredentials) {
+        db.db_password = None;
+        db.root_password = None;
+    }
+    db
+}
+
+/// `redact_response` for the detail view, masking passwords inside the
+/// connection strings too.
+fn redact_detail(mut detail: ManagedDatabaseDetail, auth: &Principal) -> ManagedDatabaseDetail {
+    if auth.has(Scope::DbCredentials) {
+        return detail;
+    }
+    let secrets: Vec<String> = [&detail.database.db_password, &detail.database.root_password]
+        .into_iter()
+        .flatten()
+        .filter(|p| !p.is_empty())
+        .cloned()
+        .collect();
+    let mask = |s: Option<String>| {
+        s.map(|mut s| {
+            for secret in &secrets {
+                s = s.replace(secret.as_str(), MASKED_PASSWORD);
+            }
+            s
+        })
+    };
+    detail.connection_string = mask(detail.connection_string);
+    detail.public_connection_string = mask(detail.public_connection_string);
+    detail.internal_connection_string = mask(detail.internal_connection_string);
+    detail.database = redact_response(detail.database, auth);
+    detail
 }
 
 /// Placeholder host shown in public connection strings when the server has no
@@ -299,13 +344,12 @@ fn next_credential(current: Option<String>, requested: Option<String>) -> Option
 
 pub async fn create_database(
     _rate: RateLimit,
-    auth: AuthRole,
-    actor: AuthActor,
+    auth: Authz<scope::DbWrite>,
     State(state): State<AppState>,
     Json(req): Json<CreateDatabaseRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     if req.public_access {
-        auth.ensure_admin("expose a database to the internet")?;
+        auth.require_to(Scope::SettingsWrite, "expose a database to the internet")?;
     }
 
     // Validate name (alphanumeric + hyphens)
@@ -459,7 +503,7 @@ pub async fn create_database(
         None,
         None,
         "db_create",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!(
             "name={} type={} image={} public_access={}",
             db.name, db.db_type, image, db.public_access
@@ -468,15 +512,17 @@ pub async fn create_database(
     .await;
 
     let detail = build_detail(db, public_host(&state).await.as_deref());
-    Ok((StatusCode::CREATED, Json(ApiResponse::ok(detail))))
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiResponse::ok(redact_detail(detail, &auth))),
+    ))
 }
 
 // ── Delete database ──
 
 pub async fn delete_database(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::DbDelete>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -503,7 +549,7 @@ pub async fn delete_database(
         None,
         None,
         "db_delete",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("name={}", db.name)),
     )
     .await;
@@ -518,8 +564,7 @@ pub async fn delete_database(
 
 pub async fn stop_database(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::DbWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -547,7 +592,7 @@ pub async fn stop_database(
         None,
         None,
         "db_stop",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("name={}", db.name)),
     )
     .await;
@@ -564,8 +609,7 @@ pub async fn stop_database(
 
 pub async fn start_database(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::DbWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -593,7 +637,7 @@ pub async fn start_database(
         None,
         None,
         "db_start",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("name={}", db.name)),
     )
     .await;
@@ -610,8 +654,7 @@ pub async fn start_database(
 
 pub async fn update_database(
     _rate: RateLimit,
-    auth: AuthRole,
-    actor: AuthActor,
+    auth: Authz<scope::DbWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateDatabaseRequest>,
@@ -621,11 +664,11 @@ pub async fn update_database(
     // A custom image runs arbitrary code with the database volume mounted, and
     // public access opens the port to the internet: both are admin decisions.
     if req.custom_image.is_some() {
-        auth.ensure_admin("change a database's Docker image")?;
+        auth.require_to(Scope::SettingsWrite, "change a database's Docker image")?;
     }
     let exposure_changed = req.public_access.is_some_and(|p| p != db.public_access);
     if exposure_changed {
-        auth.ensure_admin("change a database's public access")?;
+        auth.require_to(Scope::SettingsWrite, "change a database's public access")?;
     }
     let public_access = req.public_access.unwrap_or(db.public_access);
 
@@ -675,7 +718,7 @@ pub async fn update_database(
         None,
         None,
         "db_update",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("name={} public_access={}", db.name, public_access)),
     )
     .await;
@@ -689,7 +732,10 @@ pub async fn update_database(
     }
 
     let detail = build_detail(updated_db, public_host(&state).await.as_deref());
-    Ok((StatusCode::OK, Json(ApiResponse::ok(detail))))
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(redact_detail(detail, &auth))),
+    ))
 }
 
 // ── Redeploy database ──
@@ -708,15 +754,17 @@ pub async fn update_database(
 ///   5. Updates `container_id`, `host_port`, `status`, and `image_used` in the DB.
 pub async fn redeploy_database(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    _actor: AuthActor,
+    auth: Authz<scope::DbWrite>,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let db = fetch_db(&state.db, &id).await?;
     let updated_db = recreate_container(&state, db).await?;
     let detail = build_detail(updated_db, public_host(&state).await.as_deref());
-    Ok((StatusCode::OK, Json(ApiResponse::ok(detail))))
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(redact_detail(detail, &auth))),
+    ))
 }
 
 /// Stop, remove and recreate a database container (steps 1–5 above) and
@@ -854,8 +902,7 @@ fn refuse_rename(
 /// database isn't running, for renames, and for engines that can't do it.
 pub async fn update_database_credentials(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    actor: AuthActor,
+    auth: Authz<scope::DbCredentials>,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateDatabaseCredentials>,
@@ -970,7 +1017,7 @@ pub async fn update_database_credentials(
         None,
         None,
         "db_credentials_update",
-        &actor.0,
+        &auth.audit_actor(),
         Some(&format!("name={} changed={}", db.name, applied.join(","))),
     )
     .await;
@@ -1003,7 +1050,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        auth::{RateLimiter, RequireAuth, extractor::Role, rate_limit::RateLimit},
+        auth::{Authz, Principal, RateLimiter, rate_limit::RateLimit},
         state::AppState,
     };
 
@@ -1237,8 +1284,7 @@ mod tests {
         ] {
             let err = update_database(
                 RateLimit,
-                AuthRole(Role::Member),
-                AuthActor("member@example.com".to_string()),
+                Authz::unchecked(Principal::test_user(Role::Deployer)),
                 State(state.clone()),
                 Path(db.id.clone()),
                 Json(req),
@@ -1251,8 +1297,7 @@ mod tests {
 
         let err = create_database(
             RateLimit,
-            AuthRole(Role::Member),
-            AuthActor("member@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Deployer)),
             State(state.clone()),
             Json(CreateDatabaseRequest {
                 name: "public-db".to_string(),
@@ -1340,8 +1385,7 @@ mod tests {
 
         let response = update_database(
             RateLimit,
-            AuthRole(Role::Admin),
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(db.id.clone()),
             Json(UpdateDatabaseRequest {
@@ -1386,8 +1430,7 @@ mod tests {
     ) -> Result<axum::response::Response, String> {
         update_database_credentials(
             RateLimit,
-            RequireAuth,
-            AuthActor("admin@example.com".to_string()),
+            Authz::unchecked(Principal::test_user(Role::Admin)),
             State(state.clone()),
             Path(id.to_string()),
             Json(req),

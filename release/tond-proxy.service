@@ -14,7 +14,7 @@ Type=simple
 #                                   remove or replace root's files)
 #   tond.db, tond.db-wal, -shm      root:tond-proxy 0660 (shared with tond-server)
 #   certs/, acme_account.json       tond-proxy only (0700 / 0600)
-#   tond.env, root-api-key, setup-token, tond.sock, keys/, backups/, ...  root only
+#   tond.env, setup-token, tond.sock, keys/, backups/, ...  root only
 User=tond-proxy
 Group=tond-proxy
 WorkingDirectory=/opt/tond

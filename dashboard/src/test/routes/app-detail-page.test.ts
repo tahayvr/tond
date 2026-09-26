@@ -63,7 +63,7 @@ const api = vi.hoisted(() => ({
 	})
 }));
 
-vi.mock('$lib/auth.svelte', () => ({ isAdmin: () => true }));
+vi.mock('$lib/auth.svelte', () => ({ isAdmin: () => true, can: () => true }));
 
 vi.mock('$app/state', () => ({
 	page: state.page
