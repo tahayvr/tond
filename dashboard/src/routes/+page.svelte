@@ -17,6 +17,7 @@
 	import PageHeader from '$lib/components/nav/page-header.svelte';
 	import StatusBadge from '$lib/components/feedback/status-badge.svelte';
 	import InlineError from '$lib/components/feedback/inline-error.svelte';
+	import TrafficOverview from '$lib/components/metrics/traffic-overview.svelte';
 	import { errorMessage } from '$lib/action.svelte';
 	import { buildChecklist } from '$lib/onboarding';
 	import { appTabHref } from '$lib/tabs';
@@ -252,6 +253,10 @@
 			{/if}
 		</a>
 	</section>
+
+	{#if can('metrics:read')}
+		<TrafficOverview />
+	{/if}
 
 	<div class="grid gap-4 lg:grid-cols-3">
 		<!-- Apps that need attention, then everything by project -->

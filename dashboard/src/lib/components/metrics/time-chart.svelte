@@ -1,14 +1,25 @@
 <script lang="ts">
-	// Small SVG time-series chart: one y-axis, gaps break the line, optional
-	// limit line, restart / crash / OOM markers, crosshair tooltip (pointer and
-	// arrow keys). Series values share one unit (never two y-scales).
-	import type { MetricEvent, MetricsRange } from '$lib/api';
-	import { EVENT_LABELS, formatTime, nearestIndex, segments, timeTicks } from '$lib/metrics-format';
+	// Small SVG time-series chart: one y-axis, gaps (and null values) break
+	// the line, optional limit line, deploy / restart / crash / OOM markers,
+	// optional stacked areas, crosshair tooltip (pointer and arrow keys).
+	// Series values share one unit (never two y-scales).
+	import {
+		EVENT_LABELS,
+		formatTime,
+		markerColor,
+		nearestIndex,
+		segments,
+		stack,
+		timeTicks,
+		type ChartMarker,
+		type ChartRange
+	} from '$lib/metrics-format';
 
 	export interface ChartSeries {
 		key: string;
 		label: string;
-		values: number[];
+		/** null: no value for the bucket (breaks the line). */
+		values: (number | null)[];
 		/** CSS color (a theme variable). */
 		color: string;
 		dashed?: boolean;
@@ -24,11 +35,13 @@
 		from: number;
 		to: number;
 		step: number;
-		range: MetricsRange;
+		range: ChartRange;
 		yMax: number;
 		yFormat: (v: number) => string;
 		limit?: { value: number; label: string } | null;
-		events?: MetricEvent[];
+		events?: ChartMarker[];
+		/** Stack the series as filled areas (first series at the bottom). */
+		stacked?: boolean;
 		height?: number;
 	}
 
@@ -44,6 +57,7 @@
 		yFormat,
 		limit = null,
 		events = [],
+		stacked = false,
 		height = 180
 	}: Props = $props();
 
@@ -65,19 +79,51 @@
 
 	let runs = $derived(segments(times, step));
 
-	function linePath(values: number[]): string {
+	/** Stacked charts draw running totals; tooltips still show each series' value. */
+	let tops = $derived(
+		stacked ? stack(series.map((s) => s.values.map((v) => v ?? 0))) : series.map((s) => s.values)
+	);
+
+	function linePath(values: (number | null)[]): string {
 		return runs
-			.map((run) =>
-				run
-					.map(
-						(i, j) => `${j === 0 ? 'M' : 'L'}${x(times[i]).toFixed(1)},${y(values[i]).toFixed(1)}`
-					)
-					.join('')
-			)
+			.map((run) => {
+				let pen = false;
+				return run
+					.map((i) => {
+						const v = values[i];
+						if (v === null || v === undefined) {
+							pen = false;
+							return '';
+						}
+						const cmd = pen ? 'L' : 'M';
+						pen = true;
+						return `${cmd}${x(times[i]).toFixed(1)},${y(v).toFixed(1)}`;
+					})
+					.join('');
+			})
 			.join('');
 	}
 
-	function areaPath(values: number[]): string {
+	/** Area between `lower` (or the axis) and `upper` for stacked charts. */
+	function bandPath(upper: (number | null)[], lower: (number | null)[] | null): string {
+		return runs
+			.map((run) => {
+				const up = run
+					.map(
+						(i, j) =>
+							`${j === 0 ? 'M' : 'L'}${x(times[i]).toFixed(1)},${y(upper[i] ?? 0).toFixed(1)}`
+					)
+					.join('');
+				const down = [...run]
+					.reverse()
+					.map((i) => `L${x(times[i]).toFixed(1)},${y(lower ? (lower[i] ?? 0) : 0).toFixed(1)}`)
+					.join('');
+				return `${up}${down}Z`;
+			})
+			.join('');
+	}
+
+	function areaPath(values: (number | null)[]): string {
 		const base = (PAD.top + plotH).toFixed(1);
 		return runs
 			.map((run) => {
@@ -85,9 +131,9 @@
 				const first = x(times[run[0]]).toFixed(1);
 				const last = x(times[run[run.length - 1]] + (run.length === 1 ? step : 0)).toFixed(1);
 				const top = run
-					.map((i) => `L${x(times[i]).toFixed(1)},${y(values[i]).toFixed(1)}`)
+					.map((i) => `L${x(times[i]).toFixed(1)},${y(values[i] ?? 0).toFixed(1)}`)
 					.join('');
-				const tail = run.length === 1 ? `L${last},${y(values[run[0]]).toFixed(1)}` : '';
+				const tail = run.length === 1 ? `L${last},${y(values[run[0]] ?? 0).toFixed(1)}` : '';
 				return `M${first},${base}${top}${tail}L${last},${base}Z`;
 			})
 			.join('');
@@ -123,8 +169,8 @@
 		}
 	}
 
-	function eventColor(kind: MetricEvent['kind']): string {
-		return kind === 'restart' ? 'var(--warn)' : 'var(--destructive)';
+	function show(v: number | null | undefined): string {
+		return v === null || v === undefined ? '—' : yFormat(v);
 	}
 
 	let tooltipLeft = $derived(hover === null ? 0 : x(times[hover]));
@@ -133,7 +179,7 @@
 	let valueText = $derived.by(() => {
 		const i = hover ?? times.length - 1;
 		if (i < 0) return 'No data';
-		const values = series.map((s) => `${s.label} ${yFormat(s.values[i])}`).join(', ');
+		const values = series.map((s) => `${s.label} ${show(s.values[i])}`).join(', ');
 		return `${formatTime(times[i], range, true)}: ${values}`;
 	});
 </script>
@@ -212,24 +258,30 @@
 						x2={x(ev.t)}
 						y1={PAD.top}
 						y2={PAD.top + plotH}
-						stroke={eventColor(ev.kind)}
+						stroke={markerColor(ev.kind)}
 						stroke-width="1.5"
 						stroke-dasharray="3 3"
 					/>
-					<circle cx={x(ev.t)} cy={PAD.top} r="3.5" fill={eventColor(ev.kind)} />
+					<circle cx={x(ev.t)} cy={PAD.top} r="3.5" fill={markerColor(ev.kind)} />
 				{/if}
 			{/each}
 
 			<!-- series -->
-			{#each series as s (s.key)}
-				{#if s.area}
+			{#each series as s, k (s.key)}
+				{#if stacked}
+					<path
+						d={bandPath(tops[k], k > 0 ? tops[k - 1] : null)}
+						fill={s.color}
+						fill-opacity="0.35"
+					/>
+				{:else if s.area}
 					<path d={areaPath(s.values)} fill={s.color} fill-opacity="0.12" />
 				{/if}
 				<path
-					d={linePath(s.values)}
+					d={linePath(tops[k])}
 					fill="none"
 					stroke={s.color}
-					stroke-width="2"
+					stroke-width={stacked ? 1.25 : 2}
 					stroke-linejoin="round"
 					stroke-linecap="round"
 					stroke-dasharray={s.dashed ? '5 3' : undefined}
@@ -246,15 +298,18 @@
 					class="stroke-foreground/40"
 					stroke-width="1"
 				/>
-				{#each series as s (s.key)}
-					<circle
-						cx={x(times[hover])}
-						cy={y(s.values[hover])}
-						r="4"
-						fill={s.color}
-						class="stroke-card"
-						stroke-width="2"
-					/>
+				{#each series as s, k (s.key)}
+					{@const v = tops[k][hover]}
+					{#if v !== null && v !== undefined}
+						<circle
+							cx={x(times[hover])}
+							cy={y(v)}
+							r="4"
+							fill={s.color}
+							class="stroke-card"
+							stroke-width="2"
+						/>
+					{/if}
 				{/each}
 			{/if}
 		</svg>
@@ -282,7 +337,7 @@
 							stroke-dasharray={s.dashed ? '4 2' : undefined}
 						/>
 					</svg>
-					<span class="font-semibold text-foreground tabular-nums">{yFormat(s.values[hover])}</span>
+					<span class="font-semibold text-foreground tabular-nums">{show(s.values[hover])}</span>
 					<span class="text-muted-foreground">{s.label}</span>
 				</div>
 			{/each}

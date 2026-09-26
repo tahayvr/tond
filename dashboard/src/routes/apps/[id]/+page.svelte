@@ -86,6 +86,7 @@
 	import AppPreviews from '$lib/components/tabs/app-page/app-previews.svelte';
 	import PreviewDomainRequiredAlert from '$lib/components/alerts/preview-domain-required-alert.svelte';
 	import MetricsPanel from '$lib/components/metrics/metrics-panel.svelte';
+	import RequestMetricsPanel from '$lib/components/metrics/request-metrics-panel.svelte';
 	import AppHistory from '$lib/components/tabs/app-page/app-history.svelte';
 	import AppWebhooks from '$lib/components/tabs/app-page/app-webhooks.svelte';
 	import { safeUrl } from '$lib/utils';
@@ -1016,6 +1017,7 @@
 				<!-- Logs tab -->
 				{#if viewAllowed && activeTab === 'logs'}
 					<AppLogs
+						appId={app.id}
 						appName={app.name}
 						{logLines}
 						streaming={logStreaming}
@@ -1842,7 +1844,16 @@
 				<!-- Metrics tab -->
 				{#if viewAllowed && activeTab === 'metrics'}
 					{#key appId}
-						<MetricsPanel owner="apps" id={appId} noun="app" />
+						<div class="space-y-8 pt-4">
+							<section aria-labelledby="request-metrics-heading" class="space-y-3">
+								<h2 id="request-metrics-heading" class="text-base font-semibold">Requests</h2>
+								<RequestMetricsPanel owner="apps" id={appId} noun="app" />
+							</section>
+							<section aria-labelledby="resource-metrics-heading">
+								<h2 id="resource-metrics-heading" class="text-base font-semibold">Resources</h2>
+								<MetricsPanel owner="apps" id={appId} noun="app" />
+							</section>
+						</div>
 					{/key}
 				{/if}
 

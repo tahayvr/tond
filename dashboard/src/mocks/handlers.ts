@@ -53,6 +53,9 @@ import {
 	makeMockSystemMetrics,
 	makeMockSystemSelf,
 	makeMockMetrics,
+	makeMockRequestMetrics,
+	makeMockTrafficOverview,
+	makeMockAccessLog,
 	MOCK_DATABASE_SECRETS
 } from './fixtures';
 import type {
@@ -405,6 +408,14 @@ const templates: TemplateCatalogEntry[] = structuredClone(MOCK_TEMPLATES);
 let alertRules: AlertRule[] = structuredClone(MOCK_ALERT_RULES);
 const deployments: Record<string, Deployment[]> = structuredClone(MOCK_DEPLOYMENTS);
 let previews: Record<string, PreviewDeployment[]> = structuredClone(MOCK_PREVIEWS);
+/** Opt-in access logs per app id (the first running app starts with one). */
+let accessLogs: Record<string, { enabled: boolean; include_query: boolean; lines: string[] }> = {
+	[MOCK_APPS.find((a) => a.status === 'running')?.id ?? '']: {
+		enabled: true,
+		include_query: false,
+		lines: makeMockAccessLog()
+	}
+};
 let projectPreviews: Record<string, ProjectPreview[]> = structuredClone(MOCK_PROJECT_PREVIEWS);
 let databases: ManagedDatabase[] = structuredClone(MOCK_DATABASES);
 let cronJobs: CronJob[] = structuredClone(MOCK_CRON_JOBS);
@@ -2498,6 +2509,90 @@ export const handlers = [
 	http.get('/api/cron/:id/metrics', async ({ request }) => {
 		await delay(LATENCY);
 		return ok(makeMockMetrics(new URL(request.url).searchParams.get('range') ?? '1h', true));
+	}),
+
+	http.get('/api/previews/:id/metrics', async ({ request }) => {
+		await delay(LATENCY);
+		return ok(makeMockMetrics(new URL(request.url).searchParams.get('range') ?? '1h'));
+	}),
+
+	// ── Request metrics (tond-proxy traffic) ──────────────────────────────────
+
+	// Apps that are not running (and workers without a domain) have no traffic.
+	http.get('/api/apps/:id/requests', async ({ request, params }) => {
+		await delay(LATENCY);
+		const range = new URL(request.url).searchParams.get('range') ?? '24h';
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
+		if (!app) return err('App not found', 404);
+		const served = (app.status === 'running' || app.status === 'unhealthy') && !!app.domain;
+		return ok(makeMockRequestMetrics(range, { empty: !served }));
+	}),
+
+	http.get('/api/previews/:id/requests', async ({ request }) => {
+		await delay(LATENCY);
+		const range = new URL(request.url).searchParams.get('range') ?? '24h';
+		return ok(makeMockRequestMetrics(range, { scale: 0.3, withDeploys: false }));
+	}),
+
+	http.get('/api/system/requests', async ({ request }) => {
+		await delay(LATENCY);
+		return ok(makeMockTrafficOverview(new URL(request.url).searchParams.get('range') ?? '24h'));
+	}),
+
+	// ── Access logs ───────────────────────────────────────────────────────────
+
+	http.get('/api/apps/:id/access-log', async ({ request, params }) => {
+		await delay(LATENCY);
+		const url = new URL(request.url);
+		const limit = Number(url.searchParams.get('lines') ?? 500);
+		const q = (url.searchParams.get('q') ?? '').toLowerCase();
+		const log = accessLogs[params.id as string] ?? {
+			enabled: false,
+			include_query: false,
+			lines: []
+		};
+		const matching = q ? log.lines.filter((l) => l.toLowerCase().includes(q)) : log.lines;
+		return ok({
+			enabled: log.enabled,
+			include_query: log.include_query,
+			size_bytes: log.lines.reduce((sum, l) => sum + l.length + 1, 0),
+			max_bytes: 60 * 1024 * 1024,
+			lines: matching.slice(-limit),
+			truncated: matching.length > limit
+		});
+	}),
+
+	http.put('/api/apps/:id/access-log', async ({ request, params }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as { enabled: boolean; include_query?: boolean };
+		const id = params.id as string;
+		const current = accessLogs[id] ?? { enabled: false, include_query: false, lines: [] };
+		accessLogs = {
+			...accessLogs,
+			[id]: {
+				...current,
+				enabled: body.enabled,
+				include_query: body.enabled && !!body.include_query
+			}
+		};
+		return ok({ enabled: accessLogs[id].enabled, include_query: accessLogs[id].include_query });
+	}),
+
+	http.delete('/api/apps/:id/access-log', async ({ params }) => {
+		await delay(LATENCY);
+		const id = params.id as string;
+		if (accessLogs[id]) accessLogs = { ...accessLogs, [id]: { ...accessLogs[id], lines: [] } };
+		return ok(null);
+	}),
+
+	http.get('/api/apps/:id/access-log/download', async ({ params }) => {
+		const lines = accessLogs[params.id as string]?.lines ?? [];
+		return new HttpResponse(lines.map((l) => `${l}\n`).join(''), {
+			headers: {
+				'Content-Type': 'text/plain; charset=utf-8',
+				'Content-Disposition': 'attachment; filename="access.log"'
+			}
+		});
 	}),
 
 	http.get('/api/system/self', async () => {

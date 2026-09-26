@@ -1627,9 +1627,9 @@ export interface SystemMetrics {
 	collected_at: string;
 }
 
-export type MetricsOwner = 'apps' | 'databases' | 'cron';
+export type MetricsOwner = 'apps' | 'databases' | 'cron' | 'previews';
 
-/** Resource metrics of an app, database or cron job. */
+/** Resource metrics of an app, database, cron job or preview. */
 export async function getMetrics(
 	owner: MetricsOwner,
 	id: string,
@@ -1642,6 +1642,180 @@ export async function getMetrics(
 
 export async function getSystemMetrics(): Promise<SystemMetrics> {
 	return request<SystemMetrics>('/system/metrics');
+}
+
+// ── Request metrics (tond-proxy traffic) ──
+
+export type RequestRange = '1h' | '6h' | '24h' | '7d' | '30d' | '90d';
+
+/** Request series as parallel arrays. Rates are per second; latency in ms,
+ *  null for buckets without requests. */
+export interface RequestSeries {
+	t: number[];
+	rps: number[];
+	rps_1xx: number[];
+	rps_2xx: number[];
+	rps_3xx: number[];
+	rps_4xx: number[];
+	rps_5xx: number[];
+	/** 5xx share of responses, percent. */
+	err_pct: (number | null)[];
+	p50: (number | null)[];
+	p95: (number | null)[];
+	p99: (number | null)[];
+	/** Body bytes per second. */
+	bytes_in: number[];
+	bytes_out: number[];
+}
+
+export interface RequestSummary {
+	requests: number;
+	rps: number;
+	s1xx: number;
+	s2xx: number;
+	s3xx: number;
+	s4xx: number;
+	s5xx: number;
+	s502: number;
+	s504: number;
+	err_pct: number | null;
+	p50: number | null;
+	p95: number | null;
+	p99: number | null;
+	upstream_p50: number | null;
+	upstream_p95: number | null;
+	upstream_p99: number | null;
+	bytes_in: number;
+	bytes_out: number;
+}
+
+/** The last minute, from tond-server's memory. */
+export interface RequestCurrent {
+	t: number;
+	secs: number;
+	rps: number;
+	err_pct: number | null;
+	p95: number | null;
+}
+
+export type RequestMarkerKind = 'deploy' | 'rollback' | MetricEventKind;
+
+/** A deploy, rollback, restart, crash or OOM kill drawn on request charts. */
+export interface RequestMarker {
+	t: number;
+	kind: RequestMarkerKind;
+	/** Deployment status for deploys, the event detail otherwise. */
+	detail: string | null;
+	deployment_id: string | null;
+}
+
+export interface RequestMetricsResponse {
+	range: RequestRange;
+	step: number;
+	from: number;
+	to: number;
+	series: RequestSeries;
+	summary: RequestSummary;
+	current: RequestCurrent | null;
+	markers: RequestMarker[];
+	/** False when tond-proxy did not answer the last scrape. */
+	proxy_connected: boolean;
+}
+
+export type RequestOwner = 'apps' | 'previews';
+
+/** Request metrics of an app or a preview. */
+export async function getRequestMetrics(
+	owner: RequestOwner,
+	id: string,
+	range: RequestRange = '24h'
+): Promise<RequestMetricsResponse> {
+	return request<RequestMetricsResponse>(
+		`/${owner}/${encodeURIComponent(id)}/requests?range=${encodeURIComponent(range)}`
+	);
+}
+
+export interface AppTraffic {
+	id: string;
+	name: string;
+	requests: number;
+	rps: number;
+	s4xx: number;
+	s5xx: number;
+	err_pct: number | null;
+	p95: number | null;
+	bytes_out: number;
+}
+
+export interface TrafficOverview {
+	range: RequestRange;
+	from: number;
+	to: number;
+	/** Every route together (apps, previews, dashboard, unknown hosts). */
+	total: RequestSummary;
+	/** Requests for hosts nothing is routed for. */
+	unknown_requests: number;
+	/** Busiest apps first (at most 10). */
+	busiest: AppTraffic[];
+	/** Apps with 5xx responses, most first (at most 5). */
+	errors: AppTraffic[];
+	proxy_connected: boolean;
+}
+
+/** Server-wide traffic: totals, busiest apps and apps with errors. */
+export async function getTrafficOverview(range: RequestRange = '24h'): Promise<TrafficOverview> {
+	return request<TrafficOverview>(`/system/requests?range=${encodeURIComponent(range)}`);
+}
+
+// ── Access logs (opt-in per app) ──
+
+export interface AccessLogSettings {
+	enabled: boolean;
+	/** Also log query strings (they often carry tokens). */
+	include_query: boolean;
+}
+
+export interface AccessLog extends AccessLogSettings {
+	/** Bytes on disk (current + rotated file). */
+	size_bytes: number;
+	/** Most bytes the log may use (60 MB). */
+	max_bytes: number;
+	/** Matching lines, oldest first. */
+	lines: string[];
+	/** More lines matched than were returned. */
+	truncated: boolean;
+}
+
+export async function getAccessLog(
+	appId: string,
+	opts: { lines?: number; q?: string } = {}
+): Promise<AccessLog> {
+	const params = new URLSearchParams();
+	if (opts.lines) params.set('lines', String(opts.lines));
+	if (opts.q) params.set('q', opts.q);
+	const query = params.toString();
+	return request<AccessLog>(
+		`/apps/${encodeURIComponent(appId)}/access-log${query ? `?${query}` : ''}`
+	);
+}
+
+export async function updateAccessLog(
+	appId: string,
+	settings: AccessLogSettings
+): Promise<AccessLogSettings> {
+	return request<AccessLogSettings>(`/apps/${encodeURIComponent(appId)}/access-log`, {
+		method: 'PUT',
+		body: JSON.stringify(settings)
+	});
+}
+
+export async function deleteAccessLog(appId: string): Promise<void> {
+	await request(`/apps/${encodeURIComponent(appId)}/access-log`, { method: 'DELETE' });
+}
+
+/** URL of the full access log download (a plain link; the session cookie authenticates it). */
+export function accessLogDownloadUrl(appId: string): string {
+	return `${BASE}/apps/${encodeURIComponent(appId)}/access-log/download`;
 }
 
 // ── Tond measuring itself (GET /api/system/self) ──
@@ -1685,6 +1859,8 @@ export interface ProxyStats extends ProcessSample {
 	route_version: number;
 	routes: number;
 	reloads: number;
+	/** Access log lines dropped because the writer fell behind. */
+	access_log_dropped?: number;
 	loops: LoopStats[];
 }
 

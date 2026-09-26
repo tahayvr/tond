@@ -25,6 +25,9 @@ import type {
 	TemplateCatalogEntry,
 	MetricsRange,
 	MetricsResponse,
+	RequestMetricsResponse,
+	RequestRange,
+	TrafficOverview,
 	OnboardingStatus,
 	PreviewDeployment,
 	Project,
@@ -782,6 +785,237 @@ export function makeMockMetrics(range: string, empty = false): MetricsResponse {
 			pids: 14
 		}
 	};
+}
+
+// ── Request metrics (tond-proxy traffic) ───────────────────────────────────
+
+const REQUEST_SPAN: Record<RequestRange, number> = {
+	'1h': 3600,
+	'6h': 6 * 3600,
+	'24h': 86_400,
+	'7d': 7 * 86_400,
+	'30d': 30 * 86_400,
+	'90d': 90 * 86_400
+};
+const REQUEST_STEP: Record<RequestRange, number> = {
+	'1h': 60,
+	'6h': 60,
+	'24h': 180,
+	'7d': 3600,
+	'30d': 7200,
+	'90d': 18_000
+};
+
+/** Interpolated percentile of a latency around `base` ms. */
+function latency(base: number, wave: number, q: number): number {
+	return Math.round((base * (1 + wave * 0.3) * q + Math.random() * base * 0.2) * 10) / 10;
+}
+
+/**
+ * Traffic with a daily wave, a burst of 5xx after a deploy two thirds in,
+ * and a restart. `scale` sets the requests per second; `empty` is an app
+ * without traffic.
+ */
+export function makeMockRequestMetrics(
+	range: string,
+	{ empty = false, scale = 4, withDeploys = true } = {}
+): RequestMetricsResponse {
+	const r: RequestRange = (Object.keys(REQUEST_SPAN) as RequestRange[]).includes(
+		range as RequestRange
+	)
+		? (range as RequestRange)
+		: '24h';
+	const step = REQUEST_STEP[r];
+	const to = Math.floor(Date.now() / 1000);
+	const from = Math.floor((to - REQUEST_SPAN[r]) / step) * step;
+	const n = Math.floor((to - from) / step);
+	const series: RequestMetricsResponse['series'] = {
+		t: [],
+		rps: [],
+		rps_1xx: [],
+		rps_2xx: [],
+		rps_3xx: [],
+		rps_4xx: [],
+		rps_5xx: [],
+		err_pct: [],
+		p50: [],
+		p95: [],
+		p99: [],
+		bytes_in: [],
+		bytes_out: []
+	};
+	const incidentAt = Math.floor(n * 0.66);
+	let requests = 0;
+	let s2 = 0;
+	let s3 = 0;
+	let s4 = 0;
+	let s5 = 0;
+	let bytesOut = 0;
+	let bytesIn = 0;
+	for (let i = 0; i <= n; i++) {
+		const t = from + i * step;
+		series.t.push(t);
+		if (empty) {
+			for (const k of ['rps', 'rps_1xx', 'rps_2xx', 'rps_3xx', 'rps_4xx', 'rps_5xx'] as const)
+				series[k].push(0);
+			series.err_pct.push(null);
+			series.p50.push(null);
+			series.p95.push(null);
+			series.p99.push(null);
+			series.bytes_in.push(0);
+			series.bytes_out.push(0);
+			continue;
+		}
+		const wave = Math.sin((t / 86_400) * Math.PI * 2) * 0.5 + 0.5;
+		const total = Math.max(0.05, scale * (0.4 + wave) + Math.random() * scale * 0.3);
+		const incident = i >= incidentAt && i < incidentAt + Math.max(1, Math.round(900 / step));
+		const e5 = incident ? total * 0.18 : total * 0.002;
+		const e4 = total * 0.04;
+		const e3 = total * 0.08;
+		const ok = total - e5 - e4 - e3;
+		const round = (v: number) => Math.round(v * 100) / 100;
+		series.rps.push(round(total));
+		series.rps_1xx.push(0);
+		series.rps_2xx.push(round(ok));
+		series.rps_3xx.push(round(e3));
+		series.rps_4xx.push(round(e4));
+		series.rps_5xx.push(round(e5));
+		series.err_pct.push(round((e5 / total) * 100));
+		const base = incident ? 90 : 24;
+		series.p50.push(latency(base, wave, 1));
+		series.p95.push(latency(base, wave, 3.2));
+		series.p99.push(latency(base, wave, 7));
+		series.bytes_in.push(Math.round(total * 420));
+		series.bytes_out.push(Math.round(total * 18_000));
+		requests += total * step;
+		s2 += ok * step;
+		s3 += e3 * step;
+		s4 += e4 * step;
+		s5 += e5 * step;
+		bytesIn += total * 420 * step;
+		bytesOut += total * 18_000 * step;
+	}
+	const incidentT = from + incidentAt * step;
+	const markers: RequestMetricsResponse['markers'] =
+		empty || !withDeploys
+			? []
+			: [
+					{
+						t: from + Math.floor(n * 0.2) * step,
+						kind: 'deploy',
+						detail: 'succeeded',
+						deployment_id: 'dep-1'
+					},
+					{ t: incidentT, kind: 'deploy', detail: 'succeeded', deployment_id: 'dep-2' },
+					{ t: incidentT + 600, kind: 'restart', detail: 'exit code 1', deployment_id: null }
+				];
+	const R = Math.round(requests);
+	return {
+		range: r,
+		step,
+		from,
+		to,
+		series,
+		summary: {
+			requests: R,
+			rps: Math.round((requests / (to - from)) * 100) / 100,
+			s1xx: 0,
+			s2xx: Math.round(s2),
+			s3xx: Math.round(s3),
+			s4xx: Math.round(s4),
+			s5xx: Math.round(s5),
+			s502: Math.round(s5 * 0.7),
+			s504: Math.round(s5 * 0.1),
+			err_pct: R ? Math.round((s5 / requests) * 10_000) / 100 : null,
+			p50: empty ? null : 26.4,
+			p95: empty ? null : 88.1,
+			p99: empty ? null : 212.5,
+			upstream_p50: empty ? null : 23.9,
+			upstream_p95: empty ? null : 81.3,
+			upstream_p99: empty ? null : 204.2,
+			bytes_in: Math.round(bytesIn),
+			bytes_out: Math.round(bytesOut)
+		},
+		current: empty
+			? null
+			: {
+					t: to,
+					secs: 60,
+					rps: series.rps.at(-1) ?? 0,
+					err_pct: series.err_pct.at(-1) ?? null,
+					p95: series.p95.at(-1) ?? null
+				},
+		markers,
+		proxy_connected: true
+	};
+}
+
+/** Server-wide traffic for the home page tile. */
+export function makeMockTrafficOverview(range = '24h'): TrafficOverview {
+	const running = MOCK_APPS.filter((a) => a.status === 'running' || a.status === 'unhealthy');
+	const busiest = running.map((a, i) => {
+		const requests = Math.round(180_000 / (i + 1));
+		const s5xx = i === 1 ? 1_420 : i === 0 ? 12 : 0;
+		return {
+			id: a.id,
+			name: a.name,
+			requests,
+			rps: Math.round((requests / 86_400) * 100) / 100,
+			s4xx: Math.round(requests * 0.03),
+			s5xx,
+			err_pct: Math.round((s5xx / requests) * 10_000) / 100,
+			p95: 40 + i * 35,
+			bytes_out: requests * 18_000
+		};
+	});
+	const total = busiest.reduce((sum, a) => sum + a.requests, 0) + 4_210;
+	const s5xx = busiest.reduce((sum, a) => sum + a.s5xx, 0);
+	return {
+		range: range as RequestRange,
+		from: Math.floor(Date.now() / 1000) - 86_400,
+		to: Math.floor(Date.now() / 1000),
+		total: {
+			requests: total,
+			rps: Math.round((total / 86_400) * 100) / 100,
+			s1xx: 0,
+			s2xx: total - s5xx - 9_000,
+			s3xx: 3_000,
+			s4xx: 6_000,
+			s5xx,
+			s502: s5xx,
+			s504: 0,
+			err_pct: Math.round((s5xx / total) * 10_000) / 100,
+			p50: 21.3,
+			p95: 74.9,
+			p99: 190.2,
+			upstream_p50: 19.8,
+			upstream_p95: 70.1,
+			upstream_p99: 182.4,
+			bytes_in: total * 400,
+			bytes_out: total * 18_000
+		},
+		unknown_requests: 4_210,
+		busiest,
+		errors: busiest.filter((a) => a.s5xx > 0).sort((a, b) => b.s5xx - a.s5xx),
+		proxy_connected: true
+	};
+}
+
+/** Access log lines in tond-proxy's format, oldest first. */
+export function makeMockAccessLog(count = 300): string[] {
+	const paths = ['/', '/api/cart', '/api/products', '/login', '/assets/app.js', '/favicon.ico'];
+	const statuses = [200, 200, 200, 200, 304, 301, 404, 200, 500, 200];
+	const now = Date.now();
+	return Array.from({ length: count }, (_, i) => {
+		const t = new Date(now - (count - i) * 7_000).toISOString();
+		const path = paths[i % paths.length];
+		const status = statuses[i % statuses.length];
+		const ms = (4 + ((i * 37) % 180) + (status >= 500 ? 400 : 0)).toFixed(1);
+		const bytes = status === 304 ? 0 : 400 + ((i * 131) % 24_000);
+		const ip = `203.0.113.${(i * 17) % 250}`;
+		const method = path.startsWith('/api/cart') && i % 3 === 0 ? 'POST' : 'GET';
+		return `${t} ${method} ${path} ${status} ${ms}ms ${bytes} ${ip}`;
+	});
 }
 
 // ── Deployments ────────────────────────────────────────────────────────────
