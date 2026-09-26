@@ -469,11 +469,22 @@ impl TondClient {
         Ok(())
     }
 
-    pub async fn add_volume(&self, id: &str, container_path: &str) -> Result<()> {
+    /// Add a volume. The server stores it in `<data>/volumes/<app>/<name>`;
+    /// `name` defaults to one derived from the container path.
+    pub async fn add_volume(
+        &self,
+        id: &str,
+        container_path: &str,
+        name: Option<&str>,
+    ) -> Result<()> {
+        let mut body = serde_json::json!({ "container_path": container_path });
+        if let Some(name) = name {
+            body["name"] = serde_json::Value::String(name.to_string());
+        }
         let req = self
             .client
             .post(format!("{}/api/apps/{}/volumes", self.base_url, id))
-            .json(&serde_json::json!({ "container_path": container_path }));
+            .json(&body);
         let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
 
         if !resp.success {

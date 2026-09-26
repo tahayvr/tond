@@ -257,6 +257,10 @@ pub enum VolumeAction {
 
         /// Absolute path inside the container (e.g. /data)
         container_path: String,
+
+        /// Directory name under the app's volume folder (default: derived from the path)
+        #[arg(long)]
+        name: Option<String>,
     },
 
     /// List volumes for an app
@@ -720,8 +724,11 @@ pub async fn handle(client: &TondClient, action: AppsAction) -> Result<()> {
             VolumeAction::Add {
                 app,
                 container_path,
+                name,
             } => {
-                client.add_volume(&app, &container_path).await?;
+                client
+                    .add_volume(&app, &container_path, name.as_deref())
+                    .await?;
                 println!(
                     "Volume {} added to {}. Redeploy to apply: tond apps deploy {}",
                     container_path, app, app
