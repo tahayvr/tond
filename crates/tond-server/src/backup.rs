@@ -1024,10 +1024,33 @@ async fn dump_database(docker: &bollard::Docker, db: &ManagedDatabase, dest: &Pa
         .ok_or_else(|| anyhow::anyhow!("DB container not running"))?;
 
     let kind = db.db_type.as_str();
-
     // Credentials go in the exec env, never into a shell string (see mysql below).
     let mut env: Vec<String> = Vec::new();
     let (cmd, out_file) = match kind {
+        "redis" | "keydb" => {
+            // Managed Redis requires ACL auth (see handlers/databases.rs).
+            // SAVE writes a consistent dump.rdb, which is then copied out.
+            // REDISCLI_AUTH passes the password without exposing it in `ps`.
+            let cli = if kind == "keydb" {
+                "keydb-cli"
+            } else {
+                "redis-cli"
+            };
+            env.push(format!(
+                "REDISCLI_AUTH={}",
+                db.db_password.as_deref().unwrap_or("")
+            ));
+            (
+                vec![
+                    cli.to_string(),
+                    "--user".to_string(),
+                    db.db_user.as_deref().unwrap_or("default").to_string(),
+                    "--no-auth-warning".to_string(),
+                    "SAVE".to_string(),
+                ],
+                "/data/dump.rdb",
+            )
+        }
         "postgres" => {
             let user = db.db_user.as_deref().unwrap_or("postgres");
             let dbname = db.db_name.as_deref().unwrap_or("postgres");
@@ -1106,6 +1129,8 @@ async fn dump_database(docker: &bollard::Docker, db: &ManagedDatabase, dest: &Pa
     // Copy dump from container to host using `docker cp`-style read
     let dump_filename = if out_file.ends_with(".archive") {
         "dump.archive"
+    } else if out_file.ends_with(".rdb") {
+        "dump.rdb"
     } else {
         "dump.sql"
     };

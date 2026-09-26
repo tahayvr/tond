@@ -14,6 +14,8 @@ const api = vi.hoisted(() => ({
 	listProjects: vi.fn()
 }));
 
+vi.mock('$lib/auth.svelte', () => ({ isAdmin: () => true }));
+
 vi.mock('$lib/api', () => ({ ...api }));
 vi.mock('$app/navigation', () => ({ goto: vi.fn() }));
 vi.mock('$app/state', () => ({
@@ -47,7 +49,9 @@ const pg: ManagedDatabaseDetail = {
 	created_at: '2026-01-01T00:00:00.000Z',
 	updated_at: '2026-01-01T00:00:00.000Z',
 	connection_string: null,
-	internal_connection_string: null
+	internal_connection_string: null,
+	public_access: false,
+	public_connection_string: null
 };
 
 async function openEnvironment(db: ManagedDatabaseDetail) {

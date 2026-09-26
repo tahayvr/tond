@@ -14,6 +14,7 @@ const allDatabaseLogStream = ws.link('ws://*/api/databases/logs/stream');
 const databaseLogStream = ws.link('ws://*/api/databases/*/logs/stream');
 const cronRunStream = ws.link('ws://*/api/cron/*/runs/stream');
 const terminalStream = ws.link('ws://*/api/terminal/ws*');
+
 import {
 	MOCK_USER,
 	MOCK_USERS,
@@ -58,6 +59,10 @@ import type {
 	Integration,
 	ManagedDatabase,
 	TemplateCatalogEntry,
+	Volume,
+	VolumeInput,
+	CronVolume,
+	CronVolumeInput,
 	PreviewDeployment,
 	Project,
 	ProjectPreview,
@@ -76,6 +81,105 @@ function ok<T>(data: T) {
 
 function err(message: string, status = 400) {
 	return HttpResponse.json({ success: false, data: null, error: message }, { status });
+}
+
+// ── Mock helpers mirroring server-side confinement rules ─────────────────────
+
+const MOCK_VOLUMES_DIR = '/opt/tond/data/volumes';
+
+/** "/data/cache" → "data_cache" (same default as the server). */
+function mockVolumeName(containerPath: string): string {
+	return (
+		containerPath
+			.replace(/^\/+|\/+$/g, '')
+			.replace(/[^A-Za-z0-9._-]/g, '_')
+			.replace(/^\.+/, '') || 'data'
+	);
+}
+
+/** Validate a volume request like the API does; returns an error message or null. */
+function mockVolumeError(
+	input: { container_path?: string; name?: string; host_path?: string },
+	baseDir: string
+): string | null {
+	const path = input.container_path ?? '';
+	if (
+		!path.startsWith('/') ||
+		path === '/' ||
+		/[:,]/.test(path) ||
+		/(^|\/)\.\.?(\/|$)/.test(path)
+	) {
+		return `Container path '${path}' must be an absolute path inside the container, e.g. /data`;
+	}
+	if (input.name && !/^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$/.test(input.name)) {
+		return `Volume name '${input.name}' may only contain letters, digits, '.', '_' and '-' (no slashes)`;
+	}
+	if (
+		input.host_path &&
+		!new RegExp(`^${baseDir}/[A-Za-z0-9_-][A-Za-z0-9._-]*$`).test(input.host_path)
+	) {
+		return `Host path '${input.host_path}' is not allowed. Volumes are stored inside ${baseDir}; give the volume a name (e.g. "data") instead of a host path.`;
+	}
+	return null;
+}
+
+function mockAppVolume(appName: string, input: VolumeInput & { host_path?: string }): Volume {
+	const base = `${MOCK_VOLUMES_DIR}/${appName}`;
+	const name =
+		input.name ||
+		(input.host_path ? input.host_path.slice(base.length + 1) : '') ||
+		mockVolumeName(input.container_path);
+	return { name, host_path: `${base}/${name}`, container_path: input.container_path };
+}
+
+function mockCronVolumes(
+	jobId: string,
+	inputs: CronVolumeInput[] | null | undefined
+): CronVolume[] | null {
+	if (!inputs || inputs.length === 0) return null;
+	return inputs.map((v) => {
+		const name = v.name || mockVolumeName(v.container_path);
+		const base = v.app ? `${MOCK_VOLUMES_DIR}/${v.app}` : `${MOCK_VOLUMES_DIR}/_cron/${jobId}`;
+		return {
+			app: v.app ?? null,
+			name,
+			host_path: `${base}/${name}`,
+			container_path: v.container_path
+		};
+	});
+}
+
+/** A few of the server's compose rules, enough to demo the UI. */
+function mockComposeProblems(content: string): string[] {
+	const problems: string[] = [];
+	if (/^\s*privileged:\s*true/m.test(content)) {
+		problems.push(
+			"service: 'privileged' is not allowed — privileged containers have full root access to the host"
+		);
+	}
+	for (const field of ['network_mode', 'pid', 'ipc']) {
+		if (new RegExp(`^\\s*${field}:\\s*["']?host`, 'm').test(content)) {
+			problems.push(`service: '${field}: host' is not allowed`);
+		}
+	}
+	if (/^\s*cap_add:/m.test(content)) {
+		problems.push("service: 'cap_add' beyond Docker's default set is not allowed");
+	}
+	for (const m of content.matchAll(/^\s*-\s*["']?(\/[^:"'\s]*):/gm)) {
+		problems.push(
+			`service: bind mount '${m[1]}' is outside this app's volume directory — use a relative path such as ./data or a named volume`
+		);
+	}
+	return problems;
+}
+
+/** Public connection string (only when public access is on). */
+function mockPublicUrl(db: ManagedDatabase): string | null {
+	if (!db.public_access || !db.host_port) return null;
+	const isRedisLike = db.db_type === 'redis' || db.db_type === 'keydb';
+	return isRedisLike
+		? `redis://${db.db_user}:${db.db_password}@tond.example.com:${db.host_port}`
+		: `${db.db_type}://${db.db_user}:${db.db_password}@tond.example.com:${db.host_port}/${db.db_name}`;
 }
 
 // Mirrors tond-server's domains.rs: previews need a preview domain on a different
@@ -706,7 +810,24 @@ export const handlers = [
 
 	http.post('/api/apps', async ({ request }) => {
 		await delay(LATENCY * 2);
-		const body = (await request.json()) as Partial<App>;
+		const body = (await request.json()) as Omit<Partial<App>, 'volumes'> & {
+			volumes?: VolumeInput[];
+		};
+		if (body.source_type === 'compose') {
+			const problems = mockComposeProblems(body.compose_content ?? '');
+			if (problems.length === 1) return err(`Compose file rejected: ${problems[0]}`, 400);
+			if (problems.length > 1) {
+				return err(
+					`Compose file rejected (${problems.length} problems):\n- ${problems.join('\n- ')}`,
+					400
+				);
+			}
+		}
+		const appName = body.name ?? 'new-app';
+		for (const v of body.volumes ?? []) {
+			const problem = mockVolumeError(v, `${MOCK_VOLUMES_DIR}/${appName}`);
+			if (problem) return err(problem, 400);
+		}
 		const newApp: App = {
 			id: `app_${Date.now()}`,
 			name: body.name ?? 'new-app',
@@ -722,7 +843,7 @@ export const handlers = [
 			health_check_interval: 30,
 			health_failure_threshold: 3,
 			health_consecutive_failures: 0,
-			volumes: [],
+			volumes: (body.volumes ?? []).map((v) => mockAppVolume(appName, v)),
 			drain_timeout: 30,
 			build_method:
 				body.source_type === 'git' || body.source_type === 'dockerfile'
@@ -929,8 +1050,13 @@ export const handlers = [
 		await delay(LATENCY);
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx === -1) return err('App not found', 404);
-		const body = (await request.json()) as { container_path: string };
-		const vol = { host_path: `/data${body.container_path}`, container_path: body.container_path };
+		const body = (await request.json()) as VolumeInput & { host_path?: string };
+		const problem = mockVolumeError(body, `${MOCK_VOLUMES_DIR}/${apps[idx].name}`);
+		if (problem) return err(problem, 400);
+		if (apps[idx].volumes.some((v) => v.container_path === body.container_path)) {
+			return err(`A volume is already mounted at ${body.container_path}`, 400);
+		}
+		const vol = mockAppVolume(apps[idx].name, body);
 		apps[idx] = {
 			...apps[idx],
 			volumes: [...apps[idx].volumes, vol],
@@ -978,13 +1104,50 @@ export const handlers = [
 		});
 	}),
 
-	http.post('/api/apps/:id/rollback', async ({ params }) => {
+	http.post('/api/apps/:id/rollback', async ({ params, request }) => {
 		await delay(LATENCY);
+		const text = await request.text();
+		const body = (text.trim() ? JSON.parse(text) : {}) as { deployment_id?: string };
+		const list = deployments[params.id as string] ?? [];
+		const target = body.deployment_id
+			? list.find((d) => d.id === body.deployment_id)
+			: list.find((d) => d.rollback_available);
+		if (!target) {
+			return err(
+				'No previous deployment to roll back to: there is no earlier successful deployment whose image is still available',
+				400
+			);
+		}
+		if (!target.rollback_available) {
+			return err(
+				`Can't roll back to this deployment: ${target.rollback_unavailable_reason ?? 'unavailable'}`,
+				400
+			);
+		}
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx !== -1) {
 			apps[idx] = { ...apps[idx], status: 'running', updated_at: new Date().toISOString() };
 		}
-		return ok(null);
+		// The restored image becomes current.
+		deployments[params.id as string] = list.map((d) => ({
+			...d,
+			is_current: d.id === target.id,
+			rollback_available: d.id !== target.id && d.status === 'succeeded' && !d.image_pruned,
+			rollback_unavailable_reason:
+				d.id === target.id ? 'This image is already running' : d.rollback_unavailable_reason
+		}));
+		return ok({
+			message: 'Rollback started',
+			image_tag: target.image_tag,
+			deployment_id: target.id
+		});
+	}),
+
+	http.post('/api/compose/validate', async ({ request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as { compose_content: string };
+		const errors = mockComposeProblems(body.compose_content);
+		return ok({ valid: errors.length === 0, errors });
 	}),
 
 	// ── Git Integration ───────────────────────────────────────────────────────
@@ -1493,6 +1656,7 @@ export const handlers = [
 			db_type: string;
 			project_id?: string;
 			memory_limit?: number;
+			public_access?: boolean;
 		};
 		const defaultImages: Record<string, string> = {
 			postgres: 'postgres:16-alpine',
@@ -1521,7 +1685,8 @@ export const handlers = [
 			image_used: defaultImages[body.db_type] ?? `${body.db_type}:latest`,
 			custom_image: null,
 			created_at: new Date().toISOString(),
-			updated_at: new Date().toISOString()
+			updated_at: new Date().toISOString(),
+			public_access: body.public_access ?? false
 		};
 		databases = [...databases, newDb];
 		const newDbUser = newDb.db_user!;
@@ -1532,6 +1697,7 @@ export const handlers = [
 		return ok({
 			...newDb,
 			connection_string: newConnectionString,
+			public_connection_string: mockPublicUrl(newDb),
 			internal_connection_string: null
 		});
 	}),
@@ -1557,6 +1723,7 @@ export const handlers = [
 		return ok({
 			...db,
 			connection_string: db.custom_external_url ?? computedExternal,
+			public_connection_string: mockPublicUrl(db),
 			internal_connection_string: db.custom_internal_url ?? computedInternal
 		});
 	}),
@@ -1576,6 +1743,7 @@ export const handlers = [
 			custom_internal_url?: string | null;
 			custom_image?: string | null;
 			memory_limit?: number | null;
+			public_access?: boolean;
 		};
 		// Apply updates — empty string clears the override (mirrors backend behaviour)
 		const updated = { ...databases[idx] };
@@ -1598,6 +1766,9 @@ export const handlers = [
 		if (body.memory_limit !== undefined) {
 			updated.memory_limit = body.memory_limit ?? null;
 		}
+		if (body.public_access !== undefined) {
+			updated.public_access = body.public_access;
+		}
 		updated.updated_at = new Date().toISOString();
 		databases[idx] = updated;
 		const db = databases[idx];
@@ -1619,6 +1790,7 @@ export const handlers = [
 		return ok({
 			...db,
 			connection_string: db.custom_external_url ?? computedExternal,
+			public_connection_string: mockPublicUrl(db),
 			internal_connection_string: db.custom_internal_url ?? computedInternal
 		});
 	}),
@@ -1688,6 +1860,7 @@ export const handlers = [
 			database: {
 				...db,
 				connection_string: db.custom_external_url ?? computedExternalC,
+				public_connection_string: mockPublicUrl(db),
 				internal_connection_string: db.custom_internal_url ?? computedInternalC
 			},
 			changed
@@ -1759,6 +1932,7 @@ export const handlers = [
 		return ok({
 			...updated,
 			connection_string: updated.custom_external_url ?? computedExternal,
+			public_connection_string: mockPublicUrl(updated),
 			internal_connection_string: updated.custom_internal_url ?? computedInternal
 		});
 	}),
@@ -1786,7 +1960,7 @@ export const handlers = [
 			timezone?: string | null;
 			max_retries?: number;
 			retry_delay_seconds?: number;
-			volumes?: { host_path: string; container_path: string }[] | null;
+			volumes?: CronVolumeInput[] | null;
 		};
 		const newJob: CronJob = {
 			id: `cron_${Date.now()}`,
@@ -1810,7 +1984,7 @@ export const handlers = [
 			timezone: body.timezone ?? null,
 			max_retries: body.max_retries ?? 0,
 			retry_delay_seconds: body.retry_delay_seconds ?? 60,
-			volumes: body.volumes ?? null
+			volumes: mockCronVolumes(`cron_${Date.now()}`, body.volumes)
 		};
 		cronJobs = [...cronJobs, newJob];
 		cronRuns[newJob.id] = [];
@@ -1843,7 +2017,7 @@ export const handlers = [
 			timezone: string | null;
 			max_retries: number;
 			retry_delay_seconds: number;
-			volumes: { host_path: string; container_path: string }[] | null;
+			volumes: CronVolumeInput[] | null;
 		}>;
 		// Check for name conflict
 		if (body.name !== undefined && body.name !== cronJobs[idx].name) {
@@ -1872,7 +2046,9 @@ export const handlers = [
 			...(body.retry_delay_seconds !== undefined && {
 				retry_delay_seconds: body.retry_delay_seconds
 			}),
-			...('volumes' in body && { volumes: body.volumes ?? null }),
+			...('volumes' in body && {
+				volumes: mockCronVolumes(cronJobs[idx].id, body.volumes)
+			}),
 			updated_at: new Date().toISOString()
 		};
 		return ok(cronJobs[idx]);

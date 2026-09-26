@@ -24,7 +24,7 @@ use tond_common::*;
 use uuid::Uuid;
 
 use crate::{
-    auth::{RateLimit, RequireAuth},
+    auth::{RateLimit, RequireAdmin, RequireAuth},
     error::AppError,
     secret_key::{self, Purpose},
     state::AppState,
@@ -64,7 +64,7 @@ pub async fn get_storage_provider(
 
 pub async fn create_storage_provider(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Json(req): Json<CreateStorageProviderRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -101,7 +101,7 @@ pub async fn create_storage_provider(
 
 pub async fn update_storage_provider(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateStorageProviderRequest>,
@@ -142,7 +142,7 @@ pub async fn update_storage_provider(
 
 pub async fn delete_storage_provider(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -183,7 +183,7 @@ pub async fn delete_storage_provider(
 
 pub async fn test_storage_provider(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {

@@ -17,73 +17,19 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use axum::{
     Json,
-    extract::{FromRequestParts, Path, State},
-    http::{StatusCode, header, request::Parts},
-    response::{IntoResponse, Response},
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
 };
 use tond_common::*;
 
-use super::{
-    auth::{extract_session_token, validate_session},
-    fetch_app,
-};
+use super::fetch_app;
 use crate::{
     audit_log::{AuthActor, write_audit_log},
-    auth::{LocalSocket, RateLimit, RequireAuth},
+    auth::{RateLimit, RequireAdmin, RequireAuth},
     error::AppError,
     state::AppState,
 };
-
-// ── Admin gate for reveals ──
-
-/// Admits admins only: a dashboard session whose user has role "admin", an API
-/// key, or the root-only Unix socket. Use after `RequireAuth`, which has
-/// already validated whichever credential was sent.
-///
-/// TODO: switch to the shared `RequireAdmin` extractor once the containers
-/// workstream lands it on phase-0-lockdown.
-pub struct AdminCaller;
-
-impl FromRequestParts<AppState> for AdminCaller {
-    type Rejection = Response;
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        if parts.extensions.get::<LocalSocket>().is_some() {
-            return Ok(AdminCaller);
-        }
-        if let Some(token) = extract_session_token(&parts.headers) {
-            match validate_session(&state.db, &token).await {
-                Ok(Some(user)) if user.role == "admin" => return Ok(AdminCaller),
-                Ok(Some(_)) => return Err(admin_only()),
-                // Not a valid session: fall through to an API key, if any.
-                _ => {}
-            }
-        }
-        let has_bearer = parts
-            .headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.starts_with("Bearer "));
-        if has_bearer {
-            Ok(AdminCaller)
-        } else {
-            Err(admin_only())
-        }
-    }
-}
-
-fn admin_only() -> Response {
-    (
-        StatusCode::FORBIDDEN,
-        Json(ApiResponse::<()>::err(
-            "Only admins can reveal environment variable values.",
-        )),
-    )
-        .into_response()
-}
 
 // ── Pure helpers ──
 
@@ -218,8 +164,7 @@ pub async fn get_env(
 
 pub async fn reveal_env_var(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    _admin: AdminCaller,
+    _admin: RequireAdmin,
     actor: AuthActor,
     State(state): State<AppState>,
     Path((id, key)): Path<(String, String)>,
@@ -301,8 +246,7 @@ pub async fn patch_env(
 
 pub async fn reveal_preview_env_var(
     _rate: RateLimit,
-    _auth: RequireAuth,
-    _admin: AdminCaller,
+    _admin: RequireAdmin,
     actor: AuthActor,
     State(state): State<AppState>,
     Path((id, key)): Path<(String, String)>,
@@ -406,8 +350,10 @@ mod tests {
     use sqlx::SqlitePool;
     use tokio::sync::RwLock;
 
+    use axum::{extract::FromRequestParts, http::header};
+
     use super::*;
-    use crate::auth::RateLimiter;
+    use crate::auth::{LocalSocket, RateLimiter};
     use crate::handlers::auth::SESSION_COOKIE;
 
     async fn test_state() -> AppState {
@@ -507,7 +453,7 @@ mod tests {
             .body(())
             .unwrap_or_else(|err| panic!("failed to build request: {err}"))
             .into_parts();
-        AdminCaller::from_request_parts(&mut parts, state)
+        RequireAdmin::from_request_parts(&mut parts, state)
             .await
             .is_ok()
     }
@@ -524,9 +470,30 @@ mod tests {
             !admin_gate(&state, &[cookie(&member)]).await,
             "member session must be refused"
         );
+        let (api_key, raw_key) = ApiKey::generate("e2e");
+        sqlx::query("INSERT INTO api_keys (id, name, key_hash, created_at) VALUES (?, ?, ?, ?)")
+            .bind(&api_key.id)
+            .bind(&api_key.name)
+            .bind(&api_key.key_hash)
+            .bind(&api_key.created_at)
+            .execute(&state.db)
+            .await
+            .unwrap_or_else(|err| panic!("failed to seed API key: {err}"));
         assert!(
-            admin_gate(&state, &[(header::AUTHORIZATION, "Bearer key".to_string())]).await,
-            "API keys (validated by RequireAuth) count as admin"
+            admin_gate(
+                &state,
+                &[(header::AUTHORIZATION, format!("Bearer {raw_key}"))]
+            )
+            .await,
+            "API keys count as admin"
+        );
+        assert!(
+            !admin_gate(
+                &state,
+                &[(header::AUTHORIZATION, "Bearer bogus".to_string())]
+            )
+            .await,
+            "an invalid API key is refused"
         );
         assert!(!admin_gate(&state, &[]).await, "no credential");
 
@@ -536,7 +503,7 @@ mod tests {
             .unwrap_or_else(|err| panic!("failed to build request: {err}"))
             .into_parts();
         assert!(
-            AdminCaller::from_request_parts(&mut parts, &state)
+            RequireAdmin::from_request_parts(&mut parts, &state)
                 .await
                 .is_ok(),
             "the root-only Unix socket counts as admin"
@@ -704,8 +671,7 @@ mod tests {
 
         let response = reveal_env_var(
             RateLimit,
-            RequireAuth,
-            AdminCaller,
+            RequireAdmin,
             actor(),
             State(state.clone()),
             Path((app.id.clone(), "TOKEN".to_string())),
@@ -728,8 +694,7 @@ mod tests {
 
         let missing = reveal_env_var(
             RateLimit,
-            RequireAuth,
-            AdminCaller,
+            RequireAdmin,
             actor(),
             State(state.clone()),
             Path((app.id.clone(), "NOPE".to_string())),

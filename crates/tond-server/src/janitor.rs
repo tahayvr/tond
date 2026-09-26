@@ -49,7 +49,9 @@ const BATCH_PAUSE: Duration = Duration::from_millis(25);
 const STARTUP_DELAY: Duration = Duration::from_secs(120);
 /// Interval between passes.
 const INTERVAL: Duration = Duration::from_secs(3600);
-/// Succeeded deployments with an image that are always kept (rollback targets).
+/// Succeeded deployments whose image is still on the host that are always
+/// kept (rollback targets). deploy/images.rs keeps at most `KEEP_IMAGES` (3)
+/// such images plus the running one, so this never trims a live target.
 const KEEP_ROLLBACK_IMAGES: i64 = 5;
 
 /// Retention settings. Each field maps to a key in the `settings` table.
@@ -230,6 +232,7 @@ pub async fn run_once(db: &SqlitePool, policy: &RetentionPolicy) -> Result<Janit
                           AND id NOT IN (
                               SELECT id FROM deployments
                               WHERE app_id = ?1 AND status = 'succeeded' AND image_tag IS NOT NULL
+                                AND image_pruned = 0
                               ORDER BY created_at DESC LIMIT ?3)
                         LIMIT ?4)",
                 )

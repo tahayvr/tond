@@ -72,10 +72,11 @@ use tond_common::*;
 use crate::{
     alerts::fire_event_alerts,
     audit_log::{AuthActor, write_audit_log},
-    auth::{RateLimit, RequireAuth},
-    deploy, docker,
+    auth::{AuthRole, RateLimit, RequireAdmin, RequireAuth},
+    compose_policy, deploy, docker,
     error::AppError,
     state::AppState,
+    volumes,
 };
 
 // ── Health ──
@@ -149,11 +150,19 @@ pub async fn get_app(
 
 pub async fn create_app(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: AuthRole,
     actor: AuthActor,
     State(state): State<AppState>,
     Json(req): Json<CreateAppRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    // Volumes and compose files reach the host, so only admins may set them.
+    if req.volumes.as_ref().is_some_and(|v| !v.is_empty()) {
+        auth.ensure_admin("configure volumes")?;
+    }
+    if req.source_type == "compose" {
+        auth.ensure_admin("deploy Docker Compose apps")?;
+    }
+
     // Validate name (alphanumeric + hyphens)
     if !req.name.chars().all(|c| c.is_alphanumeric() || c == '-') {
         return Err(AppError(TondError::InvalidInput(
@@ -195,6 +204,18 @@ pub async fn create_app(
         return Err(AppError(TondError::InvalidInput(
             "compose_content is required when source_type is 'compose'".to_string(),
         )));
+    }
+    // Reject host-level compose options up front (privileged, host binds, …) so
+    // the user sees every problem now instead of at deploy time.
+    if req.source_type == "compose"
+        && let Some(content) = req.compose_content.as_deref()
+    {
+        let volume_dir = volumes::app_volume_dir(&volumes::data_dir(), &req.name);
+        compose_policy::validate(content, &volume_dir).map_err(|errors| {
+            AppError(TondError::InvalidInput(compose_policy::format_errors(
+                &errors,
+            )))
+        })?;
     }
 
     let requested_build_method = req.build_method.clone();
@@ -296,10 +317,13 @@ pub async fn create_app(
     if let Some(registry_credential_id) = req.registry_credential_id {
         app.registry_credential_id = Some(registry_credential_id);
     }
-    if let Some(vols) = req.volumes
-        && !vols.is_empty()
+    if let Some(reqs) = req.volumes
+        && !reqs.is_empty()
     {
-        app.volumes = serde_json::to_string(&vols).unwrap_or_else(|_| "[]".to_string());
+        let vols = volumes::app_volumes(&volumes::data_dir(), &app.name, &reqs)
+            .map_err(|msg| AppError(TondError::InvalidInput(msg)))?;
+        app.volumes = serde_json::to_string(&vols)
+            .map_err(|e| AppError(TondError::Internal(e.to_string())))?;
     }
     if let Some(content) = req.dockerfile_content {
         app.dockerfile_content = Some(content);
@@ -375,6 +399,42 @@ pub async fn create_app(
     ))
 }
 
+// ── Validate Compose ──
+//
+// POST /api/compose/validate — lets the dashboard show compose policy problems
+// under the editor while the user types, before they create the app.
+
+#[derive(Deserialize)]
+pub struct ValidateComposeRequest {
+    /// App name, used to show where bind mounts will be stored (default "app")
+    pub app_name: Option<String>,
+    pub compose_content: String,
+}
+
+pub async fn validate_compose(
+    _rate: RateLimit,
+    _auth: RequireAuth,
+    Json(req): Json<ValidateComposeRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let name = req
+        .app_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_alphanumeric() || c == '-'))
+        .unwrap_or("app");
+    let volume_dir = volumes::app_volume_dir(&volumes::data_dir(), name);
+    let errors = match compose_policy::validate(&req.compose_content, &volume_dir) {
+        Ok(()) => Vec::new(),
+        Err(errors) => errors,
+    };
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(
+            json!({ "valid": errors.is_empty(), "errors": errors }),
+        )),
+    ))
+}
+
 // ── Delete App ──
 
 pub async fn delete_app(
@@ -386,8 +446,12 @@ pub async fn delete_app(
 ) -> Result<impl IntoResponse, AppError> {
     let app = fetch_app(&state.db, &id).await?;
 
-    // Stop and remove container if running (best-effort)
-    if let Some(container_id) = &app.container_id {
+    // Stop and remove container if running (best-effort). Compose apps store a
+    // sentinel instead of a container id, so remove the whole compose project.
+    if app.source_type == "compose" {
+        docker::remove_compose_project(&state.docker, &deploy::compose_project_name(&app.name))
+            .await;
+    } else if let Some(container_id) = &app.container_id {
         let _ = docker::remove_container(&state.docker, container_id).await;
     }
 
@@ -794,43 +858,21 @@ pub async fn update_health(
 
 pub async fn add_volume(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
+    actor: AuthActor,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<VolumeRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let app = fetch_app(&state.db, &id).await?;
 
-    // Validate container_path
-    if req.container_path.is_empty() || !req.container_path.starts_with('/') {
-        return Err(AppError(TondError::InvalidInput(
-            "container_path must be an absolute path (e.g. /data)".to_string(),
-        )));
-    }
-
     let mut volumes: Vec<Volume> = serde_json::from_str(&app.volumes).unwrap_or_default();
 
-    // Reject duplicate container paths
-    if volumes
-        .iter()
-        .any(|v| v.container_path == req.container_path)
-    {
-        return Err(AppError(TondError::InvalidInput(format!(
-            "Volume at {} already exists",
-            req.container_path
-        ))));
-    }
-
-    // Build host path: /opt/tond/data/volumes/<app-name>/<sanitised-mount>
-    // e.g. /data -> /opt/tond/data/volumes/myapp/data
-    let sanitised = req.container_path.trim_start_matches('/').replace('/', "_");
-    let data_dir = std::env::var("TOND_DATA_DIR").unwrap_or_else(|_| "/opt/tond/data".to_string());
-    let host_path = format!("{}/volumes/{}/{}", data_dir, app.name, sanitised);
-
-    volumes.push(Volume {
-        host_path,
-        container_path: req.container_path,
-    });
+    // Map the request into <data>/volumes/<app>/<name>; arbitrary host paths are refused.
+    let volume = volumes::add_app_volume(&volumes::data_dir(), &app.name, &volumes, &req)
+        .map_err(|msg| AppError(TondError::InvalidInput(msg)))?;
+    let detail = format!("{} -> {}", volume.host_path, volume.container_path);
+    volumes.push(volume);
 
     let volumes_json = serde_json::to_string(&volumes)
         .map_err(|e| AppError(TondError::Internal(e.to_string())))?;
@@ -840,6 +882,16 @@ pub async fn add_volume(
         .bind(&app.id)
         .execute(&state.db)
         .await?;
+
+    write_audit_log(
+        &state.db,
+        Some(&app.id),
+        Some(&app.name),
+        "volume_add",
+        &actor.0,
+        Some(&detail),
+    )
+    .await;
 
     Ok((
         StatusCode::OK,
@@ -853,7 +905,7 @@ pub async fn add_volume(
 
 pub async fn remove_volume(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<VolumeRequest>,
@@ -1180,7 +1232,7 @@ mod tests {
     use super::*;
     use crate::{
         audit_log::AuthActor,
-        auth::{RateLimiter, RequireAuth, rate_limit::RateLimit},
+        auth::{RateLimiter, RequireAdmin, RequireAuth, extractor::Role, rate_limit::RateLimit},
         state::AppState,
     };
 
@@ -1278,7 +1330,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            RequireAuth,
+            AuthRole(Role::Admin),
             AuthActor("admin@example.com".to_string()),
             State(state),
             Json(CreateAppRequest {
@@ -1325,7 +1377,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            RequireAuth,
+            AuthRole(Role::Admin),
             AuthActor("admin@example.com".to_string()),
             State(state),
             Json(CreateAppRequest {
@@ -1372,7 +1424,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            RequireAuth,
+            AuthRole(Role::Admin),
             AuthActor("admin@example.com".to_string()),
             State(state),
             Json(CreateAppRequest {
@@ -1419,7 +1471,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            RequireAuth,
+            AuthRole(Role::Admin),
             AuthActor("admin@example.com".to_string()),
             State(state),
             Json(CreateAppRequest {
@@ -1466,7 +1518,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            RequireAuth,
+            AuthRole(Role::Admin),
             AuthActor("admin@example.com".to_string()),
             State(state),
             Json(CreateAppRequest {
@@ -1513,7 +1565,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            RequireAuth,
+            AuthRole(Role::Admin),
             AuthActor("admin@example.com".to_string()),
             State(state),
             Json(CreateAppRequest {
@@ -1560,7 +1612,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            RequireAuth,
+            AuthRole(Role::Admin),
             AuthActor("admin@example.com".to_string()),
             State(state),
             Json(CreateAppRequest {
@@ -1607,7 +1659,7 @@ mod tests {
 
         let error = create_app(
             RateLimit,
-            RequireAuth,
+            AuthRole(Role::Admin),
             AuthActor("admin@example.com".to_string()),
             State(state),
             Json(CreateAppRequest {
@@ -1653,7 +1705,7 @@ mod tests {
         let state = test_state().await;
         let response = create_app(
             RateLimit,
-            RequireAuth,
+            AuthRole(Role::Admin),
             AuthActor("admin@example.com".to_string()),
             State(state),
             Json(CreateAppRequest {
@@ -1702,7 +1754,7 @@ mod tests {
         let state = test_state().await;
         let response = create_app(
             RateLimit,
-            RequireAuth,
+            AuthRole(Role::Admin),
             AuthActor("admin@example.com".to_string()),
             State(state),
             Json(CreateAppRequest {
@@ -1750,7 +1802,7 @@ mod tests {
         let state = test_state().await;
         let response = create_app(
             RateLimit,
-            RequireAuth,
+            AuthRole(Role::Admin),
             AuthActor("admin@example.com".to_string()),
             State(state.clone()),
             Json(CreateAppRequest {
@@ -1771,9 +1823,10 @@ mod tests {
                 project_id: None,
                 github_app_id: None,
                 registry_credential_id: None,
-                volumes: Some(vec![Volume {
-                    host_path: "/opt/tond/data/demo".to_string(),
+                volumes: Some(vec![VolumeRequest {
                     container_path: "/data".to_string(),
+                    name: None,
+                    host_path: None,
                 }]),
                 drain_timeout: Some(45),
                 build_method: Some("tbuild".to_string()),
@@ -1963,11 +2016,14 @@ mod tests {
 
         let error = add_volume(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
+            AuthActor("admin@example.com".to_string()),
             State(state),
             Path(app.id),
             Json(VolumeRequest {
                 container_path: "data".to_string(),
+                name: None,
+                host_path: None,
             }),
         )
         .await
@@ -1976,7 +2032,7 @@ mod tests {
 
         assert_eq!(
             error.0.to_string(),
-            "Invalid input: container_path must be an absolute path (e.g. /data)",
+            "Invalid input: Container path 'data' must be an absolute path inside the container, e.g. /data",
             "add_volume should require absolute container paths"
         );
     }
@@ -1988,11 +2044,14 @@ mod tests {
 
         let add_response = add_volume(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
+            AuthActor("admin@example.com".to_string()),
             State(state.clone()),
             Path(app.id.clone()),
             Json(VolumeRequest {
                 container_path: "/data/cache".to_string(),
+                name: None,
+                host_path: None,
             }),
         )
         .await
@@ -2020,11 +2079,14 @@ mod tests {
 
         let error = add_volume(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
+            AuthActor("admin@example.com".to_string()),
             State(state.clone()),
             Path(app.id.clone()),
             Json(VolumeRequest {
                 container_path: "/data/cache".to_string(),
+                name: None,
+                host_path: None,
             }),
         )
         .await
@@ -2032,17 +2094,19 @@ mod tests {
         .unwrap_or_else(|| panic!("expected add_volume to reject duplicate mounts"));
         assert_eq!(
             error.0.to_string(),
-            "Invalid input: Volume at /data/cache already exists",
+            "Invalid input: A volume is already mounted at /data/cache",
             "add_volume should reject duplicate container paths"
         );
 
         let remove_response = remove_volume(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
             State(state.clone()),
             Path(app.id.clone()),
             Json(VolumeRequest {
                 container_path: "/data/cache".to_string(),
+                name: None,
+                host_path: None,
             }),
         )
         .await
@@ -2064,6 +2128,258 @@ mod tests {
             volumes_after_remove, "[]",
             "remove_volume should persist an empty volume list after deleting the only mount"
         );
+    }
+
+    #[tokio::test]
+    async fn add_volume_rejects_host_paths_outside_the_app_directory() {
+        let state = test_state().await;
+        let app = seed_app(&state, "demo").await;
+
+        for host_path in ["/", "/etc", "/var/run/docker.sock", "/opt/tond/data"] {
+            let error = add_volume(
+                RateLimit,
+                RequireAdmin,
+                AuthActor("admin@example.com".to_string()),
+                State(state.clone()),
+                Path(app.id.clone()),
+                Json(VolumeRequest {
+                    container_path: "/host".to_string(),
+                    name: None,
+                    host_path: Some(host_path.to_string()),
+                }),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("host_path {host_path} must be rejected"));
+            assert_eq!(error.0.status_code(), 400);
+            assert!(
+                error.0.to_string().contains("is not allowed"),
+                "error should explain why: {}",
+                error.0
+            );
+        }
+
+        let stored: String = sqlx::query_scalar("SELECT volumes FROM apps WHERE id = ?")
+            .bind(&app.id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_else(|err| panic!("failed to read volumes: {err}"));
+        assert_eq!(stored, "[]", "rejected volumes must not be persisted");
+    }
+
+    #[tokio::test]
+    async fn create_app_confines_volumes_and_rejects_host_root() {
+        let state = test_state().await;
+        let mut request = CreateAppRequest {
+            name: "rooted".to_string(),
+            source_type: "image".to_string(),
+            source_url: Some("alpine:3".to_string()),
+            branch: None,
+            container_port: 3000,
+            env_vars: None,
+            domain: None,
+            project_id: None,
+            memory_limit: None,
+            cpu_limit: None,
+            health_check_path: None,
+            health_check_interval: None,
+            health_failure_threshold: None,
+            drain_timeout: None,
+            build_method: None,
+            auto_deploy: false,
+            watch_branch: None,
+            volumes: Some(vec![VolumeRequest {
+                container_path: "/host".to_string(),
+                name: None,
+                host_path: Some("/".to_string()),
+            }]),
+            registry_credential_id: None,
+            github_app_id: None,
+            dockerfile_content: None,
+            compose_content: None,
+            base_dir: None,
+            static_build: false,
+        };
+
+        let error = create_app(
+            RateLimit,
+            AuthRole(Role::Admin),
+            AuthActor("admin@example.com".to_string()),
+            State(state.clone()),
+            Json(request),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("host_path '/' must be rejected"));
+        assert_eq!(error.0.status_code(), 400);
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM apps WHERE name = 'rooted'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_else(|err| panic!("count failed: {err}"));
+        assert_eq!(count, 0, "no app row may be created for a rejected request");
+
+        // Members may not set volumes at all.
+        request = CreateAppRequest {
+            name: "member-app".to_string(),
+            source_type: "image".to_string(),
+            source_url: Some("alpine:3".to_string()),
+            branch: None,
+            container_port: 3000,
+            env_vars: None,
+            domain: None,
+            project_id: None,
+            memory_limit: None,
+            cpu_limit: None,
+            health_check_path: None,
+            health_check_interval: None,
+            health_failure_threshold: None,
+            drain_timeout: None,
+            build_method: None,
+            auto_deploy: false,
+            watch_branch: None,
+            volumes: Some(vec![VolumeRequest {
+                container_path: "/data".to_string(),
+                name: None,
+                host_path: None,
+            }]),
+            registry_credential_id: None,
+            github_app_id: None,
+            dockerfile_content: None,
+            compose_content: None,
+            base_dir: None,
+            static_build: false,
+        };
+        let error = create_app(
+            RateLimit,
+            AuthRole(Role::Member),
+            AuthActor("member@example.com".to_string()),
+            State(state.clone()),
+            Json(request),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("members must not configure volumes"));
+        assert_eq!(error.0.status_code(), 403);
+    }
+
+    fn compose_request(name: &str, content: &str) -> CreateAppRequest {
+        CreateAppRequest {
+            name: name.to_string(),
+            source_type: "compose".to_string(),
+            source_url: None,
+            branch: None,
+            container_port: 80,
+            env_vars: None,
+            domain: None,
+            project_id: None,
+            memory_limit: None,
+            cpu_limit: None,
+            health_check_path: None,
+            health_check_interval: None,
+            health_failure_threshold: None,
+            drain_timeout: None,
+            build_method: None,
+            auto_deploy: false,
+            watch_branch: None,
+            volumes: None,
+            registry_credential_id: None,
+            github_app_id: None,
+            dockerfile_content: None,
+            compose_content: Some(content.to_string()),
+            base_dir: None,
+            static_build: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_app_rejects_privileged_compose_files_with_every_problem_listed() {
+        let state = test_state().await;
+        let error = create_app(
+            RateLimit,
+            AuthRole(Role::Admin),
+            AuthActor("admin@example.com".to_string()),
+            State(state.clone()),
+            Json(compose_request(
+                "evil",
+                "services:\n  web:\n    image: nginx\n    privileged: true\n    volumes:\n      - /var/run/docker.sock:/var/run/docker.sock\n",
+            )),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("a privileged compose file must be rejected"));
+        assert_eq!(error.0.status_code(), 400);
+        let msg = error.0.to_string();
+        assert!(msg.contains("'privileged' is not allowed"), "{msg}");
+        assert!(msg.contains("/var/run/docker.sock"), "{msg}");
+
+        // Members can't deploy compose apps at all; admins can deploy clean ones.
+        let error = create_app(
+            RateLimit,
+            AuthRole(Role::Member),
+            AuthActor("member@example.com".to_string()),
+            State(state.clone()),
+            Json(compose_request(
+                "member-compose",
+                "services:\n  web:\n    image: nginx\n",
+            )),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("members must not create compose apps"));
+        assert_eq!(error.0.status_code(), 403);
+
+        let response = create_app(
+            RateLimit,
+            AuthRole(Role::Admin),
+            AuthActor("admin@example.com".to_string()),
+            State(state),
+            Json(compose_request(
+                "clean",
+                "services:\n  web:\n    image: nginx\n    ports: [\"8080:80\"]\n    volumes: [\"./html:/usr/share/nginx/html\"]\n",
+            )),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("a clean compose file should be accepted: {}", err.0))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn validate_compose_lists_problems_without_failing_the_request() {
+        let response = validate_compose(
+            RateLimit,
+            RequireAuth,
+            Json(ValidateComposeRequest {
+                app_name: Some("web".to_string()),
+                compose_content: "services:\n  a:\n    image: x\n    privileged: true\n"
+                    .to_string(),
+            }),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("validate_compose should not error: {}", err.0))
+        .into_response();
+        let body = response_json(response).await;
+        assert_eq!(body["data"]["valid"], serde_json::json!(false));
+        assert!(
+            body["data"]["errors"][0]
+                .as_str()
+                .is_some_and(|e| e.contains("privileged"))
+        );
+
+        let response = validate_compose(
+            RateLimit,
+            RequireAuth,
+            Json(ValidateComposeRequest {
+                app_name: None,
+                compose_content: "services:\n  a:\n    image: x\n".to_string(),
+            }),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("validate_compose should not error: {}", err.0))
+        .into_response();
+        let body = response_json(response).await;
+        assert_eq!(body["data"]["valid"], serde_json::json!(true));
     }
 
     #[tokio::test]

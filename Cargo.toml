@@ -48,6 +48,9 @@ toml = "1.1.6"
 # Database
 sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "migrate", "chrono"] }
 
+# YAML (compose file validation; already in the tree via pingora)
+serde_yaml = "0.9.34"
+
 # Docker
 bollard = "0.21.1"
 

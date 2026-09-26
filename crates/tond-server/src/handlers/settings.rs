@@ -18,7 +18,7 @@ use tond_common::*;
 use uuid::Uuid;
 
 use crate::{
-    auth::{RateLimit, RequireAuth},
+    auth::{RateLimit, RequireAdmin, RequireAuth},
     domains::{is_valid_hostname, normalize_domain, validate_preview_domain},
     state::AppState,
 };
@@ -71,7 +71,7 @@ pub async fn get_settings(
 
 pub async fn update_settings(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Json(req): Json<UpdateSettingsRequest>,
 ) -> impl IntoResponse {
@@ -205,7 +205,7 @@ mod tests {
 
         let response = update_settings(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
             State(state.clone()),
             Json(UpdateSettingsRequest {
                 server_name: None,
@@ -252,7 +252,7 @@ mod tests {
     ) -> axum::response::Response {
         update_settings(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
             State(state.clone()),
             Json(UpdateSettingsRequest {
                 server_name: None,

@@ -85,9 +85,23 @@ impl DbEngineConfig {
         env
     }
 
-    /// Build a connection string for external access via the host port.
+    /// Build a connection string for access via the host port on the server
+    /// itself (`localhost`) — e.g. from the host or through an SSH tunnel.
     pub fn external_connection_string(
         &self,
+        host_port: i64,
+        db_name: Option<&str>,
+        db_user: Option<&str>,
+        db_password: Option<&str>,
+    ) -> String {
+        self.connection_string_on("localhost", host_port, db_name, db_user, db_password)
+    }
+
+    /// Build a connection string for `host:host_port` (used with the server's
+    /// public address when public access is enabled).
+    pub fn connection_string_on(
+        &self,
+        host: &str,
         host_port: i64,
         db_name: Option<&str>,
         db_user: Option<&str>,
@@ -96,25 +110,27 @@ impl DbEngineConfig {
         if self.uses_credentials {
             if db_name.is_some_and(|n| !n.is_empty()) {
                 format!(
-                    "{}://{}:{}@localhost:{}/{}",
+                    "{}://{}:{}@{}:{}/{}",
                     self.url_scheme,
                     db_user.unwrap_or_default(),
                     db_password.unwrap_or_default(),
+                    host,
                     host_port,
                     db_name.unwrap_or_default(),
                 )
             } else {
                 // Engines that use credentials but have no named database (e.g. Redis)
                 format!(
-                    "{}://{}:{}@localhost:{}",
+                    "{}://{}:{}@{}:{}",
                     self.url_scheme,
                     db_user.unwrap_or_default(),
                     db_password.unwrap_or_default(),
+                    host,
                     host_port,
                 )
             }
         } else {
-            format!("{}://localhost:{}", self.url_scheme, host_port)
+            format!("{}://{}:{}", self.url_scheme, host, host_port)
         }
     }
 
@@ -269,6 +285,9 @@ pub struct ManagedDatabase {
     pub custom_image: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// When true the port is published on 0.0.0.0 (reachable from the internet);
+    /// otherwise on 127.0.0.1 only. Off by default; admins opt in explicitly.
+    pub public_access: bool,
 }
 
 impl ManagedDatabase {
@@ -332,6 +351,7 @@ impl ManagedDatabase {
             custom_image: None,
             created_at: now.clone(),
             updated_at: now,
+            public_access: false,
         }
     }
 }
@@ -361,6 +381,9 @@ pub struct ManagedDatabaseResponse {
     pub custom_image: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Whether the port is published on all interfaces (internet-reachable)
+    #[serde(default)]
+    pub public_access: bool,
 }
 
 impl From<ManagedDatabase> for ManagedDatabaseResponse {
@@ -383,6 +406,7 @@ impl From<ManagedDatabase> for ManagedDatabaseResponse {
             custom_image: d.custom_image,
             created_at: d.created_at,
             updated_at: d.updated_at,
+            public_access: d.public_access,
         }
     }
 }
@@ -394,6 +418,9 @@ pub struct ManagedDatabaseDetail {
     pub database: ManagedDatabaseResponse,
     /// External connection string (using host port on localhost)
     pub connection_string: Option<String>,
+    /// Connection string via the server's public address; only set when
+    /// `public_access` is on
+    pub public_connection_string: Option<String>,
     /// Internal connection string (using container alias within the project network)
     pub internal_connection_string: Option<String>,
 }
@@ -408,6 +435,9 @@ pub struct CreateDatabaseRequest {
     pub project_id: Option<String>,
     /// Optional memory cap in bytes
     pub memory_limit: Option<i64>,
+    /// Publish the port on all interfaces (internet-reachable). Admin only; default false.
+    #[serde(default)]
+    pub public_access: bool,
 }
 
 /// PATCH /api/databases/{id} request body
@@ -429,6 +459,10 @@ pub struct UpdateDatabaseRequest {
     /// Optional memory cap in bytes (None = no limit).
     /// Send `null` or omit to leave unchanged; send `0` to clear the limit.
     pub memory_limit: Option<i64>,
+    /// Turn public (internet) access on or off. Admin only. The container is
+    /// recreated immediately so the new port binding takes effect.
+    #[serde(default)]
+    pub public_access: Option<bool>,
 }
 
 /// PATCH /api/databases/{id}/credentials request body

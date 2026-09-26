@@ -178,7 +178,13 @@ export const MOCK_APPS: App[] = [
 		health_check_interval: 30,
 		health_failure_threshold: 3,
 		health_consecutive_failures: 0,
-		volumes: [{ host_path: '/data/uploads', container_path: '/app/uploads' }],
+		volumes: [
+			{
+				name: 'uploads',
+				host_path: '/opt/tond/data/volumes/web-frontend/uploads',
+				container_path: '/app/uploads'
+			}
+		],
 		drain_timeout: 30,
 		build_method: 'tbuild',
 		auto_deploy: true,
@@ -278,7 +284,13 @@ export const MOCK_APPS: App[] = [
 		health_check_interval: 15,
 		health_failure_threshold: 2,
 		health_consecutive_failures: 2,
-		volumes: [{ host_path: '/data/postgres', container_path: '/var/lib/postgresql/data' }],
+		volumes: [
+			{
+				name: 'pgdata',
+				host_path: '/opt/tond/data/volumes/api-server/pgdata',
+				container_path: '/var/lib/postgresql/data'
+			}
+		],
 		drain_timeout: 60,
 		build_method: 'dockerfile',
 		auto_deploy: false,
@@ -449,35 +461,62 @@ export const MOCK_DEPLOYMENTS: Record<string, Deployment[]> = {
 		{
 			id: 'dep_3',
 			app_id: 'app_running',
-			image_tag: 'sha-abc123f',
-			status: 'success',
+			image_tag: 'tond-web-frontend:3f2a1b9c1234',
+			status: 'succeeded',
 			trigger_source: 'webhook',
 			has_generated_dockerfile: true,
 			started_at: '2025-03-01T08:55:00.000Z',
 			finished_at: '2025-03-01T09:02:00.000Z',
-			created_at: '2025-03-01T08:55:00.000Z'
+			created_at: '2025-03-01T08:55:00.000Z',
+			image_pruned: false,
+			is_current: true,
+			rollback_available: false,
+			rollback_unavailable_reason: 'This image is already running'
 		},
 		{
 			id: 'dep_2',
 			app_id: 'app_running',
-			image_tag: 'sha-7f3a9b1',
-			status: 'success',
+			image_tag: 'tond-web-frontend:7f3a9b1d0e2c',
+			status: 'succeeded',
 			trigger_source: 'manual',
 			has_generated_dockerfile: true,
 			started_at: '2025-02-15T14:10:00.000Z',
 			finished_at: '2025-02-15T14:17:00.000Z',
-			created_at: '2025-02-15T14:10:00.000Z'
+			created_at: '2025-02-15T14:10:00.000Z',
+			image_pruned: false,
+			is_current: false,
+			rollback_available: true,
+			rollback_unavailable_reason: null
+		},
+		{
+			id: 'dep_1b',
+			app_id: 'app_running',
+			image_tag: 'tond-web-frontend:c0ffee123456',
+			status: 'succeeded',
+			trigger_source: 'manual',
+			has_generated_dockerfile: false,
+			started_at: '2025-02-12T09:00:00.000Z',
+			finished_at: '2025-02-12T09:05:00.000Z',
+			created_at: '2025-02-12T09:00:00.000Z',
+			image_pruned: true,
+			is_current: false,
+			rollback_available: false,
+			rollback_unavailable_reason: "This deployment's image was pruned to save disk space"
 		},
 		{
 			id: 'dep_1',
 			app_id: 'app_running',
-			image_tag: 'sha-1a2b3c4',
+			image_tag: 'tond-web-frontend:1a2b3c4d5e6f',
 			status: 'failed',
 			trigger_source: 'manual',
 			has_generated_dockerfile: false,
 			started_at: '2025-02-10T10:00:00.000Z',
 			finished_at: '2025-02-10T10:03:00.000Z',
-			created_at: '2025-02-10T10:00:00.000Z'
+			created_at: '2025-02-10T10:00:00.000Z',
+			image_pruned: true,
+			is_current: false,
+			rollback_available: false,
+			rollback_unavailable_reason: 'Only successful deployments can be restored'
 		}
 	]
 };
@@ -780,7 +819,8 @@ export const MOCK_DATABASES: ManagedDatabase[] = [
 		image_used: 'postgres:16-alpine',
 		custom_image: null,
 		created_at: '2025-02-01T10:00:00.000Z',
-		updated_at: '2025-03-01T09:00:00.000Z'
+		updated_at: '2025-03-01T09:00:00.000Z',
+		public_access: false
 	},
 	{
 		id: 'db_redis1',
@@ -799,7 +839,8 @@ export const MOCK_DATABASES: ManagedDatabase[] = [
 		image_used: 'redis:7-alpine',
 		custom_image: null,
 		created_at: '2025-02-10T14:00:00.000Z',
-		updated_at: '2025-02-10T14:00:00.000Z'
+		updated_at: '2025-02-10T14:00:00.000Z',
+		public_access: false
 	},
 	{
 		id: 'db_mysql1',
@@ -818,7 +859,8 @@ export const MOCK_DATABASES: ManagedDatabase[] = [
 		image_used: 'mysql:8',
 		custom_image: null,
 		created_at: '2025-01-20T08:00:00.000Z',
-		updated_at: '2025-02-28T12:00:00.000Z'
+		updated_at: '2025-02-28T12:00:00.000Z',
+		public_access: false
 	},
 	{
 		id: 'db_mariadb1',
@@ -837,7 +879,8 @@ export const MOCK_DATABASES: ManagedDatabase[] = [
 		image_used: 'mariadb:11',
 		custom_image: null,
 		created_at: '2025-03-01T12:00:00.000Z',
-		updated_at: '2025-03-01T12:00:00.000Z'
+		updated_at: '2025-03-01T12:00:00.000Z',
+		public_access: true
 	}
 ];
 
@@ -890,7 +933,13 @@ export const MOCK_CRON_JOBS: CronJob[] = [
 		timezone: null,
 		max_retries: 0,
 		retry_delay_seconds: 60,
-		volumes: [{ host_path: '/data/backups', container_path: '/backup' }]
+		volumes: [
+			{
+				name: 'backups',
+				host_path: '/opt/tond/data/volumes/_cron/cron_2/backups',
+				container_path: '/backup'
+			}
+		]
 	},
 	{
 		id: 'cron_3',

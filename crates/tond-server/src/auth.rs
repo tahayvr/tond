@@ -25,7 +25,7 @@ pub mod rate_limit;
 pub mod secret_file;
 pub mod setup_token;
 
-pub use extractor::{LocalPeer, LocalSocket, RequireAuth};
+pub use extractor::{AuthRole, LocalPeer, LocalSocket, RequireAdmin, RequireAuth};
 pub use rate_limit::{ClientIp, RateLimit, RateLimiter};
 
 use std::path::Path;

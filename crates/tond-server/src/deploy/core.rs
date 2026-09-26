@@ -13,6 +13,12 @@
 //   deploy_image(state, app, image_tag)
 //     Skip the build step and re-run a specific image (used for rollbacks).
 //
+// Image tags: every deployment runs `tond-<app>:<deployment-id-prefix>` (see
+// images.rs) — built images are tagged that way, pulled and uploaded images
+// are re-tagged — and the tag is stored on the deployment row. Rollback
+// re-runs that exact image. After a successful deploy or rollback older
+// images are pruned (keeping the last few plus the running one).
+//
 //   deploy_preview(state, app, preview)
 //     Deploy a short-lived preview of an app.
 //
@@ -35,11 +41,13 @@ use crate::handlers::{github_apps, gitlab_tokens};
 use crate::log_bus::{self, DeployLogEvent};
 use crate::secret_key::{self, Purpose};
 use crate::state::AppState;
+use crate::volumes;
 
 use super::build::{
     BuildOptions, build_from_git, build_from_inline_dockerfile, run_inline_compose,
 };
 use super::git::{GitHttpAuth, redact_url_credentials, split_url_credentials};
+use super::images;
 
 /// Work out the clone URL and HTTPS credentials for a git app.
 ///
@@ -188,6 +196,9 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
     .execute(&state.db)
     .await?;
 
+    // The image this deployment runs, whatever the source: tond-<app>:<id>.
+    let deploy_tag = images::deployment_tag(&app_name, &deployment_id);
+
     // Update status to building
     update_status(state, &app_id, "building").await?;
     log_deploy(
@@ -255,6 +266,7 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
                     static_build: app.static_build != 0,
                     base_dir: app.base_dir.as_deref(),
                 },
+                &deploy_tag,
                 Some(&deployment_id),
                 trigger_source,
             )
@@ -283,19 +295,34 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
             };
 
             pull_image(&state.docker, image, credentials).await?;
-            image.clone()
-        }
-        "tarball" => {
-            let image_tag = format!("tond-{}", app_name);
+
+            // Pin the pulled bytes under this deployment's tag so a rollback
+            // runs exactly this image even after `image` moves on upstream.
+            images::tag_image(&state.docker, image, &deploy_tag).await?;
             log_deploy(
                 state,
                 &app_id,
                 "info",
                 trigger_source,
-                &format!("Using pre-built image: {}", image_tag),
+                &format!("Pinned {} as {}", image, deploy_tag),
             )
             .await?;
-            image_tag
+            deploy_tag.clone()
+        }
+        "tarball" => {
+            let upload_tag = images::upload_tag(&app_name);
+            images::tag_image(&state.docker, &upload_tag, &deploy_tag)
+                .await
+                .with_context(|| format!("no uploaded image {upload_tag} to deploy"))?;
+            log_deploy(
+                state,
+                &app_id,
+                "info",
+                trigger_source,
+                &format!("Using uploaded image: {}", deploy_tag),
+            )
+            .await?;
+            deploy_tag.clone()
         }
         "dockerfile" => {
             let content = app.dockerfile_content.as_deref().ok_or_else(|| {
@@ -312,7 +339,15 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
             )
             .await?;
 
-            build_from_inline_dockerfile(state, &app_id, &app_name, content, trigger_source).await?
+            build_from_inline_dockerfile(
+                state,
+                &app_id,
+                &app_name,
+                content,
+                &deploy_tag,
+                trigger_source,
+            )
+            .await?
         }
         "compose" => {
             let content = app.compose_content.as_deref().ok_or_else(|| {
@@ -357,12 +392,16 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
     if app.source_type == "compose" {
         let container_port = app.container_port as u16;
 
-        let host_port = docker::find_compose_host_port(&state.docker, &app_name, container_port)
-            .await
-            .map_err(|e| {
-                tracing::error!("[compose] could not discover host port: {}", e);
-                e
-            })?;
+        let host_port = docker::find_compose_host_port(
+            &state.docker,
+            &super::build::compose_project_name(&app_name),
+            container_port,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!("[compose] could not discover host port: {}", e);
+            e
+        })?;
 
         sqlx::query(
             "UPDATE apps SET container_id = ?, host_port = ?, status = 'running', updated_at = datetime('now') WHERE id = ?",
@@ -429,12 +468,10 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
         .and_then(|e| serde_json::from_str(e).ok())
         .unwrap_or_default();
 
+    // Host paths are re-derived from volume names and verified to stay inside
+    // <data>/volumes/<app> (no symlink escapes) right before the mount.
     let volumes: Vec<Volume> = serde_json::from_str(&app.volumes).unwrap_or_default();
-    let mut binds: Vec<String> = Vec::new();
-    for vol in &volumes {
-        tokio::fs::create_dir_all(&vol.host_path).await?;
-        binds.push(format!("{}:{}", vol.host_path, vol.container_path));
-    }
+    let binds = volumes::app_binds(&volumes::data_dir(), &app_name, &volumes)?;
 
     log_deploy(
         state,
@@ -479,12 +516,14 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
             &staging_name,
             container_port,
             new_host_port,
+            docker::Exposure::Loopback,
             env_vars,
             app.memory_limit,
             app.cpu_limit,
             binds,
             network_name.as_deref(),
             Some(&app_name),
+            None,
         )
         .await
         .map_err(|e| {
@@ -498,6 +537,7 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
             &app_name,
             container_port,
             new_host_port,
+            docker::Exposure::Loopback,
             env_vars,
             app.memory_limit,
             app.cpu_limit,
@@ -691,6 +731,8 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
             .execute(&state.db)
             .await;
 
+    images::prune_app_images(state, &app_id, &app_name).await;
+
     Ok(())
 }
 
@@ -709,6 +751,21 @@ pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> R
     let app_id = app.id.clone();
     let app_name = app.name.clone();
     let old_container_id = app.container_id.clone();
+
+    // The exact image must still be on the host (old ones are pruned).
+    if state.docker.inspect_image(image_tag).await.is_err() {
+        let _ = sqlx::query(
+            "UPDATE deployments SET image_pruned = 1 WHERE app_id = ? AND image_tag = ?",
+        )
+        .bind(&app_id)
+        .bind(image_tag)
+        .execute(&state.db)
+        .await;
+        anyhow::bail!(
+            "Image {} is no longer on this server (old images are pruned), so this deployment can't be restored",
+            image_tag
+        );
+    }
 
     // Deployment row
     let deployment_id = Uuid::new_v4().to_string();
@@ -747,12 +804,10 @@ pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> R
         .and_then(|e| serde_json::from_str(e).ok())
         .unwrap_or_default();
 
+    // Host paths are re-derived from volume names and verified to stay inside
+    // <data>/volumes/<app> (no symlink escapes) right before the mount.
     let volumes: Vec<Volume> = serde_json::from_str(&app.volumes).unwrap_or_default();
-    let mut binds: Vec<String> = Vec::new();
-    for vol in &volumes {
-        tokio::fs::create_dir_all(&vol.host_path).await?;
-        binds.push(format!("{}:{}", vol.host_path, vol.container_path));
-    }
+    let binds = volumes::app_binds(&volumes::data_dir(), &app_name, &volumes)?;
 
     log_deploy(
         state,
@@ -790,12 +845,14 @@ pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> R
             &staging_name_rb,
             container_port,
             new_host_port,
+            docker::Exposure::Loopback,
             env_vars,
             app.memory_limit,
             app.cpu_limit,
             binds,
             network_name.as_deref(),
             Some(&app_name),
+            None,
         )
         .await
         .map_err(|e| {
@@ -809,6 +866,7 @@ pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> R
             &app_name,
             container_port,
             new_host_port,
+            docker::Exposure::Loopback,
             env_vars,
             app.memory_limit,
             app.cpu_limit,
@@ -956,6 +1014,8 @@ pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> R
             .execute(&state.db)
             .await;
 
+    images::prune_app_images(state, &app_id, &app_name).await;
+
     Ok(())
 }
 
@@ -1014,6 +1074,7 @@ pub async fn deploy_preview(
                     static_build: app.static_build != 0,
                     base_dir: app.base_dir.as_deref(),
                 },
+                &images::preview_tag(&app_name, &slug),
                 None,
                 "preview",
             )
@@ -1034,14 +1095,20 @@ pub async fn deploy_preview(
             pull_image(&state.docker, image, credentials).await?;
             image.clone()
         }
-        "tarball" => {
-            format!("tond-{}", app_name)
-        }
+        "tarball" => images::upload_tag(&app_name),
         "dockerfile" => {
             let content = app.dockerfile_content.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("dockerfile_content required for source_type='dockerfile'")
             })?;
-            build_from_inline_dockerfile(state, &app_id, &app_name, content, "preview").await?
+            build_from_inline_dockerfile(
+                state,
+                &app_id,
+                &app_name,
+                content,
+                &images::preview_tag(&app_name, &slug),
+                "preview",
+            )
+            .await?
         }
         "compose" => {
             // Preview deployments are not supported for compose apps because
@@ -1073,12 +1140,10 @@ pub async fn deploy_preview(
         app.preview_env_vars.as_str(),
     );
 
+    // Host paths are re-derived from volume names and verified to stay inside
+    // <data>/volumes/<app> (no symlink escapes) right before the mount.
     let volumes: Vec<Volume> = serde_json::from_str(&app.volumes).unwrap_or_default();
-    let mut binds: Vec<String> = Vec::new();
-    for vol in &volumes {
-        tokio::fs::create_dir_all(&vol.host_path).await?;
-        binds.push(format!("{}:{}", vol.host_path, vol.container_path));
-    }
+    let binds = volumes::app_binds(&volumes::data_dir(), &app_name, &volumes)?;
 
     let container_name = format!("tond-preview-{}", slug);
 
@@ -1106,12 +1171,14 @@ pub async fn deploy_preview(
         &container_name,
         container_port,
         host_port,
+        docker::Exposure::Loopback,
         env_vars,
         app.memory_limit,
         app.cpu_limit,
         binds,
         network_name.as_deref(),
         Some(&app_name),
+        None,
     )
     .await?;
 

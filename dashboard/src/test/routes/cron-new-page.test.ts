@@ -7,6 +7,8 @@ const { goto, createCronJob } = vi.hoisted(() => ({
 	createCronJob: vi.fn()
 }));
 
+vi.mock('$lib/auth.svelte', () => ({ isAdmin: () => true }));
+
 vi.mock('$app/navigation', () => ({ goto }));
 vi.mock('$app/state', () => ({ page: { url: new URL('http://localhost/cron/new') } }));
 vi.mock('$lib/api', () => ({ createCronJob }));

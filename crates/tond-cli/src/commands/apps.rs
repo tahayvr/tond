@@ -266,6 +266,10 @@ pub enum VolumeAction {
 
         /// Absolute path inside the container (e.g. /data)
         container_path: String,
+
+        /// Directory name under the app's volume folder (default: derived from the path)
+        #[arg(long)]
+        name: Option<String>,
     },
 
     /// List volumes for an app
@@ -745,8 +749,11 @@ pub async fn handle(client: &TondClient, action: AppsAction) -> Result<()> {
             VolumeAction::Add {
                 app,
                 container_path,
+                name,
             } => {
-                client.add_volume(&app, &container_path).await?;
+                client
+                    .add_volume(&app, &container_path, name.as_deref())
+                    .await?;
                 println!(
                     "Volume {} added to {}. Redeploy to apply: tond apps deploy {}",
                     container_path, app, app
@@ -1153,7 +1160,9 @@ required = true
                         custom_image: None,
                         created_at: "2026-01-01T00:00:00Z".to_string(),
                         updated_at: "2026-01-01T00:00:00Z".to_string(),
+                        public_access: false,
                     },
+                    public_connection_string: None,
                     connection_string: Some(
                         "postgres://tond_analytics:secret@localhost:5432/tond_analytics"
                             .to_string(),

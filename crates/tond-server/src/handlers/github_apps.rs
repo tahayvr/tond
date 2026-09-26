@@ -57,7 +57,7 @@ use tond_common::{
 };
 
 use crate::{
-    auth::{RateLimit, RequireAuth},
+    auth::{RateLimit, RequireAdmin, RequireAuth},
     error::AppError,
     handlers::auth::{extract_session_token, validate_session},
     state::AppState,
@@ -384,7 +384,7 @@ async fn redirect_to_integrations(state: &AppState, error: Option<&str>) -> Resp
 /// complete the registration, once, within FLOW_TTL_MINUTES.
 pub async fn get_manifest_url(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
@@ -795,7 +795,7 @@ pub async fn get_install_url(
 
 pub async fn update_github_app(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(payload): Json<UpdateGitHubAppRequest>,
@@ -831,7 +831,7 @@ pub async fn update_github_app(
 
 pub async fn delete_github_app(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -1128,7 +1128,7 @@ pub async fn list_open_prs(
 /// Link or unlink a GitHub App from an app.
 pub async fn set_app_github_app(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Path(app_id): Path<String>,
     Json(payload): Json<SetGitHubAppRequest>,
@@ -1193,7 +1193,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        auth::{RateLimiter, RequireAuth, rate_limit::RateLimit},
+        auth::{RateLimiter, rate_limit::RateLimit},
         state::AppState,
     };
 
@@ -1456,7 +1456,7 @@ mod tests {
     }
 
     async fn manifest_state_for(state: &AppState, headers: HeaderMap) -> String {
-        let response = get_manifest_url(RateLimit, RequireAuth, State(state.clone()), headers)
+        let response = get_manifest_url(RateLimit, RequireAdmin, State(state.clone()), headers)
             .await
             .unwrap_or_else(|_| panic!("get_manifest_url should succeed for an admin session"))
             .into_response();
@@ -1493,7 +1493,7 @@ mod tests {
         let member = seed_session(&state, "member-1", "member").await;
         for headers in [HeaderMap::new(), member] {
             assert!(
-                get_manifest_url(RateLimit, RequireAuth, State(state.clone()), headers)
+                get_manifest_url(RateLimit, RequireAdmin, State(state.clone()), headers)
                     .await
                     .is_err()
             );
@@ -1735,7 +1735,7 @@ mod tests {
 
         let response = set_app_github_app(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
             State(state.clone()),
             Path("app-1".to_string()),
             Json(SetGitHubAppRequest {
@@ -1756,7 +1756,7 @@ mod tests {
 
         delete_github_app(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
             State(state.clone()),
             Path("gh-app-1".to_string()),
         )

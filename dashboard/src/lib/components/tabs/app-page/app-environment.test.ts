@@ -15,7 +15,8 @@ const api = vi.hoisted(() => ({
 const auth = vi.hoisted(() => ({ role: 'admin' }));
 
 vi.mock('$lib/auth.svelte', () => ({
-	getUser: () => ({ id: 'usr_1', email: 'a@b.c', role: auth.role, totp_enabled: false })
+	getUser: () => ({ id: 'usr_1', email: 'a@b.c', role: auth.role, totp_enabled: false }),
+	isAdmin: () => auth.role === 'admin'
 }));
 
 vi.mock('$lib/api', async () => {

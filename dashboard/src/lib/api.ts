@@ -5,8 +5,36 @@ export interface DeployLog {
 	created_at: string;
 }
 
+/**
+ * A persistent volume. The server chooses the host side:
+ * `<data>/volumes/<app>/<name>` — `host_path` is informational.
+ */
 export interface Volume {
+	name: string;
 	host_path: string;
+	container_path: string;
+}
+
+/** A volume as sent to the API: mount point plus optional directory name. */
+export interface VolumeInput {
+	container_path: string;
+	/** Directory under the app's volume folder; derived from container_path when omitted */
+	name?: string;
+}
+
+/** A cron volume: the job's own directory, or a volume shared from an app. */
+export interface CronVolume {
+	/** Share this app's volume instead of the job's own directory */
+	app?: string | null;
+	name: string;
+	/** Computed by the server (read-only) */
+	host_path: string;
+	container_path: string;
+}
+
+export interface CronVolumeInput {
+	app?: string | null;
+	name?: string;
 	container_path: string;
 }
 
@@ -285,7 +313,7 @@ export async function createApp(data: {
 	health_failure_threshold?: number;
 	drain_timeout?: number;
 	env_vars?: Record<string, string>;
-	volumes?: { host_path: string; container_path: string }[];
+	volumes?: VolumeInput[];
 	registry_credential_id?: string;
 	github_app_id?: string;
 	/** Raw Dockerfile content (required when source_type='dockerfile') */
@@ -456,10 +484,27 @@ export async function updateAppResources(
 	});
 }
 
-export async function addVolume(id: string, container_path: string): Promise<void> {
+export interface ComposeValidation {
+	valid: boolean;
+	/** One human-readable line per problem (privileged, host binds, …) */
+	errors: string[];
+}
+
+/** Check a compose file against Tond's policy without creating anything. */
+export async function validateCompose(
+	composeContent: string,
+	appName?: string
+): Promise<ComposeValidation> {
+	return request<ComposeValidation>('/compose/validate', {
+		method: 'POST',
+		body: JSON.stringify({ compose_content: composeContent, app_name: appName || null })
+	});
+}
+
+export async function addVolume(id: string, volume: VolumeInput): Promise<void> {
 	await request(`/apps/${id}/volumes`, {
 		method: 'POST',
-		body: JSON.stringify({ container_path })
+		body: JSON.stringify(volume)
 	});
 }
 
@@ -657,6 +702,14 @@ export interface Deployment {
 	started_at: string;
 	finished_at: string | null;
 	created_at: string;
+	/** The image was removed from the server to save disk space */
+	image_pruned: boolean;
+	/** This deployment's image is what the app runs now */
+	is_current: boolean;
+	/** Rolling back to this deployment would restore its exact image */
+	rollback_available: boolean;
+	/** Why rollback is unavailable (tooltip text); null when available */
+	rollback_unavailable_reason: string | null;
 }
 
 export async function listDeployments(id: string): Promise<Deployment[]> {
@@ -673,8 +726,15 @@ export async function getDeploymentGeneratedDockerfile(
 	return response.generated_dockerfile;
 }
 
-export async function rollbackApp(id: string): Promise<void> {
-	await request(`/apps/${id}/rollback`, { method: 'POST' });
+/**
+ * Redeploy the exact image of an earlier deployment. Without `deploymentId`
+ * the server restores the previous distinct image.
+ */
+export async function rollbackApp(id: string, deploymentId?: string): Promise<void> {
+	await request(`/apps/${id}/rollback`, {
+		method: 'POST',
+		...(deploymentId ? { body: JSON.stringify({ deployment_id: deploymentId }) } : {})
+	});
 }
 
 // ── Git Integration ──
@@ -1261,10 +1321,14 @@ export interface ManagedDatabase {
 	custom_image: string | null;
 	created_at: string;
 	updated_at: string;
+	/** Port published on all interfaces (reachable from the internet). Off by default. */
+	public_access: boolean;
 }
 
 export interface ManagedDatabaseDetail extends ManagedDatabase {
 	connection_string: string | null;
+	/** Connection string via the server's public address; only when public_access is on */
+	public_connection_string: string | null;
 	internal_connection_string: string | null;
 }
 
@@ -1307,6 +1371,8 @@ export async function updateDatabase(
 		custom_internal_url?: string | null;
 		custom_image?: string | null;
 		memory_limit?: number | null;
+		/** Admin only. The container is recreated immediately. */
+		public_access?: boolean;
 	}
 ): Promise<ManagedDatabaseDetail> {
 	return request<ManagedDatabaseDetail>(`/databases/${id}`, {
@@ -1376,8 +1442,8 @@ export interface CronJob {
 	max_retries: number;
 	/** Seconds to wait between retries. */
 	retry_delay_seconds: number;
-	/** Volume mounts as a JSON array. null = none. */
-	volumes: { host_path: string; container_path: string }[] | null;
+	/** Volume mounts. null = none. */
+	volumes: CronVolume[] | null;
 }
 
 export interface CronJobRun {
@@ -1421,7 +1487,7 @@ export async function createCronJob(data: {
 	/** Seconds to wait between retries. */
 	retry_delay_seconds?: number;
 	/** Volume mounts */
-	volumes?: { host_path: string; container_path: string }[] | null;
+	volumes?: CronVolumeInput[] | null;
 }): Promise<CronJob> {
 	return request<CronJob>('/cron', {
 		method: 'POST',
@@ -1457,7 +1523,7 @@ export async function updateCronJob(
 		/** Seconds to wait between retries. */
 		retry_delay_seconds: number;
 		/** Volume mounts. null = remove all. */
-		volumes: { host_path: string; container_path: string }[] | null;
+		volumes: CronVolumeInput[] | null;
 	}>
 ): Promise<CronJob> {
 	return request<CronJob>(`/cron/${id}`, {

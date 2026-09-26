@@ -30,6 +30,10 @@ pub enum TondError {
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 
+    /// The caller is authenticated but lacks the role this action needs.
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
+
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -41,6 +45,7 @@ impl TondError {
             TondError::NotFound(_) => 404,
             TondError::AppAlreadyExists(_) => 409,
             TondError::InvalidInput(_) => 400,
+            TondError::Forbidden(_) => 403,
             _ => 500,
         }
     }
@@ -71,6 +76,11 @@ mod tests {
             TondError::InvalidInput("bad".to_string()).status_code(),
             400,
             "InvalidInput should map to HTTP 400"
+        );
+        assert_eq!(
+            TondError::Forbidden("admins only".to_string()).status_code(),
+            403,
+            "Forbidden should map to HTTP 403"
         );
         assert_eq!(
             TondError::DockerError("boom".to_string()).status_code(),
