@@ -102,7 +102,7 @@ case "$CMD" in
         test="smoke"
         [[ "$CMD" == budget ]] && test="budget"
         in_vm env BUDGET_ARGS="${BUDGET_ARGS:-}" "${ROOT}/e2e/run.sh" --bundle "$BUNDLE" --acme pebble \
-            --base-domain tond.test --preview-domain preview.test --test "$test"
+            --base-domain tond.test --preview-domain preview.test --apps-domain apps.test --test "$test"
         ;;
     shell)
         in_vm bash -l

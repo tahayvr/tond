@@ -111,6 +111,7 @@ pub fn harden(
         ctx.err("'include' is not allowed: Tond deploys a single self-contained compose file");
     }
     check_top_level_volumes(root, &mut ctx);
+    check_top_level_networks(root, &mut ctx);
     check_file_references(root, "secrets", &mut ctx);
     check_file_references(root, "configs", &mut ctx);
 
@@ -243,6 +244,10 @@ fn check_namespace_mode(svc: &Mapping, service: &str, field: &str, what: &str, c
     if lower == "host" {
         ctx.err(format!(
             "service \"{service}\": '{field}: host' is not allowed — it shares the host's {what} with the container"
+        ));
+    } else if field == "network_mode" && (lower == "bridge" || lower == "default") {
+        ctx.err(format!(
+            "service \"{service}\": 'network_mode: {mode}' is not allowed — Docker's default bridge is shared with other containers; leave network_mode out to use this app's own network"
         ));
     } else if lower.starts_with("container:") {
         ctx.err(format!(
@@ -780,6 +785,39 @@ fn check_top_level_volumes(root: &Mapping, ctx: &mut Ctx) {
     }
 }
 
+/// Networks may only be private bridge networks of this compose project:
+/// joining an existing network (`external`, a fixed `name`) would reach other
+/// apps' containers or databases, and other drivers reach the host network.
+fn check_top_level_networks(root: &Mapping, ctx: &mut Ctx) {
+    let Some(Value::Mapping(nets)) = root.get("networks").map(untag) else {
+        return;
+    };
+    for (name, def) in nets {
+        let name = key_str(name);
+        let def = untag(def);
+        if def
+            .get("external")
+            .is_some_and(|v| !matches!(untag(v), Value::Bool(false) | Value::Null))
+        {
+            ctx.err(format!(
+                "network \"{name}\": 'external' is not allowed — it joins a network outside this app; each app gets its own network, and databases are shared through links"
+            ));
+        }
+        if def.get("name").is_some() {
+            ctx.err(format!(
+                "network \"{name}\": 'name' is not allowed — a fixed name can join another app's network; leave it out and compose names the network for this app"
+            ));
+        }
+        if let Some(driver) = def.get("driver").and_then(scalar_str)
+            && !driver.trim().eq_ignore_ascii_case("bridge")
+        {
+            ctx.err(format!(
+                "network \"{name}\": 'driver: {driver}' is not allowed — only bridge networks can be used"
+            ));
+        }
+    }
+}
+
 fn check_file_references(root: &Mapping, section: &str, ctx: &mut Ctx) {
     let Some(Value::Mapping(items)) = root.get(section).map(untag) else {
         return;
@@ -866,6 +904,29 @@ mod tests {
     }
 
     #[test]
+    fn networks_must_be_private_bridges_of_the_app() {
+        assert_rejected(
+            "services:\n  a:\n    image: x\nnetworks:\n  shared:\n    external: true\n",
+            "'external' is not allowed",
+        );
+        assert_rejected(
+            "services:\n  a:\n    image: x\nnetworks:\n  n:\n    name: tond-net-db-main\n",
+            "'name' is not allowed",
+        );
+        assert_rejected(
+            "services:\n  a:\n    image: x\nnetworks:\n  n:\n    driver: macvlan\n",
+            "only bridge networks",
+        );
+        assert!(
+            errors(
+                "services:\n  a:\n    image: x\n    networks: [back]\nnetworks:\n  back:\n    driver: bridge\n    internal: true\n"
+            )
+            .is_empty(),
+            "private bridge networks declared in the file stay allowed"
+        );
+    }
+
+    #[test]
     fn privileged_and_host_namespaces_are_rejected() {
         assert_rejected(
             "services:\n  a:\n    image: x\n    privileged: true\n",
@@ -906,6 +967,10 @@ mod tests {
         assert_rejected(
             "services:\n  a:\n    image: x\n    cgroup_parent: /\n",
             "'cgroup_parent'",
+        );
+        assert_rejected(
+            "services:\n  a:\n    image: x\n    network_mode: bridge\n",
+            "default bridge",
         );
         // Sharing namespaces between services of the same file is fine.
         assert!(errors("services:\n  a:\n    image: x\n  b:\n    image: y\n    network_mode: \"service:a\"\n    pid: \"service:a\"\n").is_empty());

@@ -86,6 +86,7 @@ mod janitor;
 mod log_bus;
 mod log_scrub;
 mod metrics;
+mod networks;
 mod notifications;
 mod process;
 mod proxy_link;
@@ -98,6 +99,7 @@ mod snapshot_archive;
 mod state;
 mod static_files;
 mod storage;
+mod upload;
 mod volumes;
 
 use std::future::IntoFuture;
@@ -164,6 +166,9 @@ async fn run() -> Result<()> {
 
     tracing::info!("Database initialized");
 
+    // Uploads interrupted by a restart leave their extraction dirs behind.
+    upload::clear_upload_dirs(&volumes::data_dir());
+
     // Load persisted settings from DB into the in-memory cache
     {
         use tond_common::SettingRow;
@@ -177,6 +182,10 @@ async fn run() -> Result<()> {
                 "server_name" => s.server_name = row.value,
                 "dashboard_domain" => s.dashboard_domain = row.value,
                 "preview_domain" => s.preview_domain = row.value,
+                "apps_domain" => s.apps_domain = row.value,
+                "upload_max_bytes" => {
+                    s.upload_max_bytes = row.value.parse().unwrap_or(s.upload_max_bytes)
+                }
                 "session_idle_timeout_hours" => {
                     if let Ok(v) = row.value.parse() {
                         s.session_idle_timeout_hours = v;
@@ -201,6 +210,15 @@ async fn run() -> Result<()> {
     // While no admin exists, keep a one-time setup token in a root-only file
     auth::setup_token::ensure_setup_token(&state.db, &auth::setup_token::setup_token_path())
         .await?;
+
+    // Attach databases to the networks their links call for (Docker state can
+    // drift while the server is down). Once, in the background.
+    {
+        let state = state.clone();
+        runtime::shutdown::spawn_tracked(
+            async move { networks::reconcile_all_databases(&state).await },
+        );
+    }
 
     // Finish what a previous process left behind (and resume queued deploys)
     // before anything new starts.
@@ -348,7 +366,12 @@ async fn run() -> Result<()> {
             "/api/apps/{id}/resources",
             axum::routing::patch(handlers::update_app_resources),
         )
-        .route("/api/apps/{id}/upload", post(handlers::upload_deploy))
+        // Uploads stream through upload.rs, which enforces the configurable
+        // `upload_max_bytes` cap itself, so axum's 2 MB default is lifted.
+        .route(
+            "/api/apps/{id}/upload",
+            post(handlers::upload_deploy).layer(axum::extract::DefaultBodyLimit::disable()),
+        )
         // Deployment history and rollback
         .route(
             "/api/apps/{id}/deployments",
@@ -694,6 +717,19 @@ async fn run() -> Result<()> {
             "/api/databases/{id}/credentials",
             axum::routing::patch(handlers::databases::update_database_credentials)
                 .get(handlers::databases::reveal_database_credentials),
+        )
+        // Database access: project members + links (networks.rs)
+        .route(
+            "/api/databases/{id}/access",
+            get(handlers::database_links::get_database_access),
+        )
+        .route(
+            "/api/databases/{id}/links/{app}",
+            put(handlers::database_links::link_app).delete(handlers::database_links::unlink_app),
+        )
+        .route(
+            "/api/apps/{id}/databases",
+            get(handlers::database_links::list_app_databases),
         )
         .route(
             "/api/databases/{id}/logs/stream",
@@ -1140,7 +1176,7 @@ mod tests {
         .await
         .unwrap_or_else(|err| panic!("failed to seed project_previews row: {err}"));
         sqlx::query(
-            "INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, host_port, memory_limit, cpu_limit, status, env_vars, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, deploy_key_pub, project_id, registry_credential_id, github_app_id, gitlab_token_id, preview_enabled, preview_excluded_keys, preview_env_vars, dockerfile_content, compose_content, base_dir, static_build, created_at, updated_at)
+            "INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, host_port, memory_limit, cpu_limit, status, env_vars, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, deploy_key_pub, project_id, registry_credential_id, github_app_id, gitlab_token_id, preview_enabled, preview_shared_keys, preview_env_vars, dockerfile_content, compose_content, base_dir, static_build, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind("app-1")

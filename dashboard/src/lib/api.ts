@@ -44,6 +44,11 @@ export interface App {
 	id: string;
 	name: string;
 	domain: string | null;
+	/**
+	 * Set on GET /apps/{id} when the domain is on the same site as the dashboard
+	 * (allowed, but shown as a warning).
+	 */
+	domain_warning?: string | null;
 	source_type: string;
 	source_url: string | null;
 	status: string;
@@ -79,8 +84,8 @@ export interface App {
 	static_build: boolean;
 	/** Phase 4.6: opt-in to automatic PR preview deployments via GitHub App */
 	preview_enabled: boolean;
-	/** Phase 4.6: env var keys excluded from preview containers */
-	preview_excluded_keys: string[];
+	/** App env var keys shared with preview containers (all others are withheld) */
+	preview_shared_keys: string[];
 	/**
 	 * How a deploy decides the new container is ready: `http` (health path, or
 	 * any HTTP answer on the port), `tcp` (the port accepts connections) or
@@ -423,8 +428,11 @@ export interface AppEnv {
 	vars: EnvVarEntry[];
 	preview: {
 		enabled: boolean;
-		/** App variables that preview containers do not receive */
-		excluded_keys: string[];
+		/**
+		 * App variables preview containers receive. Every other variable is withheld:
+		 * previews run pull-request code.
+		 */
+		shared_keys: string[];
 		/** Values that replace or add variables in preview containers only */
 		overrides: EnvVarEntry[];
 	};
@@ -436,8 +444,10 @@ export interface EnvPatch {
 }
 
 export interface PreviewEnvPatch extends EnvPatch {
-	exclude?: string[];
-	include?: string[];
+	/** App variables to share with previews */
+	share?: string[];
+	/** App variables to stop sharing with previews */
+	unshare?: string[];
 }
 
 export async function getAppEnv(id: string): Promise<AppEnv> {
@@ -473,8 +483,15 @@ export async function revealPreviewEnvVar(id: string, key: string): Promise<stri
 	return res.value;
 }
 
-export async function updateDomain(id: string, domain: string): Promise<void> {
-	await request(`/apps/${id}/domain`, {
+export interface UpdateDomainResult {
+	/** The domain as saved (trimmed, lowercased) */
+	domain: string;
+	/** Set when the domain is on the same site as the dashboard */
+	warning: string | null;
+}
+
+export async function updateDomain(id: string, domain: string): Promise<UpdateDomainResult> {
+	return request<UpdateDomainResult>(`/apps/${id}/domain`, {
 		method: 'PUT',
 		body: JSON.stringify({ domain })
 	});
@@ -894,10 +911,13 @@ export interface ServerSettings {
 	 */
 	preview_domain: string;
 	/**
-	 * Domain apps get an automatic address under (`<app>.<apps_domain>`), when
-	 * the server has the setting; the dashboard domain is used otherwise.
+	 * Domain automatic app hostnames live under (`<app>.<apps_domain>`). Must be a
+	 * different registrable domain from both the dashboard and preview domains;
+	 * empty = apps need a custom domain.
 	 */
-	apps_domain?: string;
+	apps_domain: string;
+	/** Max unpacked size in bytes of an uploaded source archive (`tond push`) */
+	upload_max_bytes: number;
 	/** Sessions end after this many hours without a request (1–720, default 12) */
 	session_idle_timeout_hours?: number;
 	/** Sessions end this many days after sign-in (1–365, default 30) */
@@ -1230,6 +1250,8 @@ export interface DomainCheck {
 	};
 	certificate: DomainCertificate | null;
 	checked_at: string;
+	/** Set when the domain is on the same site as the dashboard (allowed, shown as a warning) */
+	warning?: string | null;
 }
 
 /** Live DNS check: the records to create, what the domain resolves to, and its certificate. */
@@ -2052,6 +2074,62 @@ export interface ManagedDatabaseDetail extends ManagedDatabase {
 	/** Connection string via the server's public address; only when public_access is on */
 	public_connection_string: string | null;
 	internal_connection_string: string | null;
+}
+
+// ── Database access (links) ──
+// Every app and database runs on its own Docker network unless they share a
+// project. An app outside the database's project reaches it only through a
+// link, which attaches the database to that app's network.
+
+export interface DatabaseAppRef {
+	id: string;
+	name: string;
+	status: string;
+	project_id: string | null;
+}
+
+export interface DatabaseAccess {
+	database_id: string;
+	project: { id: string; name: string } | null;
+	/** Apps that reach the database through the shared project network */
+	project_apps: DatabaseAppRef[];
+	/** Apps linked to the database */
+	linked_apps: DatabaseAppRef[];
+	/** Hostname apps use (the database's name) */
+	internal_host: string;
+	internal_port: number;
+}
+
+export interface AppDatabaseAccess {
+	id: string;
+	name: string;
+	db_type: string;
+	status: string;
+	/** "project": same project network; "link": linked to the app */
+	via: 'project' | 'link';
+	internal_host: string;
+	internal_port: number;
+}
+
+export async function getDatabaseAccess(id: string): Promise<DatabaseAccess> {
+	return request<DatabaseAccess>(`/databases/${id}/access`);
+}
+
+/** Link an app to a database: the database joins the app's network. Idempotent. */
+export async function linkDatabaseApp(databaseId: string, appId: string): Promise<DatabaseAccess> {
+	return request<DatabaseAccess>(`/databases/${databaseId}/links/${appId}`, { method: 'PUT' });
+}
+
+export async function unlinkDatabaseApp(
+	databaseId: string,
+	appId: string
+): Promise<DatabaseAccess> {
+	return request<DatabaseAccess>(`/databases/${databaseId}/links/${appId}`, { method: 'DELETE' });
+}
+
+/** Databases an app can reach (through its project or a link). */
+export async function listAppDatabases(appId: string): Promise<AppDatabaseAccess[]> {
+	return request<AppDatabaseAccess[]>(`/apps/${appId}/databases`);
 }
 
 /** Plaintext credentials: GET /databases/{id}/credentials (admin, audit-logged). */

@@ -79,6 +79,10 @@
 	let appsDomain = $state<string | null>(null);
 
 	let domain = $derived(app.domain?.trim() || null);
+	/** Server warning: the domain is on the same site as the dashboard. */
+	let warning = $derived(
+		(check?.domain === domain ? check?.warning : null) ?? app.domain_warning ?? null
+	);
 	let placeholder = $derived(isPlaceholderDomain(domain));
 	let appUrl = $derived(domain && !placeholder ? safeUrl(`https://${domain}`) : undefined);
 	let automatic = $derived(automaticAddress(app.name, appsDomain));
@@ -129,7 +133,8 @@
 		if (domain) return;
 		getSettings()
 			.then((s) => {
-				const apps = (s.apps_domain ?? s.dashboard_domain ?? '').trim();
+				// Apps never fall back to the dashboard's domain (same site).
+				const apps = (s.apps_domain ?? '').trim();
 				appsDomain = apps || null;
 			})
 			.catch(() => (appsDomain = null));
@@ -310,6 +315,18 @@
 						{/if}
 					</div>
 				</div>
+				{#if warning}
+					<div
+						class="flex items-start gap-2 rounded border border-warn/40 bg-warn/10 px-3 py-2 text-sm"
+						role="note"
+					>
+						<WarnIcon class="mt-0.5 size-4 shrink-0 text-warn" />
+						<div>
+							<p class="font-medium text-warn">Same site as your dashboard</p>
+							<p class="text-xs text-muted-foreground">{warning}</p>
+						</div>
+					</div>
+				{/if}
 				{#if editing}
 					{@render editForm()}
 				{/if}
@@ -328,9 +345,11 @@
 							</p>
 						{:else}
 							<p class="text-sm text-muted-foreground">
-								Set a dashboard domain in <a href="/settings" class="underline underline-offset-2"
-									>Settings</a
-								> first; apps then get an address under it automatically.
+								No apps domain is set. Set one in <a
+									href="/settings"
+									class="underline underline-offset-2">Settings</a
+								> (a domain on a different site from the dashboard) and apps get an address under it automatically
+								— or add your own domain.
 							</p>
 						{/if}
 					</div>
@@ -355,9 +374,9 @@
 			<div class="flex items-start gap-2 rounded-md border bg-muted/30 p-3 text-sm">
 				<InfoIcon class="mt-0.5 size-4 shrink-0 text-muted-foreground" />
 				<p class="text-muted-foreground">
-					<code>{domain}</code> is a local placeholder and can't be reached from the internet. Set a
-					dashboard domain in <a href="/settings" class="underline underline-offset-2">Settings</a> so
-					apps get real addresses, or add your own domain.
+					<code>{domain}</code> is a local placeholder and can't be reached from the internet. Set
+					an apps domain in <a href="/settings" class="underline underline-offset-2">Settings</a> so apps
+					get real addresses, or add your own domain.
 				</p>
 			</div>
 		{:else if domain}

@@ -17,6 +17,10 @@
 
 	interface Props {
 		domain: string;
+		appName: string;
+		/** Settings' apps domain; null while loading, '' when none is set */
+		appsDomain?: string | null;
+		dashboardDomain?: string;
 		healthCheckPath: string;
 		healthCheckInterval: number;
 		healthFailureThreshold: number;
@@ -40,6 +44,9 @@
 
 	let {
 		domain = $bindable(''),
+		appName,
+		appsDomain = null,
+		dashboardDomain = '',
 		healthCheckPath = $bindable('/health'),
 		healthCheckInterval = $bindable(30),
 		healthFailureThreshold = $bindable(3),
@@ -56,6 +63,22 @@
 		readiness = $bindable<Readiness>('http'),
 		readyAfterSecs = $bindable(10)
 	}: Props = $props();
+
+	const normalizeHost = (d: string) => d.trim().toLowerCase().replace(/\.$/, '');
+	const siteOf = (d: string) => d.split('.').slice(-2).join('.');
+	let automaticHost = $derived(
+		appsDomain ? `${normalizeHost(appName) || '<app-name>'}.${appsDomain}` : ''
+	);
+	// Early hint only — tond-server does the Public Suffix List check and
+	// returns the same warning on the app page.
+	let sameSiteAsDashboard = $derived.by(() => {
+		const d = normalizeHost(domain);
+		const dash = normalizeHost(dashboardDomain);
+		if (!d || !dash) return false;
+		return (
+			d === dash || d.endsWith(`.${dash}`) || dash.endsWith(`.${d}`) || siteOf(d) === siteOf(dash)
+		);
+	});
 
 	const MODES: { value: Readiness; label: string; desc: string }[] = [
 		{
@@ -306,12 +329,37 @@
 		<Separator class="bg-border" />
 
 		<div class="space-y-2">
-			<Label for="domain">Custom Domain (Optional)</Label>
+			<Label for="domain">Custom Domain {appsDomain === '' ? '' : '(Optional)'}</Label>
 			<Input id="domain" type="text" bind:value={domain} placeholder="app.example.com" />
-			<p class="text-xs text-muted-foreground">
-				Leave empty to use the automatic address under your apps domain. For your own domain, the
-				app's Settings → Domain shows the DNS record to create.
-			</p>
+			{#if appsDomain}
+				<p class="text-xs text-muted-foreground">
+					Leave empty and the app is served at
+					<span class="font-mono text-foreground">{automaticHost}</span>. For your own domain, the
+					app's Settings → Domain shows the DNS record to create.
+				</p>
+			{:else if appsDomain === ''}
+				<p class="rounded border border-warn/40 bg-warn/10 px-3 py-2 text-xs">
+					<span class="font-medium text-warn">No apps domain is set,</span>
+					<span class="text-muted-foreground">
+						so without a custom domain this app has no public address. Enter one here (with an A
+						record pointing at this server), or set an apps domain in
+						<a href="/settings" class="underline underline-offset-2">Settings</a> to give every app
+						<span class="font-mono">&lt;app&gt;.&lt;apps-domain&gt;</span> automatically.
+					</span>
+				</p>
+			{:else}
+				<p class="text-xs text-muted-foreground">
+					Leave empty to use the automatic address under your apps domain. For your own domain, the
+					app's Settings → Domain shows the DNS record to create.
+				</p>
+			{/if}
+			{#if sameSiteAsDashboard}
+				<p class="text-xs text-warn">
+					This is on the same site as your dashboard ({normalizeHost(dashboardDomain)}). It works,
+					but the app could send same-site requests to the dashboard and set its cookies — use a
+					domain on a different site for code you don't fully trust.
+				</p>
+			{/if}
 		</div>
 
 		{#if readiness === 'http'}

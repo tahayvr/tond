@@ -458,7 +458,7 @@ export const MOCK_APPS: App[] = [
 		base_dir: null,
 		static_build: false,
 		preview_enabled: true,
-		preview_excluded_keys: ['DATABASE_URL', 'SECRET_KEY'],
+		preview_shared_keys: ['NODE_ENV'],
 		created_at: '2025-01-10T12:00:00.000Z',
 		updated_at: '2025-03-01T09:00:00.000Z'
 	},
@@ -491,7 +491,7 @@ export const MOCK_APPS: App[] = [
 		base_dir: null,
 		static_build: false,
 		preview_enabled: false,
-		preview_excluded_keys: [],
+		preview_shared_keys: [],
 		created_at: '2025-01-15T08:00:00.000Z',
 		updated_at: '2025-02-28T14:22:00.000Z'
 	},
@@ -524,7 +524,7 @@ export const MOCK_APPS: App[] = [
 		base_dir: null,
 		static_build: false,
 		preview_enabled: false,
-		preview_excluded_keys: [],
+		preview_shared_keys: [],
 		created_at: '2025-02-20T10:00:00.000Z',
 		updated_at: '2025-03-05T11:45:00.000Z'
 	},
@@ -563,7 +563,7 @@ export const MOCK_APPS: App[] = [
 		base_dir: null,
 		static_build: false,
 		preview_enabled: false,
-		preview_excluded_keys: [],
+		preview_shared_keys: [],
 		created_at: '2025-02-01T00:00:00.000Z',
 		updated_at: '2025-03-07T06:00:00.000Z'
 	},
@@ -596,7 +596,7 @@ export const MOCK_APPS: App[] = [
 		base_dir: null,
 		static_build: false,
 		preview_enabled: false,
-		preview_excluded_keys: [],
+		preview_shared_keys: [],
 		created_at: '2025-03-08T07:00:00.000Z',
 		updated_at: '2025-03-08T07:00:00.000Z'
 	}
@@ -608,9 +608,16 @@ export const MOCK_SETTINGS: ServerSettings = {
 	server_name: 'Tond Server',
 	dashboard_domain: 'dash.example.com',
 	preview_domain: 'example-previews.com',
+	apps_domain: 'example-apps.com',
+	upload_max_bytes: 1024 * 1024 * 1024,
 	session_idle_timeout_hours: 12,
 	session_max_age_days: 30
 };
+
+/** Database links (database_id → app_id): cache-redis is linked to ml-inference. */
+export const MOCK_DATABASE_LINKS: { database_id: string; app_id: string }[] = [
+	{ database_id: 'db_redis1', app_id: 'app_pending' }
+];
 
 // ── Certificates ───────────────────────────────────────────────────────────
 

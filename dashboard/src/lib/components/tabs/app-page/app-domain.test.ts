@@ -91,10 +91,16 @@ describe('AppDomain', () => {
 
 	it('explains the automatic address and custom domain choice without a domain', async () => {
 		const onUpdate = vi.fn().mockResolvedValue(undefined);
+		api.getSettings.mockResolvedValue({
+			server_name: 'Tond',
+			dashboard_domain: 'dash.example.com',
+			preview_domain: '',
+			apps_domain: 'example-apps.com'
+		});
 		const user = userEvent.setup();
 		render(AppDomain, { props: { app: { ...app, domain: null }, onUpdate } });
 
-		expect(await screen.findByText('web.dash.example.com')).toBeInTheDocument();
+		expect(await screen.findByText('web.example-apps.com')).toBeInTheDocument();
 		await user.click(screen.getByRole('button', { name: /add a domain/i }));
 		await user.type(screen.getByLabelText(/custom domain/i), 'not a domain');
 		await user.click(screen.getByRole('button', { name: /save domain/i }));
@@ -112,5 +118,20 @@ describe('AppDomain', () => {
 		render(AppDomain, { props: { app: { ...app, domain: 'web.localhost' }, onUpdate: vi.fn() } });
 		expect(screen.getByText(/local placeholder/i)).toBeInTheDocument();
 		expect(api.checkDomain).not.toHaveBeenCalled();
+	});
+
+	it('warns when the domain is on the same site as the dashboard', async () => {
+		api.checkDomain.mockResolvedValue({
+			...check({ status: 'ok', resolved: ['203.0.113.10'] }),
+			warning: 'app.example.com is on the same site as your dashboard (dash.example.com).'
+		});
+		render(AppDomain, { props: { app, onUpdate: vi.fn() } });
+		expect(await screen.findByText('Same site as your dashboard')).toBeInTheDocument();
+	});
+
+	it('never offers the dashboard domain as the automatic address', async () => {
+		render(AppDomain, { props: { app: { ...app, domain: null }, onUpdate: vi.fn() } });
+		expect(await screen.findByText(/No apps domain is set/)).toBeInTheDocument();
+		expect(screen.queryByText(/web\.dash\.example\.com/)).not.toBeInTheDocument();
 	});
 });

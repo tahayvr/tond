@@ -85,7 +85,7 @@
 
 	let envKeys = $derived(env?.vars.map((v) => v.key) ?? []);
 	let overrideKeys = $derived(env?.preview.overrides.map((v) => v.key) ?? []);
-	let excluded = $derived(new Set(env?.preview.excluded_keys ?? []));
+	let shared = $derived(new Set(env?.preview.shared_keys ?? []));
 	let isImage = $derived(sourceType === 'image');
 	// The server only reveals values to admins; don't offer it to anyone else.
 	let canReveal = $derived(can('env:read-values'));
@@ -170,8 +170,8 @@
 		patch: {
 			set?: Record<string, string>;
 			unset?: string[];
-			exclude?: string[];
-			include?: string[];
+			share?: string[];
+			unshare?: string[];
 		},
 		redeploy: boolean,
 		message: string
@@ -231,11 +231,11 @@
 		const verb = previousKey === null ? 'Added' : renamed ? `Renamed ${previousKey} to` : 'Updated';
 		await applyPatch(target, patch, redeploy, `${verb} ${key}.`);
 
-		// Keep a renamed variable's preview exclusion.
-		if (target === 'env' && renamed && excluded.has(previousKey as string)) {
+		// Keep sharing a renamed variable with previews.
+		if (target === 'env' && renamed && shared.has(previousKey as string)) {
 			env = await patchPreviewEnv(appId, {
-				exclude: [key],
-				include: [previousKey as string]
+				share: [key],
+				unshare: [previousKey as string]
 			});
 		}
 	}
@@ -271,16 +271,16 @@
 		}
 	}
 
-	async function handleToggleExclude(key: string, exclude: boolean) {
+	async function handleToggleShare(key: string, share: boolean) {
 		busyKey = key;
 		try {
 			await applyPatch(
 				'preview',
-				exclude ? { exclude: [key] } : { include: [key] },
+				share ? { share: [key] } : { unshare: [key] },
 				false,
-				exclude
-					? `${key} will no longer be passed to preview deployments.`
-					: `${key} will be passed to preview deployments again.`
+				share
+					? `${key} will be passed to preview deployments.`
+					: `${key} will no longer be passed to preview deployments.`
 			);
 		} catch (e: any) {
 			actionError = e.message ?? `Could not update ${key}`;
@@ -364,7 +364,8 @@
 					<p class="mt-0.5 text-xs text-muted-foreground">
 						Values are hidden; reveal one when you need it. Each change is saved on its own and
 						applies on the next deploy.
-						{#if previewEnabled}Tick "Exclude" to keep a variable out of preview deployments.{/if}
+						{#if previewEnabled}Previews get none of these unless you tick "Previews": they run
+							pull-request code, so share only values that aren't secret.{/if}
 					</p>
 				</div>
 				<div class="flex gap-2">
@@ -398,8 +399,8 @@
 					{busyKey}
 					{copiedKey}
 					noun="variable"
-					excluded={previewEnabled ? excluded : undefined}
-					onToggleExclude={previewEnabled ? handleToggleExclude : undefined}
+					shared={previewEnabled ? shared : undefined}
+					onToggleShare={previewEnabled ? handleToggleShare : undefined}
 					onToggleReveal={(key) => handleToggleReveal('env', key)}
 					onCopy={(key) => handleCopy('env', key)}
 					onEdit={(key) => openEdit('env', key)}
@@ -453,7 +454,8 @@
 							Preview Overrides
 						</h4>
 						<p class="mt-0.5 text-xs text-muted-foreground">
-							These values replace or add variables in preview deployments only.
+							Preview deployments get these values, plus the app variables ticked under "Previews"
+							above — never the rest. Use test credentials here, not production ones.
 						</p>
 					</div>
 					<div class="flex gap-2">
@@ -476,7 +478,8 @@
 					<div class="rounded border border-dashed border-border py-6 text-center">
 						<p class="text-sm text-muted-foreground">No preview overrides.</p>
 						<p class="mt-1 text-xs text-muted-foreground">
-							Previews get the app's variables, minus any you exclude above.
+							Previews get only the app variables you share above. Add test values (a preview
+							database URL, sandbox API keys) here.
 						</p>
 					</div>
 				{:else}
@@ -525,7 +528,7 @@
 			<Dialog.Description>
 				{deleteTarget === 'env'
 					? 'The variable is removed now. The running app keeps it until the next deploy.'
-					: 'Preview deployments fall back to the app value (if any) from their next deploy.'}
+					: 'Preview deployments stop getting it from their next deploy (unless the app variable is shared with previews).'}
 			</Dialog.Description>
 		</Dialog.Header>
 		<InlineError message={deleteError} />

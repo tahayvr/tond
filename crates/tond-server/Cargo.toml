@@ -50,6 +50,7 @@ psl = { workspace = true }
 totp-rs = { workspace = true }
 lettre = { workspace = true }
 flate2 = { workspace = true }
+bytes = { workspace = true }
 tar = { workspace = true }
 walkdir = { workspace = true }
 portable-pty = { workspace = true }

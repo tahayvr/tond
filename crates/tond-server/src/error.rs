@@ -16,6 +16,7 @@
 //   DatabaseError    → 500 Internal Server Error
 //   DockerError      → 500 Internal Server Error
 //   Internal         → 500 Internal Server Error
+//   PayloadTooLarge  → 413 Payload Too Large
 
 use axum::{Json, http::StatusCode, response::IntoResponse};
 use tond_common::{ApiResponse, TondError};

@@ -78,6 +78,7 @@
 	import AppDeployments from '$lib/components/tabs/app-page/app-deployments.svelte';
 	import AppEnvironment from '$lib/components/tabs/app-page/app-environment.svelte';
 	import AppDomain from '$lib/components/tabs/app-page/app-domain.svelte';
+	import AppDatabases from '$lib/components/tabs/app-page/app-databases.svelte';
 	import AppHealth from '$lib/components/tabs/app-page/app-health.svelte';
 	import AppPort from '$lib/components/tabs/app-page/app-port.svelte';
 	import AppReadiness from '$lib/components/tabs/app-page/app-readiness.svelte';
@@ -1061,7 +1062,17 @@
 					/>
 				{/if}
 
-				<!-- Health section (kind of app, port, health check, deploy timeout) -->
+				<!-- Databases: what this app can reach (project + links) -->
+				{#if viewAllowed && activeTab === 'databases'}
+					<AppDatabases
+						appId={app.id}
+						appName={app.name}
+						sourceType={app.source_type}
+						projectId={app.project_id}
+					/>
+				{/if}
+
+				<!-- Health section(kind of app, port, health check, deploy timeout) -->
 				{#if viewAllowed && activeTab === 'health'}
 					<AppReadiness
 						{app}

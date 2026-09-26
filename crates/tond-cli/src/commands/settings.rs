@@ -34,6 +34,16 @@ pub enum SettingsAction {
         /// Domain name (e.g. example-previews.com). Pass an empty string to clear.
         domain: String,
     },
+    /// Set the domain automatic app hostnames live under (<app>.<domain>)
+    ///
+    /// Must be a separate site from the dashboard and preview domains (apps
+    /// run your code; keeping them off the dashboard's site keeps them away
+    /// from its cookies), with a wildcard DNS record *.<domain> pointing at
+    /// this server. Without it, apps need a custom domain.
+    SetAppsDomain {
+        /// Domain name (e.g. example-apps.com). Pass an empty string to clear.
+        domain: String,
+    },
     /// Turn the dashboard's host terminal (a shell on this server) on or off
     ///
     /// Off by default. It can only be switched from the server itself (this
@@ -69,6 +79,11 @@ pub async fn handle(client: &TondClient, action: Option<SettingsAction>) -> Resu
                 println!("dashboard-domain  (not set)");
             } else {
                 println!("dashboard-domain  {}", s.dashboard_domain);
+            }
+            if s.apps_domain.is_empty() {
+                println!("apps-domain       (not set — apps need a custom domain)");
+            } else {
+                println!("apps-domain       {}", s.apps_domain);
             }
             if s.preview_domain.is_empty() {
                 println!("preview-domain    (not set — previews disabled)");
@@ -112,7 +127,6 @@ pub async fn handle(client: &TondClient, action: Option<SettingsAction>) -> Resu
         Some(SettingsAction::SetDashboardDomain { domain }) => {
             let s = client
                 .update_settings(UpdateSettingsRequest {
-                    server_name: None,
                     dashboard_domain: Some(domain.clone()),
                     preview_domain: None,
                     ..UpdateSettingsRequest::default()
@@ -125,11 +139,28 @@ pub async fn handle(client: &TondClient, action: Option<SettingsAction>) -> Resu
                 println!("tond-proxy will pick up the change within 5 seconds.");
             }
         }
+        Some(SettingsAction::SetAppsDomain { domain }) => {
+            let s = client
+                .update_settings(UpdateSettingsRequest {
+                    apps_domain: Some(domain.clone()),
+                    ..Default::default()
+                })
+                .await?;
+            if domain.is_empty() {
+                println!(
+                    "apps-domain cleared. New apps get no automatic hostname; give them a custom domain."
+                );
+            } else {
+                println!("apps-domain set to: {}", s.apps_domain);
+                println!(
+                    "Point a wildcard DNS record *.{} at this server. New apps are served at <app>.{}",
+                    s.apps_domain, s.apps_domain
+                );
+            }
+        }
         Some(SettingsAction::SetPreviewDomain { domain }) => {
             let s = client
                 .update_settings(UpdateSettingsRequest {
-                    server_name: None,
-                    dashboard_domain: None,
                     preview_domain: Some(domain.clone()),
                     ..UpdateSettingsRequest::default()
                 })

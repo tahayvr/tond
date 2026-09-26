@@ -1,4 +1,17 @@
-// domains.rs — domain validation for the dashboard and preview domains
+// domains.rs — domain validation for the dashboard, apps and preview domains
+//
+// Three kinds of hostnames, three sites:
+//
+//   dashboard domain  the dashboard and API (session cookies live here)
+//   apps domain       automatic app hostnames, `<app>.<apps_domain>`
+//   preview domain    pull-request previews, `<slug>-<app>.<preview_domain>`
+//
+// Apps run user code and previews run pull-request code, so each must be a
+// different registrable domain from the dashboard — and from each other: a
+// preview on the apps' site could set cookies for production apps, and
+// tond-proxy reserves the preview domain for previews (apps under it are not
+// routed). Custom app domains may share the dashboard's site (the user owns
+// both), but the dashboard shows a warning.
 //
 // Previews run pull-request code, which may come from people who cannot
 // otherwise touch the server. They are therefore served only on a separate
@@ -19,6 +32,10 @@
 //   normalize_domain()        trim, lowercase, drop a trailing dot
 //   registrable_domain()      the PSL registrable domain of a hostname
 //   validate_preview_domain() check a preview domain against the dashboard domain
+//   validate_apps_domain()    check an apps domain against the dashboard and preview domains
+//   check_custom_app_domain() validate a custom app domain; Ok(Some(warning)) when same-site
+//                             with the dashboard
+//   app_host()                <app>.<apps_domain>
 //   preview_host()            <slug>-<app>.<preview_domain>
 //   require_preview_domain()  the configured preview domain, or a 400 explaining why one is needed
 
@@ -111,6 +128,85 @@ pub fn validate_preview_domain(preview: &str, dashboard: &str) -> Result<(), Str
         ));
     }
     Ok(())
+}
+
+/// `a` and `b` are the same site: one is the other or a subdomain of it, or
+/// both have the same registrable domain.
+pub fn same_site(a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if is_same_or_subdomain(a, b) || is_same_or_subdomain(b, a) {
+        return true;
+    }
+    let site_a = registrable_domain(a).unwrap_or_else(|| a.to_string());
+    let site_b = registrable_domain(b).unwrap_or_else(|| b.to_string());
+    site_a == site_b
+}
+
+/// Validate a (normalized) apps domain against the (normalized) dashboard and
+/// preview domains; either may be empty.
+pub fn validate_apps_domain(apps: &str, dashboard: &str, preview: &str) -> Result<(), String> {
+    if !is_valid_hostname(apps) {
+        return Err(format!(
+            "'{apps}' is not a valid domain name (expected something like example-apps.com)"
+        ));
+    }
+    let Some(apps_site) = registrable_domain(apps) else {
+        return Err(format!(
+            "'{apps}' is a public suffix; use a domain you own, such as example-apps.com"
+        ));
+    };
+    if same_site(apps, dashboard) {
+        return Err(format!(
+            "The apps domain must be a different site from the dashboard ({dashboard}): {apps}              and {dashboard} both belong to {apps_site}, so every app would be same-site with              the dashboard (it could send same-site requests to the API and set cookies the              dashboard reads). Use a separate domain, such as example-apps.com."
+        ));
+    }
+    if same_site(apps, preview) {
+        return Err(format!(
+            "The apps domain must be a different site from the preview domain ({preview}).              Previews run pull-request code and must not share a site with your production              apps, and hostnames under the preview domain only serve previews."
+        ));
+    }
+    Ok(())
+}
+
+/// The automatic hostname of an app: `<app>.<apps_domain>`.
+pub fn app_host(app_name: &str, apps_domain: &str) -> String {
+    format!("{app_name}.{apps_domain}")
+}
+
+/// Shown next to a custom app domain on the dashboard's site.
+pub fn same_site_warning(domain: &str, dashboard: &str) -> String {
+    format!(
+        "{domain} is on the same site as your dashboard ({dashboard}). The app can send          same-site requests to the dashboard and set cookies for it; use a domain on a          different site for code you don't fully trust."
+    )
+}
+
+/// Validate a (normalized) custom app domain. Returns a warning when it is on
+/// the dashboard's site (allowed: the user owns both), an error when it can't
+/// work (the dashboard domain itself, or under the preview domain, which only
+/// serves previews).
+pub fn check_custom_app_domain(
+    domain: &str,
+    dashboard: &str,
+    preview: &str,
+) -> Result<Option<String>, String> {
+    if !is_valid_hostname(domain) {
+        return Err(format!(
+            "'{domain}' is not a valid domain name (expected something like app.example.com)"
+        ));
+    }
+    if !dashboard.is_empty() && domain == dashboard {
+        return Err(format!(
+            "{domain} is the dashboard domain; choose another hostname for the app"
+        ));
+    }
+    if !preview.is_empty() && is_same_or_subdomain(domain, preview) {
+        return Err(format!(
+            "{domain} is under the preview domain ({preview}), which only serves previews;              choose a hostname outside it"
+        ));
+    }
+    Ok(same_site(domain, dashboard).then(|| same_site_warning(domain, dashboard)))
 }
 
 /// The hostname a preview is served at: `<slug>-<app>.<preview_domain>`.
@@ -216,6 +312,71 @@ mod tests {
         assert!(validate_preview_domain("co.uk", "dash.example.com").is_err());
         assert!(validate_preview_domain("github.io", "dash.example.com").is_err());
         assert!(validate_preview_domain("not a domain", "").is_err());
+    }
+
+    #[test]
+    fn validate_apps_domain_requires_a_site_of_its_own() {
+        assert_eq!(
+            validate_apps_domain(
+                "example-apps.com",
+                "dash.example.com",
+                "example-previews.com"
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_apps_domain("203-0-113-7.nip.io", "203-0-113-7.sslip.io", ""),
+            Ok(()),
+            "the install default: apps on nip.io next to a dashboard on sslip.io"
+        );
+        for (apps, dashboard, preview) in [
+            ("apps.example.com", "dash.example.com", ""),
+            ("dash.example.com", "dash.example.com", ""),
+            ("apps.203-0-113-7.sslip.io", "203-0-113-7.sslip.io", ""),
+            (
+                "example-previews.com",
+                "dash.example.com",
+                "example-previews.com",
+            ),
+            (
+                "apps.example-previews.com",
+                "dash.example.com",
+                "example-previews.com",
+            ),
+            ("co.uk", "", ""),
+            ("not a domain", "", ""),
+        ] {
+            assert!(
+                validate_apps_domain(apps, dashboard, preview).is_err(),
+                "{apps} must be rejected (dashboard {dashboard:?}, preview {preview:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_app_domains_on_the_dashboard_site_are_allowed_with_a_warning() {
+        assert_eq!(
+            check_custom_app_domain("shop.example.org", "dash.example.com", ""),
+            Ok(None)
+        );
+        let warning = check_custom_app_domain("shop.example.com", "dash.example.com", "")
+            .unwrap_or_else(|e| panic!("same-site custom domains are allowed: {e}"));
+        assert!(
+            warning
+                .as_deref()
+                .is_some_and(|w| w.contains("same site as your dashboard")),
+            "got {warning:?}"
+        );
+        assert!(check_custom_app_domain("dash.example.com", "dash.example.com", "").is_err());
+        assert!(
+            check_custom_app_domain("x.example-previews.com", "", "example-previews.com").is_err()
+        );
+        assert!(check_custom_app_domain("bad domain", "", "").is_err());
+    }
+
+    #[test]
+    fn app_host_suffixes_the_app_name() {
+        assert_eq!(app_host("web", "example-apps.com"), "web.example-apps.com");
     }
 
     #[test]

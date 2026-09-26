@@ -157,6 +157,10 @@ bytes = "1.11.1"
 pingora = { version = "0.9.0", features = ["lb", "openssl"] }
 async-trait = "0.1.89"
 
+# Release signature verification (`tond update`); `minisign` signs in tests only
+minisign-verify = "0.3.0"
+minisign = "0.10.0"
+
 # Test helpers
 filetime = "0.2.27"
 tempfile = "3.27.0"

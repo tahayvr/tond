@@ -3,6 +3,7 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import {
+		getSettings,
 		createApp,
 		createDatabase,
 		createProject,
@@ -99,6 +100,22 @@
 
 	// Step 3: Network
 	let domain = $state('');
+	// From Settings: where apps without a custom domain are served, and the
+	// dashboard domain (a custom domain on its site gets a warning).
+	let appsDomain = $state<string | null>(null);
+	let dashboardDomain = $state('');
+
+	$effect(() => {
+		(async () => {
+			try {
+				const settings = await getSettings();
+				appsDomain = settings.apps_domain ?? '';
+				dashboardDomain = settings.dashboard_domain ?? '';
+			} catch {
+				// Unknown: the network step then shows neutral copy.
+			}
+		})();
+	});
 	// No path by default: the deploy then waits for any answer on the port.
 	let healthCheckPath = $state('');
 	let healthCheckInterval = $state(30);
@@ -651,6 +668,9 @@
 			{:else if currentStep === 2}
 				<AppWizardNetwork
 					bind:domain
+					appName={name}
+					{appsDomain}
+					{dashboardDomain}
 					bind:healthCheckPath
 					bind:healthCheckInterval
 					bind:healthFailureThreshold
@@ -705,6 +725,7 @@
 					{baseDir}
 					{staticBuild}
 					{domain}
+					{appsDomain}
 					{healthCheckPath}
 					{healthCheckInterval}
 					{healthFailureThreshold}

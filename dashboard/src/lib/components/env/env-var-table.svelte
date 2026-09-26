@@ -19,9 +19,9 @@
 		noun: string;
 		/** Show reveal and copy (admins only; the server refuses others) */
 		canReveal?: boolean;
-		/** When set, shows an "Exclude from previews" checkbox column */
-		excluded?: ReadonlySet<string>;
-		onToggleExclude?: (key: string, exclude: boolean) => void;
+		/** When set, shows a "Share with previews" checkbox column */
+		shared?: ReadonlySet<string>;
+		onToggleShare?: (key: string, share: boolean) => void;
 		onToggleReveal: (key: string) => void;
 		onCopy: (key: string) => void;
 		onEdit: (key: string) => void;
@@ -35,8 +35,8 @@
 		copiedKey,
 		noun,
 		canReveal = true,
-		excluded,
-		onToggleExclude,
+		shared,
+		onToggleShare,
 		onToggleReveal,
 		onCopy,
 		onEdit,
@@ -58,11 +58,12 @@
 				>
 					Value
 				</th>
-				{#if excluded}
+				{#if shared}
 					<th
 						class="w-24 px-3 py-2 text-center font-mono text-xs font-medium text-muted-foreground uppercase"
+						title="Preview deployments get only the variables ticked here"
 					>
-						Exclude
+						Previews
 					</th>
 				{/if}
 				<th class="w-32 px-3 py-2"><span class="sr-only">Actions</span></th>
@@ -84,15 +85,15 @@
 							<span class="tracking-widest" aria-label="hidden value">{entry.masked}</span>
 						{/if}
 					</td>
-					{#if excluded && onToggleExclude}
+					{#if shared && onToggleShare}
 						<td class="px-3 py-2 text-center">
 							<input
 								type="checkbox"
-								checked={excluded.has(entry.key)}
+								checked={shared.has(entry.key)}
 								disabled={busy}
-								onchange={(e) => onToggleExclude(entry.key, e.currentTarget.checked)}
+								onchange={(e) => onToggleShare(entry.key, e.currentTarget.checked)}
 								class="h-4 w-4 cursor-pointer accent-primary"
-								aria-label={`Exclude ${entry.key} from previews`}
+								aria-label={`Share ${entry.key} with previews`}
 							/>
 						</td>
 					{/if}

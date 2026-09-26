@@ -31,7 +31,7 @@ const MASK = '••••••••';
 function envWith(keys: string[], preview: Partial<AppEnv['preview']> = {}): AppEnv {
 	return {
 		vars: keys.map((key) => ({ key, masked: MASK })),
-		preview: { enabled: false, excluded_keys: [], overrides: [], ...preview }
+		preview: { enabled: false, shared_keys: [], overrides: [], ...preview }
 	};
 }
 
@@ -208,18 +208,23 @@ describe('AppEnvironment', () => {
 		expect(await screen.findByText('API_KEY')).toBeInTheDocument();
 	});
 
-	it('toggles preview exclusion with a preview-only patch', async () => {
-		api.getAppEnv.mockResolvedValue(envWith(['SECRET'], { enabled: true }));
+	it('shares a variable with previews through a preview-only patch', async () => {
+		api.getAppEnv.mockResolvedValue(envWith(['NODE_ENV'], { enabled: true }));
 		api.patchPreviewEnv.mockResolvedValue(
-			envWith(['SECRET'], { enabled: true, excluded_keys: ['SECRET'] })
+			envWith(['NODE_ENV'], { enabled: true, shared_keys: ['NODE_ENV'] })
 		);
 
 		const user = userEvent.setup();
 		renderTab({ previewEnabled: true });
 
-		await user.click(await screen.findByLabelText('Exclude SECRET from previews'));
+		expect(
+			await screen.findByText(/Previews get none of these unless you tick/)
+		).toBeInTheDocument();
+		const checkbox = await screen.findByLabelText('Share NODE_ENV with previews');
+		expect(checkbox).not.toBeChecked();
+		await user.click(checkbox);
 
-		expect(api.patchPreviewEnv).toHaveBeenCalledWith('app_1', { exclude: ['SECRET'] });
+		expect(api.patchPreviewEnv).toHaveBeenCalledWith('app_1', { share: ['NODE_ENV'] });
 		expect(api.patchAppEnv).not.toHaveBeenCalled();
 	});
 });

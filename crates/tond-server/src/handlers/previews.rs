@@ -439,7 +439,7 @@ mod tests {
         app.preview_enabled = 1;
 
         sqlx::query(
-            "INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, host_port, memory_limit, cpu_limit, status, env_vars, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, deploy_key_pub, project_id, registry_credential_id, github_app_id, gitlab_token_id, preview_enabled, preview_excluded_keys, preview_env_vars, dockerfile_content, compose_content, base_dir, static_build, created_at, updated_at)
+            "INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, host_port, memory_limit, cpu_limit, status, env_vars, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, deploy_key_pub, project_id, registry_credential_id, github_app_id, gitlab_token_id, preview_enabled, preview_shared_keys, preview_env_vars, dockerfile_content, compose_content, base_dir, static_build, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&app.id)
@@ -471,7 +471,7 @@ mod tests {
         .bind(&app.github_app_id)
         .bind(&app.gitlab_token_id)
         .bind(app.preview_enabled)
-        .bind(&app.preview_excluded_keys)
+        .bind(&app.preview_shared_keys)
         .bind(&app.preview_env_vars)
         .bind(&app.dockerfile_content)
         .bind(&app.compose_content)
@@ -680,7 +680,7 @@ mod tests {
     async fn update_preview_config_persists_enable_flag_without_touching_preview_env() {
         let state = test_state().await;
         let app = seed_preview_app(&state, "frontend", "git").await;
-        sqlx::query("UPDATE apps SET preview_excluded_keys = ?, preview_env_vars = ? WHERE id = ?")
+        sqlx::query("UPDATE apps SET preview_shared_keys = ?, preview_env_vars = ? WHERE id = ?")
             .bind(r#"["TOKEN"]"#)
             .bind(r#"{"MODE":"preview"}"#)
             .bind(&app.id)
@@ -705,7 +705,7 @@ mod tests {
             "update_preview_config should succeed for existing apps"
         );
         let row: (i64, String, String) = sqlx::query_as(
-            "SELECT preview_enabled, preview_excluded_keys, preview_env_vars FROM apps WHERE id = ?",
+            "SELECT preview_enabled, preview_shared_keys, preview_env_vars FROM apps WHERE id = ?",
         )
         .bind(&app.id)
         .fetch_one(&state.db)

@@ -12,6 +12,13 @@ fn default_server_name() -> String {
     "Tond Server".to_string()
 }
 
+/// Default cap on the unpacked size of an uploaded source archive (1 GiB).
+pub const DEFAULT_UPLOAD_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+
+fn default_upload_max_bytes() -> u64 {
+    DEFAULT_UPLOAD_MAX_BYTES
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerSettings {
     /// A human-readable name for this Tond server instance (e.g. "My VPS").
@@ -25,6 +32,16 @@ pub struct ServerSettings {
     /// preview pages are cross-site to the dashboard. Empty = previews disabled.
     #[serde(default)]
     pub preview_domain: String,
+    /// The domain automatic app hostnames live under (`<app>.<apps_domain>`).
+    /// Must be a different registrable domain from both `dashboard_domain`
+    /// and `preview_domain`. Empty = apps get no automatic hostname and need
+    /// a custom domain.
+    #[serde(default)]
+    pub apps_domain: String,
+    /// Max unpacked size in bytes of an uploaded source archive (`tond push`).
+    /// The compressed upload is capped at the same size.
+    #[serde(default = "default_upload_max_bytes")]
+    pub upload_max_bytes: u64,
     /// Dashboard sessions end after this many hours without a request
     /// (settings key `session_idle_timeout_hours`).
     #[serde(default = "default_session_idle_hours")]
@@ -58,6 +75,8 @@ impl Default for ServerSettings {
             server_name: default_server_name(),
             dashboard_domain: String::new(),
             preview_domain: String::new(),
+            apps_domain: String::new(),
+            upload_max_bytes: DEFAULT_UPLOAD_MAX_BYTES,
             session_idle_timeout_hours: DEFAULT_SESSION_IDLE_HOURS,
             session_max_age_days: DEFAULT_SESSION_MAX_AGE_DAYS,
         }
@@ -80,6 +99,9 @@ pub struct UpdateSettingsRequest {
     #[serde(default)]
     pub preview_domain: Option<String>,
     #[serde(default)]
+    pub apps_domain: Option<String>,
+    #[serde(default)]
+    pub upload_max_bytes: Option<u64>,
     pub session_idle_timeout_hours: Option<i64>,
     #[serde(default)]
     pub session_max_age_days: Option<i64>,

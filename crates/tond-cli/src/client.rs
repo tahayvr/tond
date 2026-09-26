@@ -295,12 +295,12 @@ impl TondClient {
             .client
             .post(format!("{}/api/apps/{}/upload", self.base_url, id))
             .multipart(form);
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-
-        if !resp.success {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
-        }
-        Ok(())
+        let resp = self
+            .auth_header(req)
+            .send()
+            .await
+            .context("Upload failed")?;
+        upload_result(resp.status(), &resp.text().await.unwrap_or_default())
     }
 
     pub async fn action(&self, id: &str, action: &str) -> Result<()> {
@@ -1526,6 +1526,63 @@ impl TondClient {
     }
 }
 
+/// Turn the upload endpoint's reply into a result. The server refuses unsafe
+/// or oversized archives with a JSON error that says what to change; anything
+/// else (a proxy's HTML page, an empty body) is reported with its status.
+fn upload_result(status: reqwest::StatusCode, body: &str) -> Result<()> {
+    match serde_json::from_str::<ApiResponse<Value>>(body) {
+        Ok(resp) if resp.success => Ok(()),
+        Ok(resp) => anyhow::bail!(
+            "{}",
+            resp.error
+                .unwrap_or_else(|| format!("Upload failed ({status})"))
+        ),
+        Err(_) => anyhow::bail!(
+            "Upload failed ({status}){}",
+            if body.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", body.trim().chars().take(300).collect::<String>())
+            }
+        ),
+    }
+}
+
+#[cfg(test)]
+mod upload_result_tests {
+    use super::*;
+
+    #[test]
+    fn upload_result_surfaces_server_errors_and_non_json_replies() {
+        assert!(
+            upload_result(
+                reqwest::StatusCode::ACCEPTED,
+                r#"{"success":true,"data":{}}"#
+            )
+            .is_ok()
+        );
+        let err = upload_result(
+            reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+            r#"{"success":false,"error":"Too large: add build output to .tondignore"}"#,
+        )
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+        assert!(
+            err.contains(".tondignore"),
+            "server message should be shown: {err}"
+        );
+        let err = upload_result(reqwest::StatusCode::BAD_GATEWAY, "<html>bad gateway</html>")
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            err.contains("502"),
+            "status should be shown for non-JSON replies: {err}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
@@ -1592,7 +1649,7 @@ mod tests {
             "github_app_id": null,
             "gitlab_token_id": null,
             "preview_enabled": false,
-            "preview_excluded_keys": [],
+            "preview_shared_keys": [],
             "preview_env_vars": {},
             "dockerfile_content": null,
             "compose_content": null,

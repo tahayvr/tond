@@ -1,8 +1,8 @@
 name: Release Tond
 
-# `just release` pushes a v* tag, which builds, packages and publishes both
-# architectures. Can also be run manually (builds and uploads the bundles as
-# workflow artifacts; only tag runs create a GitHub Release).
+# `just release` pushes a v* tag, which builds, packages, signs and publishes
+# both architectures. Can also be run manually (builds, signs and uploads the
+# bundles as workflow artifacts; only tag runs create a GitHub Release).
 on:
   push:
     tags:
@@ -46,9 +46,84 @@ jobs:
             dist/tond-linux-${{ matrix.arch }}.tar.gz
             dist/tond-linux-${{ matrix.arch }}.tar.gz.sha256
 
+  # Signing and provenance run in their own job: the build job executes
+  # third-party build scripts, so it never sees the signing key or an OIDC
+  # token. This job runs no code from the repository's dependencies.
+  sign:
+    name: Sign and attest
+    needs: build
+    runs-on: ubuntu-24.04
+    environment: release # holds MINISIGN_SECRET_KEY; add required reviewers there
+    permissions:
+      contents: read
+      id-token: write # Sigstore signing of the provenance attestation (GitHub OIDC)
+      attestations: write # Store the attestation on the repository
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          sparse-checkout: release/minisign.pub
+          sparse-checkout-cone-mode: false
+
+      - name: Download bundles
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify checksums
+        working-directory: dist
+        run: sha256sum -c tond-linux-x86_64.tar.gz.sha256 tond-linux-aarch64.tar.gz.sha256
+
+      - name: Install minisign
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+
+      # MINISIGN_SECRET_KEY is the content of a passwordless minisign secret
+      # key (minisign -G -W); release/minisign.pub is its public key. See
+      # release/SIGNING.md.
+      - name: Sign tarballs and checksums
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          TRUSTED_COMMENT: tond ${{ github.ref_name }} ${{ github.sha }}
+        run: |
+          if [[ -z "$MINISIGN_SECRET_KEY" ]]; then
+            echo "::error::MINISIGN_SECRET_KEY is not set (release environment). See release/SIGNING.md."
+            exit 1
+          fi
+          if ! grep -qv '^untrusted comment:' <(grep -v '^$' release/minisign.pub); then
+            echo "::error::release/minisign.pub has no key yet. See release/SIGNING.md."
+            exit 1
+          fi
+          key="$(mktemp)"
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
+          for file in dist/*.tar.gz dist/*.tar.gz.sha256; do
+            minisign -S -s "$key" -m "$file" -t "$TRUSTED_COMMENT $(basename "$file")"
+          done
+
+      # Clients verify with the committed public key, so check that exact key.
+      - name: Verify signatures with the committed public key
+        run: |
+          for file in dist/*.tar.gz dist/*.tar.gz.sha256; do
+            minisign -V -p release/minisign.pub -m "$file"
+          done
+
+      - name: Attest build provenance (SLSA)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-path: |
+            dist/tond-linux-x86_64.tar.gz
+            dist/tond-linux-aarch64.tar.gz
+
+      - name: Upload signed bundles
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: tond-signed
+          path: dist/
+
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: sign
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     permissions:
@@ -60,11 +135,11 @@ jobs:
         with:
           fetch-depth: 0 # Full history needed for changelog
 
-      - name: Download bundles
+      - name: Download signed bundles
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
+          name: tond-signed
           path: dist
-          merge-multiple: true
 
       - name: Verify checksums
         working-directory: dist
@@ -87,8 +162,13 @@ jobs:
           files: |
             dist/tond-linux-x86_64.tar.gz
             dist/tond-linux-x86_64.tar.gz.sha256
+            dist/tond-linux-x86_64.tar.gz.minisig
+            dist/tond-linux-x86_64.tar.gz.sha256.minisig
             dist/tond-linux-aarch64.tar.gz
             dist/tond-linux-aarch64.tar.gz.sha256
+            dist/tond-linux-aarch64.tar.gz.minisig
+            dist/tond-linux-aarch64.tar.gz.sha256.minisig
+            release/minisign.pub
           body: ${{ steps.git-cliff.outputs.content }}
           draft: false
           prerelease: false

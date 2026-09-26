@@ -48,6 +48,7 @@ export type AppTab = 'overview' | 'deployments' | 'logs' | 'metrics' | 'settings
 export type AppSettingsSection =
 	| 'environment'
 	| 'domain'
+	| 'databases'
 	| 'health'
 	| 'volumes'
 	| 'resources'
@@ -67,6 +68,7 @@ export const APP_TABS: readonly TabDef<AppTab>[] = [
 export const APP_SETTINGS_SECTIONS: readonly TabDef<AppSettingsSection>[] = [
 	{ id: 'environment', label: 'Environment', scope: 'env:read-names' },
 	{ id: 'domain', label: 'Domain' },
+	{ id: 'databases', label: 'Databases', scope: 'db:read' },
 	{ id: 'health', label: 'Health' },
 	{ id: 'volumes', label: 'Volumes' },
 	{ id: 'resources', label: 'Resources' },

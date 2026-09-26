@@ -15,6 +15,9 @@ set -euo pipefail
 #   E2E_PREVIEW_DOMAIN    preview domain passed to install.sh (e.g. preview.test, a
 #                         different site than the base domain). When unset the
 #                         preview checks are skipped.
+#   E2E_APPS_DOMAIN       apps domain passed to install.sh (e.g. apps.test). When set,
+#                         an app without a custom domain must be served at
+#                         <app>.<apps-domain>; when unset that check is skipped.
 #   E2E_TARGET_IP         IP that the domains resolve to (default: 127.0.0.1)
 #   E2E_CA_FILE           root CA of the ACME server (Pebble / LE staging). When set,
 #                         the test waits for a real certificate and verifies it
@@ -28,6 +31,7 @@ set -euo pipefail
 BASE="${E2E_BASE_DOMAIN:?E2E_BASE_DOMAIN is required}"
 DASH="${E2E_DASHBOARD_DOMAIN:-dash.${BASE}}"
 PREVIEW="${E2E_PREVIEW_DOMAIN:-}"
+APPS_DOMAIN="${E2E_APPS_DOMAIN:-}"
 IP="${E2E_TARGET_IP:-127.0.0.1}"
 CA_FILE="${E2E_CA_FILE:-}"
 FIXTURE_DIR="${E2E_FIXTURE_DIR:-$(cd "$(dirname "$0")" && pwd)/fixtures/static-site}"
@@ -128,7 +132,7 @@ wait_for_app_running() {
 }
 
 delete_e2e_resources() {
-    for app in e2e-whoami e2e-static e2e-rooted e2e-compose e2e-badport e2e-worker e2e-worker-domain; do
+    for app in e2e-whoami e2e-static e2e-rooted e2e-compose e2e-badport e2e-worker e2e-worker-domain e2e-auto; do
         tond apps delete "$app" -y > /dev/null 2>&1 || true
     done
     tond db delete e2e-redis -y > /dev/null 2>&1 || true
@@ -268,9 +272,10 @@ if runuser -u tond-proxy -- bash -c ": >> '${DATA_DIR}/tond.db'" 2>/dev/null; th
     fail "tond-proxy must not be able to write tond.db"
 fi
 pass "tond-proxy cannot write tond.db"
+# The link reconnects with backoff after install starts the proxy; give it a moment.
+wait_for 30 "tond-server holding a control connection to tond-proxy" \
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/system/self | jq -e '.data.proxy.connected == true'"
 self=$(api /api/system/self)
-echo "$self" | jq -e '.data.proxy.connected == true' > /dev/null \
-    || fail "tond-server must hold a control connection to tond-proxy: $(echo "$self" | jq -c .data.proxy)"
 echo "$self" | jq -e '.data.proxy.stats.route_version >= 0 and .data.proxy.stats.pid > 0' > /dev/null \
     || fail "tond-proxy must report its stats over the control socket"
 pass "tond-server ↔ tond-proxy control link is up (proxy pid $(echo "$self" | jq -r .data.proxy.stats.pid))"
@@ -1000,6 +1005,130 @@ code=$(api_req POST /api/apps '{"name":"e2e-compose","source_type":"compose","co
 [[ "$code" == 400 ]] && grep -q "privileged" "$API_BODY" && grep -q "network_mode: host" "$API_BODY" \
     || fail "a privileged compose file must be rejected with every problem listed, got ${code}: $(cat "$API_BODY")"
 pass "compose with privileged + network_mode: host → 400 listing both problems"
+
+step "Network isolation (per-app networks, database links)"
+# Every app and database has its own Docker network (none is on the default
+# bridge); a database is reachable from outside its project only through a
+# link. A throwaway probe container on an app's network sees exactly what the
+# app sees.
+networks_of() { docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$1"; }
+ip_on() { docker inspect -f "{{(index .NetworkSettings.Networks \"$2\").IPAddress}}" "$1"; }
+PROBE_IMAGE="redis:7-alpine" # already pulled for e2e-redis; has wget, redis-cli, timeout
+# Traffic between networks is dropped, so a refused probe would hang in TCP
+# connect: every tool gets its own timeout, --init makes signals work (a
+# process running as PID 1 ignores SIGTERM), and the host caps the whole run.
+probe() {
+    local net=$1; shift
+    timeout 30 docker run --rm --init --network "$net" "$PROBE_IMAGE" "$@"
+}
+http_ok() { probe "$1" wget -q -T 3 -O /dev/null "http://$2/" > /dev/null 2>&1; }
+redis_reachable() { probe "$1" redis-cli -t 3 -h "$2" PING 2>&1 | grep -q NOAUTH; }
+redis_unreachable() { ! redis_reachable "$@"; }
+
+WHOAMI_NET=tond-net-app-e2e-whoami
+STATIC_NET=tond-net-app-e2e-static
+REDIS_NET=tond-net-db-e2e-redis
+for pair in "tond-e2e-whoami ${WHOAMI_NET}" "tond-e2e-static ${STATIC_NET}" "tond-db-e2e-redis ${REDIS_NET}"; do
+    read -r container net <<<"$pair"
+    [[ "$(networks_of "$container")" == "${net} " ]] \
+        || fail "${container} must be on ${net} only, not the default bridge (on: $(networks_of "$container"))"
+done
+pass "e2e-whoami, e2e-static and e2e-redis each run on their own network (never the default bridge)"
+jq -e '.icc == false' /etc/docker/daemon.json > /dev/null \
+    || fail "install.sh must set icc=false for Docker's default bridge"
+pass "daemon.json turns inter-container traffic off on the default bridge"
+[[ "$(docker network inspect -f '{{index .Options "com.docker.network.bridge.enable_icc"}}' "$REDIS_NET")" == false ]] \
+    || fail "a database's own network must have inter-container traffic off"
+pass "a database's own network has icc off"
+
+WHOAMI_IP=$(ip_on tond-e2e-whoami "$WHOAMI_NET")
+REDIS_IP=$(ip_on tond-db-e2e-redis "$REDIS_NET")
+http_ok "$WHOAMI_NET" "$WHOAMI_IP" || fail "the probe must reach e2e-whoami from its own network (probe broken?)"
+http_ok "$WHOAMI_NET" "e2e-whoami" || fail "an app must be reachable by name on its own network"
+pass "control: e2e-whoami answers on its own network (by IP and by name)"
+! http_ok "$STATIC_NET" "$WHOAMI_IP" || fail "e2e-static's network must not reach e2e-whoami (${WHOAMI_IP})"
+pass "another app's network cannot reach e2e-whoami's container IP"
+! redis_reachable "$WHOAMI_NET" "$REDIS_IP" || fail "an unlinked app must not reach e2e-redis (${REDIS_IP})"
+pass "an unlinked app cannot reach a database outside its project"
+
+read -r code body < <(api_send PUT /api/databases/e2e-redis/links/e2e-whoami '{}')
+[[ "$code" == 200 ]] && jq -e '.data.linked_apps | any(.name == "e2e-whoami")' <<<"$body" > /dev/null \
+    || fail "linking e2e-whoami to e2e-redis must succeed (got ${code}: ${body})"
+wait_for 20 "e2e-redis reachable by name from e2e-whoami's network" redis_reachable "$WHOAMI_NET" e2e-redis
+pass "after linking, e2e-whoami reaches e2e-redis by name"
+api /api/apps/e2e-whoami/databases | jq -e '.data | any(.name == "e2e-redis" and .via == "link")' > /dev/null \
+    || fail "GET /api/apps/e2e-whoami/databases must list the linked database"
+read -r code body < <(api_send PUT /api/databases/e2e-redis/links/e2e-static '{}')
+[[ "$code" == 200 ]] || fail "linking e2e-static must succeed (got ${code}: ${body})"
+! http_ok "$STATIC_NET" "$WHOAMI_IP" \
+    || fail "two apps linked to the same database must still not reach each other"
+pass "apps linked to the same database still cannot reach each other"
+read -r code body < <(api_send DELETE /api/databases/e2e-redis/links/e2e-static '{}')
+[[ "$code" == 200 ]] || fail "unlinking e2e-static must succeed (got ${code}: ${body})"
+read -r code body < <(api_send DELETE /api/databases/e2e-redis/links/e2e-whoami '{}')
+[[ "$code" == 200 ]] || fail "unlinking e2e-whoami must succeed (got ${code}: ${body})"
+wait_for 30 "e2e-redis unreachable from e2e-whoami after unlinking" \
+    redis_unreachable "$WHOAMI_NET" "$REDIS_IP"
+[[ "$(networks_of tond-db-e2e-redis)" == "${REDIS_NET} " ]] \
+    || fail "unlinking must detach e2e-redis from the apps' networks (on: $(networks_of tond-db-e2e-redis))"
+pass "unlinking detaches the database again"
+code=$(api_req POST /api/apps '{"name":"e2e-compose","source_type":"compose","container_port":80,"compose_content":"services:\n  web:\n    image: nginx:alpine\nnetworks:\n  shared:\n    external: true\n    name: tond-net-db-e2e-redis\n"}')
+[[ "$code" == 400 ]] && grep -q "external" "$API_BODY" \
+    || fail "a compose file joining another network must be rejected, got ${code}: $(cat "$API_BODY")"
+pass "compose files cannot join another app's or database's network"
+
+step "Upload safety (archives are extracted in Rust, with limits)"
+UPLOAD_TMP=$(mktemp -d)
+ln -s /etc/shadow "${UPLOAD_TMP}/shadow"
+tar -czf "${UPLOAD_TMP}/evil.tar.gz" -C "$UPLOAD_TMP" shadow
+code=$(curl -s -o "$API_BODY" -w '%{http_code}' --unix-socket "$SOCK" \
+    -F "file=@${UPLOAD_TMP}/evil.tar.gz" http://localhost/api/apps/e2e-static/upload)
+[[ "$code" == 400 ]] && grep -q "outside the project" "$API_BODY" \
+    || fail "an archive with a symlink to /etc/shadow must be refused with 400, got ${code}: $(cat "$API_BODY")"
+pass "an archive linking outside the project is refused (400, says why)"
+read -r code body < <(api_send PUT /api/settings '{"upload_max_bytes": 1048576}')
+[[ "$code" == 200 ]] || fail "setting a 1 MiB upload limit must succeed (got ${code}: ${body})"
+head -c 3145728 /dev/zero > "${UPLOAD_TMP}/zeros.bin"
+tar -czf "${UPLOAD_TMP}/bomb.tar.gz" -C "$UPLOAD_TMP" zeros.bin
+code=$(curl -s -o "$API_BODY" -w '%{http_code}' --unix-socket "$SOCK" \
+    -F "file=@${UPLOAD_TMP}/bomb.tar.gz" http://localhost/api/apps/e2e-static/upload)
+read -r restore_code _ < <(api_send PUT /api/settings '{"upload_max_bytes": 1073741824}')
+[[ "$restore_code" == 200 ]] || fail "restoring the upload limit must succeed"
+[[ "$code" == 413 ]] && grep -q "tondignore" "$API_BODY" \
+    || fail "an archive that unpacks past the limit must be refused with 413, got ${code}: $(cat "$API_BODY")"
+pass "an archive that unpacks past upload_max_bytes is refused (413, says how to fix it)"
+[[ -z "$(ls -A "${DATA_DIR}/uploads" 2> /dev/null)" ]] || fail "refused uploads must not leave files in ${DATA_DIR}/uploads"
+pass "refused uploads leave nothing behind"
+rm -rf "$UPLOAD_TMP"
+[[ "$(app_field e2e-static status)" == running ]] || fail "refused uploads must not touch the running app"
+
+step "Apps domain (automatic hostnames never on the dashboard's site)"
+api /api/apps/e2e-whoami | jq -e '.data.domain_warning | strings | contains("same site as your dashboard")' > /dev/null \
+    || fail "a custom domain on the dashboard's site (${WHOAMI_DOMAIN}) must carry a warning"
+pass "custom domain ${WHOAMI_DOMAIN} (same site as ${DASH}) is allowed with a warning"
+read -r code body < <(api_send PUT /api/settings "{\"apps_domain\": \"apps.${BASE}\"}")
+[[ "$code" == 400 ]] || fail "an apps domain on the dashboard's site must be rejected (got ${code}: ${body})"
+pass "an apps domain on the dashboard's site (apps.${BASE}) is rejected"
+if [[ -n "$APPS_DOMAIN" ]]; then
+    # Capture first: grep -q exiting early would SIGPIPE tond under pipefail.
+    apps_settings_out="$(tond settings)"
+    grep -qE "^apps-domain +${APPS_DOMAIN}$" <<< "$apps_settings_out" \
+        || fail "install.sh must set the apps domain to ${APPS_DOMAIN}"
+    tond apps create e2e-auto --source-type image --source traefik/whoami:v1.10 --port 80 > /dev/null
+    tond apps deploy e2e-auto > /dev/null
+    wait_for_app_running e2e-auto 180
+    [[ "$(app_field e2e-auto domain)" == "e2e-auto.${APPS_DOMAIN}" ]] \
+        || fail "an app without a domain must get e2e-auto.${APPS_DOMAIN}, got $(app_field e2e-auto domain)"
+    wait_for 60 "route for e2e-auto.${APPS_DOMAIN}" \
+        bash -c "curl -sk --resolve 'e2e-auto.${APPS_DOMAIN}:443:${IP}' 'https://e2e-auto.${APPS_DOMAIN}/' | grep -q Hostname:"
+    pass "an app without a custom domain is served at e2e-auto.${APPS_DOMAIN}"
+    tond apps delete e2e-auto -y > /dev/null
+    ! docker network inspect tond-net-app-e2e-auto > /dev/null 2>&1 \
+        || fail "deleting an app must remove its network"
+    pass "deleting the app removes its network"
+else
+    echo "  - E2E_APPS_DOMAIN not set; skipping the automatic hostname check"
+fi
 
 step "Per-deployment images and rollback"
 deployments() { api /api/apps/e2e-whoami/deployments; }

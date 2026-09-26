@@ -40,6 +40,7 @@ pub mod audit_log;
 pub mod auth;
 pub mod backups;
 pub mod cron;
+pub mod database_links;
 pub mod databases;
 pub mod deployments;
 pub mod domains;
@@ -79,11 +80,11 @@ use crate::audit_log::{AuditEntry, record};
 use crate::{
     audit_log::write_audit_log,
     auth::{Authz, Principal, RateLimit, principal::Actor, scope},
-    compose_policy, deploy, docker,
+    compose_policy, deploy, docker, domains as domain_rules,
     error::AppError,
-    proxy_link, secrets,
+    networks, proxy_link, secrets,
     state::AppState,
-    volumes,
+    upload, volumes,
 };
 
 // ── Health ──
@@ -186,10 +187,33 @@ pub async fn get_app(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let app = fetch_app(&state.db, &id).await?;
-    Ok((
-        StatusCode::OK,
-        Json(ApiResponse::ok(AppResponse::from(app))),
-    ))
+    let mut response = AppResponse::from(app);
+    response.domain_warning = domain_warning(&state, response.domain.as_deref()).await;
+    Ok((StatusCode::OK, Json(ApiResponse::ok(response))))
+}
+
+/// The "same site as your dashboard" warning for an app domain, if it applies.
+async fn domain_warning(state: &AppState, domain: Option<&str>) -> Option<String> {
+    let domain = domain?;
+    let dashboard = state.settings.read().await.dashboard_domain.clone();
+    domain_rules::same_site(domain, &dashboard)
+        .then(|| domain_rules::same_site_warning(domain, &dashboard))
+}
+
+/// Normalize and validate a custom app domain against the current settings.
+/// Returns the normalized domain and the same-site warning, if any.
+async fn check_app_domain(
+    state: &AppState,
+    domain: &str,
+) -> Result<(String, Option<String>), AppError> {
+    let domain = domain_rules::normalize_domain(domain);
+    let (dashboard, preview) = {
+        let s = state.settings.read().await;
+        (s.dashboard_domain.clone(), s.preview_domain.clone())
+    };
+    let warning = domain_rules::check_custom_app_domain(&domain, &dashboard, &preview)
+        .map_err(|msg| AppError(TondError::InvalidInput(msg)))?;
+    Ok((domain, warning))
 }
 
 // ── Create App ──
@@ -302,8 +326,8 @@ pub async fn create_app(
         req.container_port,
     );
 
-    if let Some(domain) = req.domain {
-        app.domain = Some(domain);
+    if let Some(domain) = req.domain.filter(|d| !d.trim().is_empty()) {
+        app.domain = Some(check_app_domain(&state, &domain).await?.0);
     }
 
     let env = match req.env_vars {
@@ -507,6 +531,11 @@ pub async fn delete_app(
             .await;
     } else if let Some(container_id) = &app.container_id {
         let _ = docker::remove_container(&state.docker, container_id).await;
+    }
+    // The app's own network (linked databases are detached with it; the
+    // links themselves go with the row).
+    if app.project_id.is_none() {
+        docker::remove_network(&state.docker, &networks::app_network(&app.name)).await;
     }
 
     sqlx::query("DELETE FROM apps WHERE id = ?")
@@ -772,6 +801,21 @@ pub async fn update_domain(
     Json(req): Json<UpdateDomainRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let app = fetch_app(&state.db, &id).await?;
+    let (domain, warning) = check_app_domain(&state, &req.domain).await?;
+    let req = UpdateDomainRequest { domain };
+
+    let taken: Option<String> =
+        sqlx::query_scalar("SELECT name FROM apps WHERE domain = ? AND id != ? LIMIT 1")
+            .bind(&req.domain)
+            .bind(&app.id)
+            .fetch_optional(&state.db)
+            .await?;
+    if let Some(other) = taken {
+        return Err(AppError(TondError::InvalidInput(format!(
+            "{} is already used by the app '{other}'",
+            req.domain
+        ))));
+    }
 
     sqlx::query("UPDATE apps SET domain = ?, updated_at = datetime('now') WHERE id = ?")
         .bind(&req.domain)
@@ -826,9 +870,11 @@ pub async fn update_domain(
 
     Ok((
         StatusCode::OK,
-        Json(ApiResponse::ok(
-            json!({ "message": "Domain updated, certificate provisioning queued" }),
-        )),
+        Json(ApiResponse::ok(json!({
+            "message": "Domain updated, certificate provisioning queued",
+            "domain": req.domain,
+            "warning": warning,
+        }))),
     ))
 }
 
@@ -1099,6 +1145,104 @@ pub async fn update_drain_timeout(
     ))
 }
 
+/// Stream the multipart `file` field into `upload::extract_archive`, running
+/// on a blocking thread. Errors are user-facing (400/413 with what to do).
+async fn receive_upload(
+    multipart: &mut Multipart,
+    dest: &std::path::Path,
+    max_bytes: u64,
+) -> Result<(), AppError> {
+    let mut extracted = false;
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(e) => {
+                return Err(AppError(TondError::InvalidInput(format!(
+                    "Failed to read upload: {e}"
+                ))));
+            }
+        };
+        if field.name() != Some("file") || extracted {
+            continue;
+        }
+        extracted = true;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(8);
+        let dest_owned = dest.to_path_buf();
+        let job = tokio::task::spawn_blocking(move || {
+            upload::extract_archive(
+                upload::ArchiveReader::new(rx, max_bytes),
+                &dest_owned,
+                upload::ExtractLimits::with_max_bytes(max_bytes),
+            )
+        });
+
+        let mut field = field;
+        let mut received: u64 = 0;
+        let mut extractor_stopped = false;
+        loop {
+            match field.chunk().await {
+                Ok(Some(chunk)) => {
+                    received += chunk.len() as u64;
+                    // A send error means the extractor already stopped (it
+                    // refused the archive); its result says why. Keep reading
+                    // (and discarding) a bounded amount so the client gets
+                    // the error response instead of a reset connection.
+                    if !extractor_stopped && tx.send(Ok(chunk)).await.is_err() {
+                        extractor_stopped = true;
+                    }
+                    if extractor_stopped && received > max_bytes.saturating_mul(2) {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(std::io::Error::other(format!(
+                            "the upload was interrupted: {e}"
+                        ))))
+                        .await;
+                    break;
+                }
+            }
+        }
+        drop(tx);
+
+        let result = job.await.map_err(|e| {
+            AppError(TondError::Internal(format!(
+                "upload extraction failed: {e}"
+            )))
+        })?;
+        match result {
+            Ok(stats) => tracing::info!(
+                "Upload extracted: {} files, {} bytes",
+                stats.files,
+                stats.bytes
+            ),
+            Err(upload::UploadError::TooLarge(msg)) => {
+                return Err(AppError(TondError::PayloadTooLarge(msg)));
+            }
+            Err(upload::UploadError::Invalid(msg)) => {
+                return Err(AppError(TondError::InvalidInput(format!(
+                    "Upload refused: {msg}"
+                ))));
+            }
+            Err(upload::UploadError::Io(msg)) => {
+                return Err(AppError(TondError::Internal(format!(
+                    "Could not unpack the upload: {msg}"
+                ))));
+            }
+        }
+    }
+    if !extracted {
+        return Err(AppError(TondError::InvalidInput(
+            "The upload has no 'file' part: send the archive as multipart field 'file'".to_string(),
+        )));
+    }
+    Ok(())
+}
+
 // ── Readiness (web app / TCP service / background worker) ──
 
 /// Whether a readiness change comes from creating the app or editing it.
@@ -1262,51 +1406,20 @@ pub async fn upload_deploy(
 ) -> Result<impl IntoResponse, AppError> {
     let mut app = fetch_app(&state.db, &id).await?;
 
-    // Extract into a directory of its own: an earlier upload of the same app
-    // may still be waiting in the build queue or building.
-    let extract_dir = format!("/tmp/tond-uploads/{}", uuid::Uuid::new_v4());
-    tokio::fs::create_dir_all(&extract_dir).await.map_err(|e| {
+    // Extract the archive while it streams in, into a fresh private directory
+    // (see upload.rs for everything that is refused).
+    let data_dir = volumes::data_dir();
+    let extract_path = upload::create_upload_dir(&data_dir).map_err(|e| {
         AppError(TondError::Internal(format!(
-            "Failed to create upload dir: {}",
-            e
+            "Failed to create upload dir: {e}"
         )))
     })?;
-
-    while let Ok(Some(field)) = multipart.next_field().await {
-        if field.name() == Some("file") {
-            let data = field.bytes().await.map_err(|e| {
-                AppError(TondError::InvalidInput(format!(
-                    "Failed to read upload: {}",
-                    e
-                )))
-            })?;
-
-            let tar_path = format!("{}/upload.tar.gz", extract_dir);
-            tokio::fs::write(&tar_path, &data).await.map_err(|e| {
-                AppError(TondError::Internal(format!(
-                    "Failed to write tarball: {}",
-                    e
-                )))
-            })?;
-
-            // Extract tarball
-            let output = crate::process::command("tar")
-                .args(["xzf", &tar_path, "-C", &extract_dir])
-                .output()
-                .await
-                .map_err(|e| AppError(TondError::Internal(format!("Failed to run tar: {}", e))))?;
-
-            if !output.status.success() {
-                let _ = tokio::fs::remove_dir_all(&extract_dir).await;
-                return Err(AppError(TondError::InvalidInput(
-                    "Failed to extract tarball".to_string(),
-                )));
-            }
-
-            // Remove the tar file
-            let _ = tokio::fs::remove_file(&tar_path).await;
-        }
+    let max_bytes = state.settings.read().await.upload_max_bytes;
+    if let Err(e) = receive_upload(&mut multipart, &extract_path, max_bytes).await {
+        let _ = tokio::fs::remove_dir_all(&extract_path).await;
+        return Err(e);
     }
+    let extract_dir = extract_path.to_string_lossy().into_owned();
 
     // Update source type
     sqlx::query(
@@ -1369,6 +1482,12 @@ pub async fn assign_project(
 ) -> Result<impl IntoResponse, AppError> {
     let app = fetch_app(&state.db, &id).await?;
 
+    // Changing the project moves the app to another Docker network, which
+    // changes which databases it can reach (networks.rs).
+    if req.project_id != app.project_id {
+        auth.require_to(Scope::DbWrite, "move an app to another project's network")?;
+    }
+
     // If a project_id is provided, verify it exists
     if let Some(ref pid) = req.project_id {
         let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?)")
@@ -1385,6 +1504,21 @@ pub async fn assign_project(
         .bind(&app.id)
         .execute(&state.db)
         .await?;
+
+    // Move the running container to its new home network (project or own)
+    // and re-attach linked databases there; drop the now-unused own network.
+    if req.project_id != app.project_id {
+        let moved = App {
+            project_id: req.project_id.clone(),
+            ..app.clone()
+        };
+        networks::reconcile_app(&state, &moved)
+            .await
+            .map_err(|e| AppError(TondError::DockerError(e.to_string())))?;
+        if moved.project_id.is_some() {
+            docker::remove_network(&state.docker, &networks::app_network(&app.name)).await;
+        }
+    }
 
     write_audit_log(
         &state.db,
@@ -2812,5 +2946,182 @@ mod tests {
         )
         .await;
         assert!(missing.is_err(), "unknown domains are a 404");
+    }
+
+    /// Run `receive_upload` behind a real axum router so the Multipart
+    /// extractor parses a genuine multipart body.
+    async fn post_upload(body: Vec<u8>, max_bytes: u64) -> (StatusCode, String, tempfile::TempDir) {
+        use tower::ServiceExt;
+
+        let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let dest = dir.path().to_path_buf();
+        let router = axum::Router::new().route(
+            "/upload",
+            axum::routing::post(move |mut multipart: Multipart| {
+                let dest = dest.clone();
+                async move {
+                    match receive_upload(&mut multipart, &dest, max_bytes).await {
+                        Ok(()) => StatusCode::OK.into_response(),
+                        Err(e) => e.into_response(),
+                    }
+                }
+            })
+            .layer(axum::extract::DefaultBodyLimit::disable()),
+        );
+        let boundary = "tondtestboundary";
+        let mut payload = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"upload.tar.gz\"\r\nContent-Type: application/gzip\r\n\r\n"
+        )
+        .into_bytes();
+        payload.extend_from_slice(&body);
+        payload.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(axum::body::Body::from(payload))
+            .unwrap_or_else(|e| panic!("request: {e}"));
+        let response = router
+            .oneshot(request)
+            .await
+            .unwrap_or_else(|e| panic!("router: {e}"));
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        (status, String::from_utf8_lossy(&bytes).into_owned(), dir)
+    }
+
+    fn gzip_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, content) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, *content)
+                .unwrap_or_else(|e| panic!("append: {e}"));
+        }
+        let tar = builder.into_inner().unwrap_or_else(|e| panic!("tar: {e}"));
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(&tar).unwrap_or_else(|e| panic!("gz: {e}"));
+        enc.finish().unwrap_or_else(|e| panic!("gz: {e}"))
+    }
+
+    #[tokio::test]
+    async fn receive_upload_extracts_a_streamed_multipart_archive() {
+        let archive = gzip_tar(&[("Dockerfile", b"FROM scratch\n"), ("src/app.txt", b"hi")]);
+        let (status, body, dir) = post_upload(archive, 1024 * 1024).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "valid upload should extract: {body}"
+        );
+        assert!(dir.path().join("Dockerfile").is_file());
+        assert!(dir.path().join("src/app.txt").is_file());
+    }
+
+    #[tokio::test]
+    async fn receive_upload_refuses_oversized_archives_with_413() {
+        let big = vec![0u8; 3 * 1024 * 1024];
+        let archive = gzip_tar(&[("big.bin", &big)]);
+        let (status, body, _dir) = post_upload(archive, 1024 * 1024).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "body: {body}");
+        assert!(
+            body.contains(".tondignore"),
+            "the error should say how to fix it: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_upload_refuses_malicious_archives_with_400() {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        builder
+            .append_link(&mut header, "passwd", "/etc/passwd")
+            .unwrap_or_else(|e| panic!("append link: {e}"));
+        let tar = builder.into_inner().unwrap_or_else(|e| panic!("tar: {e}"));
+        let (status, body, _dir) = post_upload(tar, 1024 * 1024).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(body.contains("outside the project"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn update_domain_warns_on_the_dashboard_site_and_refuses_unroutable_domains() {
+        let state = test_state().await;
+        {
+            let mut s = state.settings.write().await;
+            s.dashboard_domain = "dash.example.com".to_string();
+            s.preview_domain = "example-previews.com".to_string();
+        }
+        let app = seed_app(&state, "demo").await;
+        let set = |domain: &str| {
+            let state = state.clone();
+            let id = app.id.clone();
+            let domain = domain.to_string();
+            async move {
+                update_domain(
+                    RateLimit,
+                    Authz::unchecked(Principal::test_user(Role::Admin)),
+                    State(state),
+                    Path(id),
+                    Json(UpdateDomainRequest { domain }),
+                )
+                .await
+                .map(IntoResponse::into_response)
+            }
+        };
+
+        let response = set(" Shop.Example.com ")
+            .await
+            .unwrap_or_else(|err| panic!("same-site custom domains are allowed: {}", err.0));
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        assert_eq!(
+            json["data"]["domain"], "shop.example.com",
+            "domains are normalized"
+        );
+        assert!(
+            json["data"]["warning"]
+                .as_str()
+                .is_some_and(|w| w.contains("same site as your dashboard")),
+            "a same-site domain comes back with a warning: {json}"
+        );
+
+        let detail = get_app(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            State(state.clone()),
+            Path(app.id.clone()),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("get_app: {}", err.0))
+        .into_response();
+        let body = to_bytes(detail.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        assert!(
+            json["data"]["domain_warning"].is_string(),
+            "the app detail carries the warning too: {json}"
+        );
+
+        for bad in [
+            "dash.example.com",
+            "pr.example-previews.com",
+            "not a domain",
+        ] {
+            assert!(set(bad).await.is_err(), "{bad} must be refused");
+        }
     }
 }

@@ -49,9 +49,11 @@ use uuid::Uuid;
 use crate::alerts;
 use crate::backup::{self, SnapshotTrigger};
 use crate::docker;
+use crate::domains;
 use crate::handlers::{github_apps, gitlab_tokens};
 use crate::log_bus::{self, DeployLogEvent};
 use crate::log_scrub;
+use crate::networks;
 use crate::secret_key::{self, Purpose};
 use crate::secrets;
 use crate::state::AppState;
@@ -162,25 +164,63 @@ async fn persist_generated_dockerfile(
     }
 }
 
-fn auto_domain(base_domain: &str, app_name: &str) -> String {
-    let base = if base_domain.is_empty() {
-        "localhost"
-    } else {
-        base_domain
-    };
-    format!("{}.{}", app_name, base)
+/// The automatic hostname for an app: `<app>.<apps_domain>`, or `None` when
+/// no apps domain is configured. Apps never default to a name under the
+/// dashboard domain: that would put user code on the dashboard's site.
+fn auto_domain(apps_domain: &str, app_name: &str) -> Option<String> {
+    (!apps_domain.is_empty()).then(|| domains::app_host(app_name, apps_domain))
 }
 
+/// Give an app without a domain its automatic hostname, or log how to reach
+/// it when there is no apps domain.
+async fn assign_automatic_domain(
+    state: &AppState,
+    app: &mut App,
+    trigger_source: &str,
+) -> Result<()> {
+    // Background workers serve no traffic: no address.
+    if app.domain.is_some() || !app.readiness().serves_traffic() {
+        return Ok(());
+    }
+    let apps_domain = state.settings.read().await.apps_domain.clone();
+    match auto_domain(&apps_domain, &app.name) {
+        Some(domain) => {
+            sqlx::query("UPDATE apps SET domain = ? WHERE id = ?")
+                .bind(&domain)
+                .bind(&app.id)
+                .execute(&state.db)
+                .await?;
+            app.domain = Some(domain);
+        }
+        None => {
+            log_deploy(
+                state,
+                &app.id,
+                "info",
+                trigger_source,
+                "No apps domain is set, so this app has no public address yet. Add a custom \
+                 domain on the app's page, or set an apps domain in Settings.",
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// The environment of a preview container: only the app variables listed in
+/// `shared_keys_json`, then the preview overrides on top. Previews run
+/// pull-request code, so production variables (database URLs, API keys) are
+/// withheld unless an admin shared them explicitly.
 fn preview_env_vars(
     base_env: BTreeMap<String, String>,
-    excluded_keys_json: &str,
+    shared_keys_json: &str,
     preview_overrides: BTreeMap<String, String>,
 ) -> HashMap<String, String> {
-    let mut env_vars: HashMap<String, String> = base_env.into_iter().collect();
-    let excluded_keys: Vec<String> = serde_json::from_str(excluded_keys_json).unwrap_or_default();
-    for key in &excluded_keys {
-        env_vars.remove(key);
-    }
+    let shared_keys: Vec<String> = serde_json::from_str(shared_keys_json).unwrap_or_default();
+    let mut env_vars: HashMap<String, String> = shared_keys
+        .iter()
+        .filter_map(|key| base_env.get(key).map(|value| (key.clone(), value.clone())))
+        .collect();
     env_vars.extend(preview_overrides);
     env_vars
 }
@@ -564,7 +604,7 @@ async fn pipeline(
 
         app.host_port = Some(host_port as i64);
         app.status = "running".to_string();
-        assign_auto_domain(state, app).await?;
+        assign_automatic_domain(state, app, trigger_source).await?;
 
         log_deploy(
             state,
@@ -613,17 +653,11 @@ async fn pipeline(
     )
     .await?;
 
-    // If the app belongs to a project, ensure the project's Docker network exists
-    // and connect this container to it (lazy creation on first deploy).
-    let network_name = if let Some(ref pid) = app.project_id {
-        let net = format!("tond-{}", pid);
-        if let Err(e) = docker::ensure_network(&state.docker, &net).await {
-            tracing::warn!("Could not ensure project network {}: {}", net, e);
-        }
-        Some(net)
-    } else {
-        None
-    };
+    // The container joins only its home network: the project network, or the
+    // app's own network (see networks.rs). Never the default bridge.
+    let network = networks::ensure_app_home(&state.docker, app)
+        .await
+        .context("could not create the app's Docker network")?;
 
     // Start the NEW container.
     //
@@ -652,7 +686,7 @@ async fn pipeline(
             app.memory_limit,
             app.cpu_limit,
             binds,
-            network_name.as_deref(),
+            &network,
             Some(&app_name),
             None,
         )
@@ -670,7 +704,7 @@ async fn pipeline(
             app.memory_limit,
             app.cpu_limit,
             binds,
-            network_name.as_deref(),
+            &network,
         )
         .await
         .context("Docker could not start the new container")?
@@ -849,7 +883,7 @@ async fn pipeline(
         let _ = docker::rename_container(&state.docker, &staging_name, &canonical_name).await;
     }
 
-    assign_auto_domain(state, app).await?;
+    assign_automatic_domain(state, app, trigger_source).await?;
 
     log_deploy(
         state,
@@ -869,6 +903,19 @@ async fn pipeline(
     .await?;
 
     images::prune_app_images(state, &app_id, &app_name).await;
+
+    // The home network may have just been (re)created: make sure the
+    // databases linked to this app are attached to it.
+    if let Err(e) = networks::reconcile_databases_for_app(state, app).await {
+        log_deploy(
+            state,
+            &app_id,
+            "warn",
+            trigger_source,
+            &format!("Could not attach linked databases to the app network: {e}"),
+        )
+        .await?;
+    }
 
     Ok(())
 }
@@ -1045,25 +1092,6 @@ async fn source_image(
 
 /// Auto-assign `<app>.<dashboard domain>` when the app has no domain.
 /// Falls back to `<app>.localhost` if no dashboard domain is configured.
-async fn assign_auto_domain(state: &AppState, app: &mut App) -> Result<()> {
-    // Background workers serve no traffic: no address.
-    if app.domain.is_some() || !app.readiness().serves_traffic() {
-        return Ok(());
-    }
-    let base = {
-        let s = state.settings.read().await;
-        s.dashboard_domain.clone()
-    };
-    let domain = auto_domain(&base, &app.name);
-    sqlx::query("UPDATE apps SET domain = ? WHERE id = ?")
-        .bind(&domain)
-        .bind(&app.id)
-        .execute(&state.db)
-        .await?;
-    app.domain = Some(domain);
-    Ok(())
-}
-
 /// Without a health check path the port probe waits at least this long, so a
 /// slow-booting app isn't failed by a short drain timeout.
 const PORT_PROBE_MIN_SECS: u64 = 60;
@@ -1201,7 +1229,7 @@ pub async fn deploy_preview(
 
     let env_vars = preview_env_vars(
         secrets::app_env(app)?,
-        app.preview_excluded_keys.as_str(),
+        app.preview_shared_keys.as_str(),
         secrets::app_preview_env(app)?,
     );
 
@@ -1219,16 +1247,12 @@ pub async fn deploy_preview(
         container_port
     );
 
-    // Connect preview containers to the project network if the app has one.
-    let network_name = if let Some(ref pid) = app.project_id {
-        let net = format!("tond-{}", pid);
-        if let Err(e) = docker::ensure_network(&state.docker, &net).await {
-            tracing::warn!("Could not ensure project network {}: {}", net, e);
-        }
-        Some(net)
-    } else {
-        None
-    };
+    // Previews run pull-request code: they get a network of their own and
+    // never join the project network, so they can't reach production
+    // databases or apps.
+    let network = networks::ensure_preview(&state.docker, &slug)
+        .await
+        .context("could not create the preview's Docker network")?;
 
     let container_id = docker::run_container_named(
         &state.docker,
@@ -1241,7 +1265,7 @@ pub async fn deploy_preview(
         app.memory_limit,
         app.cpu_limit,
         binds,
-        network_name.as_deref(),
+        &network,
         Some(&app_name),
         None,
     )
@@ -1871,21 +1895,21 @@ mod tests {
     }
 
     #[test]
-    fn auto_domain_uses_dashboard_domain_or_localhost_fallback() {
+    fn auto_domain_uses_the_apps_domain_and_nothing_else() {
         assert_eq!(
-            auto_domain("dashboard.example.com", "frontend"),
-            "frontend.dashboard.example.com",
-            "auto_domain should suffix the app name with the configured dashboard domain"
+            auto_domain("example-apps.com", "frontend").as_deref(),
+            Some("frontend.example-apps.com"),
+            "auto_domain should suffix the app name with the apps domain"
         );
         assert_eq!(
             auto_domain("", "frontend"),
-            "frontend.localhost",
-            "auto_domain should fall back to localhost when the dashboard domain is not configured"
+            None,
+            "without an apps domain there is no automatic hostname (never the dashboard's site)"
         );
     }
 
     #[test]
-    fn preview_env_vars_removes_excluded_keys_and_applies_overrides() {
+    fn preview_env_vars_passes_only_shared_keys_and_applies_overrides() {
         let map = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
             pairs
                 .iter()
@@ -1898,7 +1922,7 @@ mod tests {
                 ("PUBLIC_FLAG", "1"),
                 ("KEEP", "yes"),
             ]),
-            r#"["DATABASE_URL","MISSING"]"#,
+            r#"["PUBLIC_FLAG","KEEP","MISSING"]"#,
             map(&[("PUBLIC_FLAG", "preview"), ("NEW_KEY", "value")]),
         );
 
@@ -1909,7 +1933,13 @@ mod tests {
                 ("KEEP".to_string(), "yes".to_string()),
                 ("NEW_KEY".to_string(), "value".to_string()),
             ]),
-            "preview_env_vars should remove excluded keys and apply preview-specific overrides on top of the base environment"
+            "previews get only shared app variables (never DATABASE_URL here) plus their overrides"
+        );
+
+        let nothing_shared = preview_env_vars(map(&[("DATABASE_URL", "prod")]), "[]", map(&[]));
+        assert!(
+            nothing_shared.is_empty(),
+            "by default a preview receives none of the production environment"
         );
     }
 
@@ -1918,7 +1948,7 @@ mod tests {
         let state = test_state().await;
 
         sqlx::query(
-            "INSERT INTO apps (id, name, source_type, container_port, status, env_vars, volumes, drain_timeout, build_method, auto_deploy, preview_enabled, preview_excluded_keys, preview_env_vars, static_build, created_at, updated_at)
+            "INSERT INTO apps (id, name, source_type, container_port, status, env_vars, volumes, drain_timeout, build_method, auto_deploy, preview_enabled, preview_shared_keys, preview_env_vars, static_build, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))",
         )
         .bind("app-1")

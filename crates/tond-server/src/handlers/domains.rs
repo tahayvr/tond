@@ -15,7 +15,8 @@
 // The server's public addresses come from the routing table
 // (dns::server_addresses); behind NAT, where those are private, a public-IP
 // lookup is made once per hour and cached. The apps domain is the
-// `apps_domain` setting when present, else the dashboard domain.
+// `apps_domain` setting (apps never default to the dashboard's domain; see
+// domains.rs). `warning` is set when the domain is on the dashboard's site.
 
 use std::net::IpAddr;
 use std::sync::LazyLock;
@@ -34,7 +35,9 @@ use tond_common::{ApiResponse, Certificate, TondError};
 
 use crate::{
     auth::{Authz, RateLimit, scope},
-    domains::{is_valid_hostname, normalize_domain, registrable_domain},
+    domains::{
+        is_valid_hostname, normalize_domain, registrable_domain, same_site, same_site_warning,
+    },
     error::AppError,
     handlers::onboarding,
     state::AppState,
@@ -117,6 +120,9 @@ pub struct DomainCheckResponse {
     pub dns: DnsStatus,
     pub certificate: Option<CertificateSummary>,
     pub checked_at: String,
+    /// Set when the domain is on the same site as the dashboard (allowed,
+    /// but shown as a warning)
+    pub warning: Option<String>,
 }
 
 /// Name of `host` relative to `zone`: "@" for the apex, else the prefix.
@@ -242,11 +248,7 @@ async fn apps_domain(state: &AppState) -> Option<String> {
             .await
             .ok()
             .flatten();
-    let domain = match configured.filter(|d| !d.trim().is_empty()) {
-        Some(d) => d,
-        None => state.settings.read().await.dashboard_domain.clone(),
-    };
-    let domain = normalize_domain(&domain);
+    let domain = normalize_domain(&configured.unwrap_or_default());
     (!domain.is_empty()).then_some(domain)
 }
 
@@ -280,6 +282,9 @@ pub async fn check_domain(
         _ => Vec::new(),
     };
 
+    let dashboard = state.settings.read().await.dashboard_domain.clone();
+    let warning = same_site(&domain, &dashboard).then(|| same_site_warning(&domain, &dashboard));
+
     let certificate =
         sqlx::query_as::<_, Certificate>("SELECT * FROM certificates WHERE domain = ? LIMIT 1")
             .bind(&domain)
@@ -300,6 +305,7 @@ pub async fn check_domain(
             server_ips: server_ips.iter().map(ToString::to_string).collect(),
             certificate,
             checked_at: chrono::Utc::now().to_rfc3339(),
+            warning,
         })),
     ))
 }
