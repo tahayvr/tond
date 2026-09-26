@@ -9,7 +9,7 @@
 <div class="flex items-center justify-between gap-2">
 	<div class="flex items-center gap-1.5">
 		<Waypoints class="size-3.5" />
-		<span class="text-xs font-semibold uppercase group-data-[collapsible=icon]:hidden">
+		<span class="text-xs font-semibold group-data-[collapsible=icon]:hidden">
 			{feed.title}
 		</span>
 	</div>

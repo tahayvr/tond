@@ -1,9 +1,13 @@
 <script lang="ts">
+	import { can } from '$lib/auth.svelte';
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { page } from '$app/state';
 	import {
 		updateAlertRule,
 		deleteAlertRule,
+		testAlertRule,
 		ALERT_GROUPS,
+		type AlertChannelTestResult,
 		type AlertRule,
 		type AlertMetric,
 		type AlertEvent,
@@ -12,16 +16,19 @@
 	import { SvelteSet } from 'svelte/reactivity';
 	import { goto } from '$app/navigation';
 	import { setUiContext, clearUiContext, alertsContext } from '$lib/ui-context.svelte';
-	import { Badge } from '$lib/components/ui/badge/index.js';
+	import StatusBadge from '$lib/components/feedback/status-badge.svelte';
+	import SuccessAlert from '$lib/components/feedback/success-alert.svelte';
+	import PageHeader from '$lib/components/nav/page-header.svelte';
+	import LinkTabs from '$lib/components/nav/link-tabs.svelte';
+	import ConfirmDialog from '$lib/components/dialogs/confirm-dialog.svelte';
+	import { useAction } from '$lib/action.svelte';
+	import { ALERT_TABS, allowedTabs, tabFromUrl, tabHref, type AlertTab } from '$lib/tabs';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Checkbox } from '$lib/components/ui/checkbox/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
-	import { Separator } from '$lib/components/ui/separator/index.js';
-	import * as Tabs from '$lib/components/ui/tabs/index.js';
 	import * as Select from '$lib/components/ui/select/index.js';
 	import Breadcrumb from '$lib/components/nav/breadcrumb.svelte';
-	import ConfirmDeleteDialog from '$lib/components/dialogs/confirm-delete-dialog.svelte';
 	import IntegrationSelector from '$lib/components/integrations/integration-selector.svelte';
 	import SavedSecretField, {
 		secretFieldUpdate
@@ -35,6 +42,18 @@
 	let rule = $derived(data.rule as AlertRule | null);
 	let error = $state('');
 	let showDeleteDialog = $state(false);
+	let tab = $derived<AlertTab>(tabFromUrl(page.url, ALERT_TABS, 'overview'));
+	let testResults = $state<AlertChannelTestResult[]>([]);
+	const sendTest = useAction(async () => {
+		testResults = await testAlertRule(ruleId);
+	});
+	let testSummary = $derived(
+		testResults.length === 0
+			? ''
+			: testResults.every((r) => r.ok)
+				? `Test sent to ${testResults.length} channel${testResults.length === 1 ? '' : 's'}. Check that it arrived.`
+				: ''
+	);
 
 	// Apps list for resolving app names
 	let apps = $derived(data.apps as App[]);
@@ -51,7 +70,7 @@
 	let settingsWebhookRemoved = $state(false);
 	let settingsSaving = $state(false);
 	let settingsError = $state('');
-	let settingsSuccess = $state(false);
+	let settingsSuccess = $state('');
 
 	// Derived: current settings group
 	let settingsGroup = $derived(
@@ -116,14 +135,10 @@
 		return event;
 	}
 
-	async function handleToggleEnabled() {
+	const toggleEnabled = useAction(async () => {
 		if (!rule) return;
-		try {
-			rule = await updateAlertRule(ruleId, { enabled: !rule.enabled });
-		} catch (e: any) {
-			error = e.message ?? 'Failed to update rule';
-		}
-	}
+		rule = await updateAlertRule(ruleId, { enabled: !rule.enabled });
+	});
 
 	function handleSettingsGroupChange(groupId: string) {
 		settingsGroupId = groupId;
@@ -150,7 +165,7 @@
 	async function handleSaveSettings() {
 		settingsSaving = true;
 		settingsError = '';
-		settingsSuccess = false;
+		settingsSuccess = '';
 		try {
 			rule = await updateAlertRule(ruleId, {
 				name: settingsName.trim(),
@@ -164,8 +179,7 @@
 				}),
 				events: [...settingsEvents]
 			});
-			settingsSuccess = true;
-			setTimeout(() => (settingsSuccess = false), 3000);
+			settingsSuccess = 'Settings saved.';
 		} catch (e: any) {
 			settingsError = e.message ?? 'Failed to save settings';
 		} finally {
@@ -175,7 +189,7 @@
 
 	async function handleDelete() {
 		await deleteAlertRule(ruleId);
-		goto('/alerts');
+		goto('/alerts', { invalidateAll: true });
 	}
 
 	$effect(() => {
@@ -199,93 +213,100 @@
 </script>
 
 {#if error && !rule}
-	<div class="rounded-md border border-destructive/50 bg-destructive/10 p-4 text-destructive">
-		{error}
-	</div>
+	<InlineError message={error} />
 {:else if rule}
+	{@const current = rule}
 	<div class="space-y-6">
 		<!-- Breadcrumb -->
 		<Breadcrumb items={[{ label: 'Alerts', href: '/alerts' }, { label: rule.name }]} />
 
-		<!-- Error banner -->
-		{#if error}
+		<PageHeader title={rule.name} section={ALERT_TABS.find((t) => t.id === tab)?.label}>
+			{#snippet meta()}
+				<StatusBadge status={current.enabled ? 'enabled' : 'paused'} />
+				{#if current.metric}
+					<span class="text-xs">
+						{metricLabel(current.metric)} &gt; {current.threshold}{thresholdUnit(current.metric)}
+					</span>
+				{/if}
+				{#if current.events.length > 0}
+					<span class="text-xs">
+						{current.events.length} event{current.events.length > 1 ? 's' : ''}
+					</span>
+				{/if}
+			{/snippet}
+			{#snippet actions()}
+				{#if can('settings:write')}
+					<Button
+						variant="outline"
+						size="sm"
+						onclick={() => sendTest.run()}
+						disabled={sendTest.pending}
+						aria-busy={sendTest.pending}
+					>
+						{sendTest.pending ? 'Sending test…' : 'Send test'}
+					</Button>
+					<Button
+						variant="outline"
+						size="sm"
+						onclick={() => toggleEnabled.run()}
+						disabled={toggleEnabled.pending}
+					>
+						{toggleEnabled.pending ? 'Saving…' : current.enabled ? 'Pause' : 'Enable'}
+					</Button>
+				{/if}
+			{/snippet}
+		</PageHeader>
+
+		<InlineError message={error} ondismiss={() => (error = '')} />
+		<InlineError message={toggleEnabled.error} ondismiss={toggleEnabled.clear} />
+		<InlineError title="Test not sent" message={sendTest.error} ondismiss={sendTest.clear} />
+		<SuccessAlert message={testSummary} ondismiss={() => (testResults = [])} />
+		{#if testResults.some((r) => !r.ok)}
 			<div
-				class="rounded-md border border-destructive/50 bg-destructive/10 p-4 text-sm text-destructive"
+				role="alert"
+				class="space-y-1 rounded-sm border border-warn/40 bg-warn/10 px-3 py-2.5 text-sm text-warn"
 			>
-				{error}
+				<p class="font-semibold">Some channels didn't receive the test</p>
+				<ul class="space-y-0.5">
+					{#each testResults as result (result.kind + result.name)}
+						<li>
+							{result.ok ? '✓' : '✕'}
+							{result.name} ({result.kind}){result.error ? `: ${result.error}` : ''}
+						</li>
+					{/each}
+				</ul>
 			</div>
 		{/if}
 
-		<!-- Header -->
-		<div class="flex h-14 items-center justify-between">
-			<div>
-				<h2 class="text-3xl font-extrabold uppercase">{rule.name}</h2>
-				<div class="mt-2 flex items-center gap-3 text-sm text-muted-foreground">
-					<Badge variant={rule.enabled ? 'default' : 'secondary'}>
-						{rule.enabled ? 'Enabled' : 'Paused'}
-					</Badge>
-					{#if rule.metric}
-						<span class="font-mono text-xs uppercase">{metricLabel(rule.metric)}</span>
-						<span class="font-mono text-xs">
-							&gt; {rule.threshold}{thresholdUnit(rule.metric)}
-						</span>
-					{/if}
-					{#if rule.events.length > 0}
-						<span class="font-mono text-xs uppercase">
-							{rule.events.length} event{rule.events.length > 1 ? 's' : ''}
-						</span>
-					{/if}
-				</div>
-			</div>
-			<div class="flex gap-2">
-				<Button
-					variant="outline"
-					size="sm"
-					onclick={handleToggleEnabled}
-					class={rule.enabled
-						? 'border-destructive/50 text-destructive hover:border-destructive hover:text-destructive'
-						: ''}
-				>
-					{rule.enabled ? 'Disable' : 'Enable'}
-				</Button>
-				<Button variant="destructive" size="sm" onclick={() => (showDeleteDialog = true)}>
-					Delete
-				</Button>
-			</div>
-		</div>
+		<LinkTabs
+			label="Alert rule sections"
+			tabs={allowedTabs(ALERT_TABS, can)}
+			active={tab}
+			href={(id) => tabHref(page.url.pathname, id, 'overview')}
+		/>
 
-		<Separator />
-
-		<!-- Tabs -->
-		<Tabs.Root value="overview">
-			<Tabs.List>
-				<Tabs.Trigger value="overview">Overview</Tabs.Trigger>
-				<Tabs.Trigger value="settings">Settings</Tabs.Trigger>
-			</Tabs.List>
-
+		<div>
 			<!-- ── Overview tab ── -->
-			<Tabs.Content value="overview">
+			{#if tab === 'overview'}
 				<div class="space-y-4 pt-4">
-					<div class="grid gap-4 sm:grid-cols-2">
+					<div class="grid grid-cols-1 gap-4 sm:grid-cols-2 [&>*]:min-w-0">
 						<!-- Status card -->
 						<div class="space-y-3 rounded border border-dotted p-4">
-							<h4
+							<h2
 								class="font-mono text-xs font-medium tracking-wider text-muted-foreground uppercase"
 							>
 								Status
-							</h4>
+							</h2>
 							<div class="space-y-1 text-sm">
 								<div class="flex items-center gap-2">
 									<span class="text-muted-foreground">State:</span>
-									<Badge variant={rule.enabled ? 'default' : 'secondary'} class="text-xs">
-										{rule.enabled ? 'Enabled' : 'Paused'}
-									</Badge>
+									<StatusBadge status={rule.enabled ? 'enabled' : 'paused'} size="sm" />
 								</div>
 								<div>
 									<span class="text-muted-foreground">Last fired:</span>
 									{formatRelative(rule.last_fired_at)}
 									{#if rule.last_fired_at}
-										<span class="ml-1 font-mono text-xs text-muted-foreground/60">
+										<span class="ml-1 font-mono text-xs text-muted-foreground">
 											({formatDate(rule.last_fired_at)})
 										</span>
 									{/if}
@@ -307,11 +328,11 @@
 
 						<!-- Condition card -->
 						<div class="space-y-3 rounded border border-dotted p-4">
-							<h4
+							<h2
 								class="font-mono text-xs font-medium tracking-wider text-muted-foreground uppercase"
 							>
 								Condition
-							</h4>
+							</h2>
 							<div class="space-y-1 text-sm">
 								{#if rule.metric}
 									<div>
@@ -350,11 +371,11 @@
 
 						<!-- Notifications card -->
 						<div class="space-y-3 rounded border border-dotted p-4 sm:col-span-2">
-							<h4
+							<h2
 								class="font-mono text-xs font-medium tracking-wider text-muted-foreground uppercase"
 							>
 								Notifications
-							</h4>
+							</h2>
 							<div class="space-y-3 text-sm">
 								{#if rule.has_webhook_url}
 									<div class="flex items-start gap-2">
@@ -383,25 +404,13 @@
 						</div>
 					</div>
 				</div>
-			</Tabs.Content>
+			{/if}
 
 			<!-- ── Settings tab ── -->
-			<Tabs.Content value="settings">
+			{#if tab === 'settings' && can('settings:write')}
 				<div class="space-y-6 pt-4">
-					{#if settingsError}
-						<div
-							class="rounded-md border border-destructive/50 bg-destructive/10 p-4 text-sm text-destructive"
-						>
-							{settingsError}
-						</div>
-					{/if}
-					{#if settingsSuccess}
-						<div
-							class="rounded-md border border-green-500/50 bg-green-500/10 p-4 text-sm text-green-600 dark:text-green-400"
-						>
-							Settings saved.
-						</div>
-					{/if}
+					<InlineError message={settingsError} />
+					<SuccessAlert message={settingsSuccess} ondismiss={() => (settingsSuccess = '')} />
 
 					<div class="grid max-w-xl gap-5">
 						<!-- Name -->
@@ -522,25 +531,18 @@
 
 						<!-- Notification channels -->
 						<div class="grid gap-2">
-							<Label>Notification Channels</Label>
+							<p class="text-sm font-medium">Notification channels</p>
 							<IntegrationSelector {ruleId} />
 						</div>
 					</div>
 
-					<Button
-						onclick={handleSaveSettings}
-						disabled={settingsSaving}
-						variant="outline"
-						class="border-success text-success"
-					>
-						{settingsSaving ? 'Saving...' : 'Save Settings'}
+					<Button onclick={handleSaveSettings} disabled={settingsSaving} aria-busy={settingsSaving}>
+						{settingsSaving ? 'Saving…' : 'Save settings'}
 					</Button>
 
 					<!-- Danger Zone -->
 					<div class="space-y-3 rounded border border-destructive/30 p-4">
-						<h4 class="font-mono text-xs font-medium tracking-wider text-destructive uppercase">
-							Danger Zone
-						</h4>
+						<h2 class="text-sm font-semibold text-destructive">Danger zone</h2>
 						<p class="text-sm text-muted-foreground">
 							Permanently delete this alert rule. This cannot be undone.
 						</p>
@@ -550,19 +552,20 @@
 							class="border-destructive/50 text-destructive hover:border-destructive hover:text-destructive"
 							onclick={() => (showDeleteDialog = true)}
 						>
-							Delete Rule
+							Delete rule…
 						</Button>
 					</div>
 				</div>
-			</Tabs.Content>
-		</Tabs.Root>
+			{/if}
+		</div>
 	</div>
 
-	<ConfirmDeleteDialog
+	<ConfirmDialog
 		bind:open={showDeleteDialog}
-		title="Delete Alert Rule"
-		description="This will permanently delete the alert rule and cannot be undone."
-		confirmation={rule.name}
+		title={`Delete ${rule.name}?`}
+		description="You won't be notified about these conditions any more. Your notification channels are kept."
+		confirmLabel="Delete rule"
+		pendingLabel="Deleting…"
 		onconfirm={handleDelete}
 	/>
 {/if}

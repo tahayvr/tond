@@ -56,7 +56,7 @@
 
 <section class="grid gap-3" aria-labelledby="port-heading">
 	<div>
-		<h3 id="port-heading" class="text-sm font-medium">Port</h3>
+		<h2 id="port-heading" class="text-sm font-medium">Port</h2>
 		<p class="mt-1 text-sm text-muted-foreground">
 			The port your app listens on inside its container. Tond sets <code>$PORT</code> to it and sends
 			traffic there. nginx and most static servers use 80; many Node apps use 3000.

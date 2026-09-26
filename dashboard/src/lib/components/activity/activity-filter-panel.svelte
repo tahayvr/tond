@@ -61,7 +61,7 @@
 		<Label for="activity-q" class="text-xs text-muted-foreground">Search</Label>
 		<div class="relative">
 			<SearchIcon
-				class="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground/60"
+				class="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground"
 			/>
 			<Input
 				id="activity-q"

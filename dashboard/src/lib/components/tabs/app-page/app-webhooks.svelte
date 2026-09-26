@@ -1,4 +1,5 @@
 <script lang="ts">
+	import SuccessAlert from '$lib/components/feedback/success-alert.svelte';
 	import {
 		getWebhookConfig,
 		revealWebhookSecret,
@@ -157,9 +158,7 @@
 			<button type="button" class="text-xs underline" onclick={() => (error = '')}>Dismiss</button>
 		</div>
 	{/if}
-	{#if success}
-		<p class="text-sm text-success">{success}</p>
-	{/if}
+	<SuccessAlert message={success} />
 
 	{#if loading}
 		<p class="text-xs text-muted-foreground">Loading webhook settings…</p>

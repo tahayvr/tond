@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { can } from '$lib/auth.svelte';
 	import {
 		createSnapshot,
 		deleteSnapshot,
@@ -14,14 +15,18 @@
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
 	import Badge from '$lib/components/ui/badge/badge.svelte';
-	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
+	import SuccessAlert from '$lib/components/feedback/success-alert.svelte';
+	import StatusBadge from '$lib/components/feedback/status-badge.svelte';
+	import PageHeader from '$lib/components/nav/page-header.svelte';
+	import { confirmAction } from '$lib/confirm.svelte';
+	import { useAction } from '$lib/action.svelte';
+	import { invalidateAll } from '$app/navigation';
 	import { setUiContext, clearUiContext, snapshotsContext } from '$lib/ui-context.svelte';
 	import Trash2 from '~icons/ri/delete-bin-line';
 	import RefreshCw from '~icons/ri/refresh-line';
-	import Download from '~icons/ri/download-line';
 	import Settings2 from '~icons/ri/equalizer-line';
 	import Plus from '~icons/ri/add-line';
-	import ChevronDown from '~icons/ri/arrow-down-s-line';
 	import KeyIcon from '~icons/ri/key-2-line';
 	import CloudIcon from '~icons/ri/cloud-line';
 	import type { PageProps } from './$types';
@@ -35,18 +40,7 @@
 
 	let snapshots = $derived((data as SnapshotsPageData).snapshots);
 	let error = $state('');
-	let creating = $state(false);
-	let createError = $state('');
 	let successMessage = $state('');
-
-	// Restore / rollback
-	let confirmRestoreId = $state<string | null>(null);
-	let confirmRollbackId = $state<string | null>(null);
-	let rollbackAppName = $state('');
-	let restoringId = $state<string | null>(null);
-
-	// Delete
-	let deletingId = $state<string | null>(null);
 
 	// Config panel
 	let showConfig = $state(false);
@@ -73,70 +67,75 @@
 
 	// ── Create snapshot ───────────────────────────────────────────────────────
 
-	async function handleCreate() {
-		creating = true;
-		createError = '';
-		successMessage = '';
-		try {
-			const snap = await createSnapshot();
-			snapshots = [snap, ...snapshots];
-			successMessage = `Snapshot created: ${snap.name}`;
-		} catch (e: any) {
-			createError = e.message ?? 'Failed to create snapshot';
-		} finally {
-			creating = false;
+	const create = useAction(() => createSnapshot(), {
+		invalidate: true,
+		success: (snap) => `Snapshot created: ${snap.name}`,
+		onSuccess: (snap) => {
+			if (!snapshots.some((s) => s.id === snap.id)) snapshots = [snap, ...snapshots];
 		}
-	}
+	});
 
 	// ── Delete ────────────────────────────────────────────────────────────────
 
-	async function handleDelete(id: string) {
-		deletingId = id;
-		error = '';
-		try {
-			await deleteSnapshot(id);
-			snapshots = snapshots.filter((s) => s.id !== id);
-		} catch (e: any) {
-			error = e.message ?? 'Failed to delete snapshot';
-		} finally {
-			deletingId = null;
-		}
+	function handleDelete(snap: Snapshot) {
+		successMessage = '';
+		confirmAction({
+			title: 'Delete this snapshot?',
+			description: `${triggerLabel(snap)} from ${new Date(snap.created_at).toLocaleString()}. The local copy and any remote copy are removed. You can't restore from it afterwards.`,
+			confirmLabel: 'Delete snapshot',
+			pendingLabel: 'Deleting…',
+			onconfirm: async () => {
+				await deleteSnapshot(snap.id);
+				snapshots = snapshots.filter((s) => s.id !== snap.id);
+				await invalidateAll();
+			}
+		});
 	}
 
 	// ── Full restore ──────────────────────────────────────────────────────────
 
-	async function handleRestore(id: string) {
-		restoringId = id;
-		confirmRestoreId = null;
-		error = '';
+	function handleRestore(snap: Snapshot) {
 		successMessage = '';
-		try {
-			const result = await restoreSnapshot(id);
-			successMessage = result.message;
-		} catch (e: any) {
-			error = e.message ?? 'Restore failed';
-		} finally {
-			restoringId = null;
-		}
+		confirmAction({
+			title: 'Restore the whole server from this snapshot?',
+			description: `Snapshot from ${new Date(snap.created_at).toLocaleString()}. Tond takes a pre-restore snapshot first, so you can undo this.`,
+			details: [
+				'Every app and database container is stopped.',
+				"Tond's own database is replaced: apps, settings, users and sessions go back to this point. Everyone is signed out.",
+				'All app volumes and database data are overwritten with the snapshot copy. Changes made since then are lost.',
+				'Tond restarts when the restore finishes; the dashboard is unavailable for a minute.'
+			],
+			confirmLabel: 'Restore server',
+			pendingLabel: 'Starting restore…',
+			typedConfirmation: 'restore',
+			onconfirm: async () => {
+				const result = await restoreSnapshot(snap.id);
+				successMessage = result.message;
+			}
+		});
 	}
 
 	// ── App rollback ──────────────────────────────────────────────────────────
 
-	async function handleRollback(snapshotId: string) {
-		if (!rollbackAppName.trim()) return;
-		restoringId = snapshotId;
-		confirmRollbackId = null;
-		error = '';
+	function handleRollback(snap: Snapshot) {
+		const appName = snap.trigger_app ?? '';
 		successMessage = '';
-		try {
-			const result = await rollbackAppToSnapshot(snapshotId, rollbackAppName.trim());
-			successMessage = result.message;
-		} catch (e: any) {
-			error = e.message ?? 'Rollback failed';
-		} finally {
-			restoringId = null;
-			rollbackAppName = '';
-		}
+		confirmAction({
+			title: `Roll back ${appName}'s data to this snapshot?`,
+			description: `Snapshot taken before a deploy on ${new Date(snap.created_at).toLocaleString()}.`,
+			details: [
+				`${appName} is stopped while its volumes are replaced.`,
+				`Everything written to ${appName}'s volumes since this snapshot is lost.`,
+				'The app starts again afterwards. Its code and settings are not changed.'
+			],
+			confirmLabel: 'Roll back data',
+			pendingLabel: 'Rolling back…',
+			typedConfirmation: appName,
+			onconfirm: async () => {
+				const result = await rollbackAppToSnapshot(snap.id, appName);
+				successMessage = result.message;
+			}
+		});
 	}
 
 	// ── Config panel ──────────────────────────────────────────────────────────
@@ -258,43 +257,44 @@
 </script>
 
 <div class="space-y-6">
-	<!-- Header -->
-	<div class="flex h-14 items-center justify-between">
-		<h2 class="text-3xl font-extrabold uppercase">Snapshots</h2>
-		<div class="flex items-center gap-2">
-			<Button variant="outline" size="sm" class="h-8 text-xs uppercase" onclick={openConfig}>
-				<Settings2 class="h-3.5 w-3.5" />
-				Config
-			</Button>
-			<Button size="sm" class="h-8 text-xs uppercase" disabled={creating} onclick={handleCreate}>
-				<Plus class="h-3.5 w-3.5" />
-				{creating ? 'Creating…' : 'Create Snapshot'}
-			</Button>
-		</div>
-	</div>
+	<PageHeader
+		title="Snapshots"
+		description="Point-in-time copies of Tond's database, app volumes and database data."
+	>
+		{#snippet actions()}
+			{#if can('snapshots:create')}
+				<Button variant="outline" size="sm" onclick={openConfig}>
+					<Settings2 class="h-3.5 w-3.5" />
+					Backup settings
+				</Button>
+				<Button
+					size="sm"
+					disabled={create.pending}
+					aria-busy={create.pending}
+					onclick={() => create.run()}
+				>
+					<Plus class="h-3.5 w-3.5" />
+					{create.pending ? 'Creating…' : 'Create snapshot'}
+				</Button>
+			{/if}
+		{/snippet}
+	</PageHeader>
 
-	<!-- Feedback banners -->
-	{#if error}
-		<ErrorAlert title="Snapshot Error" description={error} />
-	{/if}
-
-	{#if createError}
-		<div class="rounded border border-destructive bg-destructive/10 p-3 text-xs text-destructive">
-			{createError}
-		</div>
-	{/if}
-
-	{#if successMessage}
-		<div class="rounded border border-green-500 bg-green-500/10 p-3 text-xs text-green-600">
-			{successMessage}
-		</div>
-	{/if}
+	<InlineError message={error} ondismiss={() => (error = '')} />
+	<InlineError title="Snapshot not created" message={create.error} ondismiss={create.clear} />
+	<SuccessAlert
+		message={successMessage || create.success}
+		ondismiss={() => {
+			successMessage = '';
+			create.clear();
+		}}
+	/>
 
 	<!-- Config panel (inline sheet) -->
 	{#if showConfig}
 		<div class="space-y-4 border bg-muted/30 p-5">
 			<div class="flex items-center justify-between">
-				<p class="text-xs font-semibold uppercase">Backup Configuration</p>
+				<h2 class="text-sm font-semibold">Backup settings</h2>
 				<Button variant="ghost" size="sm" class="h-7 text-xs" onclick={() => (showConfig = false)}>
 					Close
 				</Button>
@@ -303,9 +303,7 @@
 			{#if configLoading}
 				<p class="text-xs text-muted-foreground">Loading…</p>
 			{:else}
-				{#if configError}
-					<p class="text-xs text-destructive">{configError}</p>
-				{/if}
+				<InlineError message={configError} />
 				<div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
 					<div class="flex items-center gap-2">
 						<input type="checkbox" id="cfg-enabled" bind:checked={cfgEnabled} />
@@ -372,7 +370,7 @@
 						disabled={configSaving}
 						onclick={handleSaveConfig}
 					>
-						{configSaving ? 'Saving…' : 'Save Config'}
+						{configSaving ? 'Saving…' : 'Save settings'}
 					</Button>
 					<Button
 						variant="outline"
@@ -428,12 +426,12 @@
 									>
 								{:else if isPreDeploy(snap)}
 									<span
-										class="absolute top-3 -left-1.75 flex h-3.5 w-3.5 rotate-45 items-center justify-center bg-amber-500"
+										class="absolute top-3 -left-1.75 flex h-3.5 w-3.5 rotate-45 items-center justify-center bg-warn"
 										title="Pre-deploy"
 									></span>
 								{:else}
 									<span
-										class="absolute top-3 -left-1.75 h-3.5 w-3.5 rounded-full bg-blue-500"
+										class="absolute top-3 -left-1.75 h-3.5 w-3.5 rounded-full bg-info"
 										title="Full snapshot"
 									></span>
 								{/if}
@@ -450,8 +448,8 @@
 														+{formatBytes(snap.delta_bytes)}
 													</Badge>
 												{/if}
-												{#if snap.status === 'failed'}
-													<Badge variant="destructive" class="h-4 px-1 text-[10px]">Failed</Badge>
+												{#if snap.status !== 'completed'}
+													<StatusBadge status={snap.status} kind="snapshot" size="sm" />
 												{/if}
 											</div>
 											{#if remoteLabel(snap)}
@@ -477,105 +475,43 @@
 										</div>
 
 										<div class="ml-4 flex shrink-0 items-center gap-1">
-											<!-- Download -->
-											<Button
-												variant="ghost"
-												size="icon"
-												class="h-7 w-7"
-												aria-label="Download"
-												onclick={() => window.open(`/api/snapshots/${snap.id}/download`)}
-											>
-												<Download class="h-3.5 w-3.5" />
-											</Button>
-
 											<!-- Rollback (pre-deploy) or Restore (full) -->
-											{#if isPreDeploy(snap) && snap.trigger_app}
-												{#if confirmRollbackId === snap.id}
-													<div class="flex items-center gap-1">
-														<Input
-															class="h-7 w-32 text-xs"
-															bind:value={rollbackAppName}
-															placeholder={snap.trigger_app}
-														/>
-														<Button
-															size="sm"
-															class="h-7 text-xs uppercase"
-															disabled={restoringId === snap.id}
-															onclick={() => handleRollback(snap.id)}
-														>
-															{restoringId === snap.id ? '…' : 'Confirm'}
-														</Button>
-														<Button
-															variant="outline"
-															size="sm"
-															class="h-7 text-xs uppercase"
-															onclick={() => (confirmRollbackId = null)}
-														>
-															Cancel
-														</Button>
-													</div>
-												{:else}
-													<Button
-														variant="outline"
-														size="sm"
-														class="h-7 text-xs uppercase"
-														onclick={() => {
-															confirmRollbackId = snap.id;
-															rollbackAppName = snap.trigger_app ?? '';
-														}}
-													>
-														<RefreshCw class="h-3 w-3" />
-														Rollback
-													</Button>
-												{/if}
+											{#if !can('snapshots:restore')}
+												<!-- restore, roll back and delete need snapshots:restore -->
+											{:else if isPreDeploy(snap) && snap.trigger_app}
+												<Button
+													variant="outline"
+													size="sm"
+													class="h-7 text-xs"
+													onclick={() => handleRollback(snap)}
+												>
+													<RefreshCw class="h-3 w-3" />
+													Roll back data
+												</Button>
 											{:else if isFullScope(snap) && snap.status === 'completed'}
-												{#if confirmRestoreId === snap.id}
-													<div class="flex items-center gap-1">
-														<span class="text-[10px] text-destructive"
-															>Full restore — are you sure?</span
-														>
-														<Button
-															size="sm"
-															class="h-7 text-xs uppercase"
-															disabled={restoringId === snap.id}
-															onclick={() => handleRestore(snap.id)}
-														>
-															{restoringId === snap.id ? 'Restoring…' : 'Yes, restore'}
-														</Button>
-														<Button
-															variant="outline"
-															size="sm"
-															class="h-7 text-xs uppercase"
-															onclick={() => (confirmRestoreId = null)}
-														>
-															Cancel
-														</Button>
-													</div>
-												{:else}
-													<Button
-														variant="outline"
-														size="sm"
-														class="h-7 text-xs uppercase"
-														onclick={() => (confirmRestoreId = snap.id)}
-													>
-														<RefreshCw class="h-3 w-3" />
-														Restore
-														<ChevronDown class="h-3 w-3" />
-													</Button>
-												{/if}
+												<Button
+													variant="outline"
+													size="sm"
+													class="h-7 text-xs"
+													onclick={() => handleRestore(snap)}
+												>
+													<RefreshCw class="h-3 w-3" />
+													Restore…
+												</Button>
 											{/if}
 
 											<!-- Delete -->
-											<Button
-												variant="ghost"
-												size="icon"
-												class="h-7 w-7 text-destructive hover:text-destructive"
-												aria-label={`Delete snapshot ${snap.name}`}
-												disabled={deletingId === snap.id}
-												onclick={() => handleDelete(snap.id)}
-											>
-												<Trash2 class="h-3.5 w-3.5" />
-											</Button>
+											{#if can('snapshots:restore')}
+												<Button
+													variant="ghost"
+													size="icon"
+													class="h-7 w-7 text-destructive hover:text-destructive"
+													aria-label={`Delete snapshot ${snap.name}`}
+													onclick={() => handleDelete(snap)}
+												>
+													<Trash2 class="h-3.5 w-3.5" />
+												</Button>
+											{/if}
 										</div>
 									</div>
 								</div>

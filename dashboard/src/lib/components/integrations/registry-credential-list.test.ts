@@ -1,6 +1,7 @@
 import { render, screen } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { confirmDialog, renderConfirmHost } from '../../../test/confirm';
 import RegistryCredentialList from './registry-credential-list.svelte';
 
 const api = vi.hoisted(() => ({
@@ -95,7 +96,9 @@ describe('RegistryCredentialList', () => {
 			}
 		});
 
+		renderConfirmHost();
 		await user.click(screen.getByRole('button', { name: /delete ghcr/i }));
+		await confirmDialog(user);
 
 		expect(api.deleteRegistryCredential).toHaveBeenCalledWith('cred_1');
 		expect(screen.queryByText(/^GHCR$/)).not.toBeInTheDocument();

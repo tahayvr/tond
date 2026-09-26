@@ -1,4 +1,5 @@
 <script lang="ts">
+	import PageTitle from '$lib/components/nav/page-title.svelte';
 	import ChevronLeft from '~icons/ri/arrow-left-s-line';
 	import Mail from '~icons/ri/mail-line';
 	import { Input } from '$lib/components/ui/input/index.js';
@@ -93,14 +94,20 @@
 	});
 </script>
 
+<PageTitle title="Email · Integrations" />
+
 <div class="space-y-8">
 	<div class="flex h-14 items-center gap-4">
-		<a href="/integrations" class="text-muted-foreground hover:text-foreground">
+		<a
+			href="/integrations"
+			class="text-muted-foreground hover:text-foreground"
+			aria-label="Back to integrations"
+		>
 			<ChevronLeft class="h-5 w-5" />
 		</a>
 		<div class="flex items-center gap-3">
 			<Mail class="h-6 w-6" />
-			<h2 class="text-3xl font-extrabold uppercase">Email (SMTP)</h2>
+			<h1 class="text-2xl font-extrabold sm:text-3xl">Email (SMTP)</h1>
 		</div>
 	</div>
 

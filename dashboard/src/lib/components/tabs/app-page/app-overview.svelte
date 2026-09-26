@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { safeUrl } from '$lib/utils';
-	import { Badge } from '$lib/components/ui/badge/index.js';
+	import StatusBadge from '$lib/components/feedback/status-badge.svelte';
 	import type { App } from '$lib/api';
 
 	interface Props {
@@ -24,14 +24,6 @@
 		dockerfile: 'Dockerfile'
 	};
 
-	const STATUS_VARIANT: Record<string, 'default' | 'secondary' | 'destructive' | 'outline'> = {
-		running: 'default',
-		building: 'secondary',
-		stopped: 'outline',
-		failed: 'destructive',
-		pending: 'secondary'
-	};
-
 	let isGit = $derived(
 		app.source_type === 'git' ||
 			app.source_type === 'git-public' ||
@@ -53,29 +45,26 @@
 </script>
 
 <div class="space-y-4 pt-4">
-	<div class="grid gap-4 sm:grid-cols-2">
+	<div class="grid grid-cols-1 gap-4 sm:grid-cols-2 [&>*]:min-w-0">
 		<!-- Status -->
-		<div class="space-y-3 rounded border border-dotted p-4">
-			<h4 class="font-mono text-xs font-medium tracking-wider text-muted-foreground uppercase">
+		<div class="min-w-0 space-y-3 rounded border border-dotted p-4">
+			<h2 class="font-mono text-xs font-medium tracking-wider text-muted-foreground uppercase">
 				Status
-			</h4>
+			</h2>
 			<div class="space-y-1 text-sm">
 				<div class="flex items-center gap-2">
 					<span class="text-muted-foreground">State:</span>
-					<Badge variant={STATUS_VARIANT[app.status] ?? 'outline'} class="text-xs capitalize">
-						{app.status}
-					</Badge>
+					<StatusBadge status={app.status} kind="app" />
 					{#if app.health_consecutive_failures > 0}
-						<Badge variant="destructive" class="text-xs">
-							{app.health_consecutive_failures} health fail{app.health_consecutive_failures !== 1
-								? 's'
-								: ''}
-						</Badge>
+						<StatusBadge
+							status="failed"
+							label={`${app.health_consecutive_failures} failed health check${app.health_consecutive_failures !== 1 ? 's' : ''}`}
+						/>
 					{/if}
 				</div>
 				<div>
 					<span class="text-muted-foreground">App ID:</span>
-					<span class="font-mono text-xs">{app.id}</span>
+					<span class="font-mono text-xs break-all">{app.id}</span>
 				</div>
 				<div>
 					<span class="text-muted-foreground">Created:</span>
@@ -89,10 +78,10 @@
 		</div>
 
 		<!-- Source -->
-		<div class="space-y-3 rounded border border-dotted p-4">
-			<h4 class="font-mono text-xs font-medium tracking-wider text-muted-foreground uppercase">
+		<div class="min-w-0 space-y-3 rounded border border-dotted p-4">
+			<h2 class="font-mono text-xs font-medium tracking-wider text-muted-foreground uppercase">
 				Source
-			</h4>
+			</h2>
 			<div class="space-y-1 text-sm">
 				<div>
 					<span class="text-muted-foreground">Type:</span>
@@ -103,7 +92,7 @@
 						<span class="text-muted-foreground"
 							>{app.source_type === 'image' ? 'Image' : 'URL'}:</span
 						>
-						<span class="font-mono text-xs">{app.source_url}</span>
+						<span class="font-mono text-xs break-all">{app.source_url}</span>
 					</div>
 				{:else if app.source_type === 'dockerfile' && app.dockerfile_content}
 					<div class="text-muted-foreground">
@@ -121,7 +110,7 @@
 					{#if app.watch_branch}
 						<div>
 							<span class="text-muted-foreground">Watch Branch:</span>
-							<span class="font-mono text-xs">{app.watch_branch}</span>
+							<span class="font-mono text-xs break-all">{app.watch_branch}</span>
 						</div>
 					{/if}
 				{:else if isGit}
@@ -133,10 +122,10 @@
 		</div>
 
 		<!-- Build -->
-		<div class="space-y-3 rounded border border-dotted p-4">
-			<h4 class="font-mono text-xs font-medium tracking-wider text-muted-foreground uppercase">
+		<div class="min-w-0 space-y-3 rounded border border-dotted p-4">
+			<h2 class="font-mono text-xs font-medium tracking-wider text-muted-foreground uppercase">
 				Build
-			</h4>
+			</h2>
 			<div class="space-y-1 text-sm">
 				{#if isGit}
 					<div>
@@ -155,7 +144,7 @@
 				{#if app.base_dir}
 					<div>
 						<span class="text-muted-foreground">Base Directory:</span>
-						<span class="font-mono text-xs">{app.base_dir}</span>
+						<span class="font-mono text-xs break-all">{app.base_dir}</span>
 					</div>
 				{/if}
 				<div>
@@ -176,10 +165,10 @@
 		</div>
 
 		<!-- Network -->
-		<div class="space-y-3 rounded border border-dotted p-4">
-			<h4 class="font-mono text-xs font-medium tracking-wider text-muted-foreground uppercase">
+		<div class="min-w-0 space-y-3 rounded border border-dotted p-4">
+			<h2 class="font-mono text-xs font-medium tracking-wider text-muted-foreground uppercase">
 				Network
-			</h4>
+			</h2>
 			<div class="space-y-1 text-sm">
 				<div>
 					<span class="text-muted-foreground">Domain:</span>
@@ -198,7 +187,7 @@
 				<div>
 					<span class="text-muted-foreground">Health Path:</span>
 					{#if app.health_check_path}
-						<span class="font-mono text-xs">{app.health_check_path}</span>
+						<span class="font-mono text-xs break-all">{app.health_check_path}</span>
 					{:else}
 						Disabled
 					{/if}
@@ -222,10 +211,10 @@
 	</div>
 
 	<!-- Resources (full width) -->
-	<div class="space-y-3 rounded border border-dotted p-4">
-		<h4 class="font-mono text-xs font-medium tracking-wider text-muted-foreground uppercase">
+	<div class="min-w-0 space-y-3 rounded border border-dotted p-4">
+		<h2 class="font-mono text-xs font-medium tracking-wider text-muted-foreground uppercase">
 			Resources
-		</h4>
+		</h2>
 		<div class="grid gap-x-8 gap-y-1 text-sm sm:grid-cols-2">
 			<div>
 				<span class="text-muted-foreground">Memory:</span>
@@ -236,10 +225,10 @@
 				{cpuDisplay(app.cpu_limit)}
 			</div>
 			{#if app.volumes.length > 0}
-				<div class="pt-1 sm:col-span-2">
+				<div class="min-w-0 pt-1 sm:col-span-2">
 					<div class="text-muted-foreground">Volumes ({app.volumes.length}):</div>
 					{#each app.volumes as vol (vol.container_path)}
-						<div class="mt-0.5 truncate font-mono text-xs text-muted-foreground/80">
+						<div class="mt-0.5 font-mono text-xs break-all text-muted-foreground">
 							↳ {vol.host_path} → {vol.container_path}
 						</div>
 					{/each}

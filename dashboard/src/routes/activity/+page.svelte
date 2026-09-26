@@ -1,4 +1,6 @@
 <script lang="ts">
+	import PageHeader from '$lib/components/nav/page-header.svelte';
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { goto } from '$app/navigation';
 	import {
 		listAuditLog,
@@ -87,18 +89,17 @@
 </script>
 
 <div class="space-y-6">
-	<div class="flex flex-wrap items-center justify-between gap-3">
-		<div>
-			<h2 class="text-3xl font-extrabold uppercase">Activity</h2>
-			<p class="text-sm text-muted-foreground">
-				Every change and security event, with who did it. The log is append-only.
-			</p>
-		</div>
-		<Button variant="outline" size="sm" onclick={handleVerify} disabled={verifying}>
-			<ShieldCheck class="mr-1.5 size-4" />
-			{verifying ? 'Checking…' : 'Verify integrity'}
-		</Button>
-	</div>
+	<PageHeader
+		title="Activity"
+		description="Every change and security event, with who did it. The log is append-only."
+	>
+		{#snippet actions()}
+			<Button variant="outline" size="sm" onclick={handleVerify} disabled={verifying}>
+				<ShieldCheck class="mr-1.5 size-4" />
+				{verifying ? 'Checking…' : 'Verify integrity'}
+			</Button>
+		{/snippet}
+	</PageHeader>
 
 	{#if report}
 		{#if report.ok}
@@ -127,25 +128,17 @@
 			</div>
 		{/if}
 	{/if}
-	{#if verifyError}
-		<div class="rounded-md bg-destructive/10 p-3 text-sm text-destructive" role="alert">
-			{verifyError}
-		</div>
-	{/if}
+	<InlineError message={verifyError} />
 
 	<ActivityFilterPanel {filters} {knownActors} loading={applying} onApply={handleApply} />
 
-	{#if error}
-		<div class="rounded-md bg-destructive/10 p-3 text-sm text-destructive" role="alert">
-			{error}
-		</div>
-	{/if}
+	<InlineError message={error} />
 
 	{#if entries.length === 0}
 		<div
 			class="flex flex-col items-center justify-center rounded-lg border border-dashed border-border py-16 text-center"
 		>
-			<ActivityIcon class="mb-3 size-10 text-muted-foreground/40" />
+			<ActivityIcon class="mb-3 size-10 text-muted-foreground" />
 			<p class="font-medium">No matching events</p>
 			<p class="mt-1 text-sm text-muted-foreground">
 				Try a different filter. Deploys, sign-ins and changes show up here as they happen.

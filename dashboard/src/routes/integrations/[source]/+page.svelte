@@ -1,4 +1,5 @@
 <script lang="ts">
+	import PageTitle from '$lib/components/nav/page-title.svelte';
 	import { page } from '$app/state';
 	import Github from '~icons/ri/github-fill';
 	import Package from '~icons/ri/archive-2-line';
@@ -86,12 +87,17 @@
 <div class="space-y-8">
 	<!-- Header with back link -->
 	<div class="flex h-14 items-center gap-4">
-		<a href="/integrations" class="text-muted-foreground hover:text-foreground">
+		<a
+			href="/integrations"
+			class="text-muted-foreground hover:text-foreground"
+			aria-label="Back to integrations"
+		>
 			<ChevronLeft class="h-5 w-5" />
 		</a>
 		<div class="flex items-center gap-3">
 			<meta.icon class="h-6 w-6" />
-			<h2 class="text-3xl font-extrabold uppercase">{meta.title}</h2>
+			<h1 class="text-2xl font-extrabold sm:text-3xl">{meta.title}</h1>
+			<PageTitle title={`${meta.title} · Integrations`} />
 		</div>
 	</div>
 

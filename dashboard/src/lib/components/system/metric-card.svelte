@@ -16,22 +16,22 @@
 <div class="rounded-lg border border-border bg-card p-4">
 	<div class="mb-2 flex items-center gap-2">
 		{#if Icon}
-			<Icon class="h-4 w-4 text-muted-foreground/70" />
+			<Icon class="h-4 w-4 text-muted-foreground" />
 		{/if}
-		<span class="font-mono text-[10px] tracking-wider text-muted-foreground/70 uppercase">
+		<span class="font-mono text-[10px] tracking-wider text-muted-foreground uppercase">
 			{label}
 		</span>
 	</div>
 	<div class="font-mono text-3xl text-foreground tabular-nums">
 		{value}
 	</div>
-	<p class="mt-1 font-mono text-[10px] text-muted-foreground/60">{detail}</p>
+	<p class="mt-1 font-mono text-[10px] text-muted-foreground">{detail}</p>
 	{#if healthy !== undefined}
 		<div class="mt-1 flex items-center gap-2">
 			<span
 				class="inline-block size-2 rounded-full {healthy ? 'bg-success' : 'bg-muted-foreground/40'}"
 			></span>
-			<span class="font-mono text-[10px] text-muted-foreground/60">{healthyDetail}</span>
+			<span class="font-mono text-[10px] text-muted-foreground">{healthyDetail}</span>
 		</div>
 	{/if}
 </div>
