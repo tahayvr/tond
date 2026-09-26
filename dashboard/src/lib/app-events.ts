@@ -7,7 +7,7 @@ export type EventCategory = 'deploys' | 'runtime' | 'changes';
 export const EVENT_CATEGORIES: { id: EventCategory | 'all'; label: string }[] = [
 	{ id: 'all', label: 'All' },
 	{ id: 'deploys', label: 'Deploys' },
-	{ id: 'runtime', label: 'Restarts & crashes' },
+	{ id: 'runtime', label: 'Health' },
 	{ id: 'changes', label: 'Changes' }
 ];
 
@@ -23,6 +23,8 @@ export function eventCategory(kind: AppEventKind): EventCategory {
 		case 'oom':
 		case 'cert_issued':
 		case 'cert_failed':
+		case 'alert_fired':
+		case 'alert_resolved':
 			return 'runtime';
 		default:
 			return 'changes';

@@ -71,7 +71,7 @@ describe('AppEventsList', () => {
 		expect(await screen.findByText('Killed: out of memory')).toBeTruthy();
 		expect(api.getAppEvents).toHaveBeenLastCalledWith('a1', { limit: 50, before: deploy.at });
 
-		await userEvent.click(screen.getByRole('button', { name: 'Restarts & crashes' }));
+		await userEvent.click(screen.getByRole('button', { name: 'Health' }));
 		expect(screen.queryByText('Deploy succeeded in 42 s')).toBeNull();
 		expect(screen.getByText('Killed: out of memory')).toBeTruthy();
 	});

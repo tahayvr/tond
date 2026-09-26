@@ -20,8 +20,8 @@
 //              Retention is the janitor's job (store::prune).
 //   Events     Restarts (a container that exited on its own and was started
 //              again), crashes (exited on its own and stayed down) and OOM
-//              kills are recorded in metric_events and fire the
-//              container_restart / container_oom alert events. Exits that
+//              kills are recorded in metric_events and wake the alert
+//              engine (OOM and crash-loop rules read them). Exits that
 //              follow a `kill`/`stop` request (deploys, stop, restart buttons)
 //              are not crashes. Counter resets and memory.events oom_kill
 //              deltas catch what the event stream missed.
@@ -54,8 +54,6 @@ const FIRST_TICK: Duration = Duration::from_secs(5);
 const REQUESTED_WINDOW_SECS: i64 = 60;
 /// An unrequested exit not followed by a start within this long is a crash.
 const CRASH_AFTER_SECS: i64 = 60;
-/// Minimum gap between two alerts of the same kind for one target.
-const ALERT_COOLDOWN_SECS: i64 = 600;
 const EVENT_RETRY_MIN: Duration = Duration::from_secs(5);
 const EVENT_RETRY_MAX: Duration = Duration::from_secs(300);
 /// Label Tond puts on cron containers (value: the cron job id).
@@ -273,7 +271,6 @@ pub struct Collector {
     mem_limits: HashMap<i64, i64>,
     next_5m: Option<i64>,
     next_1h: Option<i64>,
-    last_alert: HashMap<(Owner, &'static str), i64>,
     /// Changes to the owner tables (runtime::changes): the resolver is
     /// reloaded only when one moved, not on every tick.
     owner_changes: Vec<tokio::sync::watch::Receiver<u64>>,
@@ -294,7 +291,6 @@ impl Collector {
             mem_limits: HashMap::new(),
             next_5m: None,
             next_1h: None,
-            last_alert: HashMap::new(),
             owner_changes: [
                 changes::Table::Apps,
                 changes::Table::Databases,
@@ -594,7 +590,7 @@ impl Collector {
         Ok(id)
     }
 
-    /// Persist a happening and fire its alert (rate-limited per target).
+    /// Persist a happening and let the alert engine look at it.
     async fn record(&mut self, state: &AppState, h: Happening) {
         let target = match self.target_id(&state.db, &h.owner).await {
             Ok(t) => t,
@@ -608,28 +604,9 @@ impl Collector {
         {
             tracing::warn!("metrics: cannot record {:?}: {}", h.kind, e);
         }
-        let slug = match h.kind {
-            EventKind::Oom => "container_oom",
-            EventKind::Restart | EventKind::Crash => "container_restart",
-        };
-        let key = (h.owner.clone(), slug);
-        if self
-            .last_alert
-            .get(&key)
-            .is_some_and(|t| h.ts - t < ALERT_COOLDOWN_SECS)
-        {
-            return;
-        }
-        self.last_alert.insert(key, h.ts);
         let name = self.resolver.name(&h.owner);
-        let detail = describe(&h);
-        tracing::info!("{} {} {}", h.owner.kind.as_str(), name, detail);
-        let state = state.clone();
-        let owner_id = h.owner.id.clone();
-        tokio::spawn(async move {
-            alerts::fire_event_alerts(&state, slug, Some(&owner_id), Some(&name), Some(&detail))
-                .await;
-        });
+        tracing::info!("{} {} {}", h.owner.kind.as_str(), name, describe(&h));
+        alerts::kick();
     }
 
     /// One sampling pass: host gauges, container samples, rollups.
@@ -721,6 +698,9 @@ impl Collector {
         if let Err(e) = self.roll_up(&state.db, now).await {
             tracing::warn!("metrics: rollup failed: {}", e);
         }
+
+        // Alert rules are evaluated on this tick (no loop of their own).
+        alerts::on_metrics_tick(state, now).await;
     }
 
     async fn roll_up(&mut self, db: &SqlitePool, now: i64) -> sqlx::Result<()> {

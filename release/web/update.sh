@@ -42,7 +42,7 @@ hash_file() {
 # signing (TOND_UNSIGNED_RELEASES) or TOND_ALLOW_UNSIGNED=1 is set. The check
 # needs only openssl (Ed25519 over the file's BLAKE2b-512 hash, which is what
 # minisign's default "ED" signatures are).
-TOND_RELEASE_PUBKEY=""
+TOND_RELEASE_PUBKEY="RWRyw6SNQq+I90HcxHS9ho+7FUE9drT12DfUN0W1vyS7nU3W6PZ0XeXL"
 TOND_UNSIGNED_RELEASES="v0.1.0"
 
 # verify_minisig FILE SIGFILE PUBKEY_B64 — succeeds when SIGFILE is a valid

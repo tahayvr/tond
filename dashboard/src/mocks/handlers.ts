@@ -60,8 +60,12 @@ import {
 } from './fixtures';
 import type {
 	UpdateAuditShipping,
+	ActiveAlert,
+	AlertEpisode,
 	AlertRule,
-	AlertIntegrationLink,
+	AlertRuleInput,
+	AlertRuleUpdate,
+	AlertSettings,
 	App,
 	BackupConfig,
 	CronJob,
@@ -88,7 +92,14 @@ import type {
 	EnvVarEntry,
 	DatabaseCredentials
 } from '$lib/api';
-import { MOCK_ALERT_RULES } from './fixtures';
+import {
+	MOCK_ACTIVE_ALERTS,
+	MOCK_ALERT_DELIVERIES,
+	MOCK_ALERT_HISTORY,
+	MOCK_ALERT_KINDS,
+	MOCK_ALERT_RULES,
+	MOCK_ALERT_SETTINGS
+} from './fixtures';
 
 // Simulated network latency (ms). Set to 0 for instant responses.
 const LATENCY = 200;
@@ -411,6 +422,9 @@ let apps: App[] = structuredClone(MOCK_APPS);
 let projects: Project[] = structuredClone(MOCK_PROJECTS);
 const templates: TemplateCatalogEntry[] = structuredClone(MOCK_TEMPLATES);
 let alertRules: AlertRule[] = structuredClone(MOCK_ALERT_RULES);
+let activeAlerts: ActiveAlert[] = structuredClone(MOCK_ACTIVE_ALERTS);
+const alertHistory: AlertEpisode[] = structuredClone(MOCK_ALERT_HISTORY);
+let alertSettings: AlertSettings = structuredClone(MOCK_ALERT_SETTINGS);
 const deployments: Record<string, Deployment[]> = structuredClone(MOCK_DEPLOYMENTS);
 let previews: Record<string, PreviewDeployment[]> = structuredClone(MOCK_PREVIEWS);
 let projectPreviews: Record<string, ProjectPreview[]> = structuredClone(MOCK_PROJECT_PREVIEWS);
@@ -427,20 +441,21 @@ const webhookSecrets: Record<string, string> = {};
 // responses only ever carry masked values or `has_*` flags.
 const ENV_MASK = '••••••••';
 
-function urlHost(url: string): string | null {
-	try {
-		return new URL(url).host || null;
-	} catch {
-		return null;
-	}
-}
-
 /** Mirrors tond_common::mask_url_password. */
 function maskUrlPassword(url: string): string {
 	return url.replace(/(:\/\/[^:/@\s]+):[^/\s]+@/g, `$1:${ENV_MASK}@`);
 }
 
-const INTEGRATION_SECRET_FIELDS = ['bot_token', 'webhook_url', 'smtp_password'] as const;
+const INTEGRATION_SECRET_FIELDS = [
+	'bot_token',
+	'webhook_url',
+	'smtp_password',
+	'topic',
+	'token',
+	'user_key',
+	'app_token',
+	'signing_secret'
+] as const;
 const integrationSecrets: Record<string, Record<string, string>> = {};
 
 /** Split a submitted integration config into its plain part and saved secrets. */
@@ -454,6 +469,7 @@ function storeIntegrationConfig(
 		const value = plain[field];
 		delete plain[field];
 		if (typeof value === 'string' && value.trim()) saved[field] = value.trim();
+		else if (value === null) delete saved[field];
 	}
 	return {
 		config: plain as unknown as Integration['config'],
@@ -627,20 +643,6 @@ function applyEnvPatch(
 	for (const key of body.unset ?? []) delete next[key];
 	return next;
 }
-
-// alert_id → AlertIntegrationLink[]
-let alertIntegrationLinks: Record<string, AlertIntegrationLink[]> = {
-	alert_1: [
-		{
-			id: 'link_1',
-			rule_id: 'alert_1',
-			integration_id: 'int_telegram_1',
-			integration_name: 'Ops Telegram',
-			integration_kind: 'telegram',
-			created_at: '2025-03-06T00:00:00.000Z'
-		}
-	]
-};
 
 // ── Mock scenarios ──────────────────────────────────────────────────────────
 // Reproduce failure states in the browser. Set one in the devtools console,
@@ -2740,7 +2742,102 @@ export const handlers = [
 		return ok(MOCK_SETTINGS);
 	}),
 
-	// ── Alert Rules ───────────────────────────────────────────────────────────
+	// ── Alerts ────────────────────────────────────────────────────────────────
+
+	http.get('/api/alerts/kinds', async () => {
+		await delay(LATENCY);
+		return ok(MOCK_ALERT_KINDS);
+	}),
+
+	http.get('/api/alerts/active', async () => {
+		await delay(LATENCY);
+		return ok(activeAlerts.filter((a) => alertRules.find((r) => r.id === a.rule_id)?.enabled));
+	}),
+
+	http.get('/api/alerts/history', async ({ request }) => {
+		await delay(LATENCY);
+		const p = new URL(request.url).searchParams;
+		const perPage = Math.min(Math.max(Number(p.get('per_page') ?? 25) || 25, 1), 100);
+		const pageNo = Math.max(Number(p.get('page') ?? 1) || 1, 1);
+		const matching = alertHistory.filter(
+			(e) =>
+				(!p.get('rule_id') || e.rule_id === p.get('rule_id')) &&
+				(!p.get('app_id') || e.app_id === p.get('app_id')) &&
+				(!p.get('state') || e.state === p.get('state'))
+		);
+		return ok({
+			episodes: matching.slice((pageNo - 1) * perPage, pageNo * perPage),
+			total: matching.length
+		});
+	}),
+
+	http.get('/api/alerts/history/:id', async ({ params }) => {
+		await delay(LATENCY);
+		const ep = alertHistory.find((e) => e.id === params.id);
+		if (!ep) return err('Alert not found', 404);
+		const rule = alertRules.find((r) => r.id === ep.rule_id);
+		const deliveries =
+			MOCK_ALERT_DELIVERIES[ep.id] ??
+			(rule?.integration_ids ?? []).flatMap((id, i) => {
+				const channel = integrations.find((c) => c.id === id);
+				if (!channel) return [];
+				const events: ('firing' | 'resolved')[] = ep.resolved_at
+					? ['firing', 'resolved']
+					: ['firing'];
+				return events.map((event) => ({
+					id: `d_${ep.id}_${i}_${event}`,
+					episode_id: ep.id,
+					integration_id: id,
+					integration_name: channel.name,
+					integration_kind: channel.kind,
+					event,
+					status: 'sent' as const,
+					attempts: 1,
+					deferred: false,
+					last_error: null,
+					next_attempt_at: null,
+					sent_at: event === 'firing' ? ep.fired_at : ep.resolved_at,
+					created_at: event === 'firing' ? ep.fired_at : (ep.resolved_at ?? ep.fired_at)
+				}));
+			});
+		return ok({ episode: ep, deliveries });
+	}),
+
+	http.post('/api/alerts/history/:id/acknowledge', async ({ params }) => {
+		await delay(LATENCY);
+		const ep = alertHistory.find((e) => e.id === params.id && e.state === 'firing');
+		if (!ep) return err("That alert isn't firing any more.", 404);
+		const now = new Date().toISOString();
+		ep.acknowledged_at = now;
+		ep.acknowledged_by = 'admin@example.com';
+		for (const a of activeAlerts) {
+			if (a.episode_id === ep.id) {
+				a.acknowledged_at = now;
+				a.acknowledged_by = 'admin@example.com';
+			}
+		}
+		return ok({ acknowledged: ep.id });
+	}),
+
+	http.get('/api/alerts/settings', async () => {
+		await delay(LATENCY);
+		return ok(alertSettings);
+	}),
+
+	http.put('/api/alerts/settings', async ({ request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as AlertSettings;
+		const q = body.quiet_hours;
+		if (!/^\d{2}:\d{2}$/.test(q.start) || !/^\d{2}:\d{2}$/.test(q.end)) {
+			return err('Quiet hours need a start and end time like 22:00.', 400);
+		}
+		if (q.start === q.end) return err('Quiet hours need different start and end times.', 400);
+		if (!q.timezone.includes('/') && q.timezone !== 'UTC') {
+			return err(`Unknown time zone '${q.timezone}'. Use a name like Europe/Berlin.`, 400);
+		}
+		alertSettings = body;
+		return ok(alertSettings);
+	}),
 
 	http.get('/api/alerts', async () => {
 		await delay(LATENCY);
@@ -2756,77 +2853,44 @@ export const handlers = [
 
 	http.post('/api/alerts', async ({ request }) => {
 		await delay(LATENCY);
-		const body = (await request.json()) as Omit<
-			AlertRule,
-			| 'id'
-			| 'enabled'
-			| 'last_fired_at'
-			| 'created_at'
-			| 'updated_at'
-			| 'has_webhook_url'
-			| 'webhook_host'
-		> & { webhook_url?: string; integration_ids?: string[] };
-		const validMetrics = ['cpu', 'memory', 'app_down', 'disk_usage'];
-		const validEvents = [
-			'deployment_success',
-			'deployment_failure',
-			'cron_success',
-			'cron_failure'
-		];
-		if (body.metric && !validMetrics.includes(body.metric)) {
-			return err(`metric must be one of: ${validMetrics.join(', ')}`, 400);
-		}
-		if (body.events) {
-			for (const ev of body.events) {
-				if (!validEvents.includes(ev)) {
-					return err(`event must be one of: ${validEvents.join(', ')}`, 400);
-				}
-			}
-		}
-		if (!body.metric && (!body.events || body.events.length === 0)) {
-			return err('At least one metric or event is required', 400);
-		}
+		const body = (await request.json()) as AlertRuleInput;
+		const kind = MOCK_ALERT_KINDS.find((k) => k.kind === body.kind);
+		if (!kind) return err(`Unknown rule kind '${body.kind}'.`, 400);
+		if (!kind.available) return err(kind.unavailable_reason ?? 'Not available', 400);
+		if (!body.name?.trim()) return err('Give the rule a name.', 400);
 		const channelIds = [...new Set(body.integration_ids ?? [])];
-		if (!(body.webhook_url ?? '').trim() && channelIds.length === 0) {
-			return err(
-				'Choose at least one notification channel or add a webhook URL, so this rule notifies someone.',
-				400
-			);
+		if (channelIds.length === 0) {
+			return err('Choose at least one notification channel, so this rule notifies someone.', 400);
 		}
 		for (const id of channelIds) {
 			if (!integrations.some((i) => i.id === id)) {
-				return err(`Notification channel ${id} doesn't exist`, 400);
+				return err(`Notification channel ${id} doesn't exist.`, 400);
 			}
 		}
+		const appId = kind.scope === 'app' ? (body.app_id ?? null) : null;
+		const now = new Date().toISOString();
 		const newRule: AlertRule = {
 			id: `alert_${Date.now()}`,
-			app_id: body.app_id ?? null,
-			name: body.name,
-			metric: body.metric ?? null,
-			threshold: body.threshold ?? 0,
-			has_webhook_url: !!body.webhook_url?.trim(),
-			webhook_host: urlHost(body.webhook_url?.trim() ?? ''),
+			name: body.name.trim(),
+			kind: body.kind,
+			app_id: appId,
+			app_name: appId ? (apps.find((a) => a.id === appId)?.name ?? null) : null,
+			threshold: kind.default_threshold === null ? 0 : (body.threshold ?? kind.default_threshold),
+			window_secs:
+				kind.default_window_secs === null ? 0 : (body.window_secs ?? kind.default_window_secs),
+			for_secs: body.for_secs ?? kind.default_for_secs,
+			severity: body.severity ?? kind.default_severity,
+			repeat_secs: body.repeat_secs ?? 14_400,
 			enabled: true,
-			events: body.events ?? [],
+			snoozed_until: null,
+			integration_ids: channelIds.sort(),
+			firing: 0,
+			pending: 0,
 			last_fired_at: null,
-			created_at: new Date().toISOString(),
-			updated_at: new Date().toISOString()
+			created_at: now,
+			updated_at: now
 		};
 		alertRules = [...alertRules, newRule];
-		alertIntegrationLinks = {
-			...alertIntegrationLinks,
-			[newRule.id]: channelIds.map((id, i) => {
-				const integration = integrations.find((x) => x.id === id)!;
-				return {
-					id: `link_${Date.now()}_${i}`,
-					rule_id: newRule.id,
-					integration_id: id,
-					integration_name: integration.name,
-					integration_kind: integration.kind,
-					created_at: new Date().toISOString()
-				};
-			})
-		};
 		return HttpResponse.json({ success: true, data: newRule, error: null }, { status: 201 });
 	}),
 
@@ -2834,48 +2898,21 @@ export const handlers = [
 		await delay(LATENCY);
 		const idx = alertRules.findIndex((r) => r.id === params.id);
 		if (idx === -1) return err('Alert rule not found', 404);
-		const { webhook_url, ...body } = (await request.json()) as Partial<
-			Pick<AlertRule, 'name' | 'metric' | 'threshold' | 'enabled' | 'events'> & {
-				webhook_url: string;
-			}
-		>;
-		if (
-			webhook_url !== undefined &&
-			!webhook_url.trim() &&
-			(alertIntegrationLinks[params.id as string] ?? []).length === 0
-		) {
-			return err(
-				'Choose at least one notification channel or add a webhook URL, so this rule notifies someone.',
-				400
-			);
+		const body = (await request.json()) as AlertRuleUpdate;
+		if (body.integration_ids && body.integration_ids.length === 0) {
+			return err('Choose at least one notification channel, so this rule notifies someone.', 400);
 		}
-		if (webhook_url !== undefined) {
-			alertRules[idx] = {
-				...alertRules[idx],
-				has_webhook_url: !!webhook_url.trim(),
-				webhook_host: urlHost(webhook_url.trim())
-			};
+		const { snoozed_until, ...rest } = body;
+		alertRules[idx] = {
+			...alertRules[idx],
+			...rest,
+			...(snoozed_until !== undefined ? { snoozed_until: snoozed_until || null } : {}),
+			updated_at: new Date().toISOString()
+		};
+		if (body.enabled === false) {
+			activeAlerts = activeAlerts.filter((a) => a.rule_id !== params.id);
+			alertRules[idx] = { ...alertRules[idx], firing: 0, pending: 0 };
 		}
-		if (body.metric) {
-			const validMetrics = ['cpu', 'memory', 'app_down', 'disk_usage'];
-			if (!validMetrics.includes(body.metric)) {
-				return err(`metric must be one of: ${validMetrics.join(', ')}`, 400);
-			}
-		}
-		if (body.events) {
-			const validEvents = [
-				'deployment_success',
-				'deployment_failure',
-				'cron_success',
-				'cron_failure'
-			];
-			for (const ev of body.events) {
-				if (!validEvents.includes(ev)) {
-					return err(`event must be one of: ${validEvents.join(', ')}`, 400);
-				}
-			}
-		}
-		alertRules[idx] = { ...alertRules[idx], ...body, updated_at: new Date().toISOString() };
 		return ok(alertRules[idx]);
 	}),
 
@@ -2883,28 +2920,56 @@ export const handlers = [
 		await delay(LATENCY * 3);
 		const rule = alertRules.find((r) => r.id === params.id);
 		if (!rule) return err('Alert rule not found', 404);
-		const results = [
-			...(rule.has_webhook_url
-				? [{ kind: 'webhook', name: rule.webhook_host ?? 'Webhook', ok: true, error: null }]
-				: []),
-			...(alertIntegrationLinks[rule.id] ?? []).map((link) => {
-				const integration = integrations.find((i) => i.id === link.integration_id);
-				const enabled = integration?.enabled ?? false;
-				return {
-					kind: link.integration_kind,
-					name: link.integration_name,
-					ok: enabled,
-					error: enabled ? null : 'This channel is switched off on the Integrations page'
-				};
-			})
-		];
-		if (results.length === 0) {
-			return err(
-				'Choose at least one notification channel or add a webhook URL, so this rule notifies someone.',
-				400
-			);
-		}
+		const results = rule.integration_ids.map((id) => {
+			const integration = integrations.find((i) => i.id === id);
+			const enabled = integration?.enabled ?? false;
+			return {
+				integration_id: id,
+				kind: integration?.kind ?? 'webhook',
+				name: integration?.name ?? id,
+				ok: enabled,
+				error: enabled ? null : 'This channel is switched off on the Integrations page'
+			};
+		});
 		return ok(results);
+	}),
+
+	http.post('/api/alerts/:id/snooze', async ({ params, request }) => {
+		await delay(LATENCY);
+		const rule = alertRules.find((r) => r.id === params.id);
+		if (!rule) return err('Alert rule not found', 404);
+		const body = (await request.json()) as {
+			target?: string;
+			minutes?: number;
+			until_resolved?: boolean;
+		};
+		const until = body.minutes ? new Date(Date.now() + body.minutes * 60_000).toISOString() : null;
+		if (!body.target) {
+			rule.snoozed_until = until;
+		} else {
+			for (const a of activeAlerts) {
+				if (a.rule_id === rule.id && a.target === body.target) {
+					a.snoozed_until = body.until_resolved ? null : until;
+					a.snoozed_until_resolved = !!body.until_resolved;
+				}
+			}
+		}
+		return ok({ snoozed_until: until, until_resolved: !!body.until_resolved });
+	}),
+
+	http.post('/api/alerts/:id/unsnooze', async ({ params, request }) => {
+		await delay(LATENCY);
+		const rule = alertRules.find((r) => r.id === params.id);
+		if (!rule) return err('Alert rule not found', 404);
+		const body = (await request.json()) as { target?: string };
+		if (!body.target) rule.snoozed_until = null;
+		for (const a of activeAlerts) {
+			if (a.rule_id === rule.id && (!body.target || a.target === body.target)) {
+				a.snoozed_until = null;
+				a.snoozed_until_resolved = false;
+			}
+		}
+		return ok({ unsnoozed: true });
 	}),
 
 	http.delete('/api/alerts/:id', async ({ params }) => {
@@ -2912,6 +2977,7 @@ export const handlers = [
 		const exists = alertRules.some((r) => r.id === params.id);
 		if (!exists) return err('Alert rule not found', 404);
 		alertRules = alertRules.filter((r) => r.id !== params.id);
+		activeAlerts = activeAlerts.filter((a) => a.rule_id !== params.id);
 		return ok({ deleted: params.id });
 	}),
 
@@ -3735,6 +3801,7 @@ export const handlers = [
 			name: string;
 			kind: string;
 			config: Record<string, unknown>;
+			quiet_hours?: Integration['quiet_hours'];
 		};
 		const newId = `int_${Date.now()}`;
 		const stored = storeIntegrationConfig(newId, body.config ?? {});
@@ -3742,7 +3809,11 @@ export const handlers = [
 			telegram: 'bot_token',
 			discord: 'webhook_url',
 			slack: 'webhook_url',
-			email: 'smtp_password'
+			email: 'smtp_password',
+			ntfy: 'topic',
+			pushover: 'app_token',
+			gotify: 'app_token',
+			webhook: 'webhook_url'
 		};
 		if (!stored.saved_secrets.includes(needed[body.kind])) {
 			return err(`invalid config for ${body.kind}: missing field \`${needed[body.kind]}\``, 400);
@@ -3753,6 +3824,10 @@ export const handlers = [
 			kind: body.kind as Integration['kind'],
 			...stored,
 			enabled: true,
+			quiet_hours: body.quiet_hours ?? { mode: 'global' },
+			last_sent_at: null,
+			last_error: null,
+			last_error_at: null,
 			created_at: new Date().toISOString(),
 			updated_at: new Date().toISOString()
 		};
@@ -3772,7 +3847,7 @@ export const handlers = [
 		const idx = integrations.findIndex((i) => i.id === params.id);
 		if (idx === -1) return err('Integration not found', 404);
 		const { config, ...body } = (await request.json()) as Partial<
-			Pick<Integration, 'name' | 'enabled'> & { config: Record<string, unknown> }
+			Pick<Integration, 'name' | 'enabled' | 'quiet_hours'> & { config: Record<string, unknown> }
 		>;
 		integrations[idx] = {
 			...integrations[idx],
@@ -3788,12 +3863,11 @@ export const handlers = [
 		const exists = integrations.some((i) => i.id === params.id);
 		if (!exists) return err('Integration not found', 404);
 		integrations = integrations.filter((i) => i.id !== params.id);
-		// Remove any alert links referencing this integration
-		for (const ruleId of Object.keys(alertIntegrationLinks)) {
-			alertIntegrationLinks[ruleId] = alertIntegrationLinks[ruleId].filter(
-				(l) => l.integration_id !== params.id
-			);
-		}
+		// Rule links go with the channel.
+		alertRules = alertRules.map((r) => ({
+			...r,
+			integration_ids: r.integration_ids.filter((id) => id !== params.id)
+		}));
 		return ok({ deleted: params.id });
 	}),
 
@@ -3802,64 +3876,12 @@ export const handlers = [
 		const integration = integrations.find((i) => i.id === params.id);
 		if (!integration) return err('Integration not found', 404);
 		if (!integration.enabled) return err('Integration is disabled', 400);
-		return ok({ message: `Test message sent via ${integration.kind}` });
-	}),
-
-	// ── Alert ↔ Integration Links ──────────────────────────────────────────────
-
-	http.get('/api/alerts/:id/integrations', async ({ params }) => {
-		await delay(LATENCY);
-		const rule = alertRules.find((r) => r.id === params.id);
-		if (!rule) return err('Alert rule not found', 404);
-		return ok(alertIntegrationLinks[params.id as string] ?? []);
-	}),
-
-	http.post('/api/alerts/:id/integrations', async ({ params, request }) => {
-		await delay(LATENCY);
-		const rule = alertRules.find((r) => r.id === params.id);
-		if (!rule) return err('Alert rule not found', 404);
-		const body = (await request.json()) as { integration_id: string };
-		const integration = integrations.find((i) => i.id === body.integration_id);
-		if (!integration) return err('Integration not found', 404);
-		const ruleId = params.id as string;
-		const existing = alertIntegrationLinks[ruleId] ?? [];
-		if (existing.some((l) => l.integration_id === body.integration_id)) {
-			return err('Integration already linked to this rule', 409);
+		if (integration.last_error) {
+			integration.last_error_at = new Date().toISOString();
+			return err(`The test didn't arrive: ${integration.last_error}`, 400);
 		}
-		const link: AlertIntegrationLink = {
-			id: `link_${Date.now()}`,
-			rule_id: ruleId,
-			integration_id: body.integration_id,
-			integration_name: integration.name,
-			integration_kind: integration.kind,
-			created_at: new Date().toISOString()
-		};
-		alertIntegrationLinks = {
-			...alertIntegrationLinks,
-			[ruleId]: [...existing, link]
-		};
-		return HttpResponse.json({ success: true, data: link, error: null }, { status: 201 });
-	}),
-
-	http.delete('/api/alerts/:id/integrations/:integrationId', async ({ params }) => {
-		await delay(LATENCY);
-		const ruleId = params.id as string;
-		const rule = alertRules.find((r) => r.id === ruleId);
-		if (!rule) return err('Alert rule not found', 404);
-		const links = alertIntegrationLinks[ruleId] ?? [];
-		const exists = links.some((l) => l.integration_id === params.integrationId);
-		if (!exists) return err('Integration link not found', 404);
-		if (links.length + (rule.has_webhook_url ? 1 : 0) <= 1) {
-			return err(
-				"This is the rule's only notification channel. Add another channel or a webhook URL first, or delete the rule.",
-				400
-			);
-		}
-		alertIntegrationLinks = {
-			...alertIntegrationLinks,
-			[ruleId]: links.filter((l) => l.integration_id !== params.integrationId)
-		};
-		return ok(null);
+		integration.last_sent_at = new Date().toISOString();
+		return ok({ message: 'Test notification sent' });
 	}),
 
 	// ── WebSocket: All-databases log stream ───────────────────────────────────

@@ -5,6 +5,7 @@
 // (or `use tond_common::*`) without knowing which sub-module a type lives in.
 
 pub mod access;
+pub mod alerts;
 pub mod api;
 pub mod apps;
 pub mod audit_shipping;
@@ -30,6 +31,7 @@ pub mod templates;
 mod secret_fields_test;
 
 pub use access::*;
+pub use alerts::*;
 pub use api::*;
 pub use apps::*;
 pub use audit_shipping::*;

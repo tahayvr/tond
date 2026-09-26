@@ -46,7 +46,6 @@ use std::collections::{BTreeMap, HashMap};
 use tond_common::{App, DeployFailure, DeployPhase, PreviewDeployment, Readiness, Volume};
 use uuid::Uuid;
 
-use crate::alerts;
 use crate::backup::{self, SnapshotTrigger};
 use crate::docker;
 use crate::domains;
@@ -357,14 +356,6 @@ pub async fn run(
     match result {
         Ok(()) => {
             progress::finish_ok(state, &app_id, deployment_id).await;
-            alerts::fire_event_alerts(
-                state,
-                "deployment_success",
-                Some(app_id.as_str()),
-                Some(app.name.as_str()),
-                None,
-            )
-            .await;
             DeployOutcome::Succeeded
         }
         Err(e) => {
@@ -415,14 +406,6 @@ pub async fn run(
             app.status = restore;
 
             tracing::error!("Deploy failed for {}: {}", app.name, error);
-            alerts::fire_event_alerts(
-                state,
-                "deployment_failure",
-                Some(app_id.as_str()),
-                Some(app.name.as_str()),
-                Some(&failure.title),
-            )
-            .await;
             DeployOutcome::Failed(failure)
         }
     }

@@ -23,6 +23,9 @@
 //                    hourly rollups 90 days; restart/crash/OOM events for
 //                    `retention_app_events_days`) plus targets whose owner
 //                    is gone; see metrics::store::prune.
+//   alert_history  — drop episodes resolved more than N days ago (default 90;
+//                    their deliveries go with them) and close episodes whose
+//                    rule disappeared with its app.
 //   sessions / mfa_pending / password_links — drop expired rows (sessions
 //                    also when idle past the idle timeout).
 //   terminal_tickets / github_app_flows — drop expired rows.
@@ -48,7 +51,7 @@ use chrono::Utc;
 use sqlx::SqlitePool;
 
 use crate::runtime::loops;
-use crate::{docker, metrics, state::AppState};
+use crate::{alerts, docker, metrics, state::AppState};
 
 /// Rows deleted per statement.
 const BATCH_SIZE: i64 = 2_000;
@@ -81,6 +84,8 @@ pub struct RetentionPolicy {
     pub audit_log_days: i64,
     /// `retention_app_events_days` — max age of restart / crash / OOM events.
     pub app_events_days: i64,
+    /// `retention_alert_history_days` — how long resolved alerts are kept.
+    pub alert_history_days: i64,
 }
 
 fn rule_default(key: &str) -> i64 {
@@ -97,6 +102,7 @@ impl Default for RetentionPolicy {
             cron_run_days: rule_default("retention_cron_runs_days"),
             audit_log_days: rule_default("retention_audit_log_days"),
             app_events_days: rule_default("retention_app_events_days"),
+            alert_history_days: rule_default("retention_alert_history_days"),
         }
     }
 }
@@ -135,6 +141,7 @@ impl RetentionPolicy {
             "retention_cron_runs_days" => &mut self.cron_run_days,
             "retention_audit_log_days" => &mut self.audit_log_days,
             "retention_app_events_days" => &mut self.app_events_days,
+            "retention_alert_history_days" => &mut self.alert_history_days,
             _ => return None,
         })
     }
@@ -154,6 +161,7 @@ pub struct JanitorReport {
     pub cron_job_runs: u64,
     pub audit_log: u64,
     pub metrics: u64,
+    pub alerts: u64,
     pub sessions: u64,
 }
 
@@ -164,6 +172,7 @@ impl JanitorReport {
             + self.cron_job_runs
             + self.audit_log
             + self.metrics
+            + self.alerts
             + self.sessions
     }
 }
@@ -347,6 +356,22 @@ pub async fn run_once(db: &SqlitePool, policy: &RetentionPolicy) -> Result<Janit
         i64::MAX / 2
     };
     report.metrics += metrics::store::prune(db, now.timestamp(), event_keep_secs).await?;
+
+    // ── alert history (unix seconds; deliveries cascade) ──
+    let _ = alerts::evaluate::close_orphans(db, now.timestamp()).await;
+    if policy.alert_history_days > 0 {
+        let cutoff = now.timestamp() - policy.alert_history_days * 86_400;
+        report.alerts += delete_in_batches(|| {
+            sqlx::query(
+                "DELETE FROM alert_history WHERE id IN (
+                    SELECT id FROM alert_history WHERE resolved_at < ? LIMIT ?)",
+            )
+            .bind(cutoff)
+            .bind(BATCH_SIZE)
+            .execute(db)
+        })
+        .await?;
+    }
 
     // ── expired sessions and MFA challenges (RFC 3339 timestamps) ──
     let now_str = now.to_rfc3339();
@@ -692,6 +717,65 @@ mod tests {
             ids(&db, "SELECT id FROM deployments ORDER BY id").await,
             vec!["new-0", "new-1", "new-2", "old-ok", "stuck"],
             "keeps last 3, the rollback image and the running row; drops old failures and orphans"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_alerts_are_kept_90_days_and_orphans_are_closed() {
+        let db = test_db().await;
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO integrations (id, name, kind, config) VALUES ('i', 'i', 'webhook', '{}')",
+        )
+        .execute(&db)
+        .await
+        .unwrap_or_else(|err| panic!("seed integration: {err}"));
+        for (id, resolved) in [
+            ("old", Some(now - 91 * 86_400)),
+            ("recent", Some(now - 89 * 86_400)),
+            ("open", None),
+        ] {
+            sqlx::query(
+                "INSERT INTO alert_history (id, rule_name, kind, severity, target, target_label,
+                    threshold, pending_since, fired_at, resolved_at)
+                 VALUES (?, 'r', 'cpu', 'warning', 'host', 'Server', 1, 0, 0, ?)",
+            )
+            .bind(id)
+            .bind(resolved)
+            .execute(&db)
+            .await
+            .unwrap_or_else(|err| panic!("seed episode: {err}"));
+            sqlx::query(
+                "INSERT INTO alert_deliveries (id, episode_id, integration_id, event, next_attempt_at, created_at)
+                 VALUES (?, ?, 'i', 'firing', 0, 0)",
+            )
+            .bind(format!("d-{id}"))
+            .bind(id)
+            .execute(&db)
+            .await
+            .unwrap_or_else(|err| panic!("seed delivery: {err}"));
+        }
+        let report = run_once(&db, &RetentionPolicy::default())
+            .await
+            .unwrap_or_else(|err| panic!("janitor pass: {err}"));
+        assert_eq!(report.alerts, 1);
+        assert_eq!(
+            ids(&db, "SELECT id FROM alert_history ORDER BY id").await,
+            vec!["open", "recent"]
+        );
+        assert_eq!(
+            ids(&db, "SELECT id FROM alert_deliveries ORDER BY id").await,
+            vec!["d-open", "d-recent"],
+            "deliveries go with their episode"
+        );
+        let open_resolved: Option<i64> =
+            sqlx::query_scalar("SELECT resolved_at FROM alert_history WHERE id = 'open'")
+                .fetch_one(&db)
+                .await
+                .unwrap_or_else(|err| panic!("read: {err}"));
+        assert!(
+            open_resolved.is_some(),
+            "an episode no state points at is closed"
         );
     }
 

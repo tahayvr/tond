@@ -38,10 +38,15 @@ pub enum Table {
     Databases,
     AuditLog,
     AuditShipping,
+    Certificates,
+    Snapshots,
+    /// Not a table: the alert engine queued deliveries to send now
+    /// (`alerts::kick`). Only published through `notify`.
+    AlertKick,
 }
 
 impl Table {
-    const ALL: [Table; 10] = [
+    const ALL: [Table; 13] = [
         Table::Apps,
         Table::PreviewDeployments,
         Table::CronJobs,
@@ -52,6 +57,9 @@ impl Table {
         Table::Databases,
         Table::AuditLog,
         Table::AuditShipping,
+        Table::Certificates,
+        Table::Snapshots,
+        Table::AlertKick,
     ];
 
     fn index(self) -> usize {
@@ -74,6 +82,8 @@ impl Table {
             "databases" => Table::Databases,
             "audit_log" => Table::AuditLog,
             "audit_shipping" => Table::AuditShipping,
+            "certificates" => Table::Certificates,
+            "snapshots" => Table::Snapshots,
             _ => return None,
         })
     }

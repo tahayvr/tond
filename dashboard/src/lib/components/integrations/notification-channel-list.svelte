@@ -9,10 +9,16 @@
 		updateIntegration,
 		deleteIntegration,
 		testIntegration,
+		type ChannelQuietHours,
 		type Integration,
 		type IntegrationKind,
-		type IntegrationConfig
+		type IntegrationConfig,
+		type QuietHours
 	} from '$lib/api';
+	import { localTimeZone, quietHoursSummary } from '$lib/alerts';
+	import { formatRelativePast } from '$lib/time';
+	import QuietHoursFields from '$lib/components/alerts/QuietHoursFields.svelte';
+	import * as Select from '$lib/components/ui/select/index.js';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
@@ -64,6 +70,7 @@
 
 	let showAdd = $state(false);
 	let addName = $state('');
+	let addQuiet = $state<ChannelQuietHours>({ mode: 'global' });
 	let adding = $state(false);
 	let addError = $state('');
 
@@ -71,6 +78,30 @@
 
 	let editingId = $state<string | null>(null);
 	let editName = $state('');
+	let editQuiet = $state<ChannelQuietHours>({ mode: 'global' });
+
+	// ── Quiet hours ───────────────────────────────────────────────────────────
+
+	const QUIET_MODES: { value: ChannelQuietHours['mode']; label: string }[] = [
+		{ value: 'global', label: 'Follow the global quiet hours' },
+		{ value: 'off', label: 'No quiet hours — always notify' },
+		{ value: 'custom', label: 'Own quiet hours' }
+	];
+
+	function defaultWindow(): QuietHours {
+		return {
+			enabled: true,
+			start: '22:00',
+			end: '07:00',
+			timezone: localTimeZone(),
+			critical_bypass: true
+		};
+	}
+
+	function withMode(mode: string): ChannelQuietHours {
+		if (mode === 'custom') return { mode: 'custom', ...defaultWindow() };
+		return { mode: mode === 'off' ? 'off' : 'global' };
+	}
 	let saving = $state(false);
 	let editError = $state('');
 
@@ -107,9 +138,15 @@
 
 		adding = true;
 		try {
-			const created = await createIntegration({ name: addName.trim(), kind, config });
+			const created = await createIntegration({
+				name: addName.trim(),
+				kind,
+				config,
+				quiet_hours: addQuiet
+			});
 			integrations = [created, ...integrations];
 			addName = '';
+			addQuiet = { mode: 'global' };
 			resetConfig();
 			showAdd = false;
 		} catch (e: any) {
@@ -128,6 +165,7 @@
 
 		editingId = integration.id;
 		editName = integration.name;
+		editQuiet = integration.quiet_hours ?? { mode: 'global' };
 		editError = '';
 		loadConfig(integration.config, integration.saved_secrets ?? []);
 	}
@@ -149,7 +187,11 @@
 
 		saving = true;
 		try {
-			const updated = await updateIntegration(editingId, { name: editName.trim(), config });
+			const updated = await updateIntegration(editingId, {
+				name: editName.trim(),
+				config,
+				quiet_hours: editQuiet
+			});
 			integrations = integrations.map((i) => (i.id === updated.id ? updated : i));
 			cancelEdit();
 		} catch (e: any) {
@@ -208,6 +250,13 @@
 			error = e.message ?? 'Test notification failed';
 		} finally {
 			testingId = null;
+			// The test updates the channel's delivery health.
+			try {
+				const all = await listIntegrations();
+				integrations = all.filter((i) => i.kind === kind);
+			} catch {
+				// keep the current list
+			}
 		}
 	}
 
@@ -245,6 +294,33 @@
 		void load();
 	});
 </script>
+
+{#snippet quietFields(
+	idPrefix: string,
+	value: ChannelQuietHours,
+	set: (v: ChannelQuietHours) => void
+)}
+	<div class="grid gap-2">
+		<Label class="text-xs" for={`${idPrefix}-mode`}>Quiet hours</Label>
+		<Select.Root type="single" value={value.mode} onValueChange={(m) => m && set(withMode(m))}>
+			<Select.Trigger id={`${idPrefix}-mode`} class="h-8 w-full text-xs">
+				{QUIET_MODES.find((m) => m.value === value.mode)?.label}
+			</Select.Trigger>
+			<Select.Content>
+				{#each QUIET_MODES as m (m.value)}
+					<Select.Item value={m.value} class="text-xs">{m.label}</Select.Item>
+				{/each}
+			</Select.Content>
+		</Select.Root>
+		{#if value.mode === 'custom'}
+			{@const custom = value}
+			<QuietHoursFields
+				{idPrefix}
+				bind:value={() => custom, (v: QuietHours) => set({ mode: 'custom', ...v })}
+			/>
+		{/if}
+	</div>
+{/snippet}
 
 <InlineError title="Integration Error" message={error} />
 
@@ -284,6 +360,7 @@
 			{#if configFields}
 				{@render configFields()}
 			{/if}
+			{@render quietFields('add-quiet', addQuiet, (v) => (addQuiet = v))}
 			<div class="flex gap-2 pt-1">
 				<Button type="submit" size="sm" class="h-8 text-xs uppercase" disabled={adding}>
 					{adding ? 'Saving…' : 'Save Channel'}
@@ -321,7 +398,20 @@
 									<StatusBadge status="disabled" size="sm" />
 								{/if}
 							</div>
-							<span class="text-muted-foreground">Added {formatDate(integration.created_at)}</span>
+							<span class="text-muted-foreground">
+								Added {formatDate(integration.created_at)} · {quietHoursSummary(
+									integration.quiet_hours ?? { mode: 'global' }
+								)}
+							</span>
+							{#if integration.last_error}
+								<span class="break-words text-destructive">
+									Last delivery failed {formatRelativePast(integration.last_error_at)}: {integration.last_error}
+								</span>
+							{:else if integration.last_sent_at}
+								<span class="text-muted-foreground">
+									Last delivered {formatRelativePast(integration.last_sent_at)}
+								</span>
+							{/if}
 						</div>
 						<div class="ml-4 flex shrink-0 items-center gap-1">
 							<Button
@@ -382,6 +472,7 @@
 							{#if configFields}
 								{@render configFields()}
 							{/if}
+							{@render quietFields('edit-quiet', editQuiet, (v) => (editQuiet = v))}
 							<div class="flex gap-2 pt-1">
 								<Button type="submit" size="sm" class="h-8 text-xs uppercase" disabled={saving}>
 									{saving ? 'Saving…' : 'Save Changes'}

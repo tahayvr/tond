@@ -1,7 +1,8 @@
 // events.rs — the per-app event feed (GET /api/apps/{id}/events)
 //
 // Assembled on request from the tables that already record each fact
-// (deployments, metric_events, certificates, audit_log); nothing is stored
+// (deployments, metric_events, certificates, audit_log, alert_history);
+// nothing is stored
 // twice.
 
 use serde::{Deserialize, Serialize};
@@ -31,13 +32,18 @@ pub enum AppEventKind {
     ConfigChanged,
     /// Started, stopped or restarted by someone.
     Control,
+    /// An alert rule started firing for this app.
+    AlertFired,
+    /// A firing alert resolved.
+    AlertResolved,
 }
 
 impl AppEventKind {
     /// "info" | "success" | "warning" | "danger" — how the dashboard colours it.
     pub fn severity(self) -> &'static str {
         match self {
-            Self::DeploySucceeded | Self::CertIssued => "success",
+            Self::DeploySucceeded | Self::CertIssued | Self::AlertResolved => "success",
+            Self::AlertFired => "danger",
             Self::DeployFailed | Self::Crash | Self::Oom | Self::CertFailed => "danger",
             Self::Restart | Self::DeployCancelled => "warning",
             _ => "info",

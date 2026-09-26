@@ -177,6 +177,13 @@ pub const RETENTION_RULES: &[RetentionRule] = &[
         max: 365,
         unit: "days",
     },
+    RetentionRule {
+        key: "retention_alert_history_days",
+        default: 90,
+        min: 7,
+        max: 365,
+        unit: "days",
+    },
 ];
 
 /// The rule for a settings key.

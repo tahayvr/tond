@@ -10,6 +10,8 @@
 //   audit_log       domain, resource-limit and other configuration changes,
 //                   start / stop / restart by a person or token — only for
 //                   callers who may read the audit log (events:read)
+//   alert_history   alerts that fired for the app and when they resolved —
+//                   only for callers who may see alerts (metrics:read)
 //
 // Each source is read through an index with the same `before` bound and
 // `limit`, then merged; `next_before` pages further back.
@@ -214,6 +216,7 @@ pub async fn app_events(
     db: &SqlitePool,
     app: &App,
     include_audit: bool,
+    include_alerts: bool,
     before: DateTime<Utc>,
     limit: i64,
 ) -> Result<AppEventsResponse, sqlx::Error> {
@@ -325,6 +328,38 @@ pub async fn app_events(
         }
     }
 
+    // Alerts that fired for the app (unix seconds).
+    if include_alerts {
+        let rows: Vec<(String, String, i64, Option<i64>)> = sqlx::query_as(
+            "SELECT rule_name, severity, fired_at, resolved_at FROM alert_history
+             WHERE app_id = ? AND fired_at < ? ORDER BY fired_at DESC LIMIT ?",
+        )
+        .bind(&app.id)
+        .bind(before.timestamp())
+        .bind(limit)
+        .fetch_all(db)
+        .await?;
+        some_source_full |= i64::try_from(rows.len()).unwrap_or(0) >= limit;
+        for (rule, severity, fired, resolved) in rows {
+            if let Some(at) = DateTime::<Utc>::from_timestamp(fired, 0) {
+                all.push(event(
+                    at,
+                    AppEventKind::AlertFired,
+                    format!("Alert fired: {rule}"),
+                    Some(format!("severity {severity}")),
+                ));
+            }
+            if let Some(at) = resolved.and_then(|r| DateTime::<Utc>::from_timestamp(r, 0)) {
+                all.push(event(
+                    at,
+                    AppEventKind::AlertResolved,
+                    format!("Alert resolved: {rule}"),
+                    None,
+                ));
+            }
+        }
+    }
+
     all.retain(|(at, _)| *at < before);
     all.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
     let more = some_source_full || i64::try_from(all.len()).unwrap_or(0) > limit;
@@ -358,6 +393,7 @@ pub async fn list_app_events(
         &state.db,
         &app,
         auth.has(Scope::EventsRead),
+        auth.has(Scope::MetricsRead),
         before,
         q.limit.unwrap_or(DEFAULT_LIMIT),
     )
@@ -441,6 +477,18 @@ mod tests {
             Some("memory=512MiB"),
         )
         .await;
+        let fired = parse_time("2026-09-19T08:00:00Z").map_or(0, |t| t.timestamp());
+        sqlx::query(
+            "INSERT INTO alert_history (id, rule_name, kind, severity, target, target_label, app_id,
+                                        threshold, pending_since, fired_at, resolved_at)
+             VALUES ('h1', 'High memory', 'memory', 'warning', 'app:a1', 'web', 'a1', 90, ?, ?, ?)",
+        )
+        .bind(fired)
+        .bind(fired)
+        .bind(fired + 600)
+        .execute(db)
+        .await
+        .unwrap_or_else(|e| panic!("alert: {e}"));
         sqlx::query_as::<_, App>("SELECT * FROM apps WHERE id = 'a1'")
             .fetch_one(db)
             .await
@@ -451,7 +499,7 @@ mod tests {
     async fn events_merge_every_source_newest_first() {
         let state = AppState::for_tests().await;
         let app = seed(&state.db).await;
-        let res = app_events(&state.db, &app, true, Utc::now(), 50)
+        let res = app_events(&state.db, &app, true, true, Utc::now(), 50)
             .await
             .unwrap_or_else(|e| panic!("events: {e}"));
         let kinds: Vec<AppEventKind> = res.events.iter().map(|e| e.kind).collect();
@@ -464,6 +512,8 @@ mod tests {
                 AppEventKind::DeployFailed,
                 AppEventKind::CertIssued,
                 AppEventKind::DeploySucceeded,
+                AppEventKind::AlertResolved,
+                AppEventKind::AlertFired,
             ]
         );
         let ok = &res.events[5];
@@ -481,21 +531,20 @@ mod tests {
         assert_eq!(res.next_before, None);
 
         // Without events:read, audit-derived events are left out.
-        let res = app_events(&state.db, &app, false, Utc::now(), 50)
+        let res = app_events(&state.db, &app, false, false, Utc::now(), 50)
             .await
             .unwrap_or_else(|e| panic!("events: {e}"));
-        assert!(
-            !res.events
-                .iter()
-                .any(|e| e.kind == AppEventKind::ResourcesChanged)
-        );
+        assert!(!res.events.iter().any(|e| matches!(
+            e.kind,
+            AppEventKind::ResourcesChanged | AppEventKind::AlertFired
+        )));
     }
 
     #[tokio::test]
     async fn events_page_backwards() {
         let state = AppState::for_tests().await;
         let app = seed(&state.db).await;
-        let first = app_events(&state.db, &app, true, Utc::now(), 2)
+        let first = app_events(&state.db, &app, true, true, Utc::now(), 2)
             .await
             .unwrap_or_else(|e| panic!("events: {e}"));
         assert_eq!(first.events.len(), 2);
@@ -504,7 +553,7 @@ mod tests {
             .as_deref()
             .and_then(parse_time)
             .unwrap_or_else(|| panic!("more pages expected"));
-        let second = app_events(&state.db, &app, true, before, 2)
+        let second = app_events(&state.db, &app, true, true, before, 2)
             .await
             .unwrap_or_else(|e| panic!("events: {e}"));
         assert_eq!(

@@ -227,7 +227,7 @@ async fn run() -> Result<()> {
     // it watches changes (runtime/changes.rs), so an idle server barely wakes.
     tokio::spawn(health::run_health_checker(state.clone()));
     tokio::spawn(metrics::run_metrics_collector(state.clone()));
-    tokio::spawn(alerts::run_alert_checker(state.clone()));
+    tokio::spawn(alerts::run_alert_engine(state.clone()));
     tokio::spawn(cron::run_cron_scheduler(state.clone()));
     tokio::spawn(janitor::run_janitor(state.clone()));
     tokio::spawn(audit_ship::run(state.clone()));
@@ -608,9 +608,22 @@ async fn run() -> Result<()> {
         )
         .route("/api/system/self", get(handlers::system_self::get_self))
         .route("/metrics", get(handlers::system_self::metrics))
-        // Alert rules
+        // Alerts: rules, live alerts, history, snooze, quiet hours
         .route("/api/alerts", get(handlers::alerts::list_alerts))
         .route("/api/alerts", post(handlers::alerts::create_alert))
+        .route("/api/alerts/kinds", get(handlers::alerts::list_kinds))
+        .route("/api/alerts/active", get(handlers::alerts::list_active))
+        .route("/api/alerts/history", get(handlers::alerts::list_history))
+        .route(
+            "/api/alerts/history/{id}",
+            get(handlers::alerts::get_episode),
+        )
+        .route(
+            "/api/alerts/history/{id}/acknowledge",
+            post(handlers::alerts::acknowledge),
+        )
+        .route("/api/alerts/settings", get(handlers::alerts::get_settings))
+        .route("/api/alerts/settings", put(handlers::alerts::put_settings))
         .route("/api/alerts/{id}", get(handlers::alerts::get_alert))
         .route(
             "/api/alerts/{id}",
@@ -618,18 +631,10 @@ async fn run() -> Result<()> {
         )
         .route("/api/alerts/{id}", delete(handlers::alerts::delete_alert))
         .route("/api/alerts/{id}/test", post(handlers::alerts::test_alert))
-        // Alert ↔ integration links
+        .route("/api/alerts/{id}/snooze", post(handlers::alerts::snooze))
         .route(
-            "/api/alerts/{id}/integrations",
-            get(handlers::alerts::list_alert_integrations),
-        )
-        .route(
-            "/api/alerts/{id}/integrations",
-            post(handlers::alerts::link_alert_integration),
-        )
-        .route(
-            "/api/alerts/{id}/integrations/{int_id}",
-            delete(handlers::alerts::unlink_alert_integration),
+            "/api/alerts/{id}/unsnooze",
+            post(handlers::alerts::unsnooze),
         )
         // Notification integrations
         .route(

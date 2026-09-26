@@ -13,7 +13,7 @@ export type RetentionGroup = 'deploys' | 'cron' | 'events' | 'security';
 export const RETENTION_GROUPS: { id: RetentionGroup; title: string }[] = [
 	{ id: 'deploys', title: 'Deployments' },
 	{ id: 'cron', title: 'Cron jobs' },
-	{ id: 'events', title: 'App events' },
+	{ id: 'events', title: 'Events and alerts' },
 	{ id: 'security', title: 'Security' }
 ];
 
@@ -47,6 +47,11 @@ export const RETENTION_COPY: Record<string, RetentionCopy> = {
 	retention_app_events_days: {
 		label: 'Restarts, crashes and OOM kills for',
 		help: 'Shown in each app’s Recent events and metrics.',
+		group: 'events'
+	},
+	retention_alert_history_days: {
+		label: 'Resolved alerts for',
+		help: 'Alert history on the Alerts page and in Recent events.',
 		group: 'events'
 	},
 	retention_audit_log_days: {
@@ -99,6 +104,8 @@ const TABLE_GROUPS: Record<string, string> = {
 	metrics_1h: 'Metrics',
 	metric_targets: 'Metrics',
 	metric_events: 'App events',
+	alert_history: 'Alert history',
+	alert_deliveries: 'Alert history',
 	sessions: 'Sessions',
 	snapshots: 'Snapshot records',
 	webhook_deliveries: 'Webhook deliveries'

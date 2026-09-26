@@ -1,210 +1,126 @@
 <script lang="ts">
-	import { can } from '$lib/auth.svelte';
-	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import { page } from '$app/state';
+	import { goto, invalidateAll } from '$app/navigation';
+	import { can } from '$lib/auth.svelte';
 	import {
-		updateAlertRule,
 		deleteAlertRule,
+		snoozeAlert,
 		testAlertRule,
-		ALERT_GROUPS,
+		unsnoozeAlert,
+		updateAlertRule,
+		type ActiveAlert,
 		type AlertChannelTestResult,
+		type AlertKindInfo,
 		type AlertRule,
-		type AlertMetric,
-		type AlertEvent,
-		type App
+		type AlertRuleInput,
+		type App,
+		type Integration,
+		type QuietHours
 	} from '$lib/api';
-	import { SvelteSet } from 'svelte/reactivity';
-	import { goto } from '$app/navigation';
+	import { useAction } from '$lib/action.svelte';
+	import {
+		CHANNEL_KIND_LABEL,
+		FOR_OPTIONS,
+		REPEAT_OPTIONS,
+		SEVERITY_LABEL,
+		conditionSummary,
+		kindLabel,
+		optionLabel,
+		severityTone
+	} from '$lib/alerts';
+	import { confirmAction } from '$lib/confirm.svelte';
+	import { ALERT_TABS, allowedTabs, tabFromUrl, tabHref, type AlertTab } from '$lib/tabs';
 	import { setUiContext, clearUiContext, alertsContext } from '$lib/ui-context.svelte';
 	import StatusBadge from '$lib/components/feedback/status-badge.svelte';
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import SuccessAlert from '$lib/components/feedback/success-alert.svelte';
 	import PageHeader from '$lib/components/nav/page-header.svelte';
 	import LinkTabs from '$lib/components/nav/link-tabs.svelte';
-	import ConfirmDialog from '$lib/components/dialogs/confirm-dialog.svelte';
-	import { useAction } from '$lib/action.svelte';
-	import { ALERT_TABS, allowedTabs, tabFromUrl, tabHref, type AlertTab } from '$lib/tabs';
-	import { Button } from '$lib/components/ui/button/index.js';
-	import { Checkbox } from '$lib/components/ui/checkbox/index.js';
-	import { Input } from '$lib/components/ui/input/index.js';
-	import { Label } from '$lib/components/ui/label/index.js';
-	import * as Select from '$lib/components/ui/select/index.js';
 	import Breadcrumb from '$lib/components/nav/breadcrumb.svelte';
-	import IntegrationSelector from '$lib/components/integrations/integration-selector.svelte';
-	import SavedSecretField, {
-		secretFieldUpdate
-	} from '$lib/components/secrets/saved-secret-field.svelte';
-	import Bell from '~icons/ri/notification-3-line';
-	import Plug from '~icons/ri/plug-line';
+	import ActiveAlertList from '$lib/components/alerts/ActiveAlertList.svelte';
+	import AlertHistory from '$lib/components/alerts/AlertHistory.svelte';
+	import AlertEpisodeDialog from '$lib/components/alerts/AlertEpisodeDialog.svelte';
+	import AlertRuleForm from '$lib/components/alerts/AlertRuleForm.svelte';
+	import { Button } from '$lib/components/ui/button/index.js';
+	import * as Popover from '$lib/components/ui/popover/index.js';
+	import AllClear from '~icons/ri/checkbox-circle-line';
 	import type { PageProps } from './$types';
 
-	let { data, params }: PageProps = $props();
+	let { data }: PageProps = $props();
 
-	let rule = $derived(data.rule as AlertRule | null);
-	let error = $state('');
-	let showDeleteDialog = $state(false);
+	let rule = $derived(data.rule as AlertRule);
+	let active = $derived(data.active as ActiveAlert[]);
+	let kinds = $derived(data.kinds as AlertKindInfo[]);
+	let apps = $derived(data.apps as App[]);
+	let channels = $derived(data.integrations as Integration[]);
+	let quietHours = $derived((data.quietHours ?? undefined) as QuietHours | undefined);
 	let tab = $derived<AlertTab>(tabFromUrl(page.url, ALERT_TABS, 'overview'));
+	let episodeId = $state<string | null>(null);
+	let historyKey = $state(0);
+	let muteOpen = $state(false);
+	let saved = $state('');
+
+	let mutedUntil = $derived(
+		rule.snoozed_until && new Date(rule.snoozed_until).getTime() > Date.now()
+			? new Date(rule.snoozed_until)
+			: null
+	);
+	let linked = $derived(channels.filter((c) => rule.integration_ids.includes(c.id)));
+
 	let testResults = $state<AlertChannelTestResult[]>([]);
 	const sendTest = useAction(async () => {
-		testResults = await testAlertRule(ruleId);
+		testResults = await testAlertRule(rule.id);
 	});
 	let testSummary = $derived(
-		testResults.length === 0
-			? ''
-			: testResults.every((r) => r.ok)
-				? `Test sent to ${testResults.length} channel${testResults.length === 1 ? '' : 's'}. Check that it arrived.`
-				: ''
+		testResults.length > 0 && testResults.every((r) => r.ok)
+			? `Test sent to ${testResults.length} channel${testResults.length === 1 ? '' : 's'}. Check that it arrived.`
+			: ''
 	);
 
-	// Apps list for resolving app names
-	let apps = $derived(data.apps as App[]);
-
-	// Settings form state — seeded from rule on load
-	let settingsName = $state('');
-	let settingsGroupId = $state(ALERT_GROUPS[0].id);
-	let settingsMetric = $state<AlertMetric | ''>('');
-	let settingsThreshold = $state(80);
-	let settingsEvents = new SvelteSet<AlertEvent>();
-	// The webhook URL is write-only: a saved one shows as "Saved" + host.
-	let settingsWebhookUrl = $state('');
-	let settingsWebhookReplacing = $state(false);
-	let settingsWebhookRemoved = $state(false);
-	let settingsSaving = $state(false);
-	let settingsError = $state('');
-	let settingsSuccess = $state('');
-
-	// Derived: current settings group
-	let settingsGroup = $derived(
-		ALERT_GROUPS.find((g) => g.id === settingsGroupId) ?? ALERT_GROUPS[0]
-	);
-	let settingsHasMetrics = $derived(settingsGroup.metrics.length > 0);
-	let settingsHasEvents = $derived(settingsGroup.events.length > 0);
-	let settingsCurrentMetric = $derived(
-		settingsGroup.metrics.find((m) => m.value === settingsMetric) ?? settingsGroup.metrics[0]
-	);
-
-	let ruleId = $derived(page.params.id || params.id);
-
-	/** Infer the group ID for a rule based on its metric and events */
-	function inferGroupId(r: AlertRule): string {
-		if (r.metric) {
-			const group = ALERT_GROUPS.find((g) => g.metrics.some((m) => m.value === r.metric));
-			if (group) return group.id;
-		}
-		if (r.events.length > 0) {
-			const group = ALERT_GROUPS.find((g) => g.events.some((e) => r.events.includes(e.value)));
-			if (group) return group.id;
-		}
-		return ALERT_GROUPS[0].id;
-	}
-
-	function metricLabel(metric: string | null): string {
-		if (!metric) return '';
-		for (const group of ALERT_GROUPS) {
-			const m = group.metrics.find((x) => x.value === metric);
-			if (m) return m.label;
-		}
-		return metric.toUpperCase();
-	}
-
-	function thresholdUnit(metric: string | null): string {
-		return metric === 'app_down' ? 'min' : '%';
-	}
-
-	function formatDate(dt: string | null): string {
-		if (!dt) return 'Never';
-		return new Date(dt).toLocaleString();
-	}
-
-	function formatRelative(dt: string | null): string {
-		if (!dt) return 'Never';
-		const diff = Date.now() - new Date(dt).getTime();
-		const minutes = Math.floor(diff / 60_000);
-		const hours = Math.floor(diff / 3_600_000);
-		const days = Math.floor(diff / 86_400_000);
-		if (minutes < 1) return 'just now';
-		if (minutes < 60) return `${minutes}m ago`;
-		if (hours < 24) return `${hours}h ago`;
-		return `${days}d ago`;
-	}
-
-	function eventLabel(event: AlertEvent): string {
-		for (const group of ALERT_GROUPS) {
-			const e = group.events.find((x) => x.value === event);
-			if (e) return e.label;
-		}
-		return event;
-	}
-
-	const toggleEnabled = useAction(async () => {
-		if (!rule) return;
-		rule = await updateAlertRule(ruleId, { enabled: !rule.enabled });
+	const toggleEnabled = useAction(() => updateAlertRule(rule.id, { enabled: !rule.enabled }), {
+		invalidate: true
 	});
+	const mute = useAction(
+		async (minutes: number | null) => {
+			muteOpen = false;
+			if (minutes === null) await unsnoozeAlert(rule.id);
+			else await snoozeAlert(rule.id, { minutes });
+		},
+		{ invalidate: true }
+	);
 
-	function handleSettingsGroupChange(groupId: string) {
-		settingsGroupId = groupId;
-		const group = ALERT_GROUPS.find((g) => g.id === groupId) ?? ALERT_GROUPS[0];
-		settingsMetric = group.metrics[0]?.value ?? '';
-		settingsThreshold = group.metrics[0]?.placeholder ?? 80;
-		settingsEvents.clear();
+	async function refresh() {
+		await invalidateAll();
+		historyKey += 1;
 	}
 
-	function handleSettingsMetricChange(metric: string) {
-		settingsMetric = metric as AlertMetric;
-		const m = settingsGroup.metrics.find((x) => x.value === metric);
-		if (m) settingsThreshold = m.placeholder;
+	async function save(input: AlertRuleInput) {
+		await updateAlertRule(rule.id, {
+			name: input.name,
+			threshold: input.threshold,
+			window_secs: input.window_secs,
+			for_secs: input.for_secs,
+			severity: input.severity,
+			repeat_secs: input.repeat_secs,
+			integration_ids: input.integration_ids
+		});
+		await invalidateAll();
+		saved = 'Rule saved.';
 	}
 
-	function toggleSettingsEvent(event: AlertEvent) {
-		if (settingsEvents.has(event)) {
-			settingsEvents.delete(event);
-		} else {
-			settingsEvents.add(event);
-		}
+	function handleDelete() {
+		void confirmAction({
+			title: `Delete ${rule.name}?`,
+			description:
+				"You won't be notified about this condition any more. Its alert history is kept for 90 days; your channels stay.",
+			confirmLabel: 'Delete rule',
+			pendingLabel: 'Deleting…',
+			onconfirm: async () => {
+				await deleteAlertRule(rule.id);
+				await goto('/alerts?tab=rules', { invalidateAll: true });
+			}
+		});
 	}
-
-	async function handleSaveSettings() {
-		settingsSaving = true;
-		settingsError = '';
-		settingsSuccess = '';
-		try {
-			rule = await updateAlertRule(ruleId, {
-				name: settingsName.trim(),
-				metric: settingsHasMetrics && settingsMetric ? (settingsMetric as AlertMetric) : null,
-				threshold: settingsThreshold,
-				webhook_url: secretFieldUpdate({
-					saved: rule?.has_webhook_url ?? false,
-					replacing: settingsWebhookReplacing,
-					removed: settingsWebhookRemoved,
-					value: settingsWebhookUrl
-				}),
-				events: [...settingsEvents]
-			});
-			settingsSuccess = 'Settings saved.';
-		} catch (e: any) {
-			settingsError = e.message ?? 'Failed to save settings';
-		} finally {
-			settingsSaving = false;
-		}
-	}
-
-	async function handleDelete() {
-		await deleteAlertRule(ruleId);
-		goto('/alerts', { invalidateAll: true });
-	}
-
-	$effect(() => {
-		if (rule) {
-			settingsName = rule.name;
-			settingsGroupId = inferGroupId(rule);
-			settingsMetric = rule.metric ?? '';
-			settingsThreshold = rule.threshold;
-			settingsWebhookUrl = '';
-			settingsWebhookReplacing = false;
-			settingsWebhookRemoved = false;
-			settingsEvents.clear();
-			for (const ev of rule.events) settingsEvents.add(ev);
-		}
-	});
 
 	$effect(() => {
 		setUiContext(alertsContext());
@@ -212,360 +128,216 @@
 	});
 </script>
 
-{#if error && !rule}
-	<InlineError message={error} />
-{:else if rule}
-	{@const current = rule}
-	<div class="space-y-6">
-		<!-- Breadcrumb -->
-		<Breadcrumb items={[{ label: 'Alerts', href: '/alerts' }, { label: rule.name }]} />
+<div class="space-y-6">
+	<Breadcrumb items={[{ label: 'Alerts', href: '/alerts?tab=rules' }, { label: rule.name }]} />
 
-		<PageHeader title={rule.name} section={ALERT_TABS.find((t) => t.id === tab)?.label}>
-			{#snippet meta()}
-				<StatusBadge status={current.enabled ? 'enabled' : 'paused'} />
-				{#if current.metric}
-					<span class="text-xs">
-						{metricLabel(current.metric)} &gt; {current.threshold}{thresholdUnit(current.metric)}
-					</span>
-				{/if}
-				{#if current.events.length > 0}
-					<span class="text-xs">
-						{current.events.length} event{current.events.length > 1 ? 's' : ''}
-					</span>
-				{/if}
-			{/snippet}
-			{#snippet actions()}
-				{#if can('settings:write')}
-					<Button
-						variant="outline"
-						size="sm"
-						onclick={() => sendTest.run()}
-						disabled={sendTest.pending}
-						aria-busy={sendTest.pending}
-					>
-						{sendTest.pending ? 'Sending test…' : 'Send test'}
-					</Button>
-					<Button
-						variant="outline"
-						size="sm"
-						onclick={() => toggleEnabled.run()}
-						disabled={toggleEnabled.pending}
-					>
-						{toggleEnabled.pending ? 'Saving…' : current.enabled ? 'Pause' : 'Enable'}
-					</Button>
-				{/if}
-			{/snippet}
-		</PageHeader>
-
-		<InlineError message={error} ondismiss={() => (error = '')} />
-		<InlineError message={toggleEnabled.error} ondismiss={toggleEnabled.clear} />
-		<InlineError title="Test not sent" message={sendTest.error} ondismiss={sendTest.clear} />
-		<SuccessAlert message={testSummary} ondismiss={() => (testResults = [])} />
-		{#if testResults.some((r) => !r.ok)}
-			<div
-				role="alert"
-				class="space-y-1 rounded-sm border border-warn/40 bg-warn/10 px-3 py-2.5 text-sm text-warn"
-			>
-				<p class="font-semibold">Some channels didn't receive the test</p>
-				<ul class="space-y-0.5">
-					{#each testResults as result (result.kind + result.name)}
-						<li>
-							{result.ok ? '✓' : '✕'}
-							{result.name} ({result.kind}){result.error ? `: ${result.error}` : ''}
-						</li>
-					{/each}
-				</ul>
-			</div>
-		{/if}
-
-		<LinkTabs
-			label="Alert rule sections"
-			tabs={allowedTabs(ALERT_TABS, can)}
-			active={tab}
-			href={(id) => tabHref(page.url.pathname, id, 'overview')}
-		/>
-
-		<div>
-			<!-- ── Overview tab ── -->
-			{#if tab === 'overview'}
-				<div class="space-y-4 pt-4">
-					<div class="grid grid-cols-1 gap-4 sm:grid-cols-2 [&>*]:min-w-0">
-						<!-- Status card -->
-						<div class="space-y-3 rounded border border-dotted p-4">
-							<h2
-								class="font-mono text-xs font-medium tracking-wider text-muted-foreground uppercase"
-							>
-								Status
-							</h2>
-							<div class="space-y-1 text-sm">
-								<div class="flex items-center gap-2">
-									<span class="text-muted-foreground">State:</span>
-									<StatusBadge status={rule.enabled ? 'enabled' : 'paused'} size="sm" />
-								</div>
-								<div>
-									<span class="text-muted-foreground">Last fired:</span>
-									{formatRelative(rule.last_fired_at)}
-									{#if rule.last_fired_at}
-										<span class="ml-1 font-mono text-xs text-muted-foreground">
-											({formatDate(rule.last_fired_at)})
-										</span>
-									{/if}
-								</div>
-								<div>
-									<span class="text-muted-foreground">Rule ID:</span>
-									<span class="font-mono text-xs">{rule.id}</span>
-								</div>
-								<div>
-									<span class="text-muted-foreground">Created:</span>
-									{formatDate(rule.created_at)}
-								</div>
-								<div>
-									<span class="text-muted-foreground">Updated:</span>
-									{formatDate(rule.updated_at)}
-								</div>
-							</div>
-						</div>
-
-						<!-- Condition card -->
-						<div class="space-y-3 rounded border border-dotted p-4">
-							<h2
-								class="font-mono text-xs font-medium tracking-wider text-muted-foreground uppercase"
-							>
-								Condition
-							</h2>
-							<div class="space-y-1 text-sm">
-								{#if rule.metric}
-									<div>
-										<span class="text-muted-foreground">Metric:</span>
-										{metricLabel(rule.metric)}
-									</div>
-									<div>
-										<span class="text-muted-foreground">Threshold:</span>
-										<span class="font-mono">{rule.threshold} {thresholdUnit(rule.metric)}</span>
-									</div>
-									<div>
-										<span class="text-muted-foreground">Scope:</span>
-										{#if rule.app_id}
-											{@const appId = rule.app_id}
-											{apps.find((a) => a.id === appId)?.name ?? appId.slice(0, 8)}
-										{:else}
-											Global — all apps
-										{/if}
-									</div>
-								{/if}
-								{#if rule.events.length > 0}
-									<div>
-										<span class="text-muted-foreground">Events:</span>
-										<ul class="mt-0.5 list-inside list-disc space-y-0.5 text-xs">
-											{#each rule.events as ev (ev)}
-												<li>{eventLabel(ev)}</li>
-											{/each}
-										</ul>
-									</div>
-								{/if}
-								{#if !rule.metric && rule.events.length === 0}
-									<p class="text-xs text-muted-foreground">No condition configured.</p>
-								{/if}
-							</div>
-						</div>
-
-						<!-- Notifications card -->
-						<div class="space-y-3 rounded border border-dotted p-4 sm:col-span-2">
-							<h2
-								class="font-mono text-xs font-medium tracking-wider text-muted-foreground uppercase"
-							>
-								Notifications
-							</h2>
-							<div class="space-y-3 text-sm">
-								{#if rule.has_webhook_url}
-									<div class="flex items-start gap-2">
-										<Bell class="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
-										<div class="min-w-0">
-											<p class="font-mono text-xs font-medium uppercase">Webhook</p>
-											<p class="truncate font-mono text-xs text-muted-foreground">
-												{rule.webhook_host ?? 'Saved'}
-											</p>
-										</div>
-									</div>
-								{:else}
-									<p class="text-xs text-muted-foreground">No webhook configured.</p>
-								{/if}
-
-								<div class="mt-1">
-									<p
-										class="mb-2 flex items-center gap-1.5 font-mono text-xs font-medium text-muted-foreground uppercase"
-									>
-										<Plug class="h-3.5 w-3.5" />
-										Notification Channels
-									</p>
-									<IntegrationSelector {ruleId} />
-								</div>
-							</div>
-						</div>
-					</div>
-				</div>
+	<PageHeader title={rule.name} section={ALERT_TABS.find((t) => t.id === tab)?.label}>
+		{#snippet meta()}
+			{#if !rule.enabled}
+				<StatusBadge status="paused" />
+			{:else if rule.firing > 0}
+				<StatusBadge status="firing" label={rule.firing > 1 ? `${rule.firing} firing` : 'Firing'} />
+			{:else if mutedUntil}
+				<StatusBadge status="paused" label="Muted" />
+			{:else}
+				<StatusBadge status="success" label="Watching" />
 			{/if}
-
-			<!-- ── Settings tab ── -->
-			{#if tab === 'settings' && can('settings:write')}
-				<div class="space-y-6 pt-4">
-					<InlineError message={settingsError} />
-					<SuccessAlert message={settingsSuccess} ondismiss={() => (settingsSuccess = '')} />
-
-					<div class="grid max-w-xl gap-5">
-						<!-- Name -->
-						<div class="grid gap-2">
-							<Label for="s-name">Name</Label>
-							<Input id="s-name" type="text" bind:value={settingsName} />
-						</div>
-
-						<!-- Category / Group -->
-						<div class="grid gap-2">
-							<Label>Category</Label>
-							<Select.Root
-								type="single"
-								value={settingsGroupId}
-								onValueChange={(v) => {
-									if (v) handleSettingsGroupChange(v);
-								}}
-							>
-								<Select.Trigger class="w-full">
-									{settingsGroup.label}
-								</Select.Trigger>
-								<Select.Content>
-									{#each ALERT_GROUPS as group (group.id)}
-										<Select.Item value={group.id}>{group.label}</Select.Item>
-									{/each}
-								</Select.Content>
-							</Select.Root>
-						</div>
-
-						<!-- Metric (only for groups with metrics) -->
-						{#if settingsHasMetrics}
-							<div class="grid gap-2">
-								<Label>Metric</Label>
-								<Select.Root
-									type="single"
-									value={settingsMetric || ''}
-									onValueChange={(v) => {
-										if (v) handleSettingsMetricChange(v);
-									}}
+			<StatusBadge
+				status={rule.severity}
+				tone={severityTone(rule.severity)}
+				label={SEVERITY_LABEL[rule.severity]}
+			/>
+			<span class="text-sm text-muted-foreground">{conditionSummary(rule)}</span>
+		{/snippet}
+		{#snippet actions()}
+			{#if can('settings:write')}
+				<Button
+					variant="outline"
+					size="sm"
+					onclick={() => sendTest.run()}
+					disabled={sendTest.pending}
+					aria-busy={sendTest.pending}
+				>
+					{sendTest.pending ? 'Sending test…' : 'Send test'}
+				</Button>
+				<Button
+					variant="outline"
+					size="sm"
+					onclick={() => toggleEnabled.run()}
+					disabled={toggleEnabled.pending}
+					aria-busy={toggleEnabled.pending}
+				>
+					{toggleEnabled.pending ? 'Saving…' : rule.enabled ? 'Pause' : 'Turn on'}
+				</Button>
+			{/if}
+			{#if can('apps:control') && rule.enabled}
+				{#if mutedUntil}
+					<Button
+						variant="outline"
+						size="sm"
+						onclick={() => mute.run(null)}
+						disabled={mute.pending}
+						aria-busy={mute.pending}
+					>
+						{mute.pending ? 'Unmuting…' : 'Unmute'}
+					</Button>
+				{:else}
+					<Popover.Root bind:open={muteOpen}>
+						<Popover.Trigger>
+							{#snippet child({ props })}
+								<Button {...props} variant="outline" size="sm" disabled={mute.pending}>
+									{mute.pending ? 'Muting…' : 'Mute'}
+								</Button>
+							{/snippet}
+						</Popover.Trigger>
+						<Popover.Content class="w-48 p-1" align="end">
+							<p class="px-2 py-1.5 text-xs text-muted-foreground">Mute the whole rule for</p>
+							{#each [{ l: '1 hour', m: 60 }, { l: '8 hours', m: 480 }, { l: '24 hours', m: 1440 }, { l: '7 days', m: 10_080 }] as o (o.m)}
+								<button
+									type="button"
+									class="w-full rounded-sm px-2 py-1.5 text-left text-sm hover:bg-accent focus-visible:bg-accent focus-visible:outline-none"
+									onclick={() => mute.run(o.m)}
 								>
-									<Select.Trigger class="w-full">
-										{settingsCurrentMetric?.label ?? 'Select metric'}
-									</Select.Trigger>
-									<Select.Content>
-										{#each settingsGroup.metrics as m (m.value)}
-											<Select.Item value={m.value}>{m.label}</Select.Item>
-										{/each}
-									</Select.Content>
-								</Select.Root>
-							</div>
+									{o.l}
+								</button>
+							{/each}
+						</Popover.Content>
+					</Popover.Root>
+				{/if}
+			{/if}
+		{/snippet}
+	</PageHeader>
 
-							<!-- Threshold -->
-							{#if settingsCurrentMetric}
-								<div class="grid gap-2">
-									<Label for="s-threshold">
-										Threshold
-										<span class="ml-1 font-mono text-xs text-muted-foreground">
-											({settingsCurrentMetric.unit})
-										</span>
-									</Label>
-									<Input
-										id="s-threshold"
-										type="number"
-										min="0"
-										bind:value={settingsThreshold}
-										class="font-mono"
-									/>
-								</div>
-							{/if}
-						{/if}
+	<InlineError message={toggleEnabled.error} ondismiss={toggleEnabled.clear} />
+	<InlineError message={mute.error} ondismiss={mute.clear} />
+	<InlineError title="Test not sent" message={sendTest.error} ondismiss={sendTest.clear} />
+	<SuccessAlert message={testSummary} ondismiss={() => (testResults = [])} />
+	{#if testResults.some((r) => !r.ok)}
+		<InlineError
+			title="Some channels didn't receive the test"
+			message={testResults
+				.map(
+					(r) =>
+						`${r.ok ? '✓' : '✕'} ${r.name} (${CHANNEL_KIND_LABEL[r.kind as keyof typeof CHANNEL_KIND_LABEL] ?? r.kind})${r.error ? `: ${r.error}` : ''}`
+				)
+				.join('\n')}
+			ondismiss={() => (testResults = [])}
+		/>
+	{/if}
+	{#if mutedUntil}
+		<p class="text-sm text-muted-foreground">
+			Muted until {mutedUntil.toLocaleString()}: alerts still fire and show here, but nobody is
+			notified.
+		</p>
+	{/if}
 
-						<!-- Event checkboxes (only for groups with events) -->
-						{#if settingsHasEvents}
-							<div class="grid gap-2">
-								<Label>Events</Label>
-								<div class="space-y-2 rounded border border-border p-3">
-									{#each settingsGroup.events as ev (ev.value)}
-										<div class="flex items-center gap-2">
-											<Checkbox
-												id={`s-ev-${ev.value}`}
-												checked={settingsEvents.has(ev.value)}
-												onCheckedChange={() => toggleSettingsEvent(ev.value)}
-											/>
-											<label for={`s-ev-${ev.value}`} class="cursor-pointer text-sm">
-												{ev.label}
-											</label>
-										</div>
-									{/each}
-								</div>
-								<p class="text-xs text-muted-foreground">
-									Alert fires when any of the selected events occur.
-								</p>
-							</div>
-						{/if}
+	<LinkTabs
+		label="Alert rule sections"
+		tabs={allowedTabs(ALERT_TABS, can)}
+		active={tab}
+		href={(id) => tabHref(page.url.pathname, id, 'overview')}
+	/>
 
-						<!-- Webhook URL -->
-						<div class="grid gap-2">
-							<Label for="s-webhook">
-								Webhook URL
-								<span class="text-muted-foreground">(optional)</span>
-							</Label>
-							<SavedSecretField
-								id="s-webhook"
-								kind="url"
-								saved={rule.has_webhook_url}
-								savedHint={rule.webhook_host}
-								allowRemove
-								bind:value={settingsWebhookUrl}
-								bind:replacing={settingsWebhookReplacing}
-								bind:removed={settingsWebhookRemoved}
-								placeholder="https://hooks.example.com/alert"
-							/>
-							<p class="text-xs text-muted-foreground">
-								Webhook URLs often carry a token, so they are stored encrypted and never shown
-								again.
-							</p>
-						</div>
-
-						<!-- Notification channels -->
-						<div class="grid gap-2">
-							<p class="text-sm font-medium">Notification channels</p>
-							<IntegrationSelector {ruleId} />
-						</div>
-					</div>
-
-					<Button onclick={handleSaveSettings} disabled={settingsSaving} aria-busy={settingsSaving}>
-						{settingsSaving ? 'Saving…' : 'Save settings'}
-					</Button>
-
-					<!-- Danger Zone -->
-					<div class="space-y-3 rounded border border-destructive/30 p-4">
-						<h2 class="text-sm font-semibold text-destructive">Danger zone</h2>
-						<p class="text-sm text-muted-foreground">
-							Permanently delete this alert rule. This cannot be undone.
-						</p>
-						<Button
-							variant="outline"
-							size="sm"
-							class="border-destructive/50 text-destructive hover:border-destructive hover:text-destructive"
-							onclick={() => (showDeleteDialog = true)}
-						>
-							Delete rule…
-						</Button>
-					</div>
+	{#if tab === 'overview'}
+		<section class="space-y-3" aria-labelledby="now-heading">
+			<h2 id="now-heading" class="text-lg font-semibold">Right now</h2>
+			{#if active.length}
+				<ActiveAlertList
+					alerts={active}
+					showRule={false}
+					canRespond={can('apps:control')}
+					onchanged={refresh}
+					onopen={(id) => (episodeId = id)}
+				/>
+			{:else}
+				<div class="flex items-center gap-3 rounded-sm border bg-card px-4 py-4">
+					<AllClear class="size-5 shrink-0 text-success" aria-hidden="true" />
+					<p class="text-sm">
+						{rule.enabled ? 'Nothing is firing for this rule.' : 'This rule is paused.'}
+					</p>
 				</div>
 			{/if}
-		</div>
-	</div>
+		</section>
 
-	<ConfirmDialog
-		bind:open={showDeleteDialog}
-		title={`Delete ${rule.name}?`}
-		description="You won't be notified about these conditions any more. Your notification channels are kept."
-		confirmLabel="Delete rule"
-		pendingLabel="Deleting…"
-		onconfirm={handleDelete}
-	/>
-{/if}
+		<section class="grid gap-4 sm:grid-cols-2" aria-label="Rule settings">
+			<dl class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 rounded-sm border bg-card p-4 text-sm">
+				<dt class="text-muted-foreground">Watches</dt>
+				<dd>{kindLabel(rule.kind)}</dd>
+				<dt class="text-muted-foreground">Where</dt>
+				<dd>
+					{#if rule.kind === 'disk_usage' || rule.kind === 'disk_forecast'}Server
+					{:else if rule.kind === 'cert_expiry'}Every certificate
+					{:else if rule.kind === 'backup_failed'}Backups
+					{:else if rule.kind === 'cron_failed'}Every cron job
+					{:else if rule.app_id}<a
+							href={`/apps/${rule.app_id}`}
+							class="underline underline-offset-2">{rule.app_name ?? 'One app'}</a
+						>
+					{:else}Every app{/if}
+				</dd>
+				<dt class="text-muted-foreground">Fires after</dt>
+				<dd>{optionLabel(FOR_OPTIONS, rule.for_secs)}</dd>
+				<dt class="text-muted-foreground">Reminders</dt>
+				<dd>{optionLabel(REPEAT_OPTIONS, rule.repeat_secs)}</dd>
+			</dl>
+			<div class="space-y-2 rounded-sm border bg-card p-4 text-sm">
+				<h3 class="text-muted-foreground">Notifies</h3>
+				{#if linked.length}
+					<ul class="space-y-1">
+						{#each linked as c (c.id)}
+							<li class="flex flex-wrap items-center justify-between gap-2">
+								<span>{c.name}</span>
+								<span class="text-xs text-muted-foreground">
+									{CHANNEL_KIND_LABEL[c.kind]}{c.enabled ? '' : ' · switched off'}
+								</span>
+								{#if c.last_error}
+									<span class="w-full text-xs break-words text-destructive">
+										Last delivery failed: {c.last_error}
+									</span>
+								{/if}
+							</li>
+						{/each}
+					</ul>
+				{:else}
+					<p>
+						{rule.integration_ids.length} channel{rule.integration_ids.length === 1 ? '' : 's'}
+					</p>
+				{/if}
+			</div>
+		</section>
+
+		<section class="space-y-3" aria-labelledby="rule-history-heading">
+			<h2 id="rule-history-heading" class="text-lg font-semibold">History</h2>
+			<AlertHistory ruleId={rule.id} refreshKey={historyKey} onopen={(id) => (episodeId = id)} />
+		</section>
+	{:else if tab === 'settings' && can('settings:write')}
+		<SuccessAlert message={saved} ondismiss={() => (saved = '')} timeout={4000} />
+		{#key rule.updated_at}
+			<AlertRuleForm
+				{kinds}
+				{apps}
+				{channels}
+				{rule}
+				globalQuiet={quietHours}
+				submitLabel="Save rule"
+				pendingLabel="Saving…"
+				onsubmit={save}
+			/>
+		{/key}
+
+		<section class="max-w-2xl space-y-3 rounded-sm border border-destructive/30 p-4">
+			<h2 class="text-sm font-semibold text-destructive">Danger zone</h2>
+			<p class="text-sm text-muted-foreground">Delete this rule. Its history stays for 90 days.</p>
+			<Button
+				variant="outline"
+				size="sm"
+				class="border-destructive/50 text-destructive hover:border-destructive hover:text-destructive"
+				onclick={handleDelete}
+			>
+				Delete rule…
+			</Button>
+		</section>
+	{/if}
+</div>
+
+<AlertEpisodeDialog bind:episodeId />

@@ -15,6 +15,8 @@
 	import CpuIcon from '~icons/ri/cpu-line';
 	import SettingsIcon from '~icons/ri/settings-3-line';
 	import PowerIcon from '~icons/ri/shut-down-line';
+	import AlarmIcon from '~icons/ri/alarm-warning-line';
+	import BellIcon from '~icons/ri/notification-off-line';
 
 	let { event, class: className }: { event: AppEvent; class?: string } = $props();
 
@@ -31,7 +33,9 @@
 		domain_changed: GlobeIcon,
 		resources_changed: CpuIcon,
 		config_changed: SettingsIcon,
-		control: PowerIcon
+		control: PowerIcon,
+		alert_fired: AlarmIcon,
+		alert_resolved: BellIcon
 	} as const;
 
 	const TONES = {

@@ -1108,7 +1108,9 @@ export type AppEventKind =
 	| 'domain_changed'
 	| 'resources_changed'
 	| 'config_changed'
-	| 'control';
+	| 'control'
+	| 'alert_fired'
+	| 'alert_resolved';
 
 export interface AppEvent {
 	at: string;
@@ -1911,94 +1913,212 @@ export async function getSystemSelf(): Promise<SystemSelf> {
 	return request<SystemSelf>('/system/self');
 }
 
-// ── Alert Rules ──
+// ── Alerts ──
 
-/** Valid metric identifiers for threshold-based alert rules. */
-export type AlertMetric = 'cpu' | 'memory' | 'app_down' | 'disk_usage';
+/** Rule kinds (one condition per rule). */
+export type AlertKind =
+	| 'app_down'
+	| 'crash_loop'
+	| 'oom'
+	| 'cpu'
+	| 'memory'
+	| 'http_5xx_rate'
+	| 'http_p95_latency'
+	| 'deploy_failed'
+	| 'disk_usage'
+	| 'disk_forecast'
+	| 'cert_expiry'
+	| 'backup_failed'
+	| 'cron_failed';
 
-/** Valid event slugs for event-based alert subscriptions. */
-export type AlertEvent =
-	| 'deployment_success'
-	| 'deployment_failure'
-	| 'cron_success'
-	| 'cron_failure'
-	| 'container_restart'
-	| 'container_oom';
+export type AlertSeverity = 'info' | 'warning' | 'critical';
+/** What a rule's targets are. */
+export type AlertScope = 'app' | 'host' | 'certificate' | 'backup' | 'cron';
+/** How the value is compared with the threshold ("none": a yes/no condition). */
+export type AlertComparison = 'above' | 'at_least' | 'below' | 'none';
 
-/** Groups of alert events/metrics shown in the UI. */
-export interface AlertGroup {
-	/** Internal key used as the Select value */
-	id: string;
+/** One rule kind as described by the server (GET /api/alerts/kinds). */
+export interface AlertKindInfo {
+	kind: AlertKind;
 	label: string;
-	/** Threshold-based metrics in this group */
-	metrics: { value: AlertMetric; label: string; unit: string; placeholder: number }[];
-	/** Event-based subscriptions in this group */
-	events: { value: AlertEvent; label: string }[];
+	description: string;
+	scope: AlertScope;
+	/** Unit of the threshold and value: "%", "ms", "days", "hours", "restarts" or "" */
+	unit: string;
+	comparison: AlertComparison;
+	default_threshold: number | null;
+	default_window_secs: number | null;
+	default_for_secs: number;
+	default_severity: AlertSeverity;
+	/** False while this server can't provide the data (e.g. request metrics) */
+	available: boolean;
+	unavailable_reason: string | null;
 }
-
-export const ALERT_GROUPS: AlertGroup[] = [
-	{
-		id: 'resources',
-		label: 'Resources',
-		metrics: [
-			{ value: 'cpu', label: 'CPU Usage', unit: '%', placeholder: 80 },
-			{ value: 'memory', label: 'Memory Usage', unit: '%', placeholder: 85 },
-			{ value: 'app_down', label: 'App Down', unit: 'minutes', placeholder: 5 }
-		],
-		events: []
-	},
-	{
-		id: 'server',
-		label: 'Server',
-		metrics: [{ value: 'disk_usage', label: 'Disk Usage', unit: '%', placeholder: 85 }],
-		events: []
-	},
-	{
-		id: 'deployments',
-		label: 'Deployments',
-		metrics: [],
-		events: [
-			{ value: 'deployment_success', label: 'Deployment Success' },
-			{ value: 'deployment_failure', label: 'Deployment Failure' }
-		]
-	},
-	{
-		id: 'containers',
-		label: 'Crashes',
-		metrics: [],
-		events: [
-			{ value: 'container_restart', label: 'Crashed or restarted unexpectedly' },
-			{ value: 'container_oom', label: 'Process killed for running out of memory' }
-		]
-	},
-	{
-		id: 'scheduled_tasks',
-		label: 'Scheduled Tasks',
-		metrics: [],
-		events: [
-			{ value: 'cron_success', label: 'Scheduled Task Success' },
-			{ value: 'cron_failure', label: 'Scheduled Task Failure' }
-		]
-	}
-];
 
 export interface AlertRule {
 	id: string;
-	app_id: string | null;
 	name: string;
-	/** Threshold-based metric, null for pure event-based rules */
-	metric: AlertMetric | null;
+	kind: AlertKind;
+	/** App-scoped kinds: one app, or null for every app */
+	app_id: string | null;
+	app_name: string | null;
 	threshold: number;
-	/** Whether a webhook URL is set (the URL itself is write-only) */
-	has_webhook_url: boolean;
-	/** Host of the saved webhook URL, e.g. "hooks.slack.com" */
-	webhook_host: string | null;
+	/** Look-back window in seconds (5xx rate, p95, OOM, crash loop) */
+	window_secs: number;
+	/** How long the condition must hold before the alert fires */
+	for_secs: number;
+	severity: AlertSeverity;
+	/** Re-notify while firing and unacknowledged; 0 = never */
+	repeat_secs: number;
 	enabled: boolean;
-	/** Event slugs this rule subscribes to */
-	events: AlertEvent[];
+	/** The whole rule is muted until then */
+	snoozed_until: string | null;
+	/** Linked notification channels (at least one) */
+	integration_ids: string[];
+	/** Targets firing / pending right now */
+	firing: number;
+	pending: number;
 	last_fired_at: string | null;
 	created_at: string;
 	updated_at: string;
+}
+
+export interface AlertRuleInput {
+	name: string;
+	kind: AlertKind;
+	app_id?: string | null;
+	threshold?: number;
+	window_secs?: number;
+	for_secs?: number;
+	severity?: AlertSeverity;
+	repeat_secs?: number;
+	integration_ids: string[];
+}
+
+export interface AlertRuleUpdate {
+	name?: string;
+	threshold?: number;
+	window_secs?: number;
+	for_secs?: number;
+	severity?: AlertSeverity;
+	repeat_secs?: number;
+	enabled?: boolean;
+	integration_ids?: string[];
+	/** RFC 3339 to mute the whole rule, "" to unmute */
+	snoozed_until?: string;
+}
+
+/** A pending or firing alert. */
+export interface ActiveAlert {
+	rule_id: string;
+	rule_name: string;
+	kind: AlertKind;
+	severity: AlertSeverity;
+	/** "app:<id>" | "host" | "cert:<domain>" | "backup" | "cron:<id>" */
+	target: string;
+	target_label: string;
+	app_id: string | null;
+	state: 'pending' | 'firing';
+	/** When the condition became true */
+	since: string;
+	fired_at: string | null;
+	value: number | null;
+	threshold: number;
+	unit: string;
+	comparison: AlertComparison;
+	/** History row of the firing episode */
+	episode_id: string | null;
+	acknowledged_at: string | null;
+	acknowledged_by: string | null;
+	snoozed_until: string | null;
+	snoozed_until_resolved: boolean;
+	/** Notifications of this alert that failed for good */
+	failed_deliveries: number;
+}
+
+/** One firing episode in the history. */
+export interface AlertEpisode {
+	id: string;
+	rule_id: string | null;
+	rule_name: string;
+	kind: AlertKind;
+	severity: AlertSeverity;
+	target: string;
+	target_label: string;
+	app_id: string | null;
+	threshold: number;
+	unit: string;
+	comparison: AlertComparison;
+	/** Value when it fired, and the latest one seen */
+	value: number | null;
+	last_value: number | null;
+	state: 'firing' | 'resolved';
+	pending_since: string;
+	fired_at: string;
+	resolved_at: string | null;
+	acknowledged_at: string | null;
+	acknowledged_by: string | null;
+	notifications_sent: number;
+	failed_deliveries: number;
+}
+
+export interface AlertHistoryPage {
+	episodes: AlertEpisode[];
+	total: number;
+}
+
+export interface AlertHistoryFilter {
+	rule_id?: string;
+	app_id?: string;
+	state?: 'firing' | 'resolved';
+	page?: number;
+	per_page?: number;
+}
+
+/** One notification to one channel. */
+export interface AlertDelivery {
+	id: string;
+	episode_id: string;
+	integration_id: string;
+	integration_name: string;
+	integration_kind: IntegrationKind;
+	event: 'firing' | 'repeat' | 'resolved';
+	status: 'pending' | 'sent' | 'failed' | 'skipped';
+	attempts: number;
+	/** Held back by quiet hours */
+	deferred: boolean;
+	last_error: string | null;
+	next_attempt_at: string | null;
+	sent_at: string | null;
+	created_at: string;
+}
+
+export interface AlertEpisodeDetail {
+	episode: AlertEpisode;
+	deliveries: AlertDelivery[];
+}
+
+/** A daily window when notifications wait (critical ones can bypass it). */
+export interface QuietHours {
+	enabled: boolean;
+	/** "HH:MM" */
+	start: string;
+	end: string;
+	/** IANA time zone, e.g. "Europe/Berlin" */
+	timezone: string;
+	critical_bypass: boolean;
+}
+
+/** A channel follows the global quiet hours, has none, or its own. */
+export type ChannelQuietHours =
+	{ mode: 'global' } | { mode: 'off' } | ({ mode: 'custom' } & QuietHours);
+
+export interface AlertSettings {
+	quiet_hours: QuietHours;
+}
+
+export async function listAlertKinds(): Promise<AlertKindInfo[]> {
+	return request<AlertKindInfo[]>('/alerts/kinds');
 }
 
 export async function listAlertRules(): Promise<AlertRule[]> {
@@ -2009,35 +2129,14 @@ export async function getAlertRule(id: string): Promise<AlertRule> {
 	return request<AlertRule>(`/alerts/${id}`);
 }
 
-export async function createAlertRule(data: {
-	app_id?: string;
-	name: string;
-	metric?: AlertMetric;
-	threshold?: number;
-	/** Optional webhook ('' = none). A rule needs a webhook or at least one channel. */
-	webhook_url?: string;
-	events?: AlertEvent[];
-	/** Notification channels (integration ids) to link when the rule is created. */
-	integration_ids?: string[];
-}): Promise<AlertRule> {
+export async function createAlertRule(data: AlertRuleInput): Promise<AlertRule> {
 	return request<AlertRule>('/alerts', {
 		method: 'POST',
 		body: JSON.stringify(data)
 	});
 }
 
-export async function updateAlertRule(
-	id: string,
-	data: Partial<{
-		name: string;
-		metric: AlertMetric | null;
-		threshold: number;
-		/** Omit to keep the saved URL, "" to remove it */
-		webhook_url: string;
-		enabled: boolean;
-		events: AlertEvent[];
-	}>
-): Promise<AlertRule> {
+export async function updateAlertRule(id: string, data: AlertRuleUpdate): Promise<AlertRule> {
 	return request<AlertRule>(`/alerts/${id}`, {
 		method: 'PATCH',
 		body: JSON.stringify(data)
@@ -2049,7 +2148,8 @@ export async function deleteAlertRule(id: string): Promise<void> {
 }
 
 export interface AlertChannelTestResult {
-	/** "webhook" or the integration kind ("slack", "email", …). */
+	integration_id: string;
+	/** The channel kind ("slack", "ntfy", "webhook", …) */
 	kind: string;
 	name: string;
 	ok: boolean;
@@ -2059,6 +2159,58 @@ export interface AlertChannelTestResult {
 /** Send a test message to every channel of a rule; one result per channel. */
 export async function testAlertRule(id: string): Promise<AlertChannelTestResult[]> {
 	return request<AlertChannelTestResult[]>(`/alerts/${id}/test`, { method: 'POST' });
+}
+
+/** Pending and firing alerts, firing first. */
+export async function listActiveAlerts(): Promise<ActiveAlert[]> {
+	return request<ActiveAlert[]>('/alerts/active');
+}
+
+export async function listAlertHistory(filter: AlertHistoryFilter = {}): Promise<AlertHistoryPage> {
+	const params = new URLSearchParams();
+	for (const [key, value] of Object.entries(filter)) {
+		if (value !== undefined && value !== '') params.set(key, String(value));
+	}
+	const qs = params.toString();
+	return request<AlertHistoryPage>(`/alerts/history${qs ? `?${qs}` : ''}`);
+}
+
+export async function getAlertEpisode(id: string): Promise<AlertEpisodeDetail> {
+	return request<AlertEpisodeDetail>(`/alerts/history/${id}`);
+}
+
+/** Stop repeat notifications for a firing alert. */
+export async function acknowledgeAlert(episodeId: string): Promise<void> {
+	await request(`/alerts/history/${episodeId}/acknowledge`, { method: 'POST' });
+}
+
+/** Mute one target of a rule (or the whole rule without `target`). */
+export async function snoozeAlert(
+	ruleId: string,
+	snooze: { target?: string; minutes?: number; until_resolved?: boolean }
+): Promise<void> {
+	await request(`/alerts/${ruleId}/snooze`, {
+		method: 'POST',
+		body: JSON.stringify(snooze)
+	});
+}
+
+export async function unsnoozeAlert(ruleId: string, target?: string): Promise<void> {
+	await request(`/alerts/${ruleId}/unsnooze`, {
+		method: 'POST',
+		body: JSON.stringify(target ? { target } : {})
+	});
+}
+
+export async function getAlertSettings(): Promise<AlertSettings> {
+	return request<AlertSettings>('/alerts/settings');
+}
+
+export async function updateAlertSettings(settings: AlertSettings): Promise<AlertSettings> {
+	return request<AlertSettings>('/alerts/settings', {
+		method: 'PUT',
+		body: JSON.stringify(settings)
+	});
 }
 
 // ── Audit log ──
@@ -2880,11 +3032,13 @@ export function openTerminalSession(
 
 // ── Notification Integrations ─────────────────────────────────────────────────
 
-export type IntegrationKind = 'telegram' | 'discord' | 'slack' | 'email';
+export type IntegrationKind =
+	'telegram' | 'discord' | 'slack' | 'email' | 'ntfy' | 'pushover' | 'gotify' | 'webhook';
 
-// Secret fields (bot_token, webhook_url, smtp_password) are write-only: the
-// server never returns them (see `Integration.saved_secrets`), and an update
-// that omits one, or sends "", keeps the saved value.
+// Secret fields (bot_token, webhook_url, smtp_password, topic, token,
+// user_key, app_token, signing_secret) are write-only: the server never
+// returns them (see `Integration.saved_secrets`); an update that omits one, or
+// sends "", keeps the saved value, and `null` clears an optional one.
 
 export interface TelegramConfig {
 	bot_token?: string;
@@ -2912,7 +3066,39 @@ export interface EmailConfig {
 	to_addrs: string[];
 }
 
-export type IntegrationConfig = TelegramConfig | DiscordConfig | SlackConfig | EmailConfig;
+export interface NtfyConfig {
+	server_url?: string;
+	/** Secret: on a public server the topic name is the password */
+	topic?: string;
+	/** Access token for protected topics (null clears it) */
+	token?: string | null;
+}
+
+export interface PushoverConfig {
+	user_key?: string;
+	app_token?: string;
+}
+
+export interface GotifyConfig {
+	server_url?: string;
+	app_token?: string;
+}
+
+export interface WebhookChannelConfig {
+	webhook_url?: string;
+	/** HMAC-SHA256 key for X-Tond-Signature-256 (null clears it) */
+	signing_secret?: string | null;
+}
+
+export type IntegrationConfig =
+	| TelegramConfig
+	| DiscordConfig
+	| SlackConfig
+	| EmailConfig
+	| NtfyConfig
+	| PushoverConfig
+	| GotifyConfig
+	| WebhookChannelConfig;
 
 export interface Integration {
 	id: string;
@@ -2923,17 +3109,14 @@ export interface Integration {
 	/** Secret fields that have a saved value, e.g. ["bot_token"] */
 	saved_secrets: string[];
 	enabled: boolean;
+	quiet_hours: ChannelQuietHours;
+	/** Last successful delivery */
+	last_sent_at: string | null;
+	/** Last delivery error, until a delivery succeeds again */
+	last_error: string | null;
+	last_error_at: string | null;
 	created_at: string;
 	updated_at: string;
-}
-
-export interface AlertIntegrationLink {
-	id: string;
-	rule_id: string;
-	integration_id: string;
-	integration_name: string;
-	integration_kind: IntegrationKind;
-	created_at: string;
 }
 
 // API functions
@@ -2950,6 +3133,7 @@ export async function createIntegration(data: {
 	name: string;
 	kind: IntegrationKind;
 	config: IntegrationConfig;
+	quiet_hours?: ChannelQuietHours;
 }): Promise<Integration> {
 	return request<Integration>('/integrations', {
 		method: 'POST',
@@ -2959,7 +3143,12 @@ export async function createIntegration(data: {
 
 export async function updateIntegration(
 	id: string,
-	data: { name?: string; config?: IntegrationConfig; enabled?: boolean }
+	data: {
+		name?: string;
+		config?: IntegrationConfig;
+		enabled?: boolean;
+		quiet_hours?: ChannelQuietHours;
+	}
 ): Promise<Integration> {
 	return request<Integration>(`/integrations/${id}`, {
 		method: 'PATCH',
@@ -2973,26 +3162,6 @@ export async function deleteIntegration(id: string): Promise<void> {
 
 export async function testIntegration(id: string): Promise<{ message: string }> {
 	return request<{ message: string }>(`/integrations/${id}/test`, { method: 'POST' });
-}
-
-// Alert ↔ integration links
-
-export async function listAlertIntegrations(ruleId: string): Promise<AlertIntegrationLink[]> {
-	return request<AlertIntegrationLink[]>(`/alerts/${ruleId}/integrations`);
-}
-
-export async function linkAlertIntegration(
-	ruleId: string,
-	integrationId: string
-): Promise<{ id: string; rule_id: string; integration_id: string }> {
-	return request(`/alerts/${ruleId}/integrations`, {
-		method: 'POST',
-		body: JSON.stringify({ integration_id: integrationId })
-	});
-}
-
-export async function unlinkAlertIntegration(ruleId: string, integrationId: string): Promise<void> {
-	await request(`/alerts/${ruleId}/integrations/${integrationId}`, { method: 'DELETE' });
 }
 
 // ── Storage Providers ─────────────────────────────────────────────────────────
