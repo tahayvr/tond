@@ -1,14 +1,14 @@
 // handlers/users.rs — user management (admins: `users:admin`)
 //
 // Routes:
-//   GET    /api/users                          — every user, with live session counts
-//   POST   /api/users                          — invite: email + role → one-time set-password link (24 h)
-//   PATCH  /api/users/{id}                     — change role and/or disable / enable
-//   DELETE /api/users/{id}                     — delete (never yourself, never the last admin)
-//   POST   /api/users/{id}/password-link       — new set-password link (reset)
-//   GET    /api/users/{id}/sessions            — a user's live sessions
-//   DELETE /api/users/{id}/sessions            — sign a user out everywhere
-//   DELETE /api/users/{id}/sessions/{session}  — revoke one session
+//   GET    /api/v1/users                          — every user, with live session counts
+//   POST   /api/v1/users                          — invite: email + role → one-time set-password link (24 h)
+//   PATCH  /api/v1/users/{id}                     — change role and/or disable / enable
+//   DELETE /api/v1/users/{id}                     — delete (never yourself, never the last admin)
+//   POST   /api/v1/users/{id}/password-link       — new set-password link (reset)
+//   GET    /api/v1/users/{id}/sessions            — a user's live sessions
+//   DELETE /api/v1/users/{id}/sessions            — sign a user out everywhere
+//   DELETE /api/v1/users/{id}/sessions/{session}  — revoke one session
 //
 // Changing a role or disabling an account signs the user out everywhere.
 // Their API tokens don't need rewriting: a token's scopes are capped by its
@@ -98,7 +98,7 @@ fn is_valid_email(email: &str) -> bool {
         && email.len() <= 254
 }
 
-// ── GET /api/users ──
+// ── GET /api/v1/users ──
 
 pub async fn list_users(
     _rate: RateLimit,
@@ -136,7 +136,7 @@ pub async fn list_users(
     Ok((StatusCode::OK, Json(ApiResponse::ok(body))))
 }
 
-// ── POST /api/users ──
+// ── POST /api/v1/users ──
 
 pub async fn create_user(
     _rate: RateLimit,
@@ -197,7 +197,7 @@ pub async fn create_user(
     ))
 }
 
-// ── PATCH /api/users/{id} ──
+// ── PATCH /api/v1/users/{id} ──
 
 pub async fn update_user(
     _rate: RateLimit,
@@ -294,7 +294,7 @@ pub async fn update_user(
     ))
 }
 
-// ── DELETE /api/users/{id} ──
+// ── DELETE /api/v1/users/{id} ──
 
 pub async fn delete_user(
     _rate: RateLimit,
@@ -339,7 +339,7 @@ pub async fn delete_user(
     ))
 }
 
-// ── POST /api/users/{id}/password-link ──
+// ── POST /api/v1/users/{id}/password-link ──
 
 pub async fn create_password_link(
     _rate: RateLimit,
@@ -375,7 +375,7 @@ pub async fn create_password_link(
     ))
 }
 
-// ── GET /api/users/{id}/sessions ──
+// ── GET /api/v1/users/{id}/sessions ──
 
 pub async fn list_user_sessions(
     _rate: RateLimit,
@@ -389,7 +389,7 @@ pub async fn list_user_sessions(
     Ok((StatusCode::OK, Json(ApiResponse::ok(sessions))))
 }
 
-// ── DELETE /api/users/{id}/sessions ──
+// ── DELETE /api/v1/users/{id}/sessions ──
 
 pub async fn revoke_user_sessions(
     _rate: RateLimit,
@@ -419,7 +419,7 @@ pub async fn revoke_user_sessions(
     ))
 }
 
-// ── DELETE /api/users/{id}/sessions/{session_id} ──
+// ── DELETE /api/v1/users/{id}/sessions/{session_id} ──
 
 pub async fn revoke_user_session(
     _rate: RateLimit,

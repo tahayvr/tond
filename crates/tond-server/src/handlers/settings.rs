@@ -1,11 +1,11 @@
-// handlers/settings.rs — GET and PUT /api/settings
+// handlers/settings.rs — GET and PUT /api/v1/settings
 //
 // Settings are held in memory in AppState.settings (Arc<RwLock<ServerSettings>>)
 // and persisted to the `settings` table so that tond-proxy (a separate process)
 // can read them from the DB on restart.
 //
-//   get_settings()    GET  /api/settings — return a snapshot of the in-memory settings
-//   update_settings() PUT  /api/settings — patch one or more keys; write-through to DB
+//   get_settings()    GET  /api/v1/settings — return a snapshot of the in-memory settings
+//   update_settings() PUT  /api/v1/settings — patch one or more keys; write-through to DB
 //
 // upload_max_bytes caps uploaded source archives (see upload.rs); it must be
 // between 1 MiB and 64 GiB.

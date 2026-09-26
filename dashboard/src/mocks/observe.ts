@@ -407,36 +407,36 @@ function validate(body: UptimeCheckUpdate): string | null {
 }
 
 export const observeHandlers = [
-	http.get('/api/system/host', async () => {
+	http.get('/api/v1/system/host', async () => {
 		await delay(LATENCY);
 		const overview = makeMockHostOverview();
 		overview.disk = mockDisk();
 		return ok(overview);
 	}),
 
-	http.get('/api/system/host/history', async ({ request }) => {
+	http.get('/api/v1/system/host/history', async ({ request }) => {
 		await delay(LATENCY);
 		const range = (new URL(request.url).searchParams.get('range') ?? '24h') as MetricsRange;
 		if (!(range in SPANS)) return err(`range must be one of 1h, 24h, 7d, 30d (got '${range}')`);
 		return ok(makeMockHostHistory(range));
 	}),
 
-	http.get('/api/system/host/forecast', async () => {
+	http.get('/api/v1/system/host/forecast', async () => {
 		await delay(LATENCY);
 		return ok(makeMockHostOverview().forecast);
 	}),
 
-	http.post('/api/system/disk/refresh', async () => {
+	http.post('/api/v1/system/disk/refresh', async () => {
 		await delay(1200);
 		return ok({ ...mockDisk(), collected_at: now() });
 	}),
 
-	http.get('/api/system/disk/cleanup', async () => {
+	http.get('/api/v1/system/disk/cleanup', async () => {
 		await delay(900);
 		return ok(mockCleanupPreview());
 	}),
 
-	http.post('/api/system/disk/cleanup', async () => {
+	http.post('/api/v1/system/disk/cleanup', async () => {
 		await delay(1500);
 		const preview = mockCleanupPreview();
 		const result = {
@@ -455,12 +455,12 @@ export const observeHandlers = [
 		return ok(result);
 	}),
 
-	http.get('/api/system/heartbeat', async () => {
+	http.get('/api/v1/system/heartbeat', async () => {
 		await delay(LATENCY);
 		return ok(heartbeat);
 	}),
 
-	http.put('/api/system/heartbeat', async ({ request }) => {
+	http.put('/api/v1/system/heartbeat', async ({ request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as HeartbeatUpdate;
 		if (body.url !== undefined && body.url !== '') {
@@ -501,14 +501,14 @@ export const observeHandlers = [
 		return ok(heartbeat);
 	}),
 
-	http.post('/api/system/heartbeat/test', async () => {
+	http.post('/api/v1/system/heartbeat/test', async () => {
 		await delay(700);
 		if (!heartbeat.configured) return err('Add a heartbeat URL first, then send a test ping');
 		heartbeat = { ...heartbeat, last_ok_at: now() };
 		return ok({ outcome: 'sent', status: 200, heartbeat });
 	}),
 
-	http.get('/api/uptime', async () => {
+	http.get('/api/v1/uptime', async () => {
 		await delay(LATENCY);
 		const rows: UptimeSummary[] = checks.map((c) => {
 			const d = describe(c);
@@ -528,12 +528,12 @@ export const observeHandlers = [
 		return ok(rows);
 	}),
 
-	http.get('/api/system/uptime', async () => {
+	http.get('/api/v1/system/uptime', async () => {
 		await delay(LATENCY);
 		return ok(describe(checks[0]));
 	}),
 
-	http.put('/api/system/uptime', async ({ request }) => {
+	http.put('/api/v1/system/uptime', async ({ request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as UptimeCheckUpdate;
 		const problem = validate(body);
@@ -542,19 +542,19 @@ export const observeHandlers = [
 		return ok(describe(checks[0]));
 	}),
 
-	http.post('/api/system/uptime/check', async () => {
+	http.post('/api/v1/system/uptime/check', async () => {
 		await delay(900);
 		return ok(describe(checks[0]));
 	}),
 
-	http.get('/api/apps/:id/uptime', async ({ params }) => {
+	http.get('/api/v1/apps/:id/uptime', async ({ params }) => {
 		await delay(LATENCY);
 		const check = findAppCheck(params.id as string);
 		if (check === undefined) return err('App not found', 404);
 		return ok(check ? describe(check) : noCheck());
 	}),
 
-	http.put('/api/apps/:id/uptime', async ({ params, request }) => {
+	http.put('/api/v1/apps/:id/uptime', async ({ params, request }) => {
 		await delay(LATENCY);
 		const check = findAppCheck(params.id as string);
 		if (check === undefined) return err('App not found', 404);
@@ -566,7 +566,7 @@ export const observeHandlers = [
 		return ok(describe(check));
 	}),
 
-	http.post('/api/apps/:id/uptime/check', async ({ params }) => {
+	http.post('/api/v1/apps/:id/uptime/check', async ({ params }) => {
 		await delay(1100);
 		const check = findAppCheck(params.id as string);
 		if (check === undefined) return err('App not found', 404);

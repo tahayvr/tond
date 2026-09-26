@@ -230,7 +230,7 @@ mod tests {
 
     #[test]
     fn body_less_cookie_post_without_csrf_header_is_rejected() {
-        // e.g. POST /api/apps/{id}/deploy from a preview page.
+        // e.g. POST /api/v1/apps/{id}/deploy from a preview page.
         let h = headers(&[COOKIE]);
         assert_eq!(
             check_request(&Method::POST, &h, DASH),

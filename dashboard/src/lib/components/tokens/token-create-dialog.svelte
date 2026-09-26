@@ -179,7 +179,7 @@
 			<div class="space-y-1 text-xs text-muted-foreground">
 				<p>Use it as a bearer token:</p>
 				<pre
-					class="rounded-md border border-border bg-muted/40 px-3 py-2 font-mono break-all whitespace-pre-wrap">curl -H "Authorization: Bearer $TOND_TOKEN" {origin}/api/apps</pre>
+					class="rounded-md border border-border bg-muted/40 px-3 py-2 font-mono break-all whitespace-pre-wrap">curl -H "Authorization: Bearer $TOND_TOKEN" {origin}/api/v1/apps</pre>
 			</div>
 			<Dialog.Footer>
 				<Button onclick={() => (open = false)}>I've stored it</Button>

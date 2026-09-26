@@ -72,6 +72,7 @@ pub struct Integration {
 // ── Typed config variants ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TelegramConfig {
     pub bot_token: String,
     pub chat_id: String,
@@ -80,16 +81,19 @@ pub struct TelegramConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DiscordConfig {
     pub webhook_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SlackConfig {
     pub webhook_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct EmailConfig {
     pub from_name: String,
     pub from_addr: String,
@@ -107,6 +111,7 @@ fn default_ntfy_server() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct NtfyConfig {
     #[serde(default = "default_ntfy_server")]
     pub server_url: String,
@@ -117,18 +122,21 @@ pub struct NtfyConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PushoverConfig {
     pub user_key: String,
     pub app_token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct GotifyConfig {
     pub server_url: String,
     pub app_token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WebhookConfig {
     pub webhook_url: String,
     /// HMAC-SHA256 key for `X-Tond-Signature-256`
@@ -138,6 +146,7 @@ pub struct WebhookConfig {
 
 /// Strongly-typed config parsed from the `config` JSON column.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum IntegrationConfig {
     Telegram(TelegramConfig),
@@ -172,6 +181,7 @@ impl IntegrationConfig {
 /// Outbound representation of an integration — the non-secret config fields,
 /// the names of the secret fields that are saved, and `enabled` as a bool.
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct IntegrationResponse {
     pub id: String,
     pub name: String,
@@ -235,8 +245,9 @@ impl From<Integration> for IntegrationResponse {
 
 // ── Request bodies ───────────────────────────────────────────────────────────
 
-/// POST /api/integrations
+/// POST /api/v1/integrations
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreateIntegrationRequest {
     pub name: String,
     /// One of `INTEGRATION_KINDS`
@@ -247,8 +258,9 @@ pub struct CreateIntegrationRequest {
     pub quiet_hours: Option<crate::ChannelQuietHours>,
 }
 
-/// PATCH /api/integrations/:id — all fields optional
+/// PATCH /api/v1/integrations/:id — all fields optional
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateIntegrationRequest {
     pub name: Option<String>,
     pub config: Option<serde_json::Value>,

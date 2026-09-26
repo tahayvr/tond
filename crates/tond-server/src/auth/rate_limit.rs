@@ -400,7 +400,7 @@ mod tests {
 
     fn parts_with(peer: Option<&str>, xff: Option<&str>) -> Parts {
         let mut parts = Request::builder()
-            .uri("/api/auth/login")
+            .uri("/api/v1/auth/login")
             .body(())
             .unwrap_or_else(|err| panic!("failed to build request: {err}"))
             .into_parts()

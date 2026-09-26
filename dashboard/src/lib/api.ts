@@ -163,7 +163,7 @@ export interface TemplateCatalogEntry {
 /** A user's role. Admin is the owner; see `Role::scopes` on the server. */
 export type Role = 'admin' | 'deployer' | 'viewer';
 
-/** A permission, e.g. `apps:deploy` (full list: GET /api/tokens/catalog). */
+/** A permission, e.g. `apps:deploy` (full list: GET /api/v1/tokens/catalog). */
 export type Scope = string;
 
 export interface User {
@@ -195,7 +195,8 @@ interface ApiResponse<T> {
 	code?: string;
 }
 
-const BASE = '/api';
+/** Versioned API root (the OpenAPI spec is at `${BASE}/openapi.json`). */
+export const BASE = '/api/v1';
 
 /**
  * Sent on every API request. The server requires it on cookie-authenticated
@@ -787,7 +788,7 @@ export interface RoleInfo {
 	scopes: Scope[];
 }
 
-/** Everything the token form needs, from GET /api/tokens/catalog. */
+/** Everything the token form needs, from GET /api/v1/tokens/catalog. */
 export interface TokenCatalog {
 	groups: ScopeGroupInfo[];
 	presets: TokenPreset[];
@@ -1478,7 +1479,7 @@ export interface WebhookUrls {
 
 export interface WebhookConfig {
 	app_id: string;
-	/** Paths relative to the server origin, e.g. `/api/webhooks/github/<uuid>` */
+	/** Paths relative to the server origin, e.g. `/api/v1/webhooks/github/<uuid>` */
 	paths: WebhookUrls;
 	/** Absolute URLs when the dashboard domain is configured, else null */
 	urls: WebhookUrls | null;
@@ -2013,7 +2014,7 @@ export function accessLogDownloadUrl(appId: string): string {
 	return `${BASE}/apps/${encodeURIComponent(appId)}/access-log/download`;
 }
 
-// ── Tond measuring itself (GET /api/system/self) ──
+// ── Tond measuring itself (GET /api/v1/system/self) ──
 
 /** Health of one background loop of tond-server or tond-proxy. */
 export interface LoopStats {
@@ -2091,7 +2092,7 @@ export async function getSystemSelf(): Promise<SystemSelf> {
 	return request<SystemSelf>('/system/self');
 }
 
-// ── Host history, disk, Docker (GET /api/system/host…) ──
+// ── Host history, disk, Docker (GET /api/v1/system/host…) ──
 
 export interface Filesystem {
 	mount: string;
@@ -2449,7 +2450,7 @@ export type AlertScope = 'app' | 'host' | 'certificate' | 'backup' | 'cron';
 /** How the value is compared with the threshold ("none": a yes/no condition). */
 export type AlertComparison = 'above' | 'at_least' | 'below' | 'none';
 
-/** One rule kind as described by the server (GET /api/alerts/kinds). */
+/** One rule kind as described by the server (GET /api/v1/alerts/kinds). */
 export interface AlertKindInfo {
 	kind: AlertKind;
 	label: string;
@@ -3301,7 +3302,7 @@ export async function listCronJobRuns(
 
 // ── Log streaming (WebSocket) ──────────────────────────────────────────────
 //
-// The backend sends JSON frames over a WebSocket at /api/apps/{id}/logs/stream.
+// The backend sends JSON frames over a WebSocket at /api/v1/apps/{id}/logs/stream.
 //
 // Frame types:
 //   { type: "snapshot", deploy_logs: DeployLog[], container_logs: {ts: string|null, line: string}[] }
@@ -3409,7 +3410,7 @@ function emitCronRun(
  * tond-server restarted). Returns a `close()` function — call it in $effect
  * cleanup.
  *
- * Pass a relative URL like `/api/apps/{id}/logs/stream`; it will be resolved
+ * Pass a relative URL like `/api/v1/apps/{id}/logs/stream`; it will be resolved
  * to `ws://` or `wss://` automatically based on the current page protocol.
  */
 export function openLogStream(path: string, callbacks: LogStreamCallbacks): () => void {
@@ -3843,4 +3844,4 @@ export async function updateBackupConfig(config: Partial<BackupConfig>): Promise
 		body: JSON.stringify(config)
 	});
 }
-// Download: window.open(`/api/snapshots/${id}/download`) — no fetch wrapper needed
+// Download: window.open(`/api/v1/snapshots/${id}/download`) — no fetch wrapper needed

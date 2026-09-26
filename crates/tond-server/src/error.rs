@@ -58,6 +58,7 @@ pub fn code_for_status(status: StatusCode) -> &'static str {
         413 => code::PAYLOAD_TOO_LARGE,
         429 => code::RATE_LIMITED,
         503 => code::SERVICE_UNAVAILABLE,
+        400..=499 => code::INVALID_INPUT,
         _ => code::INTERNAL,
     }
 }

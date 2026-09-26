@@ -1,18 +1,18 @@
 // handlers/terminal.rs — browser terminal: host shell and container exec
 //
-// Two kinds of sessions, both over a WebSocket (`/api/terminal/ws`):
+// Two kinds of sessions, both over a WebSocket (`/api/v1/terminal/ws`):
 //
 //   * Container exec (`docker exec` into a running app or database) — for app
 //     debugging. Needs the `terminal:host` scope (admins).
 //   * Host shell (`su -l $TOND_TERMINAL_USER`) — off by default. It can only be
 //     switched on from the host itself (`tond settings host-terminal on`, which
-//     calls PUT /api/settings/host-terminal over the root-only Unix socket),
+//     calls PUT /api/v1/settings/host-terminal over the root-only Unix socket),
 //     so no dashboard session or API token can enable it. When on, it needs the
 //     `terminal:host` scope (admins) and every session needs step-up
 //     re-authentication: the password, plus a TOTP code when 2FA is enabled.
 //
 // Opening a session is two steps. The dashboard first POSTs to
-// /api/terminal/tickets with its session cookie (and the step-up credentials
+// /api/v1/terminal/tickets with its session cookie (and the step-up credentials
 // for the host shell); the server returns a single-use ticket valid for 30
 // seconds, bound to the user, the target and the requesting dashboard origin.
 // The WebSocket then presents `?ticket=`; the ticket is consumed atomically and
@@ -70,6 +70,7 @@ const TICKET_TTL_SECS: i64 = 30;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalTargetKind {
     Server,
@@ -108,8 +109,9 @@ pub struct TerminalTargetResponse {
     pub requires_step_up: bool,
 }
 
-/// Body of POST /api/terminal/tickets.
+/// Body of POST /api/v1/terminal/tickets.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct TerminalTicketRequest {
     pub target_kind: TerminalTargetKind,
     pub target_id: String,
@@ -128,12 +130,14 @@ pub struct TerminalTicketResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct TerminalWsQuery {
     pub ticket: String,
 }
 
-/// Body of PUT /api/settings/host-terminal, and the GET response.
+/// Body of PUT /api/v1/settings/host-terminal, and the GET response.
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct HostTerminalSetting {
     pub enabled: bool,
 }
@@ -214,7 +218,7 @@ pub async fn host_terminal_enabled(db: &sqlx::SqlitePool) -> Result<bool, sqlx::
     Ok(value.as_deref() == Some("on"))
 }
 
-// ── GET /api/settings/host-terminal ──
+// ── GET /api/v1/settings/host-terminal ──
 
 pub async fn get_host_terminal(
     _rate: RateLimit,
@@ -228,7 +232,7 @@ pub async fn get_host_terminal(
     ))
 }
 
-// ── PUT /api/settings/host-terminal ──
+// ── PUT /api/v1/settings/host-terminal ──
 // Only accepted on the root-only Unix socket (`tond settings host-terminal`).
 
 pub async fn set_host_terminal(
@@ -280,7 +284,7 @@ pub async fn set_host_terminal(
         .into_response()
 }
 
-// ── POST /api/terminal/tickets ──
+// ── POST /api/v1/terminal/tickets ──
 
 pub async fn create_ticket(
     _rate: RateLimit,
@@ -470,7 +474,7 @@ async fn redeem_ticket(
     })
 }
 
-// ── GET /api/terminal/ws?ticket=… ──
+// ── GET /api/v1/terminal/ws?ticket=… ──
 
 pub async fn terminal_ws(
     ws: WebSocketUpgrade,

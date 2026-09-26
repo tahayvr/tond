@@ -59,6 +59,7 @@ impl From<&TondError> for ApiErrorBody {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(bound(deserialize = "T: DeserializeOwned"))]
 pub struct ApiResponse<T: Serialize> {
     pub success: bool,

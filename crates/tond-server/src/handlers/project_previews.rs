@@ -9,17 +9,17 @@
 // project preview is refused with a 400.
 //
 // Routes (all require RateLimit + an Authz scope, see each handler):
-//   POST   /api/projects/{id}/previews
+//   POST   /api/v1/projects/{id}/previews
 //     Create a project preview: insert one project_previews row, then for
 //     every member app insert a preview_deployments row linked via
 //     project_preview_id and spawn a background build. Returns 202 with the
 //     ProjectPreviewResponse (status will be "building" initially).
 //
-//   GET    /api/projects/{id}/previews
+//   GET    /api/v1/projects/{id}/previews
 //     List all non-expired project previews with their child deployments and
 //     the aggregated status.
 //
-//   DELETE /api/projects/{id}/previews/{preview_id}
+//   DELETE /api/v1/projects/{id}/previews/{preview_id}
 //     Stop all child containers, mark child rows as 'expired', delete the
 //     project_previews row.
 
@@ -99,7 +99,7 @@ fn random_slug() -> String {
     generate_raw_key()[..12].to_string()
 }
 
-// ── POST /api/projects/{id}/previews ─────────────────────────────────────────
+// ── POST /api/v1/projects/{id}/previews ─────────────────────────────────────────
 
 /// Create a project-level preview environment.
 /// Inserts one `project_previews` row and one `preview_deployments` row per
@@ -273,7 +273,7 @@ pub async fn create_project_preview(
     (StatusCode::ACCEPTED, Json(ApiResponse::ok(resp))).into_response()
 }
 
-// ── GET /api/projects/{id}/previews ──────────────────────────────────────────
+// ── GET /api/v1/projects/{id}/previews ──────────────────────────────────────────
 
 /// List all non-expired project previews (with child deployment rows and
 /// aggregated status) for a project.
@@ -323,7 +323,7 @@ pub async fn list_project_previews(
     (StatusCode::OK, Json(ApiResponse::ok(responses))).into_response()
 }
 
-// ── DELETE /api/projects/{id}/previews/{preview_id} ──────────────────────────
+// ── DELETE /api/v1/projects/{id}/previews/{preview_id} ──────────────────────────
 
 /// Stop all child containers, mark child preview_deployments as 'expired',
 /// and delete the project_previews row.

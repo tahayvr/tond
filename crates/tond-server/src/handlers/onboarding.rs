@@ -410,7 +410,7 @@ mod tests {
         session_token: &str,
     ) -> Authz<scope::AppsRead> {
         let mut parts = axum::http::Request::builder()
-            .uri("/api/onboarding/status")
+            .uri("/api/v1/onboarding/status")
             .body(())
             .unwrap_or_else(|err| panic!("failed to build onboarding test request: {err}"))
             .into_parts()

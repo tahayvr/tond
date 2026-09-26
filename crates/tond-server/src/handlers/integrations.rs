@@ -1,12 +1,12 @@
 // handlers/integrations.rs — Notification integration CRUD + test
 //
 // Routes:
-//   GET    /api/integrations              — list all integrations
-//   GET    /api/integrations/:id          — get single integration
-//   POST   /api/integrations              — create integration
-//   PATCH  /api/integrations/:id          — update integration (partial)
-//   DELETE /api/integrations/:id          — delete integration (cascades links)
-//   POST   /api/integrations/:id/test     — send a test notification
+//   GET    /api/v1/integrations              — list all integrations
+//   GET    /api/v1/integrations/:id          — get single integration
+//   POST   /api/v1/integrations              — create integration
+//   PATCH  /api/v1/integrations/:id          — update integration (partial)
+//   DELETE /api/v1/integrations/:id          — delete integration (cascades links)
+//   POST   /api/v1/integrations/:id/test     — send a test notification
 //
 // Secret config fields (bot tokens, webhook URLs, SMTP passwords, API tokens)
 // are stored encrypted and never returned: responses list them in

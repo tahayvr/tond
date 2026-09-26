@@ -22,7 +22,7 @@
 //   verifiable and the pruning itself is on the record.
 //
 //   `verify` walks the chain from the checkpoint; exposed as
-//   GET /api/audit-log/verify and `tond audit verify`.
+//   GET /api/v1/audit-log/verify and `tond audit verify`.
 //
 //   Limits: truncating the newest rows can't be detected from inside the
 //   database. Shipping every entry to a remote syslog server or webhook

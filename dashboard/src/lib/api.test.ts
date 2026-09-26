@@ -177,7 +177,7 @@ describe('api request helper (headers and bodies)', () => {
 		await listApps();
 
 		const { url, init, headers } = lastRequest();
-		expect(url).toBe('/api/apps');
+		expect(url).toBe('/api/v1/apps');
 		expect(init.credentials).toBe('same-origin');
 		expect(headers.get(CSRF_HEADER)).toBe('1');
 		expect(headers.get('Content-Type')).toBe('application/json');
@@ -216,7 +216,7 @@ describe('api request helper (headers and bodies)', () => {
 
 		expect(ticket.ticket).toBe('t');
 		const { url, init } = lastRequest();
-		expect(url).toBe('/api/terminal/tickets');
+		expect(url).toBe('/api/v1/terminal/tickets');
 		expect(JSON.parse(init.body as string)).toEqual({
 			target_kind: 'server',
 			target_id: 'server',

@@ -1,7 +1,7 @@
 // procstat.rs — cheap process self-measurement from /proc (Linux only)
 //
 // Used by tond-server and tond-proxy to report their own resource use
-// (GET /api/system/self, /metrics, the proxy's `stats` control request).
+// (GET /api/v1/system/self, /metrics, the proxy's `stats` control request).
 // Everything is read on demand from /proc/self; nothing runs in the
 // background. On other platforms (macOS dev machines) every value is None.
 
@@ -13,6 +13,7 @@ const CLOCK_TICKS: f64 = 100.0;
 
 /// One snapshot of this process's resource use.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ProcessSample {
     /// Resident set size in bytes.
     pub rss_bytes: Option<u64>,

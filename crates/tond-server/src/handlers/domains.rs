@@ -1,6 +1,6 @@
 // handlers/domains.rs — live DNS check for the dashboard's domain card
 //
-// GET /api/domains/check?domain=app.example.com
+// GET /api/v1/domains/check?domain=app.example.com
 //
 //   Resolves the domain (A/AAAA), compares the answer with this server's
 //   public addresses (tond_common::dns, the same logic tond-proxy uses before
@@ -47,6 +47,7 @@ const DNS_TIMEOUT: Duration = Duration::from_secs(3);
 const PUBLIC_IP_TTL: Duration = Duration::from_secs(3600);
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct DomainCheckQuery {
     pub domain: String,
 }

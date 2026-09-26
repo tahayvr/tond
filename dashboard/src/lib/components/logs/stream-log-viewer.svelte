@@ -8,7 +8,7 @@
 	import LogViewer from '$lib/components/logs/log-viewer.svelte';
 
 	interface Props {
-		/** e.g. `/api/databases/{id}/logs/stream` */
+		/** e.g. `/api/v1/databases/{id}/logs/stream` */
 		wsUrl: string;
 		downloadName: string;
 		label: string;

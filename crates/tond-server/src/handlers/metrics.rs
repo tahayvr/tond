@@ -1,15 +1,15 @@
 // handlers/metrics.rs — resource metric endpoints
 //
 // Routes:
-//   GET /api/apps/{id}/metrics?range=1h|24h|7d|30d
-//   GET /api/databases/{id}/metrics?range=…
-//   GET /api/cron/{id}/metrics?range=…
+//   GET /api/v1/apps/{id}/metrics?range=1h|24h|7d|30d
+//   GET /api/v1/databases/{id}/metrics?range=…
+//   GET /api/v1/cron/{id}/metrics?range=…
 //     Downsampled series (≤ 480 buckets, rates computed server-side), the
 //     restarts / crashes / OOM kills in the window and the latest sample.
 //     `{id}` may be the id or the name. Compose apps are the sum of their
 //     services.
 //
-//   GET /api/system/metrics
+//   GET /api/v1/system/metrics
 //     Host CPU / memory / disk (the filesystem holding the data directory)
 //     from the collector's cache — no sampling or sleeping in the request.
 

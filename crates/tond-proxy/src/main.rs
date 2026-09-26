@@ -1448,7 +1448,7 @@ mod tests {
 
     #[test]
     fn dashboard_forwarding_headers_replace_client_supplied_values() {
-        let mut req = pingora::http::RequestHeader::build("POST", b"/api/auth/login", None)
+        let mut req = pingora::http::RequestHeader::build("POST", b"/api/v1/auth/login", None)
             .unwrap_or_else(|err| panic!("failed to build request header: {err}"));
         req.insert_header("X-Forwarded-For", "1.2.3.4")
             .unwrap_or_else(|err| panic!("{err}"));

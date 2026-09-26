@@ -8,16 +8,16 @@
 // registrable domain from the dashboard (see domains.rs). Without a preview
 // domain, creating or enabling previews is refused with a 400.
 //
-//   POST   /api/apps/{id}/preview
+//   POST   /api/v1/apps/{id}/preview
 //     Build the app's image (same source as a regular deploy) and start a
 //     container named `tond-preview-{slug}`. Returns a PreviewDeploymentResponse
 //     with the preview URL. Runs in background; returns 202 immediately.
 //     Body (optional): { "ttl_hours": 24 }
 //
-//   GET    /api/apps/{id}/previews
+//   GET    /api/v1/apps/{id}/previews
 //     List all non-expired preview deployments for an app.
 //
-//   DELETE /api/apps/{id}/previews/{preview_id}
+//   DELETE /api/v1/apps/{id}/previews/{preview_id}
 //     Stop and remove the preview container, mark the row as 'expired'.
 
 use axum::{
@@ -61,7 +61,7 @@ fn random_slug() -> String {
     generate_raw_key()[..12].to_string()
 }
 
-// ── POST /api/apps/{id}/preview ─────────────────────────────────────────────
+// ── POST /api/v1/apps/{id}/preview ─────────────────────────────────────────────
 
 /// Create a preview deployment for an app.
 /// Spawns a background task that builds the image and starts the container.
@@ -198,7 +198,7 @@ pub async fn create_preview(
         .into_response()
 }
 
-// ── GET /api/apps/{id}/previews ─────────────────────────────────────────────
+// ── GET /api/v1/apps/{id}/previews ─────────────────────────────────────────────
 
 /// List active (non-expired) preview deployments for an app.
 pub async fn list_previews(
@@ -242,7 +242,7 @@ pub async fn list_previews(
     (StatusCode::OK, Json(ApiResponse::ok(responses))).into_response()
 }
 
-// ── DELETE /api/apps/{id}/previews/{preview_id} ─────────────────────────────
+// ── DELETE /api/v1/apps/{id}/previews/{preview_id} ─────────────────────────────
 
 /// Stop and remove a specific preview deployment.
 pub async fn delete_preview(
@@ -319,7 +319,7 @@ pub async fn delete_preview(
         .into_response()
 }
 
-// ── PUT /api/apps/{id}/preview-config ────────────────────────────────────────
+// ── PUT /api/v1/apps/{id}/preview-config ────────────────────────────────────────
 
 /// Enable or disable PR preview deployments for an app.
 /// Body: `{ "preview_enabled": true }`

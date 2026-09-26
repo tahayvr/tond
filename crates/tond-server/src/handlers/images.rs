@@ -1,6 +1,6 @@
 // handlers/images.rs — Docker image inspection for the new-app wizard
 //
-// POST /api/images/inspect
+// POST /api/v1/images/inspect
 //   Body: { "image": "nginx:alpine", "registry_credential_id"?: "..." }
 //   Pulls the image if it isn't on the server yet (the first deploy needs it
 //   anyway, so the pull is not wasted) and reports the ports its config
@@ -28,6 +28,7 @@ use crate::{
 const PULL_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct InspectImageRequest {
     pub image: String,
     pub registry_credential_id: Option<String>,

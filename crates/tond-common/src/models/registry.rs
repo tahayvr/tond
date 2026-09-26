@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 /// via the API — only `id`, `name`, `server`, `username`, and timestamps are
 /// exposed.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RegistryCredential {
     pub id: String,
     pub name: String,
@@ -24,6 +25,7 @@ pub struct RegistryCredential {
 
 /// API view — password never included.
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RegistryCredentialResponse {
     pub id: String,
     pub name: String,
@@ -46,8 +48,9 @@ impl From<RegistryCredential> for RegistryCredentialResponse {
     }
 }
 
-/// POST /api/registry-credentials request body
+/// POST /api/v1/registry-credentials request body
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreateRegistryCredentialRequest {
     pub name: String,
     pub server: String,
@@ -55,8 +58,9 @@ pub struct CreateRegistryCredentialRequest {
     pub password: String,
 }
 
-/// PUT /api/apps/{id}/registry-credential request body
+/// PUT /api/v1/apps/{id}/registry-credential request body
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SetRegistryCredentialRequest {
     /// Pass `null` to detach
     pub registry_credential_id: Option<String>,

@@ -1,5 +1,5 @@
 <!--
-  UptimeList — every uptime check at a glance (GET /api/uptime): status and
+  UptimeList — every uptime check at a glance (GET /api/v1/uptime): status and
   uptime over 24 h / 7 d / 30 d, each app linking to its Uptime tab.
 -->
 <script lang="ts">

@@ -15,20 +15,20 @@
 // Handler summary:
 //
 //   health()            GET  /health              — liveness probe, no auth
-//   list_apps()         GET  /api/apps             — all apps ordered by created_at
-//   get_app()           GET  /api/apps/{id}        — single app by ID or name
-//   create_app()        POST /api/apps             — validate name, insert, 409 on duplicate
-//   delete_app()        DEL  /api/apps/{id}        — remove container (best-effort) then DB row
-//   deploy_app()        POST /api/apps/{id}/deploy — spawns background deploy task, returns 202
-//   stop_app()          POST /api/apps/{id}/stop   — Docker stop + set status=stopped
-//   start_app()         POST /api/apps/{id}/start  — Docker start + set status=running
-//   restart_app()       POST /api/apps/{id}/restart— sequential stop+start
-//   app_logs()          GET  /api/apps/{id}/logs   — last 50 deploy_logs + 100 container lines
+//   list_apps()         GET  /api/v1/apps             — all apps ordered by created_at
+//   get_app()           GET  /api/v1/apps/{id}        — single app by ID or name
+//   create_app()        POST /api/v1/apps             — validate name, insert, 409 on duplicate
+//   delete_app()        DEL  /api/v1/apps/{id}        — remove container (best-effort) then DB row
+//   deploy_app()        POST /api/v1/apps/{id}/deploy — spawns background deploy task, returns 202
+//   stop_app()          POST /api/v1/apps/{id}/stop   — Docker stop + set status=stopped
+//   start_app()         POST /api/v1/apps/{id}/start  — Docker start + set status=running
+//   restart_app()       POST /api/v1/apps/{id}/restart— sequential stop+start
+//   app_logs()          GET  /api/v1/apps/{id}/logs   — last 50 deploy_logs + 100 container lines
 //   (env vars live in handlers/env.rs: masked GET, PATCH, per-key reveal)
-//   update_domain()     PUT  /api/apps/{id}/domain — set domain, upsert 'pending' cert record
-//   update_port()       PUT  /api/apps/{id}/port   — container port (next deploy)
+//   update_domain()     PUT  /api/v1/apps/{id}/domain — set domain, upsert 'pending' cert record
+//   update_port()       PUT  /api/v1/apps/{id}/port   — container port (next deploy)
 //   (certificates live in handlers/certificates.rs)
-//   upload_deploy()     POST /api/apps/{id}/upload — accept .tar.gz, extract, build,
+//   upload_deploy()     POST /api/v1/apps/{id}/upload — accept .tar.gz, extract, build,
 //                                                    then deploy — all in background, returns 202
 //
 // Deploy flow for git source (triggered by deploy_app or upload_deploy):
@@ -154,6 +154,7 @@ async fn fetch_app(db: &sqlx::SqlitePool, id_or_name: &str) -> Result<App, AppEr
 // name-based lookup. When present, returns only the matching app (or 404).
 
 #[derive(Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ListAppsQuery {
     pub name: Option<String>,
 }
@@ -495,10 +496,11 @@ pub async fn create_app(
 
 // ── Validate Compose ──
 //
-// POST /api/compose/validate — lets the dashboard show compose policy problems
+// POST /api/v1/compose/validate — lets the dashboard show compose policy problems
 // under the editor while the user types, before they create the app.
 
 #[derive(Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ValidateComposeRequest {
     /// App name, used to show where bind mounts will be stored (default "app")
     pub app_name: Option<String>,
@@ -1248,8 +1250,9 @@ pub(crate) fn apply_readiness(
     Ok(())
 }
 
-/// PUT /api/apps/{id}/readiness body.
+/// PUT /api/v1/apps/{id}/readiness body.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct UpdateReadinessRequest {
     /// "http" | "tcp" | "none"
     pub readiness: String,
@@ -1257,7 +1260,7 @@ pub struct UpdateReadinessRequest {
     pub ready_after_secs: Option<i64>,
 }
 
-// PUT /api/apps/{id}/readiness
+// PUT /api/v1/apps/{id}/readiness
 // How deploys decide the new container is ready. Switching to a background
 // worker ("none") removes the app's domain and health check path: a worker
 // serves no traffic and is never routed. Takes effect on the next deploy.
@@ -1312,11 +1315,12 @@ pub async fn update_readiness(
 
 // ── Update Container Port ──
 //
-// PUT /api/apps/{id}/port  { "container_port": 80 }
+// PUT /api/v1/apps/{id}/port  { "container_port": 80 }
 // The port the app listens on inside its container (also passed as $PORT).
 // Takes effect on the next deploy.
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct UpdatePortRequest {
     pub container_port: i64,
 }
@@ -1427,7 +1431,7 @@ pub async fn upload_deploy(
 
 // ── Assign / Remove Project ──
 //
-// PUT /api/apps/{id}/project
+// PUT /api/v1/apps/{id}/project
 //   { "project_id": "<uuid>" }  — assign app to project
 //   { "project_id": null }      — remove app from project
 

@@ -2,10 +2,10 @@
 //
 // Per-app endpoints, addressed by app UUID only (never by name):
 //
-//   POST /api/webhooks/github/{app_id}   X-Hub-Signature-256: sha256=HMAC-SHA256(secret, body)
-//   POST /api/webhooks/gitlab/{app_id}   X-Gitlab-Token: <secret>   (constant-time compare)
-//   POST /api/webhooks/gitea/{app_id}    X-Gitea-Signature / X-Forgejo-Signature: hex HMAC
-//   POST /api/webhooks/generic/{app_id}  X-Tond-Signature-256: sha256=<hex HMAC>
+//   POST /api/v1/webhooks/github/{app_id}   X-Hub-Signature-256: sha256=HMAC-SHA256(secret, body)
+//   POST /api/v1/webhooks/gitlab/{app_id}   X-Gitlab-Token: <secret>   (constant-time compare)
+//   POST /api/v1/webhooks/gitea/{app_id}    X-Gitea-Signature / X-Forgejo-Signature: hex HMAC
+//   POST /api/v1/webhooks/generic/{app_id}  X-Tond-Signature-256: sha256=<hex HMAC>
 //                                        or Authorization: Bearer <secret>
 //
 // GitHub App endpoint (all repos the App is installed on):
@@ -456,7 +456,7 @@ fn extract_push_branch(body: &[u8]) -> Option<String> {
 
 // ── GitHub ─────────────────────────────────────────────────────────────────
 
-/// POST /api/webhooks/github/{app_id}
+/// POST /api/v1/webhooks/github/{app_id}
 ///
 /// Requires a valid X-Hub-Signature-256; only "push" events trigger a deploy.
 pub async fn github_webhook(
@@ -482,7 +482,7 @@ pub async fn github_webhook(
 
 // ── GitLab ─────────────────────────────────────────────────────────────────
 
-/// POST /api/webhooks/gitlab/{app_id}
+/// POST /api/v1/webhooks/gitlab/{app_id}
 ///
 /// Requires X-Gitlab-Token to equal the app's secret. "Push Hook" triggers a
 /// deploy; "Merge Request Hook" drives preview deployments.
@@ -511,7 +511,7 @@ pub async fn gitlab_webhook(
 
 // ── Gitea / Forgejo ────────────────────────────────────────────────────────
 
-/// POST /api/webhooks/gitea/{app_id}
+/// POST /api/v1/webhooks/gitea/{app_id}
 ///
 /// Requires a valid X-Gitea-Signature (or X-Forgejo-Signature); "push" events
 /// trigger a deploy.
@@ -537,7 +537,7 @@ pub async fn gitea_webhook(
 
 // ── Generic ────────────────────────────────────────────────────────────────
 
-/// POST /api/webhooks/generic/{app_id}
+/// POST /api/v1/webhooks/generic/{app_id}
 ///
 /// For CI pipelines and scripts. Authenticate with
 /// `X-Tond-Signature-256: sha256=<HMAC-SHA256(secret, body)>` or
