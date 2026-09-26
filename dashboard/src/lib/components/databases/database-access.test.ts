@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from '@testing-library/svelte';
+import { render, screen } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { App, DatabaseAccess } from '$lib/api';
@@ -16,6 +16,16 @@ const auth = vi.hoisted(() => ({ canWrite: true }));
 vi.mock('$lib/auth.svelte', () => ({
 	can: (scope: string) => auth.canWrite || !scope.endsWith(':write'),
 	isAdmin: () => auth.canWrite
+}));
+
+const confirm = vi.hoisted(() => ({
+	answer: true,
+	confirmAction: vi.fn()
+}));
+
+vi.mock('$lib/confirm.svelte', () => ({
+	// Like ConfirmHost: run onconfirm when the user confirms.
+	confirmAction: confirm.confirmAction
 }));
 
 vi.mock('$lib/api', async () => {
@@ -49,6 +59,13 @@ describe('DatabaseAccess', () => {
 		for (const fn of Object.values(api)) fn.mockReset();
 		document.body.style.pointerEvents = '';
 		auth.canWrite = true;
+		confirm.answer = true;
+		confirm.confirmAction.mockReset();
+		confirm.confirmAction.mockImplementation(async (o: { onconfirm?: () => unknown }) => {
+			if (!confirm.answer) return false;
+			await o.onconfirm?.();
+			return true;
+		});
 		api.listApps.mockResolvedValue([app('app_1', 'web'), app('app_2', 'api')]);
 	});
 
@@ -78,35 +95,33 @@ describe('DatabaseAccess', () => {
 	});
 
 	it('asks before unlinking and shows the result', async () => {
-		api.getDatabaseAccess.mockResolvedValue(access({ linked_apps: [ref('app_1', 'web')] }));
+		api.getDatabaseAccess
+			.mockResolvedValueOnce(access({ linked_apps: [ref('app_1', 'web')] }))
+			.mockResolvedValueOnce(access());
 		api.unlinkDatabaseApp.mockResolvedValue(access());
 		const user = userEvent.setup();
 		render(DatabaseAccessCard, { props: { databaseId: 'db_1', databaseName: 'main-db' } });
 
 		await user.click(await screen.findByRole('button', { name: 'Unlink web' }));
-		const dialog = await screen.findByRole('dialog');
-		expect(
-			within(dialog).getByText(/loses its connection to main-db right away/)
-		).toBeInTheDocument();
-		expect(api.unlinkDatabaseApp).not.toHaveBeenCalled();
-
-		await user.click(within(dialog).getByRole('button', { name: 'Unlink' }));
+		expect(confirm.confirmAction).toHaveBeenCalledWith(
+			expect.objectContaining({
+				title: 'Unlink web?',
+				destructive: true,
+				description: expect.stringContaining('loses its connection to main-db right away')
+			})
+		);
 		expect(api.unlinkDatabaseApp).toHaveBeenCalledWith('db_1', 'app_1');
 		expect(await screen.findByText('web can no longer reach main-db.')).toBeInTheDocument();
 	});
 
-	it('shows the server error when unlinking fails and keeps the app listed', async () => {
+	it('does nothing when the confirmation is cancelled', async () => {
+		confirm.answer = false;
 		api.getDatabaseAccess.mockResolvedValue(access({ linked_apps: [ref('app_1', 'web')] }));
-		api.unlinkDatabaseApp.mockRejectedValue(new Error('Docker error: daemon unavailable'));
 		const user = userEvent.setup();
 		render(DatabaseAccessCard, { props: { databaseId: 'db_1', databaseName: 'main-db' } });
 
 		await user.click(await screen.findByRole('button', { name: 'Unlink web' }));
-		const dialog = await screen.findByRole('dialog');
-		await user.click(within(dialog).getByRole('button', { name: 'Unlink' }));
-		await waitFor(() =>
-			expect(within(dialog).getByRole('alert')).toHaveTextContent('daemon unavailable')
-		);
+		expect(api.unlinkDatabaseApp).not.toHaveBeenCalled();
 		expect(screen.getByRole('link', { name: 'web' })).toBeInTheDocument();
 	});
 

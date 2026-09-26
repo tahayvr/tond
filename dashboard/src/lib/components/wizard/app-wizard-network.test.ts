@@ -25,7 +25,9 @@ function renderStep(props: {
 			registryCredentialId: '',
 			buildMethod: 'tbuild' as const,
 			templatePort: null,
-			portTouched: false
+			portTouched: false,
+			readiness: 'http' as const,
+			readyAfterSecs: 10
 		}
 	});
 }

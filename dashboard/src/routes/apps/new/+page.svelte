@@ -14,6 +14,7 @@
 		getSystemMetrics,
 		type DatabaseCredentials,
 		type DeployStarted,
+		type Readiness,
 		type Project,
 		type RegistryCredential,
 		type TemplateCatalogEntry,
@@ -85,6 +86,11 @@
 	let containerPort = $state(8080);
 	/** The user typed a port; detected ports no longer overwrite it. */
 	let portTouched = $state(false);
+	/** Web app (http), TCP service (tcp) or background worker (none). */
+	let readiness = $state<Readiness>('http');
+	/** Background workers: seconds the new container must stay up. */
+	let readyAfterSecs = $state(10);
+	let isWorker = $derived(readiness === 'none');
 	let autoDeploy = $state(false);
 	/** Branch to deploy; auto-deploy watches it too. Empty until the repo's default is known. */
 	let branch = $state('');
@@ -321,6 +327,13 @@
 	}
 
 	function validateNetworkStep(): boolean {
+		if (isWorker) {
+			if (!Number.isInteger(readyAfterSecs) || readyAfterSecs < 1 || readyAfterSecs > 600) {
+				error = 'Enter how long the worker must stay up (1-600 seconds)';
+				return false;
+			}
+			return true;
+		}
 		if (!Number.isInteger(containerPort) || containerPort < 1 || containerPort > 65535) {
 			error = 'Enter the port your app listens on (1-65535)';
 			return false;
@@ -440,14 +453,18 @@
 				container_port: containerPort,
 				...(apiSourceType === 'git' ? { build_method: buildMethod } : {}),
 				...(sourceUrl.trim() ? { source_url: sourceUrl.trim() } : {}),
-				...(domain.trim() ? { domain: domain.trim() } : {}),
+				...(domain.trim() && !isWorker ? { domain: domain.trim() } : {}),
+				readiness,
+				...(isWorker ? { ready_after_secs: readyAfterSecs } : {}),
 				...(templateProjectId || effectiveProjectId
 					? { project_id: templateProjectId ?? effectiveProjectId }
 					: {}),
 				...(isGitSource
 					? { branch: deployBranch, auto_deploy: autoDeploy, watch_branch: deployBranch }
 					: {}),
-				...(healthCheckPath.trim() ? { health_check_path: healthCheckPath.trim() } : {}),
+				...(healthCheckPath.trim() && readiness === 'http'
+					? { health_check_path: healthCheckPath.trim() }
+					: {}),
 				health_check_interval: healthCheckInterval,
 				health_failure_threshold: healthFailureThreshold,
 				drain_timeout: drainTimeout,
@@ -660,6 +677,8 @@
 					bind:drainTimeout
 					bind:containerPort
 					bind:portTouched
+					bind:readiness
+					bind:readyAfterSecs
 					{sourceSubType}
 					{sourceUrl}
 					{dockerfileContent}
@@ -699,6 +718,8 @@
 					{composeContent}
 					{buildMethod}
 					{containerPort}
+					{readiness}
+					{readyAfterSecs}
 					{autoDeploy}
 					branch={isGitSource ? branch || templateSourceRef : ''}
 					{baseDir}

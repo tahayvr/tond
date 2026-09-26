@@ -115,11 +115,72 @@ pub struct App {
     pub base_dir: Option<String>,
     /// 1 = serve final build output as a static site; 0 = run as a process
     pub static_build: i64,
+    /// How a deploy decides the new container is ready: "http" | "tcp" | "none"
+    /// (see [`Readiness`])
+    #[sqlx(default)]
+    pub readiness: String,
+    /// For readiness "none": seconds the container must stay up
+    #[sqlx(default)]
+    pub ready_after_secs: i64,
     pub created_at: String,
     pub updated_at: String,
 }
 
+/// Default for [`App::ready_after_secs`].
+pub const DEFAULT_READY_AFTER_SECS: i64 = 10;
+/// Bounds for [`App::ready_after_secs`].
+pub const READY_AFTER_SECS_RANGE: std::ops::RangeInclusive<i64> = 1..=600;
+
+/// How a deploy decides a new container is ready to take over.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Readiness {
+    /// The health check path answers 2xx, or (without one) any HTTP answer on
+    /// the container port. Web apps; routed by domain.
+    #[default]
+    Http,
+    /// The container port accepts TCP connections. Non-HTTP services.
+    Tcp,
+    /// Background worker: no port, no domain, never routed. Ready once the
+    /// container has stayed up for `ready_after_secs` without exiting.
+    None,
+}
+
+impl Readiness {
+    /// Parse a stored value; anything unknown is `Http` (the old behaviour).
+    pub fn parse(value: &str) -> Self {
+        Self::from_input(value).unwrap_or(Readiness::Http)
+    }
+
+    /// Parse user input strictly.
+    pub fn from_input(value: &str) -> Option<Self> {
+        match value {
+            "http" => Some(Readiness::Http),
+            "tcp" => Some(Readiness::Tcp),
+            "none" => Some(Readiness::None),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Readiness::Http => "http",
+            Readiness::Tcp => "tcp",
+            Readiness::None => "none",
+        }
+    }
+
+    /// Whether the app serves traffic (gets a domain and a route).
+    pub fn serves_traffic(self) -> bool {
+        self != Readiness::None
+    }
+}
+
 impl App {
+    /// This app's readiness mode.
+    pub fn readiness(&self) -> Readiness {
+        Readiness::parse(&self.readiness)
+    }
+
     pub fn new(
         name: String,
         source_type: String,
@@ -166,6 +227,8 @@ impl App {
             compose_content: None,
             base_dir: None,
             static_build: 0,
+            readiness: Readiness::Http.as_str().to_string(),
+            ready_after_secs: DEFAULT_READY_AFTER_SECS,
             created_at: now.clone(),
             updated_at: now,
         }
@@ -222,6 +285,12 @@ pub struct CreateAppRequest {
     /// Serve build output as a static site (default false)
     #[serde(default)]
     pub static_build: bool,
+    /// "http" (default) | "tcp" | "none" (background worker: no port, no domain)
+    #[serde(default)]
+    pub readiness: Option<String>,
+    /// For readiness "none": seconds the container must stay up (default 10)
+    #[serde(default)]
+    pub ready_after_secs: Option<i64>,
 }
 
 fn default_port() -> i64 {
@@ -288,6 +357,12 @@ pub struct AppResponse {
     pub base_dir: Option<String>,
     /// Whether the build output is served as a static site
     pub static_build: bool,
+    /// "http" | "tcp" | "none" (background worker)
+    #[serde(default)]
+    pub readiness: String,
+    /// For readiness "none": seconds the container must stay up
+    #[serde(default)]
+    pub ready_after_secs: i64,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -330,6 +405,8 @@ impl From<App> for AppResponse {
             compose_content: app.compose_content,
             base_dir: app.base_dir,
             static_build: app.static_build != 0,
+            readiness: Readiness::parse(&app.readiness).as_str().to_string(),
+            ready_after_secs: app.ready_after_secs,
             created_at: app.created_at,
             updated_at: app.updated_at,
             domain_warning: None,
@@ -608,6 +685,11 @@ mod tests {
             "new apps have no explicit memory cap (the host default applies)"
         );
         assert_eq!(app.cpu_limit, None, "new apps may use every CPU");
+        assert_eq!(app.readiness(), Readiness::Http, "new apps are web apps");
+        assert_eq!(app.ready_after_secs, DEFAULT_READY_AFTER_SECS);
+        assert_eq!(Readiness::parse("bogus"), Readiness::Http);
+        assert_eq!(Readiness::from_input("bogus"), None);
+        assert!(!Readiness::None.serves_traffic());
         assert_eq!(
             app.env_vars.as_deref(),
             Some("{}"),

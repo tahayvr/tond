@@ -14,7 +14,9 @@
 	import { Badge } from '$lib/components/ui/badge/index.js';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Skeleton } from '$lib/components/ui/skeleton/index.js';
-	import * as Dialog from '$lib/components/ui/dialog/index.js';
+	import InlineError from '$lib/components/feedback/inline-error.svelte';
+	import SuccessAlert from '$lib/components/feedback/success-alert.svelte';
+	import { confirmAction } from '$lib/confirm.svelte';
 	import * as Select from '$lib/components/ui/select/index.js';
 	import { untrack } from 'svelte';
 	import { can } from '$lib/auth.svelte';
@@ -42,10 +44,6 @@
 
 	/** Linking changes network reach on both sides: db:write + apps:write. */
 	let canLink = $derived(can('db:write') && can('apps:write'));
-
-	let unlinkTarget = $state<DatabaseAppRef | null>(null);
-	let unlinkOpen = $state(false);
-	let unlinking = $state(false);
 
 	let endpoint = $derived(access ? `${access.internal_host}:${access.internal_port}` : '');
 
@@ -98,25 +96,22 @@
 		}
 	}
 
-	function openUnlink(app: DatabaseAppRef) {
-		unlinkTarget = app;
+	async function handleUnlink(app: DatabaseAppRef) {
 		actionError = '';
-		unlinkOpen = true;
-	}
-
-	async function handleConfirmUnlink() {
-		if (!unlinkTarget) return;
-		unlinking = true;
-		actionError = '';
-		try {
-			access = await unlinkDatabaseApp(databaseId, unlinkTarget.id);
-			notice = `${unlinkTarget.name} can no longer reach ${databaseName}.`;
-			unlinkOpen = false;
-		} catch (e: any) {
-			actionError = e.message ?? `Could not unlink ${unlinkTarget.name}`;
-		} finally {
-			unlinking = false;
-		}
+		notice = '';
+		const done = await confirmAction({
+			title: `Unlink ${app.name}?`,
+			description: `${app.name} loses its connection to ${databaseName} right away. Open connections are cut, and requests that need the database fail until you link it again.`,
+			confirmLabel: 'Unlink',
+			pendingLabel: 'Unlinking…',
+			destructive: true,
+			onconfirm: async () => {
+				await unlinkDatabaseApp(databaseId, app.id);
+			}
+		});
+		if (!done) return;
+		access = await getDatabaseAccess(databaseId);
+		notice = `${app.name} can no longer reach ${databaseName}.`;
 	}
 </script>
 
@@ -136,15 +131,13 @@
 			<Skeleton class="h-10 w-full" />
 		</div>
 	{:else if loadError && !access}
-		<div
-			class="space-y-2 rounded bg-destructive/10 px-3 py-2 text-sm text-destructive"
-			role="alert"
-		>
-			<p>{loadError}</p>
-			<Button variant="outline" size="sm" onclick={load}>
-				<RefreshIcon class="size-3.5" /> Retry
-			</Button>
-		</div>
+		<InlineError message={loadError}>
+			{#snippet actions()}
+				<Button variant="outline" size="sm" onclick={load}>
+					<RefreshIcon class="size-3.5" /> Retry
+				</Button>
+			{/snippet}
+		</InlineError>
 	{:else if access}
 		<p class="text-sm text-muted-foreground">
 			Every app runs on its own network. Only the apps below can reach
@@ -154,24 +147,8 @@
 				: ': link an app to give it access'}.
 		</p>
 
-		{#if notice}
-			<p class="rounded bg-success/10 px-3 py-2 text-xs text-success" role="status">{notice}</p>
-		{/if}
-		{#if actionError}
-			<div
-				class="flex items-start justify-between gap-3 rounded bg-destructive/10 px-3 py-2 text-xs text-destructive"
-				role="alert"
-			>
-				<p>{actionError}</p>
-				<button
-					type="button"
-					class="shrink-0 underline-offset-2 hover:underline"
-					onclick={() => (actionError = '')}
-				>
-					Dismiss
-				</button>
-			</div>
-		{/if}
+		<SuccessAlert message={notice} timeout={6000} ondismiss={() => (notice = '')} />
+		<InlineError message={actionError} ondismiss={() => (actionError = '')} />
 
 		{#if hasAccess}
 			<ul class="divide-y divide-border rounded border border-border">
@@ -197,7 +174,7 @@
 								size="sm"
 								class="h-7 text-muted-foreground hover:text-destructive"
 								aria-label={`Unlink ${app.name}`}
-								onclick={() => openUnlink(app)}
+								onclick={() => handleUnlink(app)}
 							>
 								<LinkUnlinkIcon class="size-3.5" /> Unlink
 							</Button>
@@ -243,28 +220,3 @@
 		</p>
 	{/if}
 </div>
-
-<Dialog.Root bind:open={unlinkOpen}>
-	<Dialog.Content class="sm:max-w-md">
-		<Dialog.Header>
-			<Dialog.Title>Unlink {unlinkTarget?.name}?</Dialog.Title>
-			<Dialog.Description>
-				{unlinkTarget?.name} loses its connection to {databaseName} right away. Open connections are cut,
-				and requests that need the database will fail until you link it again.
-			</Dialog.Description>
-		</Dialog.Header>
-		{#if actionError}
-			<p class="rounded bg-destructive/10 px-3 py-2 text-xs text-destructive" role="alert">
-				{actionError}
-			</p>
-		{/if}
-		<Dialog.Footer>
-			<Button variant="outline" onclick={() => (unlinkOpen = false)} disabled={unlinking}>
-				Cancel
-			</Button>
-			<Button variant="destructive" onclick={handleConfirmUnlink} disabled={unlinking}>
-				{unlinking ? 'Unlinking…' : 'Unlink'}
-			</Button>
-		</Dialog.Footer>
-	</Dialog.Content>
-</Dialog.Root>

@@ -1,4 +1,4 @@
-import { render, screen, within } from '@testing-library/svelte';
+import { render, screen } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AppDatabaseAccess, ManagedDatabase } from '$lib/api';
@@ -17,6 +17,16 @@ const auth = vi.hoisted(() => ({ canWrite: true }));
 vi.mock('$lib/auth.svelte', () => ({
 	can: (scope: string) => auth.canWrite || !scope.endsWith(':write'),
 	isAdmin: () => auth.canWrite
+}));
+
+const confirm = vi.hoisted(() => ({
+	answer: true,
+	confirmAction: vi.fn()
+}));
+
+vi.mock('$lib/confirm.svelte', () => ({
+	// Like ConfirmHost: run onconfirm when the user confirms.
+	confirmAction: confirm.confirmAction
 }));
 
 vi.mock('$lib/api', async () => {
@@ -57,6 +67,13 @@ describe('AppDatabases', () => {
 		for (const fn of Object.values(api)) fn.mockReset();
 		document.body.style.pointerEvents = '';
 		auth.canWrite = true;
+		confirm.answer = true;
+		confirm.confirmAction.mockReset();
+		confirm.confirmAction.mockImplementation(async (o: { onconfirm?: () => unknown }) => {
+			if (!confirm.answer) return false;
+			await o.onconfirm?.();
+			return true;
+		});
 		api.listDatabases.mockResolvedValue([db('db_1', 'main'), db('db_2', 'cache')]);
 		api.listProjects.mockResolvedValue([{ id: 'p1', name: 'shop' }]);
 	});
@@ -91,9 +108,9 @@ describe('AppDatabases', () => {
 		renderTab();
 
 		await user.click(await screen.findByRole('button', { name: 'Unlink cache' }));
-		const dialog = await screen.findByRole('dialog');
-		await user.click(within(dialog).getByRole('button', { name: 'Unlink' }));
-
+		expect(confirm.confirmAction).toHaveBeenCalledWith(
+			expect.objectContaining({ title: 'Unlink cache?', destructive: true })
+		);
 		expect(api.unlinkDatabaseApp).toHaveBeenCalledWith('db_2', 'app_1');
 		expect(await screen.findByText('web can no longer reach cache.')).toBeInTheDocument();
 	});
