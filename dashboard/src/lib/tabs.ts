@@ -133,6 +133,13 @@ export const CRON_TABS: readonly TabDef<CronTab>[] = [
 	{ id: 'settings', label: 'Settings' }
 ];
 
+export type AlertsPageTab = 'alerts' | 'rules' | 'settings';
+export const ALERTS_PAGE_TABS: readonly TabDef<AlertsPageTab>[] = [
+	{ id: 'alerts', label: 'Alerts' },
+	{ id: 'rules', label: 'Rules' },
+	{ id: 'settings', label: 'Quiet hours' }
+];
+
 export type AlertTab = 'overview' | 'settings';
 export const ALERT_TABS: readonly TabDef<AlertTab>[] = [
 	{ id: 'overview', label: 'Overview' },

@@ -990,22 +990,87 @@ TZ_CODE=$(api_req POST /api/cron '{"name":"e2e-bad-tz","schedule":"0 3 * * *","i
 [[ "$TZ_CODE" == 400 ]] || fail "creating a cron job with an unknown time zone should be 400, got $TZ_CODE"
 pass "schedule preview uses Mon-Fri for 1-5 in the job's time zone; unknown zones are rejected"
 
-NO_CHANNEL=$(api_req POST /api/alerts '{"name":"e2e-nobody","events":["deployment_failure"]}')
+NO_CHANNEL=$(api_req POST /api/alerts '{"name":"e2e-nobody","kind":"deploy_failed"}')
 [[ "$NO_CHANNEL" == 400 ]] || fail "an alert rule that notifies nobody should be 400, got $NO_CHANNEL"
-RULE_CODE=$(api_req POST /api/alerts '{"name":"e2e-events","events":["deployment_failure"],"webhook_url":"http://127.0.0.1:9/unreachable"}')
-[[ "$RULE_CODE" == 201 ]] || fail "an event-only rule with a webhook should be created, got $RULE_CODE: $(cat "$API_BODY")"
+CH_CODE=$(api_req POST /api/integrations '{"name":"e2e-unreachable","kind":"webhook","config":{"webhook_url":"http://127.0.0.1:9/unreachable"}}')
+[[ "$CH_CODE" == 201 ]] || fail "a webhook channel should be created, got $CH_CODE: $(cat "$API_BODY")"
+UNREACHABLE_ID=$(jq -r '.data.id' "$API_BODY")
+RULE_CODE=$(api_req POST /api/alerts "{\"name\":\"e2e-deploys\",\"kind\":\"deploy_failed\",\"integration_ids\":[\"${UNREACHABLE_ID}\"]}")
+[[ "$RULE_CODE" == 201 ]] || fail "a deploy-failed rule with a channel should be created, got $RULE_CODE: $(cat "$API_BODY")"
 RULE_ID=$(jq -r '.data.id' "$API_BODY")
 TEST_CODE=$(api_req POST "/api/alerts/${RULE_ID}/test" '')
 [[ "$TEST_CODE" == 200 ]] || fail "send-test should answer 200, got $TEST_CODE"
 jq -e '.data | length == 1 and .[0].kind == "webhook" and .[0].ok == false and (.[0].error | length > 0)' "$API_BODY" > /dev/null \
     || fail "send-test should report the unreachable webhook: $(cat "$API_BODY")"
+api /api/integrations | jq -e --arg id "$UNREACHABLE_ID" '.data[] | select(.id == $id and (.last_error | length > 0))' > /dev/null \
+    || fail "a failed send must be visible on the channel"
 api_req DELETE "/api/alerts/${RULE_ID}" '' > /dev/null
-pass "alert rules need a channel; event-only rules work; send-test reports each channel"
+api_req DELETE "/api/integrations/${UNREACHABLE_ID}" '' > /dev/null
+pass "alert rules need a channel; send-test reports each channel; failures show on the channel"
 
 ONBOARDING=$(api /api/onboarding/status)
 jq -e '.data.has_successful_deploy == true and .data.last_deployment.app_name != null and (.data | has("has_source_integration") and has("has_notification_channel"))' \
     <<<"$ONBOARDING" > /dev/null || fail "onboarding status should report the checklist and last deploy: $ONBOARDING"
 pass "onboarding status reports the first-run checklist and the latest deployment"
+
+step "Alert engine: an alert fires, notifies a signed webhook and resolves"
+# A tiny local receiver stores every POST body (and its signature header);
+# a memory rule on e2e-whoami at a near-zero threshold fires on the next
+# metrics tick, then raising the threshold resolves it.
+if command -v python3 > /dev/null; then
+    HOOK_DIR=$(mktemp -d)
+    python3 -c '
+import http.server, os, sys
+d = sys.argv[1]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        n = len([f for f in os.listdir(d) if f.endswith(".json")])
+        open(os.path.join(d, "%03d.sig" % n), "w").write(self.headers.get("X-Tond-Signature-256", ""))
+        open(os.path.join(d, "%03d.json" % n), "wb").write(body)
+        self.send_response(200)
+        self.end_headers()
+    def log_message(self, *args):
+        pass
+http.server.HTTPServer(("127.0.0.1", 18099), H).serve_forever()
+' "$HOOK_DIR" &
+    HOOK_PID=$!
+    wait_for 10 "the local webhook receiver" bash -c "curl -s -o /dev/null -X POST -d '{}' http://127.0.0.1:18099/probe"
+    rm -f "$HOOK_DIR"/*
+    [[ "$(api_req POST /api/integrations '{"name":"e2e-signed-hook","kind":"webhook","config":{"webhook_url":"http://127.0.0.1:18099/hook","signing_secret":"e2e-signing-secret"}}')" == 201 ]] \
+        || fail "the signed webhook channel should be created: $(cat "$API_BODY")"
+    HOOK_ID=$(jq -r '.data.id' "$API_BODY")
+    jq -e '.data.saved_secrets | index("signing_secret") and index("webhook_url")' "$API_BODY" > /dev/null \
+        || fail "the channel's secrets must be write-only: $(cat "$API_BODY")"
+    [[ "$(api_req POST /api/alerts "{\"name\":\"e2e-memory\",\"kind\":\"memory\",\"app_id\":\"${WHOAMI_ID}\",\"threshold\":0.001,\"for_secs\":0,\"severity\":\"critical\",\"integration_ids\":[\"${HOOK_ID}\"]}")" == 201 ]] \
+        || fail "the memory rule should be created: $(cat "$API_BODY")"
+    MEM_RULE=$(jq -r '.data.id' "$API_BODY")
+    wait_for 120 "the firing notification" bash -c "grep -l '\"event\":\"firing\"' '$HOOK_DIR'/*.json"
+    FIRED=$(grep -l '"event":"firing"' "$HOOK_DIR"/*.json | head -1)
+    jq -e --arg rule "$MEM_RULE" '.version == 1 and .alert.rule_id == $rule and .alert.target_label == "e2e-whoami" and .alert.severity == "critical" and .alert.value > 0' "$FIRED" > /dev/null \
+        || fail "the firing payload must describe the alert: $(cat "$FIRED")"
+    if command -v openssl > /dev/null; then
+        EXPECTED="sha256=$(openssl dgst -sha256 -hmac e2e-signing-secret -hex < "$FIRED" | awk '{print $NF}')"
+        [[ "$(cat "${FIRED%.json}.sig")" == "$EXPECTED" ]] || fail "the webhook signature must be HMAC-SHA256 of the body"
+    fi
+    api /api/alerts/active | jq -e --arg rule "$MEM_RULE" '.data[] | select(.rule_id == $rule and .state == "firing" and .target == "app:'"${WHOAMI_ID}"'")' > /dev/null \
+        || fail "the alert must be listed as firing"
+    pass "memory alert fired and a signed notification arrived"
+
+    [[ "$(api_req PATCH "/api/alerts/${MEM_RULE}" '{"threshold":100}')" == 200 ]] || fail "raising the threshold should work: $(cat "$API_BODY")"
+    wait_for 120 "the resolved notification" bash -c "grep -l '\"event\":\"resolved\"' '$HOOK_DIR'/*.json"
+    api "/api/alerts/history?rule_id=${MEM_RULE}" | jq -e '.data.total == 1 and .data.episodes[0].state == "resolved" and .data.episodes[0].notifications_sent >= 2' > /dev/null \
+        || fail "history must show the resolved episode with its notifications: $(api "/api/alerts/history?rule_id=${MEM_RULE}")"
+    [[ "$(api /api/alerts/active | jq --arg rule "$MEM_RULE" '[.data[] | select(.rule_id == $rule)] | length')" == 0 ]] \
+        || fail "a resolved alert must leave the active list"
+    api_req DELETE "/api/alerts/${MEM_RULE}" '' > /dev/null
+    api_req DELETE "/api/integrations/${HOOK_ID}" '' > /dev/null
+    kill "$HOOK_PID" 2> /dev/null || true
+    rm -rf "$HOOK_DIR"
+    pass "the alert resolved, sent a resolve notification and is in the history"
+else
+    echo "  - python3 not available; skipping the alert fire/resolve check"
+fi
 
 step "Container confinement"
 # Every container Tond starts: ports on 127.0.0.1 only (Docker's iptables rules

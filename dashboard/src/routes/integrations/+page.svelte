@@ -13,6 +13,10 @@
 	import Send from '~icons/ri/send-plane-line';
 	import Webhook from '~icons/ri/webhook-line';
 	import Mail from '~icons/ri/mail-line';
+	import NtfyIcon from '~icons/ri/notification-badge-line';
+	import PhoneIcon from '~icons/ri/smartphone-line';
+	import GotifyIcon from '~icons/ri/notification-2-line';
+	import CodeIcon from '~icons/ri/code-s-slash-line';
 	import { setUiContext, clearUiContext, integrationsContext } from '$lib/ui-context.svelte';
 	import type { PageProps } from './$types';
 
@@ -65,7 +69,11 @@
 	function channelDetails(kind: IntegrationKind) {
 		const items = integrations.filter((i) => i.kind === kind);
 		if (items.length === 0) return [];
-		return [{ label: 'Configured', value: String(items.length) }];
+		const failing = items.filter((i) => i.last_error).length;
+		return [
+			{ label: 'Configured', value: String(items.length) },
+			...(failing ? [{ label: 'Failing', value: String(failing) }] : [])
+		];
 	}
 </script>
 
@@ -109,6 +117,34 @@
 				status={channelStatus('email')}
 				details={channelDetails('email')}
 				href="/integrations/email"
+			/>
+			<IntegrationCard
+				name="ntfy"
+				icon={NtfyIcon}
+				status={channelStatus('ntfy')}
+				details={channelDetails('ntfy')}
+				href="/integrations/ntfy"
+			/>
+			<IntegrationCard
+				name="Pushover"
+				icon={PhoneIcon}
+				status={channelStatus('pushover')}
+				details={channelDetails('pushover')}
+				href="/integrations/pushover"
+			/>
+			<IntegrationCard
+				name="Gotify"
+				icon={GotifyIcon}
+				status={channelStatus('gotify')}
+				details={channelDetails('gotify')}
+				href="/integrations/gotify"
+			/>
+			<IntegrationCard
+				name="Webhook"
+				icon={CodeIcon}
+				status={channelStatus('webhook')}
+				details={channelDetails('webhook')}
+				href="/integrations/webhook"
 			/>
 		</div>
 	</section>

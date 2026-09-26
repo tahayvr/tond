@@ -466,19 +466,6 @@ pub async fn latest_sample(
     }))
 }
 
-/// Highest latest-sample CPU (percent of one core) across all app targets
-/// sampled since `since`.
-pub async fn max_app_cpu_since(db: &SqlitePool, since: i64) -> sqlx::Result<Option<f64>> {
-    let v: Option<i64> = sqlx::query_scalar(
-        "SELECT MAX(cpu) FROM metrics_raw
-         WHERE target IN (SELECT id FROM metric_targets WHERE kind = 'app') AND ts >= ?",
-    )
-    .bind(since)
-    .fetch_one(db)
-    .await?;
-    Ok(v.map(|c| c as f64 / 100.0))
-}
-
 /// Hundredths of a percent → percent with one decimal.
 pub fn centi_to_percent(v: f64) -> f64 {
     (v / 10.0).round() / 10.0
@@ -623,10 +610,6 @@ mod tests {
         assert_eq!(
             latest.map(|(ts, s)| (ts, s.cpu)),
             Some((base + 39 * 30, 3000))
-        );
-        assert_eq!(
-            max_app_cpu_since(&db, base).await.ok().flatten(),
-            Some(30.0)
         );
     }
 

@@ -208,7 +208,8 @@ pub fn open_integration_config(kind: &str, stored: &str) -> Result<IntegrationCo
 /// Validate a requested integration config and return its stored form.
 ///
 /// Secret fields are write-only: one that is missing or empty in `requested`
-/// keeps the value saved in `existing` (the stored config being updated).
+/// keeps the value saved in `existing` (the stored config being updated);
+/// an explicit `null` clears it (for optional secrets such as an ntfy token).
 /// The merged config must parse as `kind`; secrets are then encrypted.
 pub fn seal_integration_config(
     kind: &str,
@@ -228,7 +229,11 @@ pub fn seal_integration_config(
         if provided {
             continue;
         }
+        let cleared = object.get(*field).is_some_and(serde_json::Value::is_null);
         object.remove(*field);
+        if cleared {
+            continue;
+        }
         if let Some(value) = saved.get(*field) {
             // Still encrypted: decrypt it for validation, re-sealed below.
             let mut one = JsonObject::new();
@@ -249,22 +254,6 @@ pub fn seal_integration_config(
         Purpose::IntegrationSecret,
     )?;
     Ok(serde_json::Value::Object(object).to_string())
-}
-
-// ── Alert rules ──────────────────────────────────────────────────────────────
-
-pub fn alert_webhook_url(stored: &str) -> Result<String> {
-    if stored.is_empty() {
-        return Ok(String::new());
-    }
-    secret_key::decrypt(Purpose::AlertWebhookUrl, stored)
-}
-
-pub fn seal_alert_webhook_url(url: &str) -> Result<String> {
-    if url.is_empty() {
-        return Ok(String::new());
-    }
-    secret_key::encrypt(Purpose::AlertWebhookUrl, url)
 }
 
 #[cfg(test)]
@@ -360,6 +349,36 @@ mod tests {
             IntegrationConfig::Telegram(cfg) => assert_eq!(cfg.bot_token, "999:NEW"),
             other => panic!("unexpected config {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_optional_secret_is_cleared_by_null_and_kept_when_omitted() {
+        let created = seal_integration_config(
+            "ntfy",
+            &serde_json::json!({ "topic": "alerts-x9", "token": "tk_1" }),
+            None,
+        )
+        .expect("create");
+        let kept =
+            seal_integration_config("ntfy", &serde_json::json!({}), Some(&created)).expect("keep");
+        match open_integration_config("ntfy", &kept).expect("open") {
+            IntegrationConfig::Ntfy(cfg) => {
+                assert_eq!(cfg.topic, "alerts-x9");
+                assert_eq!(cfg.token.as_deref(), Some("tk_1"));
+            }
+            other => panic!("unexpected config {other:?}"),
+        }
+        let cleared =
+            seal_integration_config("ntfy", &serde_json::json!({ "token": null }), Some(&kept))
+                .expect("clear");
+        match open_integration_config("ntfy", &cleared).expect("open") {
+            IntegrationConfig::Ntfy(cfg) => {
+                assert_eq!(cfg.topic, "alerts-x9", "other secrets are kept");
+                assert_eq!(cfg.token, None);
+            }
+            other => panic!("unexpected config {other:?}"),
+        }
+        assert!(!cleared.contains("alerts-x9"), "topic stored in plaintext");
     }
 
     #[test]
