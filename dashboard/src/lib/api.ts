@@ -1138,6 +1138,33 @@ export async function getAppEvents(
 	return request<AppEventsPage>(`/apps/${id}/events${query ? `?${query}` : ''}`);
 }
 
+// ── Deploy trend ──
+
+export interface DeployOutcome {
+	id: string;
+	/** "succeeded" | "failed" | "superseded" | "cancelled" */
+	status: string;
+	started_at: string;
+	duration_secs: number | null;
+	commit_sha: string | null;
+}
+
+export interface DeployStats {
+	/** Finished deployments covered (at most 30) */
+	window: number;
+	succeeded: number;
+	failed: number;
+	/** 0–1; null before the first result */
+	success_rate: number | null;
+	median_duration_secs: number | null;
+	/** Oldest first */
+	outcomes: DeployOutcome[];
+}
+
+export async function getDeployStats(id: string): Promise<DeployStats> {
+	return request<DeployStats>(`/apps/${id}/deployments/stats`);
+}
+
 // ── Deployments ──
 
 /** Steps of a deployment, in order ("release" = switch traffic, stop the old container). */

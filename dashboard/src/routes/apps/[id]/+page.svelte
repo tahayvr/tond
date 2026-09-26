@@ -1041,6 +1041,7 @@
 						onRollback={handleRollback}
 						canRollback={can('apps:rollback')}
 						onViewGeneratedDockerfile={handleViewGeneratedDockerfile}
+						sourceUrl={app.source_url}
 					/>
 				{/if}
 

@@ -2121,6 +2121,37 @@ export const handlers = [
 
 	// ── Deployments ───────────────────────────────────────────────────────────
 
+	http.get('/api/apps/:id/deployments/stats', async ({ params }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
+		if (!app) return err('App not found', 404);
+		const outcomes = Array.from({ length: 30 }, (_, i) => {
+			const status =
+				i === 7 || i === 19 || i === 20 ? 'failed' : i === 12 ? 'superseded' : 'succeeded';
+			return {
+				id: `dep_trend_${i}`,
+				status,
+				started_at: new Date(Date.now() - (30 - i) * 86_400_000).toISOString(),
+				duration_secs: 60 + ((i * 17) % 50),
+				commit_sha: (0xabc1234 + i).toString(16)
+			};
+		});
+		const succeeded = outcomes.filter((o) => o.status === 'succeeded').length;
+		const failed = outcomes.filter((o) => o.status === 'failed').length;
+		const durations = outcomes
+			.filter((o) => o.status === 'succeeded')
+			.map((o) => o.duration_secs)
+			.sort((a, b) => a - b);
+		return ok({
+			window: outcomes.length,
+			succeeded,
+			failed,
+			success_rate: succeeded / (succeeded + failed),
+			median_duration_secs: durations[Math.floor(durations.length / 2)],
+			outcomes
+		});
+	}),
+
 	http.get('/api/apps/:id/deployments', async ({ params }) => {
 		await delay(LATENCY);
 		return ok(deployments[params.id as string] ?? []);
