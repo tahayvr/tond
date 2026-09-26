@@ -88,10 +88,11 @@ export function appTabHref(appId: string, tab: AppTab, section?: AppSettingsSect
 
 // ── Database and cron pages ─────────────────────────────────────────────────
 
-export type DatabaseTab = 'overview' | 'environment' | 'settings';
+export type DatabaseTab = 'overview' | 'environment' | 'metrics' | 'settings';
 export const DATABASE_TABS: readonly TabDef<DatabaseTab>[] = [
 	{ id: 'overview', label: 'Overview' },
 	{ id: 'environment', label: 'Environment' },
+	{ id: 'metrics', label: 'Metrics' },
 	{ id: 'settings', label: 'Settings' }
 ];
 

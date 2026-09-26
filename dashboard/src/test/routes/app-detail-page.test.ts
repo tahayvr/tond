@@ -39,7 +39,7 @@ const api = vi.hoisted(() => ({
 	deletePreview: vi.fn(),
 	updatePreviewConfig: vi.fn(),
 	listOpenPRs: vi.fn(),
-	getAppMetrics: vi.fn(),
+	getMetrics: vi.fn(),
 	listRegistryCredentials: vi.fn(),
 	createRegistryCredential: vi.fn(),
 	deleteRegistryCredential: vi.fn(),
@@ -94,7 +94,7 @@ vi.mock('$lib/components/tabs/app-page/app-previews.svelte', async () => ({
 	default: (await import('../mocks/EmptyComponent.svelte')).default
 }));
 
-vi.mock('$lib/components/tabs/app-page/app-metrics.svelte', async () => ({
+vi.mock('$lib/components/metrics/time-chart.svelte', async () => ({
 	default: (await import('../mocks/EmptyComponent.svelte')).default
 }));
 
@@ -182,7 +182,16 @@ describe('apps/[id] page', () => {
 			preview_domain: 'example-previews.com'
 		});
 		api.listOpenPRs.mockResolvedValue([]);
-		api.getAppMetrics.mockResolvedValue([]);
+		api.getMetrics.mockResolvedValue({
+			range: '1h',
+			step: 30,
+			from: 0,
+			to: 3600,
+			mem_limit: null,
+			series: { t: [], cpu: [], cpu_max: [], mem: [], mem_max: [], rx: [], tx: [], pids: [] },
+			events: [],
+			current: null
+		});
 		api.listRegistryCredentials.mockResolvedValue([]);
 		api.listGitHubApps.mockResolvedValue([]);
 		api.listGitHubRepos.mockResolvedValue([]);
@@ -597,12 +606,13 @@ describe('apps/[id] page', () => {
 			renderPage();
 
 			await goToTab('?tab=metrics');
-			await vi.waitFor(() => expect(api.getAppMetrics).toHaveBeenCalledTimes(1));
+			await vi.waitFor(() => expect(api.getMetrics).toHaveBeenCalledTimes(1));
+			expect(api.getMetrics).toHaveBeenCalledWith('apps', app.id, '1h');
 
 			await user.click(screen.getByRole('button', { name: /^deploy$/i }));
 			await vi.waitFor(() => expect(api.getApp).toHaveBeenCalled());
 
-			expect(api.getAppMetrics).toHaveBeenCalledTimes(1);
+			expect(api.getMetrics).toHaveBeenCalledTimes(1);
 		});
 	});
 });

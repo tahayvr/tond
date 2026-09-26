@@ -2,100 +2,111 @@
 
 use serde::{Deserialize, Serialize};
 
-// ── MetricPoint (single resource sample for one app) ──
+// ── Resource metrics (per app / database / cron job) ──
 
-/// One 30-second resource sample stored in the `metrics` table.
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-pub struct MetricPoint {
-    pub id: String,
-    pub app_id: String,
-    /// CPU usage as a percentage (0.0 – 100.0)
-    pub cpu_percent: f64,
-    /// Memory used by the container in bytes
-    pub mem_used: i64,
-    /// Memory limit for the container in bytes (0 = no limit)
-    pub mem_limit: i64,
-    /// Cumulative bytes received on all network interfaces
-    pub net_rx: i64,
-    /// Cumulative bytes transmitted on all network interfaces
-    pub net_tx: i64,
-    /// Container restart count at sample time
-    pub restarts: i64,
-    pub collected_at: String,
-}
-
-/// API response shape for a single metric data point.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MetricPointResponse {
-    pub cpu_percent: f64,
-    pub mem_used: i64,
-    pub mem_limit: i64,
-    pub mem_percent: f64,
-    pub net_rx: i64,
-    pub net_tx: i64,
-    pub restarts: i64,
-    pub collected_at: String,
-}
-
-impl From<MetricPoint> for MetricPointResponse {
-    fn from(m: MetricPoint) -> Self {
-        let mem_percent = if m.mem_limit > 0 {
-            (m.mem_used as f64 / m.mem_limit as f64) * 100.0
-        } else {
-            0.0
-        };
-        Self {
-            cpu_percent: m.cpu_percent,
-            mem_used: m.mem_used,
-            mem_limit: m.mem_limit,
-            mem_percent,
-            net_rx: m.net_rx,
-            net_tx: m.net_tx,
-            restarts: m.restarts,
-            collected_at: m.collected_at,
-        }
-    }
-}
-
-/// Query parameters for `GET /api/apps/{id}/metrics?period=`
+/// Query parameters for `GET /api/{apps,databases,cron}/{id}/metrics?range=`
 #[derive(Debug, Deserialize)]
 pub struct MetricsQuery {
-    /// Time window: "1h" | "24h" | "7d" (default "1h")
-    #[serde(default = "default_period")]
-    pub period: String,
+    /// Time window: "1h" | "24h" | "7d" | "30d" (default "1h")
+    #[serde(default = "default_range")]
+    pub range: String,
 }
 
-fn default_period() -> String {
+fn default_range() -> String {
     "1h".to_string()
+}
+
+/// Downsampled time series, one entry per bucket, as parallel arrays (about
+/// half the JSON of an array of objects). Rates are computed server-side.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MetricSeries {
+    /// Bucket start, unix seconds.
+    pub t: Vec<i64>,
+    /// Average CPU in the bucket, percent of one core (100 = one full core).
+    pub cpu: Vec<f64>,
+    /// Highest CPU sample in the bucket.
+    pub cpu_max: Vec<f64>,
+    /// Average working-set memory in bytes.
+    pub mem: Vec<i64>,
+    /// Highest memory sample in the bucket.
+    pub mem_max: Vec<i64>,
+    /// Received bytes per second.
+    pub rx: Vec<i64>,
+    /// Transmitted bytes per second.
+    pub tx: Vec<i64>,
+    /// Highest process count in the bucket.
+    pub pids: Vec<i64>,
+}
+
+/// A restart, crash or OOM kill.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MetricEventResponse {
+    /// Unix seconds.
+    pub t: i64,
+    /// "restart" | "crash" | "oom"
+    pub kind: String,
+    pub detail: Option<String>,
+}
+
+/// The most recent sample (not averaged).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MetricCurrentResponse {
+    pub t: i64,
+    pub cpu: f64,
+    pub mem: i64,
+    /// Peak memory since the container started, when the kernel reports it.
+    pub mem_peak: Option<i64>,
+    pub rx: i64,
+    pub tx: i64,
+    pub pids: i64,
+}
+
+/// Response of the metrics endpoints.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MetricsResponse {
+    pub range: String,
+    /// Bucket width in seconds.
+    pub step: i64,
+    /// Window start / end, unix seconds.
+    pub from: i64,
+    pub to: i64,
+    /// Memory limit in bytes (None when unlimited or never measured).
+    pub mem_limit: Option<i64>,
+    pub series: MetricSeries,
+    pub events: Vec<MetricEventResponse>,
+    pub current: Option<MetricCurrentResponse>,
 }
 
 // ── SystemMetrics (host-level snapshot, not persisted) ──
 
-/// Point-in-time snapshot of host-level system resources.
-/// Returned by `GET /api/system/metrics`.
+/// Point-in-time snapshot of host-level system resources, sampled by the
+/// metrics collector every tick. Returned by `GET /api/system/metrics`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SystemMetrics {
-    /// Host CPU usage as a percentage (0.0 – 100.0)
+    /// Host CPU usage as a percentage of all cores (0.0 – 100.0)
     pub cpu_percent: f64,
-    /// Host memory used in bytes
+    /// Host memory used in bytes (total − available)
     pub mem_used: i64,
     /// Total host memory in bytes
     pub mem_total: i64,
     /// Memory usage percentage
     pub mem_percent: f64,
-    /// Host disk used in bytes
+    /// Used bytes on the filesystem holding the Tond data directory
     pub disk_used: i64,
-    /// Total host disk in bytes
+    /// Size of that filesystem in bytes
     pub disk_total: i64,
-    /// Disk usage percentage
+    /// Disk usage percentage (the number the disk alert compares)
     pub disk_percent: f64,
-    /// Number of running Docker containers (all, not just tond apps)
+    /// Mount point of that filesystem (usually "/")
+    pub disk_mount: String,
+    /// Number of running containers Tond manages (apps, databases, cron,
+    /// compose services, previews)
     pub containers_running: i64,
     /// Total number of apps managed by tond
     pub apps_total: i64,
     /// Number of apps with status = "running"
     pub apps_running: i64,
-    /// Timestamp of this snapshot
+    /// Timestamp of the sample (RFC 3339)
     pub collected_at: String,
 }
 
@@ -107,11 +118,15 @@ pub struct SystemMetrics {
 /// Groups:
 ///   Deployments  → deployment_success, deployment_failure
 ///   Scheduled Tasks → cron_success, cron_failure
+///   Containers   → container_restart (crashed and restarted, or exited),
+///                  container_oom (a process was killed for running out of memory)
 pub const VALID_ALERT_EVENTS: &[&str] = &[
     "deployment_success",
     "deployment_failure",
     "cron_success",
     "cron_failure",
+    "container_restart",
+    "container_oom",
 ];
 
 /// Valid metric slugs for threshold-based alert rules.
@@ -303,51 +318,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn metric_point_response_computes_memory_percentage_and_handles_zero_limit() {
-        let with_limit = MetricPoint {
-            id: "metric-1".to_string(),
-            app_id: "app-1".to_string(),
-            cpu_percent: 12.5,
-            mem_used: 50,
-            mem_limit: 200,
-            net_rx: 100,
-            net_tx: 200,
-            restarts: 1,
-            collected_at: "2026-01-01T00:00:00Z".to_string(),
-        };
-        let with_limit_response = MetricPointResponse::from(with_limit);
-        assert_eq!(
-            with_limit_response.mem_percent, 25.0,
-            "MetricPointResponse should compute mem_percent from mem_used / mem_limit"
-        );
-
-        let without_limit = MetricPoint {
-            id: "metric-2".to_string(),
-            app_id: "app-1".to_string(),
-            cpu_percent: 12.5,
-            mem_used: 50,
-            mem_limit: 0,
-            net_rx: 100,
-            net_tx: 200,
-            restarts: 1,
-            collected_at: "2026-01-01T00:00:00Z".to_string(),
-        };
-        let without_limit_response = MetricPointResponse::from(without_limit);
-        assert_eq!(
-            without_limit_response.mem_percent, 0.0,
-            "MetricPointResponse should report 0.0 mem_percent when no memory limit is set"
-        );
-    }
-
-    #[test]
-    fn metrics_query_defaults_period_to_one_hour() {
+    fn metrics_query_defaults_range_to_one_hour() {
         let query: MetricsQuery = serde_json::from_value(serde_json::json!({}))
             .unwrap_or_else(|err| panic!("failed to deserialize MetricsQuery: {err}"));
-
-        assert_eq!(
-            query.period, "1h",
-            "MetricsQuery should default the period to 1h"
-        );
+        assert_eq!(query.range, "1h");
     }
 
     #[test]

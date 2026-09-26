@@ -71,6 +71,7 @@ mod notifications;
 mod secret_key;
 mod security_headers;
 mod state;
+mod static_files;
 mod storage;
 mod volumes;
 
@@ -82,7 +83,6 @@ use axum::{
     Extension, Router,
     routing::{delete, get, post, put},
 };
-use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
@@ -151,7 +151,7 @@ async fn main() -> Result<()> {
     // Spawn background health check poller
     tokio::spawn(health::run_health_checker(state.clone()));
 
-    // Spawn background metrics collector (every 30 s)
+    // Spawn the metrics collector (cgroup sampling every 30 s, Docker events)
     tokio::spawn(metrics::run_metrics_collector(state.clone()));
 
     // Spawn background alert checker (every 60 s)
@@ -464,6 +464,14 @@ async fn main() -> Result<()> {
             get(handlers::metrics::get_app_metrics),
         )
         .route(
+            "/api/databases/{id}/metrics",
+            get(handlers::metrics::get_database_metrics),
+        )
+        .route(
+            "/api/cron/{id}/metrics",
+            get(handlers::metrics::get_cron_metrics),
+        )
+        .route(
             "/api/system/metrics",
             get(handlers::metrics::get_system_metrics),
         )
@@ -679,9 +687,7 @@ async fn main() -> Result<()> {
     {
         tracing::info!("Serving dashboard from {}", dashboard_dir);
         security_headers::init_from_dashboard(Path::new(&dashboard_dir));
-        let serve_dir = ServeDir::new(&dashboard_dir)
-            .not_found_service(ServeFile::new(format!("{}/index.html", dashboard_dir)));
-        api.fallback_service(serve_dir)
+        api.fallback_service(static_files::dashboard_router(Path::new(&dashboard_dir)))
     } else {
         tracing::info!("No dashboard found at {}, running API-only", dashboard_dir);
         api

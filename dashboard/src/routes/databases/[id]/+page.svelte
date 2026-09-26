@@ -34,6 +34,7 @@
 	import * as Dialog from '$lib/components/ui/dialog/index.js';
 	import * as Select from '$lib/components/ui/select/index.js';
 	import Breadcrumb from '$lib/components/nav/breadcrumb.svelte';
+	import MetricsPanel from '$lib/components/metrics/metrics-panel.svelte';
 	import { SvelteSet } from 'svelte/reactivity';
 	import { untrack } from 'svelte';
 	import Eye from '~icons/ri/eye-line';
@@ -1200,6 +1201,13 @@
 						</Button>
 					</section>
 				</div>
+			{/if}
+
+			<!-- ── Metrics tab (mounted only while open, so it polls only then) ── -->
+			{#if tab === 'metrics'}
+				{#key db.id}
+					<MetricsPanel owner="databases" id={db.id} noun="database" />
+				{/key}
 			{/if}
 		</div>
 	</div>

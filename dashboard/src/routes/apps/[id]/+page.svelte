@@ -26,7 +26,6 @@
 		deletePreview,
 		updatePreviewConfig,
 		listOpenPRs,
-		getAppMetrics,
 		listRegistryCredentials,
 		createRegistryCredential,
 		deleteRegistryCredential,
@@ -40,7 +39,6 @@
 		type DeployKey,
 		type PreviewDeployment,
 		type GithubPR,
-		type MetricPoint,
 		type RegistryCredential,
 		type GitHubApp,
 		type GitHubRepo,
@@ -80,7 +78,7 @@
 	import AppVolumes from '$lib/components/tabs/app-page/app-volumes.svelte';
 	import AppPreviews from '$lib/components/tabs/app-page/app-previews.svelte';
 	import PreviewDomainRequiredAlert from '$lib/components/alerts/preview-domain-required-alert.svelte';
-	import AppMetrics from '$lib/components/tabs/app-page/app-metrics.svelte';
+	import MetricsPanel from '$lib/components/metrics/metrics-panel.svelte';
 	import AppHistory from '$lib/components/tabs/app-page/app-history.svelte';
 	import AppWebhooks from '$lib/components/tabs/app-page/app-webhooks.svelte';
 	import { safeUrl } from '$lib/utils';
@@ -93,6 +91,7 @@
 	import type { LogLine } from '$lib/components/tabs/app-page/app-logs.svelte';
 	import { createLogBuffer } from '$lib/log-buffer';
 	import { pollWhileVisible } from '$lib/polling';
+	import { connectWithRetry, wsUrl, type ReconnectingSocket } from '$lib/reconnecting-socket';
 	import { untrack } from 'svelte';
 
 	let { data, params }: PageProps = $props();
@@ -194,16 +193,10 @@
 	let openPRsError = $state('');
 	let deployingPR = $state<number | null>(null);
 
-	// Metrics state
-	let metrics = $state<MetricPoint[]>([]);
-	let metricsLoading = $state(false);
-	let metricsError = $state('');
-	let metricsPeriod = $state<'1h' | '24h' | '7d'>('1h');
-
 	// Logs state — bounded (last LOG_BUFFER_LIMIT lines) and batched per flush.
 	let logLines = $state.raw<LogLine[]>([]);
 	let logStreaming = $state(false);
-	let logSocket: WebSocket | null = null;
+	let logSocket: ReconnectingSocket | null = null;
 	const logBuffer = createLogBuffer<LogLine>((lines) => (logLines = lines));
 
 	let appId = $derived(page.params.id || params.id);
@@ -260,73 +253,63 @@
 	}
 
 	function stopLogStream() {
-		if (logSocket) {
-			// Detach handlers first so a late close event can't touch a newer stream.
-			logSocket.onmessage = null;
-			logSocket.onerror = null;
-			logSocket.onclose = null;
-			logSocket.close();
-			logSocket = null;
-		}
+		logSocket?.close();
+		logSocket = null;
 		logBuffer.flush();
 		logStreaming = false;
+	}
+
+	function handleLogMessage(evt: MessageEvent) {
+		try {
+			const msg = JSON.parse(evt.data);
+			if (msg.type === 'snapshot') {
+				// Sent on every (re)connection: replaces what is shown.
+				const deployLogs: LogLine[] = (msg.deploy_logs ?? []).map(
+					(l: { level: string; trigger_source: string; message: string; ts: string }) => ({
+						kind: 'deploy' as const,
+						level: l.level,
+						trigger_source: l.trigger_source,
+						message: l.message,
+						ts: l.ts
+					})
+				);
+				const containerLogs: LogLine[] = (msg.container_logs ?? []).map(
+					(entry: { ts: string | null; line: string }) => ({
+						kind: 'container' as const,
+						line: entry.line,
+						ts: entry.ts ?? undefined
+					})
+				);
+				logBuffer.replace([...deployLogs, ...containerLogs]);
+			} else if (msg.type === 'deploy') {
+				logBuffer.push({
+					kind: 'deploy',
+					level: msg.level,
+					trigger_source: msg.trigger_source,
+					message: msg.message,
+					ts: msg.ts
+				});
+			} else if (msg.type === 'container') {
+				logBuffer.push({ kind: 'container', line: msg.line, ts: msg.ts ?? undefined });
+			}
+		} catch {
+			// ignore parse errors
+		}
 	}
 
 	function startLogStream() {
 		stopLogStream();
 		logBuffer.clear();
 		logStreaming = true;
-
-		const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-		const ws = new WebSocket(`${proto}://${location.host}/api/apps/${appId}/logs/stream`);
-		logSocket = ws;
-
-		ws.onmessage = (evt) => {
-			try {
-				const msg = JSON.parse(evt.data);
-				if (msg.type === 'snapshot') {
-					const deployLogs: LogLine[] = (msg.deploy_logs ?? []).map(
-						(l: { level: string; trigger_source: string; message: string; ts: string }) => ({
-							kind: 'deploy' as const,
-							level: l.level,
-							trigger_source: l.trigger_source,
-							message: l.message,
-							ts: l.ts
-						})
-					);
-					const containerLogs: LogLine[] = (msg.container_logs ?? []).map(
-						(entry: { ts: string | null; line: string }) => ({
-							kind: 'container' as const,
-							line: entry.line,
-							ts: entry.ts ?? undefined
-						})
-					);
-					logBuffer.replace([...deployLogs, ...containerLogs]);
-				} else if (msg.type === 'deploy') {
-					logBuffer.push({
-						kind: 'deploy',
-						level: msg.level,
-						trigger_source: msg.trigger_source,
-						message: msg.message,
-						ts: msg.ts
-					});
-				} else if (msg.type === 'container') {
-					logBuffer.push({ kind: 'container', line: msg.line, ts: msg.ts ?? undefined });
-				}
-			} catch {
-				// ignore parse errors
+		// Reconnects with backoff if the server restarts.
+		logSocket = connectWithRetry(wsUrl(`/api/apps/${appId}/logs/stream`), {
+			onOpen: () => (logStreaming = true),
+			onMessage: handleLogMessage,
+			onDisconnect: () => {
+				logBuffer.flush();
+				logStreaming = false;
 			}
-		};
-
-		ws.onerror = () => {
-			logStreaming = false;
-		};
-
-		ws.onclose = () => {
-			logBuffer.flush();
-			logStreaming = false;
-			if (logSocket === ws) logSocket = null;
-		};
+		});
 	}
 
 	async function handleDeploy() {
@@ -807,18 +790,6 @@
 		}
 	}
 
-	async function loadMetrics() {
-		if (metrics.length === 0) metricsLoading = true;
-		metricsError = '';
-		try {
-			metrics = await getAppMetrics(appId, metricsPeriod);
-		} catch (e: any) {
-			metricsError = e.message;
-		} finally {
-			metricsLoading = false;
-		}
-	}
-
 	async function handleCreatePreview(options: Parameters<typeof createPreview>[1] = {}) {
 		previewsError = '';
 		try {
@@ -904,14 +875,6 @@
 	$effect(() => {
 		if (appStatus !== 'building' && !statusPollRequested) return;
 		return pollWhileVisible(pollStatus, 2000, { immediate: false });
-	});
-
-	// Metrics polling only while the Metrics tab is open (paused in hidden tabs).
-	$effect(() => {
-		if (activeTab !== 'metrics') return;
-		void metricsPeriod;
-		void appId;
-		return pollWhileVisible(() => untrack(loadMetrics), 30_000);
 	});
 
 	// Log stream only while the Logs tab is open; restarts for a different app.
@@ -1805,13 +1768,9 @@
 
 				<!-- Metrics tab -->
 				{#if activeTab === 'metrics'}
-					<AppMetrics
-						{metrics}
-						loading={metricsLoading}
-						error={metricsError}
-						period={metricsPeriod}
-						onPeriodChange={(p) => (metricsPeriod = p)}
-					/>
+					{#key appId}
+						<MetricsPanel owner="apps" id={appId} noun="app" />
+					{/key}
 				{/if}
 
 				<!-- History tab -->
