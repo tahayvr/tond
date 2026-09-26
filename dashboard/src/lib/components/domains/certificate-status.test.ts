@@ -32,6 +32,10 @@ function cert(overrides: Partial<Certificate>): Certificate {
 		last_attempt_at: null,
 		next_retry_at: null,
 		failure_count: 0,
+		issuer: null,
+		issuer_kind: 'unknown',
+		last_renewed_at: null,
+		serves: { kind: 'unused' },
 		...overrides
 	};
 }

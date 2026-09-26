@@ -330,7 +330,11 @@ function queueMockCertificate(domain: string) {
 		last_error: null,
 		last_attempt_at: null,
 		next_retry_at: null,
-		failure_count: 0
+		failure_count: 0,
+		issuer: null,
+		issuer_kind: 'unknown',
+		last_renewed_at: null,
+		serves: { kind: 'unused' }
 	});
 }
 
@@ -2032,6 +2036,7 @@ export const handlers = [
 		const cert = certificates.find((c) => c.domain === params.domain);
 		if (!cert) return err(`No certificate for ${params.domain}`, 404);
 		cert.next_retry_at = null;
+		cert.last_attempt_at = new Date().toISOString();
 		return ok({ message: 'Certificate retry queued', domain: cert.domain });
 	}),
 

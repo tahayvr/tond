@@ -499,7 +499,24 @@ export async function updateDomain(id: string, domain: string): Promise<UpdateDo
 
 // ── Certificates ──
 
+/** Which CA issued a certificate. */
+export type IssuerKind = 'letsencrypt' | 'letsencrypt_staging' | 'custom' | 'unknown';
+
+/** What a certificate's domain is used for right now. */
+export type CertificateTarget =
+	| { kind: 'dashboard' }
+	| { kind: 'app'; app_id: string; app_name: string }
+	| {
+			kind: 'preview';
+			app_id: string;
+			app_name: string;
+			preview_id: string;
+			pr_number: number | null;
+	  }
+	| { kind: 'unused' };
+
 export interface Certificate {
+	/** Empty for a served domain tond-proxy has not reported on yet */
 	id: string;
 	domain: string;
 	cert_type: string;
@@ -513,6 +530,12 @@ export interface Certificate {
 	/** No new attempt before this time (exponential backoff) */
 	next_retry_at: string | null;
 	failure_count: number;
+	/** Issuing CA as named in the certificate, e.g. "Let's Encrypt R11" */
+	issuer: string | null;
+	issuer_kind: IssuerKind;
+	/** Last successful issuance or renewal */
+	last_renewed_at: string | null;
+	serves: CertificateTarget;
 }
 
 export async function listCertificates(): Promise<Certificate[]> {

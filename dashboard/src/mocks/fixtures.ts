@@ -623,18 +623,24 @@ export const MOCK_DATABASE_LINKS: { database_id: string; app_id: string }[] = [
 
 const minutesFromNow = (m: number) => new Date(Date.now() + m * 60_000).toISOString();
 
+const daysFromNow = (d: number) => new Date(Date.now() + d * 86_400_000).toISOString();
+
 export const MOCK_CERTIFICATES: Certificate[] = [
 	{
 		id: 'cert-001',
 		domain: 'api.example.com',
 		cert_type: 'acme',
 		status: 'active',
-		issued_at: '2026-08-01T00:00:00Z',
-		expires_at: '2026-10-30T00:00:00Z',
+		issued_at: daysFromNow(-24),
+		expires_at: daysFromNow(66),
 		last_error: null,
-		last_attempt_at: '2026-08-01T00:00:00Z',
+		last_attempt_at: daysFromNow(-24),
 		next_retry_at: null,
-		failure_count: 0
+		failure_count: 0,
+		issuer: "Let's Encrypt R11",
+		issuer_kind: 'letsencrypt',
+		last_renewed_at: daysFromNow(-24),
+		serves: { kind: 'app', app_id: 'app_running', app_name: 'api-service' }
 	},
 	{
 		id: 'cert-002',
@@ -647,7 +653,11 @@ export const MOCK_CERTIFICATES: Certificate[] = [
 			"DNS for app.example.com points to 1.2.3.4, expected 5.6.7.8. Update the domain's A/AAAA record to this server.",
 		last_attempt_at: minutesFromNow(-4),
 		next_retry_at: minutesFromNow(12),
-		failure_count: 4
+		failure_count: 4,
+		issuer: null,
+		issuer_kind: 'unknown',
+		last_renewed_at: null,
+		serves: { kind: 'app', app_id: 'app_stopped', app_name: 'web-frontend' }
 	},
 	{
 		id: 'cert-003',
@@ -660,7 +670,66 @@ export const MOCK_CERTIFICATES: Certificate[] = [
 			'polling order ready: order failed: 403 urn:ietf:params:acme:error:unauthorized: Invalid response from http://dash.example.com/.well-known/acme-challenge/abc: 404',
 		last_attempt_at: minutesFromNow(-1),
 		next_retry_at: minutesFromNow(1),
-		failure_count: 1
+		failure_count: 1,
+		issuer: null,
+		issuer_kind: 'unknown',
+		last_renewed_at: null,
+		serves: { kind: 'dashboard' }
+	},
+	{
+		id: 'cert-004',
+		domain: 'shop.example.com',
+		cert_type: 'acme',
+		status: 'active',
+		issued_at: daysFromNow(-80),
+		expires_at: daysFromNow(10),
+		last_error:
+			'polling order ready: order failed: urn:ietf:params:acme:error:connection: Timeout during connect (likely firewall problem)',
+		last_attempt_at: minutesFromNow(-90),
+		next_retry_at: minutesFromNow(150),
+		failure_count: 6,
+		issuer: "Let's Encrypt R10",
+		issuer_kind: 'letsencrypt',
+		last_renewed_at: daysFromNow(-80),
+		serves: { kind: 'app', app_id: 'app_running', app_name: 'api-service' }
+	},
+	{
+		id: 'cert-005',
+		domain: 'a1b2c3-api-service.example-previews.com',
+		cert_type: 'acme',
+		status: 'active',
+		issued_at: daysFromNow(-2),
+		expires_at: daysFromNow(88),
+		last_error: null,
+		last_attempt_at: daysFromNow(-2),
+		next_retry_at: null,
+		failure_count: 0,
+		issuer: "(STAGING) Let's Encrypt (STAGING) Riddling Rhubarb R12",
+		issuer_kind: 'letsencrypt_staging',
+		last_renewed_at: daysFromNow(-2),
+		serves: {
+			kind: 'preview',
+			app_id: 'app_running',
+			app_name: 'api-service',
+			preview_id: 'prev_1',
+			pr_number: 42
+		}
+	},
+	{
+		id: 'cert-006',
+		domain: 'old.example.com',
+		cert_type: 'acme',
+		status: 'active',
+		issued_at: daysFromNow(-50),
+		expires_at: daysFromNow(40),
+		last_error: null,
+		last_attempt_at: daysFromNow(-50),
+		next_retry_at: null,
+		failure_count: 0,
+		issuer: "Let's Encrypt R11",
+		issuer_kind: 'letsencrypt',
+		last_renewed_at: daysFromNow(-50),
+		serves: { kind: 'unused' }
 	}
 ];
 

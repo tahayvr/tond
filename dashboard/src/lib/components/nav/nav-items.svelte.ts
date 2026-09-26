@@ -15,6 +15,7 @@ export const navItems: NavItem[] = [
 	{ href: '/cron', label: 'Cron jobs', icon: 'clock' },
 	{ href: '/snapshots', label: 'Snapshots', icon: 'clock' },
 	{ href: '/alerts', label: 'Alerts', icon: 'bell' },
+	{ href: '/certificates', label: 'Certificates', icon: 'lock' },
 	{ href: '/integrations', label: 'Integrations', icon: 'puzzle', scope: 'settings:write' },
 	{ href: '/activity', label: 'Activity', icon: 'activity' },
 	// { href: '/iam', label: 'IAM', icon: 'fingerprint-pattern' },
