@@ -35,10 +35,11 @@ pub enum Table {
     BackupConfig,
     RouteState,
     Deployments,
+    Databases,
 }
 
 impl Table {
-    const ALL: [Table; 7] = [
+    const ALL: [Table; 8] = [
         Table::Apps,
         Table::PreviewDeployments,
         Table::CronJobs,
@@ -46,6 +47,7 @@ impl Table {
         Table::BackupConfig,
         Table::RouteState,
         Table::Deployments,
+        Table::Databases,
     ];
 
     fn index(self) -> usize {
@@ -65,6 +67,7 @@ impl Table {
             "backup_config" => Table::BackupConfig,
             "route_state" => Table::RouteState,
             "deployments" => Table::Deployments,
+            "databases" => Table::Databases,
             _ => return None,
         })
     }
