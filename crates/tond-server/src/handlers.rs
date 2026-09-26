@@ -26,6 +26,7 @@
 //   app_logs()          GET  /api/apps/{id}/logs   — last 50 deploy_logs + 100 container lines
 //   (env vars live in handlers/env.rs: masked GET, PATCH, per-key reveal)
 //   update_domain()     PUT  /api/apps/{id}/domain — set domain, upsert 'pending' cert record
+//   update_port()       PUT  /api/apps/{id}/port   — container port (next deploy)
 //   list_certs()        GET  /api/certs            — all certificate rows
 //   upload_deploy()     POST /api/apps/{id}/upload — accept .tar.gz, extract, build,
 //                                                    then deploy — all in background, returns 202
@@ -1016,6 +1017,52 @@ pub async fn update_drain_timeout(
     ))
 }
 
+// ── Update Container Port ──
+//
+// PUT /api/apps/{id}/port  { "container_port": 80 }
+// The port the app listens on inside its container (also passed as $PORT).
+// Takes effect on the next deploy.
+
+#[derive(Debug, Deserialize)]
+pub struct UpdatePortRequest {
+    pub container_port: i64,
+}
+
+pub async fn update_port(
+    _rate: RateLimit,
+    _auth: RequireAuth,
+    actor: AuthActor,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdatePortRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let app = fetch_app(&state.db, &id).await?;
+    if !(1..=65535).contains(&req.container_port) {
+        return Err(AppError(TondError::InvalidInput(
+            "container_port must be between 1 and 65535".to_string(),
+        )));
+    }
+    sqlx::query("UPDATE apps SET container_port = ?, updated_at = datetime('now') WHERE id = ?")
+        .bind(req.container_port)
+        .bind(&app.id)
+        .execute(&state.db)
+        .await?;
+    write_audit_log(
+        &state.db,
+        Some(&app.id),
+        Some(&app.name),
+        "port_update",
+        &actor.0,
+        Some(&format!("container_port={}", req.container_port)),
+    )
+    .await;
+    let updated = fetch_app(&state.db, &app.id).await?;
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(AppResponse::from(updated))),
+    ))
+}
+
 pub async fn upload_deploy(
     _rate: RateLimit,
     _auth: RequireAuth,
@@ -1860,6 +1907,49 @@ mod tests {
             serde_json::json!(app.id),
             "list_apps with ?name should return the matching app record"
         );
+    }
+
+    #[tokio::test]
+    async fn update_port_validates_and_saves_the_container_port() {
+        let state = test_state().await;
+        let app = seed_app(&state, "portapp").await;
+        let bad = update_port(
+            RateLimit,
+            RequireAuth,
+            AuthActor("admin@example.com".to_string()),
+            State(state.clone()),
+            Path(app.id.clone()),
+            Json(UpdatePortRequest { container_port: 0 }),
+        )
+        .await;
+        assert!(bad.is_err(), "port 0 is rejected");
+        update_port(
+            RateLimit,
+            RequireAuth,
+            AuthActor("admin@example.com".to_string()),
+            State(state.clone()),
+            Path(app.id.clone()),
+            Json(UpdatePortRequest { container_port: 80 }),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("update_port should succeed: {}", err.0));
+        let port: i64 = sqlx::query_scalar("SELECT container_port FROM apps WHERE id = ?")
+            .bind(&app.id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_else(|err| panic!("read port: {err}"));
+        assert_eq!(port, 80);
+    }
+
+    #[test]
+    fn deploy_trigger_names_the_caller() {
+        assert_eq!(deploy_trigger(true, "unknown").0, "cli");
+        assert_eq!(deploy_trigger(false, "api-key").0, "api");
+        assert_eq!(
+            deploy_trigger(false, "ada@example.com"),
+            ("manual", Some("ada@example.com".to_string()))
+        );
+        assert_eq!(deploy_trigger(false, "unknown"), ("manual", None));
     }
 
     #[tokio::test]

@@ -265,6 +265,7 @@ async fn main() -> Result<()> {
         )
         .route("/api/apps/{id}/domain", put(handlers::update_domain))
         .route("/api/apps/{id}/health", put(handlers::update_health))
+        .route("/api/apps/{id}/port", put(handlers::update_port))
         .route("/api/compose/validate", post(handlers::validate_compose))
         .route("/api/apps/{id}/volumes", post(handlers::add_volume))
         .route("/api/apps/{id}/volumes", delete(handlers::remove_volume))
