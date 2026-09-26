@@ -6,7 +6,17 @@ Wants=tond-server.service
 
 [Service]
 Type=simple
-User=root
+# The proxy parses untrusted TLS and HTTP from the internet, so it runs as a
+# dedicated unprivileged user whose only capability is binding ports 80/443.
+# File access (see install.sh secure_data_dir):
+#   /opt/tond/data                  root:tond-proxy 3770 (setgid + sticky: it can
+#                                   create files, e.g. SQLite's -wal/-shm, but not
+#                                   remove or replace root's files)
+#   tond.db, tond.db-wal, -shm      root:tond-proxy 0660 (shared with tond-server)
+#   certs/, acme_account.json       tond-proxy only (0700 / 0600)
+#   tond.env, tond.sock, keys/, backups/, volumes/, ...  root only
+User=tond-proxy
+Group=tond-proxy
 WorkingDirectory=/opt/tond
 ExecStart=/opt/tond/bin/tond-proxy
 Restart=on-failure
@@ -38,11 +48,40 @@ Environment=TOND_SERVER_ADDR=127.0.0.1:3001
 # Logging level: trace, debug, info, warn, error
 Environment=RUST_LOG=info
 
-# Security
+# ── Privileges ──
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
+# Keys, certificates and the ACME account are written owner-only. SQLite gives
+# -wal/-shm the mode of tond.db itself (0660), independent of the umask.
+UMask=0077
+
+# ── Sandboxing ──
 ProtectSystem=strict
-ProtectHome=true
 ReadWritePaths=/opt/tond/data
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+KeyringMode=private
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target

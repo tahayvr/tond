@@ -9,6 +9,8 @@ Tond is a fast & lightweight self-hosted Platform as a Service (PaaS) for a sing
 
 Use `just check` for full project formatting, checks, and linting.
 Use `just test` to run all Rust tests (including doc tests). See `justfile` for more targets.
+Use `just audit` for the supply-chain gates (`cargo deny` per `deny.toml`, `pnpm audit --prod`).
+Linux builds/bundles/VMs default to x86_64; add `arch=arm64` for ARM64, e.g. `just arch=arm64 vm-e2e`.
 
 ### Dev environment variables (`dashboard/.env.local`)
 
@@ -145,7 +147,18 @@ VITE_MOCK_API=true          # start MSW service worker to intercept /api request
 
 ## Key Technical Constraints
 
-- Production target: a **single x86_64 Linux VPS**. Keep resource usage minimal.
+- Production target: a **single Linux VPS, x86_64 or aarch64 (ARM64)**. Both are built,
+  packaged (`dist/tond-linux-<arch>`) and end-to-end tested. Keep resource usage minimal.
+- `tond-proxy` runs as the unprivileged `tond-proxy` user (only `CAP_NET_BIND_SERVICE`);
+  `tond-server` runs as root. They share `tond.db` through the `tond-proxy` group
+  (`/opt/tond/data` is `root:tond-proxy 3770`, `tond.db*` `0660`). Anything else under
+  `/opt/tond/data` must stay root-only; never make the proxy depend on Docker or on files
+  outside `tond.db`, `certs/` and `acme_account.json` (see `secure_data_dir` in
+  `release/install.sh`).
+- Previews run pull-request code and are served only as `<id>-<app>.<preview_domain>`, a
+  separate registrable domain from the dashboard (`preview_domain` setting, validated with
+  the Public Suffix List in `crates/tond-server/src/domains.rs`). tond-proxy never serves
+  the dashboard/API on the preview domain. Without a preview domain, previews are refused.
 - `tond-server` and `tond-proxy` share the same SQLite database file; avoid long
   transactions or WAL-mode changes that could block both processes.
 - The dashboard is a **fully static SPA** (`ssr = false`, `prerender = false` in

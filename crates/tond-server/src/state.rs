@@ -6,7 +6,8 @@
 //
 //   db           — SQLite connection pool. Path from TOND_DB_PATH
 //                  (default: /opt/tond/data/tond.db). Created with ?mode=rwc so
-//                  the file is created on first run.
+//                  the file is created on first run, then kept at 0660 so
+//                  tond-proxy (group tond-proxy) can share it.
 //
 //   docker       — Bollard Docker client connected via the local Unix
 //                  socket. Verified at startup by calling docker.version().
@@ -25,7 +26,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tond_common::ServerSettings;
 
-use crate::auth::RateLimiter;
+use crate::{auth::RateLimiter, db};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -46,6 +47,7 @@ impl AppState {
         }
 
         let db = SqlitePool::connect(&format!("sqlite:{}?mode=rwc", db_path)).await?;
+        db::share_with_proxy(Path::new(&db_path));
 
         let docker = Docker::connect_with_local_defaults()?;
 
