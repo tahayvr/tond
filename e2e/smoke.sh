@@ -809,6 +809,52 @@ code=$(api_req GET "/api/domains/check?domain=not_a_domain" '')
 [[ "$code" == 400 ]] || fail "an invalid domain must be rejected with 400, got ${code}"
 pass "domain check reports DNS '${DNS_STATUS}' for ${WHOAMI_DOMAIN}; invalid domains → 400"
 
+step "Resource metrics (cgroup sampling, restarts, cached host stats)"
+# The collector samples every 30 s; the first reading only primes the rates.
+wait_for 150 "e2e-whoami metrics samples" \
+    bash -c "curl -sf --unix-socket '$SOCK' 'http://localhost/api/apps/e2e-whoami/metrics?range=1h' | jq -e '(.data.series.t | length) >= 1 and .data.current != null'"
+WHOAMI_METRICS=$(api "/api/apps/e2e-whoami/metrics?range=1h")
+jq -e '.data.step == 30 and .data.series.mem[-1] > 0 and .data.series.pids[-1] > 0 and .data.mem_limit > 0 and (.data.series.cpu | length) == (.data.series.t | length)' \
+    <<<"$WHOAMI_METRICS" > /dev/null || fail "app metrics should carry memory, pids, a limit and aligned series: ${WHOAMI_METRICS}"
+pass "app samples come from cgroups (memory, pids, limit; rates computed server-side)"
+wait_for 120 "e2e-redis metrics samples" \
+    bash -c "curl -sf --unix-socket '$SOCK' 'http://localhost/api/databases/e2e-redis/metrics?range=24h' | jq -e '(.data.series.t | length) >= 1'"
+pass "managed databases are measured too"
+jq -e '.data.step == 7200 and (.data.series.t | length) <= 480' <<<"$(api "/api/apps/e2e-whoami/metrics?range=30d")" > /dev/null \
+    || fail "30d metrics should be downsampled to 2 h buckets"
+[[ "$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$SOCK" 'http://localhost/api/apps/e2e-whoami/metrics?range=1y')" == 400 ]] \
+    || fail "an unknown metrics range must be rejected"
+pass "series are downsampled per range (30d → 2 h buckets); unknown ranges → 400"
+
+# Kill the app's process behind Docker's back: an unrequested exit that the
+# restart policy recovers from must show up as a restart event.
+WHOAMI_PID=$(docker inspect -f '{{.State.Pid}}' tond-e2e-whoami)
+kill -9 "$WHOAMI_PID"
+wait_for 90 "restart event for e2e-whoami" \
+    bash -c "curl -sf --unix-socket '$SOCK' 'http://localhost/api/apps/e2e-whoami/metrics?range=1h' | jq -e '.data.events | any(.kind == \"restart\" and (.detail | contains(\"exit code 137\")))'"
+wait_for 60 "e2e-whoami running again" bash -c "docker inspect -f '{{.State.Running}}' tond-e2e-whoami | grep -qx true"
+pass "a crash-restart is recorded as a restart event (exit code 137)"
+
+SYS_TIME=$(curl -sf -o /dev/null -w '%{time_total}' --unix-socket "$SOCK" http://localhost/api/system/metrics)
+awk -v t="$SYS_TIME" 'BEGIN { exit !(t < 0.15) }' || fail "/api/system/metrics took ${SYS_TIME}s (it must read a cache, not sample)"
+jq -e '.data.disk_total > 0 and (.data.disk_mount | length) > 0 and .data.containers_running >= 2' \
+    <<<"$(api /api/system/metrics)" > /dev/null || fail "system metrics should report the data directory's filesystem and Tond's containers"
+pass "system metrics answer from the cache in ${SYS_TIME}s with the data directory's disk"
+
+step "Dashboard delivery (precompressed, cached)"
+INDEX_HEADERS=$(curl -sk -D - -o /dev/null -H 'Accept-Encoding: br, gzip' --resolve "${DASH}:443:${IP}" "https://${DASH}/")
+grep -qi '^content-encoding: br' <<<"$INDEX_HEADERS" || fail "index.html should be served brotli-compressed: ${INDEX_HEADERS}"
+grep -qi '^cache-control: no-cache' <<<"$INDEX_HEADERS" || fail "index.html must revalidate (no-cache)"
+ASSET=$(curl -sk --resolve "${DASH}:443:${IP}" "https://${DASH}/" | grep -o '/_app/immutable/[^"]*\.js' | head -1)
+[[ -n "$ASSET" ]] || fail "no hashed asset referenced from index.html"
+ASSET_HEADERS=$(curl -sk -D - -o /dev/null -H 'Accept-Encoding: br, gzip' --resolve "${DASH}:443:${IP}" "https://${DASH}${ASSET}")
+grep -qi '^cache-control: public, max-age=31536000, immutable' <<<"$ASSET_HEADERS" || fail "hashed assets must be immutable: ${ASSET_HEADERS}"
+grep -qi '^content-encoding: br' <<<"$ASSET_HEADERS" || fail "hashed assets should be brotli-compressed"
+[[ "$(proxied_status "$DASH" /_app/immutable/chunks/missing-deadbeef.js)" == 404 ]] \
+    || fail "a missing build file must be 404, not the SPA shell"
+[[ -z "$(find /opt/tond/dashboard -name '*.ttf')" ]] || fail "the dashboard should ship no TTF fonts"
+pass "index.html br + no-cache; hashed assets br + immutable; missing chunks 404; no TTF fonts"
+
 step "Snapshot"
 tond snapshot create --name e2e-smoke > /dev/null
 wait_for 120 "e2e-smoke snapshot completed" \

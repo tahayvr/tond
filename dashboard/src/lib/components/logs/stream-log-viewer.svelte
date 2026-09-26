@@ -36,11 +36,15 @@
 		void attempt;
 		if (paused) return;
 		buffer.clear();
-		streaming = true;
+		// The stream reconnects by itself after a drop; each connection starts
+		// with a fresh snapshot, so what is shown is replaced.
 		const close = openLogStream(url, {
 			onLine: (line) => buffer.push(line),
-			onError: () => (streaming = false),
-			onClose: () => {
+			onOpen: (reconnected) => {
+				streaming = true;
+				if (reconnected) buffer.clear();
+			},
+			onDisconnect: () => {
 				buffer.flush();
 				streaming = false;
 			}

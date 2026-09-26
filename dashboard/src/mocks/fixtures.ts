@@ -22,7 +22,8 @@ import type {
 	Integration,
 	ManagedDatabase,
 	TemplateCatalogEntry,
-	MetricPoint,
+	MetricsRange,
+	MetricsResponse,
 	OnboardingStatus,
 	PreviewDeployment,
 	Project,
@@ -427,6 +428,7 @@ export function makeMockSystemMetrics(): SystemMetrics {
 		disk_used: 42_000_000_000 + Math.random() * 500_000_000,
 		disk_total: 160_000_000_000,
 		disk_percent: 26.2,
+		disk_mount: '/',
 		containers_running: 2,
 		apps_total: MOCK_APPS.length,
 		apps_running: MOCK_APPS.filter((a) => a.status === 'running' || a.status === 'unhealthy')
@@ -435,26 +437,83 @@ export function makeMockSystemMetrics(): SystemMetrics {
 	};
 }
 
-// ── App Metrics ────────────────────────────────────────────────────────────
+// ── Resource Metrics ───────────────────────────────────────────────────────
 
-export function makeMockAppMetrics(period: string): MetricPoint[] {
-	const points = period === '7d' ? 168 : period === '24h' ? 48 : 12;
-	const now = Date.now();
-	const intervalMs = period === '7d' ? 3_600_000 : period === '24h' ? 1_800_000 : 300_000;
-	return Array.from({ length: points }, (_, i) => {
-		const t = now - (points - 1 - i) * intervalMs;
-		const wave = Math.sin((i / points) * Math.PI * 4);
-		return {
-			cpu_percent: Math.max(0, 20 + wave * 15 + Math.random() * 5),
-			mem_used: 180_000_000 + wave * 30_000_000 + Math.random() * 10_000_000,
-			mem_limit: 512_000_000,
-			mem_percent: Math.max(0, 35 + wave * 6 + Math.random() * 2),
-			net_rx: Math.max(0, 1_000_000 + Math.random() * 500_000),
-			net_tx: Math.max(0, 200_000 + Math.random() * 100_000),
-			restarts: i === Math.floor(points * 0.6) ? 1 : 0,
-			collected_at: new Date(t).toISOString()
-		};
-	});
+const RANGE_SPAN: Record<MetricsRange, number> = {
+	'1h': 3600,
+	'24h': 86_400,
+	'7d': 7 * 86_400,
+	'30d': 30 * 86_400
+};
+const RANGE_STEP: Record<MetricsRange, number> = { '1h': 30, '24h': 180, '7d': 1500, '30d': 7200 };
+
+/**
+ * Deterministic-looking series: a daily wave with noise, a 20-minute outage
+ * (gap) two thirds in, one crash-restart and one OOM kill. `empty` returns a
+ * target that has never been measured.
+ */
+export function makeMockMetrics(range: string, empty = false): MetricsResponse {
+	const r: MetricsRange = (['1h', '24h', '7d', '30d'] as const).includes(range as MetricsRange)
+		? (range as MetricsRange)
+		: '1h';
+	const step = RANGE_STEP[r];
+	const to = Math.floor(Date.now() / 1000);
+	const from = Math.floor((to - RANGE_SPAN[r]) / step) * step;
+	const series: MetricsResponse['series'] = {
+		t: [],
+		cpu: [],
+		cpu_max: [],
+		mem: [],
+		mem_max: [],
+		rx: [],
+		tx: [],
+		pids: []
+	};
+	if (empty) {
+		return { range: r, step, from, to, mem_limit: null, series, events: [], current: null };
+	}
+	const n = Math.floor((to - from) / step);
+	const gapStart = Math.floor(n * 0.66);
+	const gapLen = Math.max(1, Math.round(1200 / step));
+	for (let i = 0; i <= n; i++) {
+		if (i >= gapStart && i < gapStart + gapLen) continue;
+		const t = from + i * step;
+		const wave = Math.sin((t / 86_400) * Math.PI * 2) * 0.5 + Math.sin(i / 7) * 0.3;
+		const noise = Math.random();
+		const cpu = Math.max(0.5, 18 + wave * 12 + noise * 6);
+		const mem = 190_000_000 + wave * 35_000_000 + noise * 8_000_000;
+		series.t.push(t);
+		series.cpu.push(Math.round(cpu * 10) / 10);
+		series.cpu_max.push(Math.round((cpu + 10 + noise * 30) * 10) / 10);
+		series.mem.push(Math.round(mem));
+		series.mem_max.push(Math.round(mem + 12_000_000));
+		series.rx.push(Math.round(40_000 + wave * 25_000 + noise * 15_000));
+		series.tx.push(Math.round(12_000 + wave * 6_000 + noise * 5_000));
+		series.pids.push(14);
+	}
+	const gapAt = from + gapStart * step;
+	const events: MetricsResponse['events'] = [
+		{ t: gapAt + 30, kind: 'oom', detail: '1 process killed' },
+		{ t: gapAt + gapLen * step, kind: 'restart', detail: 'exit code 137, out of memory' }
+	];
+	return {
+		range: r,
+		step,
+		from,
+		to,
+		mem_limit: 512 * 1024 * 1024,
+		series,
+		events,
+		current: {
+			t: to,
+			cpu: series.cpu.at(-1) ?? 0,
+			mem: series.mem.at(-1) ?? 0,
+			mem_peak: 301_000_000,
+			rx: series.rx.at(-1) ?? 0,
+			tx: series.tx.at(-1) ?? 0,
+			pids: 14
+		}
+	};
 }
 
 // ── Deployments ────────────────────────────────────────────────────────────

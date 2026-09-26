@@ -162,18 +162,22 @@ describe('live deploy view', () => {
 		expect(screen.getByText(/waiting for the build queue \(position 2\)/i)).toBeInTheDocument();
 	});
 
-	it('fetches the result when the socket closes after the deployment finished', async () => {
-		api.getDeployment.mockResolvedValue(
+	it('replaces what it shows with the snapshot after a reconnect', async () => {
+		render(DeployPage, { props: { data: { app, deployment: detail() }, params: {} } as never });
+		stream.callbacks?.onOpen?.(false);
+		expect(await screen.findByText('Live')).toBeInTheDocument();
+		stream.callbacks?.onDisconnect?.(1000);
+		await vi.waitFor(() => expect(screen.queryByText('Live')).not.toBeInTheDocument());
+		stream.callbacks?.onSnapshot(
 			detail({
 				status: 'succeeded',
 				finished_at: new Date().toISOString(),
 				duration_secs: 9,
-				is_current: true
+				is_current: true,
+				logs: [{ level: 'info', message: 'Deployed successfully!', ts: new Date().toISOString() }]
 			})
 		);
-		render(DeployPage, { props: { data: { app, deployment: detail() }, params: {} } as never });
-		stream.callbacks?.onClose?.(true);
 		expect(await screen.findByText('Deployed in 9s')).toBeInTheDocument();
-		expect(api.getDeployment).toHaveBeenCalledWith('app_1', 'dep_live_123');
+		expect(await screen.findByText('Deployed successfully!')).toBeInTheDocument();
 	});
 });

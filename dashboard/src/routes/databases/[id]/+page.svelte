@@ -32,6 +32,7 @@
 	import ConfirmDeleteDialog from '$lib/components/dialogs/confirm-delete-dialog.svelte';
 	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import StreamLogViewer from '$lib/components/logs/stream-log-viewer.svelte';
+	import MetricsPanel from '$lib/components/metrics/metrics-panel.svelte';
 	import { SvelteSet } from 'svelte/reactivity';
 	import { untrack } from 'svelte';
 	import Eye from '~icons/ri/eye-line';
@@ -53,16 +54,16 @@
 
 	let db = $state<ManagedDatabaseDetail | null>(null);
 	/** Selected tab; the Logs tab pauses the feed panel's stream (one socket per database). */
-	let dbTab = $state('overview');
+	let activeTab = $state('overview');
 
 	/** UI context for this database, with the feed paused while the Logs tab streams. */
 	function dbContext(d: ManagedDatabaseDetail) {
 		const ctx = databaseContext(d);
-		return dbTab === 'logs' ? { ...ctx, feed: { ...ctx.feed, wsUrl: null } } : ctx;
+		return activeTab === 'logs' ? { ...ctx, feed: { ...ctx.feed, wsUrl: null } } : ctx;
 	}
 
 	$effect(() => {
-		void dbTab;
+		void activeTab;
 		untrack(() => {
 			if (db) setUiContext(dbContext(db));
 		});
@@ -641,17 +642,18 @@
 		<Separator />
 
 		<!-- Tabs -->
-		<Tabs.Root bind:value={dbTab}>
-			<Tabs.List>
+		<Tabs.Root bind:value={activeTab}>
+			<Tabs.List class="max-w-full justify-start overflow-x-auto">
 				<Tabs.Trigger value="overview">Overview</Tabs.Trigger>
 				<Tabs.Trigger value="logs">Logs</Tabs.Trigger>
 				<Tabs.Trigger value="environment">Environment</Tabs.Trigger>
 				<Tabs.Trigger value="limits">Limits</Tabs.Trigger>
+				<Tabs.Trigger value="metrics">Metrics</Tabs.Trigger>
 			</Tabs.List>
 
 			<!-- ── Logs tab (streams only while open) ── -->
 			<Tabs.Content value="logs" class="mt-4">
-				{#if dbTab === 'logs'}
+				{#if activeTab === 'logs'}
 					<StreamLogViewer
 						wsUrl="/api/databases/{db.id}/logs/stream"
 						downloadName="{db.name}-logs"
@@ -1227,6 +1229,15 @@
 						{/if}
 					</div>
 				</div>
+			</Tabs.Content>
+
+			<!-- ── Metrics tab (mounted only while open, so it polls only then) ── -->
+			<Tabs.Content value="metrics">
+				{#if activeTab === 'metrics'}
+					{#key db.id}
+						<MetricsPanel owner="databases" id={db.id} noun="database" />
+					{/key}
+				{/if}
 			</Tabs.Content>
 		</Tabs.Root>
 	</div>

@@ -5,7 +5,6 @@
 	import { untrack } from 'svelte';
 	import {
 		deployApp,
-		getDeployment,
 		openDeploymentStream,
 		type App,
 		type Deployment,
@@ -14,6 +13,7 @@
 		type LogLine
 	} from '$lib/api';
 	import { createLogBuffer } from '$lib/log-buffer';
+	import { pollWhileVisible } from '$lib/polling';
 	import {
 		formatDuration,
 		isFinished,
@@ -70,72 +70,45 @@
 		});
 	});
 
-	// Live stream while the deployment runs; reconnects after a dropped socket.
+	// Live stream while the deployment runs. The stream reconnects by itself
+	// after a drop and every connection starts with a full snapshot, so a
+	// result that landed while disconnected still shows up.
 	$effect(() => {
 		const appId = app.id;
 		const deploymentId = (data.deployment as DeploymentDetail).id;
 		if (untrack(() => isFinished(deployment.status))) return;
-		let close: (() => void) | null = null;
-		let retry: ReturnType<typeof setTimeout> | null = null;
-		let attempts = 0;
-		let stopped = false;
-
-		const connect = () => {
-			close = openDeploymentStream(appId, deploymentId, {
-				onSnapshot(detail) {
-					connected = true;
-					attempts = 0;
-					deployment = detail;
-					logsTruncated = detail.logs_truncated;
-					buffer.replace(detail.logs.map(toLine));
-				},
-				onLog(line) {
-					buffer.push(toLine(line));
-				},
-				onDeployment(next) {
-					deployment = next;
-					if (isFinished(next.status)) buffer.flush();
-				},
-				onClose(done) {
-					connected = false;
+		const close = openDeploymentStream(appId, deploymentId, {
+			onSnapshot(detail) {
+				deployment = detail;
+				logsTruncated = detail.logs_truncated;
+				buffer.replace(detail.logs.map(toLine));
+			},
+			onLog(line) {
+				buffer.push(toLine(line));
+			},
+			onDeployment(next) {
+				deployment = next;
+				if (isFinished(next.status)) {
 					buffer.flush();
-					if (stopped || isFinished(deployment.status)) return;
-					if (done) {
-						// The server closed after the result; make sure we have it.
-						getDeployment(appId, deploymentId)
-							.then((detail) => {
-								if (stopped) return;
-								deployment = detail;
-								logsTruncated = detail.logs_truncated;
-								buffer.replace(detail.logs.map(toLine));
-							})
-							.catch((e: any) => (error = e.message ?? 'Could not load the result'));
-						return;
-					}
-					attempts += 1;
-					if (attempts > 10) {
-						error = 'Lost the connection to the server. Reload the page to see the latest state.';
-						return;
-					}
-					retry = setTimeout(connect, Math.min(1000 * attempts, 5000));
+					connected = false;
 				}
-			});
-		};
-		connect();
-		return () => {
-			stopped = true;
-			if (retry) clearTimeout(retry);
-			close?.();
-		};
+			},
+			onOpen() {
+				connected = true;
+			},
+			onDisconnect() {
+				connected = false;
+				buffer.flush();
+			}
+		});
+		return close;
 	});
 
-	// Tick the elapsed time once a second while running.
+	// Tick the elapsed time once a second while running (paused in hidden tabs).
 	$effect(() => {
 		if (finished) return;
-		const timer = setInterval(() => (now = Date.now()), 1000);
-		return () => clearInterval(timer);
+		return pollWhileVisible(() => (now = Date.now()), 1000);
 	});
-
 	// The feed panel would open a second log socket for the same app.
 	$effect(() => {
 		const ctx = appContext(app);

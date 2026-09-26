@@ -1,3 +1,5 @@
+import { connectWithRetry, wsUrl, type ReconnectingSocket } from './reconnecting-socket';
+
 export interface DeployLog {
 	level: string;
 	message: string;
@@ -807,12 +809,19 @@ export interface DeploymentStreamCallbacks {
 	onLog: (line: DeploymentLogLine) => void;
 	/** The deployment row changed (phase, commit, result). */
 	onDeployment: (deployment: Deployment) => void;
-	/** The socket closed; `finished` is true when the server closed it after the result. */
-	onClose?: (finished: boolean) => void;
+	/** Connected (again); a snapshot follows. */
+	onOpen?: (reconnected: boolean) => void;
+	/** The connection dropped; it reconnects by itself in `retryInMs`. */
+	onDisconnect?: (retryInMs: number) => void;
 }
 
+/** Statuses after which a deployment no longer changes. */
+const FINISHED_DEPLOYMENT = ['succeeded', 'failed', 'superseded', 'cancelled', 'canceled'];
+
 /**
- * Live deploy view stream. Returns a `close()` function (call it in $effect cleanup).
+ * Live deploy view stream. Reconnects after a drop (each connection starts
+ * with a full snapshot, so nothing is missed) and closes for good once the
+ * deployment has finished. Returns a `close()` function for $effect cleanup.
  * See handlers/deployments.rs `stream_deployment` for the frames.
  */
 export function openDeploymentStream(
@@ -820,40 +829,41 @@ export function openDeploymentStream(
 	deploymentId: string,
 	callbacks: DeploymentStreamCallbacks
 ): () => void {
-	const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-	const ws = new WebSocket(
-		`${protocol}://${window.location.host}${BASE}/apps/${id}/deployments/${deploymentId}/stream`
+	const socket: ReconnectingSocket = connectWithRetry(
+		() => wsUrl(`${BASE}/apps/${id}/deployments/${deploymentId}/stream`),
+		{
+			onOpen: (reconnected) => callbacks.onOpen?.(reconnected),
+			onDisconnect: (retryInMs) => callbacks.onDisconnect?.(retryInMs),
+			onMessage: (ev) => {
+				let frame: any;
+				try {
+					frame = JSON.parse(ev.data as string);
+				} catch {
+					return;
+				}
+				let status: string | undefined;
+				if (frame.type === 'snapshot') {
+					status = frame.deployment?.status;
+					callbacks.onSnapshot({
+						...frame.deployment,
+						logs: frame.logs ?? [],
+						logs_truncated: !!frame.logs_truncated,
+						container_port: frame.container_port,
+						health_check_path: frame.health_check_path ?? null,
+						source_type: frame.source_type ?? ''
+					});
+				} else if (frame.type === 'log') {
+					callbacks.onLog({ level: frame.level, message: frame.message, ts: frame.ts });
+				} else if (frame.type === 'deployment') {
+					status = frame.deployment?.status;
+					callbacks.onDeployment(frame.deployment);
+				}
+				// Finished: the server closes the socket; don't reconnect.
+				if (status && FINISHED_DEPLOYMENT.includes(status)) socket.close();
+			}
+		}
 	);
-	let closedByUs = false;
-	ws.onmessage = (ev) => {
-		let frame: any;
-		try {
-			frame = JSON.parse(ev.data as string);
-		} catch {
-			return;
-		}
-		if (frame.type === 'snapshot') {
-			callbacks.onSnapshot({
-				...frame.deployment,
-				logs: frame.logs ?? [],
-				logs_truncated: !!frame.logs_truncated,
-				container_port: frame.container_port,
-				health_check_path: frame.health_check_path ?? null,
-				source_type: frame.source_type ?? ''
-			});
-		} else if (frame.type === 'log') {
-			callbacks.onLog({ level: frame.level, message: frame.message, ts: frame.ts });
-		} else if (frame.type === 'deployment') {
-			callbacks.onDeployment(frame.deployment);
-		}
-	};
-	ws.onclose = (ev) => {
-		if (!closedByUs) callbacks.onClose?.(ev.code === 1000);
-	};
-	return () => {
-		closedByUs = true;
-		ws.close();
-	};
+	return () => socket.close();
 }
 
 export async function getDeploymentGeneratedDockerfile(
@@ -1249,17 +1259,56 @@ export async function updatePreviewConfig(id: string, preview_enabled: boolean):
 	});
 }
 
-// ── Metrics (Phase 5) ──
+// ── Metrics ──
 
-export interface MetricPoint {
-	cpu_percent: number;
-	mem_used: number;
-	mem_limit: number;
-	mem_percent: number;
-	net_rx: number;
-	net_tx: number;
-	restarts: number;
-	collected_at: string;
+export type MetricsRange = '1h' | '24h' | '7d' | '30d';
+
+/** Downsampled series as parallel arrays (one entry per bucket). */
+export interface MetricSeries {
+	/** Bucket start, unix seconds. */
+	t: number[];
+	/** Average CPU, percent of one core (100 = one full core). */
+	cpu: number[];
+	cpu_max: number[];
+	/** Average working-set memory in bytes. */
+	mem: number[];
+	mem_max: number[];
+	/** Bytes per second. */
+	rx: number[];
+	tx: number[];
+	pids: number[];
+}
+
+export type MetricEventKind = 'restart' | 'crash' | 'oom';
+
+export interface MetricEvent {
+	/** Unix seconds. */
+	t: number;
+	kind: MetricEventKind;
+	detail: string | null;
+}
+
+export interface MetricCurrent {
+	t: number;
+	cpu: number;
+	mem: number;
+	mem_peak: number | null;
+	rx: number;
+	tx: number;
+	pids: number;
+}
+
+export interface MetricsResponse {
+	range: MetricsRange;
+	/** Bucket width in seconds. */
+	step: number;
+	from: number;
+	to: number;
+	/** Memory limit in bytes, null when unlimited. */
+	mem_limit: number | null;
+	series: MetricSeries;
+	events: MetricEvent[];
+	current: MetricCurrent | null;
 }
 
 export interface SystemMetrics {
@@ -1267,20 +1316,29 @@ export interface SystemMetrics {
 	mem_used: number;
 	mem_total: number;
 	mem_percent: number;
+	/** Filesystem holding Tond's data directory (what the disk alert watches). */
 	disk_used: number;
 	disk_total: number;
 	disk_percent: number;
+	disk_mount: string;
+	/** Running containers Tond manages. */
 	containers_running: number;
 	apps_total: number;
 	apps_running: number;
 	collected_at: string;
 }
 
-export async function getAppMetrics(
+export type MetricsOwner = 'apps' | 'databases' | 'cron';
+
+/** Resource metrics of an app, database or cron job. */
+export async function getMetrics(
+	owner: MetricsOwner,
 	id: string,
-	period: '1h' | '24h' | '7d' = '1h'
-): Promise<MetricPoint[]> {
-	return request<MetricPoint[]>(`/apps/${id}/metrics?period=${period}`);
+	range: MetricsRange = '1h'
+): Promise<MetricsResponse> {
+	return request<MetricsResponse>(
+		`/${owner}/${encodeURIComponent(id)}/metrics?range=${encodeURIComponent(range)}`
+	);
 }
 
 export async function getSystemMetrics(): Promise<SystemMetrics> {
@@ -1294,7 +1352,12 @@ export type AlertMetric = 'cpu' | 'memory' | 'app_down' | 'disk_usage';
 
 /** Valid event slugs for event-based alert subscriptions. */
 export type AlertEvent =
-	'deployment_success' | 'deployment_failure' | 'cron_success' | 'cron_failure';
+	| 'deployment_success'
+	| 'deployment_failure'
+	| 'cron_success'
+	| 'cron_failure'
+	| 'container_restart'
+	| 'container_oom';
 
 /** Groups of alert events/metrics shown in the UI. */
 export interface AlertGroup {
@@ -1331,6 +1394,15 @@ export const ALERT_GROUPS: AlertGroup[] = [
 		events: [
 			{ value: 'deployment_success', label: 'Deployment Success' },
 			{ value: 'deployment_failure', label: 'Deployment Failure' }
+		]
+	},
+	{
+		id: 'containers',
+		label: 'Crashes',
+		metrics: [],
+		events: [
+			{ value: 'container_restart', label: 'Crashed or restarted unexpectedly' },
+			{ value: 'container_oom', label: 'Process killed for running out of memory' }
 		]
 	},
 	{
@@ -1803,8 +1875,11 @@ export interface LogLine {
 
 export interface LogStreamCallbacks {
 	onLine: (line: LogLine) => void;
-	onError?: (e: Event) => void;
-	onClose?: () => void;
+	/** Connected; `reconnected` is true after a drop. The server then sends a
+	 *  fresh snapshot, so callers should clear what they show. */
+	onOpen?: (reconnected: boolean) => void;
+	/** Connection lost; the stream reconnects by itself in `retryInMs`. */
+	onDisconnect?: (retryInMs: number) => void;
 }
 
 export type TerminalTargetKind = 'server' | 'app' | 'database';
@@ -1882,69 +1957,69 @@ function emitCronRun(
 
 /**
  * Opens a WebSocket to `wsUrl` and invokes `callbacks.onLine` for every
- * incoming log line.  Returns a `close()` function — call it in $effect cleanup.
+ * incoming log line. Reconnects with backoff when the connection drops (e.g.
+ * tond-server restarted). Returns a `close()` function — call it in $effect
+ * cleanup.
  *
  * Pass a relative URL like `/api/apps/{id}/logs/stream`; it will be resolved
  * to `ws://` or `wss://` automatically based on the current page protocol.
  */
-export function openLogStream(wsUrl: string, callbacks: LogStreamCallbacks): () => void {
-	const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-	const url = `${protocol}://${window.location.host}${wsUrl}`;
-	const ws = new WebSocket(url);
+export function openLogStream(path: string, callbacks: LogStreamCallbacks): () => void {
+	const socket = connectWithRetry(() => wsUrl(path), {
+		onOpen: (reconnected) => callbacks.onOpen?.(reconnected),
+		onDisconnect: (retryInMs) => callbacks.onDisconnect?.(retryInMs),
+		onMessage: (ev) => handleLogFrame(ev, callbacks)
+	});
+	return () => socket.close();
+}
 
-	ws.onmessage = (ev) => {
-		let frame: any;
-		try {
-			frame = JSON.parse(ev.data as string);
-		} catch {
-			// Raw text line (shouldn't happen with this backend, but be defensive)
-			callbacks.onLine({ source: 'container', text: ev.data as string });
-			return;
-		}
+function handleLogFrame(ev: MessageEvent, callbacks: LogStreamCallbacks) {
+	let frame: any;
+	try {
+		frame = JSON.parse(ev.data as string);
+	} catch {
+		// Raw text line (shouldn't happen with this backend, but be defensive)
+		callbacks.onLine({ source: 'container', text: ev.data as string });
+		return;
+	}
 
-		if (frame.type === 'snapshot') {
-			// App/database log snapshot: deploy_logs + container_logs arrays
-			for (const dl of frame.deploy_logs ?? []) {
-				callbacks.onLine({
-					source: 'deploy',
-					level: dl.level,
-					text: dl.message,
-					ts: dl.ts,
-					appName: dl.app_name
-				});
-			}
-			for (const line of frame.container_logs ?? []) {
-				callbacks.onLine({ source: 'container', text: line.line, ts: line.ts ?? undefined });
-			}
-			// Cron run snapshot: single run object (may be null)
-			if (frame.run) {
-				emitCronRun(frame.run, callbacks);
-			}
-		} else if (frame.type === 'deploy') {
+	if (frame.type === 'snapshot') {
+		// App/database log snapshot: deploy_logs + container_logs arrays
+		for (const dl of frame.deploy_logs ?? []) {
 			callbacks.onLine({
 				source: 'deploy',
-				level: frame.level,
-				text: frame.message,
-				ts: frame.ts,
-				appName: frame.app_name
+				level: dl.level,
+				text: dl.message,
+				ts: dl.ts,
+				appName: dl.app_name
 			});
-		} else if (frame.type === 'container') {
-			callbacks.onLine({
-				source: 'container',
-				text: frame.line,
-				ts: frame.ts ?? undefined,
-				appName: frame.app_name
-			});
-		} else if (frame.type === 'run') {
-			// Cron run completed frame
+		}
+		for (const line of frame.container_logs ?? []) {
+			callbacks.onLine({ source: 'container', text: line.line, ts: line.ts ?? undefined });
+		}
+		// Cron run snapshot: single run object (may be null)
+		if (frame.run) {
 			emitCronRun(frame.run, callbacks);
 		}
-	};
-
-	ws.onerror = (e) => callbacks.onError?.(e);
-	ws.onclose = () => callbacks.onClose?.();
-
-	return () => ws.close();
+	} else if (frame.type === 'deploy') {
+		callbacks.onLine({
+			source: 'deploy',
+			level: frame.level,
+			text: frame.message,
+			ts: frame.ts,
+			appName: frame.app_name
+		});
+	} else if (frame.type === 'container') {
+		callbacks.onLine({
+			source: 'container',
+			text: frame.line,
+			ts: frame.ts ?? undefined,
+			appName: frame.app_name
+		});
+	} else if (frame.type === 'run') {
+		// Cron run completed frame
+		emitCronRun(frame.run, callbacks);
+	}
 }
 
 export async function listTerminalTargets(): Promise<TerminalTarget[]> {
