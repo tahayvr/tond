@@ -56,7 +56,7 @@
 <form class="rounded-lg border border-border bg-card p-4" onsubmit={handleSubmit} novalidate>
 	<div class="mb-1 flex items-center gap-2">
 		<TimerIcon class="size-4 text-muted-foreground" />
-		<h3 class="font-semibold">Dashboard sessions</h3>
+		<h2 class="font-semibold">Dashboard sessions</h2>
 	</div>
 	<p class="mb-4 max-w-2xl text-sm text-muted-foreground">
 		Signed-in browsers are signed out after a period without activity, and in any case after the

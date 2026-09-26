@@ -87,7 +87,7 @@
 <section class="space-y-4">
 	<div class="flex flex-wrap items-start justify-between gap-3">
 		<div class="max-w-xl">
-			<h3 class="font-semibold">API tokens</h3>
+			<h2 class="font-semibold">API tokens</h2>
 			<p class="text-sm text-muted-foreground">
 				For CI, scripts and agents. Each token has its own scopes, apps and expiry, and can be
 				revoked on its own.
