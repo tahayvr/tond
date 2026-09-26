@@ -1,33 +1,79 @@
 <script lang="ts">
+	// Build step (git sources): branch, build method, base directory, static
+	// output and auto-deploy. The branch list comes from the repository, with
+	// its default branch preselected; typing any branch name still works.
+	import { untrack } from 'svelte';
+	import { listRemoteBranches } from '$lib/api';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
 	import { Checkbox } from '$lib/components/ui/checkbox/index.js';
 	import { Separator } from '$lib/components/ui/separator/index.js';
 	import * as Select from '$lib/components/ui/select/index.js';
 	import type { SourceSubType } from '$lib/components/wizard/app-wizard-source.svelte';
+	import BranchIcon from '~icons/ri/git-branch-line';
 
 	interface Props {
 		buildMethod: 'dockerfile' | 'tbuild';
-		containerPort: number;
 		autoDeploy: boolean;
-		watchBranch: string;
+		/** Branch to deploy (auto-deploy watches the same branch). */
+		branch: string;
 		baseDir: string;
 		staticBuild: boolean;
 		sourceSubType: SourceSubType;
+		sourceUrl: string;
+		githubAppId: string | null;
 	}
 
 	let {
 		buildMethod = $bindable<'dockerfile' | 'tbuild'>('tbuild'),
-		containerPort = $bindable(8080),
 		autoDeploy = $bindable(false),
-		watchBranch = $bindable('main'),
+		branch = $bindable(''),
 		baseDir = $bindable(''),
 		staticBuild = $bindable(false),
-		sourceSubType
+		sourceSubType,
+		sourceUrl,
+		githubAppId
 	}: Props = $props();
 
-	// Build method and auto-deploy are only relevant for git-based source types
-	let isGit = $derived(sourceSubType === 'git-public' || sourceSubType === 'git-github-app');
+	let isGit = $derived(
+		sourceSubType === 'git-public' ||
+			sourceSubType === 'git-github-app' ||
+			sourceSubType === 'template'
+	);
+
+	let branches = $state<string[]>([]);
+	let defaultBranch = $state<string | null>(null);
+	let branchesLoading = $state(false);
+	let branchesNote = $state('');
+	let loadedFor = '';
+
+	async function loadBranches(url: string, appId: string | null) {
+		branchesLoading = true;
+		branchesNote = '';
+		try {
+			const result = await listRemoteBranches(url, appId ? { github_app_id: appId } : {});
+			branches = result.branches;
+			defaultBranch = result.default_branch;
+			if (!branch.trim()) branch = result.default_branch ?? result.branches[0] ?? 'main';
+		} catch (e: any) {
+			branches = [];
+			defaultBranch = null;
+			branchesNote = e.message ?? "Couldn't list branches";
+			if (!branch.trim()) branch = 'main';
+		} finally {
+			branchesLoading = false;
+		}
+	}
+
+	$effect(() => {
+		const url = sourceUrl.trim();
+		const appId = githubAppId;
+		if (!isGit || !/^https?:\/\//.test(url)) return;
+		const key = `${url}|${appId ?? ''}`;
+		if (key === loadedFor) return;
+		loadedFor = key;
+		untrack(() => loadBranches(url, appId));
+	});
 
 	const BUILD_METHODS: { value: 'tbuild' | 'dockerfile'; label: string; desc: string }[] = [
 		{
@@ -46,7 +92,45 @@
 </script>
 
 <div class="space-y-6">
-	<div class="flex items-center gap-2">
+	{#if isGit}
+		<div class="space-y-2">
+			<Label for="branch">Branch *</Label>
+			<div class="flex max-w-md items-center gap-2">
+				<BranchIcon class="size-4 shrink-0 text-muted-foreground" />
+				<Input
+					id="branch"
+					type="text"
+					bind:value={branch}
+					list="branch-options"
+					placeholder={branchesLoading ? 'Loading branches…' : 'main'}
+					class="font-mono"
+					autocomplete="off"
+					spellcheck={false}
+				/>
+				<datalist id="branch-options">
+					{#each branches as b (b)}
+						<option value={b}>{b === defaultBranch ? 'default branch' : ''}</option>
+					{/each}
+				</datalist>
+			</div>
+			<p class="text-xs text-muted-foreground">
+				{#if branchesLoading}
+					Reading the repository's branches…
+				{:else if branchesNote}
+					{branchesNote}
+				{:else if defaultBranch}
+					{branches.length} branch{branches.length === 1 ? '' : 'es'}; the repository's default is
+					<code>{defaultBranch}</code>.
+				{:else}
+					The branch Tond clones and deploys.
+				{/if}
+			</p>
+		</div>
+
+		<Separator class="bg-border" />
+	{/if}
+
+	<div class="flex flex-wrap items-center gap-2">
 		<Label for="build-method">Build Method:</Label>
 		<Select.Root type="single" bind:value={buildMethod}>
 			<Select.Trigger id="build-method">
@@ -66,16 +150,6 @@
 	<Separator class="bg-border" />
 
 	<div class="space-y-2">
-		<Label for="container-port">Container Port *</Label>
-		<Input id="container-port" type="number" bind:value={containerPort} min={1} max={65535} />
-		<p class="text-xs text-muted-foreground">
-			The port your application listens on inside the container. Default: 8080
-		</p>
-	</div>
-
-	<Separator class="bg-border" />
-
-	<div class="space-y-2">
 		<Label for="base-dir">Base Directory</Label>
 		<Input id="base-dir" type="text" bind:value={baseDir} placeholder="/" class="font-mono" />
 		<p class="text-xs text-muted-foreground">
@@ -85,7 +159,7 @@
 
 	<Separator class="bg-border" />
 
-	<div class="flex w-1/2 items-center justify-between">
+	<div class="flex items-center justify-between gap-4 sm:w-1/2">
 		<div class="space-y-0.5">
 			<Label>Static Build?</Label>
 			<p class="text-xs text-muted-foreground">
@@ -99,24 +173,15 @@
 	{#if isGit}
 		<Separator class="bg-border" />
 
-		<div class="space-y-4">
-			<div class="flex items-center justify-between">
-				<div class="space-y-0.5">
-					<Label>Auto Deploy</Label>
-					<p class="text-xs text-muted-foreground">
-						Automatically deploy when changes are pushed to the watched branch
-					</p>
-				</div>
-				<Checkbox bind:checked={autoDeploy} />
+		<div class="flex items-center justify-between gap-4">
+			<div class="space-y-0.5">
+				<Label>Auto Deploy</Label>
+				<p class="text-xs text-muted-foreground">
+					Deploy automatically when you push to <code>{branch.trim() || 'the branch above'}</code> (needs
+					a webhook or a GitHub App).
+				</p>
 			</div>
-
-			{#if autoDeploy}
-				<div class="space-y-2">
-					<Label for="watch-branch">Watch Branch</Label>
-					<Input id="watch-branch" type="text" bind:value={watchBranch} placeholder="main" />
-					<p class="text-xs text-muted-foreground">Branch to watch for automatic deployments</p>
-				</div>
-			{/if}
+			<Checkbox bind:checked={autoDeploy} />
 		</div>
 	{/if}
 </div>
