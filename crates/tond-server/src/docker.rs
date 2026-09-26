@@ -573,6 +573,28 @@ pub async fn find_compose_host_port(
     )
 }
 
+/// Force-remove every container of a compose project and its default network.
+/// Best-effort, like `docker compose down` without touching named volumes.
+pub async fn remove_compose_project(docker: &Docker, project_name: &str) {
+    let filters = compose_project_filter(project_name);
+    if let Ok(containers) = docker
+        .list_containers(Some(
+            ListContainersOptionsBuilder::default()
+                .all(true)
+                .filters(&filters)
+                .build(),
+        ))
+        .await
+    {
+        for id in containers.into_iter().filter_map(|c| c.id) {
+            let _ = remove_container(docker, &id).await;
+        }
+    }
+    let _ = docker
+        .remove_network(&format!("{project_name}_default"))
+        .await;
+}
+
 /// Find a free host port starting from a base
 pub async fn find_free_port(docker: &Docker, start: u16) -> anyhow::Result<u16> {
     let containers = docker

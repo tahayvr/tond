@@ -72,7 +72,7 @@ fn compose_command(compose_path: &str, app_name: &str) -> tokio::process::Comman
 
 /// Compose project names must be lowercase; this is also the label value
 /// `docker::find_compose_host_port` looks up.
-pub(crate) fn compose_project_name(app_name: &str) -> String {
+pub fn compose_project_name(app_name: &str) -> String {
     app_name.to_ascii_lowercase()
 }
 

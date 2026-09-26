@@ -446,8 +446,12 @@ pub async fn delete_app(
 ) -> Result<impl IntoResponse, AppError> {
     let app = fetch_app(&state.db, &id).await?;
 
-    // Stop and remove container if running (best-effort)
-    if let Some(container_id) = &app.container_id {
+    // Stop and remove container if running (best-effort). Compose apps store a
+    // sentinel instead of a container id, so remove the whole compose project.
+    if app.source_type == "compose" {
+        docker::remove_compose_project(&state.docker, &deploy::compose_project_name(&app.name))
+            .await;
+    } else if let Some(container_id) = &app.container_id {
         let _ = docker::remove_container(&state.docker, container_id).await;
     }
 

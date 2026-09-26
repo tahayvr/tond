@@ -690,7 +690,7 @@ assert_hardened() { # <container> <label>
         || fail "$2: logs must rotate, got $(jq -c '.LogConfig' <<<"$hc")"
     pass "$2: loopback ports, no-new-privileges, NET_RAW dropped, limits, log rotation"
 }
-assert_hardened "$(app_field e2e-whoami container_id)" "app e2e-whoami"
+assert_hardened tond-e2e-whoami "app e2e-whoami"
 assert_hardened "tond-db-e2e-redis" "database e2e-redis"
 
 WHOAMI_PORT=$(app_field e2e-whoami host_port)
@@ -744,7 +744,7 @@ code=$(api_req POST /api/apps/e2e-whoami/rollback "{\"deployment_id\":\"${FIRST_
 wait_for 300 "rollback to ${FIRST_TAG}" \
     bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/apps/e2e-whoami/deployments | jq -e --arg t '${FIRST_TAG}' '.data[0] | select(.trigger_source == \"rollback\" and .status == \"succeeded\" and .image_tag == \$t)'"
 wait_for_app_running e2e-whoami 120
-running_image=$(docker inspect "$(app_field e2e-whoami container_id)" | jq -r '.[0].Config.Image')
+running_image=$(docker inspect tond-e2e-whoami | jq -r '.[0].Config.Image')
 [[ "$running_image" == "$FIRST_TAG" ]] || fail "rollback must run exactly ${FIRST_TAG}, got ${running_image}"
 wait_for 60 "route after rollback" bash -c "curl -sk --resolve '${WHOAMI_DOMAIN}:443:${IP}' 'https://${WHOAMI_DOMAIN}/' | grep -q Hostname:"
 pass "rollback restored the exact previous image and traffic follows"

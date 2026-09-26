@@ -16,6 +16,6 @@ mod core;
 mod git;
 pub mod images;
 
-pub use build::{build_from_dir, validate_base_dir};
+pub use build::{build_from_dir, compose_project_name, validate_base_dir};
 pub use core::{deploy, deploy_image, deploy_preview};
 pub use git::GitHttpAuth;
