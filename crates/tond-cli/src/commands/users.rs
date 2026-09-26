@@ -10,10 +10,13 @@ use anyhow::Result;
 use clap::Subcommand;
 
 use crate::client::TondClient;
+use crate::error::CliError;
+use crate::output::{Output, outln};
 
 #[derive(Subcommand)]
 pub enum UsersAction {
     /// List dashboard users
+    #[command(visible_alias = "ls")]
     List,
 
     /// Print a one-time link for a user to set a new password (valid 24 hours)
@@ -23,10 +26,12 @@ pub enum UsersAction {
     },
 }
 
-pub async fn handle(client: &TondClient, action: UsersAction) -> Result<()> {
+pub async fn handle(client: &TondClient, out: &Output, action: UsersAction) -> Result<()> {
     match action {
         UsersAction::List => {
-            for u in client.list_users().await? {
+            let users = client.list_users().await?;
+            out.json(&users)?;
+            for u in users {
                 let status = if u.disabled {
                     "disabled"
                 } else if !u.password_set {
@@ -34,7 +39,8 @@ pub async fn handle(client: &TondClient, action: UsersAction) -> Result<()> {
                 } else {
                     "active"
                 };
-                println!(
+                outln!(
+                    out,
                     "{:<32} {:<9} {:<9} 2FA {}  last sign-in {}",
                     u.email,
                     u.role,
@@ -49,7 +55,14 @@ pub async fn handle(client: &TondClient, action: UsersAction) -> Result<()> {
             let user = users
                 .iter()
                 .find(|u| u.email.eq_ignore_ascii_case(email.trim()))
-                .ok_or_else(|| anyhow::anyhow!("no user with the email {email}"))?;
+                .ok_or_else(|| {
+                    CliError::coded(
+                        tond_common::code::NOT_FOUND,
+                        tond_common::exit::NOT_FOUND,
+                        format!("no user with the email {email}"),
+                    )
+                    .with_hint("List users with: tond users list")
+                })?;
             let link = client.create_password_link(&user.id).await?;
             let domain = client
                 .get_settings()
@@ -61,11 +74,24 @@ pub async fn handle(client: &TondClient, action: UsersAction) -> Result<()> {
             } else {
                 domain
             };
-            println!(
+            out.json(&serde_json::json!({
+                "email": user.email,
+                "url": format!("https://{host}{}", link.path),
+                "path": link.path,
+                "expires_at": link.expires_at,
+            }))?;
+            outln!(
+                out,
                 "Send this link to {} (valid until {}, works once):\n\n  https://{}{}\n",
-                user.email, link.expires_at, host, link.path
+                user.email,
+                link.expires_at,
+                host,
+                link.path
             );
-            println!("Setting the password signs the account out everywhere.");
+            outln!(
+                out,
+                "Setting the password signs the account out everywhere."
+            );
         }
     }
     Ok(())

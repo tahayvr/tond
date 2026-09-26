@@ -1,4 +1,9 @@
-import { listGitHubApps, listGitLabTokens, listGiteaTokens, listRegistryCredentials } from '$lib/api';
+import {
+	listGitHubApps,
+	listGitLabTokens,
+	listGiteaTokens,
+	listRegistryCredentials
+} from '$lib/api';
 
 export async function load({ params }: { params: { source: string } }) {
 	if (params.source === 'github') {

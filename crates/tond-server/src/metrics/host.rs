@@ -1,7 +1,7 @@
 // metrics/host.rs — cached host CPU / memory / disk gauges
 //
 // The collector samples the host once per tick and stores the result here;
-// `GET /api/system/metrics` and the disk-usage alert only read the cache.
+// `GET /api/v1/system/metrics` and the disk-usage alert only read the cache.
 // (The old handler built a full `sysinfo::System` — enumerating every process
 // on the host — and slept 200 ms inside the request, for every open tab.)
 //

@@ -40,8 +40,14 @@ use super::session::{MFA_PENDING_COOKIE, extract_cookie, extract_session_token, 
 
 // ── Response helpers ──
 
+/// A 401 from an auth endpoint means a wrong password, code or link, not a
+/// missing session.
 fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
-    (status, Json(ApiResponse::<()>::err(message.into()))).into_response()
+    let code = match status {
+        StatusCode::UNAUTHORIZED => tond_common::code::INVALID_CREDENTIALS,
+        _ => crate::error::code_for_status(status),
+    };
+    (status, Json(ApiResponse::<()>::err(code, message))).into_response()
 }
 
 fn internal_error(e: impl std::fmt::Display) -> Response {
@@ -205,7 +211,7 @@ async fn mark_login(state: &AppState, user_id: &str) {
 const INVALID_SETUP_TOKEN: &str = "This setup link is invalid or has already been used. \
      If the admin account already exists, sign in instead.";
 
-// ── GET /api/auth/status ──
+// ── GET /api/v1/auth/status ──
 // Whether the caller is authenticated. No auth required. Deliberately says
 // nothing about whether first-run setup is still open: setup needs the
 // one-time token anyway, and the setup page checks that token itself.
@@ -228,7 +234,7 @@ pub async fn auth_status(
     (StatusCode::OK, Json(ApiResponse::ok(response))).into_response()
 }
 
-// ── POST /api/auth/setup/check ──
+// ── POST /api/v1/auth/setup/check ──
 // Lets the setup page validate a setup link before showing the form.
 
 pub async fn setup_check(
@@ -247,7 +253,7 @@ pub async fn setup_check(
     }
 }
 
-// ── POST /api/auth/setup ──
+// ── POST /api/v1/auth/setup ──
 // First-run admin account creation. Requires the one-time setup token; the
 // token is consumed and the user inserted in one transaction, so of two
 // concurrent requests only one can succeed.
@@ -363,10 +369,10 @@ pub async fn setup(
     with_cookies(response, &[session_cookie(&session_token, max_age)])
 }
 
-// ── POST /api/auth/login ──
+// ── POST /api/v1/auth/login ──
 // When the user has 2FA enabled, this endpoint responds with a 200 and a
 // short-lived pending-2FA cookie instead of the full session. The client must
-// then POST to /api/auth/2fa/verify with the TOTP code.
+// then POST to /api/v1/auth/2fa/verify with the TOTP code.
 
 pub async fn login(
     _rate: RateLimit,
@@ -499,7 +505,7 @@ pub async fn login(
     with_cookies(response, &[session_cookie(&session_token, max_age)])
 }
 
-// ── POST /api/auth/logout ──
+// ── POST /api/v1/auth/logout ──
 
 pub async fn logout(
     _rate: RateLimit,
@@ -533,7 +539,7 @@ pub async fn logout(
     )
 }
 
-// ── GET /api/auth/me ──
+// ── GET /api/v1/auth/me ──
 // Returns the current user. Requires a valid session cookie.
 
 pub async fn me(_rate: RateLimit, State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -551,7 +557,7 @@ pub async fn me(_rate: RateLimit, State(state): State<AppState>, headers: Header
 // Password Management
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ── POST /api/auth/change-password ──
+// ── POST /api/v1/auth/change-password ──
 // Session cookie only (only human users have passwords). Verifies the current
 // password, re-hashes the new one, and signs out every other session.
 
@@ -620,7 +626,7 @@ pub async fn change_password(
         .into_response()
 }
 
-// ── GET /api/auth/sessions ──
+// ── GET /api/v1/auth/sessions ──
 // All active sessions for the current user (dashboard "Security" tab). The
 // `id` is the stored hash, which identifies a session without being usable
 // as a cookie.
@@ -686,7 +692,7 @@ pub async fn session_responses(
         .collect())
 }
 
-// ── DELETE /api/auth/sessions/{id} ──
+// ── DELETE /api/v1/auth/sessions/{id} ──
 // Revoke a specific session (by the id from list_sessions). Users can only
 // revoke their own sessions.
 
@@ -728,7 +734,7 @@ pub async fn revoke_session(
     }
 }
 
-// ── DELETE /api/auth/sessions ──
+// ── DELETE /api/v1/auth/sessions ──
 // Sign out everywhere: revoke all sessions except the current one.
 
 pub async fn revoke_all_sessions(
@@ -768,7 +774,7 @@ pub async fn revoke_all_sessions(
 // TOTP Two-Factor Authentication
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ── POST /api/auth/2fa/setup ──
+// ── POST /api/v1/auth/2fa/setup ──
 // Requires the current password and is refused while 2FA is enabled (disable
 // it first), so a stolen session can't swap in the attacker's authenticator.
 // Generates a fresh secret, stores it encrypted (not yet enabled), and returns
@@ -853,7 +859,7 @@ pub async fn totp_setup(
         .into_response()
 }
 
-// ── POST /api/auth/2fa/confirm ──
+// ── POST /api/v1/auth/2fa/confirm ──
 // Verify the first TOTP code to confirm the user has scanned the QR correctly.
 // On success: enable 2FA, generate 10 one-time backup codes, and sign out all
 // other sessions.
@@ -877,7 +883,7 @@ pub async fn totp_confirm(
     let Some(encrypted) = user.totp_secret_enc.clone() else {
         return error_response(
             StatusCode::BAD_REQUEST,
-            "2FA setup not started. Call POST /api/auth/2fa/setup first.",
+            "2FA setup not started. Call POST /api/v1/auth/2fa/setup first.",
         );
     };
     let Some(secret_b32) = decrypt_secret(&encrypted) else {
@@ -954,7 +960,7 @@ pub async fn totp_confirm(
         .into_response()
 }
 
-// ── POST /api/auth/2fa/disable ──
+// ── POST /api/v1/auth/2fa/disable ──
 // Requires the current password AND a valid TOTP code (or backup code).
 // Clears the secret, deletes backup codes, and signs out all other sessions.
 
@@ -1020,7 +1026,7 @@ pub async fn totp_disable(
         .into_response()
 }
 
-// ── POST /api/auth/2fa/verify ──
+// ── POST /api/v1/auth/2fa/verify ──
 // Second factor after login when 2FA is enabled. Validates the pending-2FA
 // cookie, checks the TOTP code (or backup code), and on success issues a full
 // session cookie. Each pending login allows MFA_MAX_ATTEMPTS wrong codes;
@@ -1167,7 +1173,7 @@ pub async fn totp_verify(
     )
 }
 
-// ── POST /api/auth/password-link/check ──
+// ── POST /api/v1/auth/password-link/check ──
 // Lets the set-password page validate an invite/reset link before showing the form.
 
 pub async fn password_link_check(
@@ -1190,7 +1196,7 @@ pub async fn password_link_check(
     }
 }
 
-// ── POST /api/auth/password-link/complete ──
+// ── POST /api/v1/auth/password-link/complete ──
 // Set the password from an invite/reset link (single use), sign out every
 // existing session of the account and sign the browser in.
 
@@ -1546,7 +1552,10 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = response_json(response).await;
-        assert_eq!(body["error"], serde_json::json!("Invalid email address"));
+        assert_eq!(
+            body["error"]["message"],
+            serde_json::json!("Invalid email address")
+        );
     }
 
     #[tokio::test]

@@ -2548,8 +2548,7 @@ export const MOCK_DB_CATALOG: DbCatalogEntry[] = [
 		db_type: 'postgres',
 		variant: 'postgis',
 		label: 'PostgreSQL + PostGIS',
-		description:
-			'Geographic objects and spatial queries (the PostGIS image). x86_64 servers only.',
+		description: 'Geographic objects and spatial queries (the PostGIS image). x86_64 servers only.',
 		versions: ['14', '15', '16', '17', '18'],
 		default_version: '16',
 		extensions: ['postgis', 'postgis_topology', 'fuzzystrmatch', 'pg_trgm', 'uuid-ossp'],
@@ -3241,7 +3240,7 @@ export function makeMockSystemSelf(): SystemSelf {
 		http: [
 			{
 				method: 'GET',
-				route: '/api/apps',
+				route: '/api/v1/apps',
 				count: 120,
 				errors: 0,
 				sum_ms: 240,

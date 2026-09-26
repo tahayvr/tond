@@ -1,17 +1,17 @@
 // handlers/backups.rs — Snapshot API handlers + SSE progress stream
 //
 // Routes:
-//   POST   /api/snapshots                       — trigger manual Full snapshot
-//   GET    /api/snapshots                        — list snapshots (filters: scope, trigger, app)
-//   DELETE /api/snapshots/{id}                   — delete record + local dir + remote object
-//   GET    /api/snapshots/config                 — get backup configuration
-//   PUT    /api/snapshots/config                 — update backup configuration
-//   GET    /api/snapshots/{id}/logs/stream       — SSE progress stream
-//   POST   /api/snapshots/{id}/restore           — Full restore (server restart)
-//   POST   /api/snapshots/{id}/restore-app       — App-scope rollback (no restart)
-//   POST   /api/snapshots/{id}/restore-database  — Database-scope restore (no restart)
-//   GET    /api/databases/{id}/backups           — snapshots that hold one database
-//   POST   /api/databases/{id}/backups           — back up one database now
+//   POST   /api/v1/snapshots                       — trigger manual Full snapshot
+//   GET    /api/v1/snapshots                        — list snapshots (filters: scope, trigger, app)
+//   DELETE /api/v1/snapshots/{id}                   — delete record + local dir + remote object
+//   GET    /api/v1/snapshots/config                 — get backup configuration
+//   PUT    /api/v1/snapshots/config                 — update backup configuration
+//   GET    /api/v1/snapshots/{id}/logs/stream       — SSE progress stream
+//   POST   /api/v1/snapshots/{id}/restore           — Full restore (server restart)
+//   POST   /api/v1/snapshots/{id}/restore-app       — App-scope rollback (no restart)
+//   POST   /api/v1/snapshots/{id}/restore-database  — Database-scope restore (no restart)
+//   GET    /api/v1/databases/{id}/backups           — snapshots that hold one database
+//   POST   /api/v1/databases/{id}/backups           — back up one database now
 //
 // Remote copies of snapshots are encrypted with a key derived from
 // TOND_SECRET_KEY: restoring them on another server needs the same key.
@@ -91,7 +91,7 @@ async fn database_name(state: &AppState, id_or_name: &str) -> Result<String, App
         .ok_or_else(|| AppError(TondError::NotFound(format!("database '{id_or_name}'"))))
 }
 
-/// GET /api/databases/{id}/backups — this database's own backups and the
+/// GET /api/v1/databases/{id}/backups — this database's own backups and the
 /// full snapshots (which hold every database), newest first.
 pub async fn list_database_backups(
     _rate: RateLimit,
@@ -110,7 +110,7 @@ pub async fn list_database_backups(
     Ok((StatusCode::OK, Json(ApiResponse::ok(resp))))
 }
 
-/// POST /api/databases/{id}/backups — back up one database now.
+/// POST /api/v1/databases/{id}/backups — back up one database now.
 pub async fn create_database_backup(
     _rate: RateLimit,
     auth: Authz<scope::SnapshotsCreate>,
@@ -139,6 +139,7 @@ pub async fn create_database_backup(
 // ── List snapshots ────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ListSnapshotsQuery {
     pub scope: Option<String>,
     pub trigger: Option<String>,

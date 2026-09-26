@@ -1,4 +1,4 @@
-// Formatting for the "Tond health" panel (GET /api/system/self).
+// Formatting for the "Tond health" panel (GET /api/v1/system/self).
 
 import type { LoopStats } from '$lib/api';
 

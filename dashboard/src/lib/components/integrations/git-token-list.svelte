@@ -71,10 +71,7 @@
 			: initialGitea.map((t) => ({ ...t, url: t.base_url }));
 	}
 
-	let tokens = $state<TokenRow[]>([]);
-	$effect(() => {
-		tokens = rows();
-	});
+	let tokens = $derived<TokenRow[]>(rows());
 
 	let adding = $state(false);
 	let name = $state('');
@@ -93,15 +90,25 @@
 		async () => {
 			const created =
 				kind === 'gitlab'
-					? await createGitLabToken({ name: name.trim(), token: secret.trim(), gitlab_url: url.trim() })
-					: await createGiteaToken({ name: name.trim(), token: secret.trim(), base_url: url.trim() });
+					? await createGitLabToken({
+							name: name.trim(),
+							token: secret.trim(),
+							gitlab_url: url.trim()
+						})
+					: await createGiteaToken({
+							name: name.trim(),
+							token: secret.trim(),
+							base_url: url.trim()
+						});
 			return created;
 		},
 		{
 			success: (t) => `Token “${t.name}” saved. Link it to an app on the app's Webhooks tab.`,
 			onSuccess: (t) => {
 				const row: TokenRow =
-					'gitlab_url' in t ? { ...t, url: t.gitlab_url } : { ...(t as GiteaToken), url: t.base_url };
+					'gitlab_url' in t
+						? { ...t, url: t.gitlab_url }
+						: { ...(t as GiteaToken), url: t.base_url };
 				tokens = [...tokens, row];
 				adding = false;
 				secret = '';

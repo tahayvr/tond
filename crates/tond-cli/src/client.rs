@@ -1,19 +1,22 @@
-// client.rs — typed HTTP client for the Tond API
+// client.rs — typed HTTP client for the Tond API (/api/v1)
 //
 // TondClient wraps reqwest::Client and provides one async method per API
-// endpoint. All methods:
-//   - Attach the Authorization: Bearer <token> header if an API token is set
-//   - Deserialise the response into ApiResponse<T>
-//   - Return the inner data on success, or bail with the error message
+// endpoint. Every request goes through one path (`send` → `parse_envelope`):
+//   - the Authorization: Bearer <token> header when an API token is set
+//   - an Idempotency-Key header on mutating requests (POST/PUT/PATCH/DELETE):
+//     the global --idempotency-key / TOND_IDEMPOTENCY_KEY when given, else a
+//     fresh UUID per request. The same key is reused on retries.
+//   - retries of transient failures: a connection error before any response,
+//     502/503/504, and 409 IDEMPOTENCY_KEY_IN_USE — up to two more attempts
+//     (0.5 s, then 1.5 s later). Other 4xx are never retried. Mutating
+//     requests always carry a key, so a retry cannot apply an action twice.
+//   - the envelope `{"success":true,"data":T}` becomes `Ok(T)`; a failure
+//     becomes a `CliError` (error.rs) carrying the server's code, message,
+//     hint and field, whose exit code comes from the shared catalog. A reply
+//     that is not an envelope (a proxy's HTML 502) is reported with its
+//     status; a connection failure is SERVER_UNREACHABLE (exit 8).
 //
-// This is the only place in the CLI that touches HTTP — main.rs only calls
-// these typed methods and prints the results.
-//
-// Special case — push_deploy():
-//   The CLI shells out to `tar czf` to package the working directory, then
-//   sends the bytes as multipart/form-data to POST /api/apps/{id}/upload.
-//   The server extracts the tarball, builds it, and deploys. The temp tarball
-//   is cleaned up locally after the upload.
+// Nothing here prints: commands decide how to render results (output.rs).
 //
 // Transports:
 //   TondClient::local(socket) talks to tond-server over its root-only Unix
@@ -21,33 +24,47 @@
 //   TondClient::new(url, token) talks HTTP(S) and sends the API token
 //   (`tond_pat_…`, created with `tond token create` or in the dashboard).
 //
-// stream_logs():
-//   Opens a WebSocket to GET /api/apps/{id}/logs/stream?token=<key> and
-//   prints each JSON message as a human-readable line until the server
-//   closes or the user presses Ctrl-C.
+// push_deploy():
+//   Shells out to `tar czf` to package the working directory, then sends the
+//   bytes as multipart/form-data to POST /api/v1/apps/{id}/upload. The server
+//   extracts the tarball and queues a build; the reply carries the deployment id.
 //
-// All other methods are straightforward REST wrappers:
-//   list_apps, create_app, get_app, deploy_app, action (stop/start/restart),
-//   delete_app, get_logs, update_env, update_domain.
+// ws_messages() / log_stream():
+//   Open a WebSocket (e.g. /api/v1/apps/{id}/logs/stream); the token, if any,
+//   travels as `?token=`. Callers read and render the frames.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use serde_json::{Map, Value};
+use reqwest::{Method, RequestBuilder, StatusCode};
+use serde::de::DeserializeOwned;
+use serde_json::{Map, Value, json};
 use tokio_tungstenite::tungstenite::Message;
 use tond_common::{
-    ApiResponse, AppResponse, AuditLogPage, AuditVerifyReport, BackupConfigResponse,
+    ApiErrorBody, AppResponse, AuditLogPage, AuditVerifyReport, BackupConfigResponse,
     CreateAppRequest, CreateCronJobRequest, CreateDatabaseRequest, CreateTokenRequest,
     CreatedDatabaseResponse, CreatedTokenResponse, CronJobResponse, CronJobRun,
     DatabaseCredentialsResponse, DeployKeyResponse, DeploymentResponse, IntegrationResponse,
     ManagedDatabaseDetail, ManagedDatabaseResponse, PasswordLinkResponse,
     PreviewDeploymentResponse, ProjectPreviewResponse, ProjectResponse, ServerSettings,
     SnapshotResponse, StorageProviderResponse, TokenResponse, UpdateCronJobRequest,
-    UpdateSettingsRequest, UserResponse, WebhookConfigResponse, WebhookSecretResponse,
+    UpdateSettingsRequest, UserResponse, WebhookConfigResponse, WebhookSecretResponse, code,
 };
 
-/// Body and response of `/api/settings/host-terminal`.
+use crate::error::CliError;
+
+/// Prefix of every API route.
+pub const API_PREFIX: &str = "/api/v1";
+
+/// Header carrying the idempotency key of a mutating request.
+pub const IDEMPOTENCY_HEADER: &str = "Idempotency-Key";
+
+/// Pauses before the second and third attempt of a transient failure.
+const RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(500), Duration::from_millis(1500)];
+
+/// Body and response of `/api/v1/settings/host-terminal`.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct HostTerminalSetting {
     enabled: bool,
@@ -59,6 +76,9 @@ pub struct TondClient {
     api_key: Option<String>,
     /// Set when talking to tond-server over its local Unix socket.
     socket_path: Option<PathBuf>,
+    /// Caller-chosen idempotency key (--idempotency-key); else one per request.
+    idempotency_key: Option<String>,
+    retry_delays: Vec<Duration>,
 }
 
 /// Incoming messages of a WebSocket opened with `TondClient::ws_messages`.
@@ -69,6 +89,92 @@ pub type WsMessages = std::pin::Pin<
 /// Host used in request URLs sent over the Unix socket (the socket, not DNS, picks the peer).
 const LOCAL_BASE_URL: &str = "http://localhost";
 
+/// Hint shown when the local socket can't be used.
+const LOCAL_HINT: &str = "Run the CLI on the Tond server as root, or connect remotely with \
+                          --server <url> --token <tond_pat_…>.";
+
+fn is_mutating(method: &Method) -> bool {
+    !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+}
+
+/// Whether a response is worth another attempt.
+fn is_transient(status: StatusCode, body: &str) -> bool {
+    match status.as_u16() {
+        502..=504 => true,
+        409 => serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|v| {
+                v.pointer("/error/code")
+                    .and_then(Value::as_str)
+                    .map(|c| c == code::IDEMPOTENCY_KEY_IN_USE)
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Turn a reply into the envelope's data (`None` for `data: null`) or a
+/// typed error.
+pub fn parse_envelope<T: DeserializeOwned>(status: StatusCode, body: &str) -> Result<Option<T>> {
+    let snippet = || {
+        let trimmed = body.trim();
+        if trimmed.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", trimmed.chars().take(300).collect::<String>())
+        }
+    };
+    let envelope = serde_json::from_str::<Value>(body)
+        .ok()
+        .filter(|v| v.get("success").and_then(Value::as_bool).is_some());
+    let Some(mut envelope) = envelope else {
+        if status.is_success() && body.trim().is_empty() {
+            return Ok(None);
+        }
+        let message = if status.is_success() {
+            format!(
+                "Unexpected reply from the server (HTTP {status}){}",
+                snippet()
+            )
+        } else {
+            format!("The server answered HTTP {status}{}", snippet())
+        };
+        return Err(if status.is_success() {
+            CliError::invalid_response(message)
+        } else {
+            CliError::status_only(status.as_u16(), message)
+        }
+        .into());
+    };
+
+    if envelope.get("success").and_then(Value::as_bool) == Some(true) {
+        return match envelope.get_mut("data").map(Value::take) {
+            None | Some(Value::Null) => Ok(None),
+            Some(data) => serde_json::from_value(data).map(Some).map_err(|e| {
+                CliError::invalid_response(format!("Could not read the server's reply: {e}")).into()
+            }),
+        };
+    }
+
+    let error = envelope.get_mut("error").map(Value::take);
+    Err(match error {
+        Some(obj @ Value::Object(_)) => match serde_json::from_value::<ApiErrorBody>(obj) {
+            Ok(body) => CliError::api(status.as_u16(), body),
+            Err(_) => CliError::status_only(
+                status.as_u16(),
+                format!("The request failed (HTTP {status})"),
+            ),
+        },
+        // Servers before /api/v1 sent the message as a plain string.
+        Some(Value::String(message)) => CliError::status_only(status.as_u16(), message),
+        _ => CliError::status_only(
+            status.as_u16(),
+            format!("The request failed without details (HTTP {status})"),
+        ),
+    }
+    .into())
+}
+
 impl TondClient {
     /// Client for a server reached over HTTP(S), authenticated with the API token `api_key`.
     pub fn new(base_url: &str, api_key: Option<&str>) -> Self {
@@ -77,6 +183,8 @@ impl TondClient {
             client: reqwest::Client::new(),
             api_key: api_key.map(|s| s.to_string()),
             socket_path: None,
+            idempotency_key: None,
+            retry_delays: RETRY_DELAYS.to_vec(),
         }
     }
 
@@ -85,20 +193,23 @@ impl TondClient {
         // Probe the socket first so a missing server or missing root privileges
         // produce an actionable message instead of a generic request error.
         if let Err(err) = std::os::unix::net::UnixStream::connect(socket_path) {
-            let hint = "Run the CLI on the Tond server as root, or connect remotely with \
-                        --server <url> --token <tond_pat_…>.";
-            return Err(match err.kind() {
-                std::io::ErrorKind::NotFound => anyhow::anyhow!(
-                    "tond-server socket not found at {}. Is tond-server running? {hint}",
+            let error = match err.kind() {
+                std::io::ErrorKind::NotFound => CliError::unreachable(format!(
+                    "tond-server socket not found at {}. Is tond-server running?",
                     socket_path.display()
-                ),
-                std::io::ErrorKind::PermissionDenied => anyhow::anyhow!(
-                    "permission denied on {} (the socket is root-only). {hint}",
+                )),
+                std::io::ErrorKind::PermissionDenied => {
+                    CliError::socket_permission_denied(format!(
+                        "permission denied on {} (the socket is root-only).",
+                        socket_path.display()
+                    ))
+                }
+                _ => CliError::unreachable(format!(
+                    "could not connect to {}: {err}",
                     socket_path.display()
-                ),
-                _ => anyhow::Error::new(err)
-                    .context(format!("connecting to {}", socket_path.display())),
-            });
+                )),
+            };
+            return Err(error.with_hint(LOCAL_HINT).into());
         }
 
         let client = reqwest::Client::builder()
@@ -110,16 +221,34 @@ impl TondClient {
             client,
             api_key: None,
             socket_path: Some(socket_path.to_path_buf()),
+            idempotency_key: None,
+            retry_delays: RETRY_DELAYS.to_vec(),
         })
     }
 
+    /// Use `key` as the Idempotency-Key of every mutating request.
+    pub fn with_idempotency_key(mut self, key: Option<String>) -> Self {
+        self.idempotency_key = key.filter(|k| !k.trim().is_empty());
+        self
+    }
+
+    #[cfg(test)]
+    fn with_retry_delays(mut self, delays: Vec<Duration>) -> Self {
+        self.retry_delays = delays;
+        self
+    }
+
     /// Add the Authorization header if an API token is configured.
-    fn auth_header(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    fn auth_header(&self, req: RequestBuilder) -> RequestBuilder {
         if let Some(ref key) = self.api_key {
             req.header("Authorization", format!("Bearer {}", key))
         } else {
             req
         }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{API_PREFIX}{path}", self.base_url)
     }
 
     /// Build the WebSocket URL (ws:// or wss://) from the HTTP base URL.
@@ -131,16 +260,117 @@ impl TondClient {
         format!("{}{}", base, path)
     }
 
-    pub async fn list_apps(&self) -> Result<Vec<AppResponse>> {
-        let req = self.client.get(format!("{}/api/apps", self.base_url));
-        let resp: ApiResponse<Vec<AppResponse>> =
-            self.auth_header(req).send().await?.json().await?;
-
-        if resp.success {
-            Ok(resp.data.unwrap_or_default())
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
+    /// Send `method path` (under /api/v1) with retries; `build` adds the body.
+    /// Returns the final status and body text.
+    async fn send(
+        &self,
+        method: Method,
+        path: &str,
+        build: &(dyn Fn(RequestBuilder) -> Result<RequestBuilder> + Send + Sync),
+    ) -> Result<(StatusCode, String)> {
+        let key = is_mutating(&method).then(|| {
+            self.idempotency_key
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+        });
+        let mut attempt = 0usize;
+        loop {
+            let mut req = self.auth_header(self.client.request(method.clone(), self.url(path)));
+            if let Some(key) = &key {
+                req = req.header(IDEMPOTENCY_HEADER, key);
+            }
+            let req = build(req)?;
+            let retry_after = self.retry_delays.get(attempt).copied();
+            match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp.text().await.map_err(|e| {
+                        CliError::unreachable(format!("The connection to tond-server broke: {e}"))
+                    })?;
+                    if let Some(delay) = retry_after
+                        && is_transient(status, &body)
+                    {
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Ok((status, body));
+                }
+                Err(e) if e.is_connect() => {
+                    if let Some(delay) = retry_after {
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(CliError::unreachable(format!(
+                        "Could not connect to tond-server at {}: {e}",
+                        self.base_url
+                    ))
+                    .with_hint("Check that tond-server is running and --server is right.")
+                    .into());
+                }
+                Err(e) => {
+                    return Err(CliError::unreachable(format!(
+                        "The request to tond-server failed: {e}"
+                    ))
+                    .into());
+                }
+            }
         }
+    }
+
+    /// Request with an optional JSON body; the envelope's data, if any.
+    async fn call_opt<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Option<T>> {
+        let (status, text) = self
+            .send(method, path, &move |req| {
+                Ok(match &body {
+                    Some(b) => req.json(b),
+                    None => req,
+                })
+            })
+            .await?;
+        parse_envelope(status, &text)
+    }
+
+    /// Request whose reply must carry data.
+    async fn call<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<T> {
+        self.call_opt(method, path, body)
+            .await?
+            .ok_or_else(|| CliError::invalid_response("No data returned").into())
+    }
+
+    /// Request returning a list (`data: null` reads as empty).
+    async fn list<T: DeserializeOwned>(&self, path: &str) -> Result<Vec<T>> {
+        Ok(self
+            .call_opt(Method::GET, path, None)
+            .await?
+            .unwrap_or_default())
+    }
+
+    /// Request whose data is returned as-is (`null` when absent).
+    async fn value(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
+        Ok(self
+            .call_opt(method, path, body)
+            .await?
+            .unwrap_or(Value::Null))
+    }
+
+    fn to_body<B: serde::Serialize>(body: &B) -> Result<Option<Value>> {
+        Ok(Some(serde_json::to_value(body)?))
+    }
+
+    pub async fn list_apps(&self) -> Result<Vec<AppResponse>> {
+        self.list("/apps").await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -190,93 +420,93 @@ impl TondClient {
             readiness: None,
             ready_after_secs: None,
         };
-
-        let req = self
-            .client
-            .post(format!("{}/api/apps", self.base_url))
-            .json(&req);
-        let resp: ApiResponse<AppResponse> = self.auth_header(req).send().await?.json().await?;
-
-        if resp.success {
-            resp.data.context("No data returned")
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.call(Method::POST, "/apps", Self::to_body(&req)?).await
     }
 
     pub async fn get_app(&self, id: &str) -> Result<AppResponse> {
-        let req = self
-            .client
-            .get(format!("{}/api/apps/{}", self.base_url, id));
-        let resp: ApiResponse<AppResponse> = self.auth_header(req).send().await?.json().await?;
-
-        if resp.success {
-            resp.data.context("No data returned")
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.call(Method::GET, &format!("/apps/{id}"), None).await
     }
 
-    /// Queue a deploy; returns the new deployment's id.
-    pub async fn deploy_app(&self, id: &str) -> Result<Option<String>> {
-        let req = self
-            .client
-            .post(format!("{}/api/apps/{}/deploy", self.base_url, id));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-
-        if !resp.success {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
-        }
-        Ok(resp
-            .data
-            .as_ref()
-            .and_then(|d| d.get("deployment_id"))
-            .and_then(Value::as_str)
-            .map(str::to_string))
+    /// Queue a deploy; returns the server's answer (`deployment_id`, `status`,
+    /// `queue_position`, …).
+    pub async fn deploy_app(&self, id: &str) -> Result<Value> {
+        self.value(Method::POST, &format!("/apps/{id}/deploy"), None)
+            .await
     }
 
-    /// GET /api/apps/{id}/deployments/{deployment_id} (deployment + log).
+    /// GET /api/v1/apps/{id}/deployments/{deployment_id} (deployment + log).
     pub async fn get_deployment(&self, id: &str, deployment_id: &str) -> Result<Value> {
-        let req = self.client.get(format!(
-            "{}/api/apps/{}/deployments/{}",
-            self.base_url, id, deployment_id
-        ));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            resp.data.context("No data returned")
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.call(
+            Method::GET,
+            &format!("/apps/{id}/deployments/{deployment_id}"),
+            None,
+        )
+        .await
     }
 
-    /// Open a WebSocket at `path` (over the Unix socket or TCP) and return its
-    /// incoming messages. The token, if any, travels as `?token=`.
+    /// Open a WebSocket at `path` (relative to /api/v1, over the Unix socket
+    /// or TCP) and return its incoming messages. The token, if any, travels
+    /// as `?token=`.
     pub async fn ws_messages(&self, path: &str) -> Result<WsMessages> {
+        let path = format!("{API_PREFIX}{path}");
         let sep = if path.contains('?') { '&' } else { '?' };
         let url = match self.api_key.as_deref() {
             Some(token) => self.ws_url(&format!("{path}{sep}token={token}")),
-            None => self.ws_url(path),
+            None => self.ws_url(&path),
+        };
+        let unreachable = |e: &dyn std::fmt::Display| {
+            CliError::unreachable(format!("Failed to open the stream: {e}"))
+        };
+        // A refused upgrade (401/403/404…) is an API error, not an outage.
+        let handshake = |e: tokio_tungstenite::tungstenite::Error| match e {
+            tokio_tungstenite::tungstenite::Error::Http(resp) => {
+                let status = resp.status();
+                let body = resp
+                    .body()
+                    .as_deref()
+                    .map(String::from_utf8_lossy)
+                    .unwrap_or_default()
+                    .into_owned();
+                parse_envelope::<Value>(status, &body)
+                    .err()
+                    .unwrap_or_else(|| {
+                        CliError::status_only(
+                            status.as_u16(),
+                            format!("The server refused the stream (HTTP {status})"),
+                        )
+                        .into()
+                    })
+            }
+            other => unreachable(&other).into(),
         };
         Ok(match &self.socket_path {
             Some(socket_path) => {
                 let stream = tokio::net::UnixStream::connect(socket_path)
                     .await
-                    .context("Failed to connect to tond-server")?;
+                    .map_err(|e| unreachable(&e))?;
                 let (ws, _) = tokio_tungstenite::client_async(url.as_str(), stream)
                     .await
-                    .context("Failed to open the stream")?;
+                    .map_err(handshake)?;
                 Box::pin(ws.split().1)
             }
             None => {
                 let (ws, _) = tokio_tungstenite::connect_async(&url)
                     .await
-                    .context("Failed to open the stream")?;
+                    .map_err(handshake)?;
                 Box::pin(ws.split().1)
             }
         })
     }
 
-    pub async fn push_deploy(&self, id: &str, dir: &str) -> Result<()> {
+    /// Live log stream of an app: a `snapshot` frame, then `deploy` and
+    /// `container` frames until the server closes.
+    pub async fn log_stream(&self, id: &str) -> Result<WsMessages> {
+        self.ws_messages(&format!("/apps/{id}/logs/stream")).await
+    }
+
+    /// Package `dir` and upload it; returns the server's answer (the queued
+    /// deployment, like `deploy_app`).
+    pub async fn push_deploy(&self, id: &str, dir: &str) -> Result<Value> {
         // Create a tarball of the directory, respecting .tondignore and
         // applying sensible default exclusions.
         let tar_path = format!("/tmp/tond-push-{}.tar.gz", uuid::Uuid::new_v4());
@@ -337,160 +567,49 @@ impl TondClient {
         let file_bytes = tokio::fs::read(&tar_path).await?;
         let _ = tokio::fs::remove_file(&tar_path).await;
 
-        let part = reqwest::multipart::Part::bytes(file_bytes)
-            .file_name("upload.tar.gz")
-            .mime_str("application/gzip")?;
+        let (status, body) = self
+            .send(Method::POST, &format!("/apps/{id}/upload"), &|req| {
+                let part = reqwest::multipart::Part::bytes(file_bytes.clone())
+                    .file_name("upload.tar.gz")
+                    .mime_str("application/gzip")?;
+                Ok(req.multipart(reqwest::multipart::Form::new().part("file", part)))
+            })
+            .await?;
+        upload_result(status, &body)
+    }
 
-        let form = reqwest::multipart::Form::new().part("file", part);
-
-        let req = self
-            .client
-            .post(format!("{}/api/apps/{}/upload", self.base_url, id))
-            .multipart(form);
-        let resp = self
-            .auth_header(req)
-            .send()
+    pub async fn action(&self, id: &str, action: &str) -> Result<Value> {
+        self.value(Method::POST, &format!("/apps/{id}/{action}"), None)
             .await
-            .context("Upload failed")?;
-        upload_result(resp.status(), &resp.text().await.unwrap_or_default())
     }
 
-    pub async fn action(&self, id: &str, action: &str) -> Result<()> {
-        let req = self
-            .client
-            .post(format!("{}/api/apps/{}/{}", self.base_url, id, action));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-
-        if !resp.success {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
-        }
-        Ok(())
-    }
-
-    pub async fn delete_app(&self, id: &str) -> Result<()> {
-        let req = self
-            .client
-            .delete(format!("{}/api/apps/{}", self.base_url, id));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-
-        if !resp.success {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
-        }
-        Ok(())
+    pub async fn delete_app(&self, id: &str) -> Result<Value> {
+        self.value(Method::DELETE, &format!("/apps/{id}"), None)
+            .await
     }
 
     pub async fn get_logs(&self, id: &str) -> Result<Value> {
-        let req = self
-            .client
-            .get(format!("{}/api/apps/{}/logs", self.base_url, id));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-
-        if resp.success {
-            resp.data.context("No data returned")
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
-    }
-
-    /// Stream live logs over WebSocket, printing lines until server closes or Ctrl-C.
-    /// The initial snapshot message is rendered first, then live events follow.
-    pub async fn stream_logs(&self, id: &str) -> Result<()> {
-        let mut read = self
-            .ws_messages(&format!("/api/apps/{}/logs/stream", id))
+        self.call(Method::GET, &format!("/apps/{id}/logs"), None)
             .await
-            .context("Failed to connect to log stream")?;
-
-        while let Some(msg) = read.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    let val: Value = match serde_json::from_str(&text) {
-                        Ok(v) => v,
-                        Err(_) => {
-                            println!("{}", text);
-                            continue;
-                        }
-                    };
-
-                    match val.get("type").and_then(|t| t.as_str()) {
-                        Some("snapshot") => {
-                            // Print historical deploy logs
-                            if let Some(arr) = val.get("deploy_logs").and_then(|v| v.as_array())
-                                && !arr.is_empty()
-                            {
-                                println!("=== Deploy Logs (snapshot) ===");
-                                for log in arr {
-                                    let level =
-                                        log.get("level").and_then(|v| v.as_str()).unwrap_or("info");
-                                    let msg =
-                                        log.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                                    let ts = log.get("ts").and_then(|v| v.as_str()).unwrap_or("");
-                                    println!("[{}] {} {}", level.to_uppercase(), ts, msg);
-                                }
-                            }
-                            // Print historical container logs
-                            if let Some(arr) = val.get("container_logs").and_then(|v| v.as_array())
-                                && !arr.is_empty()
-                            {
-                                println!("=== Container Logs (snapshot) ===");
-                                for line in arr {
-                                    if let Some(s) = line.as_str() {
-                                        print!("{}", s);
-                                    }
-                                }
-                            }
-                            println!("=== Live stream ===");
-                        }
-                        Some("deploy") => {
-                            let level = val.get("level").and_then(|v| v.as_str()).unwrap_or("info");
-                            let msg = val.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                            let ts = val.get("ts").and_then(|v| v.as_str()).unwrap_or("");
-                            println!("[DEPLOY][{}] {} {}", level.to_uppercase(), ts, msg);
-                        }
-                        Some("container") => {
-                            let line = val.get("line").and_then(|v| v.as_str()).unwrap_or("");
-                            print!("{}", line);
-                        }
-                        _ => {
-                            println!("{}", text);
-                        }
-                    }
-                }
-                Ok(Message::Close(_)) => break,
-                Ok(_) => {} // ignore binary/ping/pong
-                Err(e) => {
-                    anyhow::bail!("WebSocket error: {}", e);
-                }
-            }
-        }
-
-        Ok(())
     }
 
     /// Set individual env vars. Variables that are not named are left unchanged.
-    pub async fn update_env(&self, id: &str, env_vars: Value) -> Result<()> {
-        let req = self
-            .client
-            .patch(format!("{}/api/apps/{}/env", self.base_url, id))
-            .json(&serde_json::json!({ "set": env_vars }));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-
-        if !resp.success {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
-        }
-        Ok(())
+    pub async fn update_env(&self, id: &str, env_vars: Value) -> Result<Value> {
+        self.value(
+            Method::PATCH,
+            &format!("/apps/{id}/env"),
+            Some(json!({ "set": env_vars })),
+        )
+        .await
     }
 
-    pub async fn update_domain(&self, id: &str, domain: &str) -> Result<()> {
-        let req = self
-            .client
-            .put(format!("{}/api/apps/{}/domain", self.base_url, id))
-            .json(&serde_json::json!({ "domain": domain }));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-
-        if !resp.success {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
-        }
-        Ok(())
+    pub async fn update_domain(&self, id: &str, domain: &str) -> Result<Value> {
+        self.value(
+            Method::PUT,
+            &format!("/apps/{id}/domain"),
+            Some(json!({ "domain": domain })),
+        )
+        .await
     }
 
     pub async fn update_health(
@@ -499,21 +618,17 @@ impl TondClient {
         path: Option<&str>,
         interval: i64,
         threshold: i64,
-    ) -> Result<()> {
-        let req = self
-            .client
-            .put(format!("{}/api/apps/{}/health", self.base_url, id))
-            .json(&serde_json::json!({
+    ) -> Result<Value> {
+        self.value(
+            Method::PUT,
+            &format!("/apps/{id}/health"),
+            Some(json!({
                 "health_check_path": path,
                 "health_check_interval": interval,
                 "health_failure_threshold": threshold,
-            }));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-
-        if !resp.success {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
-        }
-        Ok(())
+            })),
+        )
+        .await
     }
 
     /// Add a volume. The server stores it in `<data>/volumes/<app>/<name>`;
@@ -523,161 +638,90 @@ impl TondClient {
         id: &str,
         container_path: &str,
         name: Option<&str>,
-    ) -> Result<()> {
-        let mut body = serde_json::json!({ "container_path": container_path });
+    ) -> Result<Value> {
+        let mut body = json!({ "container_path": container_path });
         if let Some(name) = name {
-            body["name"] = serde_json::Value::String(name.to_string());
+            body["name"] = Value::String(name.to_string());
         }
-        let req = self
-            .client
-            .post(format!("{}/api/apps/{}/volumes", self.base_url, id))
-            .json(&body);
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-
-        if !resp.success {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
-        }
-        Ok(())
+        self.value(Method::POST, &format!("/apps/{id}/volumes"), Some(body))
+            .await
     }
 
-    pub async fn remove_volume(&self, id: &str, container_path: &str) -> Result<()> {
-        let req = self
-            .client
-            .delete(format!("{}/api/apps/{}/volumes", self.base_url, id))
-            .json(&serde_json::json!({ "container_path": container_path }));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-
-        if !resp.success {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
-        }
-        Ok(())
+    pub async fn remove_volume(&self, id: &str, container_path: &str) -> Result<Value> {
+        self.value(
+            Method::DELETE,
+            &format!("/apps/{id}/volumes"),
+            Some(json!({ "container_path": container_path })),
+        )
+        .await
     }
 
-    pub async fn update_drain_timeout(&self, id: &str, seconds: i64) -> Result<()> {
-        let req = self
-            .client
-            .put(format!("{}/api/apps/{}/drain-timeout", self.base_url, id))
-            .json(&serde_json::json!({ "drain_timeout": seconds }));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-
-        if !resp.success {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
-        }
-        Ok(())
+    pub async fn update_drain_timeout(&self, id: &str, seconds: i64) -> Result<Value> {
+        self.value(
+            Method::PUT,
+            &format!("/apps/{id}/drain-timeout"),
+            Some(json!({ "drain_timeout": seconds })),
+        )
+        .await
     }
 
     pub async fn list_deployments(&self, id: &str) -> Result<Vec<DeploymentResponse>> {
-        let req = self
-            .client
-            .get(format!("{}/api/apps/{}/deployments", self.base_url, id));
-        let resp: ApiResponse<Vec<DeploymentResponse>> =
-            self.auth_header(req).send().await?.json().await?;
-
-        if resp.success {
-            Ok(resp.data.unwrap_or_default())
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.list(&format!("/apps/{id}/deployments")).await
     }
 
-    pub async fn rollback_app(&self, id: &str) -> Result<()> {
-        let req = self
-            .client
-            .post(format!("{}/api/apps/{}/rollback", self.base_url, id));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-
-        if !resp.success {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
-        }
-        Ok(())
+    pub async fn rollback_app(&self, id: &str) -> Result<Value> {
+        self.value(Method::POST, &format!("/apps/{id}/rollback"), None)
+            .await
     }
 
     /// Generate (or regenerate) an Ed25519 deploy key for an app.
     /// Returns the public key string.
     pub async fn generate_deploy_key(&self, id: &str) -> Result<String> {
-        let req = self
-            .client
-            .post(format!("{}/api/apps/{}/deploy-key", self.base_url, id));
-        let resp: ApiResponse<DeployKeyResponse> =
-            self.auth_header(req).send().await?.json().await?;
-
-        if resp.success {
-            resp.data.context("No data returned").map(|d| d.public_key)
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        let key: DeployKeyResponse = self
+            .call(Method::POST, &format!("/apps/{id}/deploy-key"), None)
+            .await?;
+        Ok(key.public_key)
     }
 
     /// Get the current public deploy key for an app.
     pub async fn get_deploy_key(&self, id: &str) -> Result<String> {
-        let req = self
-            .client
-            .get(format!("{}/api/apps/{}/deploy-key", self.base_url, id));
-        let resp: ApiResponse<DeployKeyResponse> =
-            self.auth_header(req).send().await?.json().await?;
-
-        if resp.success {
-            resp.data.context("No data returned").map(|d| d.public_key)
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        let key: DeployKeyResponse = self
+            .call(Method::GET, &format!("/apps/{id}/deploy-key"), None)
+            .await?;
+        Ok(key.public_key)
     }
 
     /// Webhook URLs for an app (the secret is revealed separately).
     pub async fn get_webhook_config(&self, id: &str) -> Result<WebhookConfigResponse> {
-        let req = self
-            .client
-            .get(format!("{}/api/apps/{}/webhook", self.base_url, id));
-        let resp: ApiResponse<WebhookConfigResponse> =
-            self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            resp.data.context("No data returned")
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.call(Method::GET, &format!("/apps/{id}/webhook"), None)
+            .await
     }
 
     /// Replace the webhook secret with a caller-chosen value.
     pub async fn set_webhook_secret(&self, id: &str, secret: &str) -> Result<()> {
-        let req = self
-            .client
-            .put(format!("{}/api/apps/{}/webhook-secret", self.base_url, id))
-            .json(&serde_json::json!({ "secret": secret }));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-
-        if !resp.success {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
-        }
+        self.value(
+            Method::PUT,
+            &format!("/apps/{id}/webhook-secret"),
+            Some(json!({ "secret": secret })),
+        )
+        .await?;
         Ok(())
     }
 
     /// Reveal the app's webhook secret (admin only, audit-logged).
     pub async fn reveal_webhook_secret(&self, id: &str) -> Result<WebhookSecretResponse> {
-        let req = self
-            .client
-            .get(format!("{}/api/apps/{}/webhook-secret", self.base_url, id));
-        let resp: ApiResponse<WebhookSecretResponse> =
-            self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            resp.data.context("No data returned")
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.call(Method::GET, &format!("/apps/{id}/webhook-secret"), None)
+            .await
     }
 
     /// Replace the webhook secret with a freshly generated one; returns it.
     pub async fn rotate_webhook_secret(&self, id: &str) -> Result<WebhookSecretResponse> {
-        let req = self.client.post(format!(
-            "{}/api/apps/{}/webhook-secret/rotate",
-            self.base_url, id
-        ));
-        let resp: ApiResponse<WebhookSecretResponse> =
-            self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            resp.data.context("No data returned")
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.call(
+            Method::POST,
+            &format!("/apps/{id}/webhook-secret/rotate"),
+            None,
+        )
+        .await
     }
 
     /// Enable or disable auto-deploy, optionally setting the watch branch.
@@ -687,18 +731,15 @@ impl TondClient {
         auto_deploy: bool,
         watch_branch: Option<&str>,
     ) -> Result<()> {
-        let req = self
-            .client
-            .put(format!("{}/api/apps/{}/auto-deploy", self.base_url, id))
-            .json(&serde_json::json!({
+        self.value(
+            Method::PUT,
+            &format!("/apps/{id}/auto-deploy"),
+            Some(json!({
                 "auto_deploy": auto_deploy,
                 "watch_branch": watch_branch,
-            }));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-
-        if !resp.success {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
-        }
+            })),
+        )
+        .await?;
         Ok(())
     }
 
@@ -711,61 +752,33 @@ impl TondClient {
         id: &str,
         ttl_hours: Option<i64>,
     ) -> Result<PreviewDeploymentResponse> {
-        let body = serde_json::json!({ "ttl_hours": ttl_hours });
-        let req = self
-            .client
-            .post(format!("{}/api/apps/{}/preview", self.base_url, id))
-            .json(&body);
-        let resp: ApiResponse<PreviewDeploymentResponse> =
-            self.auth_header(req).send().await?.json().await?;
-
-        if resp.success {
-            resp.data.context("No data returned")
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.call(
+            Method::POST,
+            &format!("/apps/{id}/preview"),
+            Some(json!({ "ttl_hours": ttl_hours })),
+        )
+        .await
     }
 
     /// List active (non-expired) preview deployments for an app.
     pub async fn list_previews(&self, id: &str) -> Result<Vec<PreviewDeploymentResponse>> {
-        let req = self
-            .client
-            .get(format!("{}/api/apps/{}/previews", self.base_url, id));
-        let resp: ApiResponse<Vec<PreviewDeploymentResponse>> =
-            self.auth_header(req).send().await?.json().await?;
-
-        if resp.success {
-            Ok(resp.data.unwrap_or_default())
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.list(&format!("/apps/{id}/previews")).await
     }
 
     /// Stop and remove a specific preview deployment.
-    pub async fn delete_preview(&self, id: &str, preview_id: &str) -> Result<()> {
-        let req = self.client.delete(format!(
-            "{}/api/apps/{}/previews/{}",
-            self.base_url, id, preview_id
-        ));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-
-        if !resp.success {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
-        }
-        Ok(())
+    pub async fn delete_preview(&self, id: &str, preview_id: &str) -> Result<Value> {
+        self.value(
+            Method::DELETE,
+            &format!("/apps/{id}/previews/{preview_id}"),
+            None,
+        )
+        .await
     }
 
     // ── Projects ──
 
     pub async fn list_projects(&self) -> Result<Vec<ProjectResponse>> {
-        let req = self.client.get(format!("{}/api/projects", self.base_url));
-        let resp: ApiResponse<Vec<ProjectResponse>> =
-            self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            Ok(resp.data.unwrap_or_default())
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.list("/projects").await
     }
 
     pub async fn create_project(
@@ -773,65 +786,41 @@ impl TondClient {
         name: &str,
         description: Option<&str>,
     ) -> Result<ProjectResponse> {
-        let body = serde_json::json!({ "name": name, "description": description });
-        let req = self
-            .client
-            .post(format!("{}/api/projects", self.base_url))
-            .json(&body);
-        let resp: ApiResponse<ProjectResponse> = self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            resp.data.context("No data returned")
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.call(
+            Method::POST,
+            "/projects",
+            Some(json!({ "name": name, "description": description })),
+        )
+        .await
     }
 
     pub async fn get_project(&self, id: &str) -> Result<ProjectResponse> {
-        let req = self
-            .client
-            .get(format!("{}/api/projects/{}", self.base_url, id));
-        let resp: ApiResponse<ProjectResponse> = self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            resp.data.context("No data returned")
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.call(Method::GET, &format!("/projects/{id}"), None)
+            .await
     }
 
-    pub async fn delete_project(&self, id: &str) -> Result<()> {
-        let req = self
-            .client
-            .delete(format!("{}/api/projects/{}", self.base_url, id));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-        if !resp.success {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
-        }
-        Ok(())
+    pub async fn delete_project(&self, id: &str) -> Result<Value> {
+        self.value(Method::DELETE, &format!("/projects/{id}"), None)
+            .await
     }
 
-    pub async fn deploy_project(&self, id: &str) -> Result<()> {
-        let req = self
-            .client
-            .post(format!("{}/api/projects/{}/deploy", self.base_url, id));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-        if !resp.success {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
-        }
-        Ok(())
+    pub async fn deploy_project(&self, id: &str) -> Result<Value> {
+        self.value(Method::POST, &format!("/projects/{id}/deploy"), None)
+            .await
     }
 
     /// Assign an app to a project (or remove it when project_id is None).
-    pub async fn assign_app_project(&self, app_id: &str, project_id: Option<&str>) -> Result<()> {
-        let body = serde_json::json!({ "project_id": project_id });
-        let req = self
-            .client
-            .put(format!("{}/api/apps/{}/project", self.base_url, app_id))
-            .json(&body);
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-        if !resp.success {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
-        }
-        Ok(())
+    pub async fn assign_app_project(
+        &self,
+        app_id: &str,
+        project_id: Option<&str>,
+    ) -> Result<Value> {
+        self.value(
+            Method::PUT,
+            &format!("/apps/{app_id}/project"),
+            Some(json!({ "project_id": project_id })),
+        )
+        .await
     }
 
     // ── Project-level Previews ──
@@ -843,21 +832,12 @@ impl TondClient {
         project_id: &str,
         ttl_hours: Option<i64>,
     ) -> Result<ProjectPreviewResponse> {
-        let body = serde_json::json!({ "ttl_hours": ttl_hours });
-        let req = self
-            .client
-            .post(format!(
-                "{}/api/projects/{}/previews",
-                self.base_url, project_id
-            ))
-            .json(&body);
-        let resp: ApiResponse<ProjectPreviewResponse> =
-            self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            resp.data.context("No data returned")
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.call(
+            Method::POST,
+            &format!("/projects/{project_id}/previews"),
+            Some(json!({ "ttl_hours": ttl_hours })),
+        )
+        .await
     }
 
     /// List active project previews for a project.
@@ -865,43 +845,27 @@ impl TondClient {
         &self,
         project_id: &str,
     ) -> Result<Vec<ProjectPreviewResponse>> {
-        let req = self.client.get(format!(
-            "{}/api/projects/{}/previews",
-            self.base_url, project_id
-        ));
-        let resp: ApiResponse<Vec<ProjectPreviewResponse>> =
-            self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            Ok(resp.data.unwrap_or_default())
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.list(&format!("/projects/{project_id}/previews")).await
     }
 
     /// Delete (stop + expire) a project preview.
-    pub async fn delete_project_preview(&self, project_id: &str, preview_id: &str) -> Result<()> {
-        let req = self.client.delete(format!(
-            "{}/api/projects/{}/previews/{}",
-            self.base_url, project_id, preview_id
-        ));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-        if !resp.success {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
-        }
-        Ok(())
+    pub async fn delete_project_preview(
+        &self,
+        project_id: &str,
+        preview_id: &str,
+    ) -> Result<Value> {
+        self.value(
+            Method::DELETE,
+            &format!("/projects/{project_id}/previews/{preview_id}"),
+            None,
+        )
+        .await
     }
 
     // ── Managed Databases ──
 
     pub async fn list_databases(&self) -> Result<Vec<ManagedDatabaseResponse>> {
-        let req = self.client.get(format!("{}/api/databases", self.base_url));
-        let resp: ApiResponse<Vec<ManagedDatabaseResponse>> =
-            self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            Ok(resp.data.unwrap_or_default())
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.list("/databases").await
     }
 
     pub async fn create_database(
@@ -918,92 +882,41 @@ impl TondClient {
             memory_limit,
             ..Default::default()
         };
-        let req = self
-            .client
-            .post(format!("{}/api/databases", self.base_url))
-            .json(&body);
-        let resp: ApiResponse<CreatedDatabaseResponse> =
-            self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            resp.data.context("No data returned")
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.call(Method::POST, "/databases", Self::to_body(&body)?)
+            .await
     }
 
     /// Reveal a database's passwords and connection strings (admin only,
     /// audit-logged).
     pub async fn get_database_credentials(&self, id: &str) -> Result<DatabaseCredentialsResponse> {
-        let req = self.client.get(format!(
-            "{}/api/databases/{}/credentials",
-            self.base_url, id
-        ));
-        let resp: ApiResponse<DatabaseCredentialsResponse> =
-            self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            resp.data.context("No data returned")
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.call(Method::GET, &format!("/databases/{id}/credentials"), None)
+            .await
     }
 
     pub async fn get_database(&self, id: &str) -> Result<ManagedDatabaseDetail> {
-        let req = self
-            .client
-            .get(format!("{}/api/databases/{}", self.base_url, id));
-        let resp: ApiResponse<ManagedDatabaseDetail> =
-            self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            resp.data.context("No data returned")
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.call(Method::GET, &format!("/databases/{id}"), None)
+            .await
     }
 
-    pub async fn delete_database(&self, id: &str) -> Result<()> {
-        let req = self
-            .client
-            .delete(format!("{}/api/databases/{}", self.base_url, id));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-        if !resp.success {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
-        }
-        Ok(())
+    pub async fn delete_database(&self, id: &str) -> Result<Value> {
+        self.value(Method::DELETE, &format!("/databases/{id}"), None)
+            .await
     }
 
-    pub async fn stop_database(&self, id: &str) -> Result<()> {
-        let req = self
-            .client
-            .post(format!("{}/api/databases/{}/stop", self.base_url, id));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-        if !resp.success {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
-        }
-        Ok(())
+    pub async fn stop_database(&self, id: &str) -> Result<Value> {
+        self.value(Method::POST, &format!("/databases/{id}/stop"), None)
+            .await
     }
 
-    pub async fn start_database(&self, id: &str) -> Result<()> {
-        let req = self
-            .client
-            .post(format!("{}/api/databases/{}/start", self.base_url, id));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-        if !resp.success {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
-        }
-        Ok(())
+    pub async fn start_database(&self, id: &str) -> Result<Value> {
+        self.value(Method::POST, &format!("/databases/{id}/start"), None)
+            .await
     }
 
     // ── Cron Jobs ──
 
     pub async fn list_cron_jobs(&self) -> Result<Vec<CronJobResponse>> {
-        let req = self.client.get(format!("{}/api/cron", self.base_url));
-        let resp: ApiResponse<Vec<CronJobResponse>> =
-            self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            resp.data.context("No data returned")
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.list("/cron").await
     }
 
     pub async fn create_cron_job(
@@ -1030,28 +943,12 @@ impl TondClient {
             retry_delay_seconds: None,
             volumes: None,
         };
-        let req = self
-            .client
-            .post(format!("{}/api/cron", self.base_url))
-            .json(&body);
-        let resp: ApiResponse<CronJobResponse> = self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            resp.data.context("No data returned")
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.call(Method::POST, "/cron", Self::to_body(&body)?)
+            .await
     }
 
     pub async fn get_cron_job(&self, id: &str) -> Result<CronJobResponse> {
-        let req = self
-            .client
-            .get(format!("{}/api/cron/{}", self.base_url, id));
-        let resp: ApiResponse<CronJobResponse> = self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            resp.data.context("No data returned")
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.call(Method::GET, &format!("/cron/{id}"), None).await
     }
 
     pub async fn update_cron_job(
@@ -1081,69 +978,39 @@ impl TondClient {
             retry_delay_seconds: None,
             volumes: None,
         };
-        let req = self
-            .client
-            .patch(format!("{}/api/cron/{}", self.base_url, id))
-            .json(&body);
-        let resp: ApiResponse<CronJobResponse> = self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            resp.data.context("No data returned")
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.call(Method::PATCH, &format!("/cron/{id}"), Self::to_body(&body)?)
+            .await
     }
 
-    pub async fn delete_cron_job(&self, id: &str) -> Result<()> {
-        let req = self
-            .client
-            .delete(format!("{}/api/cron/{}", self.base_url, id));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-        if !resp.success {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
-        }
-        Ok(())
+    pub async fn delete_cron_job(&self, id: &str) -> Result<Value> {
+        self.value(Method::DELETE, &format!("/cron/{id}"), None)
+            .await
     }
 
-    pub async fn trigger_cron_job(&self, id: &str) -> Result<()> {
-        let req = self
-            .client
-            .post(format!("{}/api/cron/{}/trigger", self.base_url, id));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-        if !resp.success {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
-        }
-        Ok(())
+    pub async fn trigger_cron_job(&self, id: &str) -> Result<Value> {
+        self.value(Method::POST, &format!("/cron/{id}/trigger"), None)
+            .await
     }
 
     pub async fn list_cron_job_runs(&self, id: &str) -> Result<Vec<CronJobRun>> {
-        let req = self
-            .client
-            .get(format!("{}/api/cron/{}/runs", self.base_url, id));
-        let resp: ApiResponse<Vec<CronJobRun>> = self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            resp.data.context("No data returned")
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.list(&format!("/cron/{id}/runs")).await
     }
 
-    // ── Phase 7.1 — Password Management ──
+    // ── Password Management ──
 
     /// Change the current user's password.
     /// The server verifies `current_password` with argon2, then re-hashes
     /// `new_password` and invalidates all other active sessions.
     pub async fn change_password(&self, current_password: &str, new_password: &str) -> Result<()> {
-        let req = self
-            .client
-            .post(format!("{}/api/auth/change-password", self.base_url))
-            .json(&serde_json::json!({
+        self.value(
+            Method::POST,
+            "/auth/change-password",
+            Some(json!({
                 "current_password": current_password,
                 "new_password": new_password
-            }));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-        if !resp.success {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
-        }
+            })),
+        )
+        .await?;
         Ok(())
     }
 
@@ -1151,115 +1018,65 @@ impl TondClient {
 
     /// Fetch the current server-wide settings.
     pub async fn get_settings(&self) -> Result<ServerSettings> {
-        let req = self.client.get(format!("{}/api/settings", self.base_url));
-        let resp: ApiResponse<ServerSettings> = self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            resp.data.context("No data returned")
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.call(Method::GET, "/settings", None).await
     }
 
     /// Patch one or more server-wide settings. Only supplied fields are updated.
     pub async fn update_settings(&self, req_body: UpdateSettingsRequest) -> Result<ServerSettings> {
-        let req = self
-            .client
-            .put(format!("{}/api/settings", self.base_url))
-            .json(&req_body);
-        let resp: ApiResponse<ServerSettings> = self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            resp.data.context("No data returned")
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.call(Method::PUT, "/settings", Self::to_body(&req_body)?)
+            .await
     }
 
     /// Whether the dashboard's host terminal is switched on.
     pub async fn get_host_terminal(&self) -> Result<bool> {
-        let req = self
-            .client
-            .get(format!("{}/api/settings/host-terminal", self.base_url));
-        let resp: ApiResponse<HostTerminalSetting> =
-            self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            Ok(resp.data.context("No data returned")?.enabled)
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        let s: HostTerminalSetting = self
+            .call(Method::GET, "/settings/host-terminal", None)
+            .await?;
+        Ok(s.enabled)
     }
 
     /// Switch the dashboard's host terminal on or off. The server accepts this
     /// only over the local Unix socket.
     pub async fn set_host_terminal(&self, enabled: bool) -> Result<bool> {
-        let req = self
-            .client
-            .put(format!("{}/api/settings/host-terminal", self.base_url))
-            .json(&HostTerminalSetting { enabled });
-        let resp: ApiResponse<HostTerminalSetting> =
-            self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            Ok(resp.data.context("No data returned")?.enabled)
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        let s: HostTerminalSetting = self
+            .call(
+                Method::PUT,
+                "/settings/host-terminal",
+                Self::to_body(&HostTerminalSetting { enabled })?,
+            )
+            .await?;
+        Ok(s.enabled)
     }
 
     // ── Notification Integrations ──
 
     /// List all notification integrations.
     pub async fn list_integrations(&self) -> Result<Vec<IntegrationResponse>> {
-        let req = self
-            .client
-            .get(format!("{}/api/integrations", self.base_url));
-        let resp: ApiResponse<Vec<IntegrationResponse>> =
-            self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            Ok(resp.data.unwrap_or_default())
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.list("/integrations").await
     }
 
     /// Get a single integration by ID.
     pub async fn get_integration(&self, id: &str) -> Result<IntegrationResponse> {
-        let req = self
-            .client
-            .get(format!("{}/api/integrations/{}", self.base_url, id));
-        let resp: ApiResponse<IntegrationResponse> =
-            self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            resp.data.context("No data returned")
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.call(Method::GET, &format!("/integrations/{id}"), None)
+            .await
     }
 
     /// Delete an integration.
-    pub async fn delete_integration(&self, id: &str) -> Result<()> {
-        let req = self
-            .client
-            .delete(format!("{}/api/integrations/{}", self.base_url, id));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-        if !resp.success {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
-        }
-        Ok(())
+    pub async fn delete_integration(&self, id: &str) -> Result<Value> {
+        self.value(Method::DELETE, &format!("/integrations/{id}"), None)
+            .await
     }
 
     /// Send a test notification through an integration.
     pub async fn test_integration(&self, id: &str) -> Result<String> {
-        let req = self
-            .client
-            .post(format!("{}/api/integrations/{}/test", self.base_url, id));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            Ok(resp
-                .data
-                .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(String::from))
-                .unwrap_or_else(|| "Test sent".into()))
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        let data = self
+            .value(Method::POST, &format!("/integrations/{id}/test"), None)
+            .await?;
+        Ok(data
+            .get("message")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .unwrap_or_else(|| "Test sent".into()))
     }
 
     /// Enable or disable an integration.
@@ -1268,32 +1085,18 @@ impl TondClient {
         id: &str,
         enabled: bool,
     ) -> Result<IntegrationResponse> {
-        let req = self
-            .client
-            .patch(format!("{}/api/integrations/{}", self.base_url, id))
-            .json(&serde_json::json!({ "enabled": enabled }));
-        let resp: ApiResponse<IntegrationResponse> =
-            self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            resp.data.context("No data returned")
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.call(
+            Method::PATCH,
+            &format!("/integrations/{id}"),
+            Some(json!({ "enabled": enabled })),
+        )
+        .await
     }
 
     // ── Storage providers ─────────────────────────────────────────────────────
 
     pub async fn list_storage_providers(&self) -> Result<Vec<StorageProviderResponse>> {
-        let req = self
-            .client
-            .get(format!("{}/api/storage-providers", self.base_url));
-        let resp: ApiResponse<Vec<StorageProviderResponse>> =
-            self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            Ok(resp.data.unwrap_or_default())
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.list("/storage-providers").await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1307,10 +1110,10 @@ impl TondClient {
         access_key_id: &str,
         secret_access_key: &str,
     ) -> Result<StorageProviderResponse> {
-        let req = self
-            .client
-            .post(format!("{}/api/storage-providers", self.base_url))
-            .json(&serde_json::json!({
+        self.call(
+            Method::POST,
+            "/storage-providers",
+            Some(json!({
                 "name": name,
                 "kind": "s3",
                 "config": {
@@ -1321,42 +1124,25 @@ impl TondClient {
                     "access_key_id": access_key_id,
                     "secret_access_key": secret_access_key,
                 }
-            }));
-        let resp: ApiResponse<StorageProviderResponse> =
-            self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            resp.data.context("No data returned")
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+            })),
+        )
+        .await
     }
 
     pub async fn test_storage_provider(&self, id: &str) -> Result<String> {
-        let req = self.client.post(format!(
-            "{}/api/storage-providers/{}/test",
-            self.base_url, id
-        ));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            Ok(resp
-                .data
-                .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(String::from))
-                .unwrap_or_else(|| "Connection successful".into()))
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        let data = self
+            .value(Method::POST, &format!("/storage-providers/{id}/test"), None)
+            .await?;
+        Ok(data
+            .get("message")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .unwrap_or_else(|| "Connection successful".into()))
     }
 
-    pub async fn delete_storage_provider(&self, id: &str) -> Result<()> {
-        let req = self
-            .client
-            .delete(format!("{}/api/storage-providers/{}", self.base_url, id));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            Ok(())
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+    pub async fn delete_storage_provider(&self, id: &str) -> Result<Value> {
+        self.value(Method::DELETE, &format!("/storage-providers/{id}"), None)
+            .await
     }
 
     // ── Snapshots ─────────────────────────────────────────────────────────────
@@ -1364,187 +1150,103 @@ impl TondClient {
     /// Take a full snapshot. Returns once the local copy is complete; a remote
     /// upload (when configured) continues in the background.
     pub async fn create_snapshot(&self, name: Option<&str>) -> Result<SnapshotResponse> {
-        let req = self
-            .client
-            .post(format!("{}/api/snapshots", self.base_url))
-            .json(&serde_json::json!({ "name": name }));
-        let resp: ApiResponse<SnapshotResponse> =
-            self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            resp.data.context("No data returned")
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.call(Method::POST, "/snapshots", Some(json!({ "name": name })))
+            .await
     }
 
     pub async fn list_snapshots(&self, app: Option<&str>) -> Result<Vec<SnapshotResponse>> {
-        let mut url = format!("{}/api/snapshots", self.base_url);
-        if let Some(a) = app {
-            url.push_str(&format!("?app={}", a));
-        }
-        let req = self.client.get(url);
-        let resp: ApiResponse<Vec<SnapshotResponse>> =
-            self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            Ok(resp.data.unwrap_or_default())
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
+        match app {
+            Some(a) => {
+                self.list(&format!("/snapshots?app={}", urlencoding::encode(a)))
+                    .await
+            }
+            None => self.list("/snapshots").await,
         }
     }
 
-    pub async fn delete_snapshot(&self, id: &str) -> Result<()> {
-        let req = self
-            .client
-            .delete(format!("{}/api/snapshots/{}", self.base_url, id));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            Ok(())
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+    pub async fn delete_snapshot(&self, id: &str) -> Result<Value> {
+        self.value(Method::DELETE, &format!("/snapshots/{id}"), None)
+            .await
     }
 
-    pub async fn restore_snapshot_full(&self, id: &str) -> Result<String> {
-        let req = self
-            .client
-            .post(format!("{}/api/snapshots/{}/restore", self.base_url, id));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            Ok(resp
-                .data
-                .and_then(|v| {
-                    v.get("pre_restore_snapshot_id")
-                        .and_then(|m| m.as_str())
-                        .map(String::from)
-                })
-                .unwrap_or_default())
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+    /// Restore a full snapshot; the answer names the pre-restore snapshot
+    /// (`pre_restore_snapshot_id`).
+    pub async fn restore_snapshot_full(&self, id: &str) -> Result<Value> {
+        self.value(Method::POST, &format!("/snapshots/{id}/restore"), None)
+            .await
     }
 
-    pub async fn restore_app_from_snapshot(&self, snapshot_id: &str, app_name: &str) -> Result<()> {
-        let req = self
-            .client
-            .post(format!(
-                "{}/api/snapshots/{}/restore-app",
-                self.base_url, snapshot_id
-            ))
-            .json(&serde_json::json!({ "app_name": app_name }));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            Ok(())
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+    pub async fn restore_app_from_snapshot(
+        &self,
+        snapshot_id: &str,
+        app_name: &str,
+    ) -> Result<Value> {
+        self.value(
+            Method::POST,
+            &format!("/snapshots/{snapshot_id}/restore-app"),
+            Some(json!({ "app_name": app_name })),
+        )
+        .await
     }
 
-    pub async fn rollback_database(&self, snapshot_id: &str, db_name: &str) -> Result<()> {
-        let req = self
-            .client
-            .post(format!(
-                "{}/api/snapshots/{}/restore-database",
-                self.base_url, snapshot_id
-            ))
-            .json(&serde_json::json!({ "db_name": db_name }));
-        let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            Ok(())
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+    pub async fn rollback_database(&self, snapshot_id: &str, db_name: &str) -> Result<Value> {
+        self.value(
+            Method::POST,
+            &format!("/snapshots/{snapshot_id}/restore-database"),
+            Some(json!({ "db_name": db_name })),
+        )
+        .await
     }
 
     pub async fn get_backup_config(&self) -> Result<BackupConfigResponse> {
-        let req = self
-            .client
-            .get(format!("{}/api/snapshots/config", self.base_url));
-        let resp: ApiResponse<BackupConfigResponse> =
-            self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            resp.data.context("No data returned")
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+        self.call(Method::GET, "/snapshots/config", None).await
     }
 
-    pub async fn update_backup_config(
-        &self,
-        body: serde_json::Value,
-    ) -> Result<BackupConfigResponse> {
-        let req = self
-            .client
-            .put(format!("{}/api/snapshots/config", self.base_url))
-            .json(&body);
-        let resp: ApiResponse<BackupConfigResponse> =
-            self.auth_header(req).send().await?.json().await?;
-        if resp.success {
-            resp.data.context("No data returned")
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
+    pub async fn update_backup_config(&self, body: Value) -> Result<BackupConfigResponse> {
+        self.call(Method::PUT, "/snapshots/config", Some(body))
+            .await
     }
 
     // ── API tokens ──
 
-    /// Unwrap an API envelope into its data.
-    fn into_data<T: serde::Serialize>(resp: ApiResponse<T>) -> Result<T> {
-        if resp.success {
-            resp.data.context("No data returned")
-        } else {
-            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
-        }
-    }
-
     /// Create an API token; the response carries the secret (shown once).
     pub async fn create_token(&self, body: &CreateTokenRequest) -> Result<CreatedTokenResponse> {
-        let req = self
-            .client
-            .post(format!("{}/api/tokens", self.base_url))
-            .json(body);
-        Self::into_data(self.auth_header(req).send().await?.json().await?)
+        self.call(Method::POST, "/tokens", Self::to_body(body)?)
+            .await
     }
 
     /// List API tokens (every user's when `all`).
     pub async fn list_tokens(&self, all: bool) -> Result<Vec<TokenResponse>> {
-        let req = self
-            .client
-            .get(format!("{}/api/tokens?all={all}", self.base_url));
-        Self::into_data(self.auth_header(req).send().await?.json().await?)
+        self.list(&format!("/tokens?all={all}")).await
     }
 
     /// Revoke an API token by id.
     pub async fn revoke_token(&self, id: &str) -> Result<TokenResponse> {
-        let req = self
-            .client
-            .delete(format!("{}/api/tokens/{}", self.base_url, id));
-        Self::into_data(self.auth_header(req).send().await?.json().await?)
+        self.call(Method::DELETE, &format!("/tokens/{id}"), None)
+            .await
     }
 
     // ── Users ──
 
     pub async fn list_users(&self) -> Result<Vec<UserResponse>> {
-        let req = self.client.get(format!("{}/api/users", self.base_url));
-        Self::into_data(self.auth_header(req).send().await?.json().await?)
+        self.list("/users").await
     }
 
     /// Issue a one-time set-password link for a user (invite or reset).
     pub async fn create_password_link(&self, user_id: &str) -> Result<PasswordLinkResponse> {
-        let req = self.client.post(format!(
-            "{}/api/users/{}/password-link",
-            self.base_url, user_id
-        ));
-        Self::into_data(self.auth_header(req).send().await?.json().await?)
+        self.call(
+            Method::POST,
+            &format!("/users/{user_id}/password-link"),
+            None,
+        )
+        .await
     }
 
     // ── Audit log ──
 
     /// Verify the audit log's hash chain.
     pub async fn verify_audit_log(&self) -> Result<AuditVerifyReport> {
-        let req = self
-            .client
-            .get(format!("{}/api/audit-log/verify", self.base_url));
-        Self::into_data(self.auth_header(req).send().await?.json().await?)
+        self.call(Method::GET, "/audit-log/verify", None).await
     }
 
     /// One page of the audit log, newest first.
@@ -1553,72 +1255,21 @@ impl TondClient {
             .iter()
             .map(|(k, v)| format!("{k}={}", urlencoding::encode(v)))
             .collect();
-        let req = self
-            .client
-            .get(format!("{}/api/audit-log?{}", self.base_url, qs.join("&")));
-        Self::into_data(self.auth_header(req).send().await?.json().await?)
+        self.call(Method::GET, &format!("/audit-log?{}", qs.join("&")), None)
+            .await
     }
 }
 
-/// Turn the upload endpoint's reply into a result. The server refuses unsafe
-/// or oversized archives with a JSON error that says what to change; anything
-/// else (a proxy's HTML page, an empty body) is reported with its status.
-fn upload_result(status: reqwest::StatusCode, body: &str) -> Result<()> {
-    match serde_json::from_str::<ApiResponse<Value>>(body) {
-        Ok(resp) if resp.success => Ok(()),
-        Ok(resp) => anyhow::bail!(
-            "{}",
-            resp.error
-                .unwrap_or_else(|| format!("Upload failed ({status})"))
-        ),
-        Err(_) => anyhow::bail!(
-            "Upload failed ({status}){}",
-            if body.trim().is_empty() {
-                String::new()
-            } else {
-                format!(": {}", body.trim().chars().take(300).collect::<String>())
-            }
-        ),
-    }
+/// Turn the upload endpoint's reply into the queued deployment. The server
+/// refuses unsafe or oversized archives with a structured error that says
+/// what to change; anything else (a proxy's HTML page, an empty body) is
+/// reported with its status.
+fn upload_result(status: StatusCode, body: &str) -> Result<Value> {
+    Ok(parse_envelope::<Value>(status, body)?.unwrap_or(Value::Null))
 }
 
 #[cfg(test)]
-mod upload_result_tests {
-    use super::*;
-
-    #[test]
-    fn upload_result_surfaces_server_errors_and_non_json_replies() {
-        assert!(
-            upload_result(
-                reqwest::StatusCode::ACCEPTED,
-                r#"{"success":true,"data":{}}"#
-            )
-            .is_ok()
-        );
-        let err = upload_result(
-            reqwest::StatusCode::PAYLOAD_TOO_LARGE,
-            r#"{"success":false,"error":"Too large: add build output to .tondignore"}"#,
-        )
-        .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
-        assert!(
-            err.contains(".tondignore"),
-            "server message should be shown: {err}"
-        );
-        let err = upload_result(reqwest::StatusCode::BAD_GATEWAY, "<html>bad gateway</html>")
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
-        assert!(
-            err.contains("502"),
-            "status should be shown for non-JSON replies: {err}"
-        );
-    }
-}
-
-#[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
 
@@ -1641,7 +1292,7 @@ mod tests {
         body: Arc<Mutex<Option<Value>>>,
     }
 
-    async fn spawn_test_server(router: Router) -> SocketAddr {
+    pub(crate) async fn spawn_test_server(router: Router) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .unwrap_or_else(|err| panic!("failed to bind test server listener: {err}"));
@@ -1656,7 +1307,7 @@ mod tests {
         addr
     }
 
-    fn app_response_json() -> Value {
+    pub(crate) fn app_response_json() -> Value {
         json!({
             "id": "app-1",
             "name": "demo",
@@ -1708,15 +1359,15 @@ mod tests {
     fn ws_url_converts_http_and_https_schemes() {
         let http_client = TondClient::new("http://localhost:3001", None);
         assert_eq!(
-            http_client.ws_url("/api/apps/demo/logs/stream"),
-            "ws://localhost:3001/api/apps/demo/logs/stream",
+            http_client.ws_url("/api/v1/apps/demo/logs/stream"),
+            "ws://localhost:3001/api/v1/apps/demo/logs/stream",
             "ws_url should convert http:// base URLs to ws://"
         );
 
         let https_client = TondClient::new("https://tond.example.com", None);
         assert_eq!(
-            https_client.ws_url("/api/apps/demo/logs/stream"),
-            "wss://tond.example.com/api/apps/demo/logs/stream",
+            https_client.ws_url("/api/v1/apps/demo/logs/stream"),
+            "wss://tond.example.com/api/v1/apps/demo/logs/stream",
             "ws_url should convert https:// base URLs to wss://"
         );
     }
@@ -1725,7 +1376,11 @@ mod tests {
     fn auth_header_adds_bearer_token_only_when_configured() {
         let client_with_key = TondClient::new("http://localhost:3001", Some("secret"));
         let request_with_key = client_with_key
-            .auth_header(client_with_key.client.get("http://localhost:3001/api/apps"))
+            .auth_header(
+                client_with_key
+                    .client
+                    .get("http://localhost:3001/api/v1/apps"),
+            )
             .build()
             .unwrap_or_else(|err| panic!("failed to build authorized request: {err}"));
         assert_eq!(
@@ -1742,7 +1397,7 @@ mod tests {
             .auth_header(
                 client_without_key
                     .client
-                    .get("http://localhost:3001/api/apps"),
+                    .get("http://localhost:3001/api/v1/apps"),
             )
             .build()
             .unwrap_or_else(|err| panic!("failed to build unauthenticated request: {err}"));
@@ -1763,7 +1418,7 @@ mod tests {
         let state = CaptureState::default();
         let router = Router::new()
             .route(
-                "/api/apps",
+                "/api/v1/apps",
                 get(
                     |State(state): State<CaptureState>, headers: HeaderMap| async move {
                         *state.auth_header.lock().await = headers
@@ -1815,7 +1470,7 @@ mod tests {
     #[tokio::test]
     async fn list_apps_returns_empty_vec_when_success_response_has_no_data() {
         let router = Router::new().route(
-            "/api/apps",
+            "/api/v1/apps",
             get(|| async { axum::Json(json!({ "success": true, "data": null, "error": null })) }),
         );
         let addr = spawn_test_server(router).await;
@@ -1835,7 +1490,7 @@ mod tests {
     #[tokio::test]
     async fn list_apps_returns_unknown_error_when_api_fails_without_message() {
         let router = Router::new().route(
-            "/api/apps",
+            "/api/v1/apps",
             get(|| async { axum::Json(json!({ "success": false, "data": null, "error": null })) }),
         );
         let addr = spawn_test_server(router).await;
@@ -1849,7 +1504,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "Unknown error",
+            "The request failed without details (HTTP 200 OK)",
             "list_apps should surface a fallback error message when the API does not provide one"
         );
     }
@@ -1857,7 +1512,7 @@ mod tests {
     #[tokio::test]
     async fn get_app_requires_data_in_successful_response() {
         let router = Router::new().route(
-            "/api/apps/app-1",
+            "/api/v1/apps/app-1",
             get(|| async { axum::Json(json!({ "success": true, "data": null, "error": null })) }),
         );
         let addr = spawn_test_server(router).await;
@@ -1881,7 +1536,7 @@ mod tests {
         let capture = CaptureState::default();
         let router = Router::new()
             .route(
-                "/api/apps",
+                "/api/v1/apps",
                 post(
                     |State(state): State<CaptureState>, headers: HeaderMap, body: Bytes| async move {
                         *state.auth_header.lock().await = headers
@@ -1976,7 +1631,7 @@ mod tests {
         let capture = CaptureState::default();
         let router = Router::new()
             .route(
-                "/api/apps",
+                "/api/v1/apps",
                 post(
                     |State(state): State<CaptureState>, headers: HeaderMap, body: Bytes| async move {
                         *state.auth_header.lock().await = headers
@@ -2055,7 +1710,7 @@ mod tests {
         let capture = MultiCaptureState::default();
         let router = Router::new()
             .route(
-                "/api/projects",
+                "/api/v1/projects",
                 post(
                     |State(state): State<MultiCaptureState>, body: Bytes| async move {
                         *state.project_body.lock().await = Some(
@@ -2080,7 +1735,7 @@ mod tests {
                 ),
             )
             .route(
-                "/api/databases",
+                "/api/v1/databases",
                 post(
                     |State(state): State<MultiCaptureState>, body: Bytes| async move {
                         *state.database_body.lock().await = Some(
@@ -2174,7 +1829,7 @@ mod tests {
     #[tokio::test]
     async fn test_integration_uses_default_message_when_response_omits_one() {
         let router = Router::new().route(
-            "/api/integrations/integration-1/test",
+            "/api/v1/integrations/integration-1/test",
             post(|| async {
                 axum::Json(json!({
                     "success": true,
@@ -2195,5 +1850,274 @@ mod tests {
             message, "Test sent",
             "test_integration should fall back to a default success message when the API omits one"
         );
+    }
+
+    fn cli_error(err: &anyhow::Error) -> CliError {
+        crate::error::find(err)
+            .cloned()
+            .unwrap_or_else(|| panic!("expected a CliError, got: {err:#}"))
+    }
+
+    #[test]
+    fn structured_errors_become_typed_errors() {
+        let err = parse_envelope::<Value>(
+            reqwest::StatusCode::NOT_FOUND,
+            r#"{"success":false,"data":null,"error":{"code":"APP_NOT_FOUND","message":"App not found: web","hint":"List apps with: tond apps list","field":"app"}}"#,
+        )
+        .err()
+        .unwrap_or_else(|| panic!("expected an error"));
+        assert_eq!(
+            cli_error(&err),
+            CliError {
+                status: Some(404),
+                code: Some("APP_NOT_FOUND".into()),
+                message: "App not found: web".into(),
+                hint: Some("List apps with: tond apps list".into()),
+                field: Some("app".into()),
+                exit: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_string_errors_and_non_json_replies_use_the_status() {
+        let err = parse_envelope::<Value>(
+            reqwest::StatusCode::CONFLICT,
+            r#"{"success":false,"error":"Deploy already running"}"#,
+        )
+        .err()
+        .unwrap_or_else(|| panic!("expected an error"));
+        let e = cli_error(&err);
+        assert_eq!((e.code, e.exit), (None, 5));
+        assert_eq!(e.message, "Deploy already running");
+
+        let err = upload_result(reqwest::StatusCode::BAD_GATEWAY, "<html>bad gateway</html>")
+            .err()
+            .unwrap_or_else(|| panic!("expected an error"));
+        let e = cli_error(&err);
+        assert_eq!(e.exit, 8, "a proxy 502 means the server is unavailable");
+        assert!(e.message.contains("502"), "status is shown: {}", e.message);
+
+        let err = upload_result(
+            reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+            r#"{"success":false,"data":null,"error":{"code":"PAYLOAD_TOO_LARGE","message":"Too large","hint":"add build output to .tondignore"}}"#,
+        )
+        .err()
+        .unwrap_or_else(|| panic!("expected an error"));
+        assert_eq!(
+            cli_error(&err).hint.as_deref(),
+            Some("add build output to .tondignore")
+        );
+        assert_eq!(
+            upload_result(
+                reqwest::StatusCode::ACCEPTED,
+                r#"{"success":true,"data":{"deployment_id":"dep-1"}}"#
+            )
+            .ok(),
+            Some(json!({"deployment_id": "dep-1"}))
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct RetryState {
+        /// Idempotency-Key header of each request (None when absent).
+        keys: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    fn key_of(headers: &HeaderMap) -> Option<String> {
+        headers
+            .get(IDEMPOTENCY_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    }
+
+    fn fast(client: TondClient) -> TondClient {
+        client.with_retry_delays(vec![Duration::from_millis(1), Duration::from_millis(1)])
+    }
+
+    #[tokio::test]
+    async fn mutating_requests_retry_503_with_the_same_idempotency_key() {
+        let state = RetryState::default();
+        let router = Router::new()
+            .route(
+                "/api/v1/apps/web/deploy",
+                post(
+                    |State(state): State<RetryState>, headers: HeaderMap| async move {
+                        let mut keys = state.keys.lock().await;
+                        keys.push(key_of(&headers));
+                        if keys.len() == 1 {
+                            (StatusCode::SERVICE_UNAVAILABLE, "busy".to_string())
+                        } else {
+                            (
+                                StatusCode::ACCEPTED,
+                                json!({"success": true, "data": {"deployment_id": "dep-1"}})
+                                    .to_string(),
+                            )
+                        }
+                    },
+                ),
+            )
+            .with_state(state.clone());
+        let addr = spawn_test_server(router).await;
+        let client = fast(TondClient::new(&format!("http://{addr}"), None));
+
+        let data = client
+            .deploy_app("web")
+            .await
+            .unwrap_or_else(|err| panic!("expected the retry to succeed: {err}"));
+        assert_eq!(data["deployment_id"], "dep-1");
+        let keys = state.keys.lock().await.clone();
+        assert_eq!(keys.len(), 2, "one retry after the 503");
+        assert!(keys[0].is_some(), "mutating requests carry a key");
+        assert_eq!(keys[0], keys[1], "the retry reuses the key");
+    }
+
+    #[tokio::test]
+    async fn explicit_idempotency_key_is_sent_and_gets_carry_none() {
+        let state = RetryState::default();
+        let router = Router::new()
+            .route(
+                "/api/v1/apps/web",
+                get(
+                    |State(state): State<RetryState>, headers: HeaderMap| async move {
+                        state.keys.lock().await.push(key_of(&headers));
+                        axum::Json(json!({"success": true, "data": app_response_json()}))
+                    },
+                )
+                .delete(
+                    |State(state): State<RetryState>, headers: HeaderMap| async move {
+                        state.keys.lock().await.push(key_of(&headers));
+                        axum::Json(json!({"success": true, "data": null}))
+                    },
+                ),
+            )
+            .with_state(state.clone());
+        let addr = spawn_test_server(router).await;
+        let client = TondClient::new(&format!("http://{addr}"), None)
+            .with_idempotency_key(Some("ci-run-42".into()));
+
+        client
+            .get_app("web")
+            .await
+            .unwrap_or_else(|err| panic!("get_app: {err}"));
+        client
+            .delete_app("web")
+            .await
+            .unwrap_or_else(|err| panic!("delete_app: {err}"));
+        assert_eq!(
+            state.keys.lock().await.clone(),
+            vec![None, Some("ci-run-42".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn key_in_use_is_retried_but_other_4xx_are_not() {
+        let state = RetryState::default();
+        let router = Router::new()
+            .route(
+                "/api/v1/apps/busy/restart",
+                post(
+                    |State(state): State<RetryState>, headers: HeaderMap| async move {
+                        state.keys.lock().await.push(key_of(&headers));
+                        (
+                            StatusCode::CONFLICT,
+                            axum::Json(json!({"success": false, "data": null, "error": {
+                                "code": "IDEMPOTENCY_KEY_IN_USE", "message": "still running"}})),
+                        )
+                    },
+                ),
+            )
+            .route(
+                "/api/v1/apps/gone/restart",
+                post(
+                    |State(state): State<RetryState>, headers: HeaderMap| async move {
+                        state.keys.lock().await.push(key_of(&headers));
+                        (
+                            StatusCode::NOT_FOUND,
+                            axum::Json(json!({"success": false, "data": null, "error": {
+                                "code": "APP_NOT_FOUND", "message": "App not found: gone"}})),
+                        )
+                    },
+                ),
+            )
+            .with_state(state.clone());
+        let addr = spawn_test_server(router).await;
+        let client = fast(TondClient::new(&format!("http://{addr}"), None));
+
+        let err = client
+            .action("busy", "restart")
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("expected a conflict"));
+        assert_eq!(cli_error(&err).exit, 5);
+        assert_eq!(state.keys.lock().await.len(), 3, "two retries");
+
+        state.keys.lock().await.clear();
+        let err = client
+            .action("gone", "restart")
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("expected not found"));
+        assert_eq!(cli_error(&err).exit, 3);
+        assert_eq!(state.keys.lock().await.len(), 1, "404 is not retried");
+    }
+
+    #[tokio::test]
+    async fn non_json_502_exhausts_retries_and_exits_8() {
+        let state = RetryState::default();
+        let router = Router::new()
+            .route(
+                "/api/v1/apps",
+                get(
+                    |State(state): State<RetryState>, headers: HeaderMap| async move {
+                        state.keys.lock().await.push(key_of(&headers));
+                        (StatusCode::BAD_GATEWAY, "<html>502 Bad Gateway</html>")
+                    },
+                ),
+            )
+            .with_state(state.clone());
+        let addr = spawn_test_server(router).await;
+        let client = fast(TondClient::new(&format!("http://{addr}"), None));
+
+        let err = client
+            .list_apps()
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("expected a 502"));
+        let e = cli_error(&err);
+        assert_eq!((e.status, e.exit), (Some(502), 8));
+        assert_eq!(state.keys.lock().await.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn connection_refused_is_server_unreachable() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|err| panic!("bind: {err}"));
+        let addr = listener
+            .local_addr()
+            .unwrap_or_else(|err| panic!("addr: {err}"));
+        drop(listener);
+        let client = fast(TondClient::new(&format!("http://{addr}"), None));
+
+        let err = client
+            .list_apps()
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("expected a connection error"));
+        let e = cli_error(&err);
+        assert_eq!(e.code.as_deref(), Some("SERVER_UNREACHABLE"));
+        assert_eq!(e.exit, 8);
+    }
+
+    #[test]
+    fn missing_socket_exits_8() {
+        let dir = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
+        let err = TondClient::local(&dir.path().join("missing.sock"))
+            .err()
+            .unwrap_or_else(|| panic!("expected an error"));
+        let e = cli_error(&err);
+        assert_eq!(e.exit, 8);
+        assert!(e.hint.is_some_and(|h| h.contains("--server")));
     }
 }

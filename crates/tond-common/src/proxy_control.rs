@@ -47,6 +47,7 @@ pub const MAX_LINE_BYTES: usize = 256 * 1024;
 pub const FALLBACK_POLL_SECS: u64 = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ProxyRequest {
     Sync { id: u64, min_version: i64 },
@@ -57,6 +58,7 @@ pub enum ProxyRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProxyMessage {
     Hello { pid: u32, route_version: i64 },
@@ -65,6 +67,7 @@ pub enum ProxyMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReplyBody {
     Synced { route_version: i64, routes: u64 },
@@ -77,6 +80,7 @@ pub enum ReplyBody {
 /// Outcome of one certificate issuance attempt, as tond-server stores it in
 /// the `certificates` table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CertReport {
     pub domain: String,
     pub cert_path: String,
@@ -87,6 +91,7 @@ pub struct CertReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum CertOutcome {
     /// A certificate was issued; retry state is cleared.

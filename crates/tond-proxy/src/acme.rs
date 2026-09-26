@@ -4,7 +4,7 @@
 // TLS certificates automatically, without any manual cert management.
 //
 // How it fits into the system:
-//   1. When a user sets a custom domain (PUT /api/apps/{id}/domain),
+//   1. When a user sets a custom domain (PUT /api/v1/apps/{id}/domain),
 //      tond-server writes a 'pending' cert row to the database.
 //   2. The issuance loop (issuance.rs, every 30 s with per-domain backoff)
 //      decides which domains need a cert or a renewal.

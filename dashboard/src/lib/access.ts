@@ -3,7 +3,7 @@
 // The server is the authority on permissions (it refuses anything outside the
 // caller's scopes with 403 SCOPE_DENIED); these helpers only decide what the
 // UI offers. The scope catalog (descriptions, presets) comes from
-// GET /api/tokens/catalog; ALL_SCOPES mirrors it for the dev auth bypass.
+// GET /api/v1/tokens/catalog; ALL_SCOPES mirrors it for the dev auth bypass.
 
 import type { ApiToken, AuditLogEntry, Role, Scope, TokenKind, User } from './api';
 

@@ -245,6 +245,7 @@ pub fn offered_extensions(variant: &str) -> Vec<&'static str> {
 
 /// GET /api/databases/catalog — what can be created.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DbCatalogEntry {
     pub db_type: String,
     /// "" = the engine's own image

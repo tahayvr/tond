@@ -61,8 +61,8 @@
 
 	{#if db.custom_image}
 		<p class="text-sm text-muted-foreground">
-			This database runs a custom image, so Tond doesn't manage its version. Clear the custom image on
-			the Overview tab to upgrade here.
+			This database runs a custom image, so Tond doesn't manage its version. Clear the custom image
+			on the Overview tab to upgrade here.
 		</p>
 	{:else if db.upgrade}
 		<p class="text-sm text-muted-foreground">
@@ -104,8 +104,8 @@
 			</Button>
 		</div>
 		<p class="text-xs text-muted-foreground">
-			Apps lose their connection during the upgrade. A backup is taken first, and the old data is kept
-			until you confirm, so you can roll back. Downgrades aren't possible.
+			Apps lose their connection during the upgrade. A backup is taken first, and the old data is
+			kept until you confirm, so you can roll back. Downgrades aren't possible.
 		</p>
 		{#if stopped}
 			<p class="text-xs text-warn">Start the database to upgrade it.</p>

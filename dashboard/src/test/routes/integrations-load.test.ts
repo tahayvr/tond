@@ -1,13 +1,18 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { listGitHubApps, listRegistryCredentials, listIntegrations, listGitLabTokens, listGiteaTokens } =
-	vi.hoisted(() => ({
-		listGitHubApps: vi.fn(),
-		listRegistryCredentials: vi.fn(),
-		listIntegrations: vi.fn(),
-		listGitLabTokens: vi.fn(),
-		listGiteaTokens: vi.fn()
-	}));
+const {
+	listGitHubApps,
+	listRegistryCredentials,
+	listIntegrations,
+	listGitLabTokens,
+	listGiteaTokens
+} = vi.hoisted(() => ({
+	listGitHubApps: vi.fn(),
+	listRegistryCredentials: vi.fn(),
+	listIntegrations: vi.fn(),
+	listGitLabTokens: vi.fn(),
+	listGiteaTokens: vi.fn()
+}));
 
 vi.mock('$lib/api', () => ({
 	listGitHubApps,

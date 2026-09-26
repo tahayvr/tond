@@ -25,10 +25,7 @@
 
 	let { db, canEdit, onchange }: Props = $props();
 
-	let draft = $state('');
-	$effect(() => {
-		draft = db.allowlist.join('\n');
-	});
+	let draft = $derived(db.allowlist.join('\n'));
 
 	let parsed = $derived(parseAllowlist(draft));
 	let dirty = $derived(parsed.entries.join('\n') !== db.allowlist.join('\n'));
@@ -126,11 +123,11 @@
 				</p>
 				<p class="text-xs text-muted-foreground">
 					{#if db.tls}
-						Clients can connect with TLS (<span class="font-mono">sslmode=require</span>). Apps on the
-						internal network may keep connecting without it.
+						Clients can connect with TLS (<span class="font-mono">sslmode=require</span>). Apps on
+						the internal network may keep connecting without it.
 					{:else}
-						Encrypt connections from outside with a certificate for the dashboard domain (Let's Encrypt
-						when available, self-signed otherwise).
+						Encrypt connections from outside with a certificate for the dashboard domain (Let's
+						Encrypt when available, self-signed otherwise).
 					{/if}
 				</p>
 			</div>

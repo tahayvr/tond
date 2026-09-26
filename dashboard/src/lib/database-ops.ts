@@ -93,9 +93,11 @@ export function parseAllowlist(text: string): { entries: string[]; invalid: stri
 		if (!entry) continue;
 		const [addr, prefix, extra] = entry.split('/');
 		const octets = addr.split('.');
-		const ipOk = octets.length === 4 && octets.every((o) => /^\d{1,3}$/.test(o) && Number(o) <= 255);
+		const ipOk =
+			octets.length === 4 && octets.every((o) => /^\d{1,3}$/.test(o) && Number(o) <= 255);
 		const prefixOk =
-			prefix === undefined || (/^\d{1,2}$/.test(prefix) && Number(prefix) >= 1 && Number(prefix) <= 32);
+			prefix === undefined ||
+			(/^\d{1,2}$/.test(prefix) && Number(prefix) >= 1 && Number(prefix) <= 32);
 		if (!ipOk || !prefixOk || extra !== undefined) return { entries, invalid: entry };
 		if (!entries.includes(entry)) entries.push(entry);
 	}

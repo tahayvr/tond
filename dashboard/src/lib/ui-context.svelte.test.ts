@@ -68,7 +68,7 @@ describe('ui context state', () => {
 			app: { id: 'app_running' },
 			feed: {
 				title: 'api-service',
-				wsUrl: '/api/apps/app_running/logs/stream',
+				wsUrl: '/api/v1/apps/app_running/logs/stream',
 				label: 'live stream'
 			}
 		});

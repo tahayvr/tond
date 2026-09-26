@@ -13,7 +13,7 @@
 // next scheduled wake-up, and scheduler lag (how much later than requested a
 // timer actually fired — a direct measure of runtime starvation). Everything
 // is atomics plus a small mutex per loop; nothing here wakes up on its own.
-// Reported by GET /api/system/self and /metrics.
+// Reported by GET /api/v1/system/self and /metrics.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};

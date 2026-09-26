@@ -19,6 +19,7 @@ pub struct GiteaToken {
 
 /// API response for a stored Gitea token (the token itself is never returned).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct GiteaTokenResponse {
     pub id: String,
     pub name: String,
@@ -41,6 +42,7 @@ impl From<GiteaToken> for GiteaTokenResponse {
 
 /// POST /api/gitea-tokens — store a new token
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreateGiteaTokenRequest {
     pub name: String,
     pub token: String,
@@ -50,6 +52,7 @@ pub struct CreateGiteaTokenRequest {
 
 /// PUT /api/apps/{id}/gitea-token — link or unlink a Gitea token
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SetGiteaTokenRequest {
     /// Token ID to link; `null` = detach.
     pub gitea_token_id: Option<String>,

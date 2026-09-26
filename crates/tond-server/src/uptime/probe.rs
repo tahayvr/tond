@@ -39,6 +39,7 @@ const USER_AGENT: &str = "Tond-Uptime/1 (+https://github.com/tahayvr/tond)";
 
 /// Why a probe failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Cause {
     Dns,
@@ -108,6 +109,7 @@ impl Cause {
 
 /// How the host's DNS compares with this server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum DnsState {
     /// Resolves to this server.
@@ -135,6 +137,7 @@ pub struct ProbeSpec {
 
 /// The outcome of one probe.
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ProbeResult {
     pub ok: bool,
     pub cause: Option<Cause>,

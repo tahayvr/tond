@@ -70,6 +70,7 @@ pub struct BackupConfig {
 
 /// Outbound representation of a snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SnapshotResponse {
     pub id: String,
     pub name: String,
@@ -129,6 +130,7 @@ impl From<Snapshot> for SnapshotResponse {
 
 /// Outbound representation of the backup configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct BackupConfigResponse {
     pub enabled: bool,
     pub full_schedule_cron: String,
@@ -155,15 +157,17 @@ impl From<BackupConfig> for BackupConfigResponse {
 
 // ── Request bodies ───────────────────────────────────────────────────────────
 
-/// POST /api/snapshots — trigger a manual Full snapshot
+/// POST /api/v1/snapshots — trigger a manual Full snapshot
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreateSnapshotRequest {
     /// Optional human-readable label for this snapshot
     pub name: Option<String>,
 }
 
-/// PUT /api/snapshots/config — update backup configuration
+/// PUT /api/v1/snapshots/config — update backup configuration
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateBackupConfigRequest {
     pub enabled: Option<bool>,
     pub full_schedule_cron: Option<String>,
@@ -174,20 +178,23 @@ pub struct UpdateBackupConfigRequest {
     pub storage_provider_id: Option<String>,
 }
 
-/// POST /api/snapshots/:id/restore-app
+/// POST /api/v1/snapshots/:id/restore-app
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RestoreAppRequest {
     pub app_name: String,
 }
 
-/// POST /api/snapshots/:id/restore-database
+/// POST /api/v1/snapshots/:id/restore-database
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RestoreDatabaseRequest {
     pub db_name: String,
 }
 
 /// Reply to a database restore.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RestoreDatabaseResponse {
     pub message: String,
     /// Backup of the data as it was just before the restore (to undo it)

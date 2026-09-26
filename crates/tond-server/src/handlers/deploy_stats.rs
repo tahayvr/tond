@@ -1,6 +1,6 @@
 // handlers/deploy_stats.rs — how reliable and how fast an app's deploys are
 //
-//   deploy_stats()  GET /api/apps/{id}/deployments/stats
+//   deploy_stats()  GET /api/v1/apps/{id}/deployments/stats
 //
 // Over the last TREND_WINDOW finished deployments: success rate (succeeded
 // out of succeeded + failed; superseded/cancelled ones don't count either

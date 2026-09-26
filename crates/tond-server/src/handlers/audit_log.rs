@@ -1,7 +1,7 @@
 // handlers/audit_log.rs — audit log queries and chain verification
 //
 // Routes (both need `events:read`):
-//   GET /api/audit-log?actor=&action=&resource_type=&resource_id=&q=&outcome=&before=&limit=
+//   GET /api/v1/audit-log?actor=&action=&resource_type=&resource_id=&q=&outcome=&before=&limit=
 //     Newest first, filtered in SQL, paginated by sequence number: pass the
 //     response's `next_before` as `before` for the next (older) page.
 //       actor         — exact actor label (email, token name, "local-socket")
@@ -10,7 +10,7 @@
 //       q             — case-insensitive substring of actor, action, resource or detail
 //       outcome       — "success" | "failure"
 //       limit         — 1–200 (default 50)
-//   GET /api/audit-log/verify — walk the hash chain (see audit_log.rs)
+//   GET /api/v1/audit-log/verify — walk the hash chain (see audit_log.rs)
 
 use axum::{
     Json,
@@ -33,6 +33,7 @@ const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 200;
 
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct AuditLogQuery {
     pub actor: Option<String>,
     pub action: Option<String>,

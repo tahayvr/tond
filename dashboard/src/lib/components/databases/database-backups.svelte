@@ -181,8 +181,8 @@
 			<h2 class="text-sm font-semibold tracking-wide text-muted-foreground uppercase">Backups</h2>
 			<p class="max-w-prose text-sm text-muted-foreground">
 				A backup holds a dump of {dbName} and a copy of its data directory. Restore one into a new database
-				to check it or copy data out, or restore it over {dbName} (the current data is backed up first, so
-				that can be undone).
+				to check it or copy data out, or restore it over {dbName} (the current data is backed up first,
+				so that can be undone).
 			</p>
 		</div>
 		<Button size="sm" disabled={backingUp || !canBackup} onclick={handleBackup}>

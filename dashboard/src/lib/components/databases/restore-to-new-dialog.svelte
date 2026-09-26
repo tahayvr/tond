@@ -118,8 +118,8 @@
 					<p class="text-xs text-destructive">{nameError}</p>
 				{:else}
 					<p class="text-xs text-muted-foreground">
-						Same engine and version as {source}, with new credentials and its own port. Delete it when
-						you're done.
+						Same engine and version as {source}, with new credentials and its own port. Delete it
+						when you're done.
 					</p>
 				{/if}
 			</div>

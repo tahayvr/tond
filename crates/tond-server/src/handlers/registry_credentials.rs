@@ -2,19 +2,19 @@
 //
 // Endpoints:
 //
-//   GET    /api/registry-credentials
+//   GET    /api/v1/registry-credentials
 //     List all stored registry credentials. Passwords are never returned.
 //
-//   POST   /api/registry-credentials
+//   POST   /api/v1/registry-credentials
 //     Create a new credential. The password is encrypted with AES-256-GCM
 //     before storage. The key is derived from the TOND_SECRET_KEY env var
 //     (see secret_key.rs).
 //
-//   DELETE /api/registry-credentials/{id}
+//   DELETE /api/v1/registry-credentials/{id}
 //     Delete a credential. Also detaches it from any apps that reference it
 //     (handled automatically by the ON DELETE SET NULL FK constraint).
 //
-//   PUT    /api/apps/{id}/registry-credential
+//   PUT    /api/v1/apps/{id}/registry-credential
 //     Attach or detach a registry credential from an app. Pass
 //     { "registry_credential_id": "<id>" } to attach, or
 //     { "registry_credential_id": null } to detach.
@@ -41,7 +41,7 @@ use crate::{
 
 // ── Handlers ────────────────────────────────────────────────────────────────
 
-/// GET /api/registry-credentials
+/// GET /api/v1/registry-credentials
 pub async fn list_registry_credentials(
     _rate: RateLimit,
     _auth: Authz<scope::AppsRead>,
@@ -57,7 +57,7 @@ pub async fn list_registry_credentials(
     Ok((StatusCode::OK, Json(ApiResponse::ok(responses))))
 }
 
-/// POST /api/registry-credentials
+/// POST /api/v1/registry-credentials
 pub async fn create_registry_credential(
     _rate: RateLimit,
     auth: Authz<scope::SettingsWrite>,
@@ -119,7 +119,7 @@ pub async fn create_registry_credential(
     ))
 }
 
-/// DELETE /api/registry-credentials/{id}
+/// DELETE /api/v1/registry-credentials/{id}
 pub async fn delete_registry_credential(
     _rate: RateLimit,
     auth: Authz<scope::SettingsWrite>,
@@ -152,7 +152,7 @@ pub async fn delete_registry_credential(
     Ok((StatusCode::OK, Json(ApiResponse::<()>::ok(()))))
 }
 
-/// PUT /api/apps/{id}/registry-credential
+/// PUT /api/v1/apps/{id}/registry-credential
 ///
 /// Attach or detach a registry credential from an app.
 pub async fn set_app_registry_credential(

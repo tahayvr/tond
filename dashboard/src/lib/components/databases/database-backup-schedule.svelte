@@ -222,11 +222,7 @@
 
 		{#if canEdit}
 			<div class="flex flex-wrap items-center gap-3">
-				<Button
-					size="sm"
-					disabled={!dirty || !valid || save.pending}
-					onclick={() => save.run()}
-				>
+				<Button size="sm" disabled={!dirty || !valid || save.pending} onclick={() => save.run()}>
 					<TimeIcon class="size-4" />
 					{save.pending ? 'Saving…' : 'Save schedule'}
 				</Button>

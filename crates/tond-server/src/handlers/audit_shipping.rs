@@ -1,8 +1,8 @@
 // handlers/audit_shipping.rs — where the audit log is copied to (admin only)
 //
-//   get_shipping()     GET  /api/audit-log/shipping       — destinations + delivery status
-//   update_shipping()  PUT  /api/audit-log/shipping       — change syslog and/or webhook
-//   test_shipping()    POST /api/audit-log/shipping/test  — send a test entry now
+//   get_shipping()     GET  /api/v1/audit-log/shipping       — destinations + delivery status
+//   update_shipping()  PUT  /api/v1/audit-log/shipping       — change syslog and/or webhook
+//   test_shipping()    POST /api/v1/audit-log/shipping/test  — send a test entry now
 //
 // Delivery itself is audit_ship.rs. Re-pointing a destination (other host,
 // port, TLS or URL) starts its copy over from the oldest retained entry.

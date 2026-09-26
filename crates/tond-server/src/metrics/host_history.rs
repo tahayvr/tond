@@ -299,6 +299,7 @@ impl HistoryRange {
 
 /// Parallel arrays, one entry per bucket. Percentages and loads as floats.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct HostSeries {
     pub t: Vec<i64>,
     pub cpu: Vec<f64>,
@@ -375,6 +376,7 @@ pub async fn query(
 
 /// The trend of one window.
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct DiskForecast {
     /// "24h" | "7d"
     pub window: &'static str,
@@ -390,6 +392,7 @@ pub struct DiskForecast {
 
 /// Both windows plus the headline ETA.
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct DiskEta {
     pub used: i64,
     pub total: i64,

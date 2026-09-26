@@ -50,17 +50,15 @@
 				? `gitea:${app.gitea_token_id}`
 				: ''
 	);
-	let selected = $state('');
-	$effect(() => {
-		selected = current;
-	});
+	let selected = $derived(current);
 
 	function label(value: string): string {
 		if (!value) return 'Nothing (no statuses or previews)';
 		const [kind, id] = value.split(':');
-		const t =
-			kind === 'gitlab' ? gitlab.find((x) => x.id === id) : gitea.find((x) => x.id === id);
-		return t ? `${t.name} (${kind === 'gitlab' ? 'GitLab' : 'Gitea / Forgejo'})` : 'A removed token';
+		const t = kind === 'gitlab' ? gitlab.find((x) => x.id === id) : gitea.find((x) => x.id === id);
+		return t
+			? `${t.name} (${kind === 'gitlab' ? 'GitLab' : 'Gitea / Forgejo'})`
+			: 'A removed token';
 	}
 
 	const save = useAction(

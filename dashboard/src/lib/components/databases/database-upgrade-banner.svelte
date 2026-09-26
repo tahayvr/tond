@@ -156,7 +156,12 @@
 				</div>
 			</div>
 			<div class="flex flex-wrap gap-2">
-				<Button size="sm" variant="outline" disabled={dismiss.pending} onclick={() => dismiss.run()}>
+				<Button
+					size="sm"
+					variant="outline"
+					disabled={dismiss.pending}
+					onclick={() => dismiss.run()}
+				>
 					{dismiss.pending ? 'Dismissing…' : 'Dismiss'}
 				</Button>
 			</div>

@@ -711,7 +711,7 @@
 			{#if tab === 'logs'}
 				<div class="mt-4">
 					<StreamLogViewer
-						wsUrl="/api/databases/{db.id}/logs/stream"
+						wsUrl="/api/v1/databases/{db.id}/logs/stream"
 						downloadName="{db.name}-logs"
 						label="{db.name} logs"
 						showPrefix={false}
@@ -730,7 +730,10 @@
 						>
 							<AlertIcon class="mt-0.5 size-4 shrink-0" />
 							<span class="min-w-0 flex-1">{db.backup_warning}</span>
-							<a class="font-medium underline" href={tabHref(page.url.pathname, 'backups', 'overview')}>
+							<a
+								class="font-medium underline"
+								href={tabHref(page.url.pathname, 'backups', 'overview')}
+							>
 								Set up backups
 							</a>
 						</div>
