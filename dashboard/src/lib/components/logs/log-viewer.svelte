@@ -250,7 +250,7 @@
 				>
 			{/if}
 		</div>
-		<div class="flex items-center gap-1">
+		<div class="flex flex-wrap items-center gap-x-1">
 			{#if live}
 				<span class="mr-1 flex items-center gap-1.5 text-[11px] text-muted-foreground">
 					<span class="inline-block size-1.5 animate-pulse rounded-full bg-success"></span>
