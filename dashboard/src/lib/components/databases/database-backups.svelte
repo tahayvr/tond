@@ -142,7 +142,7 @@
 <div class="space-y-4" data-testid="database-backups">
 	<div class="flex flex-wrap items-start justify-between gap-3">
 		<div class="space-y-1">
-			<h3 class="text-sm font-semibold tracking-wide text-muted-foreground uppercase">Backups</h3>
+			<h2 class="text-sm font-semibold tracking-wide text-muted-foreground uppercase">Backups</h2>
 			<p class="max-w-prose text-sm text-muted-foreground">
 				A backup holds a dump of {dbName} and a copy of its data directory. Restoring one replaces the
 				data in {dbName}; the current data is backed up first, so a restore can be undone.
