@@ -187,12 +187,26 @@ export interface AuthStatus {
 	user: User | null;
 }
 
+/**
+ * The `error` object of a failed response. `code` is stable (the ErrorCode
+ * enum in /api/v1/openapi.json); switch on it, never on `message`.
+ */
+export interface ApiErrorBody {
+	code: string;
+	message: string;
+	/** What to do next, when the server has something to say. */
+	hint?: string;
+	/** The request field the error is about (validation errors). */
+	field?: string;
+}
+
+/** Every API response: `{success, data}` or `{success: false, data: null, error}`. */
 interface ApiResponse<T> {
 	success: boolean;
 	data: T | null;
-	error: string | null;
-	/** Stable error code on some failures, e.g. SCOPE_DENIED, TOKEN_EXPIRED */
-	code?: string;
+	error?: ApiErrorBody | null;
+	/** Informational note on a success. */
+	message?: string;
 }
 
 /** Versioned API root (the OpenAPI spec is at `${BASE}/openapi.json`). */
@@ -217,20 +231,36 @@ export class ApiError extends Error {
 	readonly retryAfter: number | null;
 	/** Stable error code from the server (e.g. `SCOPE_DENIED`), when it sent one. */
 	readonly code: string | null;
+	/** The server's "what to do next", when it sent one. */
+	readonly hint: string | null;
+	/** The request field the error is about, for validation errors. */
+	readonly field: string | null;
 
 	constructor(
 		message: string,
 		status: number,
 		retryAfter: number | null = null,
-		code: string | null = null
+		code: string | null = null,
+		details: { hint?: string | null; field?: string | null } = {}
 	) {
 		super(message);
 		this.name = 'ApiError';
 		this.status = status;
 		this.retryAfter = retryAfter;
 		this.code = code;
+		this.hint = details.hint ?? null;
+		this.field = details.field ?? null;
 	}
 }
+
+/** Stable error codes the dashboard reacts to (full list: ErrorCode in the spec). */
+export const ERROR_CODES = {
+	invalidCredentials: 'INVALID_CREDENTIALS',
+	rateLimited: 'RATE_LIMITED',
+	scopeDenied: 'SCOPE_DENIED',
+	notFound: 'NOT_FOUND',
+	appNotFound: 'APP_NOT_FOUND'
+} as const;
 
 // Endpoints that answer 401 for a wrong password or code. A 401 from these is
 // an input error, not an expired session, so it must not sign the user out.
@@ -269,11 +299,28 @@ export function parseRetryAfter(header: string | null, now: number = Date.now())
 	return Math.max(0, Math.ceil((date - now) / 1000));
 }
 
+/** The `error.code` of a JSON error body, without consuming the response. */
+async function peekErrorCode(res: Response): Promise<string | null> {
+	try {
+		const body = await res.clone().json();
+		return typeof body?.error?.code === 'string' ? body.error.code : null;
+	} catch {
+		return null;
+	}
+}
+
 /** Turn a fetch Response into data or a descriptive ApiError. */
 async function parseResponse<T>(path: string, res: Response): Promise<T> {
 	const endpoint = path.split('?')[0];
 
-	if (res.status === 401 && !CREDENTIAL_ENDPOINTS.includes(endpoint)) {
+	// A 401 is an expired session unless the endpoint checks a password or
+	// code (then it is an input error, INVALID_CREDENTIALS).
+	const code401 = res.status === 401 ? await peekErrorCode(res) : null;
+	if (
+		res.status === 401 &&
+		code401 !== ERROR_CODES.invalidCredentials &&
+		!CREDENTIAL_ENDPOINTS.includes(endpoint)
+	) {
 		unauthorizedHandler?.();
 		throw new ApiError(SESSION_EXPIRED_MESSAGE, 401);
 	}
@@ -307,11 +354,13 @@ async function parseResponse<T>(path: string, res: Response): Promise<T> {
 		throw notApi();
 	}
 	if (!res.ok || !json.success) {
+		const error = json.error && typeof json.error === 'object' ? json.error : null;
 		throw new ApiError(
-			json.error || `Request failed (HTTP ${res.status})`,
+			error?.message || `Request failed (HTTP ${res.status})`,
 			res.status,
 			null,
-			json.code ?? null
+			error?.code ?? null,
+			{ hint: error?.hint, field: error?.field }
 		);
 	}
 	return json.data as T;
@@ -333,6 +382,65 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 		throw new ApiError(SERVER_UNAVAILABLE_MESSAGE, 0);
 	}
 	return parseResponse<T>(path, res);
+}
+
+// ── API contract (GET /api/v1/openapi.json) ──
+
+/** The parts of an OpenAPI 3.1 operation the API page reads. */
+export interface OpenApiOperation {
+	operationId?: string;
+	summary?: string;
+	description?: string;
+	tags?: string[];
+	parameters?: { $ref?: string; name?: string; in?: string; [key: string]: unknown }[];
+	security?: Record<string, string[]>[];
+	responses?: Record<string, unknown>;
+	'x-tond-scopes'?: string[];
+	'x-tond-websocket'?: boolean;
+}
+
+/** The parts of the server's OpenAPI document the API page reads. */
+export interface OpenApiDocument {
+	openapi: string;
+	info?: { title?: string; version?: string; description?: string };
+	tags?: { name: string; description?: string }[];
+	paths?: Record<
+		string,
+		Partial<Record<'get' | 'post' | 'put' | 'patch' | 'delete', OpenApiOperation>>
+	>;
+	components?: {
+		schemas?: {
+			ErrorCode?: {
+				[key: string]: unknown;
+				'x-tond-codes'?: { code: string; status: number; exit_code: number; description: string }[];
+				'x-tond-exit-codes'?: { exit_code: number; name: string; meaning: string }[];
+			};
+		};
+	};
+}
+
+/** URL of the OpenAPI document (public, no credentials needed). */
+export const OPENAPI_URL = `${BASE}/openapi.json`;
+
+/**
+ * The OpenAPI document. It is a plain JSON document, not an API envelope, so
+ * it doesn't go through request<T>().
+ */
+export async function getOpenApiSpec(): Promise<OpenApiDocument> {
+	let res: Response;
+	try {
+		res = await fetch(OPENAPI_URL, { credentials: 'same-origin' });
+	} catch {
+		throw new ApiError(SERVER_UNAVAILABLE_MESSAGE, 0);
+	}
+	if (!res.ok) {
+		throw new ApiError(`Could not load the API description (HTTP ${res.status})`, res.status);
+	}
+	try {
+		return (await res.json()) as OpenApiDocument;
+	} catch {
+		throw new ApiError('The API description is not valid JSON.', res.status);
+	}
 }
 
 export async function listApps(): Promise<App[]> {

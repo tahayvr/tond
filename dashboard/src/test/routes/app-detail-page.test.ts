@@ -657,7 +657,7 @@ describe('apps/[id] page', () => {
 
 			await goToTab('?tab=logs');
 			expect(FakeWebSocket.instances).toHaveLength(1);
-			expect(FakeWebSocket.instances[0].url).toMatch(/\/api\/apps\/app_1\/logs\/stream$/);
+			expect(FakeWebSocket.instances[0].url).toMatch(/\/api\/v1\/apps\/app_1\/logs\/stream$/);
 
 			// Restarting reloads the app data, which used to tear everything down.
 			await user.click(screen.getByRole('button', { name: /^restart$/i }));

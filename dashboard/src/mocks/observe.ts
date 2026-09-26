@@ -19,17 +19,18 @@ import type {
 	UptimeSummary
 } from '$lib/api';
 import { MOCK_APPS } from './fixtures';
+import { errorBody, okBody } from './envelope';
 
 const LATENCY = 200;
 const GB = 1024 * 1024 * 1024;
 const MB = 1024 * 1024;
 
 function ok<T>(data: T) {
-	return HttpResponse.json({ success: true, data, error: null });
+	return HttpResponse.json(okBody(data));
 }
 
 function err(message: string, status = 400) {
-	return HttpResponse.json({ success: false, data: null, error: message }, { status });
+	return HttpResponse.json(errorBody(message, status), { status });
 }
 
 const now = () => Math.floor(Date.now() / 1000);

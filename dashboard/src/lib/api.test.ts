@@ -50,7 +50,7 @@ afterEach(() => {
 
 describe('request()', () => {
 	it('returns data for a successful response', async () => {
-		stubFetch(json({ success: true, data: [{ id: 'app_1' }], error: null }));
+		stubFetch(json({ success: true, data: [{ id: 'app_1' }] }));
 
 		await expect(listApps()).resolves.toEqual([{ id: 'app_1' }]);
 	});
@@ -58,7 +58,12 @@ describe('request()', () => {
 	it('treats a 401 on a normal endpoint as an expired session', async () => {
 		const onUnauthorized = vi.fn();
 		setUnauthorizedHandler(onUnauthorized);
-		stubFetch(json({ success: false, data: null, error: 'Unauthorized' }, { status: 401 }));
+		stubFetch(
+			json(
+				{ success: false, data: null, error: { code: 'SESSION_EXPIRED', message: 'Unauthorized' } },
+				{ status: 401 }
+			)
+		);
 
 		const error = await rejection(listApps());
 
@@ -72,12 +77,26 @@ describe('request()', () => {
 		setUnauthorizedHandler(onUnauthorized);
 
 		stubFetch(
-			json({ success: false, data: null, error: 'Invalid email or password' }, { status: 401 })
+			json(
+				{
+					success: false,
+					data: null,
+					error: { code: 'INVALID_CREDENTIALS', message: 'Invalid email or password' }
+				},
+				{ status: 401 }
+			)
 		);
 		expect((await rejection(login('a@b.c', 'nope'))).message).toBe('Invalid email or password');
 
 		stubFetch(
-			json({ success: false, data: null, error: 'Current password is incorrect' }, { status: 401 })
+			json(
+				{
+					success: false,
+					data: null,
+					error: { code: 'INVALID_CREDENTIALS', message: 'Current password is incorrect' }
+				},
+				{ status: 401 }
+			)
 		);
 		expect((await rejection(changePassword('wrong', 'new-password'))).message).toBe(
 			'Current password is incorrect'
@@ -113,7 +132,11 @@ describe('request()', () => {
 	it('honours Retry-After on 429', async () => {
 		stubFetch(
 			json(
-				{ success: false, data: null, error: 'Rate limit exceeded. Try again later.' },
+				{
+					success: false,
+					data: null,
+					error: { code: 'RATE_LIMITED', message: 'Rate limit exceeded. Try again later.' }
+				},
 				{ status: 429, headers: { 'Retry-After': '42' } }
 			)
 		);
@@ -126,14 +149,73 @@ describe('request()', () => {
 	});
 
 	it('falls back to a generic 429 message without Retry-After', async () => {
-		stubFetch(json({ success: false, data: null, error: 'x' }, { status: 429 }));
+		stubFetch(
+			json(
+				{ success: false, data: null, error: { code: 'RATE_LIMITED', message: 'x' } },
+				{ status: 429 }
+			)
+		);
 
 		expect((await rejection(listApps())).message).toBe('Too many attempts, try again in a moment.');
 	});
 
+	it('keeps the stable code, hint and field of a structured error', async () => {
+		stubFetch(
+			json(
+				{
+					success: false,
+					data: null,
+					error: {
+						code: 'INVALID_INPUT',
+						message: 'App name must be alphanumeric (hyphens allowed)',
+						hint: 'Use letters, digits and hyphens.',
+						field: 'name'
+					}
+				},
+				{ status: 400 }
+			)
+		);
+
+		const error = await rejection(listApps());
+
+		expect(error.status).toBe(400);
+		expect(error.code).toBe('INVALID_INPUT');
+		expect(error.message).toBe('App name must be alphanumeric (hyphens allowed)');
+		expect(error.hint).toBe('Use letters, digits and hyphens.');
+		expect(error.field).toBe('name');
+	});
+
+	it('treats INVALID_CREDENTIALS as an input error, not an expired session', async () => {
+		const onUnauthorized = vi.fn();
+		setUnauthorizedHandler(onUnauthorized);
+		stubFetch(
+			json(
+				{
+					success: false,
+					data: null,
+					error: { code: 'INVALID_CREDENTIALS', message: 'Password is incorrect' }
+				},
+				{ status: 401 }
+			)
+		);
+
+		const error = await rejection(listApps());
+
+		expect(error.message).toBe('Password is incorrect');
+		expect(error.code).toBe('INVALID_CREDENTIALS');
+		expect(onUnauthorized).not.toHaveBeenCalled();
+	});
+
 	it('uses the server error message for other failures', async () => {
 		stubFetch(
-			json({ success: false, data: null, error: 'Docker error: daemon down' }, { status: 500 })
+			json(
+				{
+					success: false,
+					data: null,
+					error: { code: 'DOCKER_ERROR', message: 'Docker error: daemon down' }
+				},
+				{ status: 500 }
+			)
 		);
 
 		const error = await rejection(listApps());

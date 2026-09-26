@@ -1,7 +1,7 @@
 /**
  * MSW request handlers for all /api/* endpoints.
  * Every handler returns the ApiResponse<T> envelope the real server uses:
- *   { success: true, data: T, error: null }
+ *   { success: true, data: T }  |  { success: false, data: null, error: { code, message, hint? } }
  */
 
 import { http, HttpResponse, ws, delay } from 'msw';
@@ -104,19 +104,18 @@ import {
 	MOCK_ALERT_SETTINGS
 } from './fixtures';
 import { observeHandlers } from './observe';
+import { errorBody, okBody } from './envelope';
+import { MOCK_OPENAPI } from './openapi';
 
 // Simulated network latency (ms). Set to 0 for instant responses.
 const LATENCY = 200;
 
 function ok<T>(data: T) {
-	return HttpResponse.json({ success: true, data, error: null });
+	return HttpResponse.json(okBody(data));
 }
 
 function err(message: string, status = 400, code?: string) {
-	return HttpResponse.json(
-		{ success: false, data: null, error: message, ...(code ? { code } : {}) },
-		{ status }
-	);
+	return HttpResponse.json(errorBody(message, status, code), { status });
 }
 
 /** The mock password policy: 12–256 characters, no common passwords. */
@@ -968,7 +967,7 @@ function isFinishedStatus(status: string) {
 }
 
 const deploymentStreamHandler = deploymentStream.addEventListener('connection', ({ client }) => {
-	const match = client.url.pathname.match(/\/api\/apps\/([^/]+)\/deployments\/([^/]+)\/stream/);
+	const match = client.url.pathname.match(/\/api\/v1\/apps\/([^/]+)\/deployments\/([^/]+)\/stream/);
 	const app = match ? apps.find((a) => a.id === match[1] || a.name === match[1]) : undefined;
 	const d = app ? (deployments[app.id] ?? []).find((x) => x.id === match?.[2]) : undefined;
 	if (!app || !d) {
@@ -1081,6 +1080,9 @@ export const handlers = [
 	// Host history, disk, Docker, heartbeat, uptime (./observe.ts)
 	...observeHandlers,
 
+	// The OpenAPI document is plain JSON, not an envelope.
+	http.get('/api/v1/openapi.json', () => HttpResponse.json(MOCK_OPENAPI)),
+
 	// Scenario gate: runs first and falls through (returns undefined) when idle.
 	http.all('/api/*', ({ request }) => {
 		const scenario = mockScenario();
@@ -1097,10 +1099,10 @@ export const handlers = [
 			return err('Unauthorized', 401);
 		}
 		if (scenario === 'rate-limited' && path === '/api/v1/auth/login') {
-			return HttpResponse.json(
-				{ success: false, data: null, error: 'Rate limit exceeded. Try again later.' },
-				{ status: 429, headers: { 'Retry-After': '30' } }
-			);
+			return HttpResponse.json(errorBody('Rate limit exceeded. Try again later.', 429), {
+				status: 429,
+				headers: { 'Retry-After': '30' }
+			});
 		}
 	}),
 
@@ -1202,8 +1204,7 @@ export const handlers = [
 					token: MOCK_PASSWORD_LINK,
 					path: `/set-password?token=${MOCK_PASSWORD_LINK}`,
 					expires_at: new Date(Date.now() + 86400_000).toISOString()
-				},
-				error: null
+				}
 			},
 			{ status: 201 }
 		);
@@ -1254,8 +1255,7 @@ export const handlers = [
 					token: MOCK_PASSWORD_LINK,
 					path: `/set-password?token=${MOCK_PASSWORD_LINK}`,
 					expires_at: new Date(Date.now() + 86400_000).toISOString()
-				},
-				error: null
+				}
 			},
 			{ status: 201 }
 		);
@@ -1386,10 +1386,7 @@ export const handlers = [
 			created_at: new Date().toISOString()
 		};
 		apiTokens = [token, ...apiTokens];
-		return HttpResponse.json(
-			{ success: true, data: { token, secret }, error: null },
-			{ status: 201 }
-		);
+		return HttpResponse.json({ success: true, data: { token, secret } }, { status: 201 });
 	}),
 
 	http.delete('/api/v1/tokens/:id', async ({ params }) => {
@@ -1461,10 +1458,7 @@ export const handlers = [
 		}
 		const ticket = `mock-ticket-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 		terminalTickets.set(ticket, { kind: body.target_kind, id: body.target_id });
-		return HttpResponse.json(
-			{ success: true, data: { ticket, expires_in: 30 }, error: null },
-			{ status: 201 }
-		);
+		return HttpResponse.json({ success: true, data: { ticket, expires_in: 30 } }, { status: 201 });
 	}),
 
 	http.get('/api/v1/settings/host-terminal', async () => {
@@ -1821,8 +1815,7 @@ export const handlers = [
 					// The mock never has to wait: the build queue is always free.
 					queue_position: 1,
 					superseded: null
-				},
-				error: null
+				}
 			},
 			{ status: 202 }
 		);
@@ -2174,24 +2167,27 @@ export const handlers = [
 		return ok(deployments[params.id as string] ?? []);
 	}),
 
-	http.get('/api/v1/apps/:id/deployments/:deploymentId/generated-dockerfile', async ({ params }) => {
-		await delay(LATENCY);
-		const appDeployments = deployments[params.id as string] ?? [];
-		const deployment = appDeployments.find((d) => d.id === params.deploymentId);
-		if (!deployment || !deployment.has_generated_dockerfile) {
-			return err('Generated Dockerfile not found', 404);
-		}
+	http.get(
+		'/api/v1/apps/:id/deployments/:deploymentId/generated-dockerfile',
+		async ({ params }) => {
+			await delay(LATENCY);
+			const appDeployments = deployments[params.id as string] ?? [];
+			const deployment = appDeployments.find((d) => d.id === params.deploymentId);
+			if (!deployment || !deployment.has_generated_dockerfile) {
+				return err('Generated Dockerfile not found', 404);
+			}
 
-		const generatedDockerfile = MOCK_GENERATED_DOCKERFILES[params.deploymentId as string];
-		if (!generatedDockerfile) {
-			return err('Generated Dockerfile not found', 404);
-		}
+			const generatedDockerfile = MOCK_GENERATED_DOCKERFILES[params.deploymentId as string];
+			if (!generatedDockerfile) {
+				return err('Generated Dockerfile not found', 404);
+			}
 
-		return ok({
-			deployment_id: params.deploymentId,
-			generated_dockerfile: generatedDockerfile
-		});
-	}),
+			return ok({
+				deployment_id: params.deploymentId,
+				generated_dockerfile: generatedDockerfile
+			});
+		}
+	),
 
 	http.post('/api/v1/apps/:id/rollback', async ({ params, request }) => {
 		await delay(LATENCY);
@@ -2232,8 +2228,7 @@ export const handlers = [
 					status: 'queued',
 					queue_position: 1,
 					superseded: null
-				},
-				error: null
+				}
 			},
 			{ status: 202 }
 		);
@@ -2990,7 +2985,7 @@ export const handlers = [
 			updated_at: now
 		};
 		alertRules = [...alertRules, newRule];
-		return HttpResponse.json({ success: true, data: newRule, error: null }, { status: 201 });
+		return HttpResponse.json({ success: true, data: newRule }, { status: 201 });
 	}),
 
 	http.patch('/api/v1/alerts/:id', async ({ params, request }) => {
@@ -3289,7 +3284,7 @@ export const handlers = [
 		if (!db) return err(`database '${params.id}' not found`, 404);
 		const snap = mockDatabaseSnapshot(db.name, 'manual');
 		snapshots = [snap, ...snapshots];
-		return HttpResponse.json({ success: true, data: snap, error: null }, { status: 201 });
+		return HttpResponse.json({ success: true, data: snap }, { status: 201 });
 	}),
 
 	http.delete('/api/v1/databases/:id', async ({ params }) => {
@@ -3627,7 +3622,7 @@ export const handlers = [
 
 	cronRunStream.addEventListener('connection', ({ client }) => {
 		// Extract job id from the URL path: /api/v1/cron/<id>/runs/stream
-		const match = client.url.pathname.match(/\/api\/cron\/([^/]+)\/runs\/stream/);
+		const match = client.url.pathname.match(/\/api\/v1\/cron\/([^/]+)\/runs\/stream/);
 		const jobId = match?.[1] ?? '';
 
 		const existingRuns = cronRuns[jobId] ?? [];
@@ -3931,7 +3926,7 @@ export const handlers = [
 			updated_at: new Date().toISOString()
 		};
 		integrations = [...integrations, newIntegration];
-		return HttpResponse.json({ success: true, data: newIntegration, error: null }, { status: 201 });
+		return HttpResponse.json({ success: true, data: newIntegration }, { status: 201 });
 	}),
 
 	http.get('/api/v1/integrations/:id', async ({ params }) => {
