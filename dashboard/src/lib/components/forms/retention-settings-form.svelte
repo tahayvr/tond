@@ -185,7 +185,7 @@
 						{formatBytes(db.file_bytes + db.wal_bytes)}
 					</p>
 					<p class="text-xs text-muted-foreground">
-						tond.db {formatBytes(db.file_bytes)}{#if db.wal_bytes > 0}{' '}+ write-ahead log {formatBytes(
+						tond.db {formatBytes(db.file_bytes)}{#if db.wal_bytes > 0}&nbsp;+ write-ahead log {formatBytes(
 								db.wal_bytes
 							)}{/if}{#if db.free_bytes > 0}, {formatBytes(db.free_bytes)} free inside the file{/if}.
 						Measured {formatRelativePast(db.measured_at)}.

@@ -44,7 +44,7 @@
 				)}
 			>
 				{#if event.detail}<span class="font-mono">{event.detail}</span
-					>{/if}{#if event.detail && event.actor}<span aria-hidden="true">{' · '}</span
+					>{/if}{#if event.detail && event.actor}<span aria-hidden="true">&nbsp;·&nbsp;</span
 					>{/if}{#if event.actor}by {event.actor}{/if}
 			</p>
 		{/if}

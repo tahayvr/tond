@@ -91,7 +91,7 @@
 
 	{#if events === null && !error}
 		<div class="space-y-2">
-			{#each Array(5) as _, i (i)}
+			{#each [0, 1, 2, 3, 4] as i (i)}
 				<Skeleton class="h-10" />
 			{/each}
 		</div>

@@ -72,7 +72,7 @@
 					{target.label}
 				{/if}
 				{#if cert.issuer_kind !== 'unknown'}
-					<span aria-hidden="true">{' · '}</span>{issuerLabel(cert.issuer_kind, cert.issuer)}
+					<span aria-hidden="true">&nbsp;·&nbsp;</span>{issuerLabel(cert.issuer_kind, cert.issuer)}
 				{/if}
 			</p>
 		</div>
@@ -87,7 +87,7 @@
 				<p class="text-xs text-muted-foreground">
 					{new Date(cert.expires_at).toLocaleDateString(undefined, { dateStyle: 'medium' })}
 					{#if cert.last_renewed_at}
-						<span aria-hidden="true">{' · '}</span>renewed {formatRelativePast(
+						<span aria-hidden="true">&nbsp;·&nbsp;</span>renewed {formatRelativePast(
 							cert.last_renewed_at,
 							now
 						)}
@@ -137,7 +137,7 @@
 			)}
 		>
 			<p class="break-words">
-				{#if issued}The last renewal attempt failed.{' '}{/if}{explained ?? cert.last_error}
+				{#if issued}The last renewal attempt failed.&nbsp;{/if}{explained ?? cert.last_error}
 			</p>
 			{#if explained}
 				<details class="text-xs text-muted-foreground">
