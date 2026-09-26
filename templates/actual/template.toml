@@ -1,0 +1,25 @@
+id = "actual"
+name = "Actual Budget"
+description = "Local-first personal finance app with envelope budgeting and sync."
+about = "Actual is a fast, privacy-focused budgeting app based on envelope budgeting. The server syncs your budget between devices (with optional end-to-end encryption) and serves the web app."
+category = "finance"
+tags = ["budget", "finance", "money", "ynab alternative"]
+logo = "actualbudget"
+version = "26.9"
+website = "https://actualbudget.org"
+docs = "https://actualbudget.org/docs/install/docker"
+repository = "https://github.com/actualbudget/actual"
+ram_mb = 120
+setup_notes = "Open the app right away and set the server password; anyone who opens it first could set it otherwise. Then create or import a budget."
+upgrade_notes = "Actual releases monthly (YY.M). Change the image tag and redeploy; snapshot the app first."
+post_deploy_checks = ["Set the server password", "Create or import a budget"]
+
+[public]
+service = "actual"
+port = 5006
+health_path = "/health"
+
+[[volumes]]
+service = "actual"
+path = "./data"
+description = "Budget files and the server's account database"

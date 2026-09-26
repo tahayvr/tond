@@ -240,13 +240,3 @@ pub async fn handle_passwd(client: &TondClient, out: &Output) -> Result<()> {
     outln!(out, "All other active sessions have been signed out.");
     Ok(())
 }
-
-/// Print a prompt on stderr and read one line from stdin (trims the newline).
-pub fn read_line_prompt(prompt: &str) -> Result<String> {
-    use std::io::{self, Write};
-    eprint!("{prompt}");
-    io::stderr().flush()?;
-    let mut s = String::new();
-    io::stdin().read_line(&mut s)?;
-    Ok(s.trim_end_matches('\n').trim_end_matches('\r').to_string())
-}

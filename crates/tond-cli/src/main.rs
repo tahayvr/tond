@@ -66,7 +66,7 @@ use commands::{
     apps::AppsAction, audit::AuditAction, cron::CronAction, db::DbAction,
     integrations::IntegrationsAction, projects::ProjectsAction, scanner::ScannerAction,
     settings::SettingsAction, snapshots::SnapshotAction, storage_providers::StorageProviderAction,
-    tokens::TokenAction, users::UsersAction,
+    templates::TemplatesAction, tokens::TokenAction, users::UsersAction,
 };
 use error::CliError;
 use output::{Output, outln};
@@ -131,6 +131,13 @@ enum Commands {
     Apps {
         #[command(subcommand)]
         action: AppsAction,
+    },
+
+    /// Browse the one-click template catalog
+    #[command(visible_alias = "template")]
+    Templates {
+        #[command(subcommand)]
+        action: TemplatesAction,
     },
 
     /// Manage projects (app groups)
@@ -354,6 +361,9 @@ async fn run(cli: Cli, out: &Output) -> Result<()> {
 
     match cli.command {
         Commands::Apps { action } => commands::apps::handle(&connect()?, out, action).await,
+        Commands::Templates { action } => {
+            commands::templates::handle(&connect()?, out, action).await
+        }
         Commands::Projects { action } => commands::projects::handle(&connect()?, out, action).await,
         Commands::Db { action } => commands::db::handle(&connect()?, out, action).await,
         Commands::Cron { action } => commands::cron::handle(&connect()?, out, action).await,

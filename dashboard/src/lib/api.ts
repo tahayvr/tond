@@ -49,6 +49,10 @@ export interface App {
 	 * (allowed, but shown as a warning).
 	 */
 	domain_warning?: string | null;
+	/** One-click template the app was deployed from (see /templates). */
+	template_id?: string | null;
+	/** The template's version at deploy time. */
+	template_version?: string | null;
 	source_type: string;
 	source_url: string | null;
 	status: string;
@@ -109,58 +113,113 @@ export function appReadiness(app: Pick<App, 'readiness'>): Readiness {
 	return app.readiness === 'tcp' || app.readiness === 'none' ? app.readiness : 'http';
 }
 
-export interface TemplateProject {
-	name: string;
+// ── One-click templates (GET /api/templates, POST /api/templates/{id}/deploy) ──
+
+export type TemplateInputKind = 'text' | 'email' | 'password' | 'url';
+
+/** A value the deploy form asks for (computed values are not listed). */
+export interface TemplateInput {
+	key: string;
+	label: string;
 	description: string | null;
+	kind: TemplateInputKind;
+	/** Must be filled in: no default and not generated. */
+	required: boolean;
+	/** Left empty, the server generates a random value. */
+	generated: boolean;
+	/** Pre-filled value; may contain {app_url}, {app_host} or {app_name}. */
+	default: string | null;
+	/** Shown once after the deploy (first-login credentials). */
+	credential: boolean;
 }
 
-export interface TemplateSource {
-	kind: string;
-	url: string;
-	ref: string | null;
+export interface TemplateService {
+	name: string;
+	image: string;
+	/** The service that gets the app's domain. */
+	public: boolean;
+	memory_limit_mb: number;
 }
 
 export interface TemplateVolume {
-	container_path: string;
+	service: string;
+	/** Bind source relative to the app's volume directory, e.g. "./data". */
+	path: string;
 	description: string;
+	owner: string | null;
 }
 
-export interface TemplateDeploy {
-	method: string;
-	default_port: number;
-	health_check_path: string | null;
-	volumes: TemplateVolume[];
+export interface TemplatePublic {
+	service: string;
+	port: number;
+	health_path: string | null;
 }
 
-export interface TemplateEnvVar {
-	key: string;
-	description: string;
-	required: boolean | null;
-	value: string | null;
-}
-
-export interface TemplateDependency {
-	name: string | null;
-	kind: string;
-	engine: string | null;
-	required: boolean | null;
-}
-
-export interface TemplateCatalogEntry {
+export interface Template {
 	id: string;
 	name: string;
 	description: string;
+	about: string | null;
 	category: string;
 	tags: string[];
-	maintainers: string[];
-	project: TemplateProject | null;
-	source: TemplateSource;
-	deploy: TemplateDeploy;
-	required_env: TemplateEnvVar[];
-	optional_env: TemplateEnvVar[];
-	dependencies: TemplateDependency[];
-	recommended_domains: string[];
+	/** Simple Icons slug. */
+	logo: string | null;
+	version: string;
+	website: string | null;
+	docs: string | null;
+	repository: string | null;
+	/** Typical memory of all services together, in MiB. */
+	ram_mb: number;
+	fits_2gb: boolean;
+	/** CPU architectures its images exist for ('amd64', 'arm64'). */
+	architectures: string[];
+	public: TemplatePublic;
+	services: TemplateService[];
+	volumes: TemplateVolume[];
+	inputs: TemplateInput[];
+	setup_notes: string | null;
+	upgrade_notes: string | null;
 	post_deploy_checks: string[];
+	compose: string;
+}
+
+export interface TemplateHostMemory {
+	total_mb: number;
+	available_mb: number;
+}
+
+export interface TemplateCatalog {
+	templates: Template[];
+	/** null until the host collector's first sample. */
+	memory: TemplateHostMemory | null;
+	/** Apps without a domain get `<name>.<apps_domain>` ("" = none). */
+	apps_domain: string;
+	/** This server's CPU architecture ('amd64' | 'arm64'). */
+	architecture: string;
+}
+
+export interface TemplateDeployRequest {
+	name: string;
+	domain?: string;
+	project_id?: string;
+	inputs: Record<string, string>;
+	/** Deploy even though the template needs more memory than is free. */
+	allow_low_memory?: boolean;
+}
+
+export interface TemplateCredential {
+	key: string;
+	label: string;
+	value: string;
+}
+
+export interface TemplateDeployResult {
+	app_id: string;
+	app_name: string;
+	domain: string | null;
+	deployment_id: string;
+	/** Shown once: the server doesn't return them again. */
+	credentials: TemplateCredential[];
 	setup_notes: string | null;
 }
 
@@ -451,8 +510,23 @@ export async function listApps(): Promise<App[]> {
 	return request<App[]>('/apps');
 }
 
-export async function listTemplates(): Promise<TemplateCatalogEntry[]> {
-	return request<TemplateCatalogEntry[]>('/templates');
+export async function listTemplates(): Promise<TemplateCatalog> {
+	return request<TemplateCatalog>('/templates');
+}
+
+/**
+ * Create an app from a template and queue its first deploy. Fails with 409
+ * `INSUFFICIENT_MEMORY` when the template needs more memory than is free,
+ * unless `allow_low_memory` is set.
+ */
+export async function deployTemplate(
+	id: string,
+	body: TemplateDeployRequest
+): Promise<TemplateDeployResult> {
+	return request<TemplateDeployResult>(`/templates/${encodeURIComponent(id)}/deploy`, {
+		method: 'POST',
+		body: JSON.stringify(body)
+	});
 }
 
 export async function getApp(id: string): Promise<App> {

@@ -1,0 +1,36 @@
+id = "umami"
+name = "Umami"
+description = "Simple, privacy-focused web analytics without cookies."
+about = "Umami tracks page views, referrers, devices and custom events for any number of websites, without cookies or personal data, so no consent banner is needed. Add its tracking script to your sites and watch the dashboard fill in real time."
+category = "analytics"
+tags = ["analytics", "privacy", "google analytics alternative", "gdpr"]
+logo = "umami"
+version = "3.4"
+website = "https://umami.is"
+docs = "https://umami.is/docs"
+repository = "https://github.com/umami-software/umami"
+ram_mb = 300
+setup_notes = "Sign in with username admin and password umami, then change the password right away under Settings → Profile. Add a website to get its tracking script."
+upgrade_notes = "Change the image tag to a newer 3.x release and redeploy; database migrations run on start. Read the release notes before a major version."
+post_deploy_checks = ["Sign in and change the default admin password", "Add your first website and install the tracking script"]
+
+[public]
+service = "umami"
+port = 3000
+health_path = "/api/heartbeat"
+
+[[inputs]]
+key = "APP_SECRET"
+label = "App secret"
+description = "Signs sessions."
+generate = "hex"
+
+[[inputs]]
+key = "DB_PASSWORD"
+label = "Database password"
+generate = "password"
+
+[[volumes]]
+service = "db"
+path = "./postgres"
+description = "PostgreSQL data: websites, users and all analytics events"

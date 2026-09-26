@@ -74,6 +74,11 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "generated credentials shown once to the creator",
     ),
     (
+        "TemplateDeployResponse",
+        "credentials",
+        "a template's generated first-login credentials, shown once to the deployer",
+    ),
+    (
         "ManagedDatabaseResponse",
         "custom_external_url",
         "masked with mask_url_password",
