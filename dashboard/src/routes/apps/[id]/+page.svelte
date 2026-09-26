@@ -76,6 +76,10 @@
 	import Unlink2 from '~icons/ri/link-unlink-m';
 	import Lock from '~icons/ri/lock-line';
 	import type { PageProps } from './$types';
+	import type { LogLine } from '$lib/components/tabs/app-page/app-logs.svelte';
+	import { createLogBuffer } from '$lib/log-buffer';
+	import { pollWhileVisible } from '$lib/polling';
+	import { untrack } from 'svelte';
 
 	let { data, params }: PageProps = $props();
 
@@ -83,8 +87,12 @@
 	let error = $state('');
 	let showDeleteDialog = $state(false);
 
-	// Status polling — auto-starts when app is building, stops on terminal status
-	let statusInterval: ReturnType<typeof setInterval> | null = null;
+	// Status polling runs while the app is building (or right after a deploy
+	// request) and stops on a terminal status. See the effects at the bottom.
+	let statusPollRequested = $state(false);
+	let appStatus = $derived(app?.status);
+	/** Selected tab; drives the log stream, metrics polling and feed context. */
+	let activeTab = $state('overview');
 
 	// Domain form
 	let domainInput = $state('');
@@ -169,13 +177,12 @@
 	let metricsLoading = $state(false);
 	let metricsError = $state('');
 	let metricsPeriod = $state<'1h' | '24h' | '7d'>('1h');
-	let metricsInterval: ReturnType<typeof setInterval> | null = null;
 
-	// Logs state
-	import type { LogLine } from '$lib/components/tabs/app-page/app-logs.svelte';
-	let logLines = $state<LogLine[]>([]);
+	// Logs state — bounded (last LOG_BUFFER_LIMIT lines) and batched per flush.
+	let logLines = $state.raw<LogLine[]>([]);
 	let logStreaming = $state(false);
 	let logSocket: WebSocket | null = null;
+	const logBuffer = createLogBuffer<LogLine>((lines) => (logLines = lines));
 
 	let appId = $derived(page.params.id || params.id);
 
@@ -198,47 +205,38 @@
 		}
 	}
 
-	function stopStatusPolling() {
-		if (statusInterval !== null) {
-			clearInterval(statusInterval);
-			statusInterval = null;
-		}
-	}
-
 	async function pollStatus() {
 		try {
 			const latest = await getApp(appId);
-			// Only update the status-related field without resetting all form inputs
-			if (app) app.status = latest.status;
-			// Stop polling once we reach a terminal state
 			if (latest.status !== 'building') {
-				stopStatusPolling();
-				// Reload the full app data now that deploy finished
+				// Terminal state: reload everything once; the polling effect stops.
+				statusPollRequested = false;
 				await loadApp();
-				// Update feed panel context so the badge reflects the new status
-				if (app) setUiContext(appContext(app));
+			} else if (app && app.status !== latest.status) {
+				// Only update the status without resetting form inputs.
+				app = { ...app, status: latest.status };
 			}
 		} catch {
 			// Non-critical — keep polling
 		}
 	}
 
-	function startStatusPolling() {
-		stopStatusPolling();
-		statusInterval = setInterval(pollStatus, 2000);
-	}
-
 	function stopLogStream() {
 		if (logSocket) {
+			// Detach handlers first so a late close event can't touch a newer stream.
+			logSocket.onmessage = null;
+			logSocket.onerror = null;
+			logSocket.onclose = null;
 			logSocket.close();
 			logSocket = null;
 		}
+		logBuffer.flush();
 		logStreaming = false;
 	}
 
 	function startLogStream() {
 		stopLogStream();
-		logLines = [];
+		logBuffer.clear();
 		logStreaming = true;
 
 		const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -265,20 +263,17 @@
 							ts: entry.ts ?? undefined
 						})
 					);
-					logLines = [...deployLogs, ...containerLogs];
+					logBuffer.replace([...deployLogs, ...containerLogs]);
 				} else if (msg.type === 'deploy') {
-					logLines = [
-						...logLines,
-						{
-							kind: 'deploy',
-							level: msg.level,
-							trigger_source: msg.trigger_source,
-							message: msg.message,
-							ts: msg.ts
-						}
-					];
+					logBuffer.push({
+						kind: 'deploy',
+						level: msg.level,
+						trigger_source: msg.trigger_source,
+						message: msg.message,
+						ts: msg.ts
+					});
 				} else if (msg.type === 'container') {
-					logLines = [...logLines, { kind: 'container', line: msg.line, ts: msg.ts ?? undefined }];
+					logBuffer.push({ kind: 'container', line: msg.line, ts: msg.ts ?? undefined });
 				}
 			} catch {
 				// ignore parse errors
@@ -290,8 +285,9 @@
 		};
 
 		ws.onclose = () => {
+			logBuffer.flush();
 			logStreaming = false;
-			logSocket = null;
+			if (logSocket === ws) logSocket = null;
 		};
 	}
 
@@ -300,8 +296,8 @@
 			openFeedPanel();
 			await deployApp(appId);
 			await loadApp();
-			// Start polling to reflect building → running transition
-			startStatusPolling();
+			// Poll to reflect the building → running transition
+			statusPollRequested = true;
 		} catch (e: any) {
 			error = e.message;
 		}
@@ -356,6 +352,7 @@
 		openFeedPanel();
 		await deployApp(appId);
 		await loadApp();
+		statusPollRequested = true;
 	}
 
 	async function handleUpdateDomain() {
@@ -767,19 +764,6 @@
 		}
 	}
 
-	function startMetricsPolling() {
-		stopMetricsPolling();
-		loadMetrics();
-		metricsInterval = setInterval(loadMetrics, 30_000);
-	}
-
-	function stopMetricsPolling() {
-		if (metricsInterval !== null) {
-			clearInterval(metricsInterval);
-			metricsInterval = null;
-		}
-	}
-
 	async function handleCreatePreview(options: Parameters<typeof createPreview>[1] = {}) {
 		previewsError = '';
 		try {
@@ -861,20 +845,50 @@
 		}
 	}
 
-	$effect(() => {
-		if (app) {
-			setUiContext(appContext(app));
-			if (app.status === 'building') {
-				startStatusPolling();
-			} else {
-				stopStatusPolling();
-			}
-		}
+	// ── Lifecycle ──────────────────────────────────────────────────────────
+	// Each concern gets its own effect so reloading the app data (which happens
+	// on every save and status poll) never tears down the log stream or polling.
 
+	// Feed panel context follows the app data and the active tab. While the Logs
+	// tab streams, the feed is paused so only one socket is open per app.
+	$effect(() => {
+		if (!app) return;
+		const ctx = appContext(app);
+		setUiContext(activeTab === 'logs' ? { ...ctx, feed: { ...ctx.feed, wsUrl: null } } : ctx);
+	});
+
+	// Status polling while building (paused in hidden tabs).
+	$effect(() => {
+		if (appStatus !== 'building' && !statusPollRequested) return;
+		return pollWhileVisible(pollStatus, 2000, { immediate: false });
+	});
+
+	// Metrics polling only while the Metrics tab is open (paused in hidden tabs).
+	$effect(() => {
+		if (activeTab !== 'metrics') return;
+		void metricsPeriod;
+		void appId;
+		return pollWhileVisible(() => untrack(loadMetrics), 30_000);
+	});
+
+	// Log stream only while the Logs tab is open; restarts for a different app.
+	$effect(() => {
+		if (activeTab !== 'logs') return;
+		void appId;
+		untrack(startLogStream);
+		return stopLogStream;
+	});
+
+	// Mount-only teardown, keyed on the app id (navigating to another app
+	// resets the page; a data reload does not).
+	$effect(() => {
+		void appId;
+		untrack(() => {
+			activeTab = 'overview';
+			statusPollRequested = false;
+		});
 		return () => {
-			stopLogStream();
-			stopMetricsPolling();
-			stopStatusPolling();
+			logBuffer.dispose();
 			clearUiContext();
 		};
 	});
@@ -920,19 +934,8 @@
 
 		<!-- Tabs -->
 		<Tabs.Root
-			value="overview"
+			bind:value={activeTab}
 			onValueChange={(v) => {
-				if (v === 'logs') {
-					startLogStream();
-					// Pause the feed panel stream to avoid two concurrent connections
-					// to the same WebSocket endpoint.
-					if (app)
-						setUiContext({ ...appContext(app), feed: { ...appContext(app).feed, wsUrl: null } });
-				} else {
-					stopLogStream();
-					// Restore the feed panel stream when leaving the Logs tab
-					if (app) setUiContext(appContext(app));
-				}
 				if (v === 'deployments') {
 					loadDeployments();
 				}
@@ -946,11 +949,6 @@
 				}
 				if (v === 'previews') {
 					loadPreviews();
-				}
-				if (v === 'metrics') {
-					startMetricsPolling();
-				} else {
-					stopMetricsPolling();
 				}
 			}}
 		>
@@ -981,7 +979,7 @@
 					streaming={logStreaming}
 					onConnect={startLogStream}
 					onStop={stopLogStream}
-					onClear={() => (logLines = [])}
+					onClear={() => logBuffer.clear()}
 				/>
 			</Tabs.Content>
 
@@ -1875,10 +1873,7 @@
 					loading={metricsLoading}
 					error={metricsError}
 					period={metricsPeriod}
-					onPeriodChange={(p) => {
-						metricsPeriod = p;
-						startMetricsPolling();
-					}}
+					onPeriodChange={(p) => (metricsPeriod = p)}
 				/>
 			</Tabs.Content>
 

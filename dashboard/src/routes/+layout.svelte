@@ -21,6 +21,8 @@
 	import { toast } from 'svelte-sonner';
 	import { SvelteMap } from 'svelte/reactivity';
 	import { registerDashboardShortcuts } from '$lib/dashboard-shortcuts';
+	import { pollWhileVisible } from '$lib/polling';
+	import { untrack } from 'svelte';
 	import favicon from '$lib/assets/favicon.svg';
 
 	import './layout.css';
@@ -87,10 +89,7 @@
 	$effect(() => {
 		if (getStatus() !== 'authenticated') return;
 
-		let stopped = false;
-
 		async function poll() {
-			if (stopped) return;
 			try {
 				const rules = await listAlertRules();
 
@@ -111,18 +110,10 @@
 			} catch {
 				// Polling failures are silent — don't interrupt the user
 			}
-
-			if (!stopped) {
-				setTimeout(poll, ALERT_POLL_MS);
-			}
 		}
 
-		// Seed snapshot immediately, then start polling
-		poll();
-
-		return () => {
-			stopped = true;
-		};
+		// Seed the snapshot immediately, then poll while the tab is visible.
+		return pollWhileVisible(() => untrack(poll), ALERT_POLL_MS);
 	});
 
 	$effect(() => {

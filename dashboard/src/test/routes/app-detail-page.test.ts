@@ -1,6 +1,6 @@
 import { render, screen } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { App } from '$lib/api';
 
 const state = vi.hoisted(() => ({
@@ -358,5 +358,82 @@ describe('apps/[id] page', () => {
 
 		expect(api.listOpenPRs).toHaveBeenCalledWith('app_1');
 		expect(await screen.findByText(/add feature/i)).toBeInTheDocument();
+	});
+
+	describe('lifecycle', () => {
+		class FakeWebSocket {
+			static instances: FakeWebSocket[] = [];
+			url: string;
+			closed = false;
+			onmessage: ((evt: { data: string }) => void) | null = null;
+			onerror: (() => void) | null = null;
+			onclose: (() => void) | null = null;
+			constructor(url: string) {
+				this.url = url;
+				FakeWebSocket.instances.push(this);
+			}
+			close() {
+				this.closed = true;
+			}
+		}
+
+		beforeEach(() => {
+			FakeWebSocket.instances = [];
+			vi.stubGlobal('WebSocket', FakeWebSocket);
+		});
+
+		afterEach(() => {
+			vi.unstubAllGlobals();
+		});
+
+		it('keeps the log stream open and the feed paused when the app reloads', async () => {
+			api.deployApp.mockResolvedValue(undefined);
+			api.getApp.mockResolvedValue({ ...app, status: 'running' });
+
+			const user = userEvent.setup();
+			renderPage();
+
+			await user.click(screen.getByRole('tab', { name: /^logs$/i }));
+			expect(FakeWebSocket.instances).toHaveLength(1);
+			expect(FakeWebSocket.instances[0].url).toMatch(/\/api\/apps\/app_1\/logs\/stream$/);
+
+			// Re-deploying reloads the app data, which used to tear everything down.
+			await user.click(screen.getByRole('button', { name: /re-deploy/i }));
+			await vi.waitFor(() => expect(api.getApp).toHaveBeenCalled());
+
+			expect(FakeWebSocket.instances).toHaveLength(1);
+			expect(FakeWebSocket.instances[0].closed).toBe(false);
+			expect(clearUiContext).not.toHaveBeenCalled();
+			expect(setUiContext).toHaveBeenLastCalledWith(
+				expect.objectContaining({ feed: expect.objectContaining({ wsUrl: null }) })
+			);
+		});
+
+		it('closes the log stream when leaving the Logs tab', async () => {
+			const user = userEvent.setup();
+			renderPage();
+
+			await user.click(screen.getByRole('tab', { name: /^logs$/i }));
+			await user.click(screen.getByRole('tab', { name: /overview/i }));
+
+			expect(FakeWebSocket.instances).toHaveLength(1);
+			expect(FakeWebSocket.instances[0].closed).toBe(true);
+		});
+
+		it('keeps a single metrics poller across app reloads', async () => {
+			api.deployApp.mockResolvedValue(undefined);
+			api.getApp.mockResolvedValue({ ...app, status: 'running' });
+
+			const user = userEvent.setup();
+			renderPage();
+
+			await user.click(screen.getByRole('tab', { name: /metrics/i }));
+			await vi.waitFor(() => expect(api.getAppMetrics).toHaveBeenCalledTimes(1));
+
+			await user.click(screen.getByRole('button', { name: /re-deploy/i }));
+			await vi.waitFor(() => expect(api.getApp).toHaveBeenCalled());
+
+			expect(api.getAppMetrics).toHaveBeenCalledTimes(1);
+		});
 	});
 });

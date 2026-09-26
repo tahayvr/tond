@@ -2,6 +2,7 @@
 	import { tick } from 'svelte';
 	import { getUiContext } from '$lib/ui-context.svelte';
 	import { openLogStream, type LogLine } from '$lib/api';
+	import { createLogBuffer } from '$lib/log-buffer';
 
 	const MAX_LINES = 500;
 
@@ -22,7 +23,9 @@
 		}
 	});
 
-	let lines = $state<LogLine[]>([]);
+	// Bounded and batched: one array copy per flush, never more than MAX_LINES.
+	let lines = $state.raw<LogLine[]>([]);
+	const buffer = createLogBuffer<LogLine>((next) => (lines = next), { limit: MAX_LINES });
 	let connected = $state(false);
 	let error = $state('');
 	let autoScroll = $state(true);
@@ -65,7 +68,7 @@
 	$effect(() => {
 		const url = wsUrl;
 
-		lines = [];
+		buffer.clear();
 		error = '';
 		connected = false;
 
@@ -74,8 +77,7 @@
 		const close = openLogStream(url, {
 			onLine(line) {
 				connected = true;
-				lines =
-					lines.length >= MAX_LINES ? [...lines.slice(-MAX_LINES + 1), line] : [...lines, line];
+				buffer.push(line);
 			},
 			onError() {
 				error = 'Stream error';
@@ -86,7 +88,10 @@
 			}
 		});
 
-		return close;
+		return () => {
+			close();
+			buffer.dispose();
+		};
 	});
 </script>
 
