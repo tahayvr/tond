@@ -16,6 +16,7 @@
 
 use axum::{
     Json,
+    body::Bytes,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
@@ -40,6 +41,19 @@ use super::fetch_app;
 pub struct RollbackRequest {
     /// Deployment whose image to restore; default: the previous distinct image.
     pub deployment_id: Option<String>,
+}
+
+/// The body is optional: empty (or whitespace) means "previous image". Parsed
+/// by hand because clients send `Content-Type: application/json` either way.
+fn parse_rollback_request(body: &[u8]) -> Result<RollbackRequest, AppError> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(RollbackRequest::default());
+    }
+    serde_json::from_slice(body).map_err(|e| {
+        AppError(TondError::InvalidInput(format!(
+            "Invalid rollback request body: {e}"
+        )))
+    })
 }
 
 /// Why a deployment can't be rolled back to, or `None` if it can.
@@ -168,10 +182,10 @@ pub async fn rollback_app(
     actor: AuthActor,
     State(state): State<AppState>,
     Path(id): Path<String>,
-    body: Option<Json<RollbackRequest>>,
+    body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
     let mut app = fetch_app(&state.db, &id).await?;
-    let req = body.map(|Json(r)| r).unwrap_or_default();
+    let req = parse_rollback_request(&body)?;
 
     let deployments = sqlx::query_as::<_, Deployment>(
         "SELECT * FROM deployments WHERE app_id = ? ORDER BY created_at DESC",
@@ -442,6 +456,18 @@ mod tests {
         .err()
         .unwrap_or_else(|| panic!("compose apps can't roll back"));
         assert!(err.0.to_string().contains("Docker Compose"), "{}", err.0);
+    }
+
+    #[test]
+    fn rollback_body_is_optional() {
+        assert!(parse_rollback_request(b"").is_ok_and(|r| r.deployment_id.is_none()));
+        assert!(parse_rollback_request(b"  \n").is_ok_and(|r| r.deployment_id.is_none()));
+        assert!(parse_rollback_request(b"{}").is_ok_and(|r| r.deployment_id.is_none()));
+        assert!(
+            parse_rollback_request(br#"{"deployment_id":"dep-1"}"#)
+                .is_ok_and(|r| r.deployment_id.as_deref() == Some("dep-1"))
+        );
+        assert!(parse_rollback_request(b"{nope").is_err());
     }
 
     #[test]
