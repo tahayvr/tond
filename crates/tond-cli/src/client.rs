@@ -40,7 +40,7 @@ use tond_common::{
     CreateDatabaseRequest, CronJobResponse, CronJobRun, DeployKeyResponse, DeploymentResponse,
     IntegrationResponse, ManagedDatabaseDetail, ManagedDatabaseResponse, PreviewDeploymentResponse,
     ProjectPreviewResponse, ProjectResponse, ServerSettings, SnapshotResponse, SnapshotStarted,
-    StorageProviderResponse, UpdateCronJobRequest, UpdateSettingsRequest,
+    StorageProviderResponse, UpdateCronJobRequest, UpdateSettingsRequest, WebhookConfigResponse,
 };
 
 pub struct TondClient {
@@ -565,8 +565,22 @@ impl TondClient {
         }
     }
 
-    /// Set or clear the HMAC webhook secret for an app.
-    pub async fn set_webhook_secret(&self, id: &str, secret: Option<&str>) -> Result<()> {
+    /// Webhook URLs and secret for an app.
+    pub async fn get_webhook_config(&self, id: &str) -> Result<WebhookConfigResponse> {
+        let req = self
+            .client
+            .get(format!("{}/api/apps/{}/webhook", self.base_url, id));
+        let resp: ApiResponse<WebhookConfigResponse> =
+            self.auth_header(req).send().await?.json().await?;
+        if resp.success {
+            resp.data.context("No data returned")
+        } else {
+            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
+        }
+    }
+
+    /// Replace the webhook secret with a caller-chosen value.
+    pub async fn set_webhook_secret(&self, id: &str, secret: &str) -> Result<()> {
         let req = self
             .client
             .put(format!("{}/api/apps/{}/webhook-secret", self.base_url, id))
@@ -577,6 +591,21 @@ impl TondClient {
             anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
         }
         Ok(())
+    }
+
+    /// Replace the webhook secret with a freshly generated one.
+    pub async fn rotate_webhook_secret(&self, id: &str) -> Result<WebhookConfigResponse> {
+        let req = self.client.post(format!(
+            "{}/api/apps/{}/webhook-secret/rotate",
+            self.base_url, id
+        ));
+        let resp: ApiResponse<WebhookConfigResponse> =
+            self.auth_header(req).send().await?.json().await?;
+        if resp.success {
+            resp.data.context("No data returned")
+        } else {
+            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
+        }
     }
 
     /// Enable or disable auto-deploy, optionally setting the watch branch.
