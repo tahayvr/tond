@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { getSystemMetrics, type SystemMetrics } from '$lib/api';
+	import { pollWhileVisible } from '$lib/polling';
 	import * as Tooltip from '$lib/components/ui/tooltip/index.js';
 	import CpuIcon from '~icons/ri/cpu-line';
 	import MemoryIcon from '~icons/ri/ram-2-line';
@@ -25,11 +26,8 @@
 		}
 	}
 
-	$effect(() => {
-		load();
-		const interval = setInterval(load, 30_000);
-		return () => clearInterval(interval);
-	});
+	// Refresh every 30 s while the tab is visible.
+	$effect(() => pollWhileVisible(load, 30_000));
 </script>
 
 {#if metrics}

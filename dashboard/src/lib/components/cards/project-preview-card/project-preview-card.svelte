@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { safeUrl } from '$lib/utils';
 	import { Badge } from '$lib/components/ui/badge/index.js';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import * as Card from '$lib/components/ui/card/index.js';
@@ -107,7 +108,7 @@
 									<td class="px-3 py-2">
 										{#if p.pr_number !== null && p.pr_url}
 											<a
-												href={p.pr_url}
+												href={safeUrl(p.pr_url)}
 												target="_blank"
 												rel="noopener noreferrer"
 												class="inline-flex items-center gap-1 font-mono text-xs text-accent hover:underline"
@@ -152,7 +153,7 @@
 									<td class="px-3 py-2">
 										{#if p.url}
 											<a
-												href={p.url}
+												href={safeUrl(p.url)}
 												target="_blank"
 												rel="noopener noreferrer"
 												class="inline-flex items-center gap-1 font-mono text-xs text-accent hover:underline"

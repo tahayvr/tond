@@ -7,7 +7,6 @@
 		startApp,
 		restartApp,
 		deleteApp,
-		updateEnv,
 		updateDomain,
 		updateHealth,
 		updateDrainTimeout,
@@ -19,10 +18,10 @@
 		rollbackApp,
 		generateDeployKey,
 		getDeployKey,
-		setWebhookSecret,
 		setAutoDeploy,
 		updateSource,
 		listPreviews,
+		getSettings,
 		createPreview,
 		deletePreview,
 		updatePreviewConfig,
@@ -48,10 +47,10 @@
 		type GitHubBranch
 	} from '$lib/api';
 	import { goto } from '$app/navigation';
+	import { isAdmin } from '$lib/auth.svelte';
 	import { setUiContext, clearUiContext, appContext, openFeedPanel } from '$lib/ui-context.svelte';
 	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
 	import ConfirmDeleteDialog from '$lib/components/dialogs/confirm-delete-dialog.svelte';
-	import * as Accordion from '$lib/components/ui/accordion/index.js';
 	import { Badge } from '$lib/components/ui/badge/index.js';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
@@ -68,8 +67,11 @@
 	import AppHealth from '$lib/components/tabs/app-page/app-health.svelte';
 	import AppVolumes from '$lib/components/tabs/app-page/app-volumes.svelte';
 	import AppPreviews from '$lib/components/tabs/app-page/app-previews.svelte';
+	import PreviewDomainRequiredAlert from '$lib/components/alerts/preview-domain-required-alert.svelte';
 	import AppMetrics from '$lib/components/tabs/app-page/app-metrics.svelte';
 	import AppHistory from '$lib/components/tabs/app-page/app-history.svelte';
+	import AppWebhooks from '$lib/components/tabs/app-page/app-webhooks.svelte';
+	import { safeUrl } from '$lib/utils';
 	import { SecretInput } from '$lib/components/ui/secret-input/index.js';
 	import Check from '~icons/ri/check-line';
 	import Github from '~icons/ri/github-fill';
@@ -77,6 +79,10 @@
 	import Unlink2 from '~icons/ri/link-unlink-m';
 	import Lock from '~icons/ri/lock-line';
 	import type { PageProps } from './$types';
+	import type { LogLine } from '$lib/components/tabs/app-page/app-logs.svelte';
+	import { createLogBuffer } from '$lib/log-buffer';
+	import { pollWhileVisible } from '$lib/polling';
+	import { untrack } from 'svelte';
 
 	let { data, params }: PageProps = $props();
 
@@ -84,15 +90,16 @@
 	let error = $state('');
 	let showDeleteDialog = $state(false);
 
-	// Status polling — auto-starts when app is building, stops on terminal status
-	let statusInterval: ReturnType<typeof setInterval> | null = null;
-
-	// Env form
-	let envSaving = $state(false);
-	let envError = $state('');
+	// Status polling runs while the app is building (or right after a deploy
+	// request) and stops on a terminal status. See the effects at the bottom.
+	let statusPollRequested = $state(false);
+	let appStatus = $derived(app?.status);
+	/** Selected tab; drives the log stream, metrics polling and feed context. */
+	let activeTab = $state('overview');
 
 	// Domain form
 	let domainInput = $state('');
+	let certRefreshKey = $state(0);
 
 	// Health form
 	let healthPath = $state('');
@@ -102,6 +109,7 @@
 
 	// Volume form
 	let volumeContainerPath = $state('');
+	let volumeName = $state('');
 	let volumeError = $state('');
 
 	// Resources form
@@ -124,12 +132,9 @@
 	let deployKeyError = $state('');
 	let gitError = $state('');
 	let gitSuccess = $state('');
-	let webhookSecretInput = $state('');
 	let watchBranchInput = $state('');
 	let sourceTypeInput = $state<'git' | 'image' | 'tarball'>('git');
 	let sourceUrlInput = $state('');
-	// Track which webhook URL was most recently copied (provider key → timestamp)
-	let copiedWebhook = $state<string | null>(null);
 
 	// Registry credentials state
 	let registryCredentials = $state<RegistryCredential[]>([]);
@@ -162,6 +167,9 @@
 	let previewTtl = $state(24);
 	let previewConfigSaving = $state(false);
 	let previewConfigError = $state('');
+	// null until settings are loaded; '' when no preview domain is configured
+	let previewDomain = $state<string | null>(null);
+	let previewsBlocked = $derived(previewDomain === '');
 
 	// Open PRs state (Load open PRs feature)
 	let openPRs = $state<GithubPR[]>([]);
@@ -174,76 +182,82 @@
 	let metricsLoading = $state(false);
 	let metricsError = $state('');
 	let metricsPeriod = $state<'1h' | '24h' | '7d'>('1h');
-	let metricsInterval: ReturnType<typeof setInterval> | null = null;
 
-	// Logs state
-	import type { LogLine } from '$lib/components/tabs/app-page/app-logs.svelte';
-	let logLines = $state<LogLine[]>([]);
+	// Logs state — bounded (last LOG_BUFFER_LIMIT lines) and batched per flush.
+	let logLines = $state.raw<LogLine[]>([]);
 	let logStreaming = $state(false);
 	let logSocket: WebSocket | null = null;
+	const logBuffer = createLogBuffer<LogLine>((lines) => (logLines = lines));
 
 	let appId = $derived(page.params.id || params.id);
+
+	/** Reset every settings form on the page to the app's saved values. */
+	function initForms(a: App) {
+		domainInput = a.domain || '';
+		healthPath = a.health_check_path || '';
+		healthInterval = a.health_check_interval;
+		healthThreshold = a.health_failure_threshold;
+		drainTimeout = a.drain_timeout;
+		// Git integration init
+		watchBranchInput = a.watch_branch || '';
+		sourceTypeInput = (a.source_type as 'git' | 'image' | 'tarball') || 'git';
+		sourceUrlInput = a.source_url || '';
+		selectedCredentialId = a.registry_credential_id;
+		initResourcesDraft();
+	}
+
+	// Fill the forms when the page's app is loaded or changes (the loader
+	// provides it; without this the forms start empty and a save would
+	// overwrite the real settings with blanks).
+	let formsInitializedFor: string | null = null;
+	$effect(() => {
+		const current = app;
+		if (!current || current.id === formsInitializedFor) return;
+		formsInitializedFor = current.id;
+		untrack(() => initForms(current));
+	});
 
 	async function loadApp() {
 		try {
 			app = await getApp(appId);
-			domainInput = app.domain || '';
-			healthPath = app.health_check_path || '';
-			healthInterval = app.health_check_interval;
-			healthThreshold = app.health_failure_threshold;
-			drainTimeout = app.drain_timeout;
-			// Git integration init
-			watchBranchInput = app.watch_branch || '';
-			sourceTypeInput = (app.source_type as 'git' | 'image' | 'tarball') || 'git';
-			sourceUrlInput = app.source_url || '';
-			selectedCredentialId = app.registry_credential_id;
-			initResourcesDraft();
+			initForms(app);
 		} catch (e: any) {
 			error = e.message;
-		}
-	}
-
-	function stopStatusPolling() {
-		if (statusInterval !== null) {
-			clearInterval(statusInterval);
-			statusInterval = null;
 		}
 	}
 
 	async function pollStatus() {
 		try {
 			const latest = await getApp(appId);
-			// Only update the status-related field without resetting all form inputs
-			if (app) app.status = latest.status;
-			// Stop polling once we reach a terminal state
 			if (latest.status !== 'building') {
-				stopStatusPolling();
-				// Reload the full app data now that deploy finished
+				// Terminal state: reload everything once; the polling effect stops.
+				statusPollRequested = false;
 				await loadApp();
-				// Update feed panel context so the badge reflects the new status
-				if (app) setUiContext(appContext(app));
+			} else if (app && app.status !== latest.status) {
+				// Only update the status without resetting form inputs.
+				app = { ...app, status: latest.status };
 			}
 		} catch {
 			// Non-critical — keep polling
 		}
 	}
 
-	function startStatusPolling() {
-		stopStatusPolling();
-		statusInterval = setInterval(pollStatus, 2000);
-	}
-
 	function stopLogStream() {
 		if (logSocket) {
+			// Detach handlers first so a late close event can't touch a newer stream.
+			logSocket.onmessage = null;
+			logSocket.onerror = null;
+			logSocket.onclose = null;
 			logSocket.close();
 			logSocket = null;
 		}
+		logBuffer.flush();
 		logStreaming = false;
 	}
 
 	function startLogStream() {
 		stopLogStream();
-		logLines = [];
+		logBuffer.clear();
 		logStreaming = true;
 
 		const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -270,20 +284,17 @@
 							ts: entry.ts ?? undefined
 						})
 					);
-					logLines = [...deployLogs, ...containerLogs];
+					logBuffer.replace([...deployLogs, ...containerLogs]);
 				} else if (msg.type === 'deploy') {
-					logLines = [
-						...logLines,
-						{
-							kind: 'deploy',
-							level: msg.level,
-							trigger_source: msg.trigger_source,
-							message: msg.message,
-							ts: msg.ts
-						}
-					];
+					logBuffer.push({
+						kind: 'deploy',
+						level: msg.level,
+						trigger_source: msg.trigger_source,
+						message: msg.message,
+						ts: msg.ts
+					});
 				} else if (msg.type === 'container') {
-					logLines = [...logLines, { kind: 'container', line: msg.line, ts: msg.ts ?? undefined }];
+					logBuffer.push({ kind: 'container', line: msg.line, ts: msg.ts ?? undefined });
 				}
 			} catch {
 				// ignore parse errors
@@ -295,8 +306,9 @@
 		};
 
 		ws.onclose = () => {
+			logBuffer.flush();
 			logStreaming = false;
-			logSocket = null;
+			if (logSocket === ws) logSocket = null;
 		};
 	}
 
@@ -305,8 +317,8 @@
 			openFeedPanel();
 			await deployApp(appId);
 			await loadApp();
-			// Start polling to reflect building → running transition
-			startStatusPolling();
+			// Poll to reflect the building → running transition
+			statusPollRequested = true;
 		} catch (e: any) {
 			error = e.message;
 		}
@@ -351,39 +363,24 @@
 		}
 	}
 
-	async function handleSaveEnv(
-		envVars: Record<string, string>,
-		credentialId: string | null,
-		previewExcludedKeys: string[],
-		previewEnvVars: Record<string, string>
-	) {
-		envSaving = true;
-		envError = '';
-		try {
-			await updateEnv(appId, envVars);
-			// If source is image and credential changed, persist it too
-			if (app?.source_type === 'image' && credentialId !== app.registry_credential_id) {
-				await setAppRegistryCredential(appId, credentialId);
-			}
-			// Persist scoped secrets alongside the preview toggle state
-			await updatePreviewConfig(
-				appId,
-				app?.preview_enabled ?? false,
-				previewExcludedKeys,
-				previewEnvVars
-			);
-			await loadApp();
-		} catch (e: any) {
-			envError = e.message;
-		} finally {
-			envSaving = false;
-		}
+	// Environment tab: errors are shown inside the tab, so these rethrow.
+	async function handleEnvRegistryCredential(credentialId: string | null) {
+		await setAppRegistryCredential(appId, credentialId);
+		await loadApp();
+	}
+
+	async function handleEnvRedeploy() {
+		openFeedPanel();
+		await deployApp(appId);
+		await loadApp();
+		statusPollRequested = true;
 	}
 
 	async function handleUpdateDomain() {
 		try {
 			await updateDomain(appId, domainInput);
 			await loadApp();
+			certRefreshKey += 1;
 		} catch (e: any) {
 			error = e.message;
 		}
@@ -422,13 +419,15 @@
 	async function handleAddVolume() {
 		volumeError = '';
 		const path = volumeContainerPath.trim();
+		const name = volumeName.trim();
 		if (!path || !path.startsWith('/')) {
 			volumeError = 'Container path must be an absolute path (e.g. /data)';
 			return;
 		}
 		try {
-			await addVolume(appId, path);
+			await addVolume(appId, { container_path: path, ...(name ? { name } : {}) });
 			volumeContainerPath = '';
+			volumeName = '';
 			await loadApp();
 		} catch (e: any) {
 			volumeError = e.message;
@@ -454,10 +453,10 @@
 		}
 	}
 
-	async function handleRollback() {
+	async function handleRollback(deploymentId?: string) {
 		rollbackError = '';
 		try {
-			await rollbackApp(appId);
+			await rollbackApp(appId, deploymentId);
 			await loadApp();
 			await loadDeployments();
 		} catch (e: any) {
@@ -490,33 +489,6 @@
 			deployKeyError = e.message;
 		} finally {
 			deployKeyLoading = false;
-		}
-	}
-
-	async function handleCopyWebhookUrl(provider: string, url: string) {
-		try {
-			await navigator.clipboard.writeText(window.location.origin + url);
-			copiedWebhook = provider;
-			setTimeout(() => {
-				if (copiedWebhook === provider) copiedWebhook = null;
-			}, 2000);
-		} catch {
-			// Clipboard API blocked (non-https dev env): select the text instead
-			copiedWebhook = null;
-		}
-	}
-
-	async function handleSetWebhookSecret() {
-		gitError = '';
-		gitSuccess = '';
-		try {
-			const secret = webhookSecretInput.trim() || null;
-			await setWebhookSecret(appId, secret);
-			await loadApp();
-			webhookSecretInput = '';
-			gitSuccess = secret ? 'Webhook secret updated.' : 'Webhook secret cleared.';
-		} catch (e: any) {
-			gitError = e.message;
 		}
 	}
 
@@ -775,6 +747,11 @@
 		} finally {
 			previewsLoading = false;
 		}
+		try {
+			previewDomain = (await getSettings()).preview_domain ?? '';
+		} catch {
+			// Leave the state unknown; the API still refuses previews without a domain.
+		}
 	}
 
 	async function loadMetrics() {
@@ -786,19 +763,6 @@
 			metricsError = e.message;
 		} finally {
 			metricsLoading = false;
-		}
-	}
-
-	function startMetricsPolling() {
-		stopMetricsPolling();
-		loadMetrics();
-		metricsInterval = setInterval(loadMetrics, 30_000);
-	}
-
-	function stopMetricsPolling() {
-		if (metricsInterval !== null) {
-			clearInterval(metricsInterval);
-			metricsInterval = null;
 		}
 	}
 
@@ -883,20 +847,50 @@
 		}
 	}
 
-	$effect(() => {
-		if (app) {
-			setUiContext(appContext(app));
-			if (app.status === 'building') {
-				startStatusPolling();
-			} else {
-				stopStatusPolling();
-			}
-		}
+	// ── Lifecycle ──────────────────────────────────────────────────────────
+	// Each concern gets its own effect so reloading the app data (which happens
+	// on every save and status poll) never tears down the log stream or polling.
 
+	// Feed panel context follows the app data and the active tab. While the Logs
+	// tab streams, the feed is paused so only one socket is open per app.
+	$effect(() => {
+		if (!app) return;
+		const ctx = appContext(app);
+		setUiContext(activeTab === 'logs' ? { ...ctx, feed: { ...ctx.feed, wsUrl: null } } : ctx);
+	});
+
+	// Status polling while building (paused in hidden tabs).
+	$effect(() => {
+		if (appStatus !== 'building' && !statusPollRequested) return;
+		return pollWhileVisible(pollStatus, 2000, { immediate: false });
+	});
+
+	// Metrics polling only while the Metrics tab is open (paused in hidden tabs).
+	$effect(() => {
+		if (activeTab !== 'metrics') return;
+		void metricsPeriod;
+		void appId;
+		return pollWhileVisible(() => untrack(loadMetrics), 30_000);
+	});
+
+	// Log stream only while the Logs tab is open; restarts for a different app.
+	$effect(() => {
+		if (activeTab !== 'logs') return;
+		void appId;
+		untrack(startLogStream);
+		return stopLogStream;
+	});
+
+	// Mount-only teardown, keyed on the app id (navigating to another app
+	// resets the page; a data reload does not).
+	$effect(() => {
+		void appId;
+		untrack(() => {
+			activeTab = 'overview';
+			statusPollRequested = false;
+		});
 		return () => {
-			stopLogStream();
-			stopMetricsPolling();
-			stopStatusPolling();
+			logBuffer.dispose();
 			clearUiContext();
 		};
 	});
@@ -942,19 +936,8 @@
 
 		<!-- Tabs -->
 		<Tabs.Root
-			value="overview"
+			bind:value={activeTab}
 			onValueChange={(v) => {
-				if (v === 'logs') {
-					startLogStream();
-					// Pause the feed panel stream to avoid two concurrent connections
-					// to the same WebSocket endpoint.
-					if (app)
-						setUiContext({ ...appContext(app), feed: { ...appContext(app).feed, wsUrl: null } });
-				} else {
-					stopLogStream();
-					// Restore the feed panel stream when leaving the Logs tab
-					if (app) setUiContext(appContext(app));
-				}
 				if (v === 'deployments') {
 					loadDeployments();
 				}
@@ -968,11 +951,6 @@
 				}
 				if (v === 'previews') {
 					loadPreviews();
-				}
-				if (v === 'metrics') {
-					startMetricsPolling();
-				} else {
-					stopMetricsPolling();
 				}
 			}}
 		>
@@ -1003,7 +981,7 @@
 					streaming={logStreaming}
 					onConnect={startLogStream}
 					onStop={stopLogStream}
-					onClear={() => (logLines = [])}
+					onClear={() => logBuffer.clear()}
 				/>
 			</Tabs.Content>
 
@@ -1021,21 +999,24 @@
 			<!-- Environment tab -->
 			<Tabs.Content value="env">
 				<AppEnvironment
+					appId={app.id}
 					sourceType={app.source_type}
 					{registryCredentials}
 					registryCredentialId={app.registry_credential_id}
-					saving={envSaving}
-					saveError={envError}
+					onRegistryCredentialChange={handleEnvRegistryCredential}
 					previewEnabled={app.preview_enabled}
-					previewExcludedKeys={app.preview_excluded_keys}
-					previewEnvVars={app.preview_env_vars}
-					onSave={handleSaveEnv}
+					onRedeploy={handleEnvRedeploy}
 				/>
 			</Tabs.Content>
 
 			<!-- Domain tab -->
 			<Tabs.Content value="domain">
-				<AppDomain bind:domainInput onUpdate={handleUpdateDomain} />
+				<AppDomain
+					bind:domainInput
+					savedDomain={app?.domain ?? null}
+					{certRefreshKey}
+					onUpdate={handleUpdateDomain}
+				/>
 			</Tabs.Content>
 
 			<!-- Health tab -->
@@ -1057,6 +1038,8 @@
 				<AppVolumes
 					{app}
 					bind:volumeContainerPath
+					bind:volumeName
+					canEdit={isAdmin()}
 					{volumeError}
 					onAdd={handleAddVolume}
 					onRemove={handleRemoveVolume}
@@ -1497,100 +1480,7 @@
 
 					<Separator />
 
-					<!-- Webhook URLs -->
-					<div class="grid gap-3">
-						<h3 class="text-sm font-medium">Webhook URLs</h3>
-						<p class="text-sm text-muted-foreground">
-							Configure your git provider to POST to one of these URLs on push events.
-						</p>
-						<div class="divide-y rounded-md border">
-							{#each [['GitHub', 'github'], ['Generic', 'generic']] as [label, provider] (provider)}
-								{@const webhookPath = `/api/webhooks/${provider}/${app.id}`}
-								<div class="flex items-center gap-2 px-4 py-2">
-									<span class="w-16 shrink-0 text-sm text-muted-foreground">{label}</span>
-									<code class="min-w-0 flex-1 truncate font-mono text-xs">{webhookPath}</code>
-									<Button
-										variant="ghost"
-										size="sm"
-										class="h-7 shrink-0 px-2 text-xs"
-										onclick={() => handleCopyWebhookUrl(provider, webhookPath)}
-									>
-										{#if copiedWebhook === provider}
-											Copied!
-										{:else}
-											Copy
-										{/if}
-									</Button>
-								</div>
-							{/each}
-						</div>
-					</div>
-
-					<!-- Setup instructions -->
-					<Accordion.Root type="single" class="w-full">
-						<Accordion.Item value="github-setup">
-							<Accordion.Trigger class="text-sm font-medium"
-								>GitHub setup instructions</Accordion.Trigger
-							>
-							<Accordion.Content>
-								<div class="space-y-3 pt-1 text-sm text-muted-foreground">
-									<p class="font-medium text-foreground">Method 1 — Public repo (HTTPS webhook)</p>
-									<ol class="list-decimal space-y-1 pl-5">
-										<li>
-											Go to your repository → <strong>Settings → Webhooks → Add webhook</strong>
-										</li>
-										<li>
-											Set <strong>Payload URL</strong> to the <em>GitHub</em> webhook URL above
-										</li>
-										<li>
-											Set <strong>Content type</strong> to
-											<code class="font-mono text-xs">application/json</code>
-										</li>
-										<li>Paste the webhook secret from the <em>Webhook Secret</em> field below</li>
-										<li>
-											Select <strong>Just the push event</strong> and click
-											<strong>Add webhook</strong>
-										</li>
-									</ol>
-									<p class="font-medium text-foreground">
-										Method 2 — Private repo (SSH deploy key)
-									</p>
-									<ol class="list-decimal space-y-1 pl-5">
-										<li>Generate a deploy key using the button below</li>
-										<li>
-											Go to your repository → <strong
-												>Settings → Deploy keys → Add deploy key</strong
-											>
-										</li>
-										<li>
-											Paste the public key; leave <strong>Allow write access</strong> unchecked
-										</li>
-										<li>
-											Set the app's Git URL to SSH format: <code class="font-mono text-xs"
-												>git@github.com:org/repo.git</code
-											>
-										</li>
-										<li>Follow the webhook setup steps above</li>
-									</ol>
-									<p class="font-medium text-foreground">Method 3 — External CI (GitHub Actions)</p>
-									<ol class="list-decimal space-y-1 pl-5">
-										<li>Create a Tond API token (Settings → API Tokens)</li>
-										<li>
-											In the repo → <strong>Settings → Secrets → Actions</strong>, add
-											<code class="font-mono text-xs">TOND_WEBHOOK</code>
-											(Generic URL above) and <code class="font-mono text-xs">TOND_TOKEN</code>
-										</li>
-										<li>In your workflow, after pushing the image, add a deploy step:</li>
-									</ol>
-									<pre
-										class="rounded-md bg-muted p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap">- name: Trigger Tond deploy
-  run: |
-    curl -sf -X POST "&#36;&#123;&#123; secrets.TOND_WEBHOOK }}" \
-      --header "Authorization: Bearer &#36;&#123;&#123; secrets.TOND_TOKEN }}"</pre>
-								</div>
-							</Accordion.Content>
-						</Accordion.Item>
-					</Accordion.Root>
+					<AppWebhooks appId={app.id} />
 
 					<Separator />
 
@@ -1647,29 +1537,6 @@
 						{:else}
 							<p class="text-xs text-muted-foreground">Watching all branches.</p>
 						{/if}
-					</div>
-
-					<Separator />
-
-					<!-- Webhook secret -->
-					<div class="grid gap-3">
-						<h3 class="text-sm font-medium">Webhook Secret</h3>
-						<p class="text-sm text-muted-foreground">
-							Set an HMAC secret to validate incoming webhook payloads. GitHub uses
-							<code class="font-mono text-xs">X-Hub-Signature-256</code>.
-						</p>
-						<div class="flex gap-3">
-							<div class="grid flex-1 gap-2">
-								<Label for="webhook-secret">New secret</Label>
-								<SecretInput
-									id="webhook-secret"
-									bind:value={webhookSecretInput}
-									placeholder="Leave empty to clear"
-									copyable={false}
-								/>
-							</div>
-							<Button onclick={handleSetWebhookSecret} class="self-end">Update</Button>
-						</div>
 					</div>
 
 					<Separator />
@@ -1731,6 +1598,10 @@
 							</Badge>
 						</div>
 
+						{#if previewsBlocked}
+							<PreviewDomainRequiredAlert />
+						{/if}
+
 						{#if previewConfigError}
 							<ErrorAlert title="Error" description={previewConfigError} />
 						{/if}
@@ -1739,7 +1610,7 @@
 							{#if !app.preview_enabled}
 								<Button
 									size="sm"
-									disabled={previewConfigSaving}
+									disabled={previewConfigSaving || previewsBlocked}
 									onclick={() => handleTogglePreviewEnabled(true)}
 								>
 									{previewConfigSaving ? 'Saving…' : 'Enable PR Previews'}
@@ -1763,11 +1634,15 @@
 							</p>
 						{/if}
 
-						<div class="rounded-md border border-dashed px-4 py-3 text-sm text-muted-foreground">
-							<strong class="text-foreground">Wildcard DNS required</strong> — add a
-							<code class="font-mono text-xs">*.yourdomain.com → &lt;server IP&gt;</code> A record so
-							preview subdomains resolve automatically.
-						</div>
+						{#if previewDomain}
+							<div class="rounded-md border border-dashed px-4 py-3 text-sm text-muted-foreground">
+								Previews are served at
+								<code class="font-mono text-xs">&lt;id&gt;-{app.name}.{previewDomain}</code>.
+								<strong class="text-foreground">Wildcard DNS required</strong> — add a
+								<code class="font-mono text-xs">*.{previewDomain} → &lt;server IP&gt;</code> A record
+								so preview hostnames resolve automatically.
+							</div>
+						{/if}
 					</div>
 
 					<Separator />
@@ -1832,7 +1707,7 @@
 													>
 													<td class="px-3 py-2 text-xs">
 														<a
-															href={pr.pr_url}
+															href={safeUrl(pr.pr_url)}
 															target="_blank"
 															rel="noopener noreferrer"
 															class="hover:underline">{pr.title}</a
@@ -1884,7 +1759,9 @@
 									class="w-28"
 								/>
 							</div>
-							<Button onclick={() => handleCreatePreview()}>Create Preview</Button>
+							<Button onclick={() => handleCreatePreview()} disabled={previewsBlocked}>
+								Create Preview
+							</Button>
 						</div>
 						<p class="text-xs text-muted-foreground">
 							The preview will be automatically removed after the TTL expires.
@@ -1900,10 +1777,7 @@
 					loading={metricsLoading}
 					error={metricsError}
 					period={metricsPeriod}
-					onPeriodChange={(p) => {
-						metricsPeriod = p;
-						startMetricsPolling();
-					}}
+					onPeriodChange={(p) => (metricsPeriod = p)}
 				/>
 			</Tabs.Content>
 

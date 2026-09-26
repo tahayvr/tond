@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { safeUrl } from '$lib/utils';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Badge } from '$lib/components/ui/badge/index.js';
 	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
@@ -65,7 +66,7 @@
 							<td class="px-4 py-2">
 								{#if p.pr_number !== null && p.pr_url}
 									<a
-										href={p.pr_url}
+										href={safeUrl(p.pr_url)}
 										target="_blank"
 										rel="noopener noreferrer"
 										class="inline-flex items-center gap-1 font-mono text-xs text-accent hover:underline"
@@ -108,7 +109,7 @@
 							<td class="px-4 py-2">
 								{#if p.subdomain}
 									<a
-										href="https://{p.subdomain}"
+										href={safeUrl(`https://${p.subdomain}`)}
 										target="_blank"
 										rel="noopener noreferrer"
 										class="inline-flex items-center gap-1 font-mono text-xs text-accent hover:underline"

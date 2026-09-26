@@ -3,7 +3,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const getAuthStatus = vi.fn();
 
 vi.mock('./api', () => ({
-	getAuthStatus
+	getAuthStatus,
+	setUnauthorizedHandler: vi.fn()
 }));
 
 describe('auth state', () => {
@@ -14,12 +15,12 @@ describe('auth state', () => {
 
 	it('sets authenticated state when auth status returns a user', async () => {
 		getAuthStatus.mockResolvedValue({
-			needs_setup: false,
 			authenticated: true,
 			user: {
 				id: 'usr_1',
 				email: 'admin@example.com',
 				role: 'admin',
+				totp_enabled: false,
 				created_at: '2026-01-01T00:00:00.000Z'
 			}
 		});
@@ -32,9 +33,8 @@ describe('auth state', () => {
 		expect(auth.getUser()).toMatchObject({ email: 'admin@example.com' });
 	});
 
-	it('sets setup state when initial admin setup is required', async () => {
+	it('sets login state for unauthenticated callers (setup state is never inferred)', async () => {
 		getAuthStatus.mockResolvedValue({
-			needs_setup: true,
 			authenticated: false,
 			user: null
 		});
@@ -44,7 +44,7 @@ describe('auth state', () => {
 		auth.clearAuth();
 		await auth.checkAuth();
 
-		expect(auth.getStatus()).toBe('setup');
+		expect(auth.getStatus()).toBe('login');
 		expect(auth.getUser()).toBeNull();
 	});
 
@@ -57,6 +57,7 @@ describe('auth state', () => {
 			id: 'usr_1',
 			email: 'admin@example.com',
 			role: 'admin',
+			totp_enabled: false,
 			created_at: '2026-01-01T00:00:00.000Z'
 		});
 		await auth.checkAuth();
@@ -89,6 +90,7 @@ describe('auth state', () => {
 			id: 'usr_2',
 			email: 'member@example.com',
 			role: 'member',
+			totp_enabled: false,
 			created_at: '2026-01-01T00:00:00.000Z'
 		});
 
@@ -99,5 +101,26 @@ describe('auth state', () => {
 
 		expect(auth.getStatus()).toBe('login');
 		expect(auth.getUser()).toBeNull();
+	});
+
+	it('signs out and flags an expired session only when a session was active', async () => {
+		const auth = await import('./auth.svelte');
+
+		auth.clearAuth();
+		auth.handleSessionExpired();
+		expect(auth.getSessionExpired()).toBe(false);
+
+		auth.setAuthenticated({
+			id: 'usr_1',
+			email: 'admin@example.com',
+			role: 'admin',
+			totp_enabled: false,
+			created_at: '2026-01-01T00:00:00.000Z'
+		});
+		auth.handleSessionExpired();
+
+		expect(auth.getStatus()).toBe('login');
+		expect(auth.getUser()).toBeNull();
+		expect(auth.getSessionExpired()).toBe(true);
 	});
 });

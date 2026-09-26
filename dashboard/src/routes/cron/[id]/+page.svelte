@@ -11,6 +11,14 @@
 		type CronJobRun,
 		type Project
 	} from '$lib/api';
+	import { isAdmin } from '$lib/auth.svelte';
+	import CronVolumeFields, {
+		OWN_FOLDER,
+		cronVolumeLabel,
+		validateCronVolume
+	} from '$lib/components/forms/cron-volume-fields.svelte';
+	import type { CronVolumeInput } from '$lib/api';
+	import { intOr, optionalInt } from '$lib/form-numbers';
 	import { goto } from '$app/navigation';
 	import {
 		setUiContext,
@@ -64,16 +72,17 @@
 	let settingsSchedule = $state('');
 	let settingsImage = $state('');
 	let settingsCommand = $state('');
-	let settingsTimeout = $state('');
+	// Number inputs bind as number | null (null when empty).
+	let settingsTimeout = $state<number | null>(null);
 	let settingsEnvVars = $state<Record<string, string>>({});
 	let settingsConcurrencyPolicy = $state('skip');
-	let settingsMemoryMb = $state('');
-	let settingsCpuShares = $state('');
+	let settingsMemoryMb = $state<number | null>(null);
+	let settingsCpuShares = $state<number | null>(null);
 	let settingsTimezone = $state('');
-	let settingsMaxRetries = $state('');
-	let settingsRetryDelay = $state('');
+	let settingsMaxRetries = $state<number | null>(0);
+	let settingsRetryDelay = $state<number | null>(60);
 	// volumes in settings
-	let settingsVolumes = $state<{ host_path: string; container_path: string }[]>([]);
+	let settingsVolumes = $state<CronVolumeInput[]>([]);
 	// project assignment
 	let projects = $state<Project[]>([]);
 	let settingsProjectId = $state<string | null>(null);
@@ -92,7 +101,8 @@
 	// Volume dialog (settings tab)
 	let volDialogOpen = $state(false);
 	let volEditingIdx = $state<number | null>(null);
-	let volHostPath = $state('');
+	let volSource = $state(OWN_FOLDER);
+	let volName = $state('');
 	let volContainerPath = $state('');
 	let volDialogError = $state('');
 
@@ -109,14 +119,14 @@
 			settingsSchedule = job.schedule;
 			settingsImage = job.image;
 			settingsCommand = parseCommand(job.command);
-			settingsTimeout = job.timeout_seconds != null ? String(job.timeout_seconds) : '';
+			settingsTimeout = job.timeout_seconds ?? null;
 			settingsEnvVars = job.env ? { ...job.env } : {};
 			settingsConcurrencyPolicy = job.concurrency_policy ?? 'skip';
-			settingsMemoryMb = job.memory_mb != null ? String(job.memory_mb) : '';
-			settingsCpuShares = job.cpu_shares != null ? String(job.cpu_shares) : '';
+			settingsMemoryMb = job.memory_mb ?? null;
+			settingsCpuShares = job.cpu_shares ?? null;
 			settingsTimezone = job.timezone ?? '';
-			settingsMaxRetries = String(job.max_retries ?? 0);
-			settingsRetryDelay = String(job.retry_delay_seconds ?? 60);
+			settingsMaxRetries = job.max_retries ?? 0;
+			settingsRetryDelay = job.retry_delay_seconds ?? 60;
 			settingsVolumes = job.volumes ? [...job.volumes] : [];
 			settingsProjectId = job.project_id;
 			setUiContext(cronJobContext(job));
@@ -207,11 +217,11 @@
 						.match(/(?:[^\s"]+|"[^"]*")+/g)
 						?.map((t) => t.replace(/^"|"$/g, '')) ?? [])
 				: [];
-			const timeoutNum = settingsTimeout.trim() ? parseInt(settingsTimeout.trim(), 10) : null;
-			const memoryMb = settingsMemoryMb.trim() ? parseInt(settingsMemoryMb.trim(), 10) : null;
-			const cpuShares = settingsCpuShares.trim() ? parseInt(settingsCpuShares.trim(), 10) : null;
-			const maxRetries = parseInt(settingsMaxRetries.trim() || '0', 10);
-			const retryDelay = parseInt(settingsRetryDelay.trim() || '60', 10);
+			const timeoutNum = optionalInt(settingsTimeout);
+			const memoryMb = optionalInt(settingsMemoryMb);
+			const cpuShares = optionalInt(settingsCpuShares);
+			const maxRetries = intOr(settingsMaxRetries, 0);
+			const retryDelay = intOr(settingsRetryDelay, 60);
 
 			job = await updateCronJob(jobId, {
 				name: settingsName.trim(),
@@ -228,7 +238,15 @@
 				timezone: settingsTimezone.trim() || null,
 				max_retries: maxRetries,
 				retry_delay_seconds: retryDelay,
-				volumes: settingsVolumes.length > 0 ? settingsVolumes : null
+				// Send name/app/container_path only: the server assigns host folders.
+				volumes:
+					settingsVolumes.length > 0
+						? settingsVolumes.map((v) => ({
+								container_path: v.container_path,
+								...(v.name ? { name: v.name } : {}),
+								...(v.app ? { app: v.app } : {})
+							}))
+						: null
 			});
 			setUiContext(cronJobContext(job));
 			settingsSuccess = 'Settings saved.';
@@ -349,7 +367,8 @@
 
 	function openVolAdd() {
 		volEditingIdx = null;
-		volHostPath = '';
+		volSource = OWN_FOLDER;
+		volName = '';
 		volContainerPath = '';
 		volDialogError = '';
 		volDialogOpen = true;
@@ -357,22 +376,23 @@
 
 	function openVolEdit(idx: number) {
 		volEditingIdx = idx;
-		volHostPath = settingsVolumes[idx].host_path;
+		volSource = settingsVolumes[idx].app || OWN_FOLDER;
+		volName = settingsVolumes[idx].name ?? '';
 		volContainerPath = settingsVolumes[idx].container_path;
 		volDialogError = '';
 		volDialogOpen = true;
 	}
 
 	function handleVolConfirm() {
-		if (!volHostPath.trim()) {
-			volDialogError = 'Host path is required';
-			return;
-		}
-		if (!volContainerPath.trim()) {
-			volDialogError = 'Container path is required';
-			return;
-		}
-		const entry = { host_path: volHostPath.trim(), container_path: volContainerPath.trim() };
+		const name = volName.trim();
+		const container = volContainerPath.trim();
+		volDialogError = validateCronVolume(name, container);
+		if (volDialogError) return;
+		const entry: CronVolumeInput = {
+			container_path: container,
+			...(name ? { name } : {}),
+			...(volSource !== OWN_FOLDER ? { app: volSource } : {})
+		};
 		if (volEditingIdx !== null) {
 			settingsVolumes = settingsVolumes.map((v, i) => (i === volEditingIdx ? entry : v));
 		} else {
@@ -394,14 +414,14 @@
 			settingsSchedule = job.schedule;
 			settingsImage = job.image;
 			settingsCommand = parseCommand(job.command);
-			settingsTimeout = job.timeout_seconds != null ? String(job.timeout_seconds) : '';
+			settingsTimeout = job.timeout_seconds ?? null;
 			settingsEnvVars = job.env ? { ...job.env } : {};
 			settingsConcurrencyPolicy = job.concurrency_policy ?? 'skip';
-			settingsMemoryMb = job.memory_mb != null ? String(job.memory_mb) : '';
-			settingsCpuShares = job.cpu_shares != null ? String(job.cpu_shares) : '';
+			settingsMemoryMb = job.memory_mb ?? null;
+			settingsCpuShares = job.cpu_shares ?? null;
 			settingsTimezone = job.timezone ?? '';
-			settingsMaxRetries = String(job.max_retries ?? 0);
-			settingsRetryDelay = String(job.retry_delay_seconds ?? 60);
+			settingsMaxRetries = job.max_retries ?? 0;
+			settingsRetryDelay = job.retry_delay_seconds ?? 60;
 			settingsVolumes = job.volumes ? [...job.volumes] : [];
 			settingsProjectId = job.project_id;
 			setUiContext(cronJobContext(job));
@@ -653,7 +673,7 @@
 										<ul class="mt-1 space-y-0.5">
 											{#each job.volumes as vol, vi (vi)}
 												<li class="font-mono text-xs text-muted-foreground">
-													{vol.host_path}:{vol.container_path}
+													{vol.host_path} → {vol.container_path}
 												</li>
 											{/each}
 										</ul>
@@ -766,6 +786,12 @@
 				<div class="space-y-6 pt-4">
 					{#if settingsError}
 						<ErrorAlert title="Error" description={settingsError} />
+					{/if}
+					{#if !isAdmin()}
+						<div class="rounded-md border bg-muted/30 p-3 text-sm text-muted-foreground">
+							Only admins can change cron job settings, because a job runs any image and command on
+							this server.
+						</div>
 					{/if}
 					{#if settingsSuccess}
 						<div class="rounded-md bg-success/10 p-3 text-sm text-success">{settingsSuccess}</div>
@@ -1118,32 +1144,18 @@
 											<Dialog.Title>
 												{volEditingIdx !== null ? 'Edit' : 'Add'} Volume Mount
 											</Dialog.Title>
-											<Dialog.Description>Map a host path into the container.</Dialog.Description>
+											<Dialog.Description
+												>Mount a persistent folder into the job's container.</Dialog.Description
+											>
 										</Dialog.Header>
-										<div class="space-y-4 py-2">
-											<div class="space-y-2">
-												<Label for="vol-host">Host Path</Label>
-												<Input
-													id="vol-host"
-													bind:value={volHostPath}
-													placeholder="/data/uploads"
-													class="font-mono"
-													autofocus
-												/>
-											</div>
-											<div class="space-y-2">
-												<Label for="vol-container">Container Path</Label>
-												<Input
-													id="vol-container"
-													bind:value={volContainerPath}
-													placeholder="/app/uploads"
-													class="font-mono"
-												/>
-											</div>
-											{#if volDialogError}
-												<p class="text-xs text-destructive">{volDialogError}</p>
-											{/if}
-										</div>
+										<CronVolumeFields
+											bind:source={volSource}
+											bind:name={volName}
+											bind:containerPath={volContainerPath}
+										/>
+										{#if volDialogError}
+											<p class="text-xs text-destructive">{volDialogError}</p>
+										{/if}
 										<Dialog.Footer>
 											<Button variant="outline" onclick={() => (volDialogOpen = false)}>
 												Cancel
@@ -1167,7 +1179,7 @@
 											<tr class="border-b border-border bg-muted/50">
 												<th
 													class="px-3 py-2 text-left font-mono text-xs font-medium text-muted-foreground uppercase"
-													>Host Path</th
+													>Stored in</th
 												>
 												<th
 													class="px-3 py-2 text-left font-mono text-xs font-medium text-muted-foreground uppercase"
@@ -1179,7 +1191,7 @@
 										<tbody>
 											{#each settingsVolumes as vol, i (i)}
 												<tr class={i < settingsVolumes.length - 1 ? 'border-b border-border' : ''}>
-													<td class="px-3 py-2 font-mono text-xs">{vol.host_path}</td>
+													<td class="px-3 py-2 font-mono text-xs">{cronVolumeLabel(vol)}</td>
 													<td class="px-3 py-2 font-mono text-xs text-muted-foreground">
 														{vol.container_path}
 													</td>
@@ -1215,7 +1227,7 @@
 					</div>
 
 					<div class="flex gap-2">
-						<Button onclick={handleSaveSettings} disabled={settingsSaving}>
+						<Button onclick={handleSaveSettings} disabled={settingsSaving || !isAdmin()}>
 							{settingsSaving ? 'Saving...' : 'Save Settings'}
 						</Button>
 					</div>

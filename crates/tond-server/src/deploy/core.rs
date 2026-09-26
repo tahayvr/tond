@@ -13,12 +13,19 @@
 //   deploy_image(state, app, image_tag)
 //     Skip the build step and re-run a specific image (used for rollbacks).
 //
+// Image tags: every deployment runs `tond-<app>:<deployment-id-prefix>` (see
+// images.rs) — built images are tagged that way, pulled and uploaded images
+// are re-tagged — and the tag is stored on the deployment row. Rollback
+// re-runs that exact image. After a successful deploy or rollback older
+// images are pruned (keeping the last few plus the running one).
+//
 //   deploy_preview(state, app, preview)
 //     Deploy a short-lived preview of an app.
 //
 // Helpers private to this module:
 //   update_status()            — update app.status in DB
-//   log_deploy()               — insert timestamped deploy log entry
+//   log_deploy()               — insert timestamped deploy log entry and publish
+//                                it on log_bus for live log streams
 //   wait_for_healthy()         — poll new container health endpoint
 //   fetch_registry_credentials() — look up and decrypt registry credentials
 //   pull_image()               — stream a docker pull with bollard
@@ -30,12 +37,96 @@ use uuid::Uuid;
 
 use crate::backup::{self, SnapshotTrigger};
 use crate::docker;
-use crate::handlers::{github_apps, gitlab_tokens, registry_credentials};
+use crate::handlers::{github_apps, gitlab_tokens};
+use crate::log_bus::{self, DeployLogEvent};
+use crate::secret_key::{self, Purpose};
 use crate::state::AppState;
+use crate::volumes;
 
 use super::build::{
     BuildOptions, build_from_git, build_from_inline_dockerfile, run_inline_compose,
 };
+use super::git::{GitHttpAuth, redact_url_credentials, split_url_credentials};
+use super::images;
+
+/// Work out the clone URL and HTTPS credentials for a git app.
+///
+/// Credentials come from the linked GitHub App (installation token), the
+/// linked GitLab PAT, or userinfo embedded in `source_url`; they are returned
+/// separately so the URL passed to git (and logged) never contains them. When
+/// `log_source` is set, which credential is used — or why it could not be —
+/// is written to the deploy log.
+async fn resolve_git_source(
+    state: &AppState,
+    app: &App,
+    source_url: &str,
+    log_source: Option<&str>,
+) -> Result<(String, Option<GitHttpAuth>)> {
+    let (clean_url, url_auth) = split_url_credentials(source_url);
+    let log = |level: &'static str, message: String| async move {
+        if let Some(trigger_source) = log_source {
+            log_deploy(state, &app.id, level, trigger_source, &message).await
+        } else {
+            Ok(())
+        }
+    };
+
+    if let Some(ref gh_app_id) = app.github_app_id
+        && let Ok(Some(gh_app)) = sqlx::query_as::<_, tond_common::GitHubApp>(
+            "SELECT * FROM github_apps WHERE id = ? LIMIT 1",
+        )
+        .bind(gh_app_id)
+        .fetch_optional(&state.db)
+        .await
+    {
+        match github_apps::generate_installation_token(&gh_app).await {
+            Ok(token) => {
+                log(
+                    "info",
+                    "Using GitHub App installation token for clone".into(),
+                )
+                .await?;
+                return Ok((
+                    clean_url,
+                    Some(GitHttpAuth {
+                        username: "x-access-token".to_string(),
+                        password: token,
+                    }),
+                ));
+            }
+            Err(e) => {
+                log(
+                    "warn",
+                    format!("GitHub App token failed ({e}); cloning without it"),
+                )
+                .await?;
+            }
+        }
+    } else if let Some(ref gl_token_id) = app.gitlab_token_id
+        && let Ok(Some(gl_token)) = sqlx::query_as::<_, tond_common::GitLabToken>(
+            "SELECT * FROM gitlab_tokens WHERE id = ? LIMIT 1",
+        )
+        .bind(gl_token_id)
+        .fetch_optional(&state.db)
+        .await
+    {
+        match gitlab_tokens::gitlab_git_credentials(&gl_token) {
+            Ok(auth) => {
+                log("info", "Using GitLab PAT for clone".into()).await?;
+                return Ok((clean_url, Some(auth)));
+            }
+            Err(e) => {
+                log(
+                    "warn",
+                    format!("GitLab PAT could not be used ({e}); cloning without it"),
+                )
+                .await?;
+            }
+        }
+    }
+
+    Ok((clean_url, url_auth))
+}
 
 async fn persist_generated_dockerfile(
     state: &AppState,
@@ -105,6 +196,9 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
     .execute(&state.db)
     .await?;
 
+    // The image this deployment runs, whatever the source: tond-<app>:<id>.
+    let deploy_tag = images::deployment_tag(&app_name, &deployment_id);
+
     // Update status to building
     update_status(state, &app_id, "building").await?;
     log_deploy(
@@ -148,102 +242,15 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
                 .ok_or_else(|| anyhow::anyhow!("Git source URL required"))?;
             let branch = app.branch.as_deref().unwrap_or("main");
 
-            // If this app is linked to a GitHub App registration, generate a
-            // short-lived installation access token and inject it into the URL.
-            // Otherwise, if it is linked to a GitLab PAT, inject oauth2:<pat>@
-            // into the HTTPS URL.
-            let effective_url = if let Some(ref gh_app_id) = app.github_app_id {
-                match sqlx::query_as::<_, tond_common::GitHubApp>(
-                    "SELECT * FROM github_apps WHERE id = ? LIMIT 1",
-                )
-                .bind(gh_app_id)
-                .fetch_optional(&state.db)
-                .await
-                {
-                    Ok(Some(gh_app)) => {
-                        match github_apps::build_clone_url_with_token(&gh_app, source_url).await {
-                            Ok(url) => {
-                                log_deploy(
-                                    state,
-                                    &app_id,
-                                    "info",
-                                    trigger_source,
-                                    "Using GitHub App installation token for clone",
-                                )
-                                .await?;
-                                url
-                            }
-                            Err(e) => {
-                                log_deploy(
-                                    state,
-                                    &app_id,
-                                    "warn",
-                                    trigger_source,
-                                    &format!(
-                                        "GitHub App token failed ({}); falling back to plain URL",
-                                        e
-                                    ),
-                                )
-                                .await?;
-                                source_url.clone()
-                            }
-                        }
-                    }
-                    _ => source_url.clone(),
-                }
-            } else if let Some(ref gl_token_id) = app.gitlab_token_id {
-                match sqlx::query_as::<_, tond_common::GitLabToken>(
-                    "SELECT * FROM gitlab_tokens WHERE id = ? LIMIT 1",
-                )
-                .bind(gl_token_id)
-                .fetch_optional(&state.db)
-                .await
-                {
-                    Ok(Some(gl_token)) => {
-                        match gitlab_tokens::build_clone_url_with_token(
-                            &gl_token, source_url, state,
-                        )
-                        .await
-                        {
-                            Ok(url) => {
-                                log_deploy(
-                                    state,
-                                    &app_id,
-                                    "info",
-                                    trigger_source,
-                                    "Using GitLab PAT for clone",
-                                )
-                                .await?;
-                                url
-                            }
-                            Err(e) => {
-                                log_deploy(
-                                    state,
-                                    &app_id,
-                                    "warn",
-                                    trigger_source,
-                                    &format!(
-                                        "GitLab PAT injection failed ({}); falling back to plain URL",
-                                        e
-                                    ),
-                                )
-                                .await?;
-                                source_url.clone()
-                            }
-                        }
-                    }
-                    _ => source_url.clone(),
-                }
-            } else {
-                source_url.clone()
-            };
+            let (clone_url, git_auth) =
+                resolve_git_source(state, app, source_url, Some(trigger_source)).await?;
 
             log_deploy(
                 state,
                 &app_id,
                 "info",
                 trigger_source,
-                &format!("Building from git: {} ({})", source_url, branch),
+                &format!("Building from git: {} ({})", clone_url, branch),
             )
             .await?;
 
@@ -251,13 +258,15 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
                 state,
                 &app_id,
                 &app_name,
-                &effective_url,
+                &clone_url,
+                git_auth.as_ref(),
                 branch,
                 &BuildOptions {
                     method: &app.build_method,
                     static_build: app.static_build != 0,
                     base_dir: app.base_dir.as_deref(),
                 },
+                &deploy_tag,
                 Some(&deployment_id),
                 trigger_source,
             )
@@ -286,19 +295,34 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
             };
 
             pull_image(&state.docker, image, credentials).await?;
-            image.clone()
-        }
-        "tarball" => {
-            let image_tag = format!("tond-{}", app_name);
+
+            // Pin the pulled bytes under this deployment's tag so a rollback
+            // runs exactly this image even after `image` moves on upstream.
+            images::tag_image(&state.docker, image, &deploy_tag).await?;
             log_deploy(
                 state,
                 &app_id,
                 "info",
                 trigger_source,
-                &format!("Using pre-built image: {}", image_tag),
+                &format!("Pinned {} as {}", image, deploy_tag),
             )
             .await?;
-            image_tag
+            deploy_tag.clone()
+        }
+        "tarball" => {
+            let upload_tag = images::upload_tag(&app_name);
+            images::tag_image(&state.docker, &upload_tag, &deploy_tag)
+                .await
+                .with_context(|| format!("no uploaded image {upload_tag} to deploy"))?;
+            log_deploy(
+                state,
+                &app_id,
+                "info",
+                trigger_source,
+                &format!("Using uploaded image: {}", deploy_tag),
+            )
+            .await?;
+            deploy_tag.clone()
         }
         "dockerfile" => {
             let content = app.dockerfile_content.as_deref().ok_or_else(|| {
@@ -315,7 +339,15 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
             )
             .await?;
 
-            build_from_inline_dockerfile(state, &app_id, &app_name, content, trigger_source).await?
+            build_from_inline_dockerfile(
+                state,
+                &app_id,
+                &app_name,
+                content,
+                &deploy_tag,
+                trigger_source,
+            )
+            .await?
         }
         "compose" => {
             let content = app.compose_content.as_deref().ok_or_else(|| {
@@ -360,12 +392,16 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
     if app.source_type == "compose" {
         let container_port = app.container_port as u16;
 
-        let host_port = docker::find_compose_host_port(&state.docker, &app_name, container_port)
-            .await
-            .map_err(|e| {
-                tracing::error!("[compose] could not discover host port: {}", e);
-                e
-            })?;
+        let host_port = docker::find_compose_host_port(
+            &state.docker,
+            &super::build::compose_project_name(&app_name),
+            container_port,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!("[compose] could not discover host port: {}", e);
+            e
+        })?;
 
         sqlx::query(
             "UPDATE apps SET container_id = ?, host_port = ?, status = 'running', updated_at = datetime('now') WHERE id = ?",
@@ -432,12 +468,10 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
         .and_then(|e| serde_json::from_str(e).ok())
         .unwrap_or_default();
 
+    // Host paths are re-derived from volume names and verified to stay inside
+    // <data>/volumes/<app> (no symlink escapes) right before the mount.
     let volumes: Vec<Volume> = serde_json::from_str(&app.volumes).unwrap_or_default();
-    let mut binds: Vec<String> = Vec::new();
-    for vol in &volumes {
-        tokio::fs::create_dir_all(&vol.host_path).await?;
-        binds.push(format!("{}:{}", vol.host_path, vol.container_path));
-    }
+    let binds = volumes::app_binds(&volumes::data_dir(), &app_name, &volumes)?;
 
     log_deploy(
         state,
@@ -482,12 +516,14 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
             &staging_name,
             container_port,
             new_host_port,
+            docker::Exposure::Loopback,
             env_vars,
             app.memory_limit,
             app.cpu_limit,
             binds,
             network_name.as_deref(),
             Some(&app_name),
+            None,
         )
         .await
         .map_err(|e| {
@@ -501,6 +537,7 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
             &app_name,
             container_port,
             new_host_port,
+            docker::Exposure::Loopback,
             env_vars,
             app.memory_limit,
             app.cpu_limit,
@@ -694,6 +731,8 @@ pub async fn deploy(state: &AppState, app: &mut App, trigger_source: &str) -> Re
             .execute(&state.db)
             .await;
 
+    images::prune_app_images(state, &app_id, &app_name).await;
+
     Ok(())
 }
 
@@ -712,6 +751,21 @@ pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> R
     let app_id = app.id.clone();
     let app_name = app.name.clone();
     let old_container_id = app.container_id.clone();
+
+    // The exact image must still be on the host (old ones are pruned).
+    if state.docker.inspect_image(image_tag).await.is_err() {
+        let _ = sqlx::query(
+            "UPDATE deployments SET image_pruned = 1 WHERE app_id = ? AND image_tag = ?",
+        )
+        .bind(&app_id)
+        .bind(image_tag)
+        .execute(&state.db)
+        .await;
+        anyhow::bail!(
+            "Image {} is no longer on this server (old images are pruned), so this deployment can't be restored",
+            image_tag
+        );
+    }
 
     // Deployment row
     let deployment_id = Uuid::new_v4().to_string();
@@ -750,12 +804,10 @@ pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> R
         .and_then(|e| serde_json::from_str(e).ok())
         .unwrap_or_default();
 
+    // Host paths are re-derived from volume names and verified to stay inside
+    // <data>/volumes/<app> (no symlink escapes) right before the mount.
     let volumes: Vec<Volume> = serde_json::from_str(&app.volumes).unwrap_or_default();
-    let mut binds: Vec<String> = Vec::new();
-    for vol in &volumes {
-        tokio::fs::create_dir_all(&vol.host_path).await?;
-        binds.push(format!("{}:{}", vol.host_path, vol.container_path));
-    }
+    let binds = volumes::app_binds(&volumes::data_dir(), &app_name, &volumes)?;
 
     log_deploy(
         state,
@@ -793,12 +845,14 @@ pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> R
             &staging_name_rb,
             container_port,
             new_host_port,
+            docker::Exposure::Loopback,
             env_vars,
             app.memory_limit,
             app.cpu_limit,
             binds,
             network_name.as_deref(),
             Some(&app_name),
+            None,
         )
         .await
         .map_err(|e| {
@@ -812,6 +866,7 @@ pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> R
             &app_name,
             container_port,
             new_host_port,
+            docker::Exposure::Loopback,
             env_vars,
             app.memory_limit,
             app.cpu_limit,
@@ -959,6 +1014,8 @@ pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> R
             .execute(&state.db)
             .await;
 
+    images::prune_app_images(state, &app_id, &app_name).await;
+
     Ok(())
 }
 
@@ -971,7 +1028,7 @@ pub async fn deploy_image(state: &AppState, app: &mut App, image_tag: &str) -> R
 ///   4. Insert a `preview_deployments` row and update it once the container is running.
 ///
 /// The caller must provide the `slug` (short random hex) and the `ttl_hours`.
-/// The `subdomain` is set by the caller after reading the dashboard domain from settings.
+/// The `subdomain` (under the preview domain) is set by the caller; see domains::preview_host.
 pub async fn deploy_preview(
     state: &AppState,
     app: &App,
@@ -997,61 +1054,27 @@ pub async fn deploy_preview(
                 .or(app.branch.as_deref())
                 .unwrap_or("main");
 
-            tracing::info!("Preview: cloning git {} ({})", source_url, branch);
+            tracing::info!(
+                "Preview: cloning git {} ({})",
+                redact_url_credentials(source_url),
+                branch
+            );
 
-            // Use GitHub App token if the app is linked to one, otherwise
-            // use GitLab PAT if linked.
-            let effective_url = if let Some(ref gh_app_id) = app.github_app_id {
-                match sqlx::query_as::<_, tond_common::GitHubApp>(
-                    "SELECT * FROM github_apps WHERE id = ? LIMIT 1",
-                )
-                .bind(gh_app_id)
-                .fetch_optional(&state.db)
-                .await
-                {
-                    Ok(Some(gh_app)) => {
-                        match github_apps::build_clone_url_with_token(&gh_app, source_url).await {
-                            Ok(url) => url,
-                            Err(_) => source_url.clone(),
-                        }
-                    }
-                    _ => source_url.clone(),
-                }
-            } else if let Some(ref gl_token_id) = app.gitlab_token_id {
-                match sqlx::query_as::<_, tond_common::GitLabToken>(
-                    "SELECT * FROM gitlab_tokens WHERE id = ? LIMIT 1",
-                )
-                .bind(gl_token_id)
-                .fetch_optional(&state.db)
-                .await
-                {
-                    Ok(Some(gl_token)) => {
-                        match gitlab_tokens::build_clone_url_with_token(
-                            &gl_token, source_url, state,
-                        )
-                        .await
-                        {
-                            Ok(url) => url,
-                            Err(_) => source_url.clone(),
-                        }
-                    }
-                    _ => source_url.clone(),
-                }
-            } else {
-                source_url.clone()
-            };
+            let (clone_url, git_auth) = resolve_git_source(state, app, source_url, None).await?;
 
             build_from_git(
                 state,
                 &app_id,
                 &app_name,
-                &effective_url,
+                &clone_url,
+                git_auth.as_ref(),
                 branch,
                 &BuildOptions {
                     method: &app.build_method,
                     static_build: app.static_build != 0,
                     base_dir: app.base_dir.as_deref(),
                 },
+                &images::preview_tag(&app_name, &slug),
                 None,
                 "preview",
             )
@@ -1072,14 +1095,20 @@ pub async fn deploy_preview(
             pull_image(&state.docker, image, credentials).await?;
             image.clone()
         }
-        "tarball" => {
-            format!("tond-{}", app_name)
-        }
+        "tarball" => images::upload_tag(&app_name),
         "dockerfile" => {
             let content = app.dockerfile_content.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("dockerfile_content required for source_type='dockerfile'")
             })?;
-            build_from_inline_dockerfile(state, &app_id, &app_name, content, "preview").await?
+            build_from_inline_dockerfile(
+                state,
+                &app_id,
+                &app_name,
+                content,
+                &images::preview_tag(&app_name, &slug),
+                "preview",
+            )
+            .await?
         }
         "compose" => {
             // Preview deployments are not supported for compose apps because
@@ -1111,12 +1140,10 @@ pub async fn deploy_preview(
         app.preview_env_vars.as_str(),
     );
 
+    // Host paths are re-derived from volume names and verified to stay inside
+    // <data>/volumes/<app> (no symlink escapes) right before the mount.
     let volumes: Vec<Volume> = serde_json::from_str(&app.volumes).unwrap_or_default();
-    let mut binds: Vec<String> = Vec::new();
-    for vol in &volumes {
-        tokio::fs::create_dir_all(&vol.host_path).await?;
-        binds.push(format!("{}:{}", vol.host_path, vol.container_path));
-    }
+    let binds = volumes::app_binds(&volumes::data_dir(), &app_name, &volumes)?;
 
     let container_name = format!("tond-preview-{}", slug);
 
@@ -1144,12 +1171,14 @@ pub async fn deploy_preview(
         &container_name,
         container_port,
         host_port,
+        docker::Exposure::Loopback,
         env_vars,
         app.memory_limit,
         app.cpu_limit,
         binds,
         network_name.as_deref(),
         Some(&app_name),
+        None,
     )
     .await?;
 
@@ -1358,7 +1387,7 @@ async fn fetch_registry_credentials(
         return Ok(None);
     };
 
-    let password = registry_credentials::decrypt_password(&cred.password_enc)?;
+    let password = secret_key::decrypt(Purpose::RegistryPassword, &cred.password_enc)?;
 
     Ok(Some(bollard::auth::DockerCredentials {
         username: Some(cred.username),
@@ -1409,7 +1438,12 @@ pub(super) async fn update_status(state: &AppState, app_id: &str, status: &str) 
     Ok(())
 }
 
-/// Helper: insert a deploy log entry
+/// Helper: insert a deploy log entry.
+///
+/// Every message is passed through `redact_url_credentials` first: deploy
+/// logs are shown in the dashboard and copied into snapshots, so a URL with
+/// `user:token@` must never reach them, whatever its source (clone output,
+/// docker build output, error messages).
 pub(super) async fn log_deploy(
     state: &AppState,
     app_id: &str,
@@ -1417,6 +1451,8 @@ pub(super) async fn log_deploy(
     trigger_source: &str,
     message: &str,
 ) -> Result<()> {
+    let redacted = redact_url_credentials(message);
+    let message = redacted.as_str();
     let id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
 
@@ -1432,11 +1468,21 @@ pub(super) async fn log_deploy(
     .execute(&state.db)
     .await?;
 
+    // Deploy logs live in the database (and the dashboard); journald only
+    // gets problems. Build output (one call per line) stays at debug.
     match level {
         "error" => tracing::error!("[{}] {}", app_id, message),
         "warn" => tracing::warn!("[{}] {}", app_id, message),
-        _ => tracing::info!("[{}] {}", app_id, message),
+        _ => tracing::debug!("[{}] {}", app_id, message),
     }
+
+    log_bus::publish(DeployLogEvent {
+        id,
+        app_id: app_id.to_string(),
+        level: level.to_string(),
+        message: message.to_string(),
+        created_at: now,
+    });
 
     Ok(())
 }
@@ -1586,6 +1632,55 @@ mod tests {
             ),
             "log_deploy should persist the message, level, and trigger source"
         );
+
+        log_deploy(
+            &state,
+            "app-1",
+            "error",
+            "manual",
+            "fatal: could not read from https://oauth2:glpat-SECRET@gitlab.com/g/r.git",
+        )
+        .await
+        .unwrap_or_else(|err| panic!("log_deploy should succeed: {err}"));
+        let messages: Vec<String> =
+            sqlx::query_scalar("SELECT message FROM deploy_logs WHERE app_id = ?")
+                .bind("app-1")
+                .fetch_all(&state.db)
+                .await
+                .unwrap_or_else(|err| panic!("failed to load deploy logs: {err}"));
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "fatal: could not read from https://***@gitlab.com/g/r.git"),
+            "log_deploy must redact URL credentials before storing: {messages:?}"
+        );
+        assert!(!messages.iter().any(|m| m.contains("glpat-SECRET")));
+    }
+
+    #[tokio::test]
+    async fn resolve_git_source_moves_url_credentials_out_of_the_clone_url() {
+        let state = test_state().await;
+        let app = App::new(
+            "private".to_string(),
+            "git".to_string(),
+            Some("https://deploy:tok3n@git.example.com/o/r.git".to_string()),
+            None,
+            3000,
+        );
+        let (url, auth) = resolve_git_source(
+            &state,
+            &app,
+            app.source_url.as_deref().unwrap_or_default(),
+            None,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("resolve_git_source should succeed: {err}"));
+        assert_eq!(url, "https://git.example.com/o/r.git");
+        let auth = auth.unwrap_or_else(|| panic!("URL credentials should become header auth"));
+        assert_eq!(
+            (auth.username.as_str(), auth.password.as_str()),
+            ("deploy", "tok3n")
+        );
     }
 
     #[tokio::test]
@@ -1639,7 +1734,7 @@ mod tests {
             "fetch_registry_credentials should return None when the referenced credential does not exist"
         );
 
-        let encrypted = registry_credentials::encrypt_password("super-secret")
+        let encrypted = secret_key::encrypt(Purpose::RegistryPassword, "super-secret")
             .unwrap_or_else(|err| panic!("password encryption should succeed: {err}"));
         sqlx::query(
             "INSERT INTO registry_credentials (id, name, server, username, password_enc)

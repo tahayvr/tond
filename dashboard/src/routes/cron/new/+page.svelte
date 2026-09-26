@@ -1,13 +1,20 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { createCronJob, type Project } from '$lib/api';
+	import { createCronJob, type CronVolumeInput, type Project } from '$lib/api';
+	import CronVolumeFields, {
+		OWN_FOLDER,
+		cronVolumeLabel,
+		validateCronVolume
+	} from '$lib/components/forms/cron-volume-fields.svelte';
+	import { intOr, optionalInt } from '$lib/form-numbers';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
 	import * as Select from '$lib/components/ui/select/index.js';
 	import * as Dialog from '$lib/components/ui/dialog/index.js';
 	import ErrorAlert from '$lib/components/alerts/error-alert.svelte';
+	import { isAdmin } from '$lib/auth.svelte';
 	import { setUiContext, clearUiContext, projectsContext } from '$lib/ui-context.svelte';
 	import Clock from '~icons/ri/time-line';
 	import Plus from '~icons/ri/add-line';
@@ -28,15 +35,16 @@
 	let image = $state('');
 	let command = $state('');
 	let selectedProjectId = $state('');
-	let timeoutSeconds = $state('');
+	// Number inputs bind as number | null (null when empty).
+	let timeoutSeconds = $state<number | null>(null);
 
 	// New fields
 	let timezone = $state('');
 	let concurrencyPolicy = $state('skip');
-	let memoryMb = $state('');
-	let cpuShares = $state('');
-	let maxRetries = $state('0');
-	let retryDelaySeconds = $state('0');
+	let memoryMb = $state<number | null>(null);
+	let cpuShares = $state<number | null>(null);
+	let maxRetries = $state<number | null>(0);
+	let retryDelaySeconds = $state<number | null>(0);
 
 	// Environment variables
 	let envVars = $state<Record<string, string>>({});
@@ -49,11 +57,12 @@
 	let envEntries = $derived(Object.entries(envVars));
 
 	// Volume mounts
-	type VolumeMount = { host_path: string; container_path: string };
-	let volumes = $state<VolumeMount[]>([]);
+	// Host folders are chosen by the server: the job's own folder or an app's volume.
+	let volumes = $state<CronVolumeInput[]>([]);
 	let volDialogOpen = $state(false);
 	let volEditingIndex = $state<number | null>(null);
-	let volHostPath = $state('');
+	let volSource = $state(OWN_FOLDER);
+	let volName = $state('');
 	let volContainerPath = $state('');
 	let volDialogError = $state('');
 
@@ -99,12 +108,12 @@
 						.match(/(?:[^\s"]+|"[^"]*")+/g)
 						?.map((t) => t.replace(/^"|"$/g, '')) ?? [])
 				: [];
-			const timeoutNum = timeoutSeconds.trim() ? parseInt(timeoutSeconds.trim(), 10) : null;
+			const timeoutNum = optionalInt(timeoutSeconds);
 			const hasEnv = Object.keys(envVars).length > 0;
-			const memoryNum = memoryMb.trim() ? parseInt(memoryMb.trim(), 10) : null;
-			const cpuNum = cpuShares.trim() ? parseInt(cpuShares.trim(), 10) : null;
-			const retriesNum = parseInt(maxRetries, 10) || 0;
-			const retryDelayNum = parseInt(retryDelaySeconds, 10) || 0;
+			const memoryNum = optionalInt(memoryMb);
+			const cpuNum = optionalInt(cpuShares);
+			const retriesNum = intOr(maxRetries, 0);
+			const retryDelayNum = intOr(retryDelaySeconds, 0);
 			const created = await createCronJob({
 				name: name.trim(),
 				schedule: schedule.trim(),
@@ -174,7 +183,8 @@
 	// Volume handlers
 	function openVolAdd() {
 		volEditingIndex = null;
-		volHostPath = '';
+		volSource = OWN_FOLDER;
+		volName = '';
 		volContainerPath = '';
 		volDialogError = '';
 		volDialogOpen = true;
@@ -182,29 +192,27 @@
 
 	function openVolEdit(index: number) {
 		volEditingIndex = index;
-		volHostPath = volumes[index].host_path;
+		volSource = volumes[index].app || OWN_FOLDER;
+		volName = volumes[index].name ?? '';
 		volContainerPath = volumes[index].container_path;
 		volDialogError = '';
 		volDialogOpen = true;
 	}
 
 	function handleVolConfirm() {
-		const host = volHostPath.trim();
+		const name = volName.trim();
 		const container = volContainerPath.trim();
-		if (!host) {
-			volDialogError = 'Host path is required';
-			return;
-		}
-		if (!container) {
-			volDialogError = 'Container path is required';
-			return;
-		}
+		volDialogError = validateCronVolume(name, container);
+		if (volDialogError) return;
+		const entry: CronVolumeInput = {
+			container_path: container,
+			...(name ? { name } : {}),
+			...(volSource !== OWN_FOLDER ? { app: volSource } : {})
+		};
 		if (volEditingIndex !== null) {
-			volumes = volumes.map((v, i) =>
-				i === volEditingIndex ? { host_path: host, container_path: container } : v
-			);
+			volumes = volumes.map((v, i) => (i === volEditingIndex ? entry : v));
 		} else {
-			volumes = [...volumes, { host_path: host, container_path: container }];
+			volumes = [...volumes, entry];
 		}
 		volDialogOpen = false;
 	}
@@ -223,6 +231,13 @@
 
 	{#if error}
 		<ErrorAlert title="Error" description={error} />
+	{/if}
+
+	{#if !isAdmin()}
+		<div class="rounded-md border bg-muted/30 p-3 text-sm text-muted-foreground">
+			Only admins can create or change cron jobs, because a job runs any image and command on this
+			server.
+		</div>
 	{/if}
 
 	<div class="space-y-1">
@@ -434,34 +449,19 @@
 							<Dialog.Title>
 								{volEditingIndex !== null ? 'Edit' : 'Add'} Volume Mount
 							</Dialog.Title>
-							<Dialog.Description>Map a host directory into the container.</Dialog.Description>
+							<Dialog.Description
+								>Mount a persistent folder into the job's container.</Dialog.Description
+							>
 						</Dialog.Header>
-						<div class="space-y-4 py-2">
-							<div class="space-y-2">
-								<Label for="vol-host">Host Path</Label>
-								<Input
-									id="vol-host"
-									bind:value={volHostPath}
-									placeholder="/data/myapp"
-									class="font-mono"
-									onkeydown={handleVolKeydown}
-									autofocus
-								/>
-							</div>
-							<div class="space-y-2">
-								<Label for="vol-container">Container Path</Label>
-								<Input
-									id="vol-container"
-									bind:value={volContainerPath}
-									placeholder="/app/data"
-									class="font-mono"
-									onkeydown={handleVolKeydown}
-								/>
-							</div>
-							{#if volDialogError}
-								<p class="text-xs text-destructive">{volDialogError}</p>
-							{/if}
-						</div>
+						<CronVolumeFields
+							bind:source={volSource}
+							bind:name={volName}
+							bind:containerPath={volContainerPath}
+							onkeydown={handleVolKeydown}
+						/>
+						{#if volDialogError}
+							<p class="text-xs text-destructive">{volDialogError}</p>
+						{/if}
 						<Dialog.Footer>
 							<Button variant="outline" onclick={() => (volDialogOpen = false)}>Cancel</Button>
 							<Button onclick={handleVolConfirm}>
@@ -482,7 +482,7 @@
 						<tbody>
 							{#each volumes as vol, i (i)}
 								<tr class={i < volumes.length - 1 ? 'border-b border-border' : ''}>
-									<td class="px-3 py-1.5 font-mono text-xs">{vol.host_path}</td>
+									<td class="px-3 py-1.5 font-mono text-xs">{cronVolumeLabel(vol)}</td>
 									<td class="px-3 py-1.5 text-center text-xs text-muted-foreground">→</td>
 									<td class="px-3 py-1.5 font-mono text-xs">{vol.container_path}</td>
 									<td class="flex gap-1 px-2 py-1.5">
@@ -641,7 +641,7 @@
 	<div>
 		<Button
 			onclick={handleCreate}
-			disabled={loading}
+			disabled={loading || !isAdmin()}
 			variant="outline"
 			class="border-success text-success"
 		>

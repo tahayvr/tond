@@ -16,6 +16,21 @@ set -euo pipefail
 # Pebble's issuing root is regenerated on every start, so run the smoke test
 # against the same Pebble instance that issued the certificates.
 
+# `pebble.sh --refresh-root <file>`: wait for the running Pebble and re-fetch its
+# issuing root. install.sh may restart Docker (daemon.json log rotation), which
+# restarts Pebble (restart policy) with a NEW root, so run.sh calls this after
+# installing and before the smoke test.
+if [[ "${1:-}" == "--refresh-root" ]]; then
+    ROOT_OUT="${2:-/opt/tond-e2e/pebble-root.pem}"
+    for _ in $(seq 1 30); do
+        curl -sf https://localhost:14000/dir > /dev/null && break
+        sleep 1
+    done
+    curl -sf https://localhost:15000/roots/0 -o "$ROOT_OUT" \
+        || { echo "Pebble is not running" >&2; exit 1; }
+    exit 0
+fi
+
 ROOT_OUT="${1:-/opt/tond-e2e/pebble-root.pem}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PEBBLE_IMAGE="ghcr.io/letsencrypt/pebble:latest"
@@ -26,14 +41,14 @@ command -v docker > /dev/null || { echo "docker is required" >&2; exit 1; }
 
 docker rm -f tond-e2e-pebble tond-e2e-challtestsrv > /dev/null 2>&1 || true
 
-docker run -d --name tond-e2e-challtestsrv --network host "$CHALLTESTSRV_IMAGE" \
+docker run -d --restart unless-stopped --name tond-e2e-challtestsrv --network host "$CHALLTESTSRV_IMAGE" \
     -defaultIPv4 127.0.0.1 -defaultIPv6 "" \
     -dnsserver 127.0.0.1:8053 -http01 "" -https01 "" -tlsalpn01 "" -doh "" \
     -management 127.0.0.1:8055 > /dev/null
 
 # PEBBLE_VA_NOSLEEP: validate immediately. PEBBLE_WFE_NONCEREJECT=0: don't
 # randomly reject nonces (Pebble's default 5% would make runs flaky).
-docker run -d --name tond-e2e-pebble --network host \
+docker run -d --restart unless-stopped --name tond-e2e-pebble --network host \
     -e PEBBLE_VA_NOSLEEP=1 -e PEBBLE_WFE_NONCEREJECT=0 \
     -v "${HERE}/pebble-config.json:/e2e/pebble-config.json:ro" \
     "$PEBBLE_IMAGE" -config /e2e/pebble-config.json -dnsserver 127.0.0.1:8053 > /dev/null

@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 pub struct Deployment {
     pub id: String,
     pub app_id: String,
-    /// Docker image tag produced or pulled (e.g. "tond-myapp" or "nginx:latest")
+    /// Image this deployment ran: `tond-<app>:<deployment-id-prefix>` (compose
+    /// apps record a `tond-compose-<app>` sentinel)
     pub image_tag: Option<String>,
     /// "pending" | "running" | "succeeded" | "failed"
     pub status: String,
@@ -19,6 +20,9 @@ pub struct Deployment {
     pub started_at: String,
     pub finished_at: Option<String>,
     pub created_at: String,
+    /// The image was removed by pruning; rolling back to it is impossible
+    #[sqlx(default)]
+    pub image_pruned: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -33,6 +37,19 @@ pub struct DeploymentResponse {
     pub started_at: String,
     pub finished_at: Option<String>,
     pub created_at: String,
+    /// The deployment's image was pruned from the host
+    #[serde(default)]
+    pub image_pruned: bool,
+    /// This deployment's image is what the app currently runs
+    #[serde(default)]
+    pub is_current: bool,
+    /// `POST /api/apps/{id}/rollback {"deployment_id": id}` would restore this
+    /// deployment's exact image
+    #[serde(default)]
+    pub rollback_available: bool,
+    /// Why rollback is unavailable (for a tooltip); `None` when available
+    #[serde(default)]
+    pub rollback_unavailable_reason: Option<String>,
 }
 
 impl From<Deployment> for DeploymentResponse {
@@ -47,6 +64,10 @@ impl From<Deployment> for DeploymentResponse {
             started_at: d.started_at,
             finished_at: d.finished_at,
             created_at: d.created_at,
+            image_pruned: d.image_pruned,
+            is_current: false,
+            rollback_available: false,
+            rollback_unavailable_reason: None,
         }
     }
 }
@@ -242,6 +263,7 @@ mod tests {
             started_at: "2026-01-01T00:00:00Z".to_string(),
             finished_at: Some("2026-01-01T00:01:00Z".to_string()),
             created_at: "2026-01-01T00:00:00Z".to_string(),
+            image_pruned: false,
         };
 
         let response = DeploymentResponse::from(deployment);

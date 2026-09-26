@@ -131,8 +131,40 @@ pub struct CronJobResponse {
     pub max_retries: i64,
     /// Seconds between retries.
     pub retry_delay_seconds: i64,
-    /// Volume mounts as a JSON array. null = none.
-    pub volumes: Option<serde_json::Value>,
+    /// Volume mounts. null = none.
+    pub volumes: Option<Vec<CronVolume>>,
+}
+
+/// A cron job bind mount. The host side is chosen by the server: the job's own
+/// directory `<data>/volumes/_cron/<job-id>/<name>`, or — when `app` is set —
+/// that app's volume `<data>/volumes/<app>/<name>`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CronVolume {
+    /// Share a volume of this app instead of using the job's own directory
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    /// Directory name of the volume
+    pub name: String,
+    /// Absolute host path, computed by the server (read-only)
+    pub host_path: String,
+    /// Mount point inside the container
+    pub container_path: String,
+}
+
+/// A cron volume as sent by clients.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CronVolumeRequest {
+    /// Share a volume of this existing app (e.g. to back up its data)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    /// Volume directory name (default: derived from `container_path`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Only accepted when it already points inside the allowed directory; prefer `name`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_path: Option<String>,
+    /// Mount point inside the container
+    pub container_path: String,
 }
 
 impl From<CronJob> for CronJobResponse {
@@ -211,8 +243,8 @@ pub struct CreateCronJobRequest {
     pub max_retries: Option<i64>,
     /// Seconds between retries. None = 60.
     pub retry_delay_seconds: Option<i64>,
-    /// Volume mounts: [{"host_path":"...","container_path":"..."}]
-    pub volumes: Option<Vec<serde_json::Value>>,
+    /// Volume mounts: [{"name":"data","container_path":"/data"}] (optionally with "app")
+    pub volumes: Option<Vec<CronVolumeRequest>>,
 }
 
 /// PATCH /api/cron/{id} request body (all fields optional)
@@ -250,7 +282,7 @@ pub struct UpdateCronJobRequest {
     /// Seconds between retries. None = no change.
     pub retry_delay_seconds: Option<i64>,
     /// Volume mounts. None = no change. Some([]) = clear all mounts.
-    pub volumes: Option<Vec<serde_json::Value>>,
+    pub volumes: Option<Vec<CronVolumeRequest>>,
 }
 
 #[cfg(test)]
@@ -318,7 +350,10 @@ mod tests {
             timezone: Some("UTC".to_string()),
             max_retries: 1,
             retry_delay_seconds: 30,
-            volumes: Some("[{\"host_path\":\"/tmp\",\"container_path\":\"/data\"}]".to_string()),
+            volumes: Some(
+                "[{\"name\":\"data\",\"host_path\":\"/opt/tond/data/volumes/_cron/job-1/data\",\"container_path\":\"/data\"}]"
+                    .to_string(),
+            ),
         };
 
         let response = CronJobResponse::from(job);
@@ -334,8 +369,13 @@ mod tests {
         );
         assert_eq!(
             response.volumes,
-            Some(serde_json::json!([{ "host_path": "/tmp", "container_path": "/data" }])),
-            "CronJobResponse should deserialize volume JSON into a JSON array"
+            Some(vec![CronVolume {
+                app: None,
+                name: "data".to_string(),
+                host_path: "/opt/tond/data/volumes/_cron/job-1/data".to_string(),
+                container_path: "/data".to_string(),
+            }]),
+            "CronJobResponse should deserialize stored volume JSON into typed volumes"
         );
     }
 
@@ -439,10 +479,12 @@ mod tests {
             timezone: Some("UTC".to_string()),
             max_retries: Some(2),
             retry_delay_seconds: Some(30),
-            volumes: Some(vec![serde_json::json!({
-                "host_path": "/tmp",
-                "container_path": "/data"
-            })]),
+            volumes: Some(vec![CronVolumeRequest {
+                app: Some("web".to_string()),
+                name: Some("data".to_string()),
+                host_path: None,
+                container_path: "/data".to_string(),
+            }]),
         };
 
         let roundtrip: CreateCronJobRequest = serde_json::from_value(
@@ -461,12 +503,15 @@ mod tests {
             Some(2),
             "CreateCronJobRequest should preserve retry settings through serde round-trips"
         );
+        let volumes = roundtrip.volumes.unwrap_or_default();
         assert_eq!(
-            roundtrip.volumes,
-            Some(vec![serde_json::json!({
-                "host_path": "/tmp",
-                "container_path": "/data"
-            })]),
+            (
+                volumes.len(),
+                volumes[0].app.as_deref(),
+                volumes[0].name.as_deref(),
+                volumes[0].container_path.as_str()
+            ),
+            (1, Some("web"), Some("data"), "/data"),
             "CreateCronJobRequest should preserve volume mounts through serde round-trips"
         );
     }

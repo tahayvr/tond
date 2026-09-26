@@ -40,8 +40,14 @@ use tond_common::{
     CreateDatabaseRequest, CronJobResponse, CronJobRun, DeployKeyResponse, DeploymentResponse,
     IntegrationResponse, ManagedDatabaseDetail, ManagedDatabaseResponse, PreviewDeploymentResponse,
     ProjectPreviewResponse, ProjectResponse, ServerSettings, SnapshotResponse, SnapshotStarted,
-    StorageProviderResponse, UpdateCronJobRequest, UpdateSettingsRequest,
+    StorageProviderResponse, UpdateCronJobRequest, UpdateSettingsRequest, WebhookConfigResponse,
 };
+
+/// Body and response of `/api/settings/host-terminal`.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct HostTerminalSetting {
+    enabled: bool,
+}
 
 pub struct TondClient {
     base_url: String,
@@ -420,11 +426,12 @@ impl TondClient {
         Ok(())
     }
 
+    /// Set individual env vars. Variables that are not named are left unchanged.
     pub async fn update_env(&self, id: &str, env_vars: Value) -> Result<()> {
         let req = self
             .client
-            .put(format!("{}/api/apps/{}/env", self.base_url, id))
-            .json(&serde_json::json!({ "env_vars": env_vars }));
+            .patch(format!("{}/api/apps/{}/env", self.base_url, id))
+            .json(&serde_json::json!({ "set": env_vars }));
         let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
 
         if !resp.success {
@@ -469,11 +476,22 @@ impl TondClient {
         Ok(())
     }
 
-    pub async fn add_volume(&self, id: &str, container_path: &str) -> Result<()> {
+    /// Add a volume. The server stores it in `<data>/volumes/<app>/<name>`;
+    /// `name` defaults to one derived from the container path.
+    pub async fn add_volume(
+        &self,
+        id: &str,
+        container_path: &str,
+        name: Option<&str>,
+    ) -> Result<()> {
+        let mut body = serde_json::json!({ "container_path": container_path });
+        if let Some(name) = name {
+            body["name"] = serde_json::Value::String(name.to_string());
+        }
         let req = self
             .client
             .post(format!("{}/api/apps/{}/volumes", self.base_url, id))
-            .json(&serde_json::json!({ "container_path": container_path }));
+            .json(&body);
         let resp: ApiResponse<Value> = self.auth_header(req).send().await?.json().await?;
 
         if !resp.success {
@@ -565,8 +583,22 @@ impl TondClient {
         }
     }
 
-    /// Set or clear the HMAC webhook secret for an app.
-    pub async fn set_webhook_secret(&self, id: &str, secret: Option<&str>) -> Result<()> {
+    /// Webhook URLs and secret for an app.
+    pub async fn get_webhook_config(&self, id: &str) -> Result<WebhookConfigResponse> {
+        let req = self
+            .client
+            .get(format!("{}/api/apps/{}/webhook", self.base_url, id));
+        let resp: ApiResponse<WebhookConfigResponse> =
+            self.auth_header(req).send().await?.json().await?;
+        if resp.success {
+            resp.data.context("No data returned")
+        } else {
+            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
+        }
+    }
+
+    /// Replace the webhook secret with a caller-chosen value.
+    pub async fn set_webhook_secret(&self, id: &str, secret: &str) -> Result<()> {
         let req = self
             .client
             .put(format!("{}/api/apps/{}/webhook-secret", self.base_url, id))
@@ -577,6 +609,21 @@ impl TondClient {
             anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()));
         }
         Ok(())
+    }
+
+    /// Replace the webhook secret with a freshly generated one.
+    pub async fn rotate_webhook_secret(&self, id: &str) -> Result<WebhookConfigResponse> {
+        let req = self.client.post(format!(
+            "{}/api/apps/{}/webhook-secret/rotate",
+            self.base_url, id
+        ));
+        let resp: ApiResponse<WebhookConfigResponse> =
+            self.auth_header(req).send().await?.json().await?;
+        if resp.success {
+            resp.data.context("No data returned")
+        } else {
+            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
+        }
     }
 
     /// Enable or disable auto-deploy, optionally setting the watch branch.
@@ -815,6 +862,7 @@ impl TondClient {
             db_type: db_type.to_string(),
             project_id: project_id.map(|s| s.to_string()),
             memory_limit,
+            public_access: false,
         };
         let req = self
             .client
@@ -1049,6 +1097,36 @@ impl TondClient {
         let resp: ApiResponse<ServerSettings> = self.auth_header(req).send().await?.json().await?;
         if resp.success {
             resp.data.context("No data returned")
+        } else {
+            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
+        }
+    }
+
+    /// Whether the dashboard's host terminal is switched on.
+    pub async fn get_host_terminal(&self) -> Result<bool> {
+        let req = self
+            .client
+            .get(format!("{}/api/settings/host-terminal", self.base_url));
+        let resp: ApiResponse<HostTerminalSetting> =
+            self.auth_header(req).send().await?.json().await?;
+        if resp.success {
+            Ok(resp.data.context("No data returned")?.enabled)
+        } else {
+            anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
+        }
+    }
+
+    /// Switch the dashboard's host terminal on or off. The server accepts this
+    /// only over the local Unix socket.
+    pub async fn set_host_terminal(&self, enabled: bool) -> Result<bool> {
+        let req = self
+            .client
+            .put(format!("{}/api/settings/host-terminal", self.base_url))
+            .json(&HostTerminalSetting { enabled });
+        let resp: ApiResponse<HostTerminalSetting> =
+            self.auth_header(req).send().await?.json().await?;
+        if resp.success {
+            Ok(resp.data.context("No data returned")?.enabled)
         } else {
             anyhow::bail!("{}", resp.error.unwrap_or_else(|| "Unknown error".into()))
         }

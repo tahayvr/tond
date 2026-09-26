@@ -9,7 +9,7 @@
 //   POST   /api/storage-providers/:id/test — verify connectivity (ListObjects)
 //
 // The `secret_access_key` in the S3 config is AES-GCM encrypted using the same
-// `encrypt_password` / `decrypt_password` helpers as registry_credentials.rs.
+// `secret_key::encrypt` / `secret_key::decrypt` helpers as the other secret columns.
 // The encrypted value is stored as `secret_access_key_enc`; the plaintext key is
 // never persisted and is stripped from all API responses.
 
@@ -24,9 +24,9 @@ use tond_common::*;
 use uuid::Uuid;
 
 use crate::{
-    auth::{RateLimit, RequireAuth},
+    auth::{RateLimit, RequireAdmin, RequireAuth},
     error::AppError,
-    handlers::registry_credentials::{decrypt_password, encrypt_password},
+    secret_key::{self, Purpose},
     state::AppState,
     storage,
 };
@@ -64,7 +64,7 @@ pub async fn get_storage_provider(
 
 pub async fn create_storage_provider(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Json(req): Json<CreateStorageProviderRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -101,7 +101,7 @@ pub async fn create_storage_provider(
 
 pub async fn update_storage_provider(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateStorageProviderRequest>,
@@ -142,7 +142,7 @@ pub async fn update_storage_provider(
 
 pub async fn delete_storage_provider(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -183,7 +183,7 @@ pub async fn delete_storage_provider(
 
 pub async fn test_storage_provider(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -249,7 +249,7 @@ fn encrypt_config(kind: &str, config: &serde_json::Value) -> Result<String, AppE
                 "secret_access_key must be a string".to_string(),
             ))
         })?;
-        let encrypted = encrypt_password(plain_str)
+        let encrypted = secret_key::encrypt(Purpose::StorageSecretKey, plain_str)
             .map_err(|e| AppError(TondError::Internal(format!("Encryption failed: {e}"))))?;
         cfg.insert("secret_access_key_enc".to_string(), json!(encrypted));
     }
@@ -305,7 +305,7 @@ pub fn decrypt_provider_secret(row: StorageProvider) -> anyhow::Result<StoragePr
         let enc_str = enc_val
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("secret_access_key_enc is not a string"))?;
-        let plaintext = decrypt_password(enc_str)?;
+        let plaintext = secret_key::decrypt(Purpose::StorageSecretKey, enc_str)?;
         cfg.insert(
             "secret_access_key".to_string(),
             serde_json::Value::String(plaintext),
@@ -417,7 +417,7 @@ mod tests {
 
     #[test]
     fn decrypt_provider_secret_restores_plaintext_secret_access_key() {
-        let encrypted = encrypt_password("secret-value")
+        let encrypted = secret_key::encrypt(Purpose::StorageSecretKey, "secret-value")
             .unwrap_or_else(|err| panic!("password encryption should succeed: {err}"));
         let row = sample_provider(&format!(
             r#"{{"region":"us-east-1","bucket":"tond-backups","access_key_id":"AKIA123","secret_access_key_enc":"{}"}}"#,

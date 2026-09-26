@@ -1,7 +1,7 @@
 name: CI
 
 # Manual only, to save Actions minutes: day-to-day checks run locally
-# (just check, just test, just vm-e2e). Run from the Actions tab when needed.
+# (just check, just test, just audit, just vm-e2e). Run from the Actions tab when needed.
 on:
   workflow_dispatch:
 
@@ -12,20 +12,24 @@ concurrency:
 permissions:
   contents: read
 
+# Actions are pinned by commit SHA (supply-chain hardening); the comment names
+# the tag or branch the SHA was taken from.
+
 jobs:
   rust:
     name: Rust (fmt, clippy, tests)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2
         with:
           tool: cargo-nextest
 
@@ -35,6 +39,30 @@ jobs:
       # Includes the tond-scanner fixture tests, which build and run images with Docker.
       - run: cargo nextest run --workspace --locked
 
+  audit:
+    name: Supply chain (cargo-deny, pnpm audit)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2
+        with:
+          tool: cargo-deny
+
+      # Advisories, licenses, bans and sources per deny.toml.
+      - run: cargo deny --all-features check
+
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          package_json_file: dashboard/package.json
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+
+      - run: pnpm audit --prod
+        working-directory: dashboard
+
   dashboard:
     name: Dashboard (check, lint, test, build)
     runs-on: ubuntu-24.04
@@ -42,13 +70,13 @@ jobs:
       run:
         working-directory: dashboard
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           package_json_file: dashboard/package.json
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "24"
           cache: pnpm
@@ -61,17 +89,29 @@ jobs:
       - run: pnpm build
 
   e2e:
-    name: End-to-end (install + smoke test, Pebble ACME)
+    name: End-to-end ${{ matrix.arch }} (install + smoke test, Pebble ACME)
     # Only spend the ~10 minutes once the fast checks pass.
     needs: [rust, dashboard]
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - uses: ./.github/actions/build-bundle
+        with:
+          arch: ${{ matrix.arch }}
 
       # The runner is a disposable Ubuntu VM with systemd, Docker and root —
       # the same kind of machine Tond is installed on.
       - name: Install and run smoke test
-        run: sudo e2e/run.sh --bundle dist/tond-linux-x86_64 --acme pebble --base-domain tond.test
+        run: |
+          sudo e2e/run.sh --bundle dist/tond-linux-${{ matrix.arch }} --acme pebble \
+            --base-domain tond.test --preview-domain preview.test

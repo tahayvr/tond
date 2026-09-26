@@ -37,9 +37,10 @@ use tond_common::{
 use uuid::Uuid;
 
 use crate::{
-    auth::{RateLimit, RequireAuth},
+    auth::{RateLimit, RequireAdmin, RequireAuth},
+    deploy::GitHttpAuth,
     error::AppError,
-    handlers::registry_credentials::{decrypt_password, encrypt_password},
+    secret_key::{self, Purpose},
     state::AppState,
 };
 
@@ -62,7 +63,7 @@ pub async fn list_gitlab_tokens(
 /// POST /api/gitlab-tokens
 pub async fn create_gitlab_token(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Json(payload): Json<CreateGitLabTokenRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -121,7 +122,7 @@ pub async fn create_gitlab_token(
         .to_string();
 
     // Encrypt the PAT
-    let token_enc = encrypt_password(payload.token.trim())
+    let token_enc = secret_key::encrypt(Purpose::GitlabToken, payload.token.trim())
         .map_err(|e| AppError(TondError::Internal(e.to_string())))?;
 
     let id = Uuid::new_v4().to_string();
@@ -152,7 +153,7 @@ pub async fn create_gitlab_token(
 /// DELETE /api/gitlab-tokens/{id}
 pub async fn delete_gitlab_token(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Path(token_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -180,7 +181,7 @@ pub async fn list_gitlab_repos(
     Path(token_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let token = fetch_token(&state, &token_id).await?;
-    let pat = decrypt_password(&token.token_enc).map_err(|e| {
+    let pat = secret_key::decrypt(Purpose::GitlabToken, &token.token_enc).map_err(|e| {
         AppError(TondError::Internal(format!(
             "Failed to decrypt token: {}",
             e
@@ -282,7 +283,7 @@ pub async fn list_gitlab_branches(
     Path((token_id, project_id)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
     let token = fetch_token(&state, &token_id).await?;
-    let pat = decrypt_password(&token.token_enc).map_err(|e| {
+    let pat = secret_key::decrypt(Purpose::GitlabToken, &token.token_enc).map_err(|e| {
         AppError(TondError::Internal(format!(
             "Failed to decrypt token: {}",
             e
@@ -341,7 +342,7 @@ pub async fn list_gitlab_branches(
 /// Attach or detach a GitLab token from an app.
 pub async fn set_app_gitlab_token(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Path(app_id): Path<String>,
     Json(payload): Json<SetGitLabTokenRequest>,
@@ -404,42 +405,15 @@ async fn fetch_token(state: &AppState, token_id: &str) -> Result<GitLabToken, Ap
         })
 }
 
-/// Build an authenticated clone URL for a GitLab repo using the stored PAT.
-///
-/// Transforms `https://gitlab.com/group/repo.git`
-///         → `https://oauth2:<token>@gitlab.com/group/repo.git`
-pub async fn build_clone_url_with_token(
-    token: &GitLabToken,
-    source_url: &str,
-    state: &AppState,
-) -> anyhow::Result<String> {
-    // Decrypt the PAT
-    let pat = decrypt_password(&token.token_enc)?;
-
-    // Inject credentials into the URL. Strip any existing `https://` prefix,
-    // then prepend `https://oauth2:<pat>@`.
-    let url = source_url.trim();
-    if let Some(rest) = url.strip_prefix("https://") {
-        // Remove any existing user:pass@ that might already be present
-        let rest = if let Some(at_pos) = rest.find('@') {
-            &rest[at_pos + 1..]
-        } else {
-            rest
-        };
-        return Ok(format!("https://oauth2:{}@{}", pat, rest));
-    }
-    if let Some(rest) = url.strip_prefix("http://") {
-        let rest = if let Some(at_pos) = rest.find('@') {
-            &rest[at_pos + 1..]
-        } else {
-            rest
-        };
-        return Ok(format!("http://oauth2:{}@{}", pat, rest));
-    }
-
-    // Non-http URL — return unchanged (SSH or other scheme)
-    let _ = state;
-    Ok(url.to_string())
+/// HTTPS credentials for cloning a GitLab repo with the stored PAT
+/// (`oauth2:<pat>` Basic auth). They are passed to git as a header through its
+/// environment config, never embedded in the clone URL — see deploy/git.rs.
+pub fn gitlab_git_credentials(token: &GitLabToken) -> anyhow::Result<GitHttpAuth> {
+    let pat = secret_key::decrypt(Purpose::GitlabToken, &token.token_enc)?;
+    Ok(GitHttpAuth {
+        username: "oauth2".to_string(),
+        password: pat,
+    })
 }
 
 /// Post a commit status to GitLab (best-effort — errors are logged, not propagated).
@@ -455,7 +429,7 @@ pub async fn post_gitlab_commit_status(
     description: &str,
     target_url: Option<&str>,
 ) -> anyhow::Result<()> {
-    let pat = decrypt_password(&token.token_enc)?;
+    let pat = secret_key::decrypt(Purpose::GitlabToken, &token.token_enc)?;
     let base = token.gitlab_url.trim_end_matches('/');
     let url = format!(
         "{}/api/v4/projects/{}/statuses/{}",
@@ -524,7 +498,7 @@ mod tests {
         GitLabToken {
             id: "token-1".to_string(),
             name: "GitLab PAT".to_string(),
-            token_enc: encrypt_password("secret-pat")
+            token_enc: secret_key::encrypt(Purpose::GitlabToken, "secret-pat")
                 .unwrap_or_else(|err| panic!("PAT encryption should succeed: {err}")),
             gitlab_url: "https://gitlab.example.com/".to_string(),
             username: "alice".to_string(),
@@ -631,36 +605,13 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn build_clone_url_with_token_injects_pat_and_preserves_non_http_urls() {
-        let state = test_state().await;
+    #[test]
+    fn gitlab_git_credentials_decrypt_the_pat_for_header_auth() {
         let token = sample_token();
-
-        assert_eq!(
-            build_clone_url_with_token(&token, "https://gitlab.example.com/group/repo.git", &state)
-                .await
-                .unwrap_or_else(|err| panic!("HTTPS clone URL injection should succeed: {err}")),
-            "https://oauth2:secret-pat@gitlab.example.com/group/repo.git",
-            "build_clone_url_with_token should inject oauth2 credentials into HTTPS clone URLs"
-        );
-        assert_eq!(
-            build_clone_url_with_token(
-                &token,
-                "https://old-user:old-pass@gitlab.example.com/group/repo.git",
-                &state,
-            )
-            .await
-            .unwrap_or_else(|err| panic!("existing credentials should be replaced cleanly: {err}")),
-            "https://oauth2:secret-pat@gitlab.example.com/group/repo.git",
-            "build_clone_url_with_token should strip any pre-existing userinfo before injecting the PAT"
-        );
-        assert_eq!(
-            build_clone_url_with_token(&token, "git@gitlab.example.com:group/repo.git", &state)
-                .await
-                .unwrap_or_else(|err| panic!("SSH URLs should be returned unchanged: {err}")),
-            "git@gitlab.example.com:group/repo.git",
-            "build_clone_url_with_token should leave non-HTTP clone URLs unchanged"
-        );
+        let auth = gitlab_git_credentials(&token)
+            .unwrap_or_else(|err| panic!("PAT decryption should succeed: {err}"));
+        assert_eq!(auth.username, "oauth2");
+        assert_eq!(auth.password, "secret-pat");
     }
 
     #[tokio::test]
@@ -684,7 +635,7 @@ mod tests {
 
         let response = set_app_gitlab_token(
             crate::auth::rate_limit::RateLimit,
-            crate::auth::RequireAuth,
+            crate::auth::RequireAdmin,
             State(state.clone()),
             Path("app-1".to_string()),
             Json(SetGitLabTokenRequest {
@@ -705,7 +656,7 @@ mod tests {
 
         let response = set_app_gitlab_token(
             crate::auth::rate_limit::RateLimit,
-            crate::auth::RequireAuth,
+            crate::auth::RequireAdmin,
             State(state.clone()),
             Path("app-1".to_string()),
             Json(SetGitLabTokenRequest {

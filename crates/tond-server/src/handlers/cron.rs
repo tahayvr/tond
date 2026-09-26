@@ -22,11 +22,12 @@ use tond_common::*;
 
 use crate::{
     audit_log::{AuthActor, write_audit_log},
-    auth::{RateLimit, RequireAuth},
+    auth::{RateLimit, RequireAdmin, RequireAuth},
     cron,
     cron::compute_next_run,
     error::AppError,
     state::AppState,
+    volumes,
 };
 
 // ── Shared lookup helper ──
@@ -39,6 +40,28 @@ async fn fetch_cron_job(pool: &sqlx::SqlitePool, id_or_name: &str) -> Result<Cro
             .fetch_optional(pool)
             .await?;
     job.ok_or_else(|| AppError(TondError::NotFound(format!("cron job '{}'", id_or_name))))
+}
+
+/// Map cron volume requests into confined host directories (see `volumes.rs`)
+/// and serialise them for storage. Empty list → `None`.
+async fn confined_cron_volumes(
+    pool: &sqlx::SqlitePool,
+    job_id: &str,
+    reqs: &[CronVolumeRequest],
+) -> Result<Option<String>, AppError> {
+    if reqs.is_empty() {
+        return Ok(None);
+    }
+    let app_names: Vec<String> = sqlx::query_scalar("SELECT name FROM apps")
+        .fetch_all(pool)
+        .await?;
+    let vols = volumes::cron_volumes(&volumes::data_dir(), job_id, reqs, |app| {
+        app_names.iter().any(|n| n == app)
+    })
+    .map_err(|msg| AppError(TondError::InvalidInput(msg)))?;
+    Ok(Some(serde_json::to_string(&vols).map_err(|e| {
+        AppError(TondError::Internal(e.to_string()))
+    })?))
 }
 
 // ── List cron jobs ──
@@ -74,7 +97,7 @@ pub async fn get_cron_job(
 
 pub async fn create_cron_job(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     actor: AuthActor,
     State(state): State<AppState>,
     Json(req): Json<CreateCronJobRequest>,
@@ -127,13 +150,6 @@ pub async fn create_cron_job(
         .filter(|m| !m.is_empty())
         .map(|m| serde_json::to_string(m).unwrap_or_default());
 
-    // Serialize volumes → JSON string for storage
-    let volumes_str = req
-        .volumes
-        .as_ref()
-        .filter(|v| !v.is_empty())
-        .map(|v| serde_json::to_string(v).unwrap_or_default());
-
     let mut job = CronJob::new(
         req.name.clone(),
         req.schedule.clone(),
@@ -148,9 +164,12 @@ pub async fn create_cron_job(
         req.timezone.clone(),
         req.max_retries.unwrap_or(0),
         req.retry_delay_seconds.unwrap_or(60),
-        volumes_str,
+        None,
     );
     job.next_run_at = Some(next_run);
+    // Volumes are keyed by the job id, so resolve them once the id exists.
+    job.volumes =
+        confined_cron_volumes(&state.db, &job.id, req.volumes.as_deref().unwrap_or(&[])).await?;
 
     sqlx::query(
         "INSERT INTO cron_jobs
@@ -213,7 +232,7 @@ pub async fn create_cron_job(
 
 pub async fn update_cron_job(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     actor: AuthActor,
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -341,11 +360,7 @@ pub async fn update_cron_job(
 
     // ── volumes ───────────────────────────────────────────────────────────────
     if let Some(ref vols) = req.volumes {
-        job.volumes = if vols.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_string(vols).unwrap_or_default())
-        };
+        job.volumes = confined_cron_volumes(&state.db, &job.id, vols).await?;
     }
 
     sqlx::query(
@@ -633,7 +648,7 @@ mod tests {
 
         let error = create_cron_job(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
             AuthActor("admin@example.com".to_string()),
             State(state),
             Json(CreateCronJobRequest {
@@ -670,7 +685,7 @@ mod tests {
 
         let error = create_cron_job(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
             AuthActor("admin@example.com".to_string()),
             State(state),
             Json(CreateCronJobRequest {
@@ -709,7 +724,7 @@ mod tests {
 
         let error = create_cron_job(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
             AuthActor("admin@example.com".to_string()),
             State(state),
             Json(CreateCronJobRequest {
@@ -746,7 +761,7 @@ mod tests {
 
         let error = create_cron_job(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
             AuthActor("admin@example.com".to_string()),
             State(state),
             Json(CreateCronJobRequest {
@@ -786,7 +801,7 @@ mod tests {
 
         let response = create_cron_job(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
             AuthActor("admin@example.com".to_string()),
             State(state.clone()),
             Json(CreateCronJobRequest {
@@ -803,10 +818,12 @@ mod tests {
                 timezone: Some("UTC".to_string()),
                 max_retries: None,
                 retry_delay_seconds: None,
-                volumes: Some(vec![serde_json::json!({
-                    "host_path": "/tmp",
-                    "container_path": "/data"
-                })]),
+                volumes: Some(vec![CronVolumeRequest {
+                    app: None,
+                    name: Some("scratch".to_string()),
+                    host_path: None,
+                    container_path: "/data".to_string(),
+                }]),
             }),
         )
         .await
@@ -838,6 +855,57 @@ mod tests {
             body["data"]["next_run_at"].as_str().is_some(),
             "create_cron_job should compute and persist next_run_at for valid schedules"
         );
+        let host_path = body["data"]["volumes"][0]["host_path"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let job_id = body["data"]["id"].as_str().unwrap_or_default();
+        assert!(
+            host_path.ends_with(&format!("/volumes/_cron/{job_id}/scratch")),
+            "cron volumes should be confined to the job's own directory, got {host_path}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_cron_job_rejects_host_paths_outside_the_volume_directory() {
+        let state = test_state().await;
+        let error = create_cron_job(
+            RateLimit,
+            RequireAdmin,
+            AuthActor("admin@example.com".to_string()),
+            State(state.clone()),
+            Json(CreateCronJobRequest {
+                name: "escape".to_string(),
+                schedule: "0 * * * *".to_string(),
+                image: "alpine:latest".to_string(),
+                command: None,
+                project_id: None,
+                timeout_seconds: None,
+                env: None,
+                concurrency_policy: None,
+                memory_mb: None,
+                cpu_shares: None,
+                timezone: None,
+                max_retries: None,
+                retry_delay_seconds: None,
+                volumes: Some(vec![CronVolumeRequest {
+                    app: None,
+                    name: None,
+                    host_path: Some("/".to_string()),
+                    container_path: "/host".to_string(),
+                }]),
+            }),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("a cron bind of / must be rejected"));
+        assert_eq!(error.0.status_code(), 400);
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cron_jobs")
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_else(|err| panic!("count failed: {err}"));
+        assert_eq!(count, 0);
     }
 
     #[tokio::test]
@@ -847,7 +915,7 @@ mod tests {
 
         let bad_name = update_cron_job(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
             AuthActor("admin@example.com".to_string()),
             State(state.clone()),
             Path(job.id.clone()),
@@ -880,7 +948,7 @@ mod tests {
 
         let bad_schedule = update_cron_job(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
             AuthActor("admin@example.com".to_string()),
             State(state.clone()),
             Path(job.id.clone()),
@@ -913,7 +981,7 @@ mod tests {
 
         let bad_policy = update_cron_job(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
             AuthActor("admin@example.com".to_string()),
             State(state),
             Path(job.id),
@@ -955,7 +1023,7 @@ mod tests {
 
         let response = update_cron_job(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
             AuthActor("admin@example.com".to_string()),
             State(state.clone()),
             Path(job.id.clone()),
@@ -1066,7 +1134,7 @@ mod tests {
 
         let error = update_cron_job(
             RateLimit,
-            RequireAuth,
+            RequireAdmin,
             AuthActor("admin@example.com".to_string()),
             State(state),
             Path(job.id),

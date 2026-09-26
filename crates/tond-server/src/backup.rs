@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use crate::handlers::storage_providers::decrypt_provider_secret;
 use crate::state::AppState;
-use crate::{docker, storage};
+use crate::{db, docker, storage};
 use tond_common::{BackupConfig, ManagedDatabase, Snapshot};
 
 // ── Progress event ────────────────────────────────────────────────────────────
@@ -572,6 +572,8 @@ async fn do_full_restore(state: &AppState, snap: &Snapshot) -> Result<()> {
             tokio::fs::create_dir_all(parent).await?;
         }
         tokio::fs::copy(&db_src, &db_dest).await?;
+        // fs::copy also copies the snapshot's mode; restore tond-proxy's access.
+        db::share_with_proxy(&db_dest);
     }
 
     // Replace app volumes
@@ -998,6 +1000,21 @@ async fn ensure_local(state: &AppState, snap: &Snapshot) -> Result<PathBuf> {
 
 // ── DB logical dumps (Step 6) ─────────────────────────────────────────────────
 
+// MySQL/MariaDB dump and import scripts. User, database and password reach
+// the client through the exec env ("$VAR" references and MYSQL_PWD), so no
+// credential is ever interpolated into the shell string. MariaDB 11 images
+// ship only the mariadb-* client names.
+const MYSQL_DUMP_SCRIPT: &str = r#"if command -v mariadb-dump >/dev/null 2>&1; then d=mariadb-dump; else d=mysqldump; fi; "$d" --single-transaction -u"$TOND_DB_USER" "$TOND_DB_NAME" > /tmp/dump.sql"#;
+const MYSQL_IMPORT_SCRIPT: &str = r#"if command -v mariadb >/dev/null 2>&1; then c=mariadb; else c=mysql; fi; "$c" -u"$TOND_DB_USER" "$TOND_DB_NAME" < /tmp/dump.sql"#;
+
+fn mysql_exec_env(user: &str, password: &str, dbname: &str) -> Vec<String> {
+    vec![
+        format!("MYSQL_PWD={password}"),
+        format!("TOND_DB_USER={user}"),
+        format!("TOND_DB_NAME={dbname}"),
+    ]
+}
+
 async fn dump_database(docker: &bollard::Docker, db: &ManagedDatabase, dest: &Path) -> Result<()> {
     use bollard::exec::CreateExecOptions;
 
@@ -1007,8 +1024,33 @@ async fn dump_database(docker: &bollard::Docker, db: &ManagedDatabase, dest: &Pa
         .ok_or_else(|| anyhow::anyhow!("DB container not running"))?;
 
     let kind = db.db_type.as_str();
-
+    // Credentials go in the exec env, never into a shell string (see mysql below).
+    let mut env: Vec<String> = Vec::new();
     let (cmd, out_file) = match kind {
+        "redis" | "keydb" => {
+            // Managed Redis requires ACL auth (see handlers/databases.rs).
+            // SAVE writes a consistent dump.rdb, which is then copied out.
+            // REDISCLI_AUTH passes the password without exposing it in `ps`.
+            let cli = if kind == "keydb" {
+                "keydb-cli"
+            } else {
+                "redis-cli"
+            };
+            env.push(format!(
+                "REDISCLI_AUTH={}",
+                db.db_password.as_deref().unwrap_or("")
+            ));
+            (
+                vec![
+                    cli.to_string(),
+                    "--user".to_string(),
+                    db.db_user.as_deref().unwrap_or("default").to_string(),
+                    "--no-auth-warning".to_string(),
+                    "SAVE".to_string(),
+                ],
+                "/data/dump.rdb",
+            )
+        }
         "postgres" => {
             let user = db.db_user.as_deref().unwrap_or("postgres");
             let dbname = db.db_name.as_deref().unwrap_or("postgres");
@@ -1030,14 +1072,12 @@ async fn dump_database(docker: &bollard::Docker, db: &ManagedDatabase, dest: &Pa
             let user = db.db_user.as_deref().unwrap_or("root");
             let pass = db.db_password.as_deref().unwrap_or("");
             let dbname = db.db_name.as_deref().unwrap_or("mysql");
+            env = mysql_exec_env(user, pass, dbname);
             (
                 vec![
                     "sh".to_string(),
                     "-c".to_string(),
-                    format!(
-                        "mysqldump --single-transaction -u{} -p{} {} > /tmp/dump.sql",
-                        user, pass, dbname
-                    ),
+                    MYSQL_DUMP_SCRIPT.to_string(),
                 ],
                 "/tmp/dump.sql",
             )
@@ -1067,6 +1107,7 @@ async fn dump_database(docker: &bollard::Docker, db: &ManagedDatabase, dest: &Pa
             container_id,
             CreateExecOptions {
                 cmd: Some(cmd),
+                env: Some(env),
                 attach_stdout: Some(true),
                 attach_stderr: Some(true),
                 ..Default::default()
@@ -1088,6 +1129,8 @@ async fn dump_database(docker: &bollard::Docker, db: &ManagedDatabase, dest: &Pa
     // Copy dump from container to host using `docker cp`-style read
     let dump_filename = if out_file.ends_with(".archive") {
         "dump.archive"
+    } else if out_file.ends_with(".rdb") {
+        "dump.rdb"
     } else {
         "dump.sql"
     };
@@ -1266,7 +1309,7 @@ async fn import_database_dump_sql(
         "mysql" | "mariadb" => vec![
             "sh".to_string(),
             "-c".to_string(),
-            format!("mysql -u{} -p{} {} < /tmp/dump.sql", user, pass, dbname),
+            MYSQL_IMPORT_SCRIPT.to_string(),
         ],
         _ => return Ok(()),
     };
@@ -1276,6 +1319,7 @@ async fn import_database_dump_sql(
             container_id,
             CreateExecOptions {
                 cmd: Some(cmd),
+                env: Some(mysql_exec_env(user, pass, dbname)),
                 attach_stdout: Some(true),
                 attach_stderr: Some(true),
                 ..Default::default()
@@ -1306,6 +1350,21 @@ mod tests {
 
     fn temp_dir() -> TempDir {
         TempDir::new().unwrap_or_else(|err| panic!("failed to create temp dir: {err}"))
+    }
+
+    #[test]
+    fn mysql_dump_and_import_keep_credentials_out_of_the_shell_string() {
+        let password = "p'w\"$(touch /tmp/pwned)`id`;";
+        let env = mysql_exec_env("app", password, "shop");
+
+        assert_eq!(env[0], format!("MYSQL_PWD={password}"));
+        for script in [MYSQL_DUMP_SCRIPT, MYSQL_IMPORT_SCRIPT] {
+            assert!(
+                !script.contains("-p"),
+                "the password must not be passed on the command line: {script}"
+            );
+            assert!(script.contains("\"$TOND_DB_USER\"") && script.contains("\"$TOND_DB_NAME\""));
+        }
     }
 
     #[test]

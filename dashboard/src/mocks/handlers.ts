@@ -14,6 +14,7 @@ const allDatabaseLogStream = ws.link('ws://*/api/databases/logs/stream');
 const databaseLogStream = ws.link('ws://*/api/databases/*/logs/stream');
 const cronRunStream = ws.link('ws://*/api/cron/*/runs/stream');
 const terminalStream = ws.link('ws://*/api/terminal/ws*');
+
 import {
 	MOCK_USER,
 	MOCK_USERS,
@@ -39,6 +40,9 @@ import {
 	MOCK_STORAGE_PROVIDERS,
 	MOCK_SNAPSHOTS,
 	MOCK_BACKUP_CONFIG,
+	MOCK_APP_ENV_VARS,
+	MOCK_PREVIEW_ENV_VARS,
+	MOCK_CERTIFICATES,
 	makeMockSystemMetrics,
 	makeMockAppMetrics
 } from './fixtures';
@@ -55,6 +59,10 @@ import type {
 	Integration,
 	ManagedDatabase,
 	TemplateCatalogEntry,
+	Volume,
+	VolumeInput,
+	CronVolume,
+	CronVolumeInput,
 	PreviewDeployment,
 	Project,
 	ProjectPreview,
@@ -75,10 +83,184 @@ function err(message: string, status = 400) {
 	return HttpResponse.json({ success: false, data: null, error: message }, { status });
 }
 
+// ── Mock helpers mirroring server-side confinement rules ─────────────────────
+
+const MOCK_VOLUMES_DIR = '/opt/tond/data/volumes';
+
+/** "/data/cache" → "data_cache" (same default as the server). */
+function mockVolumeName(containerPath: string): string {
+	return (
+		containerPath
+			.replace(/^\/+|\/+$/g, '')
+			.replace(/[^A-Za-z0-9._-]/g, '_')
+			.replace(/^\.+/, '') || 'data'
+	);
+}
+
+/** Validate a volume request like the API does; returns an error message or null. */
+function mockVolumeError(
+	input: { container_path?: string; name?: string; host_path?: string },
+	baseDir: string
+): string | null {
+	const path = input.container_path ?? '';
+	if (
+		!path.startsWith('/') ||
+		path === '/' ||
+		/[:,]/.test(path) ||
+		/(^|\/)\.\.?(\/|$)/.test(path)
+	) {
+		return `Container path '${path}' must be an absolute path inside the container, e.g. /data`;
+	}
+	if (input.name && !/^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$/.test(input.name)) {
+		return `Volume name '${input.name}' may only contain letters, digits, '.', '_' and '-' (no slashes)`;
+	}
+	if (
+		input.host_path &&
+		!new RegExp(`^${baseDir}/[A-Za-z0-9_-][A-Za-z0-9._-]*$`).test(input.host_path)
+	) {
+		return `Host path '${input.host_path}' is not allowed. Volumes are stored inside ${baseDir}; give the volume a name (e.g. "data") instead of a host path.`;
+	}
+	return null;
+}
+
+function mockAppVolume(appName: string, input: VolumeInput & { host_path?: string }): Volume {
+	const base = `${MOCK_VOLUMES_DIR}/${appName}`;
+	const name =
+		input.name ||
+		(input.host_path ? input.host_path.slice(base.length + 1) : '') ||
+		mockVolumeName(input.container_path);
+	return { name, host_path: `${base}/${name}`, container_path: input.container_path };
+}
+
+function mockCronVolumes(
+	jobId: string,
+	inputs: CronVolumeInput[] | null | undefined
+): CronVolume[] | null {
+	if (!inputs || inputs.length === 0) return null;
+	return inputs.map((v) => {
+		const name = v.name || mockVolumeName(v.container_path);
+		const base = v.app ? `${MOCK_VOLUMES_DIR}/${v.app}` : `${MOCK_VOLUMES_DIR}/_cron/${jobId}`;
+		return {
+			app: v.app ?? null,
+			name,
+			host_path: `${base}/${name}`,
+			container_path: v.container_path
+		};
+	});
+}
+
+/** A few of the server's compose rules, enough to demo the UI. */
+function mockComposeProblems(content: string): string[] {
+	const problems: string[] = [];
+	if (/^\s*privileged:\s*true/m.test(content)) {
+		problems.push(
+			"service: 'privileged' is not allowed — privileged containers have full root access to the host"
+		);
+	}
+	for (const field of ['network_mode', 'pid', 'ipc']) {
+		if (new RegExp(`^\\s*${field}:\\s*["']?host`, 'm').test(content)) {
+			problems.push(`service: '${field}: host' is not allowed`);
+		}
+	}
+	if (/^\s*cap_add:/m.test(content)) {
+		problems.push("service: 'cap_add' beyond Docker's default set is not allowed");
+	}
+	for (const m of content.matchAll(/^\s*-\s*["']?(\/[^:"'\s]*):/gm)) {
+		problems.push(
+			`service: bind mount '${m[1]}' is outside this app's volume directory — use a relative path such as ./data or a named volume`
+		);
+	}
+	return problems;
+}
+
+/** Public connection string (only when public access is on). */
+function mockPublicUrl(db: ManagedDatabase): string | null {
+	if (!db.public_access || !db.host_port) return null;
+	const isRedisLike = db.db_type === 'redis' || db.db_type === 'keydb';
+	return isRedisLike
+		? `redis://${db.db_user}:${db.db_password}@tond.example.com:${db.host_port}`
+		: `${db.db_type}://${db.db_user}:${db.db_password}@tond.example.com:${db.host_port}/${db.db_name}`;
+}
+
+// Mirrors tond-server's domains.rs: previews need a preview domain on a different
+// registrable domain from the dashboard. The mock approximates the Public Suffix
+// List check by comparing the last two labels.
+const PREVIEW_DOMAIN_REQUIRED =
+	'Invalid input: Previews need a preview domain. Set one in Settings: a separate domain you own (e.g. example-previews.com, not a subdomain of the dashboard domain) with a wildcard DNS record *.<preview-domain> pointing at this server. Previews run pull-request code, so they must not share a site with the dashboard.';
+
+function mockSite(domain: string): string {
+	return domain.split('.').slice(-2).join('.');
+}
+
+function mockPreviewDomainError(preview: string, dashboard: string): string | null {
+	if (!preview) return null;
+	if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(preview)) {
+		return `'${preview}' is not a valid domain name (expected something like example-previews.com)`;
+	}
+	if (!dashboard) return null;
+	const nested =
+		preview === dashboard || preview.endsWith(`.${dashboard}`) || dashboard.endsWith(`.${preview}`);
+	if (nested || mockSite(preview) === mockSite(dashboard)) {
+		return `The preview domain must be a different registrable domain from the dashboard (${dashboard}). Previews run pull-request code; use a separate domain you own.`;
+	}
+	return null;
+}
+
+function normalizeDomain(value: string): string {
+	return value.trim().toLowerCase().replace(/\.$/, '');
+}
+
+const certificates = MOCK_CERTIFICATES.map((c) => ({ ...c }));
+
+/** Mirror the server: saving a domain queues a pending cert and resets retry state. */
+function queueMockCertificate(domain: string) {
+	if (!domain.trim()) return;
+	const now = new Date().toISOString();
+	const existing = certificates.find((c) => c.domain === domain);
+	if (existing) {
+		Object.assign(existing, {
+			status: 'pending',
+			last_error: null,
+			next_retry_at: null,
+			failure_count: 0
+		});
+		return;
+	}
+	certificates.push({
+		id: `cert-${Date.now()}`,
+		domain,
+		cert_type: 'acme',
+		status: 'pending',
+		issued_at: now,
+		expires_at: now,
+		last_error: null,
+		last_attempt_at: null,
+		next_retry_at: null,
+		failure_count: 0
+	});
+}
+
 // In-memory mutable state (mutations survive page navigation within the session)
-// Starts as true so that running `pnpm dev:setup` drops straight into the wizard.
-// Flips to false once POST /api/auth/setup is called, matching real server behaviour.
+// Starts as true so that `pnpm dev:setup` begins signed out with setup open.
+// Like the real server, /api/auth/status doesn't reveal it: open the setup link
+// /setup?token=mock-setup-token (MOCK_SETUP_TOKEN) to reach the form.
+// Flips to false once POST /api/auth/setup succeeds.
 let needsSetup = true;
+export const MOCK_SETUP_TOKEN = 'mock-setup-token';
+
+// The host terminal is off by default, as on a real server (where only
+// `sudo tond settings host-terminal on` can enable it). To preview the step-up
+// flow in the mock, run `localStorage.setItem('tond-mock-host-terminal', 'on')`.
+function mockHostTerminalEnabled(): boolean {
+	try {
+		return globalThis.localStorage?.getItem('tond-mock-host-terminal') === 'on';
+	} catch {
+		return false;
+	}
+}
+const MOCK_STEP_UP_PASSWORD = 'ValidPass123!';
+// ticket → target, consumed by the terminal WebSocket mock
+const terminalTickets = new Map<string, { kind: string; id: string }>();
 let apps: App[] = structuredClone(MOCK_APPS);
 let projects: Project[] = structuredClone(MOCK_PROJECTS);
 const templates: TemplateCatalogEntry[] = structuredClone(MOCK_TEMPLATES);
@@ -91,11 +273,98 @@ let cronJobs: CronJob[] = structuredClone(MOCK_CRON_JOBS);
 const cronRuns: Record<string, CronJobRun[]> = structuredClone(MOCK_CRON_RUNS);
 let registryCredentials: RegistryCredential[] = structuredClone(MOCK_REGISTRY_CREDENTIALS);
 let githubApps: GitHubApp[] = structuredClone(MOCK_GITHUB_APPS);
+
+// Per-app webhook secrets (the real server generates one at app creation).
+const webhookSecrets: Record<string, string> = {};
+
+function randomHex(bytes: number): string {
+	const buf = new Uint8Array(bytes);
+	crypto.getRandomValues(buf);
+	return Array.from(buf, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function webhookConfig(app: App) {
+	webhookSecrets[app.id] ??= randomHex(32);
+	const paths = {
+		github: `/api/webhooks/github/${app.id}`,
+		gitlab: `/api/webhooks/gitlab/${app.id}`,
+		gitea: `/api/webhooks/gitea/${app.id}`,
+		generic: `/api/webhooks/generic/${app.id}`
+	};
+	const domain = MOCK_SETTINGS.dashboard_domain.trim();
+	const urls = domain
+		? {
+				github: `https://${domain}${paths.github}`,
+				gitlab: `https://${domain}${paths.gitlab}`,
+				gitea: `https://${domain}${paths.gitea}`,
+				generic: `https://${domain}${paths.generic}`
+			}
+		: null;
+	return {
+		app_id: app.id,
+		paths,
+		urls,
+		secret: webhookSecrets[app.id],
+		auto_deploy: app.auto_deploy,
+		watch_branch: app.watch_branch
+	};
+}
 let users = structuredClone(MOCK_USERS);
 let integrations: Integration[] = structuredClone(MOCK_INTEGRATIONS);
 let storageProviders: StorageProvider[] = structuredClone(MOCK_STORAGE_PROVIDERS);
 let snapshots: Snapshot[] = structuredClone(MOCK_SNAPSHOTS);
 let backupConfig: BackupConfig = structuredClone(MOCK_BACKUP_CONFIG);
+// app_id → env vars / preview overrides (plaintext; only masked values leave the mock)
+const appEnvVars: Record<string, Record<string, string>> = structuredClone(MOCK_APP_ENV_VARS);
+const previewEnvVars: Record<string, Record<string, string>> = structuredClone(
+	MOCK_PREVIEW_ENV_VARS
+);
+
+function envStore(appId: string) {
+	return (appEnvVars[appId] ??= {});
+}
+
+function previewStore(appId: string) {
+	return (previewEnvVars[appId] ??= {});
+}
+
+function maskedEntries(vars: Record<string, string>) {
+	return Object.keys(vars)
+		.sort()
+		.map((key) => ({ key, masked: vars[key] ? '••••••••' : '' }));
+}
+
+function appEnvResponse(app: App) {
+	return {
+		vars: maskedEntries(envStore(app.id)),
+		preview: {
+			enabled: app.preview_enabled,
+			excluded_keys: app.preview_excluded_keys,
+			overrides: maskedEntries(previewStore(app.id))
+		}
+	};
+}
+
+function validateEnvPatch(body: { set?: Record<string, string>; unset?: string[] }) {
+	const set = Object.keys(body.set ?? {});
+	const unset = body.unset ?? [];
+	if (set.length === 0 && unset.length === 0) {
+		return 'Invalid input: nothing to change: send at least one variable to set or unset';
+	}
+	const bad = [...set, ...unset].find((key) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key));
+	if (bad) return `Invalid input: '${bad}' is not a valid variable name`;
+	return null;
+}
+
+function applyEnvPatch(
+	current: Record<string, string>,
+	body: { set?: Record<string, string>; unset?: string[] }
+) {
+	const next = { ...current, ...(body.set ?? {}) };
+	for (const key of body.unset ?? []) delete next[key];
+	return next;
+}
+
 // alert_id → AlertIntegrationLink[]
 let alertIntegrationLinks: Record<string, AlertIntegrationLink[]> = {
 	alert_1: [
@@ -110,20 +379,102 @@ let alertIntegrationLinks: Record<string, AlertIntegrationLink[]> = {
 	]
 };
 
+// ── Mock scenarios ──────────────────────────────────────────────────────────
+// Reproduce failure states in the browser. Set one in the devtools console,
+// then reload:  localStorage.setItem('tond:mock-scenario', 'session-expired')
+//
+//   server-down      every /api request gets a proxy-style 502 HTML page
+//   session-expired  the next data request gets a 401 (one-shot), then normal
+//   rate-limited     POST /api/auth/login gets 429 with Retry-After: 30
+//   logged-out       start signed out (run with VITE_DEV_AUTH_BYPASS=false)
+//   mfa              like logged-out, and sign-in asks for a 2FA code (123456)
+//   2fa-enabled      the current user starts with 2FA enabled
+//
+// Clear with localStorage.removeItem('tond:mock-scenario').
+const SCENARIO_KEY = 'tond:mock-scenario';
+
+function mockScenario(): string | null {
+	try {
+		return globalThis.localStorage?.getItem(SCENARIO_KEY) ?? null;
+	} catch {
+		return null;
+	}
+}
+
+function clearMockScenario() {
+	try {
+		globalThis.localStorage?.removeItem(SCENARIO_KEY);
+	} catch {
+		// ignore
+	}
+}
+
+let mockSignedIn = false;
+let mockTotpEnabled = mockScenario() === '2fa-enabled';
+
+function currentMockUser() {
+	return { ...MOCK_USER, totp_enabled: mockTotpEnabled };
+}
+
+const CREDENTIAL_PATHS = ['/api/auth/'];
+
 export const handlers = [
+	// Scenario gate: runs first and falls through (returns undefined) when idle.
+	http.all('/api/*', ({ request }) => {
+		const scenario = mockScenario();
+		if (!scenario) return;
+		const path = new URL(request.url).pathname;
+		if (scenario === 'server-down') {
+			return new HttpResponse('<html><body><h1>502 Bad Gateway</h1></body></html>', {
+				status: 502,
+				headers: { 'Content-Type': 'text/html' }
+			});
+		}
+		if (scenario === 'session-expired' && !CREDENTIAL_PATHS.some((p) => path.startsWith(p))) {
+			clearMockScenario();
+			return err('Unauthorized', 401);
+		}
+		if (scenario === 'rate-limited' && path === '/api/auth/login') {
+			return HttpResponse.json(
+				{ success: false, data: null, error: 'Rate limit exceeded. Try again later.' },
+				{ status: 429, headers: { 'Retry-After': '30' } }
+			);
+		}
+	}),
+
 	// ── Auth ────────────────────────────────────────────────────────────────
 
 	http.get('/api/auth/status', async () => {
 		await delay(LATENCY);
-		if (needsSetup) {
-			return ok({ needs_setup: true, authenticated: false, user: null });
+		const scenario = mockScenario();
+		if ((scenario === 'logged-out' || scenario === 'mfa') && !mockSignedIn) {
+			return ok({ authenticated: false, user: null });
 		}
-		return ok({ needs_setup: false, authenticated: true, user: MOCK_USER });
+		if (needsSetup) {
+			return ok({ authenticated: false, user: null });
+		}
+		return ok({ authenticated: true, user: currentMockUser() });
+	}),
+
+	http.post('/api/auth/setup/check', async ({ request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as { token?: string };
+		if (!needsSetup || body.token !== MOCK_SETUP_TOKEN) {
+			return err(
+				'This setup link is invalid or has already been used. If the admin account already exists, sign in instead.',
+				403
+			);
+		}
+		return ok({ valid: true });
 	}),
 
 	http.post('/api/auth/login', async () => {
 		await delay(LATENCY);
-		return ok({ user: MOCK_USER });
+		if (mockScenario() === 'mfa') {
+			return ok({ mfa_required: true });
+		}
+		mockSignedIn = true;
+		return ok({ user: currentMockUser() });
 	}),
 
 	http.post('/api/auth/logout', async () => {
@@ -133,11 +484,18 @@ export const handlers = [
 
 	http.get('/api/auth/me', async () => {
 		await delay(LATENCY);
-		return ok(MOCK_USER);
+		return ok(currentMockUser());
 	}),
 
-	http.post('/api/auth/setup', async () => {
+	http.post('/api/auth/setup', async ({ request }) => {
 		await delay(LATENCY);
+		const body = (await request.json()) as { token?: string };
+		if (!needsSetup || body.token !== MOCK_SETUP_TOKEN) {
+			return err(
+				'This setup link is invalid or has already been used. If the admin account already exists, sign in instead.',
+				403
+			);
+		}
 		needsSetup = false;
 		return ok({ user: MOCK_USER });
 	}),
@@ -150,7 +508,14 @@ export const handlers = [
 	http.get('/api/terminal/targets', async () => {
 		await delay(LATENCY);
 		return ok([
-			{ id: 'server', kind: 'server', label: 'Server', shell_user: 'tond' },
+			{
+				id: 'server',
+				kind: 'server',
+				label: 'Server',
+				shell_user: 'tond',
+				enabled: mockHostTerminalEnabled(),
+				requires_step_up: true
+			},
 			...apps
 				.filter((app) => app.status === 'running')
 				.slice(0, 4)
@@ -158,7 +523,9 @@ export const handlers = [
 					id: app.id,
 					kind: 'app',
 					label: `App: ${app.name}`,
-					shell_user: null
+					shell_user: null,
+					enabled: true,
+					requires_step_up: false
 				})),
 			...databases
 				.filter((db) => db.status === 'running')
@@ -167,9 +534,55 @@ export const handlers = [
 					id: db.id,
 					kind: 'database',
 					label: `Database: ${db.name}`,
-					shell_user: null
+					shell_user: null,
+					enabled: true,
+					requires_step_up: false
 				}))
 		]);
+	}),
+
+	http.post('/api/terminal/tickets', async ({ request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as {
+			target_kind: string;
+			target_id: string;
+			password?: string;
+			code?: string;
+		};
+		if (body.target_kind === 'server') {
+			if (!mockHostTerminalEnabled()) {
+				return err(
+					'The host terminal is turned off. To turn it on, run `sudo tond settings host-terminal on` on the server.',
+					403
+				);
+			}
+			if (!body.password) {
+				return err('Confirm your password to open the host terminal', 401);
+			}
+			if (body.password !== MOCK_STEP_UP_PASSWORD) {
+				return err('Password is incorrect', 401);
+			}
+		}
+		const ticket = `mock-ticket-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+		terminalTickets.set(ticket, { kind: body.target_kind, id: body.target_id });
+		return HttpResponse.json(
+			{ success: true, data: { ticket, expires_in: 30 }, error: null },
+			{ status: 201 }
+		);
+	}),
+
+	http.get('/api/settings/host-terminal', async () => {
+		await delay(LATENCY);
+		return ok({ enabled: mockHostTerminalEnabled() });
+	}),
+
+	http.put('/api/settings/host-terminal', async ({ request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as { enabled?: boolean };
+		return err(
+			`The host terminal can only be switched on or off on the server itself: run \`sudo tond settings host-terminal ${body.enabled ? 'on' : 'off'}\`.`,
+			403
+		);
 	}),
 
 	http.post('/api/auth/users', async ({ request }) => {
@@ -179,6 +592,7 @@ export const handlers = [
 			id: `usr_${Date.now()}`,
 			email: body.email,
 			role: body.role ?? 'member',
+			totp_enabled: false,
 			created_at: new Date().toISOString()
 		};
 		users = [...users, newUser];
@@ -238,8 +652,15 @@ export const handlers = [
 
 	// ── Phase 7.1 — TOTP 2FA ────────────────────────────────────────────────
 
-	http.post('/api/auth/2fa/setup', async () => {
+	http.post('/api/auth/2fa/setup', async ({ request }) => {
 		await delay(LATENCY);
+		const body = (await request.json()) as { password?: string };
+		if (!body.password || body.password === 'wrong') {
+			return err('Password is incorrect', 401);
+		}
+		if (mockTotpEnabled) {
+			return err('Two-factor authentication is already enabled', 409);
+		}
 		const secret = 'JBSWY3DPEHPK3PXP';
 		// Minimal 1×1 white PNG as a stand-in for the real server-generated QR code
 		const qr_code =
@@ -257,6 +678,7 @@ export const handlers = [
 		if (body.code !== '123456') {
 			return err('Invalid TOTP code', 401);
 		}
+		mockTotpEnabled = true;
 		return ok({
 			message: '2FA enabled successfully',
 			backup_codes: Array.from({ length: 10 }, () =>
@@ -274,6 +696,7 @@ export const handlers = [
 		if (body.code !== '123456') {
 			return err('Invalid TOTP or backup code', 401);
 		}
+		mockTotpEnabled = false;
 		return ok({ message: '2FA disabled' });
 	}),
 
@@ -283,7 +706,8 @@ export const handlers = [
 		if (body.code !== '123456') {
 			return err('Invalid TOTP or backup code', 401);
 		}
-		return ok({ user: MOCK_USER });
+		mockSignedIn = true;
+		return ok({ user: currentMockUser() });
 	}),
 
 	// ── Projects ──────────────────────────────────────────────────────────────
@@ -386,7 +810,24 @@ export const handlers = [
 
 	http.post('/api/apps', async ({ request }) => {
 		await delay(LATENCY * 2);
-		const body = (await request.json()) as Partial<App>;
+		const body = (await request.json()) as Omit<Partial<App>, 'volumes'> & {
+			volumes?: VolumeInput[];
+		};
+		if (body.source_type === 'compose') {
+			const problems = mockComposeProblems(body.compose_content ?? '');
+			if (problems.length === 1) return err(`Compose file rejected: ${problems[0]}`, 400);
+			if (problems.length > 1) {
+				return err(
+					`Compose file rejected (${problems.length} problems):\n- ${problems.join('\n- ')}`,
+					400
+				);
+			}
+		}
+		const appName = body.name ?? 'new-app';
+		for (const v of body.volumes ?? []) {
+			const problem = mockVolumeError(v, `${MOCK_VOLUMES_DIR}/${appName}`);
+			if (problem) return err(problem, 400);
+		}
 		const newApp: App = {
 			id: `app_${Date.now()}`,
 			name: body.name ?? 'new-app',
@@ -402,7 +843,7 @@ export const handlers = [
 			health_check_interval: 30,
 			health_failure_threshold: 3,
 			health_consecutive_failures: 0,
-			volumes: [],
+			volumes: (body.volumes ?? []).map((v) => mockAppVolume(appName, v)),
 			drain_timeout: 30,
 			build_method:
 				body.source_type === 'git' || body.source_type === 'dockerfile'
@@ -420,7 +861,6 @@ export const handlers = [
 			static_build: body.static_build ?? false,
 			preview_enabled: false,
 			preview_excluded_keys: [],
-			preview_env_vars: {},
 			created_at: new Date().toISOString(),
 			updated_at: new Date().toISOString()
 		};
@@ -478,11 +918,64 @@ export const handlers = [
 		return ok(null);
 	}),
 
-	http.put('/api/apps/:id/env', async ({ params }) => {
+	// ── App environment (masked reads, per-key patches) ──
+
+	http.get('/api/apps/:id/env', async ({ params }) => {
 		await delay(LATENCY);
 		const app = apps.find((a) => a.id === params.id);
 		if (!app) return err('App not found', 404);
-		return ok(null);
+		return ok(appEnvResponse(app));
+	}),
+
+	http.get('/api/apps/:id/env/:key', async ({ params }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id);
+		if (!app) return err('App not found', 404);
+		const value = envStore(app.id)[params.key as string];
+		if (value === undefined) return err(`Not found: variable '${params.key}'`, 404);
+		return ok({ key: params.key, value });
+	}),
+
+	http.patch('/api/apps/:id/env', async ({ params, request }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id);
+		if (!app) return err('App not found', 404);
+		const body = (await request.json()) as { set?: Record<string, string>; unset?: string[] };
+		const problem = validateEnvPatch(body);
+		if (problem) return err(problem);
+		appEnvVars[app.id] = applyEnvPatch(envStore(app.id), body);
+		return ok(appEnvResponse(app));
+	}),
+
+	http.get('/api/apps/:id/preview-env/:key', async ({ params }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id);
+		if (!app) return err('App not found', 404);
+		const value = previewStore(app.id)[params.key as string];
+		if (value === undefined) return err(`Not found: preview override '${params.key}'`, 404);
+		return ok({ key: params.key, value });
+	}),
+
+	http.patch('/api/apps/:id/preview-env', async ({ params, request }) => {
+		await delay(LATENCY);
+		const idx = apps.findIndex((a) => a.id === params.id);
+		if (idx === -1) return err('App not found', 404);
+		const body = (await request.json()) as {
+			set?: Record<string, string>;
+			unset?: string[];
+			exclude?: string[];
+			include?: string[];
+		};
+		const hasExclusions = (body.exclude?.length ?? 0) + (body.include?.length ?? 0) > 0;
+		const problem = hasExclusions && !body.set && !body.unset ? null : validateEnvPatch(body);
+		if (problem) return err(problem);
+		const app = apps[idx];
+		previewEnvVars[app.id] = applyEnvPatch(previewStore(app.id), body);
+		const excluded = new Set(app.preview_excluded_keys);
+		for (const key of body.exclude ?? []) excluded.add(key);
+		for (const key of body.include ?? []) excluded.delete(key);
+		apps[idx] = { ...app, preview_excluded_keys: [...excluded].sort() };
+		return ok(appEnvResponse(apps[idx]));
 	}),
 
 	http.put('/api/apps/:id/domain', async ({ params, request }) => {
@@ -491,7 +984,23 @@ export const handlers = [
 		if (idx === -1) return err('App not found', 404);
 		const body = (await request.json()) as { domain: string };
 		apps[idx] = { ...apps[idx], domain: body.domain, updated_at: new Date().toISOString() };
+		queueMockCertificate(body.domain);
 		return ok(apps[idx]);
+	}),
+
+	// ── Certificates ──────────────────────────────────────────────────────────
+
+	http.get('/api/certs', async () => {
+		await delay(LATENCY);
+		return ok(certificates);
+	}),
+
+	http.post('/api/certs/:domain/retry', async ({ params }) => {
+		await delay(LATENCY);
+		const cert = certificates.find((c) => c.domain === params.domain);
+		if (!cert) return err(`No certificate for ${params.domain}`, 404);
+		cert.next_retry_at = null;
+		return ok({ message: 'Certificate retry queued', domain: cert.domain });
 	}),
 
 	http.put('/api/apps/:id/health', async ({ params, request }) => {
@@ -541,8 +1050,13 @@ export const handlers = [
 		await delay(LATENCY);
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx === -1) return err('App not found', 404);
-		const body = (await request.json()) as { container_path: string };
-		const vol = { host_path: `/data${body.container_path}`, container_path: body.container_path };
+		const body = (await request.json()) as VolumeInput & { host_path?: string };
+		const problem = mockVolumeError(body, `${MOCK_VOLUMES_DIR}/${apps[idx].name}`);
+		if (problem) return err(problem, 400);
+		if (apps[idx].volumes.some((v) => v.container_path === body.container_path)) {
+			return err(`A volume is already mounted at ${body.container_path}`, 400);
+		}
+		const vol = mockAppVolume(apps[idx].name, body);
 		apps[idx] = {
 			...apps[idx],
 			volumes: [...apps[idx].volumes, vol],
@@ -590,13 +1104,50 @@ export const handlers = [
 		});
 	}),
 
-	http.post('/api/apps/:id/rollback', async ({ params }) => {
+	http.post('/api/apps/:id/rollback', async ({ params, request }) => {
 		await delay(LATENCY);
+		const text = await request.text();
+		const body = (text.trim() ? JSON.parse(text) : {}) as { deployment_id?: string };
+		const list = deployments[params.id as string] ?? [];
+		const target = body.deployment_id
+			? list.find((d) => d.id === body.deployment_id)
+			: list.find((d) => d.rollback_available);
+		if (!target) {
+			return err(
+				'No previous deployment to roll back to: there is no earlier successful deployment whose image is still available',
+				400
+			);
+		}
+		if (!target.rollback_available) {
+			return err(
+				`Can't roll back to this deployment: ${target.rollback_unavailable_reason ?? 'unavailable'}`,
+				400
+			);
+		}
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx !== -1) {
 			apps[idx] = { ...apps[idx], status: 'running', updated_at: new Date().toISOString() };
 		}
-		return ok(null);
+		// The restored image becomes current.
+		deployments[params.id as string] = list.map((d) => ({
+			...d,
+			is_current: d.id === target.id,
+			rollback_available: d.id !== target.id && d.status === 'succeeded' && !d.image_pruned,
+			rollback_unavailable_reason:
+				d.id === target.id ? 'This image is already running' : d.rollback_unavailable_reason
+		}));
+		return ok({
+			message: 'Rollback started',
+			image_tag: target.image_tag,
+			deployment_id: target.id
+		});
+	}),
+
+	http.post('/api/compose/validate', async ({ request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as { compose_content: string };
+		const errors = mockComposeProblems(body.compose_content);
+		return ok({ valid: errors.length === 0, errors });
 	}),
 
 	// ── Git Integration ───────────────────────────────────────────────────────
@@ -618,11 +1169,35 @@ export const handlers = [
 		return ok(newKey);
 	}),
 
-	http.put('/api/apps/:id/webhook-secret', async ({ params }) => {
+	http.get('/api/apps/:id/webhook', async ({ params }) => {
 		await delay(LATENCY);
-		const app = apps.find((a) => a.id === params.id);
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
 		if (!app) return err('App not found', 404);
-		return ok(app);
+		return ok(webhookConfig(app));
+	}),
+
+	http.put('/api/apps/:id/webhook-secret', async ({ params, request }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
+		if (!app) return err('App not found', 404);
+		const body = (await request.json()) as { secret?: unknown };
+		const secret = typeof body.secret === 'string' ? body.secret.trim() : '';
+		if (secret.length < 16) {
+			return err(
+				'Invalid input: webhook secret must be at least 16 characters (rotate it to have one generated)',
+				400
+			);
+		}
+		webhookSecrets[app.id] = secret;
+		return ok(webhookConfig(app));
+	}),
+
+	http.post('/api/apps/:id/webhook-secret/rotate', async ({ params }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
+		if (!app) return err('App not found', 404);
+		webhookSecrets[app.id] = randomHex(32);
+		return ok(webhookConfig(app));
 	}),
 
 	http.put('/api/apps/:id/auto-deploy', async ({ params, request }) => {
@@ -704,6 +1279,8 @@ export const handlers = [
 
 	http.post('/api/apps/:id/preview', async ({ params, request }) => {
 		await delay(LATENCY);
+		if (!MOCK_SETTINGS.preview_domain) return err(PREVIEW_DOMAIN_REQUIRED);
+		const app = apps.find((a) => a.id === params.id);
 		const body = (await request.json()) as {
 			ttl_hours?: number;
 			pr_number?: number;
@@ -711,6 +1288,10 @@ export const handlers = [
 			head_ref?: string;
 			pr_url?: string;
 		};
+		// Mirrors the server: stored PR links must be https:// URLs.
+		if (body.pr_url && !/^https:\/\/[^/@\s]+/i.test(body.pr_url)) {
+			return err('Invalid input: pr_url must be an https:// URL', 400);
+		}
 		const ttl = (body.ttl_hours ?? 24) * 3600;
 		const slug = `preview-${Date.now()}`;
 		const newPreview: PreviewDeployment = {
@@ -718,7 +1299,7 @@ export const handlers = [
 			app_id: params.id as string,
 			project_preview_id: null,
 			slug,
-			subdomain: `${slug}.preview.example.com`,
+			subdomain: `${slug}-${app?.name ?? 'app'}.${MOCK_SETTINGS.preview_domain}`,
 			container_id: null,
 			host_port: null,
 			image_tag: null,
@@ -726,7 +1307,7 @@ export const handlers = [
 			status: 'building',
 			expires_at: new Date(Date.now() + ttl * 1000).toISOString(),
 			created_at: new Date().toISOString(),
-			url: `https://${slug}.preview.example.com`,
+			url: `https://${slug}-${app?.name ?? 'app'}.${MOCK_SETTINGS.preview_domain}`,
 			pr_number: body.pr_number ?? null,
 			head_sha: body.head_sha ?? null,
 			head_ref: body.head_ref ?? null,
@@ -754,19 +1335,16 @@ export const handlers = [
 		await delay(LATENCY);
 		const idx = apps.findIndex((a) => a.id === params.id);
 		if (idx === -1) return err('App not found', 404);
-		const body = (await request.json()) as {
-			preview_enabled: boolean;
-			preview_excluded_keys?: string[];
-			preview_env_vars?: Record<string, string>;
-		};
+		const body = (await request.json()) as { preview_enabled: boolean };
+		if (body.preview_enabled && !MOCK_SETTINGS.preview_domain) {
+			return err(PREVIEW_DOMAIN_REQUIRED);
+		}
 		apps[idx] = {
 			...apps[idx],
 			preview_enabled: body.preview_enabled,
-			preview_excluded_keys: body.preview_excluded_keys ?? apps[idx].preview_excluded_keys,
-			preview_env_vars: body.preview_env_vars ?? apps[idx].preview_env_vars,
 			updated_at: new Date().toISOString()
 		};
-		return ok(apps[idx]);
+		return ok({ preview_enabled: body.preview_enabled });
 	}),
 
 	// ── Project Previews ──────────────────────────────────────────────────────
@@ -782,6 +1360,7 @@ export const handlers = [
 		const projectId = params.id as string;
 		const project = projects.find((p) => p.id === projectId || p.name === projectId);
 		if (!project) return err('Project not found', 404);
+		if (!MOCK_SETTINGS.preview_domain) return err(PREVIEW_DOMAIN_REQUIRED);
 		const body = (await request.json()) as { ttl_hours?: number };
 		const ttlHours = body.ttl_hours ?? 24;
 		const ttlSeconds = ttlHours * 3600;
@@ -795,7 +1374,7 @@ export const handlers = [
 			app_id: app.id,
 			project_preview_id: `pprev_${Date.now()}`,
 			slug,
-			subdomain: `${slug}-${app.name}.dash.example.com`,
+			subdomain: `${slug}-${app.name}.${MOCK_SETTINGS.preview_domain}`,
 			container_id: null,
 			host_port: null,
 			image_tag: null,
@@ -803,7 +1382,7 @@ export const handlers = [
 			status: 'running',
 			expires_at: expiresAt,
 			created_at: createdAt,
-			url: `https://${slug}-${app.name}.dash.example.com`,
+			url: `https://${slug}-${app.name}.${MOCK_SETTINGS.preview_domain}`,
 			pr_number: null,
 			head_sha: null,
 			head_ref: null,
@@ -895,7 +1474,19 @@ export const handlers = [
 	http.put('/api/settings', async ({ request }) => {
 		await delay(LATENCY);
 		const body = (await request.json()) as Partial<typeof MOCK_SETTINGS>;
+		if (body.dashboard_domain !== undefined) {
+			body.dashboard_domain = normalizeDomain(body.dashboard_domain);
+		}
+		if (body.preview_domain !== undefined) {
+			body.preview_domain = normalizeDomain(body.preview_domain);
+		}
+		const previewError = mockPreviewDomainError(
+			body.preview_domain ?? MOCK_SETTINGS.preview_domain,
+			body.dashboard_domain ?? MOCK_SETTINGS.dashboard_domain
+		);
+		if (previewError) return err(previewError);
 		Object.assign(MOCK_SETTINGS, body);
+		if (body.dashboard_domain) queueMockCertificate(body.dashboard_domain);
 		MOCK_ONBOARDING_STATUS.dashboard_domain = MOCK_SETTINGS.dashboard_domain;
 		MOCK_ONBOARDING_STATUS.domain_status.configured =
 			MOCK_SETTINGS.dashboard_domain.trim().length > 0;
@@ -1065,6 +1656,7 @@ export const handlers = [
 			db_type: string;
 			project_id?: string;
 			memory_limit?: number;
+			public_access?: boolean;
 		};
 		const defaultImages: Record<string, string> = {
 			postgres: 'postgres:16-alpine',
@@ -1093,7 +1685,8 @@ export const handlers = [
 			image_used: defaultImages[body.db_type] ?? `${body.db_type}:latest`,
 			custom_image: null,
 			created_at: new Date().toISOString(),
-			updated_at: new Date().toISOString()
+			updated_at: new Date().toISOString(),
+			public_access: body.public_access ?? false
 		};
 		databases = [...databases, newDb];
 		const newDbUser = newDb.db_user!;
@@ -1104,6 +1697,7 @@ export const handlers = [
 		return ok({
 			...newDb,
 			connection_string: newConnectionString,
+			public_connection_string: mockPublicUrl(newDb),
 			internal_connection_string: null
 		});
 	}),
@@ -1129,6 +1723,7 @@ export const handlers = [
 		return ok({
 			...db,
 			connection_string: db.custom_external_url ?? computedExternal,
+			public_connection_string: mockPublicUrl(db),
 			internal_connection_string: db.custom_internal_url ?? computedInternal
 		});
 	}),
@@ -1148,6 +1743,7 @@ export const handlers = [
 			custom_internal_url?: string | null;
 			custom_image?: string | null;
 			memory_limit?: number | null;
+			public_access?: boolean;
 		};
 		// Apply updates — empty string clears the override (mirrors backend behaviour)
 		const updated = { ...databases[idx] };
@@ -1170,6 +1766,9 @@ export const handlers = [
 		if (body.memory_limit !== undefined) {
 			updated.memory_limit = body.memory_limit ?? null;
 		}
+		if (body.public_access !== undefined) {
+			updated.public_access = body.public_access;
+		}
 		updated.updated_at = new Date().toISOString();
 		databases[idx] = updated;
 		const db = databases[idx];
@@ -1191,6 +1790,7 @@ export const handlers = [
 		return ok({
 			...db,
 			connection_string: db.custom_external_url ?? computedExternal,
+			public_connection_string: mockPublicUrl(db),
 			internal_connection_string: db.custom_internal_url ?? computedInternal
 		});
 	}),
@@ -1205,11 +1805,40 @@ export const handlers = [
 			db_password?: string | null;
 			root_password?: string | null;
 		};
-		const updated = { ...databases[idx] };
-		if (body.db_name !== undefined) updated.db_name = body.db_name ?? null;
-		if (body.db_user !== undefined) updated.db_user = body.db_user ?? null;
-		if (body.db_password !== undefined) updated.db_password = body.db_password ?? null;
-		if (body.root_password !== undefined) updated.root_password = body.root_password ?? null;
+		// Mirrors the server: passwords change inside the running engine; renames,
+		// Redis/KeyDB and stopped databases are refused and nothing is saved.
+		const current = databases[idx];
+		const renamed = (next: string | null | undefined, now: string | null) =>
+			!!next?.trim() && next.trim() !== now;
+		if (renamed(body.db_name, current.db_name) || renamed(body.db_user, current.db_user)) {
+			return err(
+				"Invalid input: The username of an existing database can't be changed; only passwords can."
+			);
+		}
+		const changed: string[] = [];
+		const updated = { ...current };
+		const nextPw = body.db_password?.trim();
+		if (nextPw && nextPw !== current.db_password) {
+			updated.db_password = nextPw;
+			changed.push('db_password');
+		}
+		const nextRoot = body.root_password?.trim();
+		if (nextRoot && nextRoot !== current.root_password) {
+			updated.root_password = nextRoot;
+			changed.push('root_password');
+		}
+		if (changed.length === 0) return err('Invalid input: Nothing to change: enter a new password.');
+		if (current.db_type === 'redis' || current.db_type === 'keydb') {
+			return err(
+				"Invalid input: Redis and KeyDB passwords can't be changed in place yet. The stored password was not changed."
+			);
+		}
+		if (current.status !== 'running') {
+			return err(
+				`Invalid input: Start '${current.name}' first: the password is changed inside the running database. Nothing was changed.`
+			);
+		}
+		await delay(LATENCY * 3); // simulate the docker exec
 		updated.updated_at = new Date().toISOString();
 		databases[idx] = updated;
 		const db = databases[idx];
@@ -1231,9 +1860,10 @@ export const handlers = [
 			database: {
 				...db,
 				connection_string: db.custom_external_url ?? computedExternalC,
+				public_connection_string: mockPublicUrl(db),
 				internal_connection_string: db.custom_internal_url ?? computedInternalC
 			},
-			requires_redeploy: true
+			changed
 		});
 	}),
 
@@ -1302,6 +1932,7 @@ export const handlers = [
 		return ok({
 			...updated,
 			connection_string: updated.custom_external_url ?? computedExternal,
+			public_connection_string: mockPublicUrl(updated),
 			internal_connection_string: updated.custom_internal_url ?? computedInternal
 		});
 	}),
@@ -1329,7 +1960,7 @@ export const handlers = [
 			timezone?: string | null;
 			max_retries?: number;
 			retry_delay_seconds?: number;
-			volumes?: { host_path: string; container_path: string }[] | null;
+			volumes?: CronVolumeInput[] | null;
 		};
 		const newJob: CronJob = {
 			id: `cron_${Date.now()}`,
@@ -1353,7 +1984,7 @@ export const handlers = [
 			timezone: body.timezone ?? null,
 			max_retries: body.max_retries ?? 0,
 			retry_delay_seconds: body.retry_delay_seconds ?? 60,
-			volumes: body.volumes ?? null
+			volumes: mockCronVolumes(`cron_${Date.now()}`, body.volumes)
 		};
 		cronJobs = [...cronJobs, newJob];
 		cronRuns[newJob.id] = [];
@@ -1386,7 +2017,7 @@ export const handlers = [
 			timezone: string | null;
 			max_retries: number;
 			retry_delay_seconds: number;
-			volumes: { host_path: string; container_path: string }[] | null;
+			volumes: CronVolumeInput[] | null;
 		}>;
 		// Check for name conflict
 		if (body.name !== undefined && body.name !== cronJobs[idx].name) {
@@ -1415,7 +2046,9 @@ export const handlers = [
 			...(body.retry_delay_seconds !== undefined && {
 				retry_delay_seconds: body.retry_delay_seconds
 			}),
-			...('volumes' in body && { volumes: body.volumes ?? null }),
+			...('volumes' in body && {
+				volumes: mockCronVolumes(cronJobs[idx].id, body.volumes)
+			}),
 			updated_at: new Date().toISOString()
 		};
 		return ok(cronJobs[idx]);
@@ -1628,6 +2261,13 @@ export const handlers = [
 		return ok(githubApps);
 	}),
 
+	http.post('/api/github-apps/complete', async ({ request }) => {
+		await delay(LATENCY);
+		const body = (await request.json()) as { state?: string | null };
+		if (!body.state) return err('missing_state', 400);
+		return ok({ completed: true });
+	}),
+
 	http.post('/api/github-apps/manifest', async () => {
 		await delay(LATENCY);
 		// In mock mode: simulate the manifest flow — return a github_url that points
@@ -1636,6 +2276,16 @@ export const handlers = [
 		return ok({
 			github_url: '/integrations/github?mock_github_connected=1',
 			manifest: '{}'
+		});
+	}),
+
+	http.post('/api/github-apps/:id/install', async ({ params }) => {
+		await delay(LATENCY);
+		const app = githubApps.find((a) => a.id === params.id);
+		if (!app) return err('GitHub App not found', 404);
+		// The real server returns a single-use, admin-bound state on the URL.
+		return ok({
+			url: `https://github.com/apps/${encodeURIComponent(app.slug)}/installations/new?state=${randomHex(32)}`
 		});
 	}),
 
@@ -1875,8 +2525,21 @@ export const handlers = [
 
 	terminalStream.addEventListener('connection', ({ client }) => {
 		const url = new URL(client.url);
-		const targetKind = url.searchParams.get('target_kind') ?? 'server';
-		const targetId = url.searchParams.get('target_id') ?? 'server';
+		const ticket = url.searchParams.get('ticket') ?? '';
+		const grant = terminalTickets.get(ticket);
+		terminalTickets.delete(ticket);
+		if (!grant) {
+			client.send(
+				JSON.stringify({
+					type: 'error',
+					message: 'Terminal ticket is invalid, expired or already used'
+				})
+			);
+			client.close();
+			return;
+		}
+		const targetKind = grant.kind;
+		const targetId = grant.id;
 		const label =
 			targetKind === 'server'
 				? 'server'

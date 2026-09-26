@@ -18,6 +18,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
 bollard = { workspace = true }
+serde_yaml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 chrono = { workspace = true }
@@ -40,6 +41,7 @@ cron = { workspace = true }
 chrono-tz = { workspace = true }
 jsonwebtoken = { workspace = true }
 urlencoding = { workspace = true }
+psl = { workspace = true }
 totp-rs = { workspace = true }
 lettre = { workspace = true }
 flate2 = { workspace = true }
@@ -50,3 +52,4 @@ portable-pty = { workspace = true }
 [dev-dependencies]
 filetime = { workspace = true }
 tempfile = { workspace = true }
+tower = { version = "0.5", features = ["util"] }

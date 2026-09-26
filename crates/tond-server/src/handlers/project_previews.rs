@@ -3,8 +3,10 @@
 // A project preview spins up one ephemeral preview deployment per member app
 // under a shared slug. All child subdomains use the same prefix so it is
 // immediately obvious they belong together:
-//   abc123-frontend.domain.com
-//   abc123-api.domain.com
+//   abc123-frontend.<preview_domain>
+//   abc123-api.<preview_domain>
+// The preview domain is required (see domains.rs); without it creating a
+// project preview is refused with a 400.
 //
 // Routes (all require RequireAuth + RateLimit):
 //   POST   /api/projects/{id}/previews
@@ -35,6 +37,7 @@ use tond_common::{
 use crate::{
     auth::{RateLimit, RequireAuth},
     deploy, docker,
+    domains::{preview_host, require_preview_domain},
     error::AppError,
     state::AppState,
 };
@@ -113,6 +116,10 @@ pub async fn create_project_preview(
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
+    let preview_domain = match require_preview_domain(&state).await {
+        Ok(d) => d,
+        Err(e) => return e.into_response(),
+    };
 
     let ttl_hours = body
         .as_ref()
@@ -152,16 +159,6 @@ pub async fn create_project_preview(
     let created_at = now.to_rfc3339();
     let pp_id = uuid::Uuid::new_v4().to_string();
 
-    // Determine dashboard domain for subdomain construction
-    let dashboard_domain: Option<String> = {
-        let s = state.settings.read().await;
-        if s.dashboard_domain.is_empty() {
-            None
-        } else {
-            Some(s.dashboard_domain.clone())
-        }
-    };
-
     // Insert project_previews row
     if let Err(e) = sqlx::query(
         "INSERT INTO project_previews (id, project_id, slug, ttl_seconds, expires_at, created_at)
@@ -187,9 +184,7 @@ pub async fn create_project_preview(
     let mut inserted_previews: Vec<PreviewDeployment> = Vec::with_capacity(apps.len());
     for app in &apps {
         let preview_id = uuid::Uuid::new_v4().to_string();
-        let subdomain = dashboard_domain
-            .as_ref()
-            .map(|d| format!("{}-{}.{}", slug, app.name, d));
+        let subdomain = preview_host(&slug, &app.name, &preview_domain);
 
         if let Err(e) = sqlx::query(
             "INSERT INTO preview_deployments
@@ -428,7 +423,8 @@ mod tests {
 
         let settings = ServerSettings {
             server_name: "tond".to_string(),
-            dashboard_domain: "preview.example.com".to_string(),
+            dashboard_domain: "dash.example.com".to_string(),
+            preview_domain: "example-previews.com".to_string(),
         };
 
         AppState {

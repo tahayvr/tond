@@ -36,7 +36,6 @@ describe('integrations page', () => {
 							slug: 'tond-github-app',
 							installation_id: 123,
 							installed: true,
-							install_url: 'https://github.com/apps/tond-github-app/installations/new',
 							created_at: '2026-01-01T00:00:00.000Z',
 							updated_at: '2026-01-01T00:00:00.000Z'
 						}

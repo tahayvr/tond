@@ -32,24 +32,11 @@ use tond_common::{
 use uuid::Uuid;
 
 use crate::{
-    auth::{RateLimit, RequireAuth},
+    auth::{RateLimit, RequireAdmin, RequireAuth},
     error::AppError,
-    secret_key::{self, SecretKeys},
+    secret_key::{self, Purpose},
     state::AppState,
 };
-
-// ── Encryption ──────────────────────────────────────────────────────────────
-
-/// Encrypt a plaintext password with the current TOND_SECRET_KEY.
-/// Returns base64(nonce || ciphertext).
-pub fn encrypt_password(plaintext: &str) -> anyhow::Result<String> {
-    secret_key::encrypt(plaintext, &SecretKeys::current().aes)
-}
-
-/// Decrypt a stored password from base64(nonce || ciphertext).
-pub fn decrypt_password(encrypted: &str) -> anyhow::Result<String> {
-    secret_key::decrypt(encrypted, &SecretKeys::current().aes)
-}
 
 // ── Handlers ────────────────────────────────────────────────────────────────
 
@@ -72,7 +59,7 @@ pub async fn list_registry_credentials(
 /// POST /api/registry-credentials
 pub async fn create_registry_credential(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Json(payload): Json<CreateRegistryCredentialRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -92,7 +79,7 @@ pub async fn create_registry_credential(
         )));
     }
 
-    let password_enc = encrypt_password(&payload.password)
+    let password_enc = secret_key::encrypt(Purpose::RegistryPassword, &payload.password)
         .map_err(|e| AppError(TondError::Internal(e.to_string())))?;
 
     let id = Uuid::new_v4().to_string();
@@ -124,7 +111,7 @@ pub async fn create_registry_credential(
 /// DELETE /api/registry-credentials/{id}
 pub async fn delete_registry_credential(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Path(cred_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -149,7 +136,7 @@ pub async fn delete_registry_credential(
 /// Attach or detach a registry credential from an app.
 pub async fn set_app_registry_credential(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    _admin: RequireAdmin,
     State(state): State<AppState>,
     Path(app_id): Path<String>,
     Json(payload): Json<SetRegistryCredentialRequest>,

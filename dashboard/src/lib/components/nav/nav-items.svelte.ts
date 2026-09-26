@@ -18,4 +18,9 @@ export const navItems: NavItem[] = [
 	{ href: '/settings', label: 'Settings', icon: 'settings' }
 ];
 
+/** True when `pathname` is `href` or a page below it. */
+export function isActive(href: string, pathname: string): boolean {
+	return pathname === href || pathname.startsWith(href + '/');
+}
+
 export default navItems;

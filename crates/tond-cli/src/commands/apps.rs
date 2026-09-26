@@ -230,9 +230,18 @@ pub enum AppsAction {
         #[arg(long)]
         branch: Option<String>,
 
-        /// Set the HMAC webhook secret (use empty string to clear it)
-        #[arg(long)]
+        /// Replace the webhook secret with your own value (min. 16 characters).
+        /// Webhook verification is mandatory and cannot be turned off.
+        #[arg(long, conflicts_with = "rotate_secret")]
         secret: Option<String>,
+
+        /// Replace the webhook secret with a newly generated one
+        #[arg(long)]
+        rotate_secret: bool,
+
+        /// Print the webhook secret
+        #[arg(long)]
+        show_secret: bool,
     },
 
     /// Manage persistent volumes for an app
@@ -257,6 +266,10 @@ pub enum VolumeAction {
 
         /// Absolute path inside the container (e.g. /data)
         container_path: String,
+
+        /// Directory name under the app's volume folder (default: derived from the path)
+        #[arg(long)]
+        name: Option<String>,
     },
 
     /// List volumes for an app
@@ -659,16 +672,19 @@ pub async fn handle(client: &TondClient, action: AppsAction) -> Result<()> {
             disable,
             branch,
             secret,
+            rotate_secret,
+            show_secret,
         } => {
-            // Apply secret if provided
             if let Some(ref s) = secret {
-                let secret_val = if s.is_empty() { None } else { Some(s.as_str()) };
-                client.set_webhook_secret(&app, secret_val).await?;
-                if secret_val.is_some() {
-                    println!("Webhook secret set for {}", app);
-                } else {
-                    println!("Webhook secret cleared for {}", app);
-                }
+                client.set_webhook_secret(&app, s).await?;
+                println!("Webhook secret set for {}", app);
+            }
+            if rotate_secret {
+                client.rotate_webhook_secret(&app).await?;
+                println!(
+                    "Webhook secret rotated for {} — update it in your git provider",
+                    app
+                );
             }
 
             // Apply auto-deploy toggle
@@ -696,11 +712,24 @@ pub async fn handle(client: &TondClient, action: AppsAction) -> Result<()> {
 
             // Always print the webhook URLs
             let info = client.get_app(&app).await?;
-            let server = "http://localhost:3001";
+            let config = client.get_webhook_config(&info.id).await?;
+            let urls = config.urls.clone().unwrap_or(config.paths.clone());
             println!();
             println!("Webhook URLs for {}:", info.name);
-            println!("  GitHub:  {}/api/webhooks/github/{}", server, info.id);
-            println!("  Generic: {}/api/webhooks/generic/{}", server, info.id);
+            println!("  GitHub:        {}", urls.github);
+            println!("  GitLab:        {}", urls.gitlab);
+            println!("  Gitea/Forgejo: {}", urls.gitea);
+            println!("  Generic:       {}", urls.generic);
+            if config.urls.is_none() {
+                println!("  (set dashboard_domain in Settings to get absolute URLs)");
+            }
+            if show_secret || rotate_secret {
+                println!();
+                println!("Webhook secret: {}", config.secret);
+            } else {
+                println!();
+                println!("Webhook secret: hidden (use --show-secret)");
+            }
             println!();
             println!(
                 "Auto-deploy: {}",
@@ -720,8 +749,11 @@ pub async fn handle(client: &TondClient, action: AppsAction) -> Result<()> {
             VolumeAction::Add {
                 app,
                 container_path,
+                name,
             } => {
-                client.add_volume(&app, &container_path).await?;
+                client
+                    .add_volume(&app, &container_path, name.as_deref())
+                    .await?;
                 println!(
                     "Volume {} added to {}. Redeploy to apply: tond apps deploy {}",
                     container_path, app, app
@@ -1128,7 +1160,9 @@ required = true
                         custom_image: None,
                         created_at: "2026-01-01T00:00:00Z".to_string(),
                         updated_at: "2026-01-01T00:00:00Z".to_string(),
+                        public_access: false,
                     },
+                    public_connection_string: None,
                     connection_string: Some(
                         "postgres://tond_analytics:secret@localhost:5432/tond_analytics"
                             .to_string(),

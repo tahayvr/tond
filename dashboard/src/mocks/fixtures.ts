@@ -8,6 +8,7 @@ import type {
 	AlertRule,
 	AuditLogEntry,
 	BackupConfig,
+	Certificate,
 	CronJob,
 	CronJobRun,
 	Deployment,
@@ -37,6 +38,7 @@ export const MOCK_USER: User = {
 	id: 'usr_dev',
 	email: 'admin@localhost',
 	role: 'admin',
+	totp_enabled: false,
 	created_at: '2025-01-01T00:00:00.000Z'
 };
 
@@ -46,6 +48,7 @@ export const MOCK_USERS: User[] = [
 		id: 'usr_2',
 		email: 'member@localhost',
 		role: 'member',
+		totp_enabled: false,
 		created_at: '2025-02-01T00:00:00.000Z'
 	}
 ];
@@ -139,6 +142,24 @@ export const MOCK_TEMPLATES: TemplateCatalogEntry[] = [
 	}
 ];
 
+// ── App environment variables (served masked by GET /apps/:id/env) ─────────
+
+export const MOCK_APP_ENV_VARS: Record<string, Record<string, string>> = {
+	app_running: {
+		DATABASE_URL: 'postgres://api:s3cret@db.internal:5432/api',
+		SECRET_KEY: 'sk_live_4f9a2c7e1b',
+		LOG_LEVEL: 'info',
+		FEATURE_FLAGS: ''
+	},
+	app_stopped: {
+		NEXT_PUBLIC_API_URL: 'https://api.example.com'
+	}
+};
+
+export const MOCK_PREVIEW_ENV_VARS: Record<string, Record<string, string>> = {
+	app_running: { DATABASE_URL: 'postgres://preview:pass@localhost/preview_db' }
+};
+
 // ── Apps ───────────────────────────────────────────────────────────────────
 
 export const MOCK_APPS: App[] = [
@@ -157,7 +178,13 @@ export const MOCK_APPS: App[] = [
 		health_check_interval: 30,
 		health_failure_threshold: 3,
 		health_consecutive_failures: 0,
-		volumes: [{ host_path: '/data/uploads', container_path: '/app/uploads' }],
+		volumes: [
+			{
+				name: 'uploads',
+				host_path: '/opt/tond/data/volumes/api-service/uploads',
+				container_path: '/app/uploads'
+			}
+		],
 		drain_timeout: 30,
 		build_method: 'tbuild',
 		auto_deploy: true,
@@ -173,7 +200,6 @@ export const MOCK_APPS: App[] = [
 		static_build: false,
 		preview_enabled: true,
 		preview_excluded_keys: ['DATABASE_URL', 'SECRET_KEY'],
-		preview_env_vars: { DATABASE_URL: 'postgres://preview:pass@localhost/preview_db' },
 		created_at: '2025-01-10T12:00:00.000Z',
 		updated_at: '2025-03-01T09:00:00.000Z'
 	},
@@ -207,7 +233,6 @@ export const MOCK_APPS: App[] = [
 		static_build: false,
 		preview_enabled: false,
 		preview_excluded_keys: [],
-		preview_env_vars: {},
 		created_at: '2025-01-15T08:00:00.000Z',
 		updated_at: '2025-02-28T14:22:00.000Z'
 	},
@@ -241,7 +266,6 @@ export const MOCK_APPS: App[] = [
 		static_build: false,
 		preview_enabled: false,
 		preview_excluded_keys: [],
-		preview_env_vars: {},
 		created_at: '2025-02-20T10:00:00.000Z',
 		updated_at: '2025-03-05T11:45:00.000Z'
 	},
@@ -260,7 +284,13 @@ export const MOCK_APPS: App[] = [
 		health_check_interval: 15,
 		health_failure_threshold: 2,
 		health_consecutive_failures: 2,
-		volumes: [{ host_path: '/data/postgres', container_path: '/var/lib/postgresql/data' }],
+		volumes: [
+			{
+				name: 'pgdata',
+				host_path: '/opt/tond/data/volumes/api-server/pgdata',
+				container_path: '/var/lib/postgresql/data'
+			}
+		],
 		drain_timeout: 60,
 		build_method: 'dockerfile',
 		auto_deploy: false,
@@ -275,7 +305,6 @@ export const MOCK_APPS: App[] = [
 		static_build: false,
 		preview_enabled: false,
 		preview_excluded_keys: [],
-		preview_env_vars: {},
 		created_at: '2025-02-01T00:00:00.000Z',
 		updated_at: '2025-03-07T06:00:00.000Z'
 	},
@@ -309,7 +338,6 @@ export const MOCK_APPS: App[] = [
 		static_build: false,
 		preview_enabled: false,
 		preview_excluded_keys: [],
-		preview_env_vars: {},
 		created_at: '2025-03-08T07:00:00.000Z',
 		updated_at: '2025-03-08T07:00:00.000Z'
 	}
@@ -319,8 +347,54 @@ export const MOCK_APPS: App[] = [
 
 export const MOCK_SETTINGS: ServerSettings = {
 	server_name: 'Tond Server',
-	dashboard_domain: 'dash.example.com'
+	dashboard_domain: 'dash.example.com',
+	preview_domain: 'example-previews.com'
 };
+
+// ── Certificates ───────────────────────────────────────────────────────────
+
+const minutesFromNow = (m: number) => new Date(Date.now() + m * 60_000).toISOString();
+
+export const MOCK_CERTIFICATES: Certificate[] = [
+	{
+		id: 'cert-001',
+		domain: 'api.example.com',
+		cert_type: 'acme',
+		status: 'active',
+		issued_at: '2026-08-01T00:00:00Z',
+		expires_at: '2026-10-30T00:00:00Z',
+		last_error: null,
+		last_attempt_at: '2026-08-01T00:00:00Z',
+		next_retry_at: null,
+		failure_count: 0
+	},
+	{
+		id: 'cert-002',
+		domain: 'app.example.com',
+		cert_type: 'acme',
+		status: 'pending',
+		issued_at: '2026-09-20T00:00:00Z',
+		expires_at: '2026-12-19T00:00:00Z',
+		last_error:
+			"DNS for app.example.com points to 1.2.3.4, expected 5.6.7.8. Update the domain's A/AAAA record to this server.",
+		last_attempt_at: minutesFromNow(-4),
+		next_retry_at: minutesFromNow(12),
+		failure_count: 4
+	},
+	{
+		id: 'cert-003',
+		domain: 'dash.example.com',
+		cert_type: 'acme',
+		status: 'failed',
+		issued_at: '2026-09-20T00:00:00Z',
+		expires_at: '2026-12-19T00:00:00Z',
+		last_error:
+			'polling order ready: order failed: 403 urn:ietf:params:acme:error:unauthorized: Invalid response from http://dash.example.com/.well-known/acme-challenge/abc: 404',
+		last_attempt_at: minutesFromNow(-1),
+		next_retry_at: minutesFromNow(1),
+		failure_count: 1
+	}
+];
 
 export const MOCK_ONBOARDING_STATUS: OnboardingStatus = {
 	dashboard_domain: MOCK_SETTINGS.dashboard_domain,
@@ -387,35 +461,62 @@ export const MOCK_DEPLOYMENTS: Record<string, Deployment[]> = {
 		{
 			id: 'dep_3',
 			app_id: 'app_running',
-			image_tag: 'sha-abc123f',
-			status: 'success',
+			image_tag: 'tond-api-service:3f2a1b9c1234',
+			status: 'succeeded',
 			trigger_source: 'webhook',
 			has_generated_dockerfile: true,
 			started_at: '2025-03-01T08:55:00.000Z',
 			finished_at: '2025-03-01T09:02:00.000Z',
-			created_at: '2025-03-01T08:55:00.000Z'
+			created_at: '2025-03-01T08:55:00.000Z',
+			image_pruned: false,
+			is_current: true,
+			rollback_available: false,
+			rollback_unavailable_reason: 'This image is already running'
 		},
 		{
 			id: 'dep_2',
 			app_id: 'app_running',
-			image_tag: 'sha-7f3a9b1',
-			status: 'success',
+			image_tag: 'tond-api-service:7f3a9b1d0e2c',
+			status: 'succeeded',
 			trigger_source: 'manual',
 			has_generated_dockerfile: true,
 			started_at: '2025-02-15T14:10:00.000Z',
 			finished_at: '2025-02-15T14:17:00.000Z',
-			created_at: '2025-02-15T14:10:00.000Z'
+			created_at: '2025-02-15T14:10:00.000Z',
+			image_pruned: false,
+			is_current: false,
+			rollback_available: true,
+			rollback_unavailable_reason: null
+		},
+		{
+			id: 'dep_1b',
+			app_id: 'app_running',
+			image_tag: 'tond-api-service:c0ffee123456',
+			status: 'succeeded',
+			trigger_source: 'manual',
+			has_generated_dockerfile: false,
+			started_at: '2025-02-12T09:00:00.000Z',
+			finished_at: '2025-02-12T09:05:00.000Z',
+			created_at: '2025-02-12T09:00:00.000Z',
+			image_pruned: true,
+			is_current: false,
+			rollback_available: false,
+			rollback_unavailable_reason: "This deployment's image was pruned to save disk space"
 		},
 		{
 			id: 'dep_1',
 			app_id: 'app_running',
-			image_tag: 'sha-1a2b3c4',
+			image_tag: 'tond-api-service:1a2b3c4d5e6f',
 			status: 'failed',
 			trigger_source: 'manual',
 			has_generated_dockerfile: false,
 			started_at: '2025-02-10T10:00:00.000Z',
 			finished_at: '2025-02-10T10:03:00.000Z',
-			created_at: '2025-02-10T10:00:00.000Z'
+			created_at: '2025-02-10T10:00:00.000Z',
+			image_pruned: true,
+			is_current: false,
+			rollback_available: false,
+			rollback_unavailable_reason: 'Only successful deployments can be restored'
 		}
 	]
 };
@@ -462,7 +563,7 @@ export const MOCK_PREVIEWS: Record<string, PreviewDeployment[]> = {
 			app_id: 'app_running',
 			project_preview_id: 'pprev_1',
 			slug: 'feature-auth',
-			subdomain: 'feature-auth-api-service.dash.example.com',
+			subdomain: 'feature-auth-api-service.example-previews.com',
 			container_id: 'c0ffee1234567890',
 			host_port: 32100,
 			image_tag: 'sha-preview1',
@@ -470,7 +571,7 @@ export const MOCK_PREVIEWS: Record<string, PreviewDeployment[]> = {
 			status: 'running',
 			expires_at: new Date(Date.now() + 18 * 3_600_000).toISOString(),
 			created_at: new Date(Date.now() - 6 * 3_600_000).toISOString(),
-			url: 'https://feature-auth-api-service.dash.example.com',
+			url: 'https://feature-auth-api-service.example-previews.com',
 			pr_number: 42,
 			head_sha: 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
 			head_ref: 'feature/auth',
@@ -482,7 +583,7 @@ export const MOCK_PREVIEWS: Record<string, PreviewDeployment[]> = {
 			app_id: 'app_running',
 			project_preview_id: null,
 			slug: 'fix-memory-leak',
-			subdomain: 'fix-memory-leak.preview.example.com',
+			subdomain: 'fix-memory-leak-api-service.example-previews.com',
 			container_id: 'deadbeef12345678',
 			host_port: 32101,
 			image_tag: 'sha-preview2',
@@ -518,7 +619,7 @@ export const MOCK_PROJECT_PREVIEWS: Record<string, ProjectPreview[]> = {
 					app_id: 'app_running',
 					project_preview_id: 'pprev_1',
 					slug: 'feature-auth',
-					subdomain: 'feature-auth-api-service.dash.example.com',
+					subdomain: 'feature-auth-api-service.example-previews.com',
 					container_id: 'c0ffee1234567890',
 					host_port: 32100,
 					image_tag: 'sha-preview1',
@@ -526,7 +627,7 @@ export const MOCK_PROJECT_PREVIEWS: Record<string, ProjectPreview[]> = {
 					status: 'running',
 					expires_at: new Date(Date.now() + 18 * 3_600_000).toISOString(),
 					created_at: new Date(Date.now() - 6 * 3_600_000).toISOString(),
-					url: 'https://feature-auth-api-service.dash.example.com',
+					url: 'https://feature-auth-api-service.example-previews.com',
 					pr_number: 42,
 					head_sha: 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
 					head_ref: 'feature/auth',
@@ -538,7 +639,7 @@ export const MOCK_PROJECT_PREVIEWS: Record<string, ProjectPreview[]> = {
 					app_id: 'app_stopped',
 					project_preview_id: 'pprev_1',
 					slug: 'feature-auth',
-					subdomain: 'feature-auth-web-frontend.dash.example.com',
+					subdomain: 'feature-auth-web-frontend.example-previews.com',
 					container_id: 'abcdef0987654321',
 					host_port: 32102,
 					image_tag: 'sha-preview3',
@@ -546,7 +647,7 @@ export const MOCK_PROJECT_PREVIEWS: Record<string, ProjectPreview[]> = {
 					status: 'running',
 					expires_at: new Date(Date.now() + 18 * 3_600_000).toISOString(),
 					created_at: new Date(Date.now() - 6 * 3_600_000).toISOString(),
-					url: 'https://feature-auth-web-frontend.dash.example.com',
+					url: 'https://feature-auth-web-frontend.example-previews.com',
 					pr_number: 42,
 					head_sha: 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
 					head_ref: 'feature/auth',
@@ -718,7 +819,8 @@ export const MOCK_DATABASES: ManagedDatabase[] = [
 		image_used: 'postgres:16-alpine',
 		custom_image: null,
 		created_at: '2025-02-01T10:00:00.000Z',
-		updated_at: '2025-03-01T09:00:00.000Z'
+		updated_at: '2025-03-01T09:00:00.000Z',
+		public_access: false
 	},
 	{
 		id: 'db_redis1',
@@ -737,7 +839,8 @@ export const MOCK_DATABASES: ManagedDatabase[] = [
 		image_used: 'redis:7-alpine',
 		custom_image: null,
 		created_at: '2025-02-10T14:00:00.000Z',
-		updated_at: '2025-02-10T14:00:00.000Z'
+		updated_at: '2025-02-10T14:00:00.000Z',
+		public_access: false
 	},
 	{
 		id: 'db_mysql1',
@@ -756,7 +859,8 @@ export const MOCK_DATABASES: ManagedDatabase[] = [
 		image_used: 'mysql:8',
 		custom_image: null,
 		created_at: '2025-01-20T08:00:00.000Z',
-		updated_at: '2025-02-28T12:00:00.000Z'
+		updated_at: '2025-02-28T12:00:00.000Z',
+		public_access: false
 	},
 	{
 		id: 'db_mariadb1',
@@ -775,7 +879,8 @@ export const MOCK_DATABASES: ManagedDatabase[] = [
 		image_used: 'mariadb:11',
 		custom_image: null,
 		created_at: '2025-03-01T12:00:00.000Z',
-		updated_at: '2025-03-01T12:00:00.000Z'
+		updated_at: '2025-03-01T12:00:00.000Z',
+		public_access: true
 	}
 ];
 
@@ -828,7 +933,13 @@ export const MOCK_CRON_JOBS: CronJob[] = [
 		timezone: null,
 		max_retries: 0,
 		retry_delay_seconds: 60,
-		volumes: [{ host_path: '/data/backups', container_path: '/backup' }]
+		volumes: [
+			{
+				name: 'backups',
+				host_path: '/opt/tond/data/volumes/_cron/cron_2/backups',
+				container_path: '/backup'
+			}
+		]
 	},
 	{
 		id: 'cron_3',
@@ -944,7 +1055,6 @@ export const MOCK_GITHUB_APPS: GitHubApp[] = [
 		slug: 'tond-dev',
 		installation_id: 78901234,
 		installed: true,
-		install_url: 'https://github.com/apps/tond-dev/installations/new',
 		created_at: '2025-03-01T00:00:00.000Z',
 		updated_at: '2025-03-01T00:00:00.000Z'
 	}

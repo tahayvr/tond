@@ -19,6 +19,8 @@
 //   cron <subcommand>              — manage cron jobs (list/create/info/update/delete/trigger/runs)
 //   integrations <subcommand>      — manage notification integrations (list/info/test/enable/disable/delete)
 //   settings [subcommand]          — view or update server-wide settings
+//                                    (incl. `settings host-terminal on|off`)
+//   setup-link                     — print the first-run admin setup link again
 //   update [options]               — update tond-server to a newer version
 //   passwd                         — change dashboard account password
 
@@ -137,6 +139,9 @@ enum Commands {
 
     /// Change your dashboard account password (prompts for current and new password)
     Passwd,
+
+    /// Print the one-time link for creating the first admin account (run as root)
+    SetupLink,
 }
 
 #[tokio::main]
@@ -174,6 +179,14 @@ async fn main() -> Result<()> {
         }
         Commands::Snapshot { action } => commands::snapshots::handle(&connect()?, action).await?,
         Commands::Passwd => commands::settings::handle_passwd(&connect()?).await?,
+        Commands::SetupLink => {
+            let data_dir = cli
+                .socket
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("/opt/tond/data"));
+            commands::setup::handle_setup_link(connect(), &data_dir).await?
+        }
     }
 
     Ok(())

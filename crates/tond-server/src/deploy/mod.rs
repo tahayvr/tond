@@ -3,6 +3,7 @@
 // Splits the original deploy.rs into focused sub-modules:
 //   core.rs  — deploy(), deploy_image(), deploy_preview() and internal helpers
 //   build.rs — all image build helpers (git clone, tbuild, dockerfile, compose)
+//   git.rs   — clone hardening: credentials via env, log redaction, known_hosts
 //
 // Public surface (unchanged from the original deploy.rs):
 //   deploy::deploy(state, app, trigger_source)
@@ -12,6 +13,9 @@
 
 mod build;
 mod core;
+mod git;
+pub mod images;
 
-pub use build::build_from_dir;
+pub use build::{build_from_dir, compose_project_name, validate_base_dir};
 pub use core::{deploy, deploy_image, deploy_preview};
+pub use git::GitHttpAuth;

@@ -6,6 +6,9 @@ Requires=docker.service
 
 [Service]
 Type=simple
+# tond-server stays root: it drives Docker (root-equivalent anyway), owns the
+# root-only CLI socket (tond.sock, 0600) and switches to TOND_TERMINAL_USER for
+# the dashboard terminal. tond-proxy runs unprivileged (see tond-proxy.service).
 User=root
 WorkingDirectory=/opt/tond
 ExecStart=/opt/tond/bin/tond-server
@@ -47,11 +50,35 @@ Environment=TOND_TERMINAL_USER=tond
 # which is read-only under ProtectHome=true
 Environment=DOCKER_CONFIG=/opt/tond/data/docker-config
 
-# Security
+# ── Privileges ──
 NoNewPrivileges=true
+# Deliberately 0022, not 0077: git checkouts and extracted uploads become the
+# `docker build` context, whose file modes end up in the image — owner-only
+# files would be unreadable to images that run as a non-root USER. The data
+# directory itself is what keeps tond.db, keys and backups private (root-only
+# subdirectories under a root:tond-proxy 3770 /opt/tond/data, see install.sh).
+UMask=0022
+
+# ── Sandboxing ──
 ProtectSystem=strict
+ReadWritePaths=/opt/tond/data
 ProtectHome=true
-ReadWritePaths=/opt/tond/data /tmp
+# Private /tmp: uploads (/tmp/tond-uploads) and snapshot staging are not
+# visible to other services or users.
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+KeyringMode=private
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

@@ -7,11 +7,17 @@
 //
 // Functions:
 //
-//   run_container(docker, image, name, port, host_port, env_vars, memory_limit, cpu_limit, binds, network_name)
+//   run_container(docker, image, name, port, host_port, exposure, env_vars, memory_limit, cpu_limit, binds, network_name)
 //     Creates and starts a container named `tond-{name}`. Before creating,
 //     it force-removes any existing container with the same name (handles
 //     re-deploys). The container is configured with:
-//       - Port binding: 0.0.0.0:{host_port} -> {port}/tcp
+//       - Port binding: 127.0.0.1:{host_port} -> {port}/tcp (0.0.0.0 only for
+//         Exposure::Public, i.e. a database with public access turned on).
+//         Docker's iptables rules run before UFW, so a 0.0.0.0 binding is
+//         reachable from the internet no matter what the firewall says.
+//       - The hardening every Tond container gets (see `harden_host_config`):
+//         no-new-privileges, a trimmed capability set, a pids limit, a
+//         default memory limit and rotated json-file logs
 //       - Restart policy: UnlessStopped (survives host reboots)
 //       - Label: managed-by=tond (for identification)
 //       - Env vars + injected PORT={port} (12-factor convention)
@@ -66,9 +72,125 @@ fn env_with_port(env_vars: HashMap<String, String>, port: u16) -> Vec<String> {
     env
 }
 
-fn make_port_bindings(port: u16, host_port: u16) -> HashMap<String, Option<Vec<PortBinding>>> {
+/// Which host interface a published container port binds to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Exposure {
+    /// 127.0.0.1 — reachable only from the host (tond-proxy, health checks,
+    /// SSH tunnels). The default for everything.
+    Loopback,
+    /// 0.0.0.0 — reachable from the internet. Only for managed databases whose
+    /// admin explicitly enabled public access.
+    Public,
+}
+
+impl Exposure {
+    pub fn host_ip(self) -> &'static str {
+        match self {
+            Exposure::Loopback => "127.0.0.1",
+            Exposure::Public => "0.0.0.0",
+        }
+    }
+}
+
+// ── Container hardening ──────────────────────────────────────────────────────
+//
+// Capability policy: keep Docker's default set minus the capabilities that
+// ordinary images never need at runtime but that widen the attack surface:
+//
+//   NET_RAW      raw/packet sockets — ARP/DNS spoofing of neighbours on the
+//                shared bridge network (only `ping` misses it)
+//   MKNOD        creating device nodes
+//   AUDIT_WRITE  writing to the kernel audit log
+//   SETFCAP      setting file capabilities (used in user-namespace escapes)
+//
+// `cap_drop: ALL` would be stricter but breaks the images people actually run:
+// the postgres, mysql/mariadb, mongo and redis entrypoints chown their data
+// directory and drop to an unprivileged user (CHOWN, DAC_OVERRIDE, FOWNER,
+// SETUID, SETGID), and nginx binds :80 as root before dropping privileges
+// (NET_BIND_SERVICE, SETUID, SETGID). Those all stay.
+//
+// no-new-privileges stops setuid binaries and file capabilities from raising
+// privileges after exec; gosu/su-exec style entrypoints keep working because
+// they start as root and only lower privileges.
+
+/// Capabilities removed from Docker's default set for every Tond container.
+pub const DROPPED_CAPABILITIES: &[&str] = &["NET_RAW", "MKNOD", "AUDIT_WRITE", "SETFCAP"];
+
+/// Max processes + threads per container: stops fork bombs from taking the
+/// host down while leaving plenty of headroom for thread-heavy databases.
+pub const PIDS_LIMIT: i64 = 4096;
+
+/// Log rotation for every container Tond starts: 3 × 10 MiB json-file logs
+/// (json-file keeps `docker logs` and the dashboard log stream working).
+pub const LOG_DRIVER: &str = "json-file";
+pub const LOG_MAX_SIZE: &str = "10m";
+pub const LOG_MAX_FILE: &str = "3";
+
+/// Smallest default memory cap, for hosts where 75% of RAM is tiny.
+const MIN_DEFAULT_MEMORY: i64 = 256 * 1024 * 1024;
+
+/// The json-file log configuration with rotation.
+pub fn log_config() -> HostConfigLogConfig {
+    HostConfigLogConfig {
+        typ: Some(LOG_DRIVER.to_string()),
+        config: Some(HashMap::from([
+            ("max-size".to_string(), LOG_MAX_SIZE.to_string()),
+            ("max-file".to_string(), LOG_MAX_FILE.to_string()),
+        ])),
+    }
+}
+
+/// Default memory cap for containers without an explicit limit: 75% of the
+/// host's RAM, so one runaway container can't OOM tond-server, tond-proxy
+/// and sshd while a normal app never notices the limit.
+pub fn default_memory_limit_for(total_bytes: u64) -> i64 {
+    let three_quarters = (total_bytes / 4 * 3).min(i64::MAX as u64) as i64;
+    three_quarters.max(MIN_DEFAULT_MEMORY)
+}
+
+/// [`default_memory_limit_for`] the current host (measured once).
+pub fn default_memory_limit() -> i64 {
+    static LIMIT: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        default_memory_limit_for(sys.total_memory())
+    })
+}
+
+/// Apply Tond's container hardening to a HostConfig: no-new-privileges, the
+/// trimmed capability set, a pids limit, a default memory limit when none is
+/// set and rotated logs. Explicit (positive) memory / pids limits are kept.
+pub fn harden_host_config(host_config: &mut HostConfig, default_memory: i64) {
+    let security_opt = host_config.security_opt.get_or_insert_with(Vec::new);
+    if !security_opt
+        .iter()
+        .any(|o| o.starts_with("no-new-privileges"))
+    {
+        security_opt.push("no-new-privileges:true".to_string());
+    }
+    let cap_drop = host_config.cap_drop.get_or_insert_with(Vec::new);
+    for cap in DROPPED_CAPABILITIES {
+        if !cap_drop.iter().any(|c| c.eq_ignore_ascii_case(cap)) {
+            cap_drop.push((*cap).to_string());
+        }
+    }
+    if host_config.pids_limit.is_none_or(|p| p <= 0) {
+        host_config.pids_limit = Some(PIDS_LIMIT);
+    }
+    if host_config.memory.is_none_or(|m| m <= 0) {
+        host_config.memory = Some(default_memory);
+    }
+    host_config.log_config = Some(log_config());
+}
+
+fn make_port_bindings(
+    port: u16,
+    host_port: u16,
+    exposure: Exposure,
+) -> HashMap<String, Option<Vec<PortBinding>>> {
     let port_binding = PortBinding {
-        host_ip: Some("0.0.0.0".to_string()),
+        host_ip: Some(exposure.host_ip().to_string()),
         host_port: Some(host_port.to_string()),
     };
 
@@ -104,6 +226,32 @@ fn exact_network_name_exists(existing: &[Network], network_name: &str) -> bool {
         .any(|network| network.name.as_deref() == Some(network_name))
 }
 
+/// HostConfig for a long-running service container (app, preview, database):
+/// published port on the requested interface, restart policy, limits, binds,
+/// plus [`harden_host_config`].
+fn service_host_config(
+    port: u16,
+    host_port: u16,
+    exposure: Exposure,
+    memory_limit: Option<i64>,
+    cpu_limit: Option<i64>,
+    binds: Vec<String>,
+) -> HostConfig {
+    let mut host_config = HostConfig {
+        port_bindings: Some(make_port_bindings(port, host_port, exposure)),
+        restart_policy: Some(RestartPolicy {
+            name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
+            ..Default::default()
+        }),
+        memory: memory_limit,
+        nano_cpus: cpu_limit,
+        binds: if binds.is_empty() { None } else { Some(binds) },
+        ..Default::default()
+    };
+    harden_host_config(&mut host_config, default_memory_limit());
+    host_config
+}
+
 /// Create and start a container from a Docker image.
 /// Returns the container ID.
 ///
@@ -117,6 +265,7 @@ pub async fn run_container(
     name: &str,
     port: u16,
     host_port: u16,
+    exposure: Exposure,
     env_vars: HashMap<String, String>,
     memory_limit: Option<i64>,
     cpu_limit: Option<i64>,
@@ -125,19 +274,8 @@ pub async fn run_container(
 ) -> anyhow::Result<String> {
     ensure_image(docker, image).await?;
     let env = env_with_port(env_vars, port);
-    let port_bindings = make_port_bindings(port, host_port);
-
-    let host_config = HostConfig {
-        port_bindings: Some(port_bindings),
-        restart_policy: Some(RestartPolicy {
-            name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
-            ..Default::default()
-        }),
-        memory: memory_limit,
-        nano_cpus: cpu_limit,
-        binds: if binds.is_empty() { None } else { Some(binds) },
-        ..Default::default()
-    };
+    let host_config =
+        service_host_config(port, host_port, exposure, memory_limit, cpu_limit, binds);
 
     // Connect to a project network if specified, using the app name as the alias
     let networking_config = network_name.map(|net| {
@@ -281,6 +419,8 @@ pub async fn get_logs(
 ///
 /// `network_alias` is used as the network alias when connecting to
 /// `network_name` (typically the app name, without the `tond-preview-` prefix).
+/// `cmd` overrides the image's default command (managed Redis/KeyDB pass
+/// their generated config file this way); `None` keeps the image default.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_container_named(
     docker: &Docker,
@@ -288,28 +428,19 @@ pub async fn run_container_named(
     container_name: &str,
     port: u16,
     host_port: u16,
+    exposure: Exposure,
     env_vars: HashMap<String, String>,
     memory_limit: Option<i64>,
     cpu_limit: Option<i64>,
     binds: Vec<String>,
     network_name: Option<&str>,
     network_alias: Option<&str>,
+    cmd: Option<Vec<String>>,
 ) -> anyhow::Result<String> {
     ensure_image(docker, image).await?;
     let env = env_with_port(env_vars, port);
-    let port_bindings = make_port_bindings(port, host_port);
-
-    let host_config = HostConfig {
-        port_bindings: Some(port_bindings),
-        restart_policy: Some(RestartPolicy {
-            name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
-            ..Default::default()
-        }),
-        memory: memory_limit,
-        nano_cpus: cpu_limit,
-        binds: if binds.is_empty() { None } else { Some(binds) },
-        ..Default::default()
-    };
+    let host_config =
+        service_host_config(port, host_port, exposure, memory_limit, cpu_limit, binds);
 
     // Connect to a project network if specified
     let networking_config = network_name.map(|net| {
@@ -330,6 +461,7 @@ pub async fn run_container_named(
     let config = ContainerCreateBody {
         image: Some(image.to_string()),
         env: Some(env),
+        cmd,
         exposed_ports: Some(vec![format!("{}/tcp", port)]),
         host_config: Some(host_config),
         networking_config,
@@ -439,6 +571,28 @@ pub async fn find_compose_host_port(
         container_port,
         container_port,
     )
+}
+
+/// Force-remove every container of a compose project and its default network.
+/// Best-effort, like `docker compose down` without touching named volumes.
+pub async fn remove_compose_project(docker: &Docker, project_name: &str) {
+    let filters = compose_project_filter(project_name);
+    if let Ok(containers) = docker
+        .list_containers(Some(
+            ListContainersOptionsBuilder::default()
+                .all(true)
+                .filters(&filters)
+                .build(),
+        ))
+        .await
+    {
+        for id in containers.into_iter().filter_map(|c| c.id) {
+            let _ = remove_container(docker, &id).await;
+        }
+    }
+    let _ = docker
+        .remove_network(&format!("{project_name}_default"))
+        .await;
 }
 
 /// Find a free host port starting from a base
@@ -578,8 +732,94 @@ mod tests {
     }
 
     #[test]
+    fn make_port_bindings_binds_loopback_by_default_and_all_interfaces_only_when_public() {
+        let host_ip = |exposure| {
+            make_port_bindings(3000, 8100, exposure)
+                .get("3000/tcp")
+                .and_then(|ports| ports.as_ref())
+                .and_then(|ports| ports.first())
+                .and_then(|binding| binding.host_ip.clone())
+        };
+        assert_eq!(host_ip(Exposure::Loopback).as_deref(), Some("127.0.0.1"));
+        assert_eq!(host_ip(Exposure::Public).as_deref(), Some("0.0.0.0"));
+    }
+
+    #[test]
+    fn harden_host_config_applies_the_container_policy() {
+        let mut hc = HostConfig::default();
+        harden_host_config(&mut hc, 1_000);
+        assert_eq!(
+            hc.security_opt,
+            Some(vec!["no-new-privileges:true".to_string()])
+        );
+        assert_eq!(
+            hc.cap_drop,
+            Some(DROPPED_CAPABILITIES.iter().map(|c| c.to_string()).collect())
+        );
+        assert_eq!(hc.pids_limit, Some(PIDS_LIMIT));
+        assert_eq!(hc.memory, Some(1_000));
+        let log = hc.log_config.unwrap_or_default();
+        assert_eq!(log.typ.as_deref(), Some("json-file"));
+        let cfg = log.config.unwrap_or_default();
+        assert_eq!(cfg.get("max-size").map(String::as_str), Some("10m"));
+        assert_eq!(cfg.get("max-file").map(String::as_str), Some("3"));
+    }
+
+    #[test]
+    fn harden_host_config_keeps_explicit_limits_and_does_not_duplicate_options() {
+        let mut hc = HostConfig {
+            memory: Some(512),
+            pids_limit: Some(100),
+            security_opt: Some(vec!["no-new-privileges:true".to_string()]),
+            cap_drop: Some(vec!["net_raw".to_string()]),
+            ..Default::default()
+        };
+        harden_host_config(&mut hc, 1_000);
+        assert_eq!(hc.memory, Some(512));
+        assert_eq!(hc.pids_limit, Some(100));
+        assert_eq!(hc.security_opt.map(|o| o.len()), Some(1));
+        assert_eq!(
+            hc.cap_drop.map(|c| c.len()),
+            Some(DROPPED_CAPABILITIES.len())
+        );
+
+        // Zero / negative limits mean "unset" and get the defaults.
+        let mut hc = HostConfig {
+            memory: Some(0),
+            pids_limit: Some(-1),
+            ..Default::default()
+        };
+        harden_host_config(&mut hc, 1_000);
+        assert_eq!(hc.memory, Some(1_000));
+        assert_eq!(hc.pids_limit, Some(PIDS_LIMIT));
+    }
+
+    #[test]
+    fn default_memory_limit_is_three_quarters_of_ram_with_a_floor() {
+        assert_eq!(
+            default_memory_limit_for(4 * 1024 * 1024 * 1024),
+            3 * 1024 * 1024 * 1024
+        );
+        assert_eq!(default_memory_limit_for(0), MIN_DEFAULT_MEMORY);
+        assert!(default_memory_limit() >= MIN_DEFAULT_MEMORY);
+    }
+
+    #[test]
+    fn service_host_config_is_hardened_and_loopback_bound() {
+        let hc = service_host_config(80, 8100, Exposure::Loopback, None, None, vec![]);
+        assert!(
+            hc.security_opt
+                .unwrap_or_default()
+                .contains(&"no-new-privileges:true".to_string())
+        );
+        assert!(hc.log_config.is_some());
+        assert!(hc.memory.is_some_and(|m| m > 0));
+        assert!(hc.binds.is_none());
+    }
+
+    #[test]
     fn make_port_bindings_maps_container_port_to_requested_host_port() {
-        let bindings = make_port_bindings(3000, 8100);
+        let bindings = make_port_bindings(3000, 8100, Exposure::Loopback);
         assert_eq!(
             bindings
                 .get("3000/tcp")

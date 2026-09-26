@@ -48,7 +48,6 @@ const app = {
 	static_build: false,
 	preview_enabled: false,
 	preview_excluded_keys: [],
-	preview_env_vars: {},
 	created_at: '2026-01-01T00:00:00.000Z',
 	updated_at: '2026-01-01T00:00:00.000Z'
 };
@@ -109,8 +108,22 @@ describe('ui context state', () => {
 		setUiContext(appContext(app));
 
 		const preferred = getPreferredTerminalTarget([
-			{ id: 'server', kind: 'server', label: 'Server', shell_user: 'tond' },
-			{ id: 'app_running', kind: 'app', label: 'App: api-service', shell_user: null }
+			{
+				id: 'server',
+				kind: 'server',
+				label: 'Server',
+				shell_user: 'tond',
+				enabled: true,
+				requires_step_up: true
+			},
+			{
+				id: 'app_running',
+				kind: 'app',
+				label: 'App: api-service',
+				shell_user: null,
+				enabled: true,
+				requires_step_up: false
+			}
 		]);
 
 		expect(preferred).toMatchObject({ id: 'app_running', kind: 'app' });
@@ -120,11 +133,49 @@ describe('ui context state', () => {
 		setUiContext(databasesContext());
 
 		const preferred = getPreferredTerminalTarget([
-			{ id: 'server', kind: 'server', label: 'Server', shell_user: 'tond' },
-			{ id: 'db_1', kind: 'database', label: 'Database: app-postgres', shell_user: null }
+			{
+				id: 'server',
+				kind: 'server',
+				label: 'Server',
+				shell_user: 'tond',
+				enabled: true,
+				requires_step_up: true
+			},
+			{
+				id: 'db_1',
+				kind: 'database',
+				label: 'Database: app-postgres',
+				shell_user: null,
+				enabled: true,
+				requires_step_up: false
+			}
 		]);
 
 		expect(preferred).toMatchObject({ id: 'server', kind: 'server' });
+	});
+
+	it('prefers a usable container over the host shell while it is switched off', () => {
+		setUiContext(databasesContext());
+
+		const off = { id: 'server', kind: 'server' as const, label: 'Server', shell_user: 'tond' };
+		expect(
+			getPreferredTerminalTarget([
+				{ ...off, enabled: false, requires_step_up: true },
+				{
+					id: 'db_1',
+					kind: 'database',
+					label: 'Database: app-postgres',
+					shell_user: null,
+					enabled: true,
+					requires_step_up: false
+				}
+			])
+		).toMatchObject({ id: 'db_1', kind: 'database' });
+
+		// With nothing else to open, the server is still selected so its notice can explain.
+		expect(
+			getPreferredTerminalTarget([{ ...off, enabled: false, requires_step_up: true }])
+		).toMatchObject({ id: 'server' });
 	});
 
 	it('keeps the active manual terminal target when it still exists', () => {
@@ -132,8 +183,22 @@ describe('ui context state', () => {
 		setTerminalTarget({ id: 'db_1', kind: 'database' });
 
 		const active = syncTerminalTarget([
-			{ id: 'server', kind: 'server', label: 'Server', shell_user: 'tond' },
-			{ id: 'db_1', kind: 'database', label: 'Database: app-postgres', shell_user: null }
+			{
+				id: 'server',
+				kind: 'server',
+				label: 'Server',
+				shell_user: 'tond',
+				enabled: true,
+				requires_step_up: true
+			},
+			{
+				id: 'db_1',
+				kind: 'database',
+				label: 'Database: app-postgres',
+				shell_user: null,
+				enabled: true,
+				requires_step_up: false
+			}
 		]);
 
 		expect(active).toMatchObject({ id: 'db_1', kind: 'database' });
@@ -149,8 +214,22 @@ describe('ui context state', () => {
 		setTerminalTarget({ id: 'missing-db', kind: 'database' });
 
 		const synced = syncTerminalTarget([
-			{ id: 'server', kind: 'server', label: 'Server', shell_user: 'tond' },
-			{ id: 'app_running', kind: 'app', label: 'App: api-service', shell_user: null }
+			{
+				id: 'server',
+				kind: 'server',
+				label: 'Server',
+				shell_user: 'tond',
+				enabled: true,
+				requires_step_up: true
+			},
+			{
+				id: 'app_running',
+				kind: 'app',
+				label: 'App: api-service',
+				shell_user: null,
+				enabled: true,
+				requires_step_up: false
+			}
 		]);
 
 		expect(synced).toMatchObject({ id: 'app_running', kind: 'app' });

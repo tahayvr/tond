@@ -6,9 +6,17 @@
 //     Enable or disable auto-deploy on webhook push. Also sets the branch
 //     filter. Returns the updated app.
 //
+//   GET  /api/apps/{id}/webhook
+//     Webhook URLs (per provider) and the app's webhook secret, for setting up
+//     GitHub/GitLab/Gitea/generic webhooks.
+//
 //   PUT  /api/apps/{id}/webhook-secret
-//     Set or rotate the HMAC signing secret used to validate webhook payloads.
-//     Accepts { "secret": "..." } or { "secret": null } to disable validation.
+//     Replace the webhook secret with a caller-chosen value ({ "secret": "..." },
+//     at least MIN_WEBHOOK_SECRET_LEN characters). Verification cannot be
+//     disabled: every webhook must be signed.
+//
+//   POST /api/apps/{id}/webhook-secret/rotate
+//     Replace the webhook secret with a fresh random one; returns the new config.
 //
 //   POST /api/apps/{id}/deploy-key
 //     Generate (or regenerate) an Ed25519 SSH deploy key for the app.
@@ -25,12 +33,13 @@ use axum::{
     response::IntoResponse,
 };
 use tond_common::{
-    ApiResponse, AppResponse, DeployKeyResponse, TondError, UpdateAutoDeployRequest,
-    UpdateSourceRequest, UpdateWebhookSecretRequest,
+    ApiResponse, AppResponse, DeployKeyResponse, MIN_WEBHOOK_SECRET_LEN, TondError,
+    UpdateAutoDeployRequest, UpdateSourceRequest, UpdateWebhookSecretRequest,
+    WebhookConfigResponse, WebhookUrls, generate_raw_key,
 };
 
 use crate::{
-    auth::{RateLimit, RequireAuth},
+    auth::{AuthRole, RateLimit, RequireAuth},
     error::AppError,
     state::AppState,
 };
@@ -84,10 +93,58 @@ pub async fn update_auto_deploy(
 
 // ── Webhook secret ──────────────────────────────────────────────────────────
 
+/// Build the webhook config for an app. Absolute URLs use the dashboard domain
+/// (the proxy routes `/api` there); without one only paths are returned.
+async fn webhook_config(
+    state: &AppState,
+    app: tond_common::App,
+) -> Result<WebhookConfigResponse, AppError> {
+    let secret = app.webhook_secret.clone().ok_or_else(|| {
+        AppError(TondError::Internal(format!(
+            "app {} has no webhook secret",
+            app.name
+        )))
+    })?;
+    let domain = state.settings.read().await.dashboard_domain.clone();
+    let paths = WebhookUrls::for_app(&app.id);
+    let urls = (!domain.is_empty()).then(|| {
+        let base = format!("https://{domain}");
+        WebhookUrls {
+            github: format!("{base}{}", paths.github),
+            gitlab: format!("{base}{}", paths.gitlab),
+            gitea: format!("{base}{}", paths.gitea),
+            generic: format!("{base}{}", paths.generic),
+        }
+    });
+    Ok(WebhookConfigResponse {
+        app_id: app.id,
+        paths,
+        urls,
+        secret,
+        auto_deploy: app.auto_deploy != 0,
+        watch_branch: app.watch_branch,
+    })
+}
+
+/// GET /api/apps/{id}/webhook
+///
+/// Returns the webhook URLs for every provider and the current secret.
+pub async fn get_webhook_config(
+    _rate: RateLimit,
+    _auth: RequireAuth,
+    State(state): State<AppState>,
+    Path(app_id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let app = fetch_app(&state.db, &app_id).await?;
+    let config = webhook_config(&state, app).await?;
+    Ok((StatusCode::OK, Json(ApiResponse::ok(config))))
+}
+
 /// PUT /api/apps/{id}/webhook-secret
 ///
-/// Body: { "secret": "my-secret" } or { "secret": null }
-/// Sets the HMAC secret used to validate GitHub/GitLab webhook signatures.
+/// Body: { "secret": "my-long-secret" }
+/// Replaces the secret used to verify GitHub/Gitea/generic signatures and the
+/// GitLab token. There is no way to clear it.
 pub async fn update_webhook_secret(
     _rate: RateLimit,
     _auth: RequireAuth,
@@ -97,9 +154,8 @@ pub async fn update_webhook_secret(
 ) -> Result<impl IntoResponse, AppError> {
     let app = fetch_app(&state.db, &app_id).await?;
 
-    // Normalize empty string to NULL so that webhook handlers skip signature
-    // validation when no secret is set (consistent with null/omitted secret).
-    let secret: Option<String> = payload.secret.filter(|s| !s.is_empty());
+    let secret = payload.secret.trim().to_string();
+    validate_webhook_secret(&secret)?;
 
     sqlx::query("UPDATE apps SET webhook_secret = ?, updated_at = datetime('now') WHERE id = ?")
         .bind(&secret)
@@ -108,10 +164,50 @@ pub async fn update_webhook_secret(
         .await?;
 
     let updated = fetch_app(&state.db, &app.id).await?;
-    Ok((
-        StatusCode::OK,
-        Json(ApiResponse::ok(AppResponse::from(updated))),
-    ))
+    let config = webhook_config(&state, updated).await?;
+    Ok((StatusCode::OK, Json(ApiResponse::ok(config))))
+}
+
+/// Reject secrets that are too short to resist guessing or that contain
+/// characters a provider's settings form would mangle.
+fn validate_webhook_secret(secret: &str) -> Result<(), AppError> {
+    if secret.chars().count() < MIN_WEBHOOK_SECRET_LEN {
+        return Err(AppError(TondError::InvalidInput(format!(
+            "webhook secret must be at least {MIN_WEBHOOK_SECRET_LEN} characters \
+             (rotate it to have one generated)"
+        ))));
+    }
+    if secret.chars().any(char::is_control) {
+        return Err(AppError(TondError::InvalidInput(
+            "webhook secret must not contain control characters".to_string(),
+        )));
+    }
+    Ok(())
+}
+
+/// POST /api/apps/{id}/webhook-secret/rotate
+///
+/// Generates a new random secret. The old one stops working immediately, so
+/// the provider's webhook settings must be updated with the returned value.
+pub async fn rotate_webhook_secret(
+    _rate: RateLimit,
+    _auth: RequireAuth,
+    State(state): State<AppState>,
+    Path(app_id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let app = fetch_app(&state.db, &app_id).await?;
+
+    sqlx::query("UPDATE apps SET webhook_secret = ?, updated_at = datetime('now') WHERE id = ?")
+        .bind(generate_raw_key())
+        .bind(&app.id)
+        .execute(&state.db)
+        .await?;
+
+    tracing::info!("Rotated webhook secret for app {}", app.name);
+
+    let updated = fetch_app(&state.db, &app.id).await?;
+    let config = webhook_config(&state, updated).await?;
+    Ok((StatusCode::OK, Json(ApiResponse::ok(config))))
 }
 
 // ── Deploy keys ─────────────────────────────────────────────────────────────
@@ -225,7 +321,7 @@ fn generate_ed25519_keypair(comment: &str) -> anyhow::Result<(String, String)> {
 /// Updates the deployment source type and URL for the app.
 pub async fn update_source(
     _rate: RateLimit,
-    _auth: RequireAuth,
+    auth: AuthRole,
     State(state): State<AppState>,
     Path(app_id): Path<String>,
     Json(payload): Json<UpdateSourceRequest>,
@@ -242,6 +338,11 @@ pub async fn update_source(
     }
 
     let app = fetch_app(&state.db, &app_id).await?;
+
+    // Compose files are full container specs; switching to or from one is an admin action.
+    if payload.source_type == "compose" || app.source_type == "compose" {
+        auth.ensure_admin("change a Docker Compose app's source")?;
+    }
 
     sqlx::query(
         "UPDATE apps SET source_type = ?, source_url = ?, updated_at = datetime('now') WHERE id = ?",

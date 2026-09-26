@@ -81,6 +81,8 @@ pub struct UserResponse {
     pub id: String,
     pub email: String,
     pub role: String,
+    /// Whether TOTP 2FA is active, so the dashboard can offer "disable"
+    pub totp_enabled: bool,
     pub created_at: String,
 }
 
@@ -90,15 +92,25 @@ impl From<User> for UserResponse {
             id: u.id,
             email: u.email,
             role: u.role,
+            totp_enabled: u.totp_enabled,
             created_at: u.created_at,
         }
     }
 }
 
+/// Request body for `POST /api/auth/setup` (first-run admin account).
 #[derive(Debug, Deserialize)]
 pub struct SetupRequest {
+    /// One-time setup token from the installer (`<data dir>/setup-token`).
+    pub token: String,
     pub email: String,
     pub password: String,
+}
+
+/// Request body for `POST /api/auth/setup/check`.
+#[derive(Debug, Deserialize)]
+pub struct SetupCheckRequest {
+    pub token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,6 +179,13 @@ pub struct TotpSetupResponse {
     pub otpauth_uri: String,
     /// Base64-encoded PNG QR code (data URI payload, no prefix).
     pub qr_code: String,
+}
+
+/// Request body for `POST /api/auth/2fa/setup`: the current password, so a
+/// hijacked session can't silently enroll an attacker's authenticator.
+#[derive(Debug, Deserialize)]
+pub struct TotpSetupRequest {
+    pub password: String,
 }
 
 /// Request body for `POST /api/auth/2fa/confirm`.
@@ -315,6 +334,11 @@ mod tests {
             serialized.get("totp_secret_enc"),
             None,
             "UserResponse should not expose the encrypted TOTP secret"
+        );
+        assert_eq!(
+            serialized.get("totp_enabled"),
+            Some(&serde_json::json!(true)),
+            "UserResponse should say whether 2FA is enabled"
         );
     }
 

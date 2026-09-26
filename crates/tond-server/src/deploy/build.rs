@@ -14,12 +14,15 @@ use anyhow::Result;
 use tond_common::App;
 
 use crate::state::AppState;
+use crate::{compose_policy, docker, volumes};
+
+use super::images;
 
 use super::core::log_deploy;
-
-fn build_image_tag(app_name: &str) -> String {
-    format!("tond-{}", app_name)
-}
+use super::git::{
+    GIT_ALLOW_PROTOCOL, GitHttpAuth, clone_args, ensure_known_hosts, git_auth_env,
+    known_hosts_path, redact_url_credentials, ssh_command,
+};
 
 fn build_work_dir(data_dir: &str, app_name: &str) -> String {
     format!("{}/builds/{}", data_dir, app_name)
@@ -35,6 +38,42 @@ fn compose_work_dir(data_dir: &str, app_name: &str) -> String {
 
 fn compose_file_path(work_dir: &str) -> String {
     format!("{}/docker-compose.yml", work_dir)
+}
+
+/// `docker compose -p <app> -f <file> up --build -d` with a cleared
+/// environment: compose interpolates `${VAR}` from its own environment, and
+/// tond-server's holds TOND_SECRET_KEY. Only what docker needs is passed on.
+fn compose_command(compose_path: &str, app_name: &str) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new("docker");
+    cmd.env_clear();
+    for key in [
+        "PATH",
+        "HOME",
+        "DOCKER_HOST",
+        "DOCKER_CONFIG",
+        "XDG_RUNTIME_DIR",
+    ] {
+        if let Ok(val) = std::env::var(key) {
+            cmd.env(key, val);
+        }
+    }
+    cmd.args([
+        "compose",
+        "-p",
+        &compose_project_name(app_name),
+        "-f",
+        compose_path,
+        "up",
+        "--build",
+        "-d",
+    ]);
+    cmd
+}
+
+/// Compose project names must be lowercase; this is also the label value
+/// `docker::find_compose_host_port` looks up.
+pub fn compose_project_name(app_name: &str) -> String {
+    app_name.to_ascii_lowercase()
 }
 
 fn docker_build_args<'a>(
@@ -53,18 +92,58 @@ fn docker_build_args<'a>(
     args
 }
 
+/// Validate an app's `base_dir`: a relative path inside the checkout, without
+/// `..`, absolute/root components, backslashes or control characters.
+/// Returns the normalised form (no leading `./`, no trailing `/`).
+pub fn validate_base_dir(base_dir: &str) -> Result<String> {
+    use std::path::Component;
+
+    let trimmed = base_dir.trim();
+    if trimmed.len() > 512 {
+        anyhow::bail!("base_dir is too long");
+    }
+    if trimmed.contains('\\') || trimmed.chars().any(char::is_control) {
+        anyhow::bail!("base_dir must be a plain relative path");
+    }
+    let mut parts = Vec::new();
+    for component in std::path::Path::new(trimmed).components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            Component::ParentDir => anyhow::bail!("base_dir must not contain '..'"),
+            Component::RootDir | Component::Prefix(_) => {
+                anyhow::bail!("base_dir must be relative to the repository root")
+            }
+        }
+    }
+    Ok(parts.join("/"))
+}
+
+/// Resolve the build root for `base_dir` inside the checkout at `dir`, and
+/// make sure it really is inside it (symlinks included).
 fn resolve_build_root(dir: &str, base_dir: Option<&str>) -> Result<std::path::PathBuf> {
     let root = std::path::Path::new(dir);
-    let build_root = match base_dir {
-        Some(base) if !base.is_empty() => root.join(base),
-        _ => root.to_path_buf(),
+    let base = match base_dir {
+        Some(base) => validate_base_dir(base)?,
+        None => String::new(),
+    };
+    let build_root = if base.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(&base)
     };
 
     if !build_root.exists() {
-        anyhow::bail!(
-            "base_dir '{}' does not exist inside the repository",
-            base_dir.unwrap_or_default()
-        );
+        anyhow::bail!("base_dir '{}' does not exist inside the repository", base);
+    }
+
+    let canonical_root = root.canonicalize()?;
+    let canonical_build_root = build_root.canonicalize()?;
+    if !canonical_build_root.starts_with(&canonical_root) {
+        anyhow::bail!("base_dir '{}' resolves outside the repository", base);
+    }
+    if !canonical_build_root.is_dir() {
+        anyhow::bail!("base_dir '{}' is not a directory", base);
     }
 
     Ok(build_root)
@@ -158,13 +237,16 @@ pub(super) struct BuildOptions<'a> {
 /// Constructs [`BuildOptions`] from the app record and delegates to
 /// [`build_from_dir_with_method`], which contains the single canonical
 /// implementation of the build-method dispatch logic.
+///
+/// The image is tagged `tond-<app>:upload`; `deploy()` re-tags it per deployment.
 pub async fn build_from_dir(state: &AppState, app: &App, dir: &str) -> Result<String> {
     let build_opts = BuildOptions {
         method: &app.build_method,
         static_build: app.static_build != 0,
         base_dir: app.base_dir.as_deref(),
     };
-    build_from_dir_with_method(state, &app.id, &app.name, dir, &build_opts, None, "upload").await
+    let image_tag = images::upload_tag(&app.name);
+    build_from_dir_with_method(state, &app.id, &image_tag, dir, &build_opts, None, "upload").await
 }
 
 /// Clone a git repository and build a Docker image from it.
@@ -175,16 +257,20 @@ pub async fn build_from_dir(state: &AppState, app: &App, dir: &str) -> Result<St
 ///                  build with Docker.
 ///
 /// If a deploy key exists on disk at `$TOND_DATA_DIR/keys/<app_id>/id_ed25519`,
-/// it is injected via `GIT_SSH_COMMAND` to enable cloning private repositories
-/// over SSH without modifying the system-wide SSH configuration.
+/// it is injected via `GIT_SSH_COMMAND` (with a per-app known_hosts file) to
+/// enable cloning private repositories over SSH. HTTPS credentials in `auth`
+/// are passed as a header via git's environment config — see deploy/git.rs.
+/// `git_url` must not contain credentials.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn build_from_git(
     state: &AppState,
     app_id: &str,
     app_name: &str,
     git_url: &str,
+    auth: Option<&GitHttpAuth>,
     branch: &str,
     build_opts: &BuildOptions<'_>,
+    image_tag: &str,
     deployment_id: Option<&str>,
     trigger_source: &str,
 ) -> Result<String> {
@@ -212,18 +298,18 @@ pub(super) async fn build_from_git(
     .await?;
 
     let mut cmd = tokio::process::Command::new("git");
-    cmd.args([
-        "clone", "--depth", "1", "--branch", branch, git_url, &work_dir,
-    ]);
+    cmd.args(clone_args(branch, git_url, &work_dir))
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ALLOW_PROTOCOL", GIT_ALLOW_PROTOCOL);
+
+    if let Some(auth) = auth {
+        cmd.envs(git_auth_env(git_url, auth));
+    }
 
     if key_exists {
-        // Disable host-key checking so the first clone doesn't hang waiting
-        // for user input on an unrecognised host fingerprint.
-        let ssh_cmd = format!(
-            "ssh -i {} -o StrictHostKeyChecking=no -o BatchMode=yes",
-            key_path
-        );
-        cmd.env("GIT_SSH_COMMAND", &ssh_cmd);
+        let known_hosts = known_hosts_path(&data_dir, app_id);
+        ensure_known_hosts(&known_hosts).await?;
+        cmd.env("GIT_SSH_COMMAND", ssh_command(&key_path, &known_hosts));
         log_deploy(
             state,
             app_id,
@@ -238,13 +324,20 @@ pub(super) async fn build_from_git(
 
     if !clone_output.status.success() {
         let stderr = String::from_utf8_lossy(&clone_output.stderr);
-        anyhow::bail!("Git clone failed: {}", stderr);
+        anyhow::bail!(
+            "Git clone failed: {}",
+            redact_url_credentials(stderr.trim())
+        );
     }
+
+    // Drop the repository metadata before building: .git/config and history
+    // must never end up in the build context or an image.
+    tokio::fs::remove_dir_all(std::path::Path::new(&work_dir).join(".git")).await?;
 
     let image_tag = build_from_dir_with_method(
         state,
         app_id,
-        app_name,
+        image_tag,
         &work_dir,
         build_opts,
         deployment_id,
@@ -258,19 +351,19 @@ pub(super) async fn build_from_git(
     Ok(image_tag)
 }
 
-/// Build from a local directory using the appropriate build method.
+/// Build from a local directory using the appropriate build method and tag
+/// the result `image_tag`.
 ///
 /// `build_opts.method` controls which builder is used (same semantics as above).
 pub(super) async fn build_from_dir_with_method(
     state: &AppState,
     app_id: &str,
-    app_name: &str,
+    image_tag: &str,
     dir: &str,
     build_opts: &BuildOptions<'_>,
     deployment_id: Option<&str>,
     trigger_source: &str,
 ) -> Result<String> {
-    let image_tag = build_image_tag(app_name);
     let build_root = resolve_build_root(dir, build_opts.base_dir)?;
 
     let dockerfile_path = build_root.join("Dockerfile");
@@ -294,7 +387,7 @@ pub(super) async fn build_from_dir_with_method(
             build_with_dockerfile(
                 state,
                 app_id,
-                app_name,
+                image_tag,
                 build_root
                     .to_str()
                     .expect("build root path should be valid UTF-8"),
@@ -356,7 +449,7 @@ pub(super) async fn build_from_dir_with_method(
             build_with_dockerfile(
                 state,
                 app_id,
-                app_name,
+                image_tag,
                 build_root
                     .to_str()
                     .expect("build root path should be valid UTF-8"),
@@ -374,7 +467,7 @@ pub(super) async fn build_from_dir_with_method(
         }
     }
 
-    Ok(image_tag)
+    Ok(image_tag.to_string())
 }
 
 /// Build an image using `docker build` with the Dockerfile at the repo root.
@@ -382,17 +475,15 @@ pub(super) async fn build_from_dir_with_method(
 pub(super) async fn build_with_dockerfile(
     state: &AppState,
     app_id: &str,
-    app_name: &str,
+    image_tag: &str,
     dir: &str,
     context_dir: Option<&str>,
     trigger_source: &str,
 ) -> Result<String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
-    let image_tag = build_image_tag(app_name);
-
     let dockerfile = format!("{dir}/Dockerfile");
-    let args = docker_build_args(&image_tag, context_dir.unwrap_or(dir), Some(&dockerfile));
+    let args = docker_build_args(image_tag, context_dir.unwrap_or(dir), Some(&dockerfile));
 
     let mut child = tokio::process::Command::new("docker")
         .args(&args)
@@ -446,7 +537,7 @@ pub(super) async fn build_with_dockerfile(
     }
 
     tracing::info!("Docker build succeeded: {}", image_tag);
-    Ok(image_tag)
+    Ok(image_tag.to_string())
 }
 
 /// Build an image from an inline Dockerfile string (no git clone needed).
@@ -458,6 +549,7 @@ pub(super) async fn build_from_inline_dockerfile(
     app_id: &str,
     app_name: &str,
     dockerfile_content: &str,
+    image_tag: &str,
     trigger_source: &str,
 ) -> Result<String> {
     let data_dir = std::env::var("TOND_DATA_DIR").unwrap_or_else(|_| "/opt/tond/data".to_string());
@@ -480,7 +572,7 @@ pub(super) async fn build_from_inline_dockerfile(
     )
     .await?;
 
-    build_with_dockerfile(state, app_id, app_name, &work_dir, None, trigger_source).await
+    build_with_dockerfile(state, app_id, image_tag, &work_dir, None, trigger_source).await
 }
 
 /// Run an inline `docker-compose.yml` (no git clone needed).
@@ -500,23 +592,33 @@ pub(super) async fn run_inline_compose(
     let data_dir = std::env::var("TOND_DATA_DIR").unwrap_or_else(|_| "/opt/tond/data".to_string());
     let work_dir = compose_work_dir(&data_dir, app_name);
 
+    // Validate again at deploy time and rewrite the file: binds pinned inside
+    // <data>/volumes/<app>, ports on 127.0.0.1, container hardening added.
+    let data_path = std::path::Path::new(&data_dir);
+    let volume_dir = volumes::app_volume_dir(data_path, app_name);
+    let hardened =
+        compose_policy::harden(compose_content, &volume_dir, docker::default_memory_limit())
+            .map_err(|errors| anyhow::anyhow!(compose_policy::format_errors(&errors)))?;
+    for rel in &hardened.bind_sources {
+        volumes::prepare_host_dir(data_path, &volume_dir, rel, true)?;
+    }
+
     tokio::fs::create_dir_all(&work_dir).await?;
 
-    // Write the inline compose file (overwrite on redeploy)
+    // Write the hardened compose file (overwrite on redeploy)
     let compose_path = compose_file_path(&work_dir);
-    tokio::fs::write(&compose_path, compose_content).await?;
+    tokio::fs::write(&compose_path, &hardened.yaml).await?;
 
     log_deploy(
         state,
         app_id,
         "info",
         trigger_source,
-        "Wrote inline docker-compose.yml; running docker compose up...",
+        "Wrote hardened docker-compose.yml; running docker compose up...",
     )
     .await?;
 
-    let mut child = tokio::process::Command::new("docker")
-        .args(["compose", "-f", &compose_path, "up", "--build", "-d"])
+    let mut child = compose_command(&compose_path, app_name)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()?;
@@ -642,12 +744,46 @@ mod tests {
     }
 
     #[test]
-    fn build_image_tag_uses_tond_prefix() {
-        assert_eq!(
-            build_image_tag("frontend"),
-            "tond-frontend",
-            "build_image_tag should consistently prefix app images with 'tond-'"
-        );
+    fn validate_base_dir_accepts_relative_paths_and_rejects_traversal() {
+        for (input, expected) in [
+            ("apps/web", "apps/web"),
+            ("./apps/web/", "apps/web"),
+            ("", ""),
+            (".", ""),
+        ] {
+            assert_eq!(
+                validate_base_dir(input).unwrap_or_else(|err| panic!("{input}: {err}")),
+                expected
+            );
+        }
+        for input in [
+            "../etc",
+            "apps/../../etc",
+            "/etc",
+            "apps\\..\\etc",
+            "apps/\u{0}x",
+        ] {
+            assert!(
+                validate_base_dir(input).is_err(),
+                "base_dir {input:?} must be rejected"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_build_root_refuses_symlinks_that_leave_the_checkout() {
+        let repo = TempDir::new()
+            .unwrap_or_else(|err| panic!("failed to create temp repo directory: {err}"));
+        let outside = TempDir::new()
+            .unwrap_or_else(|err| panic!("failed to create outside directory: {err}"));
+        std::os::unix::fs::symlink(outside.path(), repo.path().join("escape"))
+            .unwrap_or_else(|err| panic!("failed to create symlink: {err}"));
+
+        let repo_dir = repo.path().to_string_lossy().to_string();
+        assert!(resolve_build_root(&repo_dir, Some("escape")).is_err());
+        assert!(resolve_build_root(&repo_dir, Some("../")).is_err());
+        assert!(resolve_build_root(&repo_dir, None).is_ok());
     }
 
     #[test]

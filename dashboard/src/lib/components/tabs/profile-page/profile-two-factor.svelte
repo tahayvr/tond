@@ -8,15 +8,17 @@
 	import ShieldCheck from '~icons/ri/shield-check-line';
 
 	interface Props {
-		phase: 'idle' | 'setup' | 'done' | 'disable';
+		phase: 'idle' | 'password' | 'setup' | 'done' | 'disable';
 		enabled: boolean;
 		setup: TotpSetup | null;
+		setupPassword: string;
 		totpCode: string;
 		disablePassword: string;
 		disableCode: string;
 		backupCodes: string[];
 		saving: boolean;
 		error: string;
+		onStart: () => void;
 		onEnable: () => void;
 		onConfirm: () => void;
 		onCancelSetup: () => void;
@@ -29,12 +31,14 @@
 		phase,
 		enabled,
 		setup,
+		setupPassword = $bindable(''),
 		totpCode = $bindable(''),
 		disablePassword = $bindable(''),
 		disableCode = $bindable(''),
 		backupCodes,
 		saving,
 		error,
+		onStart,
 		onEnable,
 		onConfirm,
 		onCancelSetup,
@@ -65,9 +69,39 @@
 		<p class="mb-4 text-sm text-muted-foreground">
 			Two-factor authentication is not enabled. Add a second factor to protect your account.
 		</p>
-		<Button onclick={onEnable} disabled={saving}>
-			{saving ? 'Generating…' : 'Enable Two-Factor Auth'}
-		</Button>
+		<Button onclick={onStart} disabled={saving}>Enable Two-Factor Auth</Button>
+	{:else if phase === 'password'}
+		<!-- Re-authenticate before a new authenticator can be enrolled -->
+		<p class="mb-4 text-sm text-muted-foreground">
+			Confirm your password to set up two-factor authentication.
+		</p>
+		<form
+			class="max-w-sm space-y-4"
+			onsubmit={(e) => {
+				e.preventDefault();
+				onEnable();
+			}}
+		>
+			<div class="grid gap-2">
+				<Label for="setup-pw" class="font-mono text-[10px] text-muted-foreground uppercase">
+					Current Password
+				</Label>
+				<Input
+					id="setup-pw"
+					type="password"
+					bind:value={setupPassword}
+					autocomplete="current-password"
+					class="border-border bg-card font-mono text-sm"
+					required
+				/>
+			</div>
+			<div class="flex gap-2">
+				<Button type="submit" disabled={saving || !setupPassword}>
+					{saving ? 'Generating…' : 'Continue'}
+				</Button>
+				<Button type="button" variant="ghost" onclick={onCancelSetup}>Cancel</Button>
+			</div>
+		</form>
 	{:else if phase === 'setup' && setup}
 		<!-- Scan QR, confirm first code -->
 		<p class="mb-4 text-sm text-muted-foreground">
@@ -136,6 +170,9 @@
 				Each code can only be used once. Store them somewhere safe — you won't see them again.
 			</p>
 		</div>
+		<p class="mb-4 text-xs text-muted-foreground">
+			For your security, every other session on your account has been signed out.
+		</p>
 
 		<div class="mb-6 grid grid-cols-2 gap-2">
 			{#each backupCodes as code (code)}
@@ -168,6 +205,7 @@
 		<!-- Disable flow -->
 		<p class="mb-4 text-sm text-muted-foreground">
 			Enter your current password and a 6-digit code from your authenticator app to disable 2FA.
+			Your other sessions will be signed out.
 		</p>
 
 		<form

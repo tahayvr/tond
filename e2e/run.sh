@@ -3,15 +3,19 @@ set -euo pipefail
 
 # Install a Tond bundle on this host and run the end-to-end smoke test.
 #
-# Runs as root on a fresh (or disposable) Ubuntu x86_64 host: a GitHub Actions
+# Runs as root on a fresh (or disposable) Ubuntu x86_64 or aarch64 host: a GitHub Actions
 # runner, the local dev VM, or a throwaway Hetzner server. It installs exactly
 # what users install (release/install.sh in bundled mode), then runs smoke.sh.
 #
 # Usage:
-#   sudo e2e/run.sh --bundle <dir> --base-domain <domain> [--acme <mode>] [--ip <ip>]
+#   sudo e2e/run.sh --bundle <dir> --base-domain <domain> [--preview-domain <domain>]
+#                   [--acme <mode>] [--ip <ip>]
 #
 #   --bundle        bundle directory produced by release/package.sh
 #   --base-domain   apps are served at <name>.<domain>; the dashboard at dash.<domain>
+#   --preview-domain  passed to install.sh; previews are served at <id>-<app>.<domain>
+#                   (a different site than the base domain, e.g. preview.test).
+#                   Without it the preview checks are skipped.
 #   --acme          pebble (default): local Pebble CA, works offline / in CI
 #                   letsencrypt-staging: real ACME against Let's Encrypt staging
 #                     (needs public DNS for the domains, e.g. <ip>.sslip.io)
@@ -21,6 +25,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BUNDLE=""
 BASE_DOMAIN=""
+PREVIEW_DOMAIN=""
 ACME="pebble"
 IP="127.0.0.1"
 
@@ -28,9 +33,10 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --bundle) BUNDLE="$2"; shift 2 ;;
         --base-domain) BASE_DOMAIN="$2"; shift 2 ;;
+        --preview-domain) PREVIEW_DOMAIN="$2"; shift 2 ;;
         --acme) ACME="$2"; shift 2 ;;
         --ip) IP="$2"; shift 2 ;;
-        -h|--help) sed -n '4,20p' "$0"; exit 0 ;;
+        -h|--help) sed -n '4,23p' "$0"; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -77,9 +83,18 @@ case "$ACME" in
     *) echo "Unknown --acme mode: $ACME" >&2; exit 1 ;;
 esac
 
-"${BUNDLE}/install.sh" --non-interactive --dashboard-domain "dash.${BASE_DOMAIN}"
+INSTALL_ARGS=(--non-interactive --dashboard-domain "dash.${BASE_DOMAIN}")
+[[ -n "$PREVIEW_DOMAIN" ]] && INSTALL_ARGS+=(--preview-domain "$PREVIEW_DOMAIN")
+"${BUNDLE}/install.sh" "${INSTALL_ARGS[@]}"
+
+# install.sh may have restarted Docker (log rotation in daemon.json), which
+# restarts Pebble with a new issuing root: fetch the current one.
+if [[ "$ACME" == pebble ]]; then
+    "${HERE}/pebble/pebble.sh" --refresh-root "$CA_FILE"
+fi
 
 E2E_BASE_DOMAIN="$BASE_DOMAIN" \
+E2E_PREVIEW_DOMAIN="$PREVIEW_DOMAIN" \
 E2E_TARGET_IP="$IP" \
 E2E_CA_FILE="$CA_FILE" \
     "${HERE}/smoke.sh"

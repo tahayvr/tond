@@ -5,8 +5,36 @@ export interface DeployLog {
 	created_at: string;
 }
 
+/**
+ * A persistent volume. The server chooses the host side:
+ * `<data>/volumes/<app>/<name>` — `host_path` is informational.
+ */
 export interface Volume {
+	name: string;
 	host_path: string;
+	container_path: string;
+}
+
+/** A volume as sent to the API: mount point plus optional directory name. */
+export interface VolumeInput {
+	container_path: string;
+	/** Directory under the app's volume folder; derived from container_path when omitted */
+	name?: string;
+}
+
+/** A cron volume: the job's own directory, or a volume shared from an app. */
+export interface CronVolume {
+	/** Share this app's volume instead of the job's own directory */
+	app?: string | null;
+	name: string;
+	/** Computed by the server (read-only) */
+	host_path: string;
+	container_path: string;
+}
+
+export interface CronVolumeInput {
+	app?: string | null;
+	name?: string;
 	container_path: string;
 }
 
@@ -51,8 +79,6 @@ export interface App {
 	preview_enabled: boolean;
 	/** Phase 4.6: env var keys excluded from preview containers */
 	preview_excluded_keys: string[];
-	/** Phase 4.6: override env vars for preview containers (key→value) */
-	preview_env_vars: Record<string, string>;
 	created_at: string;
 	updated_at: string;
 }
@@ -116,11 +142,12 @@ export interface User {
 	id: string;
 	email: string;
 	role: string;
+	/** Whether TOTP two-factor auth is active for this user */
+	totp_enabled: boolean;
 	created_at: string;
 }
 
 export interface AuthStatus {
-	needs_setup: boolean;
 	authenticated: boolean;
 	user: User | null;
 }
@@ -133,17 +160,126 @@ interface ApiResponse<T> {
 
 const BASE = '/api';
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
-	const res = await fetch(`${BASE}${path}`, {
-		headers: { 'Content-Type': 'application/json' },
-		credentials: 'same-origin',
-		...options
-	});
-	const json: ApiResponse<T> = await res.json();
-	if (!json.success) {
-		throw new Error(json.error || 'Unknown error');
+/**
+ * Sent on every API request. The server requires it on cookie-authenticated
+ * mutations: browsers only let a page add a custom header to a cross-origin
+ * request after a CORS preflight, which tond-server never grants, so its
+ * presence proves the request came from the dashboard itself.
+ */
+export const CSRF_HEADER = 'X-Tond-CSRF';
+
+export const SERVER_UNAVAILABLE_MESSAGE =
+	'Server unavailable. Tond may be restarting — try again in a moment.';
+export const SESSION_EXPIRED_MESSAGE = 'Your session has expired. Sign in again to continue.';
+
+/** An API failure, carrying the HTTP status (0 = the request never got a response). */
+export class ApiError extends Error {
+	readonly status: number;
+	/** Seconds to wait before retrying, from a 429's Retry-After header. */
+	readonly retryAfter: number | null;
+
+	constructor(message: string, status: number, retryAfter: number | null = null) {
+		super(message);
+		this.name = 'ApiError';
+		this.status = status;
+		this.retryAfter = retryAfter;
+	}
+}
+
+// Endpoints that answer 401 for a wrong password or code. A 401 from these is
+// an input error, not an expired session, so it must not sign the user out.
+// (/terminal/tickets answers 401 for a wrong step-up password; a truly expired
+// session is still caught by the next ordinary request.)
+const CREDENTIAL_ENDPOINTS = [
+	'/auth/status',
+	'/auth/login',
+	'/auth/logout',
+	'/auth/setup',
+	'/auth/setup/check',
+	'/auth/2fa/setup',
+	'/auth/2fa/verify',
+	'/auth/2fa/confirm',
+	'/auth/2fa/disable',
+	'/auth/change-password',
+	'/terminal/tickets'
+];
+
+let unauthorizedHandler: (() => void) | null = null;
+
+/** Register what happens when the session expires (auth.svelte.ts signs the user out). */
+export function setUnauthorizedHandler(handler: (() => void) | null) {
+	unauthorizedHandler = handler;
+}
+
+/** Parse a Retry-After header (delta-seconds or HTTP date) into whole seconds. */
+export function parseRetryAfter(header: string | null, now: number = Date.now()): number | null {
+	if (!header) return null;
+	const trimmed = header.trim();
+	if (/^\d+$/.test(trimmed)) return Number(trimmed);
+	const date = Date.parse(trimmed);
+	if (Number.isNaN(date)) return null;
+	return Math.max(0, Math.ceil((date - now) / 1000));
+}
+
+/** Turn a fetch Response into data or a descriptive ApiError. */
+async function parseResponse<T>(path: string, res: Response): Promise<T> {
+	const endpoint = path.split('?')[0];
+
+	if (res.status === 401 && !CREDENTIAL_ENDPOINTS.includes(endpoint)) {
+		unauthorizedHandler?.();
+		throw new ApiError(SESSION_EXPIRED_MESSAGE, 401);
+	}
+
+	if (res.status === 429) {
+		const retryAfter = parseRetryAfter(res.headers.get('Retry-After'));
+		const message =
+			retryAfter !== null
+				? `Too many attempts, try again in ${retryAfter} s.`
+				: 'Too many attempts, try again in a moment.';
+		throw new ApiError(message, 429, retryAfter);
+	}
+
+	// A proxy error page (502/504 HTML) or an empty body is not our API talking.
+	// A 5xx without our JSON body means the server (or proxy) is down; any
+	// other non-JSON reply is reported with its status.
+	const notApi = () =>
+		new ApiError(
+			res.status === 0 || res.status >= 500
+				? SERVER_UNAVAILABLE_MESSAGE
+				: `Request failed (HTTP ${res.status})`,
+			res.status
+		);
+	let json: ApiResponse<T>;
+	try {
+		json = await res.json();
+	} catch {
+		throw notApi();
+	}
+	if (!json || typeof json !== 'object' || !('success' in json)) {
+		throw notApi();
+	}
+	if (!res.ok || !json.success) {
+		throw new ApiError(json.error || `Request failed (HTTP ${res.status})`, res.status);
 	}
 	return json.data as T;
+}
+
+async function request<T>(path: string, options?: RequestInit): Promise<T> {
+	const headers = new Headers(options?.headers);
+	if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+	headers.set(CSRF_HEADER, '1');
+	let res: Response;
+	try {
+		res = await fetch(`${BASE}${path}`, {
+			credentials: 'same-origin',
+			...options,
+			headers
+		});
+	} catch {
+		// Network failure: server down, connection reset, offline.
+		throw new ApiError(SERVER_UNAVAILABLE_MESSAGE, 0);
+	}
+	return parseResponse<T>(path, res);
 }
 
 export async function listApps(): Promise<App[]> {
@@ -177,7 +313,7 @@ export async function createApp(data: {
 	health_failure_threshold?: number;
 	drain_timeout?: number;
 	env_vars?: Record<string, string>;
-	volumes?: { host_path: string; container_path: string }[];
+	volumes?: VolumeInput[];
 	registry_credential_id?: string;
 	github_app_id?: string;
 	/** Raw Dockerfile content (required when source_type='dockerfile') */
@@ -221,11 +357,68 @@ export async function getAppLogs(
 	return request(`/apps/${id}/logs`);
 }
 
-export async function updateEnv(id: string, env_vars: Record<string, string>): Promise<void> {
-	await request(`/apps/${id}/env`, {
-		method: 'PUT',
-		body: JSON.stringify({ env_vars })
+// ── App environment variables ──
+// Values are secrets: the list endpoint returns masked values only, a single
+// value is fetched with an explicit reveal, and writes are per-key patches.
+
+export interface EnvVarEntry {
+	key: string;
+	/** Masked placeholder for a non-empty value, '' for an empty value */
+	masked: string;
+}
+
+export interface AppEnv {
+	vars: EnvVarEntry[];
+	preview: {
+		enabled: boolean;
+		/** App variables that preview containers do not receive */
+		excluded_keys: string[];
+		/** Values that replace or add variables in preview containers only */
+		overrides: EnvVarEntry[];
+	};
+}
+
+export interface EnvPatch {
+	set?: Record<string, string>;
+	unset?: string[];
+}
+
+export interface PreviewEnvPatch extends EnvPatch {
+	exclude?: string[];
+	include?: string[];
+}
+
+export async function getAppEnv(id: string): Promise<AppEnv> {
+	return request<AppEnv>(`/apps/${id}/env`);
+}
+
+/** Set and remove individual variables; variables not named are left unchanged. */
+export async function patchAppEnv(id: string, patch: EnvPatch): Promise<AppEnv> {
+	return request<AppEnv>(`/apps/${id}/env`, {
+		method: 'PATCH',
+		body: JSON.stringify(patch)
 	});
+}
+
+export async function revealAppEnvVar(id: string, key: string): Promise<string> {
+	const res = await request<{ key: string; value: string }>(
+		`/apps/${id}/env/${encodeURIComponent(key)}`
+	);
+	return res.value;
+}
+
+export async function patchPreviewEnv(id: string, patch: PreviewEnvPatch): Promise<AppEnv> {
+	return request<AppEnv>(`/apps/${id}/preview-env`, {
+		method: 'PATCH',
+		body: JSON.stringify(patch)
+	});
+}
+
+export async function revealPreviewEnvVar(id: string, key: string): Promise<string> {
+	const res = await request<{ key: string; value: string }>(
+		`/apps/${id}/preview-env/${encodeURIComponent(key)}`
+	);
+	return res.value;
 }
 
 export async function updateDomain(id: string, domain: string): Promise<void> {
@@ -233,6 +426,32 @@ export async function updateDomain(id: string, domain: string): Promise<void> {
 		method: 'PUT',
 		body: JSON.stringify({ domain })
 	});
+}
+
+// ── Certificates ──
+
+export interface Certificate {
+	id: string;
+	domain: string;
+	cert_type: string;
+	/** "active" | "pending" | "expired" | "failed" */
+	status: string;
+	issued_at: string;
+	expires_at: string;
+	/** Why the last issuance attempt failed or was skipped (null after success) */
+	last_error: string | null;
+	last_attempt_at: string | null;
+	/** No new attempt before this time (exponential backoff) */
+	next_retry_at: string | null;
+	failure_count: number;
+}
+
+export async function listCertificates(): Promise<Certificate[]> {
+	return request<Certificate[]>('/certs');
+}
+
+export async function retryCertificate(domain: string): Promise<void> {
+	await request(`/certs/${encodeURIComponent(domain)}/retry`, { method: 'POST' });
 }
 
 export async function updateHealth(
@@ -265,10 +484,27 @@ export async function updateAppResources(
 	});
 }
 
-export async function addVolume(id: string, container_path: string): Promise<void> {
+export interface ComposeValidation {
+	valid: boolean;
+	/** One human-readable line per problem (privileged, host binds, …) */
+	errors: string[];
+}
+
+/** Check a compose file against Tond's policy without creating anything. */
+export async function validateCompose(
+	composeContent: string,
+	appName?: string
+): Promise<ComposeValidation> {
+	return request<ComposeValidation>('/compose/validate', {
+		method: 'POST',
+		body: JSON.stringify({ compose_content: composeContent, app_name: appName || null })
+	});
+}
+
+export async function addVolume(id: string, volume: VolumeInput): Promise<void> {
 	await request(`/apps/${id}/volumes`, {
 		method: 'POST',
-		body: JSON.stringify({ container_path })
+		body: JSON.stringify(volume)
 	});
 }
 
@@ -285,10 +521,23 @@ export async function getAuthStatus(): Promise<AuthStatus> {
 	return request<AuthStatus>('/auth/status');
 }
 
-export async function setupAdmin(email: string, password: string): Promise<{ user: User }> {
+/** Create the first admin account. `token` is the one-time setup token from the installer. */
+export async function setupAdmin(
+	token: string,
+	email: string,
+	password: string
+): Promise<{ user: User }> {
 	return request<{ user: User }>('/auth/setup', {
 		method: 'POST',
-		body: JSON.stringify({ email, password })
+		body: JSON.stringify({ token, email, password })
+	});
+}
+
+/** Check a setup token before showing the setup form. Throws if it is invalid or used. */
+export async function checkSetupToken(token: string): Promise<{ valid: boolean }> {
+	return request<{ valid: boolean }>('/auth/setup/check', {
+		method: 'POST',
+		body: JSON.stringify({ token })
 	});
 }
 
@@ -365,8 +614,12 @@ export interface TotpSetup {
 	qr_code: string;
 }
 
-export async function setup2FA(): Promise<TotpSetup> {
-	return request<TotpSetup>('/auth/2fa/setup', { method: 'POST' });
+/** Start 2FA enrollment. Requires the current password; refused while 2FA is on. */
+export async function setup2FA(password: string): Promise<TotpSetup> {
+	return request<TotpSetup>('/auth/2fa/setup', {
+		method: 'POST',
+		body: JSON.stringify({ password })
+	});
 }
 
 export async function confirm2FA(
@@ -398,6 +651,11 @@ export async function verify2FA(code: string): Promise<{ user: User }> {
 export interface ServerSettings {
 	server_name: string;
 	dashboard_domain: string;
+	/**
+	 * Domain previews are served under (`<slug>-<app>.<preview_domain>`). Must be a
+	 * different registrable domain from `dashboard_domain`; empty = previews disabled.
+	 */
+	preview_domain: string;
 }
 
 export interface OnboardingStatus {
@@ -444,6 +702,14 @@ export interface Deployment {
 	started_at: string;
 	finished_at: string | null;
 	created_at: string;
+	/** The image was removed from the server to save disk space */
+	image_pruned: boolean;
+	/** This deployment's image is what the app runs now */
+	is_current: boolean;
+	/** Rolling back to this deployment would restore its exact image */
+	rollback_available: boolean;
+	/** Why rollback is unavailable (tooltip text); null when available */
+	rollback_unavailable_reason: string | null;
 }
 
 export async function listDeployments(id: string): Promise<Deployment[]> {
@@ -460,8 +726,15 @@ export async function getDeploymentGeneratedDockerfile(
 	return response.generated_dockerfile;
 }
 
-export async function rollbackApp(id: string): Promise<void> {
-	await request(`/apps/${id}/rollback`, { method: 'POST' });
+/**
+ * Redeploy the exact image of an earlier deployment. Without `deploymentId`
+ * the server restores the previous distinct image.
+ */
+export async function rollbackApp(id: string, deploymentId?: string): Promise<void> {
+	await request(`/apps/${id}/rollback`, {
+		method: 'POST',
+		...(deploymentId ? { body: JSON.stringify({ deployment_id: deploymentId }) } : {})
+	});
 }
 
 // ── Git Integration ──
@@ -479,11 +752,40 @@ export async function getDeployKey(id: string): Promise<DeployKey> {
 	return request<DeployKey>(`/apps/${id}/deploy-key`);
 }
 
-export async function setWebhookSecret(id: string, secret: string | null): Promise<App> {
-	return request<App>(`/apps/${id}/webhook-secret`, {
+export interface WebhookUrls {
+	github: string;
+	gitlab: string;
+	gitea: string;
+	generic: string;
+}
+
+export interface WebhookConfig {
+	app_id: string;
+	/** Paths relative to the server origin, e.g. `/api/webhooks/github/<uuid>` */
+	paths: WebhookUrls;
+	/** Absolute URLs when the dashboard domain is configured, else null */
+	urls: WebhookUrls | null;
+	/** Shared secret: HMAC key for GitHub/Gitea/generic, token for GitLab */
+	secret: string;
+	auto_deploy: boolean;
+	watch_branch: string | null;
+}
+
+export async function getWebhookConfig(id: string): Promise<WebhookConfig> {
+	return request<WebhookConfig>(`/apps/${id}/webhook`);
+}
+
+/** Replace the webhook secret with a custom value (min. 16 characters). */
+export async function setWebhookSecret(id: string, secret: string): Promise<WebhookConfig> {
+	return request<WebhookConfig>(`/apps/${id}/webhook-secret`, {
 		method: 'PUT',
 		body: JSON.stringify({ secret })
 	});
+}
+
+/** Generate a new webhook secret; the old one stops working immediately. */
+export async function rotateWebhookSecret(id: string): Promise<WebhookConfig> {
+	return request<WebhookConfig>(`/apps/${id}/webhook-secret/rotate`, { method: 'POST' });
 }
 
 export async function setAutoDeploy(
@@ -530,8 +832,6 @@ export interface GitHubApp {
 	installation_id: number | null;
 	/** True when installation_id is set — pre-computed by the server */
 	installed: boolean;
-	/** Direct URL to install the App on repos — pre-computed by the server */
-	install_url: string;
 	created_at: string;
 	updated_at: string;
 }
@@ -549,6 +849,30 @@ export interface GitHubAppManifestForm {
 
 export async function getGitHubAppManifestUrl(): Promise<GitHubAppManifestForm> {
 	return request<GitHubAppManifestForm>('/github-apps/manifest', { method: 'POST' });
+}
+
+/**
+ * Start an installation flow for the logged-in admin and return the GitHub
+ * installation URL (it carries a single-use state; do not cache it).
+ */
+export async function getGitHubAppInstallUrl(id: string): Promise<string> {
+	const res = await request<{ url: string }>(`/github-apps/${id}/install`, { method: 'POST' });
+	return res.url;
+}
+
+export interface CompleteGitHubFlowRequest {
+	kind: 'manifest' | 'install';
+	state: string | null;
+	code?: string | null;
+	installation_id?: number | null;
+}
+
+/**
+ * Finish a GitHub App manifest or install flow after GitHub redirects back.
+ * Rejects with an error whose message is a flow error code (e.g. `invalid_state`).
+ */
+export async function completeGitHubFlow(req: CompleteGitHubFlowRequest): Promise<void> {
+	await request('/github-apps/complete', { method: 'POST', body: JSON.stringify(req) });
 }
 
 export async function deleteGitHubApp(id: string): Promise<void> {
@@ -689,15 +1013,11 @@ export async function deletePreview(id: string, previewId: string): Promise<void
 	await request(`/apps/${id}/previews/${previewId}`, { method: 'DELETE' });
 }
 
-export async function updatePreviewConfig(
-	id: string,
-	preview_enabled: boolean,
-	preview_excluded_keys?: string[],
-	preview_env_vars?: Record<string, string>
-): Promise<void> {
+/** Enable or disable PR previews. Preview env is edited with patchPreviewEnv(). */
+export async function updatePreviewConfig(id: string, preview_enabled: boolean): Promise<void> {
 	await request(`/apps/${id}/preview-config`, {
 		method: 'PUT',
-		body: JSON.stringify({ preview_enabled, preview_excluded_keys, preview_env_vars })
+		body: JSON.stringify({ preview_enabled })
 	});
 }
 
@@ -1001,10 +1321,14 @@ export interface ManagedDatabase {
 	custom_image: string | null;
 	created_at: string;
 	updated_at: string;
+	/** Port published on all interfaces (reachable from the internet). Off by default. */
+	public_access: boolean;
 }
 
 export interface ManagedDatabaseDetail extends ManagedDatabase {
 	connection_string: string | null;
+	/** Connection string via the server's public address; only when public_access is on */
+	public_connection_string: string | null;
 	internal_connection_string: string | null;
 }
 
@@ -1047,6 +1371,8 @@ export async function updateDatabase(
 		custom_internal_url?: string | null;
 		custom_image?: string | null;
 		memory_limit?: number | null;
+		/** Admin only. The container is recreated immediately. */
+		public_access?: boolean;
 	}
 ): Promise<ManagedDatabaseDetail> {
 	return request<ManagedDatabaseDetail>(`/databases/${id}`, {
@@ -1061,14 +1387,18 @@ export async function redeployDatabase(id: string): Promise<ManagedDatabaseDetai
 
 export interface UpdateDatabaseCredentialsResponse {
 	database: ManagedDatabaseDetail;
-	requires_redeploy: boolean;
+	/** Fields changed inside the running database and saved, e.g. ["db_password"] */
+	changed: ('db_password' | 'root_password')[];
 }
 
+/**
+ * Change a password inside the running database (the server runs ALTER USER /
+ * ALTER ROLE in the container), then save it. Refused when the database is
+ * stopped, for Redis/KeyDB, and for database or user renames.
+ */
 export async function updateDatabaseCredentials(
 	id: string,
 	data: {
-		db_name?: string | null;
-		db_user?: string | null;
 		db_password?: string | null;
 		root_password?: string | null;
 	}
@@ -1112,8 +1442,8 @@ export interface CronJob {
 	max_retries: number;
 	/** Seconds to wait between retries. */
 	retry_delay_seconds: number;
-	/** Volume mounts as a JSON array. null = none. */
-	volumes: { host_path: string; container_path: string }[] | null;
+	/** Volume mounts. null = none. */
+	volumes: CronVolume[] | null;
 }
 
 export interface CronJobRun {
@@ -1157,7 +1487,7 @@ export async function createCronJob(data: {
 	/** Seconds to wait between retries. */
 	retry_delay_seconds?: number;
 	/** Volume mounts */
-	volumes?: { host_path: string; container_path: string }[] | null;
+	volumes?: CronVolumeInput[] | null;
 }): Promise<CronJob> {
 	return request<CronJob>('/cron', {
 		method: 'POST',
@@ -1193,7 +1523,7 @@ export async function updateCronJob(
 		/** Seconds to wait between retries. */
 		retry_delay_seconds: number;
 		/** Volume mounts. null = remove all. */
-		volumes: { host_path: string; container_path: string }[] | null;
+		volumes: CronVolumeInput[] | null;
 	}>
 ): Promise<CronJob> {
 	return request<CronJob>(`/cron/${id}`, {
@@ -1256,6 +1586,24 @@ export interface TerminalTarget {
 	kind: TerminalTargetKind;
 	label: string;
 	shell_user: string | null;
+	/** False for the host shell while it is switched off on the server. */
+	enabled: boolean;
+	/** Opening a session needs the password (and 2FA code). */
+	requires_step_up: boolean;
+}
+
+/** Command that switches the host terminal on (only works on the server itself). */
+export const HOST_TERMINAL_ENABLE_COMMAND = 'sudo tond settings host-terminal on';
+
+export interface TerminalStepUp {
+	password: string;
+	/** TOTP or backup code, when 2FA is enabled. */
+	code?: string;
+}
+
+export interface TerminalTicket {
+	ticket: string;
+	expires_in: number;
 }
 
 export interface TerminalSessionCallbacks {
@@ -1375,15 +1723,32 @@ export async function listTerminalTargets(): Promise<TerminalTarget[]> {
 	return request<TerminalTarget[]>('/terminal/targets');
 }
 
-export function openTerminalSession(
+/**
+ * Get a single-use, 30-second ticket for one terminal WebSocket. The host shell
+ * needs step-up credentials (password, plus a 2FA code when enabled).
+ */
+export async function createTerminalTicket(
 	target: Pick<TerminalTarget, 'id' | 'kind'>,
+	stepUp?: TerminalStepUp
+): Promise<TerminalTicket> {
+	return request<TerminalTicket>('/terminal/tickets', {
+		method: 'POST',
+		body: JSON.stringify({
+			target_kind: target.kind,
+			target_id: target.id,
+			password: stepUp?.password,
+			code: stepUp?.code || undefined
+		})
+	});
+}
+
+/** Open a terminal WebSocket with a ticket from `createTerminalTicket`. */
+export function openTerminalSession(
+	ticket: string,
 	callbacks: TerminalSessionCallbacks
 ): TerminalSessionHandle {
 	const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-	const query = new URLSearchParams({
-		target_kind: target.kind,
-		target_id: target.id
-	});
+	const query = new URLSearchParams({ ticket });
 	const ws = new WebSocket(
 		`${protocol}://${window.location.host}${BASE}/terminal/ws?${query.toString()}`
 	);
