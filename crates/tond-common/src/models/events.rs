@@ -69,3 +69,30 @@ pub struct AppEventsResponse {
     /// Pass as `before` to get older events; None when there are no more.
     pub next_before: Option<String>,
 }
+
+// ── Deploy success-rate trend (GET /api/apps/{id}/deployments/stats) ──
+
+/// One finished deployment in the trend window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployOutcome {
+    pub id: String,
+    /// "succeeded" | "failed" | "superseded" | "cancelled"
+    pub status: String,
+    pub started_at: String,
+    pub duration_secs: Option<i64>,
+    pub commit_sha: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployStatsResponse {
+    /// How many of the latest finished deployments the numbers cover (at most 30).
+    pub window: i64,
+    pub succeeded: i64,
+    pub failed: i64,
+    /// succeeded / (succeeded + failed); None before the first result.
+    pub success_rate: Option<f64>,
+    /// Median wall-clock time of successful deployments.
+    pub median_duration_secs: Option<i64>,
+    /// Oldest first.
+    pub outcomes: Vec<DeployOutcome>,
+}

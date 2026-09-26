@@ -326,7 +326,7 @@ pub async fn app_events(
     }
 
     all.retain(|(at, _)| *at < before);
-    all.sort_by(|a, b| b.0.cmp(&a.0));
+    all.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
     let more = some_source_full || i64::try_from(all.len()).unwrap_or(0) > limit;
     all.truncate(usize::try_from(limit).unwrap_or(50));
     let next_before = if more {

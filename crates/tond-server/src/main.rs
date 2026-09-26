@@ -378,6 +378,10 @@ async fn run() -> Result<()> {
             get(handlers::deployments::list_deployments),
         )
         .route(
+            "/api/apps/{id}/deployments/stats",
+            get(handlers::deploy_stats::deploy_stats),
+        )
+        .route(
             "/api/apps/{id}/deployments/{deployment_id}",
             get(handlers::deployments::get_deployment),
         )

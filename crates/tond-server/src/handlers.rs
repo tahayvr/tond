@@ -45,6 +45,7 @@ pub mod certificates;
 pub mod cron;
 pub mod database_links;
 pub mod databases;
+pub mod deploy_stats;
 pub mod deployments;
 pub mod domains;
 pub mod env;
