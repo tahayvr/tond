@@ -245,10 +245,15 @@ pass "both units: MemoryMax, TasksMax, OOMScoreAdjust=-900 (effective), MALLOC_A
 [[ "$(systemctl show -p KillMode --value tond-server)" == mixed ]] \
     || fail "tond-server must use KillMode=mixed so SIGTERM reaches only tond-server"
 pass "tond-server: KillMode=mixed (graceful shutdown handles in-flight work)"
-[[ -f /etc/systemd/system/tond-build.slice ]] || fail "install.sh must install tond-build.slice"
-slice_max=$(systemctl show -p MemoryMax --value tond-build.slice)
-[[ -n "$slice_max" && "$slice_max" != infinity ]] || fail "tond-build.slice must cap memory, got MemoryMax=${slice_max}"
-pass "tond-build.slice caps builds at MemoryMax=${slice_max} bytes (60% of RAM)"
+[[ -f /etc/systemd/system/tondbuild.slice ]] || fail "install.sh must install tondbuild.slice"
+systemctl is-active --quiet tondbuild.slice || fail "tondbuild.slice must be active (tond-server Wants= it)"
+# The cgroup BuildKit puts RUN steps under must carry the limit itself.
+slice_max=$(cat /sys/fs/cgroup/tondbuild.slice/memory.max)
+[[ "$slice_max" =~ ^[0-9]+$ ]] || fail "/sys/fs/cgroup/tondbuild.slice must cap memory, got memory.max=${slice_max}"
+pass "tondbuild.slice is active and caps builds at $((slice_max / 1024 / 1024)) MiB (60% of RAM)"
+if [[ -d /sys/fs/cgroup/tondbuild.slice/buildkit ]]; then
+    pass "BuildKit runs build steps inside tondbuild.slice"
+fi
 
 step "tond-proxy control socket and read-only database"
 PROXY_SOCK="${DATA_DIR}/proxy.sock"

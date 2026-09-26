@@ -411,8 +411,8 @@ perform_update() {
     info "Updating service files..."
     cp "${download_path}/tond-server.service" /etc/systemd/system/tond-server.service
     cp "${download_path}/tond-proxy.service" /etc/systemd/system/tond-proxy.service
-    if [[ -f "${download_path}/tond-build.slice" ]]; then
-        cp "${download_path}/tond-build.slice" /etc/systemd/system/tond-build.slice
+    if [[ -f "${download_path}/tondbuild.slice" ]]; then
+        cp "${download_path}/tondbuild.slice" /etc/systemd/system/tondbuild.slice
     fi
     systemctl daemon-reload
 

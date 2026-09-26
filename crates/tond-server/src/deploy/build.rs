@@ -77,8 +77,8 @@ pub fn compose_project_name(app_name: &str) -> String {
 }
 
 /// Default cgroup parent for build containers: a systemd slice that
-/// install.sh caps at MemoryMax=60% (see release/tond-build.slice).
-pub const DEFAULT_BUILD_CGROUP_PARENT: &str = "tond-build.slice";
+/// install.sh caps at MemoryMax=60% (see release/tondbuild.slice).
+pub const DEFAULT_BUILD_CGROUP_PARENT: &str = "tondbuild.slice";
 
 /// Cgroup parent for `docker build` RUN steps: TOND_BUILD_CGROUP_PARENT, else
 /// DEFAULT_BUILD_CGROUP_PARENT; an empty value disables it.
@@ -87,7 +87,7 @@ pub const DEFAULT_BUILD_CGROUP_PARENT: &str = "tond-build.slice";
 /// ignores the classic builder's --memory flag, but honours --cgroup-parent
 /// for the containers that run RUN steps (the docker driver). With Docker's
 /// systemd cgroup driver the value names a slice, so every build step lands
-/// in tond-build.slice and the slice's MemoryMax bounds all builds together.
+/// in tondbuild.slice and the slice's MemoryMax bounds all builds together.
 /// If the slice unit is missing, systemd creates it with no limit, so the flag
 /// is always safe to pass.
 fn build_cgroup_parent() -> Option<String> {
@@ -844,7 +844,7 @@ mod tests {
     fn builds_run_under_the_build_slice() {
         assert_eq!(
             docker_build_args("t", "/ctx", None, Some(DEFAULT_BUILD_CGROUP_PARENT)),
-            vec!["build", "--cgroup-parent", "tond-build.slice", "-t", "t", "/ctx"]
+            vec!["build", "--cgroup-parent", "tondbuild.slice", "-t", "t", "/ctx"]
         );
         // SAFETY: only this test reads TOND_BUILD_CGROUP_PARENT.
         unsafe { std::env::remove_var("TOND_BUILD_CGROUP_PARENT") };

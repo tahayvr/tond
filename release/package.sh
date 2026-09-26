@@ -66,7 +66,7 @@ cp "${BIN_DIR}/tond-server" "${BIN_DIR}/tond-proxy" "${BIN_DIR}/tond" "${BUNDLE}
 cp -r "${ROOT}/dashboard/build/." "${BUNDLE}/dashboard/"
 cp "${ROOT}/release/install.sh" "${ROOT}/release/update.sh" \
     "${ROOT}/release/tond-server.service" "${ROOT}/release/tond-proxy.service" \
-    "${ROOT}/release/tond-build.slice" "${BUNDLE}/"
+    "${ROOT}/release/tondbuild.slice" "${BUNDLE}/"
 chmod +x "${BUNDLE}/install.sh" "${BUNDLE}/update.sh" \
     "${BUNDLE}/tond-server" "${BUNDLE}/tond-proxy" "${BUNDLE}/tond"
 # install.sh persists VERSION to /opt/tond/VERSION on the host and refuses a

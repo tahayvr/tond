@@ -3,13 +3,19 @@ Description=Tond image builds
 Documentation=https://docs.tond.io
 Before=slices.target
 
-# tond-server runs `docker build --cgroup-parent tond-build.slice`, so every
+# tond-server runs `docker build --cgroup-parent tondbuild.slice`, so every
 # RUN step of every build lands in this slice (BuildKit's docker driver
 # honours --cgroup-parent; the classic builder's --memory flag is ignored by
 # BuildKit). Together, builds may use at most 60% of RAM: a runaway `npm
 # install` is killed inside its build instead of pushing the host into an OOM
 # that takes out running apps or Tond. Builds also yield CPU and I/O to
-# running apps. Override with `systemctl edit tond-build.slice`.
+# running apps. Override with `systemctl edit tondbuild.slice`.
+#
+# The name has no dash on purpose: systemd maps "a-b.slice" to the cgroup
+# /a.slice/a-b.slice, but BuildKit uses the --cgroup-parent value as a literal
+# cgroup path (/tondbuild.slice/buildkit/<step>). A dashless top-level slice
+# is the same path for both, so the limit really applies. tond-server.service
+# Wants= this slice so it is active (and capped) before the first build.
 [Slice]
 MemoryHigh=50%
 MemoryMax=60%

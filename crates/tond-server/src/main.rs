@@ -37,7 +37,7 @@
 //                        (written only while the setting is empty)
 //   TOND_BUILD_CONCURRENCY — concurrent image builds (default 1); see deploy/queue.rs
 //   TOND_BUILD_CGROUP_PARENT — cgroup parent for build containers
-//                        (default tond-build.slice; empty disables)
+//                        (default tondbuild.slice; empty disables)
 //   TOND_SHUTDOWN_GRACE_SECS — how long in-flight work may finish on SIGTERM
 //
 // Lifecycle:

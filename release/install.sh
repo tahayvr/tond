@@ -655,8 +655,8 @@ install_services() {
     # Copy service files
     cp "${SCRIPT_DIR}/tond-server.service" /etc/systemd/system/tond-server.service
     cp "${SCRIPT_DIR}/tond-proxy.service"  /etc/systemd/system/tond-proxy.service
-    # Memory cap for image builds (docker build --cgroup-parent tond-build.slice)
-    cp "${SCRIPT_DIR}/tond-build.slice"    /etc/systemd/system/tond-build.slice
+    # Memory cap for image builds (docker build --cgroup-parent tondbuild.slice)
+    cp "${SCRIPT_DIR}/tondbuild.slice"    /etc/systemd/system/tondbuild.slice
     
     systemctl daemon-reload
     

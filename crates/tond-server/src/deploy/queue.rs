@@ -12,7 +12,7 @@
 //   - A global build semaphore (TOND_BUILD_CONCURRENCY, default 1) bounds how
 //     many image builds run at once across all apps (and previews). Only the
 //     build phase holds a slot; health checks and cutover don't.
-//   - Builds run with `--cgroup-parent tond-build.slice` (see build.rs), a
+//   - Builds run with `--cgroup-parent tondbuild.slice` (see build.rs), a
 //     systemd slice install.sh caps at MemoryMax=60%, so a runaway build can't
 //     push the host into an OOM that takes out running apps or Tond.
 //
