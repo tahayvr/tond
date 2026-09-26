@@ -45,9 +45,10 @@ export function tabHref(
 // ── App page ────────────────────────────────────────────────────────────────
 
 export type AppTab =
-	'overview' | 'deployments' | 'logs' | 'metrics' | 'uptime' | 'events' | 'settings';
+	'overview' | 'services' | 'deployments' | 'logs' | 'metrics' | 'uptime' | 'events' | 'settings';
 export type AppSettingsSection =
 	| 'environment'
+	| 'compose'
 	| 'domain'
 	| 'databases'
 	| 'health'
@@ -60,6 +61,7 @@ export type AppSettingsSection =
 
 export const APP_TABS: readonly TabDef<AppTab>[] = [
 	{ id: 'overview', label: 'Overview' },
+	{ id: 'services', label: 'Services' },
 	{ id: 'deployments', label: 'Deployments' },
 	{ id: 'logs', label: 'Logs', scope: 'logs:read' },
 	{ id: 'metrics', label: 'Metrics', scope: 'metrics:read' },
@@ -70,6 +72,7 @@ export const APP_TABS: readonly TabDef<AppTab>[] = [
 
 export const APP_SETTINGS_SECTIONS: readonly TabDef<AppSettingsSection>[] = [
 	{ id: 'environment', label: 'Environment', scope: 'env:read-names' },
+	{ id: 'compose', label: 'Compose file' },
 	{ id: 'domain', label: 'Domain' },
 	{ id: 'databases', label: 'Databases', scope: 'db:read' },
 	{ id: 'health', label: 'Health' },
@@ -80,6 +83,32 @@ export const APP_SETTINGS_SECTIONS: readonly TabDef<AppSettingsSection>[] = [
 	{ id: 'history', label: 'History' },
 	{ id: 'danger', label: 'Danger zone', scope: 'apps:delete' }
 ];
+
+/** Tabs only Docker Compose apps have. */
+const COMPOSE_ONLY_TABS: readonly string[] = ['services'];
+const COMPOSE_ONLY_SECTIONS: readonly string[] = ['compose'];
+/**
+ * Sections compose apps don't use: domains are set per service, volumes and
+ * the source live in the compose file, previews need a single container.
+ */
+const NOT_FOR_COMPOSE_SECTIONS: readonly string[] = ['domain', 'volumes', 'git', 'previews'];
+
+/** The app page tabs for an app of `sourceType`. */
+export function appTabsFor<T extends TabDef<AppTab>>(tabs: readonly T[], sourceType: string): T[] {
+	const compose = sourceType === 'compose';
+	return tabs.filter((t) => compose || !COMPOSE_ONLY_TABS.includes(t.id));
+}
+
+/** The Settings sections for an app of `sourceType`. */
+export function appSectionsFor<T extends TabDef<AppSettingsSection>>(
+	sections: readonly T[],
+	sourceType: string
+): T[] {
+	const compose = sourceType === 'compose';
+	return sections.filter((s) =>
+		compose ? !NOT_FOR_COMPOSE_SECTIONS.includes(s.id) : !COMPOSE_ONLY_SECTIONS.includes(s.id)
+	);
+}
 
 /**
  * Old flat tab names (and the sub-section names) still resolve, so links like

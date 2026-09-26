@@ -70,6 +70,10 @@
 	let githubAppId = $state<string | null>(null);
 	let dockerfileContent = $state('');
 	let composeContent = $state('');
+	let composeMode = $state<'inline' | 'git'>('inline');
+	let composePath = $state('docker-compose.yml');
+	let composeService = $state('');
+	let composeErrors = $state<string[]>([]);
 
 	// Step 2: Build
 	let buildMethod = $state<'dockerfile' | 'tbuild'>('tbuild');
@@ -221,8 +225,16 @@
 				return false;
 			}
 		} else if (sourceSubType === 'compose') {
-			if (!composeContent.trim()) {
-				error = 'docker-compose.yml content is required';
+			if (composeMode === 'git') {
+				if (!sourceUrl.trim()) {
+					error = 'Enter the repository that holds the compose file';
+					return false;
+				}
+			} else if (!composeContent.trim()) {
+				error = 'Paste your docker-compose.yml';
+				return false;
+			} else if (composeErrors.length > 0) {
+				error = 'Fix the problems listed under the compose file first';
 				return false;
 			}
 		}
@@ -315,7 +327,9 @@
 				source_type: apiSourceType,
 				container_port: containerPort,
 				...(apiSourceType === 'git' ? { build_method: buildMethod } : {}),
-				...(sourceUrl.trim() ? { source_url: sourceUrl.trim() } : {}),
+				...(sourceUrl.trim() && !(sourceSubType === 'compose' && composeMode === 'inline')
+					? { source_url: sourceUrl.trim() }
+					: {}),
 				...(domain.trim() && !isWorker ? { domain: domain.trim() } : {}),
 				readiness,
 				...(isWorker ? { ready_after_secs: readyAfterSecs } : {}),
@@ -336,7 +350,18 @@
 				...(registryCredentialId ? { registry_credential_id: registryCredentialId } : {}),
 				...(githubAppId ? { github_app_id: githubAppId } : {}),
 				...(sourceSubType === 'dockerfile' ? { dockerfile_content: dockerfileContent } : {}),
-				...(sourceSubType === 'compose' ? { compose_content: composeContent } : {}),
+				...(sourceSubType === 'compose' && composeMode === 'inline'
+					? { compose_content: composeContent }
+					: {}),
+				...(sourceSubType === 'compose' && composeMode === 'git'
+					? {
+							branch: branch.trim() || 'main',
+							compose_path: composePath.trim() || 'docker-compose.yml'
+						}
+					: {}),
+				...(sourceSubType === 'compose' && composeService.trim()
+					? { compose_service: composeService.trim() }
+					: {}),
 				...(baseDir.trim() ? { base_dir: baseDir.trim() } : {}),
 				...(staticBuild ? { static_build: true } : {})
 			};
@@ -451,6 +476,11 @@
 					bind:branch
 					bind:dockerfileContent
 					bind:composeContent
+					bind:composeMode
+					bind:composePath
+					bind:composeService
+					bind:composeErrors
+					{containerPort}
 				/>
 			{:else if currentStep === 1}
 				<AppWizardBuild

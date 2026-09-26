@@ -112,8 +112,10 @@ pub struct DeployFailure {
 pub struct Deployment {
     pub id: String,
     pub app_id: String,
-    /// Image this deployment ran: `tond-<app>:<deployment-id-prefix>` (compose
-    /// apps record a `tond-compose-<app>` sentinel)
+    /// Image this deployment ran: `tond-<app>:<deployment-id-prefix>`. For
+    /// compose apps the same tag names the deployment's *set* of service
+    /// images (`tond-<app>/<service>:<image id prefix>`, see
+    /// `deployment_services`).
     pub image_tag: Option<String>,
     /// "queued" | "running" | "succeeded" | "failed" | "superseded"
     pub status: String,
@@ -155,6 +157,10 @@ pub struct Deployment {
     /// JSON [`DeployFailure`] for failed deployments
     #[sqlx(default)]
     pub failure: Option<String>,
+    /// Compose apps: the compose file this deployment ran (for rollback)
+    #[sqlx(default)]
+    #[serde(default, skip_serializing)]
+    pub compose_source: Option<String>,
 }
 
 impl Deployment {
@@ -241,6 +247,9 @@ pub struct DeploymentResponse {
     /// Why rollback is unavailable (for a tooltip); `None` when available
     #[serde(default)]
     pub rollback_unavailable_reason: Option<String>,
+    /// Compose apps: per-service images and progress of this deployment
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<crate::DeploymentService>,
 }
 
 impl From<Deployment> for DeploymentResponse {
@@ -274,6 +283,7 @@ impl From<Deployment> for DeploymentResponse {
             is_current: false,
             rollback_available: false,
             rollback_unavailable_reason: None,
+            services: Vec::new(),
         }
     }
 }
@@ -515,6 +525,7 @@ mod tests {
             rollback_of: None,
             phases: r#"[{"phase":"build","status":"succeeded","started_at":"2026-01-01T00:00:00Z","finished_at":"2026-01-01T00:00:40Z"}]"#.to_string(),
             failure: None,
+            compose_source: None,
         };
 
         let response = DeploymentResponse::from(deployment);
@@ -568,6 +579,7 @@ mod tests {
             failure: Some(
                 r#"{"phase":"health","code":"health_check_failed","title":"t","hint":"h"}"#.into(),
             ),
+            compose_source: None,
         };
         assert!(d.phase_records().is_empty());
         let failure = d

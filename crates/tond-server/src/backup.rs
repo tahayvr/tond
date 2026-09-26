@@ -359,6 +359,59 @@ async fn build_snapshot(
         apps_included.push(app_name.clone());
     }
 
+    // ── Step: Compose named volumes ──────────────────────────────────────────
+    // Bind mounts of compose apps live under volumes/<app> (copied above);
+    // named volumes are Docker volumes <app>_<volume>. They are copied from
+    // their mount point on this host, like the volume directories (a live,
+    // crash-consistent copy; symlinks are skipped).
+    let compose_apps: Vec<String> = if app_scope.is_some() || is_full {
+        let names: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM apps WHERE source_type = 'compose'")
+                .fetch_all(&state.db)
+                .await?;
+        names
+            .into_iter()
+            .filter(|n| app_scope.as_ref().is_none_or(|a| a == n))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut compose_volumes_included: Vec<String> = Vec::new();
+    for app_name in &compose_apps {
+        let project = crate::deploy::compose_project_name(app_name);
+        let volumes = match docker::compose_volumes(&state.docker, &project).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("Could not list the volumes of {app_name}: {e:#}");
+                continue;
+            }
+        };
+        for (volume, mountpoint) in volumes {
+            let src = PathBuf::from(&mountpoint);
+            if !src.is_absolute() || !src.is_dir() {
+                continue;
+            }
+            emit(
+                progress_tx,
+                "volumes",
+                &format!("Copying volume {volume}…"),
+                false,
+            )
+            .await;
+            let dest = compose_volume_dir(&staging, app_name, &volume);
+            let prev = prev_dir
+                .as_ref()
+                .map(|p| compose_volume_dir(p, app_name, &volume));
+            let (d, t) = copy_tree(src, dest, prev).await?;
+            delta_bytes += d;
+            total_bytes += t;
+            compose_volumes_included.push(volume);
+        }
+        if !apps_included.contains(app_name) && compose_volume_root(&staging, app_name).exists() {
+            apps_included.push(app_name.clone());
+        }
+    }
+
     // ── Step: Managed DB dumps (full scope or db scope) ───────────────────────
     if is_full || db_scope.is_some() {
         let db_vol_base = PathBuf::from(data_dir()).join("databases");
@@ -452,6 +505,7 @@ async fn build_snapshot(
         "delta_bytes": delta_bytes,
         "total_bytes": total_bytes,
         "apps_included": apps_included,
+        "compose_volumes_included": compose_volumes_included,
         "databases_included": databases_included,
     });
     tokio::fs::write(
@@ -517,6 +571,78 @@ async fn build_snapshot(
     )
     .await;
 
+    Ok(())
+}
+
+/// `<snapshot>/compose-volumes/<app>`: an app's named volumes in a snapshot.
+fn compose_volume_root(snapshot: &Path, app_name: &str) -> PathBuf {
+    snapshot.join("compose-volumes").join(app_name)
+}
+
+/// `<snapshot>/compose-volumes/<app>/<docker volume name>`
+fn compose_volume_dir(snapshot: &Path, app_name: &str, volume: &str) -> PathBuf {
+    compose_volume_root(snapshot, app_name).join(volume)
+}
+
+/// Ids of every container of a compose app.
+async fn compose_containers(state: &AppState, app_name: &str) -> Vec<String> {
+    let project = crate::deploy::compose_project_name(app_name);
+    crate::compose::discover(&state.docker, &project)
+        .await
+        .map(|v| v.into_iter().map(|s| s.container_id).collect())
+        .unwrap_or_default()
+}
+
+/// Put a snapshot's named volumes of a compose app back: each Docker volume
+/// (created with compose's labels if missing) is emptied and refilled.
+async fn restore_compose_volumes(state: &AppState, snapshot: &Path, app_name: &str) -> Result<()> {
+    let root = compose_volume_root(snapshot, app_name);
+    if !root.is_dir() {
+        return Ok(());
+    }
+    let project = crate::deploy::compose_project_name(app_name);
+    for volume in list_subdirs(&root).await {
+        // Only this app's volumes: compose names them <project>_<volume>.
+        let Some(short) = volume.strip_prefix(&format!("{project}_")) else {
+            tracing::warn!("Skipping volume {volume}: not a volume of {app_name}");
+            continue;
+        };
+        let mountpoint = match state.docker.inspect_volume(&volume).await {
+            Ok(v) => v.mountpoint,
+            Err(_) => {
+                let labels = std::collections::HashMap::from([
+                    ("com.docker.compose.project".to_string(), project.clone()),
+                    ("com.docker.compose.volume".to_string(), short.to_string()),
+                ]);
+                state
+                    .docker
+                    .create_volume(bollard::models::VolumeCreateRequest {
+                        name: Some(volume.clone()),
+                        driver: Some("local".to_string()),
+                        labels: Some(labels),
+                        ..Default::default()
+                    })
+                    .await
+                    .with_context(|| format!("could not create volume {volume}"))?
+                    .mountpoint
+            }
+        };
+        let dest = PathBuf::from(&mountpoint);
+        if !dest.is_absolute() {
+            anyhow::bail!("volume {volume} has no local mount point");
+        }
+        tokio::fs::create_dir_all(&dest).await?;
+        let mut entries = tokio::fs::read_dir(&dest).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if entry.file_type().await?.is_dir() {
+                tokio::fs::remove_dir_all(&path).await?;
+            } else {
+                tokio::fs::remove_file(&path).await?;
+            }
+        }
+        copy_dir_recursive(&root.join(&volume), &dest).await?;
+    }
     Ok(())
 }
 
@@ -812,7 +938,11 @@ async fn do_full_restore(state: &AppState, snap: &Snapshot) -> Result<()> {
         .fetch_all(&state.db)
         .await?;
     for app in &apps {
-        if let Some(ref cid) = app.container_id {
+        if app.source_type == "compose" {
+            for cid in compose_containers(state, &app.name).await {
+                let _ = docker::stop_container(&state.docker, &cid).await;
+            }
+        } else if let Some(ref cid) = app.container_id {
             let _ = docker::stop_container(&state.docker, cid).await;
         }
     }
@@ -853,6 +983,16 @@ async fn do_full_restore(state: &AppState, snap: &Snapshot) -> Result<()> {
                 tokio::fs::remove_dir_all(&dest).await?;
             }
             copy_dir_recursive(&src, &dest).await?;
+        }
+    }
+
+    // Replace the named volumes of compose apps
+    let staging_named = staging.join("compose-volumes");
+    if staging_named.exists() {
+        for app_name in list_subdirs(&staging_named).await {
+            if let Err(e) = restore_compose_volumes(state, &staging, &app_name).await {
+                tracing::warn!("Could not restore the volumes of {app_name}: {e:#}");
+            }
         }
     }
 
@@ -897,8 +1037,9 @@ pub async fn restore_app(state: &AppState, snapshot_id: &str, app_name: &str) ->
     let snap = fetch_snapshot(state, snapshot_id).await?;
     let local_path = ensure_local(state, &snap).await?;
     let vol_src = local_path.join("volumes").join(app_name);
+    let named_src = compose_volume_root(&local_path, app_name);
 
-    if !vol_src.exists() {
+    if !vol_src.exists() && !named_src.exists() {
         anyhow::bail!("Snapshot does not contain volumes for app '{}'", app_name);
     }
 
@@ -909,20 +1050,31 @@ pub async fn restore_app(state: &AppState, snapshot_id: &str, app_name: &str) ->
         .await?
         .ok_or_else(|| anyhow::anyhow!("App '{}' not found", app_name))?;
 
-    // Stop container
-    if let Some(ref cid) = app.container_id {
+    // Stop the container (every service of a compose app)
+    let containers: Vec<String> = if app.source_type == "compose" {
+        compose_containers(state, app_name).await
+    } else {
+        app.container_id.iter().cloned().collect()
+    };
+    for cid in &containers {
         let _ = docker::stop_container(&state.docker, cid).await;
     }
 
-    // Atomically replace volume
-    let vol_dest = PathBuf::from(data_dir()).join("volumes").join(app_name);
-    if vol_dest.exists() {
-        tokio::fs::remove_dir_all(&vol_dest).await?;
+    // Replace the volume directory (bind mounts)
+    if vol_src.exists() {
+        let vol_dest = PathBuf::from(data_dir()).join("volumes").join(app_name);
+        if vol_dest.exists() {
+            tokio::fs::remove_dir_all(&vol_dest).await?;
+        }
+        copy_dir_recursive(&vol_src, &vol_dest).await?;
     }
-    copy_dir_recursive(&vol_src, &vol_dest).await?;
+    // ...and a compose app's named volumes
+    if app.source_type == "compose" {
+        restore_compose_volumes(state, &local_path, app_name).await?;
+    }
 
-    // Start container
-    if let Some(ref cid) = app.container_id {
+    // Start the containers again
+    for cid in &containers {
         let _ = docker::start_container(&state.docker, cid).await;
     }
 
@@ -1323,6 +1475,9 @@ fn copy_dir_with_hardlinks(src: &Path, dest: &Path, prev: Option<&Path>) -> Resu
 
         if entry.file_type().is_dir() {
             std::fs::create_dir_all(&dest_path)?;
+            if let Ok(meta) = entry.metadata() {
+                keep_owner(&meta, &dest_path);
+            }
             continue;
         }
         if !entry.file_type().is_file() {
@@ -1360,6 +1515,7 @@ fn copy_dir_with_hardlinks(src: &Path, dest: &Path, prev: Option<&Path>) -> Resu
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::copy(entry.path(), &dest_path)?;
+            keep_owner(&src_meta, &dest_path);
             // Keep the mtime so the next snapshot can hard-link this file.
             if let Ok(mtime) = src_meta.modified() {
                 let _ = std::fs::File::options()
@@ -1374,10 +1530,21 @@ fn copy_dir_with_hardlinks(src: &Path, dest: &Path, prev: Option<&Path>) -> Resu
     Ok((delta, total))
 }
 
+/// Give `path` the owner and group of `meta` (best-effort: only root can).
+/// Volume data often belongs to a service user (postgres, redis) that must
+/// still own it after a snapshot and restore.
+fn keep_owner(meta: &std::fs::Metadata, path: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let _ = std::os::unix::fs::lchown(path, Some(meta.uid()), Some(meta.gid()));
+}
+
 /// Simple recursive directory copy (no deduplication). Only regular files
-/// and directories are copied.
+/// and directories are copied; owners are kept.
 async fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
     tokio::fs::create_dir_all(dest).await?;
+    if let Ok(meta) = tokio::fs::metadata(src).await {
+        keep_owner(&meta, dest);
+    }
     let mut stack = vec![(src.to_path_buf(), dest.to_path_buf())];
     while let Some((s, d)) = stack.pop() {
         let mut entries = tokio::fs::read_dir(&s).await?;
@@ -1386,9 +1553,15 @@ async fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
             let dest_entry = d.join(entry.file_name());
             if ft.is_dir() {
                 tokio::fs::create_dir_all(&dest_entry).await?;
+                if let Ok(meta) = entry.metadata().await {
+                    keep_owner(&meta, &dest_entry);
+                }
                 stack.push((entry.path(), dest_entry));
             } else if ft.is_file() {
-                tokio::fs::copy(entry.path(), dest_entry).await?;
+                tokio::fs::copy(entry.path(), &dest_entry).await?;
+                if let Ok(meta) = entry.metadata().await {
+                    keep_owner(&meta, &dest_entry);
+                }
             }
         }
     }
@@ -2309,6 +2482,44 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<storage::Part>(16);
         drop(PartWriter::new(tx, 10));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn compose_volume_restore_only_touches_the_apps_own_volumes() {
+        let snap = temp_dir();
+        assert_eq!(
+            compose_volume_dir(snap.path(), "shop", "shop_data"),
+            snap.path().join("compose-volumes/shop/shop_data")
+        );
+        // A snapshot naming another project's volume is ignored before any
+        // Docker call (nothing listens on this Docker address).
+        fs::create_dir_all(snap.path().join("compose-volumes/shop/billing_data/x"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let db = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let state = AppState {
+            db,
+            docker: bollard::Docker::connect_with_http(
+                "http://127.0.0.1:9",
+                1,
+                bollard::API_DEFAULT_VERSION,
+            )
+            .unwrap_or_else(|e| panic!("{e}")),
+            rate_limiter: crate::auth::RateLimiter::new(60, 10.0),
+            settings: std::sync::Arc::new(tokio::sync::RwLock::new(
+                tond_common::ServerSettings::default(),
+            )),
+        };
+        restore_compose_volumes(&state, snap.path(), "shop")
+            .await
+            .unwrap_or_else(|e| panic!("foreign volumes are skipped: {e:#}"));
+        assert!(
+            restore_compose_volumes(&state, snap.path(), "nothing-here")
+                .await
+                .is_ok(),
+            "no named volumes in the snapshot: nothing to do"
+        );
     }
 
     #[test]

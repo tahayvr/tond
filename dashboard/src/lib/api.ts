@@ -55,6 +55,8 @@ export interface App {
 	template_version?: string | null;
 	source_type: string;
 	source_url: string | null;
+	/** Branch deployed from source_url (repository-based apps) */
+	branch?: string | null;
 	status: string;
 	container_port: number;
 	host_port: number | null;
@@ -86,6 +88,8 @@ export interface App {
 	dockerfile_content: string | null;
 	/** Raw docker-compose.yml content (source_type='compose') */
 	compose_content: string | null;
+	/** Compose from a git repository: path of the compose file in it */
+	compose_path?: string | null;
 	/** Subdirectory to use as build root (monorepo support) */
 	base_dir: string | null;
 	/** Whether build output is served as a static site */
@@ -557,8 +561,12 @@ export async function createApp(data: {
 	github_app_id?: string;
 	/** Raw Dockerfile content (required when source_type='dockerfile') */
 	dockerfile_content?: string;
-	/** Raw docker-compose.yml content (required when source_type='compose') */
+	/** Raw docker-compose.yml content (inline compose apps) */
 	compose_content?: string;
+	/** Compose from a git repository (source_url + branch): compose file path */
+	compose_path?: string;
+	/** Compose: the service that gets `container_port` and `domain` */
+	compose_service?: string;
 	/** Subdirectory to use as build root (monorepo support) */
 	base_dir?: string;
 	/** Serve build output as a static site */
@@ -970,6 +978,99 @@ export interface ComposeValidation {
 	valid: boolean;
 	/** One human-readable line per problem (privileged, host binds, …) */
 	errors: string[];
+	/** The services the file declares (empty when it doesn't parse) */
+	services?: ComposeServiceSpec[];
+}
+
+/** A service as a compose file declares it. */
+export interface ComposeServiceSpec {
+	name: string;
+	image: string | null;
+	/** Has a build: section (Tond builds it on deploy) */
+	builds: boolean;
+	/** Container ports under ports: and expose: */
+	ports: number[];
+	has_healthcheck: boolean;
+}
+
+/** GET /apps/{id}/services: one compose service and what Docker reports now. */
+export interface ComposeService extends ComposeServiceSpec {
+	/** Container port Tond publishes for routing (null = internal only) */
+	published_port: number | null;
+	/** Loopback host port bound to the published port */
+	host_port: number | null;
+	/** The published port changed since the last deploy */
+	redeploy_required: boolean;
+	domains: string[];
+	/** "pending" | "running" | "restarting" | "paused" | "created" | "exited" | "dead" | "missing" */
+	status: string;
+	/** "healthy" | "unhealthy" | "starting"; null without a healthcheck */
+	health: string | null;
+	exit_code: number | null;
+	container_id: string | null;
+	/** Pinned image the container runs: tond-<app>/<service>:<image id prefix> */
+	running_image: string | null;
+	image_digest: string | null;
+	/** Latest CPU use in 1/100 % of one core */
+	cpu: number | null;
+	/** Latest memory use in bytes */
+	mem: number | null;
+}
+
+export interface ServiceUpdateResult {
+	service: ComposeService | null;
+	port_changed: boolean;
+	redeploy_required: boolean;
+	warnings: string[];
+}
+
+export async function listServices(appId: string): Promise<ComposeService[]> {
+	return request<ComposeService[]>(`/apps/${appId}/services`);
+}
+
+/** Publish a container port of a service and route domains to it. */
+export async function updateService(
+	appId: string,
+	service: string,
+	data: { published_port: number | null; domains: string[] }
+): Promise<ServiceUpdateResult> {
+	return request<ServiceUpdateResult>(`/apps/${appId}/services/${encodeURIComponent(service)}`, {
+		method: 'PUT',
+		body: JSON.stringify(data)
+	});
+}
+
+export type ServiceAction = 'restart' | 'stop' | 'start';
+
+export async function serviceAction(
+	appId: string,
+	service: string,
+	action: ServiceAction
+): Promise<{ message: string; service: ComposeService | null }> {
+	return request(`/apps/${appId}/services/${encodeURIComponent(service)}/${action}`, {
+		method: 'POST'
+	});
+}
+
+export async function serviceLogs(
+	appId: string,
+	service: string,
+	tail = 200
+): Promise<{ service: string; lines: string[] }> {
+	return request(`/apps/${appId}/services/${encodeURIComponent(service)}/logs?tail=${tail}`);
+}
+
+/** Replace a compose app's file (inline) or its repository location. */
+export async function updateCompose(
+	appId: string,
+	data: {
+		compose_content?: string;
+		source_url?: string;
+		branch?: string;
+		compose_path?: string;
+	}
+): Promise<{ message: string; services: ComposeService[] }> {
+	return request(`/apps/${appId}/compose`, { method: 'PUT', body: JSON.stringify(data) });
 }
 
 /** Check a compose file against Tond's policy without creating anything. */
@@ -1604,6 +1705,21 @@ export interface Deployment {
 	rollback_available: boolean;
 	/** Why rollback is unavailable (tooltip text); null when available */
 	rollback_unavailable_reason: string | null;
+	/** Compose apps: per-service images and progress */
+	services?: DeploymentService[];
+}
+
+/** One service of a compose deployment. */
+export interface DeploymentService {
+	service: string;
+	/** "build" | "pull" | "reuse" */
+	source: string;
+	source_image: string | null;
+	/** Pinned tag rollback restores */
+	image: string | null;
+	digest: string | null;
+	/** "pending" | "building" | "pulling" | "ready" | "starting" | "healthy" | "running" | "failed" */
+	status: string;
 }
 
 export interface DeploymentLogLine {
@@ -3935,6 +4051,8 @@ export interface LogLine {
 	ts?: string;
 	/** Present on system log stream frames; identifies the source app */
 	appName?: string;
+	/** Compose apps: the service that wrote the line */
+	service?: string;
 }
 
 export interface LogStreamCallbacks {
@@ -4059,7 +4177,12 @@ function handleLogFrame(ev: MessageEvent, callbacks: LogStreamCallbacks) {
 			});
 		}
 		for (const line of frame.container_logs ?? []) {
-			callbacks.onLine({ source: 'container', text: line.line, ts: line.ts ?? undefined });
+			callbacks.onLine({
+				source: 'container',
+				text: line.line,
+				ts: line.ts ?? undefined,
+				service: line.service ?? undefined
+			});
 		}
 		// Cron run snapshot: single run object (may be null)
 		if (frame.run) {
@@ -4078,7 +4201,8 @@ function handleLogFrame(ev: MessageEvent, callbacks: LogStreamCallbacks) {
 			source: 'container',
 			text: frame.line,
 			ts: frame.ts ?? undefined,
-			appName: frame.app_name
+			appName: frame.app_name,
+			service: frame.service ?? undefined
 		});
 	} else if (frame.type === 'run') {
 		// Cron run completed frame

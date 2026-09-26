@@ -30,6 +30,7 @@
 	import LogViewer from '$lib/components/logs/log-viewer.svelte';
 	import DeploySteps from '$lib/components/deploy/deploy-steps.svelte';
 	import DeployResult from '$lib/components/deploy/deploy-result.svelte';
+	import DeploymentServices from '$lib/components/compose/deployment-services.svelte';
 	import { Badge } from '$lib/components/ui/badge/index.js';
 	import SpinnerIcon from '~icons/ri/loader-4-line';
 	import TimerIcon from '~icons/ri/timer-line';
@@ -217,6 +218,10 @@
 			<DeploySteps phases={deployment.phases} {now} />
 		{/if}
 	</section>
+
+	{#if (deployment.services ?? []).length > 0}
+		<DeploymentServices services={deployment.services ?? []} />
+	{/if}
 
 	{#if finished}
 		<DeployResult

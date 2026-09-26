@@ -578,6 +578,175 @@ pub async fn assign_automatic(
     Ok(inserted > 0)
 }
 
+// ── Compose services ──
+//
+// A compose app's domains are rows with `service` (and `port`, the container
+// port Tond publishes for that service) set. The same rules apply: one app
+// per domain, one primary per app, redirects only to the app's own domains.
+
+/// Point the app's domains that name no service (the address given at
+/// creation, seeded as primary by the apps_domain_seed trigger) at a compose
+/// service and its published port.
+pub async fn attach_to_service(
+    db: &SqlitePool,
+    app_id: &str,
+    service: &str,
+    port: i64,
+) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query(
+        "UPDATE app_domains SET service = ?, port = ?
+         WHERE app_id = ? AND service IS NULL AND kind != 'redirect'",
+    )
+    .bind(service)
+    .bind(port)
+    .bind(app_id)
+    .execute(db)
+    .await?
+    .rows_affected())
+}
+
+/// Replace the serving domains of one compose service with `domains` (on
+/// `port`). New domains are checked like [`add`] and get a certificate; the
+/// first becomes primary when the app has none. A removed domain that
+/// redirects point at is refused. Returns the domains added.
+pub async fn set_service_domains(
+    db: &SqlitePool,
+    ctx: &DomainContext,
+    app_id: &str,
+    service: &str,
+    port: Option<i64>,
+    domains: &[String],
+) -> Result<Vec<String>, TondError> {
+    let mut tx = db.begin().await?;
+    let mut wanted: Vec<String> = Vec::new();
+    let mut added: Vec<String> = Vec::new();
+    for raw in domains {
+        let (domain, existing) = check_new_domain(&mut tx, ctx, app_id, raw).await?;
+        if wanted.contains(&domain) {
+            continue;
+        }
+        match existing {
+            Some(row) if row.service.as_deref() != Some(service) => {
+                return Err(TondError::Conflict(format!(
+                    "{domain} is already a domain of this app{}",
+                    row.service
+                        .map(|s| format!(" (service {s})"))
+                        .unwrap_or_default()
+                ))
+                .with_hint("Remove it there first."));
+            }
+            Some(row) if row.kind() == DomainKind::Redirect => {
+                return Err(TondError::invalid_field(
+                    "domains",
+                    format!("{domain} is a redirect; change it in the app's domains first"),
+                ));
+            }
+            Some(_) => {}
+            None => added.push(domain.clone()),
+        }
+        wanted.push(domain);
+    }
+    let current: Vec<String> = sqlx::query_scalar(
+        "SELECT domain FROM app_domains WHERE app_id = ? AND service = ? AND kind != 'redirect'",
+    )
+    .bind(app_id)
+    .bind(service)
+    .fetch_all(&mut *tx)
+    .await?;
+    for gone in current.iter().filter(|d| !wanted.contains(d)) {
+        let pointing = redirects_to(&mut tx, gone).await?;
+        if !pointing.is_empty() {
+            return Err(TondError::Conflict(format!(
+                "{} redirect{} to {gone}",
+                pointing.join(", "),
+                if pointing.len() == 1 { "s" } else { "" },
+            ))
+            .with_hint("Remove those redirects or point them at another domain first."));
+        }
+        sqlx::query("DELETE FROM app_domains WHERE domain = ?")
+            .bind(gone)
+            .execute(&mut *tx)
+            .await?;
+    }
+    // Existing rows follow the published port.
+    sqlx::query("UPDATE app_domains SET port = ? WHERE app_id = ? AND service = ?")
+        .bind(port)
+        .bind(app_id)
+        .bind(service)
+        .execute(&mut *tx)
+        .await?;
+    for domain in &added {
+        let kind = if has_primary(&mut tx, app_id).await? {
+            DomainKind::Alias
+        } else {
+            DomainKind::Primary
+        };
+        upsert(
+            &mut tx,
+            app_id,
+            domain,
+            kind,
+            None,
+            308,
+            Some(service),
+            port,
+        )
+        .await?;
+        queue_certificate(&mut tx, domain).await?;
+    }
+    promote_if_needed(&mut tx, app_id).await?;
+    tx.commit().await?;
+    Ok(added)
+}
+
+/// Drop the domains of a compose service that left the file (redirects to
+/// them go too), promoting another domain to primary if needed.
+pub async fn remove_service(
+    tx: &mut Transaction<'_, Sqlite>,
+    app_id: &str,
+    service: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM app_domains WHERE app_id = ? AND redirect_to IN (
+            SELECT domain FROM app_domains WHERE app_id = ? AND service = ?)",
+    )
+    .bind(app_id)
+    .bind(app_id)
+    .bind(service)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("DELETE FROM app_domains WHERE app_id = ? AND service = ?")
+        .bind(app_id)
+        .bind(service)
+        .execute(&mut **tx)
+        .await?;
+    promote_if_needed(tx, app_id).await
+}
+
+/// Give a compose app without any domain its automatic address, on `service`.
+pub async fn assign_automatic_to_service(
+    db: &SqlitePool,
+    app_id: &str,
+    domain: &str,
+    service: &str,
+    port: i64,
+) -> Result<bool, sqlx::Error> {
+    if !assign_automatic(db, app_id, domain).await? {
+        return Ok(false);
+    }
+    sqlx::query(
+        "UPDATE app_domains SET service = ?, port = ? WHERE domain = ? AND app_id = ?
+           AND service IS NULL",
+    )
+    .bind(service)
+    .bind(port)
+    .bind(domain)
+    .bind(app_id)
+    .execute(db)
+    .await?;
+    Ok(true)
+}
+
 /// Remove every domain of an app (it became a background worker).
 pub async fn clear(db: &SqlitePool, app_id: &str) -> Result<Vec<String>, sqlx::Error> {
     let removed: Vec<String> =
@@ -618,6 +787,82 @@ mod tests {
             preview: "example-previews.com".into(),
             apps: "example-apps.com".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn compose_service_domains_follow_the_same_rules() {
+        let db = db().await;
+        let ctx = ctx();
+        let set = |service: &'static str, port: i64, domains: &'static [&'static str]| {
+            let db = db.clone();
+            let ctx = ctx.clone();
+            async move {
+                let domains: Vec<String> = domains.iter().map(|d| d.to_string()).collect();
+                set_service_domains(&db, &ctx, "a1", service, Some(port), &domains).await
+            }
+        };
+        // The first domain of the app becomes primary; apps.domain mirrors it.
+        let added = set("web", 80, &["Shop.Example.com", "www.shop.example.com"])
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(added, ["shop.example.com", "www.shop.example.com"]);
+        set("admin", 8080, &["admin.example.com"])
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let rows = list(&db, "a1").await.unwrap_or_else(|e| panic!("{e}"));
+        let view: Vec<(&str, &str, Option<&str>, Option<i64>)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.domain.as_str(),
+                    r.kind.as_str(),
+                    r.service.as_deref(),
+                    r.port,
+                )
+            })
+            .collect();
+        assert_eq!(
+            view,
+            [
+                ("shop.example.com", "primary", Some("web"), Some(80)),
+                ("admin.example.com", "alias", Some("admin"), Some(8080)),
+                ("www.shop.example.com", "alias", Some("web"), Some(80)),
+            ]
+        );
+        // A domain of another service or app is refused.
+        assert!(set("admin", 8080, &["shop.example.com"]).await.is_err());
+        sqlx::query("INSERT INTO app_domains (domain, app_id) VALUES ('api.example.com', 'a2')")
+            .execute(&db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(set("admin", 8080, &["api.example.com"]).await.is_err());
+        // Replacing the list follows a new port and promotes a new primary.
+        set("web", 3000, &["www.shop.example.com"])
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let primary: Option<String> = sqlx::query_scalar("SELECT domain FROM apps WHERE id = 'a1'")
+            .fetch_one(&db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(primary.as_deref(), Some("admin.example.com"));
+        let port: Option<i64> = sqlx::query_scalar(
+            "SELECT port FROM app_domains WHERE domain = 'www.shop.example.com'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(port, Some(3000));
+        // A service leaving the file takes its domains (and redirects to them).
+        let mut tx = db.begin().await.unwrap_or_else(|e| panic!("{e}"));
+        remove_service(&mut tx, "a1", "admin")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        tx.commit().await.unwrap_or_else(|e| panic!("{e}"));
+        let primary: Option<String> = sqlx::query_scalar("SELECT domain FROM apps WHERE id = 'a1'")
+            .fetch_one(&db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(primary.as_deref(), Some("www.shop.example.com"));
     }
 
     fn req(domain: &str, kind: Option<DomainKind>, to: Option<&str>) -> AddAppDomainRequest {

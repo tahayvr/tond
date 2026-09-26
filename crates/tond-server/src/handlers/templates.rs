@@ -279,6 +279,9 @@ async fn deploy_from_template(
         github_app_id: None,
         dockerfile_content: None,
         compose_content: Some(template.compose.clone()),
+        compose_path: None,
+        // The manifest's public service gets the port and the domain.
+        compose_service: Some(public.service.clone()),
         base_dir: None,
         static_build: false,
         readiness: Some(
@@ -678,6 +681,27 @@ mod tests {
             primary, "tools.example.com",
             "the domain seeds app_domains' primary row"
         );
+        // ...on the manifest's public service, which publishes its port.
+        let t = builtin_template("it-tools")
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("it-tools"));
+        let (service, port): (Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT service, port FROM app_domains WHERE domain = 'tools.example.com'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(service.as_deref(), Some(t.manifest.public.service.as_str()));
+        assert_eq!(port, Some(i64::from(t.manifest.public.port)));
+        let published: Option<i64> = sqlx::query_scalar(
+            "SELECT s.published_port FROM compose_services s JOIN apps a ON a.id = s.app_id
+             WHERE a.name = 'tools' AND s.name = ?",
+        )
+        .bind(&t.manifest.public.service)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(published, Some(i64::from(t.manifest.public.port)));
 
         // The same domain can't go to a second app.
         let mut again = deploy_request("tools2", &[]);

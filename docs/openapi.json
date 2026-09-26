@@ -1283,6 +1283,14 @@
               "null"
             ]
           },
+          "branch": {
+            "default": null,
+            "description": "Branch deployed from `source_url` (git and git-sourced compose apps)",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "build_method": {
             "description": "Build method for source-building apps: \"tbuild\" | \"dockerfile\"",
             "type": [
@@ -1292,6 +1300,14 @@
           },
           "compose_content": {
             "description": "Raw docker-compose.yml content (used when source_type = \"compose\")",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "compose_path": {
+            "default": null,
+            "description": "Git-sourced compose apps: compose file path in the repository",
             "type": [
               "string",
               "null"
@@ -1497,6 +1513,7 @@
           "template_version",
           "source_type",
           "source_url",
+          "branch",
           "status",
           "container_port",
           "host_port",
@@ -1521,6 +1538,7 @@
           "preview_shared_keys",
           "dockerfile_content",
           "compose_content",
+          "compose_path",
           "base_dir",
           "static_build",
           "readiness",
@@ -2396,6 +2414,156 @@
         ],
         "type": "object"
       },
+      "ComposeServiceResponse": {
+        "description": "`GET /api/apps/{id}/services` item: one compose service with what Docker\nreports about it now.",
+        "properties": {
+          "builds": {
+            "default": false,
+            "type": "boolean"
+          },
+          "container_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cpu": {
+            "default": null,
+            "description": "Latest CPU use in 1/100 % of one core (None before the first sample)",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "domains": {
+            "default": [],
+            "description": "Domains routed to this service",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "exit_code": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "has_healthcheck": {
+            "default": false,
+            "type": "boolean"
+          },
+          "health": {
+            "default": null,
+            "description": "\"healthy\" | \"unhealthy\" | \"starting\"; None without a healthcheck",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "host_port": {
+            "default": null,
+            "description": "Loopback host port the published port is bound to",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "image": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "image_digest": {
+            "default": null,
+            "description": "Image id of the running image (sha256:...)",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mem": {
+            "default": null,
+            "description": "Latest memory use in bytes",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "ports": {
+            "default": [],
+            "description": "Container ports declared in the file",
+            "items": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "published_port": {
+            "default": null,
+            "description": "Container port Tond publishes for routing (None = not published)",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "redeploy_required": {
+            "default": false,
+            "description": "The published port changed since the last deploy: redeploy to apply",
+            "type": "boolean"
+          },
+          "running_image": {
+            "default": null,
+            "description": "Pinned local image the container runs (`tond-<app>/<service>:<image id prefix>`)",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "\"pending\" | \"running\" | \"restarting\" | \"paused\" | \"created\" | \"exited\"\n| \"dead\" | \"missing\"",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "image",
+          "builds",
+          "ports",
+          "has_healthcheck",
+          "published_port",
+          "host_port",
+          "redeploy_required",
+          "domains",
+          "status",
+          "health",
+          "exit_code",
+          "container_id",
+          "running_image",
+          "image_digest",
+          "cpu",
+          "mem"
+        ],
+        "type": "object"
+      },
       "CreateAlertRuleRequest": {
         "description": "POST /api/v1/alerts",
         "properties": {
@@ -2497,6 +2665,22 @@
           },
           "compose_content": {
             "description": "Raw docker-compose.yml content (used when source_type = \"compose\")",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "compose_path": {
+            "default": null,
+            "description": "Compose from a git repository (source_url + branch): path of the\ncompose file in the repository (default \"docker-compose.yml\")",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "compose_service": {
+            "default": null,
+            "description": "Compose apps: the service that answers web traffic on\n`container_port` and gets `domain` (default: detected from the file)",
             "type": [
               "string",
               "null"
@@ -4585,6 +4769,13 @@
               "null"
             ]
           },
+          "services": {
+            "description": "Compose apps: per-service images and progress of this deployment",
+            "items": {
+              "$ref": "#/components/schemas/DeploymentService"
+            },
+            "type": "array"
+          },
           "source_type": {
             "description": "The app's source type (\"git\", \"image\", ...)",
             "type": "string"
@@ -4800,6 +4991,13 @@
               "null"
             ]
           },
+          "services": {
+            "description": "Compose apps: per-service images and progress of this deployment",
+            "items": {
+              "$ref": "#/components/schemas/DeploymentService"
+            },
+            "type": "array"
+          },
           "started_at": {
             "type": "string"
           },
@@ -4853,6 +5051,52 @@
           "is_current",
           "rollback_available",
           "rollback_unavailable_reason"
+        ],
+        "type": "object"
+      },
+      "DeploymentService": {
+        "description": "One service of a compose deployment: how its image was produced and the\npinned tag rollback restores.",
+        "properties": {
+          "digest": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "image": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "service": {
+            "type": "string"
+          },
+          "source": {
+            "description": "\"build\" | \"pull\" | \"reuse\"",
+            "type": "string"
+          },
+          "source_image": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "\"pending\" | \"building\" | \"pulling\" | \"ready\" | \"starting\" | \"healthy\"\n| \"running\" | \"failed\"",
+            "type": "string"
+          }
+        },
+        "required": [
+          "service",
+          "source",
+          "source_image",
+          "image",
+          "digest",
+          "status"
         ],
         "type": "object"
       },
@@ -10986,6 +11230,65 @@
         ],
         "type": "object"
       },
+      "UpdateComposeRequest": {
+        "description": "`PUT /api/apps/{id}/compose`: replace the compose file (inline) or the\nrepository location of a git-sourced compose app.",
+        "properties": {
+          "branch": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "compose_content": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "compose_path": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_url": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "UpdateComposeServiceRequest": {
+        "description": "`PUT /api/apps/{id}/services/{service}`: publish a container port and\nroute domains to it.",
+        "properties": {
+          "domains": {
+            "default": [],
+            "description": "Domains to route to the published port (replaces the current list)",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "published_port": {
+            "default": null,
+            "description": "Container port to publish on a loopback host port (None = none)",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "UpdateCronJobRequest": {
         "description": "PATCH /api/v1/cron/{id} request body (all fields optional)",
         "properties": {
@@ -14274,6 +14577,104 @@
         ]
       }
     },
+    "/api/v1/apps/{id}/compose": {
+      "put": {
+        "operationId": "update_compose",
+        "parameters": [
+          {
+            "description": "App id or name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateComposeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "description": "`{message, services}`; takes effect on the next deploy"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Replace a compose app's file or repository location",
+        "tags": [
+          "Apps"
+        ],
+        "x-tond-scopes": [
+          "apps:write",
+          "settings:write"
+        ]
+      }
+    },
     "/api/v1/apps/{id}/databases": {
       "get": {
         "operationId": "list_app_databases",
@@ -16584,6 +16985,17 @@
             }
           },
           {
+            "in": "query",
+            "name": "service",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
             "description": "API token, for WebSocket clients that can't set headers.",
             "in": "query",
             "name": "token",
@@ -18017,6 +18429,394 @@
         ],
         "x-tond-scopes": [
           "apps:rollback"
+        ]
+      }
+    },
+    "/api/v1/apps/{id}/services": {
+      "get": {
+        "description": "Asks Docker for each service's container, state and health (one call per request), plus the published port, domains and latest CPU and memory.",
+        "operationId": "list_services",
+        "parameters": [
+          {
+            "description": "App id or name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "items": {
+                        "$ref": "#/components/schemas/ComposeServiceResponse"
+                      },
+                      "type": "array"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "List a compose app's services with their state",
+        "tags": [
+          "Apps"
+        ],
+        "x-tond-scopes": [
+          "apps:read"
+        ]
+      }
+    },
+    "/api/v1/apps/{id}/services/{service}": {
+      "put": {
+        "description": "Domains route at once when the service already publishes that port; a new published port is bound on the next deploy (`redeploy_required`).",
+        "operationId": "update_service",
+        "parameters": [
+          {
+            "description": "App id or name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "service",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateComposeServiceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "description": "`{service, port_changed, redeploy_required, warnings}`"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Publish a service's container port and route domains to it",
+        "tags": [
+          "Apps"
+        ],
+        "x-tond-scopes": [
+          "apps:write"
+        ]
+      }
+    },
+    "/api/v1/apps/{id}/services/{service}/logs": {
+      "get": {
+        "operationId": "service_logs",
+        "parameters": [
+          {
+            "description": "App id or name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "service",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tail",
+            "required": false,
+            "schema": {
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "description": "`{service, lines}`; `?tail=` (default 200, at most 2000)"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Recent log lines of one service (secrets masked)",
+        "tags": [
+          "Apps"
+        ],
+        "x-tond-scopes": [
+          "logs:read"
+        ]
+      }
+    },
+    "/api/v1/apps/{id}/services/{service}/{action}": {
+      "post": {
+        "operationId": "service_action",
+        "parameters": [
+          {
+            "description": "App id or name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "service",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "action",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "description": "`{message, service}`; `action` is restart, stop or start"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Restart, stop or start one service",
+        "tags": [
+          "Apps"
+        ],
+        "x-tond-scopes": [
+          "apps:control"
         ]
       }
     },
@@ -20900,7 +21700,7 @@
                 "schema": {
                   "properties": {
                     "data": {
-                      "description": "`{valid, errors}`"
+                      "description": "`{valid, errors, services}`: one line per problem, and the services the file declares (`ComposeServiceSpec`)."
                     },
                     "message": {
                       "description": "Informational note, when there is one.",

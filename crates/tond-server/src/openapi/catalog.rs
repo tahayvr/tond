@@ -183,7 +183,22 @@ pub fn entries() -> Vec<Doc> {
         e("PUT /api/v1/apps/{id}/health", "Configure health checks").message(),
         e("PUT /api/v1/apps/{id}/port", "Change the container port").returns::<AppResponse>(),
         e("PUT /api/v1/apps/{id}/readiness", "Configure readiness (when a deploy counts as up)").returns::<AppResponse>(),
-        e("POST /api/v1/compose/validate", "Validate a Docker Compose file against Tond's policy").object("`{valid, errors}`"),
+        e("POST /api/v1/compose/validate", "Validate a Docker Compose file against Tond's policy")
+            .object("`{valid, errors, services}`: one line per problem, and the services the file declares (`ComposeServiceSpec`)."),
+        // ── Docker Compose apps ──
+        e("GET /api/v1/apps/{id}/services", "List a compose app's services with their state")
+            .returns::<Vec<ComposeServiceResponse>>()
+            .about("Asks Docker for each service's container, state and health (one call per request), plus the published port, domains and latest CPU and memory."),
+        e("PUT /api/v1/apps/{id}/services/{service}", "Publish a service's container port and route domains to it")
+            .object("`{service, port_changed, redeploy_required, warnings}`")
+            .about("Domains route at once when the service already publishes that port; a new published port is bound on the next deploy (`redeploy_required`)."),
+        e("GET /api/v1/apps/{id}/services/{service}/logs", "Recent log lines of one service (secrets masked)")
+            .object("`{service, lines}`; `?tail=` (default 200, at most 2000)"),
+        e("POST /api/v1/apps/{id}/services/{service}/{action}", "Restart, stop or start one service")
+            .object("`{message, service}`; `action` is restart, stop or start"),
+        e("PUT /api/v1/apps/{id}/compose", "Replace a compose app's file or repository location")
+            .object("`{message, services}`; takes effect on the next deploy")
+            .scopes(&["settings:write"]),
         e("POST /api/v1/apps/{id}/volumes", "Add a volume (applies on the next deploy)")
             .object("`{message, volumes}`")
             .scopes(&["settings:write"]),

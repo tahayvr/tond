@@ -776,7 +776,31 @@ fn check_top_level_volumes(root: &Mapping, ctx: &mut Ctx) {
     };
     for (name, def) in vols {
         let name = key_str(name);
-        let Some(opts) = untag(def).get("driver_opts").map(untag) else {
+        let def = untag(def);
+        // A named volume is private to this app (compose names it
+        // <app>_<volume>, and snapshots back it up). `external` or a fixed
+        // `name` would mount another app's volume.
+        if def
+            .get("external")
+            .is_some_and(|v| !matches!(untag(v), Value::Bool(false) | Value::Null))
+        {
+            ctx.err(format!(
+                "volume \"{name}\": 'external' is not allowed — it mounts a volume outside this app; leave it out and compose creates the volume for this app"
+            ));
+        }
+        if def.get("name").is_some() {
+            ctx.err(format!(
+                "volume \"{name}\": 'name' is not allowed — a fixed name can mount another app's volume; leave it out and compose names the volume for this app"
+            ));
+        }
+        if let Some(driver) = def.get("driver").and_then(scalar_str)
+            && !driver.trim().eq_ignore_ascii_case("local")
+        {
+            ctx.err(format!(
+                "volume \"{name}\": 'driver: {driver}' is not allowed — only local volumes can be used (Tond backs them up with the app)"
+            ));
+        }
+        let Some(opts) = def.get("driver_opts").map(untag) else {
             continue;
         };
         let Value::Mapping(opts) = opts else { continue };
@@ -962,6 +986,29 @@ mod tests {
             )
             .is_empty(),
             "private bridge networks declared in the file stay allowed"
+        );
+    }
+
+    #[test]
+    fn named_volumes_must_belong_to_the_app() {
+        assert_rejected(
+            "services:\n  a:\n    image: x\n    volumes: [d:/d]\nvolumes:\n  d:\n    external: true\n",
+            "volume \"d\": 'external' is not allowed",
+        );
+        assert_rejected(
+            "services:\n  a:\n    image: x\n    volumes: [d:/d]\nvolumes:\n  d:\n    name: shop_data\n",
+            "volume \"d\": 'name' is not allowed",
+        );
+        assert_rejected(
+            "services:\n  a:\n    image: x\nvolumes:\n  d:\n    driver: rexray/ebs\n",
+            "only local volumes",
+        );
+        assert!(
+            errors(
+                "services:\n  a:\n    image: x\n    volumes: [d:/d]\nvolumes:\n  d:\n    driver: local\n    external: false\n"
+            )
+            .is_empty(),
+            "plain local volumes stay allowed"
         );
     }
 

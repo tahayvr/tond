@@ -284,8 +284,8 @@
 					{:else if sourceSubType === 'compose'}
 						<p>
 							{filePorts.length
-								? `Your compose file uses container port${filePorts.length > 1 ? 's' : ''} ${filePorts.join(', ')}. Tond routes to the service that publishes the port you pick.`
-								: 'Publish the web service’s port in your compose file (ports: ["80"]) and enter it here.'}
+								? `Your compose file uses container port${filePorts.length > 1 ? 's' : ''} ${filePorts.join(', ')}. The web service gets this port on 127.0.0.1 and the domain below.`
+								: 'Enter the port your web service listens on (its ports: or expose: entry in the compose file).'}
 						</p>
 					{:else if buildMethod === 'tbuild'}
 						<p>

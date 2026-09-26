@@ -51,6 +51,8 @@ const api = vi.hoisted(() => ({
 	setAppGitHubApp: vi.fn(),
 	getApp: vi.fn(),
 	updateContainerPort: vi.fn(),
+	listGitLabTokens: vi.fn(),
+	listGiteaTokens: vi.fn(),
 	openLogStream: vi.fn((url: string) => {
 		const ws = new WebSocket(url);
 		return () => ws.close();
@@ -216,6 +218,8 @@ describe('apps/[id] page', () => {
 		api.listGitHubApps.mockResolvedValue([]);
 		api.listGitHubRepos.mockResolvedValue([]);
 		api.listGitHubBranches.mockResolvedValue([]);
+		api.listGitLabTokens.mockResolvedValue([]);
+		api.listGiteaTokens.mockResolvedValue([]);
 		api.getApp.mockResolvedValue({ ...app });
 		api.openLogStream.mockImplementation((url: string) => {
 			const ws = new WebSocket(url);
@@ -268,6 +272,20 @@ describe('apps/[id] page', () => {
 
 		const link = await screen.findByRole('link', { name: /view deploy/i });
 		expect(link).toHaveAttribute('href', '/apps/app_1/deployments/dep_live');
+	});
+
+	it('shows a redeploy of a running app from its deployment, not its status', async () => {
+		api.listDeployments.mockResolvedValue([
+			{ id: 'dep_next', status: 'queued' },
+			{ id: 'dep_old', status: 'succeeded' }
+		]);
+		renderPage({ ...app, status: 'running' });
+
+		const link = await screen.findByRole('link', { name: /view deploy/i });
+		expect(link).toHaveAttribute('href', '/apps/app_1/deployments/dep_next');
+		expect(screen.getByText('Deploying a new version')).toBeInTheDocument();
+		expect(screen.getByText('Running')).toBeInTheDocument();
+		expect(screen.getByRole('button', { name: /deploying/i })).toBeDisabled();
 	});
 
 	it('opens the tab named in ?tab=', async () => {

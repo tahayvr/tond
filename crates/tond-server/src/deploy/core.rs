@@ -60,7 +60,6 @@ use crate::volumes;
 
 use super::build::{
     BuildOptions, build_from_dir_with_method, build_from_git, build_from_inline_dockerfile,
-    run_inline_compose,
 };
 use super::failure::{self, ContainerExit, FailureContext, ProbeResult};
 use super::git::{GitHttpAuth, redact_url_credentials, split_url_credentials};
@@ -77,7 +76,7 @@ use crate::runtime::shutdown;
 /// separately so the URL passed to git (and logged) never contains them. When
 /// `log_source` is set, which credential is used — or why it could not be —
 /// is written to the deploy log.
-async fn resolve_git_source(
+pub(super) async fn resolve_git_source(
     state: &AppState,
     app: &App,
     source_url: &str,
@@ -187,7 +186,7 @@ async fn persist_generated_dockerfile(
 /// The automatic hostname for an app: `<app>.<apps_domain>`, or `None` when
 /// no apps domain is configured. Apps never default to a name under the
 /// dashboard domain: that would put user code on the dashboard's site.
-fn auto_domain(apps_domain: &str, app_name: &str) -> Option<String> {
+pub(super) fn auto_domain(apps_domain: &str, app_name: &str) -> Option<String> {
     (!apps_domain.is_empty()).then(|| domains::app_host(app_name, apps_domain))
 }
 
@@ -423,16 +422,21 @@ pub async fn run(
             .await;
             progress::finish_failed(state, &app_id, deployment_id, &failure).await;
 
-            // The previous container keeps serving when the failure happened
-            // before the cutover; only a first deploy (or compose) is "failed".
-            let restore = match (&old_container_id, app.source_type.as_str()) {
-                (Some(_), "compose") | (None, _) => "failed".to_string(),
-                (Some(_), _) if matches!(previous_status.as_str(), "building" | "pending") => {
-                    "running".to_string()
-                }
-                (Some(_), _) => previous_status,
-            };
-            let _ = update_status(state, &app_id, &restore).await;
+            // A compose app is touched from `docker compose up` (start) on;
+            // before that its services keep running untouched.
+            let compose_touched = app.source_type == "compose"
+                && matches!(
+                    phase,
+                    Some(DeployPhase::Start | DeployPhase::Health | DeployPhase::Release)
+                );
+            let restore = status_after_failure(
+                &previous_status,
+                old_container_id.is_some(),
+                compose_touched,
+            );
+            if restore != app.status {
+                let _ = update_status(state, &app_id, &restore).await;
+            }
             app.status = restore;
 
             tracing::error!("Deploy failed for {}: {}", app.name, error);
@@ -441,13 +445,50 @@ pub async fn run(
     }
 }
 
+/// True when the app serves traffic from an existing container: a deploy
+/// leaves its status alone (it stays routed until the cutover; the active
+/// deployment row shows the progress).
+pub(super) fn is_serving(status: &str, container_id: Option<&str>) -> bool {
+    container_id.is_some() && matches!(status, "running" | "unhealthy")
+}
+
+/// Mark a deployment's start on the app: 'building' only when nothing
+/// serves yet (first deploy, stopped or failed app). A serving app keeps its
+/// status, so tond-proxy keeps routing to the old container during the build.
+pub(super) async fn mark_deploy_started(state: &AppState, app: &mut App) -> Result<()> {
+    if !is_serving(&app.status, app.container_id.as_deref()) {
+        update_status(state, &app.id, "building").await?;
+        app.status = "building".to_string();
+    }
+    Ok(())
+}
+
+/// The app's status after a failed deployment, from its status when the
+/// deployment started: a serving app keeps serving the old container (a
+/// compose app whose services were already recreated is 'unhealthy', still
+/// routed); a stopped one stays stopped; with nothing to fall back on it is
+/// 'failed'.
+pub(super) fn status_after_failure(
+    previous: &str,
+    had_container: bool,
+    compose_touched: bool,
+) -> String {
+    match (previous, had_container) {
+        ("running" | "unhealthy", true) if compose_touched => "unhealthy".to_string(),
+        ("running" | "unhealthy" | "stopped", true) => previous.to_string(),
+        // Left 'building' by an interrupted deploy: the container is there.
+        ("building" | "pending", true) if !compose_touched => "running".to_string(),
+        _ => "failed".to_string(),
+    }
+}
+
 /// What the health phase saw, for classifying a failure.
 #[derive(Debug, Default)]
-struct HealthFacts {
-    probe: Option<ProbeResult>,
-    container: Option<ContainerExit>,
-    container_logs: Vec<String>,
-    timeout_secs: u64,
+pub(super) struct HealthFacts {
+    pub probe: Option<ProbeResult>,
+    pub container: Option<ContainerExit>,
+    pub container_logs: Vec<String>,
+    pub timeout_secs: u64,
 }
 
 /// The deployment pipeline. Phase transitions are recorded as it goes; the
@@ -471,7 +512,7 @@ async fn pipeline(
     // The image this deployment runs, whatever the source: tond-<app>:<id>.
     let deploy_tag = images::deployment_tag(&app_name, deployment_id);
 
-    update_status(state, &app_id, "building").await?;
+    mark_deploy_started(state, app).await?;
     log_deploy(
         state,
         &app_id,
@@ -491,7 +532,15 @@ async fn pipeline(
     // deployment — hence the fire-and-forget spawn with `let _ =`.
     {
         let volumes: Vec<Volume> = serde_json::from_str(app.volumes.as_str()).unwrap_or_default();
-        if !volumes.is_empty() {
+        // Compose apps keep data in bind mounts and named volumes; a
+        // git-sourced file is only known after the clone, so snapshot it.
+        let compose_data = app.source_type == "compose"
+            && (app.source_url.is_some()
+                || app.compose_content.as_deref().is_some_and(|c| {
+                    let usage = crate::compose::volume_usage(c);
+                    usage.binds || !usage.named.is_empty()
+                }));
+        if !volumes.is_empty() || compose_data {
             let snap_state = state.clone();
             let snap_app_name = app_name.clone();
             let snap_deploy_id = deployment_id.to_string();
@@ -509,14 +558,13 @@ async fn pipeline(
         }
     }
 
+    // Compose apps run their own pipeline (deploy/compose.rs).
+    if app.source_type == "compose" {
+        return super::compose::pipeline(state, app, deployment_id, req, facts, ctx).await;
+    }
+
     let image_name = match &req.kind {
         DeployKind::Rollback { image_tag, .. } => {
-            if app.source_type == "compose" {
-                anyhow::bail!(
-                    "Rollback is not supported for compose apps. \
-                     Update the compose content and trigger a fresh deploy instead."
-                );
-            }
             // The exact image must still be on the host (old ones are pruned).
             if state.docker.inspect_image(image_tag).await.is_err() {
                 let _ = sqlx::query(
@@ -578,60 +626,6 @@ async fn pipeline(
         .bind(deployment_id)
         .execute(&state.db)
         .await;
-
-    // ── Compose early-return ──────────────────────────────────────────────────
-    //
-    // For compose apps `run_inline_compose` already started all containers via
-    // `docker compose up -d`. There is no single "image" to re-run through the
-    // standard ZDT machinery. Instead we:
-    //   1. Inspect the running compose project to find the host port.
-    //   2. Write host_port + status='running' directly to the DB.
-    //   3. Return — the proxy will pick up the new port on its next poll.
-    //
-    // ZDT for compose is handled by docker compose itself: `up -d` only
-    // restarts services whose image/config changed, so existing connections
-    // keep flowing through unchanged services.
-    if app.source_type == "compose" && !is_rollback {
-        progress::start(state, &app_id, DeployPhase::Start).await;
-        let container_port = app.container_port as u16;
-
-        let host_port = docker::find_compose_host_port(
-            &state.docker,
-            &super::build::compose_project_name(&app_name),
-            container_port,
-        )
-        .await
-        .with_context(|| {
-            format!("no compose service publishes container port {container_port}; set the app's port to the port your web service listens on")
-        })?;
-
-        progress::start(state, &app_id, DeployPhase::Release).await;
-        sqlx::query(
-            "UPDATE apps SET container_id = ?, host_port = ?, status = 'running', updated_at = datetime('now') WHERE id = ?",
-        )
-        .bind(&image_name) // sentinel: "tond-compose-{app_name}"
-        .bind(host_port as i64)
-        .bind(&app_id)
-        .execute(&state.db)
-        .await?;
-
-        app.host_port = Some(host_port as i64);
-        app.status = "running".to_string();
-        assign_automatic_domain(state, app, trigger_source).await?;
-
-        log_deploy(
-            state,
-            &app_id,
-            "info",
-            trigger_source,
-            &format!(
-                "Compose deploy succeeded! Proxy will route to 127.0.0.1:{}",
-                host_port
-            ),
-        )
-        .await?;
-        return Ok(());
-    }
 
     // ── Start ──
     progress::start(state, &app_id, DeployPhase::Start).await;
@@ -935,7 +929,7 @@ async fn pipeline(
 
 /// Wait until tond-proxy routes the app's new port (see proxy_link.rs), and
 /// say in the deploy log how the cutover was confirmed.
-async fn wait_for_proxy_cutover(
+pub(super) async fn wait_for_proxy_cutover(
     state: &AppState,
     app_id: &str,
     trigger_source: &str,
@@ -949,7 +943,7 @@ async fn wait_for_proxy_cutover(
 }
 
 /// Build, pull or re-tag the app's configured source into `deploy_tag`
-/// (compose apps start their services here and return a sentinel).
+/// (compose apps have their own pipeline, see deploy/compose.rs).
 async fn source_image(
     state: &AppState,
     app: &App,
@@ -1080,26 +1074,6 @@ async fn source_image(
             )
             .await?
         }
-        "compose" => {
-            progress::start(state, app_id, DeployPhase::Build).await;
-            let content = app.compose_content.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("compose_content is required for source_type='compose'")
-            })?;
-
-            log_deploy(
-                state,
-                app_id,
-                "info",
-                trigger_source,
-                "Starting inline Docker Compose application...",
-            )
-            .await?;
-
-            // `${VAR}` in the compose file is filled from the app's env
-            // (templates keep their generated passwords there).
-            let env = secrets::app_env(app)?;
-            run_inline_compose(state, app_id, app_name, content, &env, trigger_source).await?
-        }
         other => {
             anyhow::bail!("Unsupported source type: {}", other);
         }
@@ -1113,7 +1087,7 @@ async fn source_image(
 const PORT_PROBE_MIN_SECS: u64 = 60;
 
 /// Drop the RFC 3339 timestamp Docker prepends with `timestamps(true)`.
-fn strip_docker_ts(raw: &str) -> &str {
+pub(super) fn strip_docker_ts(raw: &str) -> &str {
     match raw.split_once(' ') {
         Some((ts, rest)) if ts.len() <= 35 && ts.contains('T') => rest.trim_end(),
         _ => raw.trim_end(),
@@ -1320,10 +1294,10 @@ pub async fn deploy_preview(
 
 /// What [`probe_until_ready`] saw last.
 #[derive(Debug)]
-struct Probe {
-    result: ProbeResult,
+pub(super) struct Probe {
+    pub result: ProbeResult,
     /// Set when the container stopped (crash, OOM) before becoming ready.
-    container: Option<ContainerExit>,
+    pub container: Option<ContainerExit>,
 }
 
 /// The container's address on its first Docker network.
@@ -1339,7 +1313,7 @@ async fn container_ip(docker: &bollard::Docker, container_id: &str) -> Option<st
 /// Poll until the container accepts TCP connections on `port`. Connects to
 /// the container's own address: the loopback-published port is held by
 /// docker-proxy, which accepts connections even when nothing listens.
-async fn probe_tcp_until_ready(
+pub(super) async fn probe_tcp_until_ready(
     docker: &bollard::Docker,
     container_id: &str,
     port: u16,
@@ -1426,7 +1400,10 @@ fn probe_outcome(status: Option<u16>, timed_out: bool, require_2xx: bool) -> Pro
 
 /// How the container is doing; `running` is false while Docker restarts a
 /// crashed container.
-async fn container_exit(docker: &bollard::Docker, container_id: &str) -> Option<ContainerExit> {
+pub(super) async fn container_exit(
+    docker: &bollard::Docker,
+    container_id: &str,
+) -> Option<ContainerExit> {
     let info = docker.inspect_container(container_id, None).await.ok()?;
     let crashed_before = info.restart_count.unwrap_or(0) > 0;
     let st = info.state?;
@@ -1440,7 +1417,7 @@ async fn container_exit(docker: &bollard::Docker, container_id: &str) -> Option<
 /// Poll `url` once per second until the app answers: any HTTP response, or a
 /// 2xx when `require_2xx` (a health check path). Stops early when the
 /// container exits.
-async fn probe_until_ready(
+pub(super) async fn probe_until_ready(
     docker: &bollard::Docker,
     container_id: &str,
     url: &str,
@@ -1517,6 +1494,17 @@ pub async fn fetch_registry_credentials(
     }))
 }
 
+/// `image` with `:latest` appended when it names neither a tag nor a digest
+/// (`redis` → `redis:latest`, `host:5000/app` → `host:5000/app:latest`).
+pub fn with_default_tag(image: &str) -> String {
+    let last = image.rsplit('/').next().unwrap_or(image);
+    if image.contains('@') || last.contains(':') {
+        image.to_string()
+    } else {
+        format!("{image}:latest")
+    }
+}
+
 /// Pull a Docker image, optionally using registry credentials.
 pub async fn pull_image(
     docker: &bollard::Docker,
@@ -1526,9 +1514,11 @@ pub async fn pull_image(
     use bollard::query_parameters::CreateImageOptionsBuilder;
     use futures::StreamExt;
 
+    // Without a tag the Engine API pulls *every* tag of the repository.
+    let image = with_default_tag(image);
     let options = Some(
         CreateImageOptionsBuilder::default()
-            .from_image(image)
+            .from_image(&image)
             .build(),
     );
 
@@ -1645,6 +1635,113 @@ mod tests {
             rate_limiter: RateLimiter::new(60, 10.0),
             settings: Arc::new(RwLock::new(ServerSettings::default())),
         }
+    }
+
+    #[tokio::test]
+    async fn a_serving_app_stays_routable_until_the_cutover() {
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO apps (id, name, source_type, status, container_id, host_port, created_at, updated_at)
+             VALUES ('a1', 'web', 'image', 'running', 'c-old', 8100, 'now', 'now'),
+                    ('a2', 'fresh', 'image', 'pending', NULL, NULL, 'now', 'now'),
+                    ('a3', 'parked', 'image', 'stopped', 'c-parked', 8101, 'now', 'now'),
+                    ('a4', 'stack', 'compose', 'running', 'tond-stack:abc', NULL, 'now', 'now')",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+        for sql in [
+            "INSERT INTO app_domains (domain, app_id, kind) VALUES ('web.example.com', 'a1', 'primary')",
+            "INSERT INTO compose_services (app_id, name, published_port, host_port, routed_port)
+             VALUES ('a4', 'web', 80, 8300, 80)",
+            "INSERT INTO app_domains (domain, app_id, service, port, kind)
+             VALUES ('stack.example.com', 'a4', 'web', 80, 'primary')",
+        ] {
+            sqlx::query(sql)
+                .execute(&state.db)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let version = || async {
+            sqlx::query_scalar::<_, i64>("SELECT version FROM route_state WHERE id = 1")
+                .fetch_one(&state.db)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"))
+        };
+        // What tond-proxy routes (its app-domain query).
+        let routed = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT a.host_port FROM app_domains d JOIN apps a ON a.id = d.app_id
+                 WHERE a.status = 'running' AND a.host_port IS NOT NULL
+                   AND a.readiness != 'none' AND d.service IS NULL AND d.domain = 'web.example.com'",
+            )
+            .fetch_optional(&state.db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+        };
+        let before = version().await;
+        for id in ["a1", "a2", "a3", "a4"] {
+            let mut app: App = sqlx::query_as("SELECT * FROM apps WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            mark_deploy_started(&state, &mut app)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let statuses: Vec<(String, Option<i64>)> =
+            sqlx::query_as("SELECT status, host_port FROM apps ORDER BY id")
+                .fetch_all(&state.db)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            statuses,
+            [
+                ("running".to_string(), Some(8100)),
+                ("building".to_string(), None),
+                ("building".to_string(), Some(8101)),
+                ("running".to_string(), None),
+            ],
+            "only an app with nothing serving shows 'building'"
+        );
+        assert_eq!(version().await, before, "no route change while building");
+        assert_eq!(
+            routed().await,
+            Some(8100),
+            "the old container keeps the domain"
+        );
+        // The compose service route (tond-proxy's service query) stays too.
+        let service_route: Option<i64> = sqlx::query_scalar(
+            "SELECT s.host_port FROM app_domains d JOIN apps a ON a.id = d.app_id
+             JOIN compose_services s ON s.app_id = d.app_id AND s.name = d.service
+             WHERE d.service IS NOT NULL AND d.kind != 'redirect'
+               AND a.status IN ('running', 'building', 'unhealthy') AND s.host_port IS NOT NULL
+               AND d.domain = 'stack.example.com'",
+        )
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(service_route, Some(8300));
+    }
+
+    #[test]
+    fn a_failed_deploy_leaves_a_serving_app_serving() {
+        assert!(is_serving("running", Some("c")));
+        assert!(is_serving("unhealthy", Some("c")));
+        assert!(!is_serving("running", None));
+        assert!(!is_serving("stopped", Some("c")));
+        assert_eq!(status_after_failure("running", true, false), "running");
+        assert_eq!(status_after_failure("unhealthy", true, false), "unhealthy");
+        assert_eq!(
+            status_after_failure("running", true, true),
+            "unhealthy",
+            "compose services were already recreated: still routed, flagged"
+        );
+        assert_eq!(status_after_failure("stopped", true, false), "stopped");
+        assert_eq!(status_after_failure("pending", false, false), "failed");
+        assert_eq!(status_after_failure("failed", true, true), "failed");
+        assert_eq!(status_after_failure("building", true, false), "running");
     }
 
     #[test]

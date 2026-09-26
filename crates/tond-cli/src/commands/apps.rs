@@ -271,6 +271,25 @@ pub enum AppsAction {
         generate: bool,
     },
 
+    /// List the services of a Docker Compose app (state, image, ports, domains)
+    Services {
+        /// App name or ID
+        app: String,
+    },
+
+    /// Restart, stop or start one service of a Docker Compose app, or show its logs
+    Service {
+        /// App name or ID
+        app: String,
+
+        /// Service name (as in the compose file)
+        service: String,
+
+        /// restart | stop | start | logs
+        #[arg(value_parser = ["restart", "stop", "start", "logs"])]
+        action: String,
+    },
+
     /// Manage webhook URL and auto-deploy settings for an app
     GitWebhook {
         /// App name or ID
@@ -792,6 +811,82 @@ pub async fn handle(client: &TondClient, out: &Output, action: AppsAction) -> Re
                 outln!(out, "Graceful drain disabled for app {}", app);
             } else {
                 outln!(out, "Drain timeout set to {}s for app {}", seconds, app);
+            }
+        }
+
+        AppsAction::Services { app } => {
+            let services = client.list_services(&app).await?;
+            out.json(&services)?;
+            if services.is_empty() {
+                outln!(out, "No services found for {}", app);
+            } else {
+                outln!(
+                    out,
+                    "{:<16} {:<12} {:<34} {:<16} DOMAINS",
+                    "SERVICE",
+                    "STATUS",
+                    "IMAGE",
+                    "PUBLISHED"
+                );
+                for s in &services {
+                    let status = match (s.status.as_str(), s.health.as_deref()) {
+                        ("running", Some(h)) => h.to_string(),
+                        ("exited", _) => format!("exited({})", s.exit_code.unwrap_or(-1)),
+                        (st, _) => st.to_string(),
+                    };
+                    let published = match (s.published_port, s.host_port) {
+                        (Some(p), Some(h)) => format!("{p}->127.0.0.1:{h}"),
+                        (Some(p), None) => format!("{p} (deploy)"),
+                        _ => "-".to_string(),
+                    };
+                    let image = if s.builds {
+                        "(built)".to_string()
+                    } else {
+                        s.image.clone().unwrap_or_else(|| "-".to_string())
+                    };
+                    outln!(
+                        out,
+                        "{:<16} {:<12} {:<34} {:<16} {}",
+                        s.name,
+                        status,
+                        image,
+                        published,
+                        if s.domains.is_empty() {
+                            "-".to_string()
+                        } else {
+                            s.domains.join(", ")
+                        }
+                    );
+                }
+            }
+        }
+
+        AppsAction::Service {
+            app,
+            service,
+            action,
+        } => {
+            if action == "logs" {
+                let logs = client.service_logs(&app, &service).await?;
+                out.json(&logs)?;
+                for line in logs
+                    .get("lines")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                {
+                    outln!(out, "{}", line);
+                }
+            } else {
+                let data = client.service_action(&app, &service, &action).await?;
+                out.done(&action, "service", &format!("{app}/{service}"), data)?;
+                let past = match action.as_str() {
+                    "restart" => "restarted",
+                    "stop" => "stopped",
+                    _ => "started",
+                };
+                outln!(out, "Service {} of {} {}", service, app, past);
             }
         }
 
