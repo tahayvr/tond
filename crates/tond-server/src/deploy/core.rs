@@ -184,12 +184,21 @@ async fn assign_automatic_domain(
     let apps_domain = state.settings.read().await.apps_domain.clone();
     match auto_domain(&apps_domain, &app.name) {
         Some(domain) => {
-            sqlx::query("UPDATE apps SET domain = ? WHERE id = ?")
-                .bind(&domain)
-                .bind(&app.id)
-                .execute(&state.db)
+            if crate::app_domains::assign_automatic(&state.db, &app.id, &domain).await? {
+                app.domain = Some(domain);
+            } else {
+                log_deploy(
+                    state,
+                    &app.id,
+                    "warn",
+                    trigger_source,
+                    &format!(
+                        "{domain} is already used by another app, so this app has no automatic \
+                         address. Add a domain on the app's page."
+                    ),
+                )
                 .await?;
-            app.domain = Some(domain);
+            }
         }
         None => {
             log_deploy(

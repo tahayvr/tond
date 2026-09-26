@@ -70,6 +70,7 @@
 
 mod access_logs;
 mod alerts;
+mod app_domains;
 mod audit_log;
 mod audit_ship;
 mod auth;
@@ -79,6 +80,7 @@ mod cron;
 mod db;
 mod db_credentials;
 mod deploy;
+mod dns_providers;
 mod docker;
 mod domains;
 mod error;
@@ -112,7 +114,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use axum::{
     Extension, Router,
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
 };
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::prelude::*;
@@ -355,6 +357,19 @@ async fn run() -> Result<()> {
             get(handlers::env::reveal_preview_env_var),
         )
         .route("/api/apps/{id}/domain", put(handlers::update_domain))
+        .route(
+            "/api/apps/{id}/domains",
+            get(handlers::app_domains::list_domains).post(handlers::app_domains::add_domain),
+        )
+        .route(
+            "/api/apps/{id}/domains/www-pair",
+            post(handlers::app_domains::add_www_pair),
+        )
+        .route(
+            "/api/apps/{id}/domains/{domain}",
+            patch(handlers::app_domains::update_domain)
+                .delete(handlers::app_domains::remove_domain),
+        )
         .route("/api/apps/{id}/health", put(handlers::update_health))
         .route("/api/apps/{id}/port", put(handlers::update_port))
         .route("/api/apps/{id}/readiness", put(handlers::update_readiness))
@@ -409,6 +424,28 @@ async fn run() -> Result<()> {
         )
         // Certificate management
         .route("/api/certs", get(handlers::certificates::list_certs))
+        .route(
+            "/api/certs/custom",
+            post(handlers::certificates::upload_cert),
+        )
+        .route(
+            "/api/certs/custom/{domain}",
+            delete(handlers::certificates::delete_custom_cert),
+        )
+        .route(
+            "/api/dns-providers",
+            get(handlers::dns_providers::list_dns_providers)
+                .post(handlers::dns_providers::create_dns_provider),
+        )
+        .route(
+            "/api/dns-providers/{id}",
+            patch(handlers::dns_providers::update_dns_provider)
+                .delete(handlers::dns_providers::delete_dns_provider),
+        )
+        .route(
+            "/api/dns-providers/{id}/test",
+            post(handlers::dns_providers::test_dns_provider),
+        )
         .route(
             "/api/certs/{domain}/retry",
             post(handlers::certificates::retry_cert),

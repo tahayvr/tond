@@ -14,7 +14,11 @@
 //   - receives certificate results (cert events) and stores them — the proxy
 //     opens tond.db read-only — then acks them;
 //   - asks for the proxy's own stats for GET /api/system/self;
-//   - reads its per-route request counters on the metrics tick (`traffic`).
+//   - reads its per-route request counters on the metrics tick (`traffic`);
+//   - publishes and clears ACME DNS-01 TXT records the proxy asks for
+//     (`dns_txt`; the DNS provider tokens stay here, see dns_providers/);
+//   - hands uploaded certificates to the proxy, which validates, stores and
+//     serves them (`install_cert` / `remove_cert`).
 //
 // When the proxy is not running there is nothing to wait for: it loads the
 // current routes from the database when it starts. When it runs but does not
@@ -35,8 +39,8 @@ use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::{Notify, oneshot};
 use tond_common::ProxyStats;
 use tond_common::proxy_control::{
-    CertOutcome, CertReport, FALLBACK_POLL_SECS, MAX_LINE_BYTES, PROXY_SOCKET_NAME, ProxyMessage,
-    ProxyRequest, ReplyBody, encode_line,
+    CertOutcome, CertReport, FALLBACK_POLL_SECS, InstalledCert, MAX_LINE_BYTES, PROXY_SOCKET_NAME,
+    ProxyMessage, ProxyRequest, ReplyBody, encode_line,
 };
 use tond_common::traffic::TrafficSnapshot;
 
@@ -252,6 +256,54 @@ pub async fn request_certs(domain: Option<String>) {
     }
 }
 
+/// Hand an uploaded certificate to the proxy: it validates the chain and key
+/// (it links OpenSSL; tond-server does not), stores the files it owns and
+/// serves them. Returns what it parsed, or the validation error.
+pub async fn install_cert(
+    domain: &str,
+    cert_pem: String,
+    key_pem: String,
+) -> Result<InstalledCert, String> {
+    if !is_connected() {
+        return Err(
+            "tond-proxy isn't running, so the certificate can't be installed. Start it \
+                    (systemctl start tond-proxy) and try again."
+                .into(),
+        );
+    }
+    let domain = domain.to_string();
+    match request(
+        |id| ProxyRequest::InstallCert {
+            id,
+            domain,
+            cert_pem,
+            key_pem,
+        },
+        SYNC_TIMEOUT,
+    )
+    .await
+    {
+        Ok(ReplyBody::CertInstalled { cert }) => Ok(cert),
+        Ok(ReplyBody::Error { message }) => Err(message),
+        Ok(other) => Err(format!("unexpected answer from tond-proxy: {other:?}")),
+        Err(e) => Err(format!("tond-proxy did not answer: {e}")),
+    }
+}
+
+/// Stop serving an uploaded certificate (the proxy deletes its files).
+pub async fn remove_cert(domain: &str) -> Result<(), String> {
+    if !is_connected() {
+        return Err("tond-proxy isn't running; start it and try again".into());
+    }
+    let domain = domain.to_string();
+    match request(|id| ProxyRequest::RemoveCert { id, domain }, SYNC_TIMEOUT).await {
+        Ok(ReplyBody::Ok) => Ok(()),
+        Ok(ReplyBody::Error { message }) => Err(message),
+        Ok(other) => Err(format!("unexpected answer from tond-proxy: {other:?}")),
+        Err(e) => Err(format!("tond-proxy did not answer: {e}")),
+    }
+}
+
 /// The proxy's own stats, if it is connected and answers quickly.
 pub async fn proxy_stats() -> Option<ProxyStats> {
     if !is_connected() {
@@ -294,8 +346,8 @@ pub async fn apply_cert_report(db: &sqlx::SqlitePool, report: &CertReport) -> Re
                 "INSERT INTO certificates (id, domain, cert_type, cert_path, key_path, issued_at, expires_at,
                                            status, created_at, updated_at,
                                            last_error, last_attempt_at, next_retry_at, failure_count,
-                                           issuer, last_renewed_at)
-                 VALUES (?1, ?2, 'acme', ?3, ?4, ?5, ?6, 'active', ?7, ?7, NULL, ?7, NULL, 0, ?8, ?7)
+                                           issuer, last_renewed_at, challenge)
+                 VALUES (?1, ?2, 'acme', ?3, ?4, ?5, ?6, 'active', ?7, ?7, NULL, ?7, NULL, 0, ?8, ?7, ?9)
                  ON CONFLICT(domain) DO UPDATE SET
                     cert_path = excluded.cert_path,
                     key_path = excluded.key_path,
@@ -308,7 +360,9 @@ pub async fn apply_cert_report(db: &sqlx::SqlitePool, report: &CertReport) -> Re
                     next_retry_at = NULL,
                     failure_count = 0,
                     issuer = excluded.issuer,
-                    last_renewed_at = excluded.last_renewed_at",
+                    last_renewed_at = excluded.last_renewed_at,
+                    challenge = excluded.challenge
+                 WHERE certificates.cert_type != 'custom'",
             )
             .bind(uuid::Uuid::new_v4().to_string())
             .bind(&report.domain)
@@ -318,6 +372,7 @@ pub async fn apply_cert_report(db: &sqlx::SqlitePool, report: &CertReport) -> Re
             .bind(expires_at)
             .bind(&report.attempted_at)
             .bind(issuer)
+            .bind(&report.challenge)
             .execute(db)
             .await
             .context("storing issued certificate")?;
@@ -331,15 +386,18 @@ pub async fn apply_cert_report(db: &sqlx::SqlitePool, report: &CertReport) -> Re
             sqlx::query(
                 "INSERT INTO certificates (id, domain, cert_type, cert_path, key_path, issued_at, expires_at,
                                            status, created_at, updated_at,
-                                           last_error, last_attempt_at, next_retry_at, failure_count)
-                 VALUES (?1, ?2, 'acme', ?3, ?4, ?5, ?5, ?6, ?5, ?5, ?7, ?5, ?8, ?9)
+                                           last_error, last_attempt_at, next_retry_at, failure_count,
+                                           challenge)
+                 VALUES (?1, ?2, 'acme', ?3, ?4, ?5, ?5, ?6, ?5, ?5, ?7, ?5, ?8, ?9, ?10)
                  ON CONFLICT(domain) DO UPDATE SET
                     status = excluded.status,
                     updated_at = excluded.updated_at,
                     last_error = excluded.last_error,
                     last_attempt_at = excluded.last_attempt_at,
                     next_retry_at = excluded.next_retry_at,
-                    failure_count = excluded.failure_count",
+                    failure_count = excluded.failure_count,
+                    challenge = excluded.challenge
+                 WHERE certificates.cert_type != 'custom'",
             )
             .bind(uuid::Uuid::new_v4().to_string())
             .bind(&report.domain)
@@ -350,9 +408,18 @@ pub async fn apply_cert_report(db: &sqlx::SqlitePool, report: &CertReport) -> Re
             .bind(truncate(error, MAX_ERROR_LEN))
             .bind(next_retry_at)
             .bind(i64::from(*failure_count))
+            .bind(&report.challenge)
             .execute(db)
             .await
             .context("storing certificate failure")?;
+        }
+        CertOutcome::Superseded { by } => {
+            sqlx::query("DELETE FROM certificates WHERE domain = ? AND cert_type = 'acme'")
+                .bind(&report.domain)
+                .execute(db)
+                .await
+                .context("dropping a superseded certificate")?;
+            tracing::info!("[cert] {} is now served by {by}", report.domain);
         }
     }
     Ok(())
@@ -383,6 +450,26 @@ async fn handle_message(state: &AppState, msg: ProxyMessage) {
             if let Some(tx) = tx {
                 let _ = tx.send(body);
             }
+        }
+        ProxyMessage::DnsTxt {
+            id,
+            action,
+            name,
+            value,
+        } => {
+            // Provider calls and the propagation wait take seconds: don't
+            // hold up the reader (sync acks, other replies).
+            let state = state.clone();
+            tokio::spawn(async move {
+                let error = crate::dns_providers::handle_txt(&state, action, &name, &value)
+                    .await
+                    .err()
+                    .map(|e| format!("{e:#}"));
+                if let Some(e) = &error {
+                    tracing::warn!("[dns] {action:?} {name} failed: {e}");
+                }
+                let _ = send(&ProxyRequest::DnsResult { id, error }).await;
+            });
         }
         ProxyMessage::CertEvent { seq, report } => {
             match apply_cert_report(&state.db, &report).await {
@@ -509,8 +596,48 @@ mod tests {
             cert_path: "/data/certs/app.example.com/cert.pem".into(),
             key_path: "/data/certs/app.example.com/key.pem".into(),
             attempted_at: "2026-05-01T10:00:00+00:00".into(),
+            challenge: Some("dns-01".into()),
             outcome,
         }
+    }
+
+    #[tokio::test]
+    async fn cert_reports_never_overwrite_an_uploaded_certificate() {
+        let db = db().await;
+        sqlx::query(
+            "INSERT INTO certificates (id, domain, cert_type, cert_path, key_path, issued_at, expires_at, status, issuer)
+             VALUES ('c1', 'app.example.com', 'custom', '/c', '/k', 'i', '2030-01-01T00:00:00Z', 'active', 'My CA')",
+        )
+        .execute(&db)
+        .await
+        .unwrap_or_else(|e| panic!("seed: {e}"));
+        for outcome in [
+            CertOutcome::Issued {
+                issued_at: "a".into(),
+                expires_at: "b".into(),
+                issuer: Some("Let's Encrypt".into()),
+            },
+            CertOutcome::Failed {
+                status: "failed".into(),
+                error: "boom".into(),
+                failure_count: 1,
+                next_retry_at: "later".into(),
+            },
+        ] {
+            apply_cert_report(&db, &report(outcome))
+                .await
+                .unwrap_or_else(|e| panic!("apply: {e}"));
+        }
+        let (kind, issuer, status): (String, Option<String>, String) = sqlx::query_as(
+            "SELECT cert_type, issuer, status FROM certificates WHERE domain = 'app.example.com'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap_or_else(|e| panic!("read: {e}"));
+        assert_eq!(
+            (kind.as_str(), issuer.as_deref(), status.as_str()),
+            ("custom", Some("My CA"), "active")
+        );
     }
 
     #[tokio::test]

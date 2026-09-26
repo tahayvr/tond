@@ -357,7 +357,7 @@ async fn observe(
         AlertScope::Certificate => {
             let certs: Vec<(String, String)> = sqlx::query_as(
                 "SELECT domain, expires_at FROM certificates
-                 WHERE cert_type = 'acme' AND status IN ('active', 'expired')",
+                 WHERE cert_type IN ('acme', 'custom') AND status IN ('active', 'expired')",
             )
             .fetch_all(ctx.db)
             .await?;
