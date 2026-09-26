@@ -3,6 +3,7 @@
  * All IDs are stable so navigation between pages works (e.g. /apps/:id links).
  */
 
+import templatesJson from './templates.json';
 import type {
 	App,
 	ActiveAlert,
@@ -30,7 +31,8 @@ import type {
 	Integration,
 	LoopStats,
 	ManagedDatabase,
-	TemplateCatalogEntry,
+	Template,
+	TemplateHostMemory,
 	MetricsRange,
 	MetricsResponse,
 	RequestMetricsResponse,
@@ -346,71 +348,11 @@ export const MOCK_PROJECTS: Project[] = [
 	}
 ];
 
-export const MOCK_TEMPLATES: TemplateCatalogEntry[] = [
-	{
-		id: 'plausible',
-		name: 'Plausible Analytics',
-		description: 'Self-hosted privacy-friendly analytics',
-		category: 'analytics',
-		tags: ['analytics', 'privacy'],
-		maintainers: ['tond'],
-		project: {
-			name: 'plausible',
-			description: 'Plausible app and supporting services'
-		},
-		source: {
-			kind: 'image',
-			url: 'ghcr.io/plausible/community-edition',
-			ref: 'latest'
-		},
-		deploy: {
-			method: 'image',
-			default_port: 8000,
-			health_check_path: '/',
-			volumes: [
-				{
-					container_path: '/var/lib/plausible',
-					description: 'Persistent application data and uploaded assets'
-				}
-			]
-		},
-		required_env: [
-			{
-				key: 'BASE_URL',
-				description: 'Public URL for the instance',
-				required: true,
-				value: null
-			},
-			{
-				key: 'SECRET_KEY_BASE',
-				description: 'Secret key used by Plausible',
-				required: true,
-				value: null
-			},
-			{
-				key: 'DATABASE_URL',
-				description: 'Primary PostgreSQL connection string',
-				required: true,
-				value: '${db.plausible-db.internal_connection_string}'
-			}
-		],
-		optional_env: [],
-		dependencies: [
-			{
-				name: 'plausible-db',
-				kind: 'database',
-				engine: 'postgres',
-				required: true
-			}
-		],
-		recommended_domains: ['stats.example.com'],
-		post_deploy_checks: [
-			'Open / to verify the dashboard loads',
-			'Add your site domain inside Plausible after the first login'
-		],
-		setup_notes: 'Configure BASE_URL and a PostgreSQL connection before first deploy.'
-	}
-];
+/** The real catalog (generated from templates/ by a tond-common test). */
+export const MOCK_TEMPLATES: Template[] = templatesJson as Template[];
+
+/** Host memory the mock catalog reports: small enough that heavy templates warn. */
+export const MOCK_TEMPLATE_MEMORY: TemplateHostMemory = { total_mb: 2048, available_mb: 1400 };
 
 // ── App environment variables (served masked by GET /apps/:id/env) ─────────
 

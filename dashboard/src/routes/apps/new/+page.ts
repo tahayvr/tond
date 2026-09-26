@@ -1,15 +1,13 @@
-import { listProjects, listRegistryCredentials, listTemplates } from '$lib/api';
+import { listProjects, listRegistryCredentials } from '$lib/api';
 
 export async function load() {
-	const [projects, registryCredentials, templates] = await Promise.all([
+	const [projects, registryCredentials] = await Promise.all([
 		listProjects(),
-		listRegistryCredentials(),
-		listTemplates()
+		listRegistryCredentials()
 	]);
 
 	return {
 		projects,
-		registryCredentials,
-		templates
+		registryCredentials
 	};
 }
