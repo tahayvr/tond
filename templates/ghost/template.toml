@@ -1,0 +1,45 @@
+id = "ghost"
+name = "Ghost"
+description = "Publishing platform for blogs, newsletters and paid memberships."
+about = "Ghost is a fast, modern CMS with a beautiful editor, built-in newsletters, memberships and subscriptions. This template runs Ghost with MySQL 8, the database Ghost supports in production."
+category = "cms"
+tags = ["blog", "cms", "newsletter", "publishing", "memberships"]
+logo = "ghost"
+version = "6"
+website = "https://ghost.org"
+docs = "https://ghost.org/docs/config/"
+repository = "https://github.com/TryGhost/Ghost"
+ram_mb = 700
+setup_notes = "Open /ghost on the app's address right away to create the owner account. To send newsletters and sign-in emails, add mail settings (mail__transport and friends) as environment variables on the app's Environment tab."
+upgrade_notes = "The image follows Ghost 6.x: redeploying pulls the tag as stored. To move to a new major, change the tag, take a snapshot first and follow Ghost's upgrade guide."
+post_deploy_checks = ["Create the owner account at /ghost", "Configure mail so members can sign in"]
+
+[public]
+service = "ghost"
+port = 2368
+health_path = "/ghost/api/admin/site/"
+
+[[inputs]]
+key = "GHOST_URL"
+label = "Site URL"
+value = "{app_url}"
+
+[[inputs]]
+key = "DB_PASSWORD"
+label = "Database password"
+generate = "password"
+
+[[inputs]]
+key = "DB_ROOT_PASSWORD"
+label = "Database root password"
+generate = "password"
+
+[[volumes]]
+service = "ghost"
+path = "./content"
+description = "Themes, images and uploaded files"
+
+[[volumes]]
+service = "db"
+path = "./mysql"
+description = "MySQL data: posts, members and settings"

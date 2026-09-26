@@ -130,6 +130,12 @@ pub struct App {
     /// For readiness "none": seconds the container must stay up
     #[sqlx(default)]
     pub ready_after_secs: i64,
+    /// One-click template the app was deployed from (None otherwise)
+    #[sqlx(default)]
+    pub template_id: Option<String>,
+    /// The template's version at deploy time
+    #[sqlx(default)]
+    pub template_version: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -239,6 +245,8 @@ impl App {
             static_build: 0,
             readiness: Readiness::Http.as_str().to_string(),
             ready_after_secs: DEFAULT_READY_AFTER_SECS,
+            template_id: None,
+            template_version: None,
             created_at: now.clone(),
             updated_at: now,
         }
@@ -326,6 +334,12 @@ pub struct AppResponse {
     /// as the dashboard: allowed, but the dashboard shows this warning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain_warning: Option<String>,
+    /// One-click template the app was deployed from (see GET /api/v1/templates)
+    #[serde(default)]
+    pub template_id: Option<String>,
+    /// The template's version at deploy time
+    #[serde(default)]
+    pub template_version: Option<String>,
     pub source_type: String,
     pub source_url: Option<String>,
     /// Branch deployed from `source_url` (git and git-sourced compose apps)
@@ -439,6 +453,8 @@ impl From<App> for AppResponse {
             static_build: app.static_build != 0,
             readiness: Readiness::parse(&app.readiness).as_str().to_string(),
             ready_after_secs: app.ready_after_secs,
+            template_id: app.template_id,
+            template_version: app.template_version,
             created_at: app.created_at,
             updated_at: app.updated_at,
             domain_warning: None,

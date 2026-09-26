@@ -43,6 +43,7 @@ pub mod code {
     pub const CONFLICT: &str = "CONFLICT";
     pub const APP_ALREADY_EXISTS: &str = "APP_ALREADY_EXISTS";
     pub const DEPLOY_IN_PROGRESS: &str = "DEPLOY_IN_PROGRESS";
+    pub const INSUFFICIENT_MEMORY: &str = "INSUFFICIENT_MEMORY";
     pub const IDEMPOTENCY_KEY_REUSED: &str = "IDEMPOTENCY_KEY_REUSED";
     pub const IDEMPOTENCY_KEY_IN_USE: &str = "IDEMPOTENCY_KEY_IN_USE";
     pub const BUILD_FAILED: &str = "BUILD_FAILED";
@@ -315,6 +316,15 @@ pub const ERROR_CODES: &[ErrorCodeInfo] = &[
         Some("Wait for the deploy to finish (`tond apps deploy <app> --wait`), then retry."),
     ),
     info(
+        code::INSUFFICIENT_MEMORY,
+        409,
+        exit::CONFLICT,
+        "The server has less free memory than the template needs.",
+        Some(
+            "Stop or remove an app to free memory, or retry with allow_low_memory: true (`--allow-low-memory`).",
+        ),
+    ),
+    info(
         code::IDEMPOTENCY_KEY_REUSED,
         422,
         exit::CONFLICT,
@@ -447,6 +457,11 @@ pub enum TondError {
     #[error("{0}")]
     DeployInProgress(String),
 
+    /// A template needs more memory than the server has free (retry with
+    /// `allow_low_memory` to deploy anyway).
+    #[error("{0}")]
+    InsufficientMemory(String),
+
     /// The image build failed.
     #[error("{0}")]
     BuildFailed(String),
@@ -503,6 +518,7 @@ impl TondError {
             TondError::ApprovalRequired(_) => code::APPROVAL_REQUIRED,
             TondError::Conflict(_) => code::CONFLICT,
             TondError::DeployInProgress(_) => code::DEPLOY_IN_PROGRESS,
+            TondError::InsufficientMemory(_) => code::INSUFFICIENT_MEMORY,
             TondError::BuildFailed(_) => code::BUILD_FAILED,
             TondError::Unavailable(_) => code::SERVICE_UNAVAILABLE,
             TondError::Internal(_) => code::INTERNAL,
@@ -523,6 +539,7 @@ impl TondError {
             | TondError::ApprovalRequired(m)
             | TondError::Conflict(m)
             | TondError::DeployInProgress(m)
+            | TondError::InsufficientMemory(m)
             | TondError::BuildFailed(m)
             | TondError::Unavailable(m)
             | TondError::PayloadTooLarge(m) => m.clone(),
@@ -607,6 +624,7 @@ mod tests {
             TondError::ApprovalRequired(String::new()),
             TondError::Conflict(String::new()),
             TondError::DeployInProgress(String::new()),
+            TondError::InsufficientMemory(String::new()),
             TondError::BuildFailed(String::new()),
             TondError::Unavailable(String::new()),
             TondError::Internal(String::new()),

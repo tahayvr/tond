@@ -49,6 +49,7 @@ ADMIN_PASSWORD="${E2E_ADMIN_PASSWORD:-E2e-Smoke-Passw0rd!}"
 
 WHOAMI_DOMAIN="whoami.${BASE}"
 STATIC_DOMAIN="static.${BASE}"
+VAULT_DOMAIN="vault.${BASE}"
 
 # ── Output helpers ────────────────────────────────────────────────────────────
 
@@ -158,9 +159,11 @@ wait_for_app_running() {
 }
 
 delete_e2e_resources() {
-    for app in e2e-whoami e2e-static e2e-rooted e2e-compose e2e-stack e2e-badport e2e-worker e2e-worker-domain e2e-auto e2e-wild; do
+    for app in e2e-whoami e2e-static e2e-rooted e2e-compose e2e-stack e2e-badport e2e-worker e2e-worker-domain e2e-auto e2e-wild e2e-vault; do
         tond apps delete "$app" -y > /dev/null 2>&1 || true
     done
+    # A template refuses a name whose volume directory still holds data.
+    rm -rf "${DATA_DIR}/volumes/e2e-vault"
     for db in e2e-redis e2e-redis-copy e2e-pg e2e-pg-copy; do
         tond db delete "$db" -y > /dev/null 2>&1 || true
     done
@@ -1680,6 +1683,66 @@ jq -e '.data.phases[] | select(.phase == "health") | .label == "Stay up for 5s" 
 [[ "$(app_field e2e-worker readiness)" == none ]] || fail "the app must report readiness none"
 docker logs tond-e2e-worker 2>&1 | grep -q tick || fail "the worker container should be running its loop"
 pass "a background worker deploys to running with no domain (readiness step: stay up 5s)"
+
+step "One-click templates (catalog, generated credentials, encrypted inputs, volume owners)"
+CATALOG=$(api /api/v1/templates)
+jq -e '(.data.templates | length) >= 25' <<< "$CATALOG" > /dev/null \
+    || fail "the template catalog should ship 25+ templates: $(jq -c '.data.templates | length' <<< "$CATALOG")"
+jq -e '[.data.templates[].services[].image | select(test(":latest$") or (test(":") | not))] | length == 0' <<< "$CATALOG" > /dev/null \
+    || fail "every template image must be pinned"
+jq -e '.data.memory.total_mb > 0 and .data.memory.available_mb > 0' <<< "$CATALOG" > /dev/null \
+    || fail "the catalog should report host memory: $(jq -c '.data.memory' <<< "$CATALOG")"
+pass "catalog: $(jq '.data.templates | length' <<< "$CATALOG") templates, images pinned, free memory reported"
+case "$(uname -m)" in x86_64) HOST_ARCH=amd64 ;; aarch64) HOST_ARCH=arm64 ;; *) HOST_ARCH=$(uname -m) ;; esac
+[[ "$(jq -r '.data.architecture' <<< "$CATALOG")" == "$HOST_ARCH" ]] \
+    || fail "the catalog should report the server's architecture (${HOST_ARCH}): $(jq -c '.data.architecture' <<< "$CATALOG")"
+if [[ "$HOST_ARCH" == arm64 ]]; then
+    code=$(api_req POST /api/v1/templates/mattermost/deploy '{"name":"e2e-mm","inputs":{},"allow_low_memory":true}')
+    [[ "$code" == 409 ]] && jq -e '.error.message | test("ARM64")' "$API_BODY" > /dev/null \
+        || fail "an x86_64-only template must be refused on ARM64, got ${code}: $(cat "$API_BODY")"
+    pass "x86_64-only templates are refused on ARM64"
+fi
+code=$(api_req POST /api/v1/templates/vaultwarden/deploy '{"name":"Bad Name","inputs":{}}')
+[[ "$code" == 400 ]] && jq -e '.error.code == "INVALID_INPUT" and .error.field == "name"' "$API_BODY" > /dev/null \
+    || fail "a template deploy with an invalid name must be 400 INVALID_INPUT on field name, got ${code}: $(cat "$API_BODY")"
+code=$(api_req POST /api/v1/templates/nope/deploy '{"name":"e2e-nope","inputs":{}}')
+[[ "$code" == 404 ]] || fail "an unknown template must be 404, got ${code}"
+code=$(api_req POST /api/v1/templates/vaultwarden/deploy \
+    "{\"name\":\"e2e-vault\",\"domain\":\"${VAULT_DOMAIN}\",\"inputs\":{},\"allow_low_memory\":true}")
+[[ "$code" == 202 ]] || fail "deploying the vaultwarden template should be accepted, got ${code}: $(cat "$API_BODY")"
+VAULT_TOKEN=$(jq -r '.data.credentials[] | select(.key == "ADMIN_TOKEN") | .value' "$API_BODY")
+[[ ${#VAULT_TOKEN} -eq 24 ]] || fail "the deploy should return the generated admin token once: $(jq -c '.data.credentials | map(.key)' "$API_BODY")"
+jq -e '.data.deployment_id | length > 0' "$API_BODY" > /dev/null || fail "the deploy response needs a deployment id"
+[[ "$(app_field e2e-vault template_id)" == vaultwarden ]] || fail "the app should record the template it came from"
+[[ "$(app_field e2e-vault domain)" == "$VAULT_DOMAIN" ]] || fail "the template's domain should be the app's primary domain"
+pass "template deploy → 202 with a generated 24-character admin token; template and domain recorded"
+wait_for_app_running e2e-vault 300
+VAULT_CID=$(docker ps -q --filter label=com.docker.compose.project=e2e-vault --filter label=com.docker.compose.service=vaultwarden)
+[[ -n "$VAULT_CID" ]] || fail "the vaultwarden compose service should be running"
+docker inspect "$VAULT_CID" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -qx "ADMIN_TOKEN=${VAULT_TOKEN}" \
+    || fail "\${ADMIN_TOKEN} in the compose file should be filled from the app's env"
+docker inspect "$VAULT_CID" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -qx "DOMAIN=https://${VAULT_DOMAIN}" \
+    || fail "{app_url} should expand to the app's domain"
+! grep -q "$VAULT_TOKEN" "${DATA_DIR}/compose/e2e-vault/docker-compose.yml" \
+    || fail "the generated token must not be written into the compose file on disk"
+! sqlite3 "${DATA_DIR}/tond.db" "SELECT env_vars FROM apps WHERE name = 'e2e-vault'" 2> /dev/null | grep -q "$VAULT_TOKEN" \
+    || fail "the generated token must be stored encrypted"
+[[ -d "${DATA_DIR}/volumes/e2e-vault/data" ]] || fail "the template's declared volume should be created"
+pass "inputs reach the container through the app env, never plaintext on disk; volume created"
+wait_for 90 "vaultwarden answering at https://${VAULT_DOMAIN}/alive" \
+    bash -c "[[ \$(curl -sk -o /dev/null -w '%{http_code}' --resolve '${VAULT_DOMAIN}:443:${IP}' 'https://${VAULT_DOMAIN}/alive') == 200 ]]"
+pass "https://${VAULT_DOMAIN}/alive → 200 through the proxy"
+code=$(api_req POST /api/v1/templates/vaultwarden/deploy '{"name":"e2e-vault","inputs":{}}')
+[[ "$code" == 409 ]] && jq -e '.error.code == "APP_ALREADY_EXISTS"' "$API_BODY" > /dev/null \
+    || fail "a second app with the same name must be refused with APP_ALREADY_EXISTS, got ${code}: $(cat "$API_BODY")"
+tond apps delete e2e-vault -y > /dev/null
+code=$(api_req POST /api/v1/templates/vaultwarden/deploy '{"name":"e2e-vault","inputs":{},"allow_low_memory":true}')
+[[ "$code" == 400 ]] && grep -q "earlier app named e2e-vault" "$API_BODY" \
+    || fail "a template must refuse a name whose volume directory still holds data, got ${code}: $(cat "$API_BODY")"
+(( $(api /api/v1/apps | jq '[.data[] | select(.name == "e2e-vault")] | length') == 0 )) \
+    || fail "a refused template deploy must not leave an app behind"
+rm -rf "${DATA_DIR}/volumes/e2e-vault"
+pass "same name → 409; leftover data → 400 and nothing is created"
 
 
 step "Docker Compose app (per-service routing, status, logs, rollback, cleanup)"

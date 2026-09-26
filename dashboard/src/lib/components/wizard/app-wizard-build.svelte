@@ -35,11 +35,7 @@
 		githubAppId
 	}: Props = $props();
 
-	let isGit = $derived(
-		sourceSubType === 'git-public' ||
-			sourceSubType === 'git-github-app' ||
-			sourceSubType === 'template'
-	);
+	let isGit = $derived(sourceSubType === 'git-public' || sourceSubType === 'git-github-app');
 
 	let branches = $state<string[]>([]);
 	let defaultBranch = $state<string | null>(null);

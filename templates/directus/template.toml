@@ -1,0 +1,56 @@
+id = "directus"
+name = "Directus"
+description = "Headless CMS and instant REST/GraphQL API with a no-code data studio."
+about = "Directus wraps a SQL database with REST and GraphQL APIs and an intuitive admin app for content, files, users, permissions and automation flows. This template uses SQLite; point it at PostgreSQL later if you outgrow it."
+category = "cms"
+tags = ["headless cms", "api", "graphql", "backend", "strapi alternative"]
+logo = "directus"
+version = "11.17"
+website = "https://directus.io"
+docs = "https://directus.io/docs/self-hosting/overview"
+repository = "https://github.com/directus/directus"
+ram_mb = 300
+setup_notes = "Sign in with the admin email and the password Tond showed after the deploy."
+upgrade_notes = "Change the image to a newer 11.x tag and redeploy; migrations run on start. Directus 12 has breaking changes: read its migration guide and snapshot first."
+post_deploy_checks = ["Sign in to the data studio", "Create a collection and fetch it from the API"]
+
+[public]
+service = "directus"
+port = 8055
+health_path = "/server/health"
+
+[[inputs]]
+key = "PUBLIC_URL"
+label = "Public URL"
+value = "{app_url}"
+
+[[inputs]]
+key = "SECRET"
+label = "Secret"
+description = "Signs access tokens."
+generate = "hex"
+
+[[inputs]]
+key = "ADMIN_EMAIL"
+label = "Admin email"
+kind = "email"
+credential = true
+
+[[inputs]]
+key = "ADMIN_PASSWORD"
+label = "Admin password"
+kind = "password"
+generate = "password"
+credential = true
+
+[[volumes]]
+service = "directus"
+path = "./database"
+description = "The SQLite database"
+owner = "1000:1000"
+
+[[volumes]]
+service = "directus"
+path = "./uploads"
+description = "Uploaded files"
+owner = "1000:1000"

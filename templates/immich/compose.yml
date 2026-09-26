@@ -1,0 +1,48 @@
+services:
+  immich-server:
+    image: ghcr.io/immich-app/immich-server:v2.7.0
+    restart: unless-stopped
+    mem_limit: 2g
+    ports: ["2283"]
+    environment:
+      DB_HOSTNAME: database
+      DB_USERNAME: immich
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_DATABASE_NAME: immich
+      REDIS_HOSTNAME: redis
+      IMMICH_MACHINE_LEARNING_ENABLED: "false"
+    volumes:
+      - ./library:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+      database:
+        condition: service_healthy
+
+  redis:
+    image: valkey/valkey:8-alpine
+    restart: unless-stopped
+    mem_limit: 128m
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  database:
+    image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0
+    restart: unless-stopped
+    mem_limit: 512m
+    shm_size: 128mb
+    environment:
+      POSTGRES_USER: immich
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: immich
+      POSTGRES_INITDB_ARGS: --data-checksums
+    volumes:
+      - ./postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U immich -d immich"]
+      interval: 5s
+      timeout: 5s
+      retries: 20

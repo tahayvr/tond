@@ -61,45 +61,29 @@ pub fn compose_work_dir_for(app_name: &str) -> String {
     compose_work_dir(&crate::volumes::data_dir().to_string_lossy(), app_name)
 }
 
-/// Variables of tond-server's own environment `docker compose` needs.
-const COMPOSE_HOST_ENV: [&str; 5] = [
-    "PATH",
-    "HOME",
-    "DOCKER_HOST",
-    "DOCKER_CONFIG",
-    "XDG_RUNTIME_DIR",
-];
-
-/// The app's environment variables `docker compose` may interpolate: all of
-/// them except names that steer docker itself (PATH, DOCKER_*, COMPOSE_*).
-pub fn compose_app_env(
-    env: &std::collections::BTreeMap<String, String>,
-) -> std::collections::BTreeMap<String, String> {
-    env.iter()
-        .filter(|(k, _)| {
-            !COMPOSE_HOST_ENV.contains(&k.as_str())
-                && !k.starts_with("DOCKER_")
-                && !k.starts_with("COMPOSE_")
-                && !k.starts_with("BUILDKIT_")
-        })
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect()
-}
-
 /// `docker compose -p <app> -f <file> <args…>` with a cleared environment:
 /// compose interpolates `${VAR}` from its own environment, and tond-server's
-/// holds TOND_SECRET_KEY. Only what docker needs is passed on, plus the
-/// app's own variables (`app_env`, see [`compose_app_env`]).
+/// holds TOND_SECRET_KEY. Only what docker needs is passed on, plus
+/// `interpolation` (from [`compose_policy::interpolation_env`]: the app's
+/// env vars the file references, never reserved names).
 pub fn compose_command(
     compose_path: &str,
     app_name: &str,
     args: &[&str],
-    app_env: &std::collections::BTreeMap<String, String>,
+    interpolation: &[(String, String)],
 ) -> tokio::process::Command {
     let mut cmd = crate::process::command("docker");
     cmd.env_clear();
-    cmd.envs(compose_app_env(app_env));
-    for key in COMPOSE_HOST_ENV {
+    for (key, value) in interpolation {
+        cmd.env(key, value);
+    }
+    for key in [
+        "PATH",
+        "HOME",
+        "DOCKER_HOST",
+        "DOCKER_CONFIG",
+        "XDG_RUNTIME_DIR",
+    ] {
         if let Ok(val) = std::env::var(key) {
             cmd.env(key, val);
         }
@@ -823,14 +807,14 @@ pub(super) async fn compose_up(
     app_id: &str,
     app_name: &str,
     compose_path: &str,
-    app_env: &std::collections::BTreeMap<String, String>,
+    interpolation: &[(String, String)],
     trigger_source: &str,
 ) -> Result<()> {
     let cmd = compose_command(
         compose_path,
         app_name,
         &["up", "-d", "--remove-orphans"],
-        app_env,
+        interpolation,
     );
     let status = run_streaming(state, app_id, trigger_source, None, cmd).await?;
     if !status.success() {
@@ -868,16 +852,17 @@ mod tests {
     }
 
     #[test]
-    fn compose_sees_the_apps_variables_but_not_ones_that_steer_docker() {
+    fn compose_gets_only_the_interpolation_variables() {
         let env = std::collections::BTreeMap::from([
             ("DATABASE_URL".to_string(), "postgres://x".to_string()),
             ("PATH".to_string(), "/evil".to_string()),
-            ("DOCKER_HOST".to_string(), "tcp://evil:2375".to_string()),
-            ("COMPOSE_FILE".to_string(), "/etc/x.yml".to_string()),
+            ("UNUSED".to_string(), "x".to_string()),
         ]);
-        let kept = compose_app_env(&env);
-        assert_eq!(kept.keys().collect::<Vec<_>>(), vec!["DATABASE_URL"]);
-        let cmd = compose_command("/c/docker-compose.yml", "Shop", &["ps"], &env);
+        let interpolation = crate::compose_policy::interpolation_env(
+            "services:\n  a:\n    image: x\n    environment: [\"U=${DATABASE_URL}\", \"P=${PATH}\"]\n",
+            &env,
+        );
+        let cmd = compose_command("/c/docker-compose.yml", "Shop", &["ps"], &interpolation);
         let args: Vec<_> = cmd
             .as_std()
             .get_args()
@@ -887,7 +872,7 @@ mod tests {
             args,
             ["compose", "-p", "shop", "-f", "/c/docker-compose.yml", "ps"]
         );
-        let envs: Vec<_> = cmd
+        let envs: Vec<(String, String)> = cmd
             .as_std()
             .get_envs()
             .filter_map(|(k, v)| {
@@ -901,9 +886,12 @@ mod tests {
             .collect();
         assert!(envs.contains(&("DATABASE_URL".to_string(), "postgres://x".to_string())));
         assert!(
-            !envs
-                .iter()
-                .any(|(k, v)| k == "DOCKER_HOST" && v.contains("evil"))
+            !envs.iter().any(|(k, v)| k == "PATH" && v == "/evil"),
+            "reserved names never"
+        );
+        assert!(
+            !envs.iter().any(|(k, _)| k == "UNUSED"),
+            "only what the file references"
         );
         assert!(!envs.iter().any(|(k, _)| k == "TOND_SECRET_KEY"));
     }

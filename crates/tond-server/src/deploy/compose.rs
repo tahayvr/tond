@@ -334,7 +334,12 @@ async fn run_with_source(
     }
     // The app's environment variables are what `${VAR}` in the file resolves
     // against (Tond's own environment never reaches compose).
-    let app_env = super::build::compose_app_env(&crate::secrets::app_env(app)?);
+    // (compose_policy::interpolation_env picks the variables the file uses
+    // and never reserved names; the same set reaches `docker compose`.)
+    let interpolation =
+        compose_policy::interpolation_env(&source.content, &crate::secrets::app_env(app)?);
+    let app_env: std::collections::BTreeMap<String, String> =
+        interpolation.iter().cloned().collect();
     let specs =
         compose::service_specs_env(&source.content, &app_env).map_err(anyhow::Error::msg)?;
     compose::sync_specs(&state.db, &app_id, &specs).await?;
@@ -531,7 +536,15 @@ async fn run_with_source(
         "Starting services with docker compose up...",
     )
     .await?;
-    let up = compose_up(state, &app_id, &app_name, &compose_path, &app_env, trigger).await;
+    let up = compose_up(
+        state,
+        &app_id,
+        &app_name,
+        &compose_path,
+        &interpolation,
+        trigger,
+    )
+    .await;
     drop(port_guard);
     if let Err(e) = up {
         set_services_status(state, &app_id, deployment_id, &names, "failed").await;

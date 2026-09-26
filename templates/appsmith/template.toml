@@ -1,0 +1,25 @@
+id = "appsmith"
+name = "Appsmith"
+description = "Low-code builder for internal tools, admin panels and dashboards."
+about = "Appsmith lets you drag and drop widgets, connect them to databases and APIs, and write JavaScript where needed to build internal apps fast. The image bundles MongoDB, Redis and PostgreSQL in one container, so it needs a server with 4 GB of memory or more."
+category = "developer"
+tags = ["low-code", "internal tools", "retool alternative", "admin panel"]
+logo = "appsmith"
+version = "2.4"
+website = "https://www.appsmith.com"
+docs = "https://docs.appsmith.com/getting-started/setup/installation-guides/docker"
+repository = "https://github.com/appsmithorg/appsmith"
+ram_mb = 2500
+setup_notes = "The first start takes several minutes. Then open the app right away and create the admin account."
+upgrade_notes = "Change the image to a newer tag and redeploy. Appsmith migrates its bundled databases on start: snapshot the app first."
+post_deploy_checks = ["Create the admin account", "Build a first app against a data source"]
+
+[public]
+service = "appsmith"
+port = 80
+health_path = "/api/v1/health"
+
+[[volumes]]
+service = "appsmith"
+path = "./stacks"
+description = "Bundled databases, configuration and logs"

@@ -273,7 +273,12 @@ pub fn entries() -> Vec<Doc> {
         e("PUT /api/v1/settings/host-terminal", "Enable or disable the host terminal")
             .returns::<terminal::HostTerminalSetting>()
             .about("Only over the root-only Unix socket (`tond settings host-terminal on|off`)."),
-        e("GET /api/v1/templates", "The app template catalog").returns::<Vec<TemplateCatalogEntry>>(),
+        e("GET /api/v1/templates", "The one-click template catalog, free memory and the apps domain").returns::<TemplateCatalogResponse>(),
+        e("POST /api/v1/templates/{id}/deploy", "Create an app from a template and queue its first deploy")
+            .accepted()
+            .returns::<TemplateDeployResponse>()
+            .scopes(&["apps:deploy", "settings:write"])
+            .about("Inputs left empty are generated or defaulted; `credentials` (first-login passwords) are returned only in this response. 409 INSUFFICIENT_MEMORY when the template needs more memory than is free, unless `allow_low_memory` is true."),
         // ── Registry credentials ──
         e("GET /api/v1/registry-credentials", "List container registry credentials").returns::<Vec<RegistryCredentialResponse>>(),
         e("POST /api/v1/registry-credentials", "Add a registry credential").created().returns::<RegistryCredentialResponse>(),

@@ -15,6 +15,7 @@ export const navItems: NavItem[] = [
 	{ href: '/apps', label: 'Apps', icon: 'rocket', primary: true },
 	{ href: '/databases', label: 'Databases', icon: 'database', primary: true },
 	{ href: '/cron', label: 'Cron jobs', icon: 'clock', primary: true },
+	{ href: '/templates', label: 'Templates', icon: 'layout' },
 	{ href: '/snapshots', label: 'Snapshots', icon: 'clock' },
 	{ href: '/alerts', label: 'Alerts', icon: 'bell', primary: true },
 	{ href: '/certificates', label: 'Certificates', icon: 'lock' },

@@ -1,0 +1,14 @@
+services:
+  mealie:
+    image: ghcr.io/mealie-recipes/mealie:v3.28.0
+    restart: unless-stopped
+    mem_limit: 512m
+    ports: ["9000"]
+    environment:
+      BASE_URL: ${BASE_URL}
+      TZ: ${TZ}
+      ALLOW_SIGNUP: "false"
+      MAX_WORKERS: "1"
+      WEB_CONCURRENCY: "1"
+    volumes:
+      - ./data:/app/data

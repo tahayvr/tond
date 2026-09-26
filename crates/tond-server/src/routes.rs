@@ -176,6 +176,7 @@ api_routes! {
     GET "/api/v1/settings/host-terminal" => handlers::terminal::get_host_terminal;
     PUT "/api/v1/settings/host-terminal" => handlers::terminal::set_host_terminal;
     GET "/api/v1/templates" => handlers::templates::list_templates;
+    POST "/api/v1/templates/{id}/deploy" => handlers::templates::deploy_template;
     // Git integration — auto-deploy toggle, webhook secret, deploy keys, source
     PUT "/api/v1/apps/{id}/auto-deploy" => handlers::git::update_auto_deploy;
     GET "/api/v1/apps/{id}/webhook" => handlers::git::get_webhook_config;

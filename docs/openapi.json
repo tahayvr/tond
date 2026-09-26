@@ -1471,6 +1471,22 @@
           "status": {
             "type": "string"
           },
+          "template_id": {
+            "default": null,
+            "description": "One-click template the app was deployed from (see GET /api/v1/templates)",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "template_version": {
+            "default": null,
+            "description": "The template's version at deploy time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "updated_at": {
             "type": "string"
           },
@@ -1493,6 +1509,8 @@
           "id",
           "name",
           "domain",
+          "template_id",
+          "template_version",
           "source_type",
           "source_url",
           "branch",
@@ -5800,6 +5818,7 @@
           "CONFLICT",
           "APP_ALREADY_EXISTS",
           "DEPLOY_IN_PROGRESS",
+          "INSUFFICIENT_MEMORY",
           "IDEMPOTENCY_KEY_REUSED",
           "IDEMPOTENCY_KEY_IN_USE",
           "BUILD_FAILED",
@@ -5947,6 +5966,12 @@
           {
             "code": "DEPLOY_IN_PROGRESS",
             "description": "A deploy of this app is running; the action has to wait for it.",
+            "exit_code": 5,
+            "status": 409
+          },
+          {
+            "code": "INSUFFICIENT_MEMORY",
+            "description": "The server has less free memory than the template needs.",
             "exit_code": 5,
             "status": 409
           },
@@ -10148,40 +10173,301 @@
         ],
         "type": "object"
       },
-      "TemplateCatalogEntry": {
+      "TemplateCatalogResponse": {
+        "description": "GET /api/templates",
         "properties": {
-          "category": {
+          "apps_domain": {
+            "description": "Apps get `<name>.<apps_domain>` when no domain is given (\"\" = none).",
             "type": "string"
           },
-          "dependencies": {
+          "architecture": {
+            "default": "",
+            "description": "This server's CPU architecture (\"amd64\" | \"arm64\").",
+            "type": "string"
+          },
+          "memory": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TemplateHostMemory"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "None until the host collector's first sample."
+          },
+          "templates": {
             "items": {
-              "$ref": "#/components/schemas/TemplateDependency"
+              "$ref": "#/components/schemas/TemplateResponse"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "templates",
+          "memory",
+          "apps_domain",
+          "architecture"
+        ],
+        "type": "object"
+      },
+      "TemplateCredential": {
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "label",
+          "value"
+        ],
+        "type": "object"
+      },
+      "TemplateDeployRequest": {
+        "description": "POST /api/templates/{id}/deploy",
+        "properties": {
+          "allow_low_memory": {
+            "default": false,
+            "description": "Deploy even though the template needs more memory than is free.",
+            "type": "boolean"
+          },
+          "domain": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "inputs": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "type": "object"
+          },
+          "name": {
+            "description": "App name (lowercase letters, digits, hyphens).",
+            "type": "string"
+          },
+          "project_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "TemplateDeployResponse": {
+        "properties": {
+          "app_id": {
+            "type": "string"
+          },
+          "app_name": {
+            "type": "string"
+          },
+          "credentials": {
+            "description": "First-login credentials and other `credential` inputs, shown once.",
+            "items": {
+              "$ref": "#/components/schemas/TemplateCredential"
             },
             "type": "array"
           },
-          "deploy": {
-            "$ref": "#/components/schemas/TemplateDeploy"
+          "deployment_id": {
+            "type": "string"
+          },
+          "domain": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_notes": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "app_id",
+          "app_name",
+          "domain",
+          "deployment_id",
+          "credentials",
+          "setup_notes"
+        ],
+        "type": "object"
+      },
+      "TemplateHostMemory": {
+        "description": "Host memory as the catalog shows it, from the host collector's last sample.",
+        "properties": {
+          "available_mb": {
+            "description": "What the kernel reports as available (total minus used).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_mb": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total_mb",
+          "available_mb"
+        ],
+        "type": "object"
+      },
+      "TemplateInputKind": {
+        "enum": [
+          "text",
+          "email",
+          "password",
+          "url"
+        ],
+        "type": "string"
+      },
+      "TemplateInputResponse": {
+        "properties": {
+          "credential": {
+            "description": "Shown once after deploy.",
+            "type": "boolean"
+          },
+          "default": {
+            "description": "Pre-filled form value (placeholders unexpanded, e.g. \"{app_url}\").",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "generated": {
+            "description": "Left empty, a random value is generated.",
+            "type": "boolean"
+          },
+          "key": {
             "type": "string"
           },
-          "id": {
+          "kind": {
+            "$ref": "#/components/schemas/TemplateInputKind"
+          },
+          "label": {
             "type": "string"
           },
-          "maintainers": {
+          "required": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "key",
+          "label",
+          "description",
+          "kind",
+          "required",
+          "generated",
+          "default",
+          "credential"
+        ],
+        "type": "object"
+      },
+      "TemplatePublic": {
+        "additionalProperties": false,
+        "properties": {
+          "health_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "port": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "service": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "service",
+          "port",
+          "health_path"
+        ],
+        "type": "object"
+      },
+      "TemplateResponse": {
+        "description": "GET /api/templates item.",
+        "properties": {
+          "about": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "architectures": {
+            "default": [
+              "amd64",
+              "arm64"
+            ],
+            "description": "CPU architectures its images exist for (\"amd64\", \"arm64\").",
             "items": {
               "type": "string"
             },
             "type": "array"
           },
-          "name": {
+          "category": {
             "type": "string"
           },
-          "optional_env": {
+          "compose": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "docs": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fits_2gb": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "inputs": {
+            "description": "Inputs the deploy form shows (fixed computed values are left out).",
             "items": {
-              "$ref": "#/components/schemas/TemplateEnvVar"
+              "$ref": "#/components/schemas/TemplateInputResponse"
             },
             "type": "array"
+          },
+          "logo": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
           },
           "post_deploy_checks": {
             "items": {
@@ -10189,25 +10475,23 @@
             },
             "type": "array"
           },
-          "project": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/TemplateProject"
-              },
-              {
-                "type": "null"
-              }
+          "public": {
+            "$ref": "#/components/schemas/TemplatePublic"
+          },
+          "ram_mb": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "repository": {
+            "type": [
+              "string",
+              "null"
             ]
           },
-          "recommended_domains": {
+          "services": {
             "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
-          "required_env": {
-            "items": {
-              "$ref": "#/components/schemas/TemplateEnvVar"
+              "$ref": "#/components/schemas/TemplateService"
             },
             "type": "array"
           },
@@ -10217,181 +10501,111 @@
               "null"
             ]
           },
-          "source": {
-            "$ref": "#/components/schemas/TemplateSource"
-          },
           "tags": {
             "items": {
               "type": "string"
             },
             "type": "array"
+          },
+          "upgrade_notes": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "version": {
+            "type": "string"
+          },
+          "volumes": {
+            "items": {
+              "$ref": "#/components/schemas/TemplateVolume"
+            },
+            "type": "array"
+          },
+          "website": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
           "id",
           "name",
           "description",
+          "about",
           "category",
           "tags",
-          "maintainers",
-          "project",
-          "source",
-          "deploy",
-          "required_env",
-          "optional_env",
-          "dependencies",
-          "recommended_domains",
+          "logo",
+          "version",
+          "website",
+          "docs",
+          "repository",
+          "ram_mb",
+          "fits_2gb",
+          "architectures",
+          "public",
+          "services",
+          "volumes",
+          "inputs",
+          "setup_notes",
+          "upgrade_notes",
           "post_deploy_checks",
-          "setup_notes"
+          "compose"
         ],
         "type": "object"
       },
-      "TemplateDependency": {
+      "TemplateService": {
         "properties": {
-          "engine": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "kind": {
+          "image": {
             "type": "string"
           },
-          "name": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "required": {
-            "type": [
-              "boolean",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "name",
-          "kind",
-          "engine",
-          "required"
-        ],
-        "type": "object"
-      },
-      "TemplateDeploy": {
-        "properties": {
-          "default_port": {
-            "format": "uint16",
-            "maximum": 65535,
+          "memory_limit_mb": {
+            "description": "Its `mem_limit` in MiB.",
+            "format": "uint32",
             "minimum": 0,
             "type": "integer"
           },
-          "health_check_path": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "method": {
-            "type": "string"
-          },
-          "volumes": {
-            "default": [],
-            "items": {
-              "$ref": "#/components/schemas/TemplateVolume"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "method",
-          "default_port",
-          "health_check_path",
-          "volumes"
-        ],
-        "type": "object"
-      },
-      "TemplateEnvVar": {
-        "properties": {
-          "description": {
-            "type": "string"
-          },
-          "key": {
-            "type": "string"
-          },
-          "required": {
-            "type": [
-              "boolean",
-              "null"
-            ]
-          },
-          "value": {
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "key",
-          "description",
-          "required",
-          "value"
-        ],
-        "type": "object"
-      },
-      "TemplateProject": {
-        "properties": {
-          "description": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "name": {
             "type": "string"
+          },
+          "public": {
+            "description": "The service that gets the app's domain.",
+            "type": "boolean"
           }
         },
         "required": [
           "name",
-          "description"
-        ],
-        "type": "object"
-      },
-      "TemplateSource": {
-        "properties": {
-          "kind": {
-            "type": "string"
-          },
-          "ref": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "url": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "kind",
-          "url",
-          "ref"
+          "image",
+          "public",
+          "memory_limit_mb"
         ],
         "type": "object"
       },
       "TemplateVolume": {
+        "additionalProperties": false,
         "properties": {
-          "container_path": {
+          "description": {
             "type": "string"
           },
-          "description": {
+          "owner": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "type": "string"
+          },
+          "service": {
             "type": "string"
           }
         },
         "required": [
-          "container_path",
-          "description"
+          "service",
+          "path",
+          "description",
+          "owner"
         ],
         "type": "object"
       },
@@ -31129,10 +31343,7 @@
                 "schema": {
                   "properties": {
                     "data": {
-                      "items": {
-                        "$ref": "#/components/schemas/TemplateCatalogEntry"
-                      },
-                      "type": "array"
+                      "$ref": "#/components/schemas/TemplateCatalogResponse"
                     },
                     "message": {
                       "description": "Informational note, when there is one.",
@@ -31173,12 +31384,111 @@
             "sessionCookie": []
           }
         ],
-        "summary": "The app template catalog",
+        "summary": "The one-click template catalog, free memory and the apps domain",
         "tags": [
           "Apps"
         ],
         "x-tond-scopes": [
           "apps:read"
+        ]
+      }
+    },
+    "/api/v1/templates/{id}/deploy": {
+      "post": {
+        "description": "Inputs left empty are generated or defaulted; `credentials` (first-login passwords) are returned only in this response. 409 INSUFFICIENT_MEMORY when the template needs more memory than is free, unless `allow_low_memory` is true.",
+        "operationId": "deploy_template",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TemplateDeployRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/TemplateDeployResponse"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Accepted: the work continues in the background."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Create an app from a template and queue its first deploy",
+        "tags": [
+          "Apps"
+        ],
+        "x-tond-scopes": [
+          "apps:write",
+          "apps:deploy",
+          "settings:write"
         ]
       }
     },

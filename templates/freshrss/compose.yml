@@ -1,0 +1,25 @@
+services:
+  freshrss:
+    image: freshrss/freshrss:1.30.0
+    restart: unless-stopped
+    mem_limit: 256m
+    ports: ["80"]
+    environment:
+      TZ: UTC
+      CRON_MIN: "3,23,43"
+      TRUSTED_PROXY: 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+      FRESHRSS_INSTALL: >-
+        --api-enabled
+        --base-url ${BASE_URL}
+        --db-type sqlite
+        --default-user admin
+        --language en
+      FRESHRSS_USER: >-
+        --api-password ${API_PASSWORD}
+        --email ${ADMIN_EMAIL}
+        --language en
+        --password ${ADMIN_PASSWORD}
+        --user admin
+    volumes:
+      - ./data:/var/www/FreshRSS/data
+      - ./extensions:/var/www/FreshRSS/extensions

@@ -49,9 +49,10 @@ use tond_common::{
     CronJobResponse, CronJobRun, DatabaseCredentialsResponse, DeployKeyResponse,
     DeploymentResponse, IntegrationResponse, ManagedDatabaseDetail, ManagedDatabaseResponse,
     PasswordLinkResponse, PreviewDeploymentResponse, ProjectPreviewResponse, ProjectResponse,
-    ServerSettings, SnapshotResponse, StorageProviderResponse, TokenResponse,
-    UpdateAppDomainRequest, UpdateCronJobRequest, UpdateSettingsRequest, UserResponse,
-    WebhookConfigResponse, WebhookSecretResponse, WwwPairRequest, code,
+    ServerSettings, SnapshotResponse, StorageProviderResponse, TemplateCatalogResponse,
+    TemplateDeployRequest, TemplateDeployResponse, TokenResponse, UpdateAppDomainRequest,
+    UpdateCronJobRequest, UpdateSettingsRequest, UserResponse, WebhookConfigResponse,
+    WebhookSecretResponse, WwwPairRequest, code,
 };
 
 use crate::error::CliError;
@@ -368,6 +369,25 @@ impl TondClient {
 
     fn to_body<B: serde::Serialize>(body: &B) -> Result<Option<Value>> {
         Ok(Some(serde_json::to_value(body)?))
+    }
+
+    /// GET /api/v1/templates — the one-click catalog.
+    pub async fn list_templates(&self) -> Result<TemplateCatalogResponse> {
+        self.call(Method::GET, "/templates", None).await
+    }
+
+    /// POST /api/v1/templates/{id}/deploy — create the app and queue its first deploy.
+    pub async fn deploy_template(
+        &self,
+        id: &str,
+        body: &TemplateDeployRequest,
+    ) -> Result<TemplateDeployResponse> {
+        self.call(
+            Method::POST,
+            &format!("/templates/{id}/deploy"),
+            Self::to_body(body)?,
+        )
+        .await
     }
 
     pub async fn list_apps(&self) -> Result<Vec<AppResponse>> {

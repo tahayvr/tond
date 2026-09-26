@@ -1,0 +1,31 @@
+id = "gotify"
+name = "Gotify"
+description = "Simple self-hosted push notifications with a REST API and Android app."
+about = "Gotify sends and receives messages in real time: scripts and services post to its REST API with an app token, and the web UI and Android app show them instantly over WebSockets. A small Go server with an SQLite database."
+category = "communication"
+tags = ["notifications", "push", "alerts", "websocket"]
+version = "2.9"
+website = "https://gotify.net"
+docs = "https://gotify.net/docs/"
+repository = "https://github.com/gotify/server"
+ram_mb = 30
+setup_notes = "Sign in as admin with the password Tond showed after the deploy, then create an application to get a token for sending messages."
+upgrade_notes = "Change the image to a newer 2.x tag and redeploy."
+post_deploy_checks = ["Sign in as admin", "Create an application and send a test message"]
+
+[public]
+service = "gotify"
+port = 80
+health_path = "/health"
+
+[[inputs]]
+key = "ADMIN_PASSWORD"
+label = "Admin password"
+kind = "password"
+generate = "password"
+credential = true
+
+[[volumes]]
+service = "gotify"
+path = "./data"
+description = "Messages, users, applications and uploaded images (SQLite)"

@@ -1,0 +1,46 @@
+id = "twenty"
+name = "Twenty"
+description = "Modern open-source CRM for contacts, companies and deals, a Salesforce alternative."
+about = "Twenty is a customisable CRM with a Notion-like interface: people, companies, opportunities, custom objects, views, workflows and an API. It runs a server, a background worker, PostgreSQL and Redis, so plan for 2 GB of memory for it alone."
+category = "productivity"
+tags = ["crm", "sales", "salesforce alternative", "contacts"]
+logo = "twenty"
+version = "2.42"
+website = "https://twenty.com"
+docs = "https://twenty.com/developers/section/self-hosting/docker-compose"
+repository = "https://github.com/twentyhq/twenty"
+ram_mb = 1500
+setup_notes = "The first start runs migrations and takes a few minutes. Then open the app and sign up: the first account creates the workspace."
+upgrade_notes = "Upgrade one minor version at a time and read Twenty's upgrade guide: some releases need a manual upgrade command. Snapshot the app first."
+post_deploy_checks = ["Create the workspace", "Import contacts from CSV"]
+
+[public]
+service = "server"
+port = 3000
+health_path = "/healthz"
+
+[[inputs]]
+key = "SERVER_URL"
+label = "Public URL"
+value = "{app_url}"
+
+[[inputs]]
+key = "APP_SECRET"
+label = "App secret"
+generate = "base64"
+
+[[inputs]]
+key = "DB_PASSWORD"
+label = "Database password"
+generate = "password"
+
+[[volumes]]
+service = "server"
+path = "./storage"
+description = "Uploaded files and attachments"
+owner = "1000:1000"
+
+[[volumes]]
+service = "db"
+path = "./postgres"
+description = "PostgreSQL data: all CRM records"

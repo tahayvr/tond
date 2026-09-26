@@ -1,0 +1,30 @@
+id = "wikijs"
+name = "Wiki.js"
+description = "Modern wiki with a Markdown, WYSIWYG and code editor, search and Git sync."
+about = "Wiki.js is a powerful wiki with several editors, page history, fine-grained permissions, many login providers, full-text search and optional two-way Git synchronisation of your content."
+category = "documents"
+tags = ["wiki", "documentation", "knowledge base", "markdown"]
+logo = "wikidotjs"
+version = "2.5"
+website = "https://js.wiki"
+docs = "https://docs.requarks.io/install/docker"
+repository = "https://github.com/requarks/wiki"
+ram_mb = 350
+setup_notes = "Open the app right away: the setup page creates the administrator account and asks for the site URL (use this app's address)."
+upgrade_notes = "Change the image to a newer 2.5.x tag and redeploy. Wiki.js 3 is a different product line with its own migration."
+post_deploy_checks = ["Finish the setup page", "Create the home page"]
+
+[public]
+service = "wiki"
+port = 3000
+health_path = "/healthz"
+
+[[inputs]]
+key = "DB_PASSWORD"
+label = "Database password"
+generate = "password"
+
+[[volumes]]
+service = "db"
+path = "./postgres"
+description = "PostgreSQL data: pages, users and settings"

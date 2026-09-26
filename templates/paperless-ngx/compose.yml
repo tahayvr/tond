@@ -1,0 +1,33 @@
+services:
+  paperless:
+    image: ghcr.io/paperless-ngx/paperless-ngx:2.20.15
+    restart: unless-stopped
+    mem_limit: 1g
+    ports: ["8000"]
+    environment:
+      PAPERLESS_REDIS: redis://redis:6379
+      PAPERLESS_URL: ${PAPERLESS_URL}
+      PAPERLESS_SECRET_KEY: ${PAPERLESS_SECRET_KEY}
+      PAPERLESS_ADMIN_USER: admin
+      PAPERLESS_ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      PAPERLESS_OCR_LANGUAGE: ${PAPERLESS_OCR_LANGUAGE}
+      PAPERLESS_TASK_WORKERS: "1"
+      PAPERLESS_THREADS_PER_WORKER: "1"
+      PAPERLESS_WEBSERVER_WORKERS: "1"
+    volumes:
+      - ./data:/usr/src/paperless/data
+      - ./media:/usr/src/paperless/media
+      - ./consume:/usr/src/paperless/consume
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  redis:
+    image: valkey/valkey:8-alpine
+    restart: unless-stopped
+    mem_limit: 128m
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10

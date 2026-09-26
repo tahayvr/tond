@@ -20,12 +20,10 @@
 		listGitHubRepos,
 		listGitHubBranches,
 		type GitHubApp,
-		type GitHubRepo,
-		type TemplateCatalogEntry
+		type GitHubRepo
 	} from '$lib/api';
 
-	export type SourceSubType =
-		'git-public' | 'git-github-app' | 'dockerfile' | 'compose' | 'image' | 'template';
+	export type SourceSubType = 'git-public' | 'git-github-app' | 'dockerfile' | 'compose' | 'image';
 
 	interface Props {
 		name: string;
@@ -47,10 +45,6 @@
 		composeErrors?: string[];
 		/** The app's port (to suggest the compose web service). */
 		containerPort?: number;
-		selectedTemplateId: string;
-		templates: TemplateCatalogEntry[];
-		envVars: Record<string, string>;
-		onTemplateSelect: (templateId: string) => void;
 	}
 
 	let {
@@ -66,32 +60,12 @@
 		composePath = $bindable('docker-compose.yml'),
 		composeService = $bindable(''),
 		composeErrors = $bindable([]),
-		containerPort = 80,
-		selectedTemplateId = $bindable(''),
-		templates,
-		envVars = $bindable({}),
-		onTemplateSelect
+		containerPort = 80
 	}: Props = $props();
 
 	// Derive the top-level category from the sub-type
-	let sourceCategory = $derived<'git' | 'docker' | 'template'>(
-		sourceSubType === 'git-public' || sourceSubType === 'git-github-app'
-			? 'git'
-			: sourceSubType === 'template'
-				? 'template'
-				: 'docker'
-	);
-	let selectedTemplate = $derived(
-		selectedTemplateId
-			? (templates.find((template) => template.id === selectedTemplateId) ?? null)
-			: null
-	);
-	let templateRequiredInputs = $derived(
-		selectedTemplate
-			? selectedTemplate.required_env.filter(
-					(env: TemplateCatalogEntry['required_env'][number]) => !env.value
-				)
-			: []
+	let sourceCategory = $derived<'git' | 'docker'>(
+		sourceSubType === 'git-public' || sourceSubType === 'git-github-app' ? 'git' : 'docker'
 	);
 
 	// GitHub App picker state
@@ -212,18 +186,9 @@
 		if (sub !== 'git-github-app') {
 			handleClearGithubPicker();
 		}
-		if (sub !== 'template') {
-			selectedTemplateId = '';
-		}
 		if (sub !== 'git-public' && sub !== 'git-github-app' && sub !== 'image') {
 			sourceUrl = '';
 		}
-	}
-
-	function selectTemplate(templateId: string) {
-		sourceSubType = 'template';
-		selectedTemplateId = templateId;
-		onTemplateSelect(templateId);
 	}
 
 	const GIT_SUB_OPTIONS: {
@@ -296,10 +261,7 @@
 				Docker
 			</Button>
 
-			<Button
-				variant={sourceCategory === 'template' ? 'default' : 'outline'}
-				onclick={() => selectSubType('template')}
-			>
+			<Button variant="outline" href="/templates">
 				<LayoutTemplate />
 				Templates
 			</Button>
@@ -343,89 +305,9 @@
 				</button>
 			{/each}
 		</div>
-	{:else}
-		<div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-			{#each templates as template (template.id)}
-				<button
-					class="flex flex-col items-start gap-2 rounded-lg border-2 p-4 text-left transition-all {selectedTemplateId ===
-					template.id
-						? 'border-primary bg-muted'
-						: 'border-border hover:border-input'}"
-					onclick={() => selectTemplate(template.id)}
-				>
-					<LayoutTemplate class="h-5 w-5 text-muted-foreground" />
-					<div>
-						<div class="text-sm font-semibold">{template.name}</div>
-						<p class="mt-1 text-xs text-muted-foreground">{template.description}</p>
-					</div>
-					<div class="flex flex-wrap gap-1 pt-1">
-						<span class="rounded border px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
-							{template.source.kind}
-						</span>
-						<span class="rounded border px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
-							{template.deploy.method}
-						</span>
-						<span class="rounded border px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
-							:{template.deploy.default_port}
-						</span>
-					</div>
-				</button>
-			{/each}
-		</div>
 	{/if}
 
 	<!-- Context-sensitive content area -->
-
-	{#if sourceSubType === 'template' && selectedTemplate}
-		<div class="space-y-4 rounded-md border bg-muted/10 px-4 py-4">
-			<div class="space-y-1">
-				<p class="text-xs font-medium text-muted-foreground uppercase">Selected Template</p>
-				<p class="text-sm font-medium">{selectedTemplate.name}</p>
-				{#if selectedTemplate.setup_notes}
-					<p class="text-xs text-muted-foreground">{selectedTemplate.setup_notes}</p>
-				{/if}
-			</div>
-
-			{#if selectedTemplate.dependencies.length > 0}
-				<div class="space-y-2">
-					<Label class="text-xs">Dependencies</Label>
-					<div class="flex flex-wrap gap-2">
-						{#each selectedTemplate.dependencies as dependency, index (`${dependency.kind}-${index}`)}
-							<span class="rounded border px-2 py-1 font-mono text-xs">
-								{dependency.kind}:{dependency.name ?? dependency.engine ?? 'unnamed'}
-							</span>
-						{/each}
-					</div>
-				</div>
-			{/if}
-
-			{#if templateRequiredInputs.length > 0}
-				<div class="space-y-3">
-					<Label class="text-xs">Required Template Inputs</Label>
-					<div class="grid gap-3 sm:grid-cols-2">
-						{#each templateRequiredInputs as env (env.key)}
-							<div class="space-y-2">
-								<Label for={`template-env-${env.key}`}>{env.key}</Label>
-								<Input
-									id={`template-env-${env.key}`}
-									value={envVars[env.key] ?? ''}
-									oninput={(event) => {
-										envVars = {
-											...envVars,
-											[env.key]: (event.target as HTMLInputElement).value
-										};
-									}}
-									placeholder={env.description}
-									class="font-mono"
-								/>
-								<p class="text-xs text-muted-foreground">{env.description}</p>
-							</div>
-						{/each}
-					</div>
-				</div>
-			{/if}
-		</div>
-	{/if}
 
 	{#if sourceSubType === 'git-github-app'}
 		<!-- GitHub App picker -->

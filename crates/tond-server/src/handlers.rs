@@ -239,6 +239,20 @@ pub async fn create_app(
     State(state): State<AppState>,
     Json(req): Json<CreateAppRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    let app = insert_app(&state, &auth, req).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiResponse::ok(AppResponse::from(app))),
+    ))
+}
+
+/// Validate a create request and insert the app (POST /api/apps and template
+/// deploys). `auth` must already hold `apps:write`.
+pub(crate) async fn insert_app(
+    state: &AppState,
+    auth: &Principal,
+    req: CreateAppRequest,
+) -> Result<App, AppError> {
     // Volumes and compose files reach the host: they also need an admin scope.
     if req.volumes.as_ref().is_some_and(|v| !v.is_empty()) {
         auth.require_to(Scope::SettingsWrite, "configure volumes")?;
@@ -367,7 +381,7 @@ pub async fn create_app(
     );
 
     if let Some(domain) = req.domain.filter(|d| !d.trim().is_empty()) {
-        let domain = check_app_domain(&state, &domain).await?.0;
+        let domain = check_app_domain(state, &domain).await?.0;
         let taken: Option<String> = sqlx::query_scalar(
             "SELECT a.name FROM app_domains d JOIN apps a ON a.id = d.app_id WHERE d.domain = ?",
         )
@@ -545,7 +559,7 @@ pub async fn create_app(
 	})?;
 
     if let Some((specs, web)) = compose_plan {
-        apply_compose_plan(&state, &mut app, &specs, web).await?;
+        apply_compose_plan(state, &mut app, &specs, web).await?;
     }
 
     write_audit_log(
@@ -558,10 +572,7 @@ pub async fn create_app(
     )
     .await;
 
-    Ok((
-        StatusCode::CREATED,
-        Json(ApiResponse::ok(AppResponse::from(app))),
-    ))
+    Ok(app)
 }
 
 /// A new compose app: store its services, publish the web service's port and

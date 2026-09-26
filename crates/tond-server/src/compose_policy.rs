@@ -26,7 +26,9 @@
 // security-relevant field, and `docker compose` runs with a cleared
 // environment (see deploy/build.rs) so values like `${TOND_SECRET_KEY}` can't
 // leak into containers. `environment:`, `image:`, `command:` etc. may still use
-// `${VAR:-default}`.
+// `${VAR:-default}`; the variables come from the app's own env, and only the
+// ones the file references (`interpolation_env`) — never names that steer the
+// docker CLI itself (DOCKER_HOST, COMPOSE_*, LD_PRELOAD, PATH, …).
 
 use std::path::{Component, Path, PathBuf};
 
@@ -153,6 +155,24 @@ pub fn format_errors(errors: &[String]) -> String {
         msg.push_str(e);
     }
     msg
+}
+
+/// The variables `docker compose` may interpolate from: the app env vars the
+/// file references, minus names that change how the docker CLI runs
+/// (`tond_common::is_reserved_env_key`). Nothing else from the app env is
+/// handed to the host process.
+pub fn interpolation_env(
+    content: &str,
+    app_env: &std::collections::BTreeMap<String, String>,
+) -> Vec<(String, String)> {
+    let Ok(referenced) = tond_common::compose_variables(content) else {
+        return Vec::new();
+    };
+    referenced
+        .into_iter()
+        .filter(|key| !tond_common::is_reserved_env_key(key))
+        .filter_map(|key| app_env.get(&key).map(|v| (key, v.clone())))
+        .collect()
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -859,6 +879,25 @@ fn check_file_references(root: &Mapping, section: &str, ctx: &mut Ctx) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interpolation_env_passes_only_referenced_safe_vars() {
+        let env: std::collections::BTreeMap<String, String> = [
+            ("DB_PASSWORD", "s3cret"),
+            ("UNUSED", "x"),
+            ("DOCKER_HOST", "tcp://evil:2375"),
+            ("LD_PRELOAD", "/tmp/x.so"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let compose = "services:\n  web:\n    image: x:1\n    environment:\n      P: ${DB_PASSWORD}\n      H: ${DOCKER_HOST}\n      L: $LD_PRELOAD\n";
+        assert_eq!(
+            interpolation_env(compose, &env),
+            vec![("DB_PASSWORD".to_string(), "s3cret".to_string())],
+            "only referenced vars reach docker compose, and never ones that steer the docker CLI"
+        );
+    }
 
     const VOL: &str = "/opt/tond/data/volumes/web";
 

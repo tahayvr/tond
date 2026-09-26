@@ -1,0 +1,54 @@
+id = "freshrss"
+name = "FreshRSS"
+description = "Self-hosted RSS aggregator with multi-user support and mobile app APIs."
+about = "FreshRSS is a fast feed aggregator with a responsive web UI, WebSub push, extensions, and Google Reader/Fever APIs so mobile readers can sync. Feeds are refreshed every 20 minutes by a built-in cron."
+category = "productivity"
+tags = ["rss", "feeds", "reader", "news"]
+logo = "freshrss"
+version = "1.30"
+website = "https://freshrss.org"
+docs = "https://freshrss.github.io/FreshRSS/en/admins/01_Index.html"
+repository = "https://github.com/FreshRSS/FreshRSS"
+ram_mb = 100
+setup_notes = "Sign in as admin with the password Tond showed after the deploy. Mobile apps use the API password (also shown after the deploy) with the address /api/greader.php."
+upgrade_notes = "Change the image to a newer 1.x tag and redeploy."
+post_deploy_checks = ["Sign in as admin", "Subscribe to a feed"]
+
+[public]
+service = "freshrss"
+port = 80
+health_path = "/i/"
+
+[[inputs]]
+key = "BASE_URL"
+label = "Public URL"
+value = "{app_url}"
+
+[[inputs]]
+key = "ADMIN_EMAIL"
+label = "Admin email"
+kind = "email"
+
+[[inputs]]
+key = "ADMIN_PASSWORD"
+label = "Admin password"
+kind = "password"
+generate = "password"
+credential = true
+
+[[inputs]]
+key = "API_PASSWORD"
+label = "API password (mobile apps)"
+kind = "password"
+generate = "password"
+credential = true
+
+[[volumes]]
+service = "freshrss"
+path = "./data"
+description = "Configuration, users and the SQLite databases"
+
+[[volumes]]
+service = "freshrss"
+path = "./extensions"
+description = "Third-party extensions"

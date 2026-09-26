@@ -23,6 +23,8 @@ import {
 	MOCK_APPS,
 	MOCK_PROJECTS,
 	MOCK_TEMPLATES,
+	MOCK_TEMPLATE_MEMORY,
+	MOCK_SERVER_ARCH,
 	MOCK_SETTINGS,
 	MOCK_RETENTION,
 	MOCK_AUDIT_SHIPPING,
@@ -86,7 +88,8 @@ import type {
 	GithubPR,
 	Integration,
 	ManagedDatabase,
-	TemplateCatalogEntry,
+	Template,
+	TemplateDeployRequest,
 	Volume,
 	VolumeInput,
 	CronVolume,
@@ -130,6 +133,13 @@ const LATENCY = 200;
 
 function ok<T>(data: T) {
 	return HttpResponse.json(okBody(data));
+}
+
+/** 24 random letters and digits, like the server's generated passwords. */
+function mockGeneratedSecret(): string {
+	const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+	const bytes = crypto.getRandomValues(new Uint8Array(24));
+	return Array.from(bytes, (b) => alphabet[b % alphabet.length]).join('');
 }
 
 function err(message: string, status = 400, code?: string) {
@@ -557,7 +567,7 @@ let apps: App[] = structuredClone([...MOCK_APPS, MOCK_COMPOSE_APP]);
 /** Services of compose apps (app id → services). */
 const composeServices: Record<string, ComposeService[]> = structuredClone(MOCK_COMPOSE_SERVICES);
 let projects: Project[] = structuredClone(MOCK_PROJECTS);
-const templates: TemplateCatalogEntry[] = structuredClone(MOCK_TEMPLATES);
+const templates: Template[] = structuredClone(MOCK_TEMPLATES);
 let alertRules: AlertRule[] = structuredClone(MOCK_ALERT_RULES);
 let activeAlerts: ActiveAlert[] = structuredClone(MOCK_ACTIVE_ALERTS);
 const alertHistory: AlertEpisode[] = structuredClone(MOCK_ALERT_HISTORY);
@@ -1938,7 +1948,106 @@ export const handlers = [
 
 	http.get('/api/v1/templates', async () => {
 		await delay(LATENCY);
-		return ok(templates);
+		return ok({
+			templates,
+			memory: MOCK_TEMPLATE_MEMORY,
+			apps_domain: MOCK_SETTINGS.apps_domain,
+			architecture: MOCK_SERVER_ARCH
+		});
+	}),
+
+	http.post('/api/v1/templates/:id/deploy', async ({ params, request }) => {
+		await delay(LATENCY * 2);
+		const template = templates.find((t) => t.id === params.id);
+		if (!template) return err(`No template named ${params.id}`, 404);
+		const body = (await request.json()) as TemplateDeployRequest;
+		const name = (body.name ?? '').trim().toLowerCase();
+		if (!/^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/.test(name)) {
+			return HttpResponse.json(
+				errorBody('App name must be 1–40 lowercase letters, digits and hyphens', 400, undefined, {
+					field: 'name'
+				}),
+				{ status: 400 }
+			);
+		}
+		if (!template.architectures.includes(MOCK_SERVER_ARCH)) {
+			return err(
+				`${template.name} isn't available on ARM64: its images are published for x86_64 only.`,
+				409,
+				'CONFLICT'
+			);
+		}
+		if (apps.some((a) => a.name === name))
+			return err(`App already exists: ${name}`, 409, 'APP_ALREADY_EXISTS');
+		if (template.ram_mb > MOCK_TEMPLATE_MEMORY.available_mb && !body.allow_low_memory) {
+			return err(
+				`${template.name} needs about ${template.ram_mb} MB of memory and this server has ${MOCK_TEMPLATE_MEMORY.available_mb} MB free.`,
+				409,
+				'INSUFFICIENT_MEMORY'
+			);
+		}
+		const credentials: { key: string; label: string; value: string }[] = [];
+		for (const input of template.inputs) {
+			const given = (body.inputs?.[input.key] ?? '').trim();
+			const problem =
+				!given && input.required
+					? `${input.label} is required`
+					: given && input.kind === 'email' && !given.includes('@')
+						? `${input.label} must be an email address`
+						: null;
+			if (problem) {
+				return HttpResponse.json(
+					errorBody(problem, 400, undefined, { field: `inputs.${input.key}` }),
+					{ status: 400 }
+				);
+			}
+			const value = given || (input.generated ? mockGeneratedSecret() : (input.default ?? ''));
+			if (input.credential) credentials.push({ key: input.key, label: input.label, value });
+		}
+		const domain =
+			body.domain?.trim() ||
+			(MOCK_SETTINGS.apps_domain ? `${name}.${MOCK_SETTINGS.apps_domain}` : null);
+		const now = new Date().toISOString();
+		const newApp: App = {
+			...structuredClone(MOCK_APPS[0]),
+			id: `app_${Date.now()}`,
+			name,
+			domain,
+			source_type: 'compose',
+			source_url: null,
+			status: 'deploying',
+			container_port: template.public.port,
+			host_port: null,
+			health_check_path: template.public.health_path,
+			volumes: [],
+			build_method: null,
+			auto_deploy: false,
+			watch_branch: null,
+			project_id: body.project_id ?? null,
+			compose_content: template.compose,
+			dockerfile_content: null,
+			readiness: template.public.health_path ? 'http' : 'tcp',
+			template_id: template.id,
+			template_version: template.version,
+			created_at: now,
+			updated_at: now
+		};
+		apps = [...apps, newApp];
+		const d = startMockDeploy(newApp, {
+			trigger_source: 'manual',
+			trigger_detail: MOCK_USER.email
+		});
+		return HttpResponse.json(
+			okBody({
+				app_id: newApp.id,
+				app_name: name,
+				domain,
+				deployment_id: d.id,
+				credentials,
+				setup_notes: template.setup_notes
+			}),
+			{ status: 202 }
+		);
 	}),
 
 	http.post('/api/v1/projects', async ({ request }) => {

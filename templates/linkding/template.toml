@@ -1,0 +1,36 @@
+id = "linkding"
+name = "linkding"
+description = "Minimal, fast bookmark manager with tags, search and archiving."
+about = "linkding stores and organises bookmarks with tags, full-text search, read-later and optional web archive snapshots. It has browser extensions and a REST API, and runs happily on a few dozen megabytes."
+category = "productivity"
+tags = ["bookmarks", "links", "read later", "pocket alternative"]
+version = "1.47"
+website = "https://linkding.link"
+docs = "https://linkding.link/installation/"
+repository = "https://github.com/sissbruecker/linkding"
+ram_mb = 150
+setup_notes = "Sign in as admin with the password Tond showed after the deploy, then install the browser extension from Settings → Integrations."
+upgrade_notes = "Change the image to a newer 1.x tag and redeploy; migrations run on start."
+post_deploy_checks = ["Sign in as admin", "Save a bookmark"]
+
+[public]
+service = "linkding"
+port = 9090
+health_path = "/health"
+
+[[inputs]]
+key = "TRUSTED_ORIGIN"
+label = "Trusted origin"
+value = "{app_url}"
+
+[[inputs]]
+key = "ADMIN_PASSWORD"
+label = "Admin password"
+kind = "password"
+generate = "password"
+credential = true
+
+[[volumes]]
+service = "linkding"
+path = "./data"
+description = "Bookmarks database, favicons and archived pages"

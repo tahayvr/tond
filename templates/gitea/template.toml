@@ -1,0 +1,35 @@
+id = "gitea"
+name = "Gitea"
+description = "Painless self-hosted Git service with issues, pull requests and Actions."
+about = "Gitea is a fast, lightweight Git server with code review, issues, wikis, a package registry and GitHub Actions-compatible CI. This template uses SQLite and HTTPS clone URLs; SSH is off because Tond only routes HTTP."
+category = "developer"
+tags = ["git", "forge", "code review", "github alternative", "ci"]
+logo = "gitea"
+version = "1.27"
+website = "https://about.gitea.com"
+docs = "https://docs.gitea.com/installation/install-with-docker"
+repository = "https://github.com/go-gitea/gitea"
+ram_mb = 220
+setup_notes = "Open the app right away: the install page is open to the first visitor. Keep the prefilled settings, create the administrator account at the bottom of the page and press Install."
+upgrade_notes = "The image follows Gitea 1.27.x. For a newer minor version change the tag, take a snapshot and redeploy; the database is migrated on start."
+post_deploy_checks = ["Finish the install page and create the administrator", "Push a test repository over HTTPS"]
+
+[public]
+service = "gitea"
+port = 3000
+health_path = "/api/healthz"
+
+[[inputs]]
+key = "ROOT_URL"
+label = "Root URL"
+value = "{app_url}/"
+
+[[inputs]]
+key = "DOMAIN"
+label = "Domain"
+value = "{app_host}"
+
+[[volumes]]
+service = "gitea"
+path = "./data"
+description = "Repositories, attachments, packages and the SQLite database"

@@ -1,0 +1,13 @@
+services:
+  audiobookshelf:
+    image: ghcr.io/advplyr/audiobookshelf:2.36.1
+    restart: unless-stopped
+    mem_limit: 512m
+    ports: ["80"]
+    environment:
+      TZ: UTC
+    volumes:
+      - ./config:/config
+      - ./metadata:/metadata
+      - ./audiobooks:/audiobooks
+      - ./podcasts:/podcasts
