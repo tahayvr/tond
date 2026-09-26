@@ -1,0 +1,10 @@
+# Dependencies and build output
+node_modules/
+dist/
+.astro/
+
+# Generated before every build by scripts/generate.mjs
+content/reference/api/
+content/reference/error-codes.md
+content/reference/exit-codes.md
+public/openapi.json

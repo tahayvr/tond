@@ -24,6 +24,7 @@ const MODEL_SOURCES: &[(&str, &str)] = &[
     ("cron.rs", include_str!("cron.rs")),
     ("databases.rs", include_str!("databases.rs")),
     ("deployments.rs", include_str!("deployments.rs")),
+    ("domains.rs", include_str!("domains.rs")),
     ("github.rs", include_str!("github.rs")),
     ("gitlab.rs", include_str!("gitlab.rs")),
     ("monitoring.rs", include_str!("monitoring.rs")),
@@ -71,6 +72,11 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "CreatedDatabaseResponse",
         "credentials",
         "generated credentials shown once to the creator",
+    ),
+    (
+        "TemplateDeployResponse",
+        "credentials",
+        "a template's generated first-login credentials, shown once to the deployer",
     ),
     (
         "ManagedDatabaseResponse",

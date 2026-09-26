@@ -76,6 +76,7 @@
 
 <script lang="ts">
 	import { listCertificates, retryCertificate } from '$lib/api';
+	import { findCertificate } from '$lib/domains';
 	import { pollWhileVisible } from '$lib/polling';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { cn } from '$lib/utils';
@@ -97,6 +98,8 @@
 	const POLL_MS = 15_000;
 
 	let cert = $state<Certificate | undefined>(undefined);
+	/** Set when a wildcard certificate serves the domain. */
+	let coveredBy = $state<string | null>(null);
 	let loaded = $state(false);
 	let now = $state(Date.now());
 	let retrying = $state(false);
@@ -109,7 +112,7 @@
 		try {
 			const certs = await listCertificates();
 			if (target !== trimmed) return; // domain changed meanwhile
-			cert = certs.find((c) => c.domain === target);
+			({ cert, coveredBy } = findCertificate(certs, target));
 			error = '';
 		} catch (e: any) {
 			error = e.message;
@@ -137,6 +140,7 @@
 		const target = trimmed;
 		void refreshKey;
 		cert = undefined;
+		coveredBy = null;
 		loaded = false;
 		if (!target) return;
 		load(target);
@@ -177,10 +181,28 @@
 				<LockIcon class="mt-0.5 size-4 shrink-0 text-success" />
 				<div class="space-y-1">
 					<p class="font-medium">HTTPS active for {trimmed}</p>
-					<p class="text-muted-foreground">
-						Certificate valid until {new Date(view.expiresAt).toLocaleDateString()}. Tond renews it
-						automatically 30 days before it expires.
-					</p>
+					{#if cert?.cert_type === 'custom'}
+						<p class="text-muted-foreground">
+							Uploaded certificate{coveredBy ? ` (${coveredBy})` : ''}, valid until {new Date(
+								view.expiresAt
+							).toLocaleDateString()}. Tond doesn't renew uploaded certificates: upload a new one on
+							the <a href="/certificates" class="underline underline-offset-2">Certificates</a> page before
+							it expires. Expiry alerts still warn you.
+						</p>
+					{:else if coveredBy}
+						<p class="text-muted-foreground">
+							Served by the wildcard certificate <code class="text-foreground">{coveredBy}</code>,
+							valid until {new Date(view.expiresAt).toLocaleDateString()}. Tond renews it
+							automatically.
+						</p>
+					{:else}
+						<p class="text-muted-foreground">
+							Certificate valid until {new Date(view.expiresAt).toLocaleDateString()}. Tond renews
+							it automatically 30 days before it expires{cert?.challenge === 'dns-01'
+								? ' (validated through your DNS provider)'
+								: ''}.
+						</p>
+					{/if}
 					{#if view.renewalError}
 						<p class="text-foreground">
 							The last renewal attempt failed. {explainCertError(view.renewalError, trimmed) ??

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 /// A registered GitHub App (created via the manifest flow).
 /// One row per App registration; typically there is only one.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct GitHubApp {
     pub id: String,
     /// Human-readable name (e.g. "tond-myserver")
@@ -34,6 +35,7 @@ pub struct GitHubApp {
 
 /// API response for a GitHub App — omits all sensitive credentials.
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct GitHubAppResponse {
     pub id: String,
     pub name: String,
@@ -64,8 +66,9 @@ impl GitHubAppResponse {
     }
 }
 
-/// Response from `GET /api/github-apps/{id}/repos`
+/// Response from `GET /api/v1/github-apps/{id}/repos`
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct GitHubRepoResponse {
     pub id: i64,
     pub full_name: String,
@@ -76,8 +79,9 @@ pub struct GitHubRepoResponse {
     pub default_branch: String,
 }
 
-/// Response from `GET /api/github-apps/{id}/repos/{owner}/{repo}/branches`
+/// Response from `GET /api/v1/github-apps/{id}/repos/{owner}/{repo}/branches`
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct GitHubBranchResponse {
     pub name: String,
 }
@@ -86,15 +90,17 @@ pub struct GitHubBranchResponse {
 /// GitHub appends `?code=<code>&state=<state>`, echoing the `state` we put on
 /// the `github.com/settings/apps/new?state=` form action.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct GitHubCallbackQuery {
     pub code: Option<String>,
-    /// Pending flow state created by `POST /api/github-apps/manifest`
+    /// Pending flow state created by `POST /api/v1/github-apps/manifest`
     pub state: Option<String>,
 }
 
-/// POST /api/github-apps/complete — finish a manifest or install flow from the
+/// POST /api/v1/github-apps/complete — finish a manifest or install flow from the
 /// dashboard page GitHub's redirect lands on.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CompleteGitHubFlowRequest {
     /// "manifest" or "install"
     pub kind: String,
@@ -107,22 +113,25 @@ pub struct CompleteGitHubFlowRequest {
 /// GitHub appends `?installation_id=<id>&setup_action=<action>&state=<state>`,
 /// echoing the `state` we put on the installation URL.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct GitHubInstallQuery {
     pub installation_id: Option<i64>,
     pub setup_action: Option<String>,
-    /// Pending flow state created by `POST /api/github-apps/{id}/install`
+    /// Pending flow state created by `POST /api/v1/github-apps/{id}/install`
     pub state: Option<String>,
 }
 
-/// PATCH /api/github-apps/{id} — update a registered app (e.g. rename or set installation_id)
+/// PATCH /api/v1/github-apps/{id} — update a registered app (e.g. rename or set installation_id)
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateGitHubAppRequest {
     pub name: Option<String>,
     pub installation_id: Option<i64>,
 }
 
-/// PUT /api/apps/{id}/github-app — link or unlink a GitHub App from an app
+/// PUT /api/v1/apps/{id}/github-app — link or unlink a GitHub App from an app
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SetGitHubAppRequest {
     /// GitHub App registration ID to link. `null` = detach.
     pub github_app_id: Option<String>,

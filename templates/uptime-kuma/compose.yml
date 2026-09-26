@@ -1,0 +1,18 @@
+services:
+  uptime-kuma:
+    image: louislam/uptime-kuma:2.5.5
+    restart: unless-stopped
+    mem_limit: 384m
+    ports: ["3001"]
+    # Ping monitors need raw sockets, which Tond drops by default.
+    cap_add: [NET_RAW]
+    volumes:
+      - ./data:/app/data
+    # Timings only: the image's own HEALTHCHECK test is kept, but its 60s interval
+    # would keep the deploy waiting.
+    healthcheck:
+      interval: 20s
+      timeout: 10s
+      start_period: 60s
+      start_interval: 2s
+      retries: 5

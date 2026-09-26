@@ -5,6 +5,8 @@ use clap::Subcommand;
 use tond_common::UpdateSettingsRequest;
 
 use crate::client::TondClient;
+use crate::error::CliError;
+use crate::output::{Output, outln};
 
 // Variant names are the subcommand names (`tond settings set-...`).
 #[allow(clippy::enum_variant_names)]
@@ -66,47 +68,66 @@ pub enum OnOff {
 ///
 /// With no subcommand, prints the current settings.
 /// Subcommands allow updating individual settings.
-pub async fn handle(client: &TondClient, action: Option<SettingsAction>) -> Result<()> {
+pub async fn handle(
+    client: &TondClient,
+    out: &Output,
+    action: Option<SettingsAction>,
+) -> Result<()> {
     match action {
         None => {
             let s = client.get_settings().await?;
             if s.server_name.is_empty() {
-                println!("server-name       (not set)");
+                outln!(out, "server-name       (not set)");
             } else {
-                println!("server-name       {}", s.server_name);
+                outln!(out, "server-name       {}", s.server_name);
             }
             if s.dashboard_domain.is_empty() {
-                println!("dashboard-domain  (not set)");
+                outln!(out, "dashboard-domain  (not set)");
             } else {
-                println!("dashboard-domain  {}", s.dashboard_domain);
+                outln!(out, "dashboard-domain  {}", s.dashboard_domain);
             }
             if s.apps_domain.is_empty() {
-                println!("apps-domain       (not set — apps need a custom domain)");
+                outln!(
+                    out,
+                    "apps-domain       (not set — apps need a custom domain)"
+                );
             } else {
-                println!("apps-domain       {}", s.apps_domain);
+                outln!(out, "apps-domain       {}", s.apps_domain);
             }
             if s.preview_domain.is_empty() {
-                println!("preview-domain    (not set — previews disabled)");
+                outln!(out, "preview-domain    (not set — previews disabled)");
             } else {
-                println!("preview-domain    {}", s.preview_domain);
+                outln!(out, "preview-domain    {}", s.preview_domain);
             }
-            match client.get_host_terminal().await {
-                Ok(true) => println!("host-terminal     on"),
-                Ok(false) => println!("host-terminal     off"),
-                Err(_) => {}
+            let host_terminal = client.get_host_terminal().await.ok();
+            match host_terminal {
+                Some(true) => outln!(out, "host-terminal     on"),
+                Some(false) => outln!(out, "host-terminal     off"),
+                None => {}
             }
+            let mut doc = serde_json::to_value(&s)?;
+            doc["host_terminal"] = serde_json::json!(host_terminal);
+            out.json(&doc)?;
         }
         Some(SettingsAction::HostTerminal { state }) => {
             let enabled = client.set_host_terminal(state == OnOff::On).await?;
+            out.json(&serde_json::json!({ "host_terminal": enabled }))?;
             if enabled {
-                println!("host-terminal is on.");
-                println!(
+                outln!(out, "host-terminal is on.");
+                outln!(
+                    out,
                     "Admins can now open a shell on this server from the dashboard terminal; \
                      each session asks for their password (and 2FA code)."
                 );
-                println!("Turn it off again with: sudo tond settings host-terminal off");
+                outln!(
+                    out,
+                    "Turn it off again with: sudo tond settings host-terminal off"
+                );
             } else {
-                println!("host-terminal is off. Container terminals are still available.");
+                outln!(
+                    out,
+                    "host-terminal is off. Container terminals are still available."
+                );
             }
         }
         Some(SettingsAction::SetServerName { name }) => {
@@ -118,10 +139,11 @@ pub async fn handle(client: &TondClient, action: Option<SettingsAction>) -> Resu
                     ..UpdateSettingsRequest::default()
                 })
                 .await?;
+            out.json(&s)?;
             if name.is_empty() {
-                println!("server-name cleared.");
+                outln!(out, "server-name cleared.");
             } else {
-                println!("server-name set to: {}", s.server_name);
+                outln!(out, "server-name set to: {}", s.server_name);
             }
         }
         Some(SettingsAction::SetDashboardDomain { domain }) => {
@@ -132,11 +154,12 @@ pub async fn handle(client: &TondClient, action: Option<SettingsAction>) -> Resu
                     ..UpdateSettingsRequest::default()
                 })
                 .await?;
+            out.json(&s)?;
             if domain.is_empty() {
-                println!("dashboard-domain cleared.");
+                outln!(out, "dashboard-domain cleared.");
             } else {
-                println!("dashboard-domain set to: {}", s.dashboard_domain);
-                println!("tond-proxy will pick up the change within 5 seconds.");
+                outln!(out, "dashboard-domain set to: {}", s.dashboard_domain);
+                outln!(out, "tond-proxy will pick up the change within 5 seconds.");
             }
         }
         Some(SettingsAction::SetAppsDomain { domain }) => {
@@ -146,15 +169,19 @@ pub async fn handle(client: &TondClient, action: Option<SettingsAction>) -> Resu
                     ..Default::default()
                 })
                 .await?;
+            out.json(&s)?;
             if domain.is_empty() {
-                println!(
+                outln!(
+                    out,
                     "apps-domain cleared. New apps get no automatic hostname; give them a custom domain."
                 );
             } else {
-                println!("apps-domain set to: {}", s.apps_domain);
-                println!(
+                outln!(out, "apps-domain set to: {}", s.apps_domain);
+                outln!(
+                    out,
                     "Point a wildcard DNS record *.{} at this server. New apps are served at <app>.{}",
-                    s.apps_domain, s.apps_domain
+                    s.apps_domain,
+                    s.apps_domain
                 );
             }
         }
@@ -165,11 +192,16 @@ pub async fn handle(client: &TondClient, action: Option<SettingsAction>) -> Resu
                     ..UpdateSettingsRequest::default()
                 })
                 .await?;
+            out.json(&s)?;
             if domain.is_empty() {
-                println!("preview-domain cleared. New previews are refused until one is set.");
+                outln!(
+                    out,
+                    "preview-domain cleared. New previews are refused until one is set."
+                );
             } else {
-                println!("preview-domain set to: {}", s.preview_domain);
-                println!(
+                outln!(out, "preview-domain set to: {}", s.preview_domain);
+                outln!(
+                    out,
                     "Point a wildcard DNS record *.{} at this server.",
                     s.preview_domain
                 );
@@ -188,35 +220,23 @@ pub async fn handle(client: &TondClient, action: Option<SettingsAction>) -> Resu
 /// instead issue a one-time reset link: `tond users reset-link <email>`.
 /// Input is read from stdin (characters are visible; pipe a password
 /// manager's output for non-interactive use).
-pub async fn handle_passwd(client: &TondClient) -> Result<()> {
-    use std::io::{self, Write};
-
-    let current = read_line_prompt("Current password: ")?;
-    let new_pw = read_line_prompt("New password: ")?;
+pub async fn handle_passwd(client: &TondClient, out: &Output) -> Result<()> {
+    let current = out.prompt_line("Current password: ")?;
+    let new_pw = out.prompt_line("New password: ")?;
 
     if new_pw.chars().count() < 12 {
-        anyhow::bail!("New password must be at least 12 characters");
+        return Err(CliError::usage("New password must be at least 12 characters").into());
     }
 
-    let confirm = read_line_prompt("Confirm new password: ")?;
+    let confirm = out.prompt_line("Confirm new password: ")?;
 
     if new_pw != confirm {
-        anyhow::bail!("Passwords do not match");
+        return Err(CliError::usage("Passwords do not match").into());
     }
 
     client.change_password(&current, &new_pw).await?;
-    println!("Password changed successfully.");
-    println!("All other active sessions have been signed out.");
-    let _ = io::stdout().flush();
+    out.json(&serde_json::json!({ "ok": true, "action": "change_password" }))?;
+    outln!(out, "Password changed successfully.");
+    outln!(out, "All other active sessions have been signed out.");
     Ok(())
-}
-
-/// Print a prompt and read one line from stdin (trims trailing newline).
-pub fn read_line_prompt(prompt: &str) -> Result<String> {
-    use std::io::{self, Write};
-    print!("{}", prompt);
-    io::stdout().flush()?;
-    let mut s = String::new();
-    io::stdin().read_line(&mut s)?;
-    Ok(s.trim_end_matches('\n').trim_end_matches('\r').to_string())
 }

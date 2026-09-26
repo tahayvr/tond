@@ -22,7 +22,7 @@
 //   verifiable and the pruning itself is on the record.
 //
 //   `verify` walks the chain from the checkpoint; exposed as
-//   GET /api/audit-log/verify and `tond audit verify`.
+//   GET /api/v1/audit-log/verify and `tond audit verify`.
 //
 //   Limits: truncating the newest rows can't be detected from inside the
 //   database. Shipping every entry to a remote syslog server or webhook
@@ -275,7 +275,7 @@ async fn append(
     created_at: &str,
 ) -> Result<(), sqlx::Error> {
     let _guard = WRITE_LOCK.lock().await;
-    let mut tx = db.begin().await?;
+    let mut tx = crate::db::begin_write(db).await?;
     let (last_seq, prev_hash) = head(&mut *tx).await?;
     let fields = ChainFields {
         seq: last_seq + 1,
@@ -402,7 +402,7 @@ pub async fn prune_before(db: &SqlitePool, cutoff: &str, batch: i64) -> Result<u
     let mut last_checkpoint = None;
     loop {
         let _guard = WRITE_LOCK.lock().await;
-        let mut tx = db.begin().await?;
+        let mut tx = crate::db::begin_write(db).await?;
         // The newest row of this batch among the old ones: rows are appended in
         // time order, so "older than cutoff" is always a prefix of the chain.
         let through: Option<(i64, String)> = sqlx::query_as(

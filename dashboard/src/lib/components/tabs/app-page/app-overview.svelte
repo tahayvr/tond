@@ -5,6 +5,7 @@
 	import AppOverviewMetrics from './app-overview-metrics.svelte';
 	import UptimeBadge from '$lib/components/uptime/UptimeBadge.svelte';
 	import type { App } from '$lib/api';
+	import LayoutTemplate from '~icons/ri/layout-masonry-line';
 
 	interface Props {
 		app: App;
@@ -50,6 +51,24 @@
 </script>
 
 <div class="space-y-4 pt-4">
+	{#if app.template_id}
+		<p class="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted-foreground">
+			<LayoutTemplate class="size-4 shrink-0" aria-hidden="true" />
+			<span>
+				Deployed from the
+				<a
+					href="/templates/{app.template_id}"
+					class="text-foreground underline-offset-4 hover:underline">{app.template_id}</a
+				>
+				template{#if app.template_version}&nbsp;({app.template_version}){/if}
+			</span>
+			<span aria-hidden="true">·</span>
+			<a
+				href="/templates/{app.template_id}#upgrading"
+				class="text-foreground underline-offset-4 hover:underline">Upgrade notes</a
+			>
+		</p>
+	{/if}
 	{#if uptimeHref && app.domain}
 		<UptimeBadge appId={app.id} href={uptimeHref} />
 	{/if}

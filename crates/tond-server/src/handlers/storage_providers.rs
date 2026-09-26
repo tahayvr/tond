@@ -1,12 +1,12 @@
 // handlers/storage_providers.rs — Storage provider CRUD + connectivity test
 //
 // Routes:
-//   GET    /api/storage-providers          — list all configured providers
-//   GET    /api/storage-providers/:id      — get single provider
-//   POST   /api/storage-providers          — create provider (secret encrypted at rest)
-//   PATCH  /api/storage-providers/:id      — update name or config (partial)
-//   DELETE /api/storage-providers/:id      — delete (fails if referenced by backup_config)
-//   POST   /api/storage-providers/:id/test — verify connectivity (ListObjects)
+//   GET    /api/v1/storage-providers          — list all configured providers
+//   GET    /api/v1/storage-providers/:id      — get single provider
+//   POST   /api/v1/storage-providers          — create provider (secret encrypted at rest)
+//   PATCH  /api/v1/storage-providers/:id      — update name or config (partial)
+//   DELETE /api/v1/storage-providers/:id      — delete (fails if referenced by backup_config)
+//   POST   /api/v1/storage-providers/:id/test — verify connectivity (ListObjects)
 //
 // The `secret_access_key` in the S3 config is AES-GCM encrypted using the same
 // `secret_key::encrypt` / `secret_key::decrypt` helpers as the other secret columns.

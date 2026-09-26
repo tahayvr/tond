@@ -38,6 +38,9 @@
 //   Docker networks — remove Tond-labelled networks no container uses (older
 //                    than an hour; see docker::prune_networks).
 //
+// The same hourly pass also runs the daily update check (updates/releases.rs:
+// a no-op unless a day has passed) so it needs no loop of its own.
+//
 // Every delete runs in batches of BATCH_SIZE rows with a short pause between
 // batches, so a single statement never holds SQLite's write lock for long
 // (tond-proxy shares the database file). Each batch selects its victims
@@ -235,6 +238,11 @@ pub async fn run_janitor(state: AppState) {
             Ok(_) => {}
             Err(e) => tracing::warn!("Janitor: network prune failed: {e}"),
         }
+        // Once a day at most: is there a newer Tond release? And the audit
+        // entry of an update that finished since.
+        crate::updates::releases::check_if_due(&state.db).await;
+        crate::updates::audit_finished_run(&state.db, &crate::updates::run::Paths::from_env())
+            .await;
         lp.sleep(INTERVAL).await;
     }
 }
@@ -470,6 +478,9 @@ pub async fn run_once(db: &SqlitePool, policy: &RetentionPolicy) -> Result<Janit
         .execute(db)
     })
     .await?;
+
+    // ── idempotency keys past their 24 h window, and the row cap ──
+    crate::idempotency::prune(db, now.timestamp()).await?;
 
     // ── finished preview rows (their containers are already gone) ──
     let preview_cutoff = (now - chrono::Duration::days(7)).to_rfc3339();

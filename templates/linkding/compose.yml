@@ -1,0 +1,19 @@
+services:
+  linkding:
+    image: sissbruecker/linkding:1.47.0
+    restart: unless-stopped
+    mem_limit: 256m
+    ports: ["9090"]
+    environment:
+      LD_SUPERUSER_NAME: admin
+      LD_SUPERUSER_PASSWORD: ${ADMIN_PASSWORD}
+      LD_CSRF_TRUSTED_ORIGINS: ${TRUSTED_ORIGIN}
+    volumes:
+      - ./data:/etc/linkding/data
+    # Timings only: the image's own HEALTHCHECK test is kept, but its 30s interval
+    # would keep the deploy waiting.
+    healthcheck:
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      start_interval: 2s

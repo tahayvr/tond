@@ -261,7 +261,10 @@
 						<code class="font-mono text-xs">application/json</code>.
 					</li>
 					<li>Paste the <strong>Secret</strong> above.</li>
-					<li>Trigger on <strong>Push events</strong> and click <strong>Add webhook</strong>.</li>
+					<li>
+						Trigger on <strong>Push events</strong> (and <strong>Pull request</strong> events for
+						preview deployments), then click <strong>Add webhook</strong>.
+					</li>
 				</ol>
 			{:else}
 				<p>

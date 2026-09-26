@@ -1,15 +1,16 @@
 // requests.rs — request metrics and access log DTOs
 //
-//   GET /api/apps/{id}/requests?range=       RequestMetricsResponse
-//   GET /api/previews/{id}/requests?range=   RequestMetricsResponse
-//   GET /api/system/requests?range=          TrafficOverviewResponse
-//   GET /api/apps/{id}/access-log            AccessLogResponse
-//   PUT /api/apps/{id}/access-log            AccessLogSettings
+//   GET /api/v1/apps/{id}/requests?range=       RequestMetricsResponse
+//   GET /api/v1/previews/{id}/requests?range=   RequestMetricsResponse
+//   GET /api/v1/system/requests?range=          TrafficOverviewResponse
+//   GET /api/v1/apps/{id}/access-log            AccessLogResponse
+//   PUT /api/v1/apps/{id}/access-log            AccessLogSettings
 
 use serde::{Deserialize, Serialize};
 
 /// Query string of the request metric endpoints.
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RequestMetricsQuery {
     /// "1h" | "6h" | "24h" | "7d" | "30d" | "90d" (default "24h")
     #[serde(default = "default_request_range")]
@@ -24,6 +25,7 @@ fn default_request_range() -> String {
 /// second averaged over the bucket; latency is in milliseconds and null for
 /// buckets without requests.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RequestSeries {
     /// Bucket start, unix seconds.
     pub t: Vec<i64>,
@@ -45,6 +47,7 @@ pub struct RequestSeries {
 
 /// Totals over a window.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RequestSummary {
     pub requests: u64,
     /// Average requests per second over the window.
@@ -72,6 +75,7 @@ pub struct RequestSummary {
 
 /// The last minute, from tond-server's memory.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RequestCurrent {
     /// End of the window, unix seconds.
     pub t: i64,
@@ -84,6 +88,7 @@ pub struct RequestCurrent {
 
 /// Something to draw on the charts: a deploy or a container event.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RequestMarker {
     /// Unix seconds.
     pub t: i64,
@@ -96,8 +101,9 @@ pub struct RequestMarker {
     pub deployment_id: Option<String>,
 }
 
-/// Response of GET /api/apps/{id}/requests and /api/previews/{id}/requests.
+/// Response of GET /api/v1/apps/{id}/requests and /api/v1/previews/{id}/requests.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RequestMetricsResponse {
     pub range: String,
     /// Bucket width in seconds.
@@ -114,6 +120,7 @@ pub struct RequestMetricsResponse {
 
 /// One app in the traffic overview.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AppTrafficResponse {
     pub id: String,
     pub name: String,
@@ -126,9 +133,10 @@ pub struct AppTrafficResponse {
     pub bytes_out: u64,
 }
 
-/// Response of GET /api/system/requests: server-wide traffic and the apps
+/// Response of GET /api/v1/system/requests: server-wide traffic and the apps
 /// that served the most requests and errors.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TrafficOverviewResponse {
     pub range: String,
     pub from: i64,
@@ -146,6 +154,7 @@ pub struct TrafficOverviewResponse {
 
 /// Access log settings of an app.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AccessLogSettings {
     pub enabled: bool,
     /// Also log query strings (they often carry tokens; off by default).
@@ -153,8 +162,9 @@ pub struct AccessLogSettings {
     pub include_query: bool,
 }
 
-/// Query string of GET /api/apps/{id}/access-log.
+/// Query string of GET /api/v1/apps/{id}/access-log.
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AccessLogQuery {
     /// Most recent lines to return (default 500, at most 5000).
     pub lines: Option<usize>,
@@ -162,8 +172,9 @@ pub struct AccessLogQuery {
     pub q: Option<String>,
 }
 
-/// Response of GET /api/apps/{id}/access-log.
+/// Response of GET /api/v1/apps/{id}/access-log.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AccessLogResponse {
     pub enabled: bool,
     pub include_query: bool,

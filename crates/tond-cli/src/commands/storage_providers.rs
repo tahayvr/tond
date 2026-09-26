@@ -2,12 +2,15 @@
 
 use anyhow::Result;
 use clap::Subcommand;
+use serde_json::json;
 
 use crate::client::TondClient;
+use crate::output::{Output, outln};
 
 #[derive(Subcommand)]
 pub enum StorageProviderAction {
     /// List all configured storage providers
+    #[command(visible_alias = "ls")]
     List,
 
     /// Create a new S3-compatible storage provider
@@ -47,25 +50,35 @@ pub enum StorageProviderAction {
         id: String,
     },
 
-    /// Delete a storage provider
+    /// Delete a storage provider (asks first)
+    #[command(visible_alias = "rm")]
     Delete {
         /// Storage provider ID
         id: String,
+
+        /// Don't ask for confirmation (required when stdin is not a terminal)
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 }
 
-pub async fn handle(client: &TondClient, action: StorageProviderAction) -> Result<()> {
+pub async fn handle(
+    client: &TondClient,
+    out: &Output,
+    action: StorageProviderAction,
+) -> Result<()> {
     match action {
         StorageProviderAction::List => {
             let list = client.list_storage_providers().await?;
+            out.json(&list)?;
             if list.is_empty() {
-                println!("No storage providers configured.");
-                println!("Use `tond storage-provider create` to add one.");
+                outln!(out, "No storage providers configured.");
+                outln!(out, "Use `tond storage-provider create` to add one.");
             } else {
-                println!("{:<28} {:<6} NAME", "ID", "KIND");
-                println!("{}", "-".repeat(60));
+                outln!(out, "{:<28} {:<6} NAME", "ID", "KIND");
+                outln!(out, "{}", "-".repeat(60));
                 for p in &list {
-                    println!("{:<28} {:<6} {}", p.id, p.kind, p.name);
+                    outln!(out, "{:<28} {:<6} {}", p.id, p.kind, p.name);
                 }
             }
         }
@@ -90,18 +103,28 @@ pub async fn handle(client: &TondClient, action: StorageProviderAction) -> Resul
                     &secret,
                 )
                 .await?;
-            println!("Storage provider created: {} ({})", p.name, p.id);
+            out.json(&p)?;
+            outln!(out, "Storage provider created: {} ({})", p.name, p.id);
         }
 
         StorageProviderAction::Test { id } => {
-            println!("Testing connectivity…");
+            outln!(out, "Testing connectivity…");
             let msg = client.test_storage_provider(&id).await?;
-            println!("{}", msg);
+            out.json(&json!({ "ok": true, "id": id, "message": msg }))?;
+            outln!(out, "{}", msg);
         }
 
-        StorageProviderAction::Delete { id } => {
-            client.delete_storage_provider(&id).await?;
-            println!("Storage provider {} deleted.", id);
+        StorageProviderAction::Delete { id, yes } => {
+            out.confirm(
+                yes,
+                &format!(
+                    "Delete storage provider {id}? Snapshots stored there are no longer reachable from Tond."
+                ),
+                &format!("delete storage provider {id}"),
+            )?;
+            let data = client.delete_storage_provider(&id).await?;
+            out.done("delete", "storage_provider", &id, data)?;
+            outln!(out, "Storage provider {} deleted.", id);
         }
     }
 

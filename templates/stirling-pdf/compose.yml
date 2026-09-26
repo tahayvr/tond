@@ -1,0 +1,22 @@
+services:
+  stirling-pdf:
+    image: stirlingtools/stirling-pdf:2.14.3
+    restart: unless-stopped
+    mem_limit: 2g
+    ports: ["8080"]
+    environment:
+      SECURITY_ENABLELOGIN: "true"
+      SECURITY_INITIALLOGIN_USERNAME: admin
+      SECURITY_INITIALLOGIN_PASSWORD: ${ADMIN_PASSWORD}
+      SYSTEM_ENABLEANALYTICS: "false"
+      LANGS: en_GB
+    volumes:
+      - ./configs:/configs
+    # Timings only: the image's own HEALTHCHECK test is kept, but its 30s interval
+    # would keep the deploy waiting.
+    healthcheck:
+      interval: 15s
+      timeout: 15s
+      start_period: 120s
+      start_interval: 2s
+      retries: 5

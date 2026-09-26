@@ -36,7 +36,11 @@ function envWith(keys: string[], preview: Partial<AppEnv['preview']> = {}): AppE
 }
 
 function renderTab(
-	props: Partial<{ onRedeploy: () => Promise<void>; previewEnabled: boolean }> = {}
+	props: Partial<{
+		onRedeploy: () => Promise<void>;
+		previewEnabled: boolean;
+		inProject: boolean;
+	}> = {}
 ) {
 	const onRedeploy = props.onRedeploy ?? vi.fn().mockResolvedValue(undefined);
 	render(AppEnvironment, {
@@ -47,6 +51,7 @@ function renderTab(
 			registryCredentialId: null,
 			onRegistryCredentialChange: vi.fn().mockResolvedValue(undefined),
 			previewEnabled: props.previewEnabled ?? false,
+			inProject: props.inProject ?? false,
 			onRedeploy
 		}
 	});
@@ -71,6 +76,24 @@ describe('AppEnvironment', () => {
 		expect(screen.queryByRole('button', { name: 'Reveal API_KEY' })).not.toBeInTheDocument();
 		expect(screen.queryByRole('button', { name: 'Copy API_KEY' })).not.toBeInTheDocument();
 		expect(screen.getByRole('button', { name: 'Edit variable API_KEY' })).toBeInTheDocument();
+	});
+
+	it('says project variables are passed too, and that the app wins, only for project members', async () => {
+		api.getAppEnv.mockResolvedValue(envWith(['API_KEY']));
+
+		renderTab({ inProject: true });
+
+		expect(await screen.findByText('API_KEY')).toBeInTheDocument();
+		expect(screen.getByText(/project's shared variables are passed too/i)).toBeInTheDocument();
+	});
+
+	it('does not mention project variables for an app outside a project', async () => {
+		api.getAppEnv.mockResolvedValue(envWith(['API_KEY']));
+
+		renderTab();
+
+		expect(await screen.findByText('API_KEY')).toBeInTheDocument();
+		expect(screen.queryByText(/project's shared variables/i)).not.toBeInTheDocument();
 	});
 
 	it('lists existing variables with masked values instead of starting empty', async () => {

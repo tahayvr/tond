@@ -106,6 +106,8 @@ export function issuerLabel(kind: IssuerKind, issuer: string | null): string {
 			return "Let's Encrypt staging";
 		case 'custom':
 			return issuer ?? 'Custom CA';
+		case 'uploaded':
+			return issuer ? `Uploaded · ${issuer}` : 'Uploaded';
 		default:
 			return '—';
 	}
@@ -126,13 +128,29 @@ export function targetLabel(target: CertificateTarget): { label: string; href: s
 						: `Preview of ${target.app_name}`,
 				href: `/apps/${target.app_id}?tab=settings&section=previews`
 			};
+		case 'wildcard': {
+			const hosts = `${target.hosts} ${target.hosts === 1 ? 'host' : 'hosts'}`;
+			if (target.purpose === 'apps') {
+				return { label: `Wildcard for every app (${hosts})`, href: '/integrations/dns' };
+			}
+			if (target.purpose === 'previews') {
+				return { label: `Wildcard for every preview (${hosts})`, href: '/integrations/dns' };
+			}
+			return { label: `Wildcard (${hosts})`, href: null };
+		}
 		default:
 			return { label: 'Not in use', href: null };
 	}
 }
 
+/** Uploaded by an admin: never renewed by Tond. */
+export function isUploaded(cert: Certificate): boolean {
+	return cert.cert_type === 'custom';
+}
+
 /** Show "Retry now" for rows that are waiting on a backoff or failing. */
 export function canRetry(cert: Certificate, now: number): boolean {
+	if (isUploaded(cert)) return false;
 	const problem = certificateProblem(cert, now);
 	return (
 		problem === 'failing' ||

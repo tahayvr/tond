@@ -38,6 +38,7 @@ const DOCKER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Docker daemon health for the services panel.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct DockerHealth {
     pub reachable: bool,
     pub version: Option<String>,
@@ -177,6 +178,7 @@ fn process_uptime(stat: &str, proc_uptime: &str) -> Option<u64> {
 
 /// One category of the disk breakdown.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct UsageItem {
     pub bytes: i64,
     pub count: i64,
@@ -186,6 +188,7 @@ pub struct UsageItem {
 
 /// `docker system df` plus the Tond data directory.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct DiskUsage {
     pub images: UsageItem,
     pub containers: UsageItem,
@@ -335,6 +338,7 @@ pub fn dir_size(dir: &Path) -> Option<i64> {
 
 /// One dangling image.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct DanglingImage {
     pub id: String,
     pub bytes: i64,
@@ -344,6 +348,7 @@ pub struct DanglingImage {
 
 /// What "Free up space" would remove.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct CleanupPreview {
     /// Unused build cache.
     pub build_cache_bytes: i64,
@@ -357,6 +362,7 @@ pub struct CleanupPreview {
 
 /// What was removed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct CleanupResult {
     pub build_cache_bytes: i64,
     pub build_cache_entries: i64,

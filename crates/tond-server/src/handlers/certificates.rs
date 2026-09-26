@@ -1,13 +1,25 @@
-// handlers/certificates.rs — TLS certificate status
+// handlers/certificates.rs — TLS certificate status and uploaded certificates
 //
-//   list_certs()  GET  /api/certs                 — every certificate, with what it serves
-//   retry_cert()  POST /api/certs/{domain}/retry  — try issuance now instead of after backoff
+//   list_certs()   GET    /api/v1/certs                  — every certificate, with what it serves
+//   retry_cert()   POST   /api/v1/certs/{domain}/retry   — try issuance now instead of after backoff
+//   upload_cert()  POST   /api/v1/certs/custom           — serve an uploaded certificate for a domain
+//   delete_custom_cert() DELETE /api/v1/certs/custom/{domain} — stop serving it (ACME takes over)
 //
 // tond-proxy obtains and renews certificates; tond-server stores the results
 // it reports over the control socket (proxy_link.rs). The list joins each row
-// with what currently uses the domain (dashboard, an app, a preview, or
-// nothing), and adds served domains the proxy has not reported on yet, so the
-// Certificates page shows the whole picture.
+// with what currently uses the domain (dashboard, an app, a preview, a
+// wildcard, or nothing), and adds served domains the proxy has not reported
+// on yet — including the apps / preview wildcards once a DNS provider covers
+// them — so the Certificates page shows the whole picture. Hosts covered by
+// an active wildcard (or uploaded) certificate need no certificate of their
+// own and are not listed as waiting.
+//
+// Uploaded certificates: tond-server doesn't parse X.509 (no OpenSSL here);
+// it hands the PEMs to tond-proxy, which validates them (the key matches the
+// leaf, the chain is in order, not expired, covers the domain), writes them
+// to the certs directory it owns (key 0600) and serves them. The row has
+// cert_type 'custom': never renewed or overwritten by ACME, expiry alerts
+// still apply.
 
 use std::collections::HashMap;
 
@@ -19,19 +31,54 @@ use axum::{
 };
 use serde_json::json;
 use sqlx::SqlitePool;
+use tond_common::dns::wildcard_covers;
 use tond_common::*;
 
 use crate::audit_log::{AuditEntry, record};
 use crate::auth::{Authz, RateLimit, scope};
+use crate::domains::{is_valid_hostname, normalize_domain};
 use crate::error::AppError;
 use crate::proxy_link;
 use crate::state::AppState;
+
+/// Largest PEM accepted for an upload (a long chain is a few KiB).
+const MAX_PEM_BYTES: usize = 64 * 1024;
 
 /// A domain tond currently serves, and whether tond-proxy routes it now (and
 /// so should be obtaining a certificate for it).
 struct Served {
     target: CertificateTarget,
     routed: bool,
+}
+
+/// The domain settings the list depends on.
+#[derive(Debug, Clone, Default)]
+pub struct CertContext {
+    pub dashboard: String,
+    pub apps: String,
+    pub preview: String,
+}
+
+impl CertContext {
+    pub async fn load(state: &AppState) -> Self {
+        let s = state.settings.read().await;
+        Self {
+            dashboard: s.dashboard_domain.clone(),
+            apps: s.apps_domain.clone(),
+            preview: s.preview_domain.clone(),
+        }
+    }
+
+    fn wildcard_purpose(&self, pattern: &str) -> &'static str {
+        let base = pattern.strip_prefix("*.").unwrap_or(pattern);
+        if !self.apps.is_empty() && base == self.apps {
+            "apps"
+        } else if !self.preview.is_empty() && base == self.preview {
+            "previews"
+        } else {
+            "custom"
+        }
+    }
 }
 
 /// Every domain tond serves, keyed by domain. Mirrors tond-proxy's routing
@@ -43,9 +90,9 @@ async fn served_domains(
     let mut served = HashMap::new();
 
     let apps: Vec<(String, String, String, String, bool)> = sqlx::query_as(
-        "SELECT id, name, domain, readiness,
-                status = 'running' AND host_port IS NOT NULL
-         FROM apps WHERE domain IS NOT NULL AND domain != ''",
+        "SELECT a.id, a.name, d.domain, a.readiness,
+                a.status = 'running' AND a.host_port IS NOT NULL
+         FROM app_domains d JOIN apps a ON a.id = d.app_id",
     )
     .fetch_all(db)
     .await?;
@@ -95,31 +142,79 @@ async fn served_domains(
     Ok(served)
 }
 
+/// Wildcards tond-proxy orders: `*.<apps domain>` and `*.<preview domain>`
+/// when a DNS provider covers them (mirrors tond-proxy's issuance.rs).
+async fn ordered_wildcards(db: &SqlitePool, ctx: &CertContext) -> Result<Vec<String>, sqlx::Error> {
+    let providers = crate::dns_providers::list(db).await?;
+    Ok([&ctx.apps, &ctx.preview]
+        .into_iter()
+        .filter(|base| !base.is_empty())
+        .map(|base| format!("*.{base}"))
+        .filter(|w| crate::dns_providers::provider_for(&providers, w).is_some())
+        .collect())
+}
+
 /// Certificate rows joined with what they serve, plus routed domains that
 /// have no row yet. Problems first is the dashboard's job; this is sorted by
 /// domain.
 pub async fn certificate_list(
     db: &SqlitePool,
-    dashboard_domain: &str,
+    ctx: &CertContext,
 ) -> Result<Vec<CertificateResponse>, sqlx::Error> {
     let rows = sqlx::query_as::<_, Certificate>("SELECT * FROM certificates")
         .fetch_all(db)
         .await?;
-    let mut served = served_domains(db, dashboard_domain).await?;
+    let mut served = served_domains(db, &ctx.dashboard).await?;
+    let routed_hosts: Vec<String> = served
+        .iter()
+        .filter(|(_, s)| s.routed)
+        .map(|(d, _)| d.clone())
+        .collect();
+    let hosts_covered = |pattern: &str| {
+        let n = routed_hosts
+            .iter()
+            .filter(|h| wildcard_covers(pattern, h))
+            .count();
+        u32::try_from(n).unwrap_or(u32::MAX)
+    };
+    // Active wildcard / uploaded certificates cover hosts on their own.
+    let covering: Vec<String> = rows
+        .iter()
+        .filter(|r| r.status == "active" && (r.domain.starts_with("*.") || r.cert_type == "custom"))
+        .map(|r| r.domain.to_lowercase())
+        .collect();
 
     let mut list: Vec<CertificateResponse> = rows
         .into_iter()
         .map(|row| {
-            let target = served
-                .remove(&row.domain.to_lowercase())
-                .map_or(CertificateTarget::Unused, |s| s.target);
+            let domain = row.domain.to_lowercase();
+            let target = if domain.starts_with("*.") {
+                CertificateTarget::Wildcard {
+                    purpose: ctx.wildcard_purpose(&domain).into(),
+                    hosts: hosts_covered(&domain),
+                }
+            } else {
+                served
+                    .remove(&domain)
+                    .map_or(CertificateTarget::Unused, |s| s.target)
+            };
             CertificateResponse::from_row(row, target)
         })
         .collect();
+    for wildcard in ordered_wildcards(db, ctx).await? {
+        if !list.iter().any(|c| c.domain == wildcard) {
+            let target = CertificateTarget::Wildcard {
+                purpose: ctx.wildcard_purpose(&wildcard).into(),
+                hosts: hosts_covered(&wildcard),
+            };
+            list.push(CertificateResponse::waiting(wildcard, target));
+        }
+    }
     list.extend(
         served
             .into_iter()
             .filter(|(_, s)| s.routed)
+            .filter(|(d, _)| !covering.iter().any(|c| c == d || wildcard_covers(c, d)))
             .map(|(domain, s)| CertificateResponse::waiting(domain, s.target)),
     );
     list.sort_by(|a, b| a.domain.cmp(&b.domain));
@@ -133,14 +228,14 @@ pub async fn list_certs(
     _auth: Authz<scope::AppsRead>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
-    let dashboard_domain = state.settings.read().await.dashboard_domain.clone();
-    let list = certificate_list(&state.db, &dashboard_domain).await?;
+    let ctx = CertContext::load(&state).await;
+    let list = certificate_list(&state.db, &ctx).await?;
     Ok((StatusCode::OK, Json(ApiResponse::ok(list))))
 }
 
 // ── Retry a certificate now ──
 
-/// POST /api/certs/{domain}/retry — ask tond-proxy to attempt issuance now
+/// POST /api/v1/certs/{domain}/retry — ask tond-proxy to attempt issuance now
 /// instead of waiting for the backoff. The failure count is kept, so repeated
 /// retries of a broken domain still back off. A served domain without a row
 /// yet just gets a certificate pass.
@@ -163,7 +258,7 @@ pub async fn retry_cert(
     if updated == 0 {
         let dashboard_domain = state.settings.read().await.dashboard_domain.clone();
         let served = served_domains(&state.db, &dashboard_domain).await?;
-        if !served.get(&domain).is_some_and(|s| s.routed) {
+        if !served.get(&domain).is_some_and(|s| s.routed) && !domain.starts_with("*.") {
             return Err(TondError::NotFound(format!("No certificate for {domain}")).into());
         }
     }
@@ -182,6 +277,134 @@ pub async fn retry_cert(
         Json(ApiResponse::ok(
             json!({ "message": "Certificate retry queued", "domain": domain }),
         )),
+    ))
+}
+
+// ── Uploaded certificates ──
+
+/// A domain an uploaded certificate may serve: a hostname or `*.hostname`.
+fn check_cert_domain(raw: &str) -> Result<String, AppError> {
+    let domain = normalize_domain(raw);
+    let host = domain.strip_prefix("*.").unwrap_or(&domain);
+    if !is_valid_hostname(host) {
+        return Err(AppError(TondError::invalid_field(
+            "domain",
+            format!(
+                "'{}' isn't a valid domain (use app.example.com or *.example.com)",
+                raw.trim()
+            ),
+        )));
+    }
+    Ok(domain)
+}
+
+/// POST /api/v1/certs/custom — validate (in tond-proxy) and serve an uploaded
+/// certificate. Replaces an ACME certificate for the same domain; ACME stops
+/// renewing it until the upload is removed.
+pub async fn upload_cert(
+    _rate: RateLimit,
+    auth: Authz<scope::SettingsWrite>,
+    State(state): State<AppState>,
+    Json(req): Json<UploadCertificateRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let domain = check_cert_domain(&req.domain)?;
+    if req.cert_pem.len() > MAX_PEM_BYTES || req.key_pem.len() > MAX_PEM_BYTES {
+        return Err(AppError(TondError::PayloadTooLarge(
+            "Certificate and key must each be under 64 KiB of PEM".into(),
+        )));
+    }
+    if !req.cert_pem.contains("-----BEGIN CERTIFICATE-----") {
+        return Err(AppError(TondError::invalid_field(
+            "cert_pem",
+            "The certificate must be PEM (-----BEGIN CERTIFICATE-----), leaf first, then the \
+             intermediates",
+        )));
+    }
+    if !req.key_pem.contains("PRIVATE KEY-----") {
+        return Err(AppError(TondError::invalid_field(
+            "key_pem",
+            "The private key must be PEM (-----BEGIN PRIVATE KEY----- or an RSA/EC key)",
+        )));
+    }
+    let installed = proxy_link::install_cert(&domain, req.cert_pem, req.key_pem).await?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO certificates (id, domain, cert_type, cert_path, key_path, issued_at, expires_at,
+                                   status, created_at, updated_at, last_error, last_attempt_at,
+                                   next_retry_at, failure_count, issuer, last_renewed_at, challenge)
+         VALUES (?1, ?2, 'custom', ?3, ?4, ?5, ?6, 'active', ?7, ?7, NULL, ?7, NULL, 0, ?8, ?7, NULL)
+         ON CONFLICT(domain) DO UPDATE SET
+            cert_type = 'custom', cert_path = excluded.cert_path, key_path = excluded.key_path,
+            issued_at = excluded.issued_at, expires_at = excluded.expires_at, status = 'active',
+            updated_at = excluded.updated_at, last_error = NULL, last_attempt_at = excluded.last_attempt_at,
+            next_retry_at = NULL, failure_count = 0, issuer = excluded.issuer,
+            last_renewed_at = excluded.last_renewed_at, challenge = NULL",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(&domain)
+    .bind(&installed.cert_path)
+    .bind(&installed.key_path)
+    .bind(&installed.issued_at)
+    .bind(&installed.expires_at)
+    .bind(&now)
+    .bind(&installed.issuer)
+    .execute(&state.db)
+    .await?;
+
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("cert_upload")
+            .resource("certificate", &domain, &domain)
+            .detail(format!(
+                "expires_at={} issuer={} names={}",
+                installed.expires_at,
+                installed.issuer.as_deref().unwrap_or("-"),
+                installed.names.join(",")
+            )),
+    )
+    .await;
+    let ctx = CertContext::load(&state).await;
+    let entry = certificate_list(&state.db, &ctx)
+        .await?
+        .into_iter()
+        .find(|c| c.domain == domain);
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(entry))))
+}
+
+/// DELETE /api/v1/certs/custom/{domain} — stop serving an uploaded certificate.
+/// A domain Tond still serves gets an ACME certificate on the next pass.
+pub async fn delete_custom_cert(
+    _rate: RateLimit,
+    auth: Authz<scope::SettingsWrite>,
+    State(state): State<AppState>,
+    Path(domain): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let domain = check_cert_domain(&domain)?;
+    let exists: Option<String> =
+        sqlx::query_scalar("SELECT id FROM certificates WHERE domain = ? AND cert_type = 'custom'")
+            .bind(&domain)
+            .fetch_optional(&state.db)
+            .await?;
+    if exists.is_none() {
+        return Err(TondError::NotFound(format!("No uploaded certificate for {domain}")).into());
+    }
+    proxy_link::remove_cert(&domain).await?;
+    sqlx::query("DELETE FROM certificates WHERE domain = ?")
+        .bind(&domain)
+        .execute(&state.db)
+        .await?;
+    tokio::spawn(proxy_link::request_certs(None));
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("cert_upload_remove").resource("certificate", &domain, &domain),
+    )
+    .await;
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(json!({ "deleted": domain }))),
     ))
 }
 
@@ -239,7 +462,11 @@ mod tests {
         )
         .await;
 
-        let list = certificate_list(&db, "Dash.Example.com")
+        let ctx = CertContext {
+            dashboard: "Dash.Example.com".into(),
+            ..Default::default()
+        };
+        let list = certificate_list(&db, &ctx)
             .await
             .unwrap_or_else(|e| panic!("list: {e}"));
         let by_domain = |d: &str| {
@@ -285,6 +512,114 @@ mod tests {
         sorted.sort();
         assert_eq!(domains, sorted);
     }
+    #[tokio::test]
+    async fn uploads_need_pem_and_a_running_proxy() {
+        let state = AppState::for_tests().await;
+        let upload = |cert: &str, key: &str| UploadCertificateRequest {
+            domain: "*.corp.example.com".into(),
+            cert_pem: cert.into(),
+            key_pem: key.into(),
+        };
+        let not_pem = upload_cert(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            State(state.clone()),
+            Json(upload("hello", "key")),
+        )
+        .await;
+        assert!(
+            matches!(&not_pem, Err(AppError(e)) if e.field() == Some("cert_pem") && e.message().contains("PEM")),
+            "PEM is checked before anything else"
+        );
+        let no_proxy = upload_cert(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            State(state.clone()),
+            Json(upload(
+                "-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----",
+                "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----",
+            )),
+        )
+        .await;
+        assert!(
+            matches!(&no_proxy, Err(AppError(e)) if e.code() == "SERVICE_UNAVAILABLE" && e.message().contains("tond-proxy isn't running")),
+            "the proxy validates and stores uploads"
+        );
+        let bad_domain = upload_cert(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            State(state),
+            Json(UploadCertificateRequest {
+                domain: "not a domain".into(),
+                ..upload("", "")
+            }),
+        )
+        .await;
+        assert!(bad_domain.is_err());
+    }
+
+    #[tokio::test]
+    async fn wildcards_are_listed_and_cover_their_hosts() {
+        let db = db().await;
+        let now = "2026-05-01T00:00:00Z";
+        exec(
+            &db,
+            &format!(
+                "INSERT INTO apps (id, name, domain, status, host_port, created_at, updated_at)
+                 VALUES ('a1', 'web', 'web.apps.test', 'running', 4000, '{now}', '{now}'),
+                        ('a2', 'shop', 'shop.example.com', 'running', 4001, '{now}', '{now}')"
+            ),
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO dns_providers (id, name, kind, zones, token_enc, created_at, updated_at)
+             VALUES ('p1', 'cf', 'cloudflare', '[\"apps.test\"]', 'x', 'now', 'now')",
+        )
+        .await;
+        let ctx = CertContext {
+            dashboard: String::new(),
+            apps: "apps.test".into(),
+            preview: "previews.test".into(),
+        };
+        let list = certificate_list(&db, &ctx)
+            .await
+            .unwrap_or_else(|e| panic!("list: {e}"));
+        let domains: Vec<&str> = list.iter().map(|c| c.domain.as_str()).collect();
+        assert_eq!(
+            domains,
+            vec!["*.apps.test", "shop.example.com", "web.apps.test"],
+            "the wildcard is waiting; hosts still wait too until it is issued"
+        );
+        assert_eq!(
+            list[0].serves,
+            CertificateTarget::Wildcard {
+                purpose: "apps".into(),
+                hosts: 1
+            }
+        );
+
+        exec(
+            &db,
+            "INSERT INTO certificates (id, domain, cert_path, key_path, issued_at, expires_at, status, challenge)
+             VALUES ('w', '*.apps.test', '/c', '/k', 'i', '2030-01-01T00:00:00Z', 'active', 'dns-01'),
+                    ('u', 'shop.example.com', '/c', '/k', 'i', '2030-01-01T00:00:00Z', 'active', NULL)",
+        )
+        .await;
+        exec(
+            &db,
+            "UPDATE certificates SET cert_type = 'custom' WHERE id = 'u'",
+        )
+        .await;
+        let list = certificate_list(&db, &ctx)
+            .await
+            .unwrap_or_else(|e| panic!("list: {e}"));
+        let domains: Vec<&str> = list.iter().map(|c| c.domain.as_str()).collect();
+        assert_eq!(domains, vec!["*.apps.test", "shop.example.com"]);
+        assert_eq!(list[0].challenge.as_deref(), Some("dns-01"));
+        assert_eq!(list[1].issuer_kind, IssuerKind::Uploaded);
+    }
+
     #[tokio::test]
     async fn retry_cert_clears_next_retry_but_keeps_the_failure_count() {
         let state = AppState::for_tests().await;

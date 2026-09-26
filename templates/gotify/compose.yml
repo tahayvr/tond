@@ -1,0 +1,20 @@
+services:
+  gotify:
+    image: gotify/server:2.9.1
+    restart: unless-stopped
+    mem_limit: 128m
+    ports: ["80"]
+    environment:
+      GOTIFY_DEFAULTUSER_NAME: admin
+      GOTIFY_DEFAULTUSER_PASS: ${ADMIN_PASSWORD}
+      GOTIFY_REGISTRATION: "false"
+      TZ: UTC
+    volumes:
+      - ./data:/app/data
+    # Timings only: the image's own HEALTHCHECK test is kept, but its 30s interval
+    # would keep the deploy waiting.
+    healthcheck:
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      start_interval: 1s

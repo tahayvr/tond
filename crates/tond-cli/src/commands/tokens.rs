@@ -7,12 +7,15 @@
 //
 // The secret is printed once, on stdout alone, so it can be captured with
 // `TOKEN=$(sudo tond token create … )`; everything else goes to stderr.
+// With --json, stdout holds the whole created-token object (secret included).
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use clap::Subcommand;
 use tond_common::{CreateTokenRequest, TokenKind, TokenResponse};
 
 use crate::client::TondClient;
+use crate::error::CliError;
+use crate::output::{Output, note, outln};
 
 #[derive(Subcommand)]
 pub enum TokenAction {
@@ -53,14 +56,22 @@ pub enum TokenAction {
     },
 
     /// List API tokens (yours, or every token with --all)
+    #[command(visible_alias = "ls")]
     List {
         /// Every user's tokens (needs tokens:admin; always the case as root)
         #[arg(long)]
         all: bool,
     },
 
-    /// Revoke an API token (by id, name or visible prefix)
-    Revoke { token: String },
+    /// Revoke an API token (by id, name or visible prefix; asks first)
+    #[command(visible_aliases = ["delete", "rm"])]
+    Revoke {
+        token: String,
+
+        /// Don't ask for confirmation (required when stdin is not a terminal)
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
 }
 
 /// Parse a lifetime like `24h`, `30d`, `12w` or `never` into hours (0 = never).
@@ -74,13 +85,13 @@ pub fn parse_expiry(value: &str) -> Result<i64> {
         anyhow::anyhow!("invalid lifetime '{value}': use e.g. 24h, 30d, 12w or never")
     })?;
     if n <= 0 {
-        bail!("the lifetime must be positive");
+        anyhow::bail!("the lifetime must be positive");
     }
     Ok(match unit {
         "h" => n,
         "d" => n * 24,
         "w" => n * 24 * 7,
-        _ => bail!("invalid lifetime '{value}': use e.g. 24h, 30d, 12w or never"),
+        _ => anyhow::bail!("invalid lifetime '{value}': use e.g. 24h, 30d, 12w or never"),
     })
 }
 
@@ -125,7 +136,7 @@ fn describe(t: &TokenResponse) -> String {
     )
 }
 
-pub async fn handle(client: &TondClient, action: TokenAction) -> Result<()> {
+pub async fn handle(client: &TondClient, out: &Output, action: TokenAction) -> Result<()> {
     match action {
         TokenAction::Create {
             name,
@@ -137,8 +148,12 @@ pub async fn handle(client: &TondClient, action: TokenAction) -> Result<()> {
             allowed_ips,
             expires,
         } => {
-            let kind: TokenKind = kind.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-            let expires_in_hours = expires.as_deref().map(parse_expiry).transpose()?;
+            let kind: TokenKind = kind.parse().map_err(CliError::usage)?;
+            let expires_in_hours = expires
+                .as_deref()
+                .map(parse_expiry)
+                .transpose()
+                .map_err(|e| CliError::usage(e.to_string()))?;
             let created = client
                 .create_token(&CreateTokenRequest {
                     name,
@@ -151,22 +166,26 @@ pub async fn handle(client: &TondClient, action: TokenAction) -> Result<()> {
                     expires_in_hours,
                 })
                 .await?;
-            eprintln!("Created API token:\n{}", describe(&created.token));
-            eprintln!("\nStore it now: it won't be shown again.");
-            println!("{}", created.secret);
+            out.json(&created)?;
+            note!(out, "Created API token:\n{}", describe(&created.token));
+            note!(out, "\nStore it now: it won't be shown again.");
+            outln!(out, "{}", created.secret);
         }
         TokenAction::List { all } => {
             let tokens = client.list_tokens(all).await?;
+            out.json(&tokens)?;
             if tokens.is_empty() {
-                println!(
+                outln!(
+                    out,
                     "No API tokens. Create one with `tond token create --name <name> --preset readonly`."
                 );
             }
             for t in tokens {
-                println!("{}  (id {})", describe(&t), t.id);
+                outln!(out, "{}  (id {})", describe(&t), t.id);
             }
         }
-        TokenAction::Revoke { token } => {
+        TokenAction::Revoke { token, yes } => {
+            out.can_confirm(yes, &format!("revoke token {token}"))?;
             let tokens = client.list_tokens(true).await?;
             let matches: Vec<&TokenResponse> = tokens
                 .iter()
@@ -175,13 +194,33 @@ pub async fn handle(client: &TondClient, action: TokenAction) -> Result<()> {
                 .collect();
             let target = match matches.as_slice() {
                 [one] => *one,
-                [] => bail!("no active token matches '{token}' (see `tond token list --all`)"),
-                _ => bail!(
-                    "'{token}' matches several tokens; use the id from `tond token list --all`"
-                ),
+                [] => {
+                    return Err(CliError::coded(
+                        tond_common::code::NOT_FOUND,
+                        tond_common::exit::NOT_FOUND,
+                        format!("no active token matches '{token}'"),
+                    )
+                    .with_hint("See `tond token list --all`.")
+                    .into());
+                }
+                _ => {
+                    return Err(CliError::usage(format!(
+                        "'{token}' matches several tokens; use the id from `tond token list --all`"
+                    ))
+                    .into());
+                }
             };
-            client.revoke_token(&target.id).await?;
-            println!("Revoked {} ({}).", target.name, target.prefix);
+            out.confirm(
+                yes,
+                &format!(
+                    "Revoke token {} ({})? Anything using it stops working.",
+                    target.name, target.prefix
+                ),
+                &format!("revoke token {}", target.name),
+            )?;
+            let revoked = client.revoke_token(&target.id).await?;
+            out.json(&revoked)?;
+            outln!(out, "Revoked {} ({}).", target.name, target.prefix);
         }
     }
     Ok(())

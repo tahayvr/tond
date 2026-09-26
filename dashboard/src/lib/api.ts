@@ -49,8 +49,14 @@ export interface App {
 	 * (allowed, but shown as a warning).
 	 */
 	domain_warning?: string | null;
+	/** One-click template the app was deployed from (see /templates). */
+	template_id?: string | null;
+	/** The template's version at deploy time. */
+	template_version?: string | null;
 	source_type: string;
 	source_url: string | null;
+	/** Branch deployed from source_url (repository-based apps) */
+	branch?: string | null;
 	status: string;
 	container_port: number;
 	host_port: number | null;
@@ -72,12 +78,18 @@ export interface App {
 	registry_credential_id: string | null;
 	/** GitHub App integration (Phase 4.4) */
 	github_app_id: string | null;
+	/** GitLab token for clones, commit statuses and merge request previews */
+	gitlab_token_id?: string | null;
+	/** Gitea/Forgejo token for clones, commit statuses and pull request previews */
+	gitea_token_id?: string | null;
 	// Project grouping (Phase 6.1)
 	project_id: string | null;
 	/** Raw Dockerfile content (source_type='dockerfile') */
 	dockerfile_content: string | null;
 	/** Raw docker-compose.yml content (source_type='compose') */
 	compose_content: string | null;
+	/** Compose from a git repository: path of the compose file in it */
+	compose_path?: string | null;
 	/** Subdirectory to use as build root (monorepo support) */
 	base_dir: string | null;
 	/** Whether build output is served as a static site */
@@ -105,65 +117,120 @@ export function appReadiness(app: Pick<App, 'readiness'>): Readiness {
 	return app.readiness === 'tcp' || app.readiness === 'none' ? app.readiness : 'http';
 }
 
-export interface TemplateProject {
-	name: string;
+// ── One-click templates (GET /api/templates, POST /api/templates/{id}/deploy) ──
+
+export type TemplateInputKind = 'text' | 'email' | 'password' | 'url';
+
+/** A value the deploy form asks for (computed values are not listed). */
+export interface TemplateInput {
+	key: string;
+	label: string;
 	description: string | null;
+	kind: TemplateInputKind;
+	/** Must be filled in: no default and not generated. */
+	required: boolean;
+	/** Left empty, the server generates a random value. */
+	generated: boolean;
+	/** Pre-filled value; may contain {app_url}, {app_host} or {app_name}. */
+	default: string | null;
+	/** Shown once after the deploy (first-login credentials). */
+	credential: boolean;
 }
 
-export interface TemplateSource {
-	kind: string;
-	url: string;
-	ref: string | null;
+export interface TemplateService {
+	name: string;
+	image: string;
+	/** The service that gets the app's domain. */
+	public: boolean;
+	memory_limit_mb: number;
 }
 
 export interface TemplateVolume {
-	container_path: string;
+	service: string;
+	/** Bind source relative to the app's volume directory, e.g. "./data". */
+	path: string;
 	description: string;
+	owner: string | null;
 }
 
-export interface TemplateDeploy {
-	method: string;
-	default_port: number;
-	health_check_path: string | null;
-	volumes: TemplateVolume[];
+export interface TemplatePublic {
+	service: string;
+	port: number;
+	health_path: string | null;
 }
 
-export interface TemplateEnvVar {
-	key: string;
-	description: string;
-	required: boolean | null;
-	value: string | null;
-}
-
-export interface TemplateDependency {
-	name: string | null;
-	kind: string;
-	engine: string | null;
-	required: boolean | null;
-}
-
-export interface TemplateCatalogEntry {
+export interface Template {
 	id: string;
 	name: string;
 	description: string;
+	about: string | null;
 	category: string;
 	tags: string[];
-	maintainers: string[];
-	project: TemplateProject | null;
-	source: TemplateSource;
-	deploy: TemplateDeploy;
-	required_env: TemplateEnvVar[];
-	optional_env: TemplateEnvVar[];
-	dependencies: TemplateDependency[];
-	recommended_domains: string[];
+	/** Simple Icons slug. */
+	logo: string | null;
+	version: string;
+	website: string | null;
+	docs: string | null;
+	repository: string | null;
+	/** Typical memory of all services together, in MiB. */
+	ram_mb: number;
+	fits_2gb: boolean;
+	/** CPU architectures its images exist for ('amd64', 'arm64'). */
+	architectures: string[];
+	public: TemplatePublic;
+	services: TemplateService[];
+	volumes: TemplateVolume[];
+	inputs: TemplateInput[];
+	setup_notes: string | null;
+	upgrade_notes: string | null;
 	post_deploy_checks: string[];
+	compose: string;
+}
+
+export interface TemplateHostMemory {
+	total_mb: number;
+	available_mb: number;
+}
+
+export interface TemplateCatalog {
+	templates: Template[];
+	/** null until the host collector's first sample. */
+	memory: TemplateHostMemory | null;
+	/** Apps without a domain get `<name>.<apps_domain>` ("" = none). */
+	apps_domain: string;
+	/** This server's CPU architecture ('amd64' | 'arm64'). */
+	architecture: string;
+}
+
+export interface TemplateDeployRequest {
+	name: string;
+	domain?: string;
+	project_id?: string;
+	inputs: Record<string, string>;
+	/** Deploy even though the template needs more memory than is free. */
+	allow_low_memory?: boolean;
+}
+
+export interface TemplateCredential {
+	key: string;
+	label: string;
+	value: string;
+}
+
+export interface TemplateDeployResult {
+	app_id: string;
+	app_name: string;
+	domain: string | null;
+	deployment_id: string;
+	/** Shown once: the server doesn't return them again. */
+	credentials: TemplateCredential[];
 	setup_notes: string | null;
 }
 
 /** A user's role. Admin is the owner; see `Role::scopes` on the server. */
 export type Role = 'admin' | 'deployer' | 'viewer';
 
-/** A permission, e.g. `apps:deploy` (full list: GET /api/tokens/catalog). */
+/** A permission, e.g. `apps:deploy` (full list: GET /api/v1/tokens/catalog). */
 export type Scope = string;
 
 export interface User {
@@ -187,15 +254,30 @@ export interface AuthStatus {
 	user: User | null;
 }
 
+/**
+ * The `error` object of a failed response. `code` is stable (the ErrorCode
+ * enum in /api/v1/openapi.json); switch on it, never on `message`.
+ */
+export interface ApiErrorBody {
+	code: string;
+	message: string;
+	/** What to do next, when the server has something to say. */
+	hint?: string;
+	/** The request field the error is about (validation errors). */
+	field?: string;
+}
+
+/** Every API response: `{success, data}` or `{success: false, data: null, error}`. */
 interface ApiResponse<T> {
 	success: boolean;
 	data: T | null;
-	error: string | null;
-	/** Stable error code on some failures, e.g. SCOPE_DENIED, TOKEN_EXPIRED */
-	code?: string;
+	error?: ApiErrorBody | null;
+	/** Informational note on a success. */
+	message?: string;
 }
 
-const BASE = '/api';
+/** Versioned API root (the OpenAPI spec is at `${BASE}/openapi.json`). */
+export const BASE = '/api/v1';
 
 /**
  * Sent on every API request. The server requires it on cookie-authenticated
@@ -216,20 +298,36 @@ export class ApiError extends Error {
 	readonly retryAfter: number | null;
 	/** Stable error code from the server (e.g. `SCOPE_DENIED`), when it sent one. */
 	readonly code: string | null;
+	/** The server's "what to do next", when it sent one. */
+	readonly hint: string | null;
+	/** The request field the error is about, for validation errors. */
+	readonly field: string | null;
 
 	constructor(
 		message: string,
 		status: number,
 		retryAfter: number | null = null,
-		code: string | null = null
+		code: string | null = null,
+		details: { hint?: string | null; field?: string | null } = {}
 	) {
 		super(message);
 		this.name = 'ApiError';
 		this.status = status;
 		this.retryAfter = retryAfter;
 		this.code = code;
+		this.hint = details.hint ?? null;
+		this.field = details.field ?? null;
 	}
 }
+
+/** Stable error codes the dashboard reacts to (full list: ErrorCode in the spec). */
+export const ERROR_CODES = {
+	invalidCredentials: 'INVALID_CREDENTIALS',
+	rateLimited: 'RATE_LIMITED',
+	scopeDenied: 'SCOPE_DENIED',
+	notFound: 'NOT_FOUND',
+	appNotFound: 'APP_NOT_FOUND'
+} as const;
 
 // Endpoints that answer 401 for a wrong password or code. A 401 from these is
 // an input error, not an expired session, so it must not sign the user out.
@@ -268,11 +366,28 @@ export function parseRetryAfter(header: string | null, now: number = Date.now())
 	return Math.max(0, Math.ceil((date - now) / 1000));
 }
 
+/** The `error.code` of a JSON error body, without consuming the response. */
+async function peekErrorCode(res: Response): Promise<string | null> {
+	try {
+		const body = await res.clone().json();
+		return typeof body?.error?.code === 'string' ? body.error.code : null;
+	} catch {
+		return null;
+	}
+}
+
 /** Turn a fetch Response into data or a descriptive ApiError. */
 async function parseResponse<T>(path: string, res: Response): Promise<T> {
 	const endpoint = path.split('?')[0];
 
-	if (res.status === 401 && !CREDENTIAL_ENDPOINTS.includes(endpoint)) {
+	// A 401 is an expired session unless the endpoint checks a password or
+	// code (then it is an input error, INVALID_CREDENTIALS).
+	const code401 = res.status === 401 ? await peekErrorCode(res) : null;
+	if (
+		res.status === 401 &&
+		code401 !== ERROR_CODES.invalidCredentials &&
+		!CREDENTIAL_ENDPOINTS.includes(endpoint)
+	) {
 		unauthorizedHandler?.();
 		throw new ApiError(SESSION_EXPIRED_MESSAGE, 401);
 	}
@@ -306,11 +421,13 @@ async function parseResponse<T>(path: string, res: Response): Promise<T> {
 		throw notApi();
 	}
 	if (!res.ok || !json.success) {
+		const error = json.error && typeof json.error === 'object' ? json.error : null;
 		throw new ApiError(
-			json.error || `Request failed (HTTP ${res.status})`,
+			error?.message || `Request failed (HTTP ${res.status})`,
 			res.status,
 			null,
-			json.code ?? null
+			error?.code ?? null,
+			{ hint: error?.hint, field: error?.field }
 		);
 	}
 	return json.data as T;
@@ -334,12 +451,86 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 	return parseResponse<T>(path, res);
 }
 
+// ── API contract (GET /api/v1/openapi.json) ──
+
+/** The parts of an OpenAPI 3.1 operation the API page reads. */
+export interface OpenApiOperation {
+	operationId?: string;
+	summary?: string;
+	description?: string;
+	tags?: string[];
+	parameters?: { $ref?: string; name?: string; in?: string; [key: string]: unknown }[];
+	security?: Record<string, string[]>[];
+	responses?: Record<string, unknown>;
+	'x-tond-scopes'?: string[];
+	'x-tond-websocket'?: boolean;
+}
+
+/** The parts of the server's OpenAPI document the API page reads. */
+export interface OpenApiDocument {
+	openapi: string;
+	info?: { title?: string; version?: string; description?: string };
+	tags?: { name: string; description?: string }[];
+	paths?: Record<
+		string,
+		Partial<Record<'get' | 'post' | 'put' | 'patch' | 'delete', OpenApiOperation>>
+	>;
+	components?: {
+		schemas?: {
+			ErrorCode?: {
+				[key: string]: unknown;
+				'x-tond-codes'?: { code: string; status: number; exit_code: number; description: string }[];
+				'x-tond-exit-codes'?: { exit_code: number; name: string; meaning: string }[];
+			};
+		};
+	};
+}
+
+/** URL of the OpenAPI document (public, no credentials needed). */
+export const OPENAPI_URL = `${BASE}/openapi.json`;
+
+/**
+ * The OpenAPI document. It is a plain JSON document, not an API envelope, so
+ * it doesn't go through request<T>().
+ */
+export async function getOpenApiSpec(): Promise<OpenApiDocument> {
+	let res: Response;
+	try {
+		res = await fetch(OPENAPI_URL, { credentials: 'same-origin' });
+	} catch {
+		throw new ApiError(SERVER_UNAVAILABLE_MESSAGE, 0);
+	}
+	if (!res.ok) {
+		throw new ApiError(`Could not load the API description (HTTP ${res.status})`, res.status);
+	}
+	try {
+		return (await res.json()) as OpenApiDocument;
+	} catch {
+		throw new ApiError('The API description is not valid JSON.', res.status);
+	}
+}
+
 export async function listApps(): Promise<App[]> {
 	return request<App[]>('/apps');
 }
 
-export async function listTemplates(): Promise<TemplateCatalogEntry[]> {
-	return request<TemplateCatalogEntry[]>('/templates');
+export async function listTemplates(): Promise<TemplateCatalog> {
+	return request<TemplateCatalog>('/templates');
+}
+
+/**
+ * Create an app from a template and queue its first deploy. Fails with 409
+ * `INSUFFICIENT_MEMORY` when the template needs more memory than is free,
+ * unless `allow_low_memory` is set.
+ */
+export async function deployTemplate(
+	id: string,
+	body: TemplateDeployRequest
+): Promise<TemplateDeployResult> {
+	return request<TemplateDeployResult>(`/templates/${encodeURIComponent(id)}/deploy`, {
+		method: 'POST',
+		body: JSON.stringify(body)
+	});
 }
 
 export async function getApp(id: string): Promise<App> {
@@ -370,8 +561,12 @@ export async function createApp(data: {
 	github_app_id?: string;
 	/** Raw Dockerfile content (required when source_type='dockerfile') */
 	dockerfile_content?: string;
-	/** Raw docker-compose.yml content (required when source_type='compose') */
+	/** Raw docker-compose.yml content (inline compose apps) */
 	compose_content?: string;
+	/** Compose from a git repository (source_url + branch): compose file path */
+	compose_path?: string;
+	/** Compose: the service that gets `container_port` and `domain` */
+	compose_service?: string;
 	/** Subdirectory to use as build root (monorepo support) */
 	base_dir?: string;
 	/** Serve build output as a static site */
@@ -497,10 +692,88 @@ export async function updateDomain(id: string, domain: string): Promise<UpdateDo
 	});
 }
 
+// ── App domains (several per app) ──
+
+/** primary: the app's main address · alias: also served · redirect: answered with a 301/308 */
+export type DomainKind = 'primary' | 'alias' | 'redirect';
+
+export interface AppDomain {
+	domain: string;
+	kind: DomainKind;
+	/** For redirects: the domain visitors are sent to (a serving domain of the same app) */
+	redirect_to: string | null;
+	/** 301 or 308 */
+	redirect_code: number;
+	/** Compose apps: the service this domain routes to (null: the main container) */
+	service: string | null;
+	port: number | null;
+	created_at: string;
+	/** Under the apps domain (the automatic address) */
+	automatic: boolean;
+	/** Set when the domain is on the same site as the dashboard */
+	warning: string | null;
+}
+
+export interface AddAppDomainRequest {
+	domain: string;
+	/** Default: primary when the app has none, else alias */
+	kind?: DomainKind;
+	redirect_to?: string;
+	redirect_code?: 301 | 308;
+}
+
+export interface UpdateAppDomainRequest {
+	kind?: DomainKind;
+	redirect_to?: string;
+	redirect_code?: 301 | 308;
+}
+
+export async function listAppDomains(id: string): Promise<AppDomain[]> {
+	return request<AppDomain[]>(`/apps/${id}/domains`);
+}
+
+/** Every call returns the app's full, updated domain list. */
+export async function addAppDomain(id: string, req: AddAppDomainRequest): Promise<AppDomain[]> {
+	return request<AppDomain[]>(`/apps/${id}/domains`, {
+		method: 'POST',
+		body: JSON.stringify(req)
+	});
+}
+
+/** Add example.com and www.example.com: `canonical` serves, the other redirects to it. */
+export async function addWwwPair(
+	id: string,
+	domain: string,
+	canonical: 'apex' | 'www',
+	primary = true
+): Promise<AppDomain[]> {
+	return request<AppDomain[]>(`/apps/${id}/domains/www-pair`, {
+		method: 'POST',
+		body: JSON.stringify({ domain, canonical, primary })
+	});
+}
+
+export async function updateAppDomain(
+	id: string,
+	domain: string,
+	req: UpdateAppDomainRequest
+): Promise<AppDomain[]> {
+	return request<AppDomain[]>(`/apps/${id}/domains/${encodeURIComponent(domain)}`, {
+		method: 'PATCH',
+		body: JSON.stringify(req)
+	});
+}
+
+export async function removeAppDomain(id: string, domain: string): Promise<AppDomain[]> {
+	return request<AppDomain[]>(`/apps/${id}/domains/${encodeURIComponent(domain)}`, {
+		method: 'DELETE'
+	});
+}
+
 // ── Certificates ──
 
 /** Which CA issued a certificate. */
-export type IssuerKind = 'letsencrypt' | 'letsencrypt_staging' | 'custom' | 'unknown';
+export type IssuerKind = 'letsencrypt' | 'letsencrypt_staging' | 'custom' | 'uploaded' | 'unknown';
 
 /** What a certificate's domain is used for right now. */
 export type CertificateTarget =
@@ -513,6 +786,8 @@ export type CertificateTarget =
 			preview_id: string;
 			pr_number: number | null;
 	  }
+	/** purpose: apps (the apps domain) | previews (the preview domain) | custom */
+	| { kind: 'wildcard'; purpose: 'apps' | 'previews' | 'custom'; hosts: number }
 	| { kind: 'unused' };
 
 export interface Certificate {
@@ -535,6 +810,8 @@ export interface Certificate {
 	issuer_kind: IssuerKind;
 	/** Last successful issuance or renewal */
 	last_renewed_at: string | null;
+	/** How the CA validated the domain (ACME certificates) */
+	challenge: 'http-01' | 'dns-01' | null;
 	serves: CertificateTarget;
 }
 
@@ -544,6 +821,104 @@ export async function listCertificates(): Promise<Certificate[]> {
 
 export async function retryCertificate(domain: string): Promise<void> {
 	await request(`/certs/${encodeURIComponent(domain)}/retry`, { method: 'POST' });
+}
+
+export interface UploadCertificateRequest {
+	/** app.example.com or *.example.com */
+	domain: string;
+	/** PEM: the leaf first, then the intermediates */
+	cert_pem: string;
+	/** PEM private key (unencrypted) */
+	key_pem: string;
+}
+
+/** tond-proxy validates the upload (key, chain order, validity, names) before serving it. */
+export async function uploadCertificate(
+	req: UploadCertificateRequest
+): Promise<Certificate | null> {
+	return request<Certificate | null>('/certs/custom', {
+		method: 'POST',
+		body: JSON.stringify(req)
+	});
+}
+
+/** Stop serving an uploaded certificate; Tond requests one from Let's Encrypt again. */
+export async function deleteUploadedCertificate(domain: string): Promise<void> {
+	await request(`/certs/custom/${encodeURIComponent(domain)}`, { method: 'DELETE' });
+}
+
+// ── DNS providers (ACME DNS-01: wildcard certificates) ──
+
+export type DnsProviderKind =
+	'cloudflare' | 'hetzner' | 'digitalocean' | 'route53' | 'challtestsrv';
+
+export interface DnsProviderConfig {
+	/** Route 53: the access key id (the secret access key is the token) */
+	access_key_id?: string;
+	/** challtestsrv (tests only): management API URL */
+	url?: string;
+}
+
+export interface DnsProvider {
+	id: string;
+	name: string;
+	kind: DnsProviderKind;
+	/** Zones the provider may write challenge records in, e.g. ["example.com"] */
+	zones: string[];
+	config: DnsProviderConfig;
+	/** The token is write-only: never returned */
+	token_set: boolean;
+	created_at: string;
+	updated_at: string;
+	last_used_at: string | null;
+	last_error: string | null;
+}
+
+export interface CreateDnsProviderRequest {
+	name: string;
+	kind: DnsProviderKind;
+	zones: string[];
+	token: string;
+	config?: DnsProviderConfig;
+}
+
+export interface UpdateDnsProviderRequest {
+	name?: string;
+	zones?: string[];
+	/** Replaced only when sent */
+	token?: string;
+	config?: DnsProviderConfig;
+}
+
+export interface DnsProviderTestResult {
+	ok: boolean;
+	zones: { zone: string; ok: boolean; message: string }[];
+}
+
+export async function listDnsProviders(): Promise<DnsProvider[]> {
+	return request<DnsProvider[]>('/dns-providers');
+}
+
+export async function createDnsProvider(req: CreateDnsProviderRequest): Promise<DnsProvider> {
+	return request<DnsProvider>('/dns-providers', { method: 'POST', body: JSON.stringify(req) });
+}
+
+export async function updateDnsProvider(
+	id: string,
+	req: UpdateDnsProviderRequest
+): Promise<DnsProvider> {
+	return request<DnsProvider>(`/dns-providers/${id}`, {
+		method: 'PATCH',
+		body: JSON.stringify(req)
+	});
+}
+
+export async function deleteDnsProvider(id: string): Promise<void> {
+	await request(`/dns-providers/${id}`, { method: 'DELETE' });
+}
+
+export async function testDnsProvider(id: string): Promise<DnsProviderTestResult> {
+	return request<DnsProviderTestResult>(`/dns-providers/${id}/test`, { method: 'POST' });
 }
 
 export async function updateHealth(
@@ -603,6 +978,99 @@ export interface ComposeValidation {
 	valid: boolean;
 	/** One human-readable line per problem (privileged, host binds, …) */
 	errors: string[];
+	/** The services the file declares (empty when it doesn't parse) */
+	services?: ComposeServiceSpec[];
+}
+
+/** A service as a compose file declares it. */
+export interface ComposeServiceSpec {
+	name: string;
+	image: string | null;
+	/** Has a build: section (Tond builds it on deploy) */
+	builds: boolean;
+	/** Container ports under ports: and expose: */
+	ports: number[];
+	has_healthcheck: boolean;
+}
+
+/** GET /apps/{id}/services: one compose service and what Docker reports now. */
+export interface ComposeService extends ComposeServiceSpec {
+	/** Container port Tond publishes for routing (null = internal only) */
+	published_port: number | null;
+	/** Loopback host port bound to the published port */
+	host_port: number | null;
+	/** The published port changed since the last deploy */
+	redeploy_required: boolean;
+	domains: string[];
+	/** "pending" | "running" | "restarting" | "paused" | "created" | "exited" | "dead" | "missing" */
+	status: string;
+	/** "healthy" | "unhealthy" | "starting"; null without a healthcheck */
+	health: string | null;
+	exit_code: number | null;
+	container_id: string | null;
+	/** Pinned image the container runs: tond-<app>/<service>:<image id prefix> */
+	running_image: string | null;
+	image_digest: string | null;
+	/** Latest CPU use in 1/100 % of one core */
+	cpu: number | null;
+	/** Latest memory use in bytes */
+	mem: number | null;
+}
+
+export interface ServiceUpdateResult {
+	service: ComposeService | null;
+	port_changed: boolean;
+	redeploy_required: boolean;
+	warnings: string[];
+}
+
+export async function listServices(appId: string): Promise<ComposeService[]> {
+	return request<ComposeService[]>(`/apps/${appId}/services`);
+}
+
+/** Publish a container port of a service and route domains to it. */
+export async function updateService(
+	appId: string,
+	service: string,
+	data: { published_port: number | null; domains: string[] }
+): Promise<ServiceUpdateResult> {
+	return request<ServiceUpdateResult>(`/apps/${appId}/services/${encodeURIComponent(service)}`, {
+		method: 'PUT',
+		body: JSON.stringify(data)
+	});
+}
+
+export type ServiceAction = 'restart' | 'stop' | 'start';
+
+export async function serviceAction(
+	appId: string,
+	service: string,
+	action: ServiceAction
+): Promise<{ message: string; service: ComposeService | null }> {
+	return request(`/apps/${appId}/services/${encodeURIComponent(service)}/${action}`, {
+		method: 'POST'
+	});
+}
+
+export async function serviceLogs(
+	appId: string,
+	service: string,
+	tail = 200
+): Promise<{ service: string; lines: string[] }> {
+	return request(`/apps/${appId}/services/${encodeURIComponent(service)}/logs?tail=${tail}`);
+}
+
+/** Replace a compose app's file (inline) or its repository location. */
+export async function updateCompose(
+	appId: string,
+	data: {
+		compose_content?: string;
+		source_url?: string;
+		branch?: string;
+		compose_path?: string;
+	}
+): Promise<{ message: string; services: ComposeService[] }> {
+	return request(`/apps/${appId}/compose`, { method: 'PUT', body: JSON.stringify(data) });
 }
 
 /** Check a compose file against Tond's policy without creating anything. */
@@ -787,7 +1255,7 @@ export interface RoleInfo {
 	scopes: Scope[];
 }
 
-/** Everything the token form needs, from GET /api/tokens/catalog. */
+/** Everything the token form needs, from GET /api/v1/tokens/catalog. */
 export interface TokenCatalog {
 	groups: ScopeGroupInfo[];
 	presets: TokenPreset[];
@@ -1237,6 +1705,21 @@ export interface Deployment {
 	rollback_available: boolean;
 	/** Why rollback is unavailable (tooltip text); null when available */
 	rollback_unavailable_reason: string | null;
+	/** Compose apps: per-service images and progress */
+	services?: DeploymentService[];
+}
+
+/** One service of a compose deployment. */
+export interface DeploymentService {
+	service: string;
+	/** "build" | "pull" | "reuse" */
+	source: string;
+	source_image: string | null;
+	/** Pinned tag rollback restores */
+	image: string | null;
+	digest: string | null;
+	/** "pending" | "building" | "pulling" | "ready" | "starting" | "healthy" | "running" | "failed" */
+	status: string;
 }
 
 export interface DeploymentLogLine {
@@ -1419,6 +1902,12 @@ export interface DnsRecord {
 export type DnsCheckStatus = 'ok' | 'mismatch' | 'missing' | 'inconclusive';
 
 export interface DomainCertificate {
+	/** The certificate's own name (`*.apps.example.com` for a wildcard) */
+	domain: string;
+	/** "acme" | "custom" (uploaded) */
+	cert_type: string;
+	challenge: 'http-01' | 'dns-01' | null;
+	issuer: string | null;
 	status: string;
 	issued_at: string;
 	expires_at: string;
@@ -1444,6 +1933,10 @@ export interface DomainCheck {
 		message: string;
 	};
 	certificate: DomainCertificate | null;
+	/** Set when a wildcard certificate serves the domain */
+	covered_by: string | null;
+	/** DNS provider that validates the domain with DNS-01, if any */
+	dns_provider: string | null;
 	checked_at: string;
 	/** Set when the domain is on the same site as the dashboard (allowed, shown as a warning) */
 	warning?: string | null;
@@ -1478,7 +1971,7 @@ export interface WebhookUrls {
 
 export interface WebhookConfig {
 	app_id: string;
-	/** Paths relative to the server origin, e.g. `/api/webhooks/github/<uuid>` */
+	/** Paths relative to the server origin, e.g. `/api/v1/webhooks/github/<uuid>` */
 	paths: WebhookUrls;
 	/** Absolute URLs when the dashboard domain is configured, else null */
 	urls: WebhookUrls | null;
@@ -1570,6 +2063,78 @@ export interface GitHubApp {
 
 export async function listGitHubApps(): Promise<GitHubApp[]> {
 	return request<GitHubApp[]>('/github-apps');
+}
+
+// ── Git tokens (GitLab, Gitea/Forgejo) ──
+// A token linked to an app lets Tond clone its private repository, report
+// deploys and previews as commit statuses (tond/deploy, tond/preview) and
+// comment the preview URL on pull/merge requests.
+
+export interface GitLabToken {
+	id: string;
+	name: string;
+	gitlab_url: string;
+	username: string;
+	created_at: string;
+}
+
+export interface GiteaToken {
+	id: string;
+	name: string;
+	/** Instance URL, e.g. https://codeberg.org */
+	base_url: string;
+	username: string;
+	created_at: string;
+}
+
+export async function listGitLabTokens(): Promise<GitLabToken[]> {
+	return request<GitLabToken[]>('/gitlab-tokens');
+}
+
+/** Store a GitLab personal access token (checked against the instance first). */
+export async function createGitLabToken(data: {
+	name: string;
+	token: string;
+	gitlab_url?: string;
+}): Promise<GitLabToken> {
+	return request<GitLabToken>('/gitlab-tokens', { method: 'POST', body: JSON.stringify(data) });
+}
+
+export async function deleteGitLabToken(id: string): Promise<void> {
+	await request(`/gitlab-tokens/${id}`, { method: 'DELETE' });
+}
+
+export async function listGiteaTokens(): Promise<GiteaToken[]> {
+	return request<GiteaToken[]>('/gitea-tokens');
+}
+
+/** Store a Gitea/Forgejo access token (checked against the instance first). */
+export async function createGiteaToken(data: {
+	name: string;
+	token: string;
+	base_url: string;
+}): Promise<GiteaToken> {
+	return request<GiteaToken>('/gitea-tokens', { method: 'POST', body: JSON.stringify(data) });
+}
+
+export async function deleteGiteaToken(id: string): Promise<void> {
+	await request(`/gitea-tokens/${id}`, { method: 'DELETE' });
+}
+
+/** Link (or with null, unlink) a GitLab token and an app. */
+export async function setAppGitLabToken(appId: string, tokenId: string | null): Promise<App> {
+	return request<App>(`/apps/${appId}/gitlab-token`, {
+		method: 'PUT',
+		body: JSON.stringify({ gitlab_token_id: tokenId })
+	});
+}
+
+/** Link (or with null, unlink) a Gitea/Forgejo token and an app. */
+export async function setAppGiteaToken(appId: string, tokenId: string | null): Promise<App> {
+	return request<App>(`/apps/${appId}/gitea-token`, {
+		method: 'PUT',
+		body: JSON.stringify({ gitea_token_id: tokenId })
+	});
 }
 
 export interface GitHubAppManifestForm {
@@ -2013,7 +2578,7 @@ export function accessLogDownloadUrl(appId: string): string {
 	return `${BASE}/apps/${encodeURIComponent(appId)}/access-log/download`;
 }
 
-// ── Tond measuring itself (GET /api/system/self) ──
+// ── Tond measuring itself (GET /api/v1/system/self) ──
 
 /** Health of one background loop of tond-server or tond-proxy. */
 export interface LoopStats {
@@ -2091,7 +2656,7 @@ export async function getSystemSelf(): Promise<SystemSelf> {
 	return request<SystemSelf>('/system/self');
 }
 
-// ── Host history, disk, Docker (GET /api/system/host…) ──
+// ── Host history, disk, Docker (GET /api/v1/system/host…) ──
 
 export interface Filesystem {
 	mount: string;
@@ -2301,6 +2866,104 @@ export async function testHeartbeat(): Promise<HeartbeatOutcome & { heartbeat: H
 	});
 }
 
+// ── Tond updates (System → Updates) ──
+
+/** A published Tond release. */
+export interface TondRelease {
+	version: string;
+	tag: string;
+	name: string;
+	url: string;
+	published_at: string | null;
+	/** Release notes (Markdown). */
+	body: string;
+}
+
+export type UpdateRunKind = 'update' | 'rollback';
+export type UpdateRunState = 'running' | 'succeeded' | 'failed' | 'rolled_back' | 'interrupted';
+
+/** An update or rollback run (status.json on the server). */
+export interface UpdateRun {
+	id: string;
+	kind: UpdateRunKind;
+	/** As written by the run; see `effective_state`. */
+	state: UpdateRunState;
+	/** snapshot, download, backup, install, migrate, health, proxy, rollback, done */
+	step: string;
+	from_version: string;
+	to_version: string;
+	actor: string;
+	snapshot_id: string | null;
+	/** Unix seconds. */
+	started_at: number;
+	updated_at: number;
+	finished_at: number | null;
+	message: string;
+	pid: number | null;
+	/** The automatic rollback put the pre-update database back. */
+	database_restored: boolean;
+	/** `state`, except a run whose process vanished is `interrupted`. */
+	effective_state: UpdateRunState;
+	/** The last lines of the run's output. */
+	log: string[];
+}
+
+export interface UpdateRollbackOption {
+	to_version: string;
+	backup_created_at: number;
+	available_until: number;
+	/** Rolling back also restores the database from before the update. */
+	restores_database: boolean;
+}
+
+export interface UpdateOverview {
+	current_version: string;
+	schema_version: number | null;
+	latest: TondRelease | null;
+	update_available: boolean;
+	/** Releases newer than the running version, newest first. */
+	changelog: TondRelease[];
+	check: { enabled: boolean; checked_at: number | null; error: string | null };
+	run: UpdateRun | null;
+	rollback: UpdateRollbackOption | null;
+	/** Why updates can't run from the dashboard on this server. */
+	unsupported_reason: string | null;
+}
+
+export async function getUpdateOverview(): Promise<UpdateOverview> {
+	return request<UpdateOverview>('/system/update');
+}
+
+/** Look for new releases now (throttled to once a minute by the server). */
+export async function checkForUpdates(): Promise<UpdateOverview> {
+	return request<UpdateOverview>('/system/update/check', { method: 'POST' });
+}
+
+/** Snapshot, then update in the background. Returns the new run. */
+export async function startUpdate(
+	options: { version?: string; skip_snapshot?: boolean; force?: boolean } = {}
+): Promise<UpdateRun> {
+	return request<UpdateRun>('/system/update', {
+		method: 'POST',
+		body: JSON.stringify(options)
+	});
+}
+
+/** Roll back to the version before the last update. */
+export async function startRollback(options: { skip_snapshot?: boolean } = {}): Promise<UpdateRun> {
+	return request<UpdateRun>('/system/update/rollback', {
+		method: 'POST',
+		body: JSON.stringify(options)
+	});
+}
+
+export async function setUpdateCheck(checkEnabled: boolean): Promise<UpdateOverview> {
+	return request<UpdateOverview>('/system/update/settings', {
+		method: 'PUT',
+		body: JSON.stringify({ check_enabled: checkEnabled })
+	});
+}
+
 // ── Uptime checks ──
 
 export type UptimeStatus = 'up' | 'down' | 'paused' | 'pending';
@@ -2449,7 +3112,7 @@ export type AlertScope = 'app' | 'host' | 'certificate' | 'backup' | 'cron';
 /** How the value is compared with the threshold ("none": a yes/no condition). */
 export type AlertComparison = 'above' | 'at_least' | 'below' | 'none';
 
-/** One rule kind as described by the server (GET /api/alerts/kinds). */
+/** One rule kind as described by the server (GET /api/v1/alerts/kinds). */
 export interface AlertKindInfo {
 	kind: AlertKind;
 	label: string;
@@ -2921,6 +3584,20 @@ export interface ManagedDatabase {
 	updated_at: string;
 	/** Port published on all interfaces (reachable from the internet). Off by default. */
 	public_access: boolean;
+	/** Engine major version, e.g. "16" */
+	version: string;
+	/** Image variant: "" (the engine's own image) | "pgvector" | "postgis" */
+	variant: string;
+	/** Cron expression of this database's own backups (null = none) */
+	backup_schedule: string | null;
+	/** Scheduled backups of this database kept */
+	backup_retention: number;
+	/** Addresses (IP or CIDR) allowed to connect while public; empty = anyone */
+	allowlist: string[];
+	/** Serves TLS (PostgreSQL, MySQL, MariaDB) */
+	tls: boolean;
+	/** A major-version upgrade in progress or waiting for confirmation */
+	upgrade: DbUpgradeState | null;
 }
 
 /** Connection strings in a detail response have the password masked. */
@@ -2929,6 +3606,149 @@ export interface ManagedDatabaseDetail extends ManagedDatabase {
 	/** Connection string via the server's public address; only when public_access is on */
 	public_connection_string: string | null;
 	internal_connection_string: string | null;
+	/** Newer versions this database can be upgraded to */
+	upgrade_targets: string[];
+	/** Why its network access deserves attention (public without an allowlist, …) */
+	access_warning: string | null;
+	/** The allowlist is loaded into the server firewall */
+	allowlist_enforced: boolean;
+	/** The engine can serve TLS */
+	supports_tls: boolean;
+	/** Set when nothing backs this database up automatically */
+	backup_warning: string | null;
+}
+
+export type DbUpgradeStatus = 'running' | 'awaiting_confirmation' | 'failed';
+
+/** A major-version upgrade (see the server's db_upgrade.rs). */
+export interface DbUpgradeState {
+	status: DbUpgradeStatus;
+	from_version: string;
+	to_version: string;
+	from_image: string;
+	to_image: string;
+	/** What the upgrade is doing, or did last */
+	step: string;
+	/** Backup taken before anything changed */
+	backup_id: string | null;
+	started_at: string;
+	finished_at: string | null;
+	error: string | null;
+	rollback_dir?: string | null;
+}
+
+/** One engine + variant the server can run (GET /databases/catalog). */
+export interface DbCatalogEntry {
+	db_type: string;
+	/** "" = the engine's own image */
+	variant: string;
+	label: string;
+	description: string;
+	/** Oldest first */
+	versions: string[];
+	default_version: string;
+	extensions: string[];
+	/** False for x86_64-only images on an ARM64 server */
+	available: boolean;
+	supports_tls: boolean;
+	supports_upgrade: boolean;
+}
+
+export async function getDatabaseCatalog(): Promise<DbCatalogEntry[]> {
+	return request<DbCatalogEntry[]>('/databases/catalog');
+}
+
+/** Schedule and health of one database's backups. */
+export interface DatabaseBackupStatus {
+	schedule: string | null;
+	retention: number;
+	next_run_at: string | null;
+	full_snapshots_enabled: boolean;
+	full_schedule: string | null;
+	last_backup_at: string | null;
+	/** Latest attempt of this database's own backups */
+	last_status: 'completed' | 'failed' | null;
+	last_error: string | null;
+	warning: string | null;
+}
+
+export async function getDatabaseBackupSchedule(id: string): Promise<DatabaseBackupStatus> {
+	return request<DatabaseBackupStatus>(`/databases/${id}/backup-schedule`);
+}
+
+/** Set (or with an empty/null schedule, turn off) a database's backup schedule. */
+export async function updateDatabaseBackupSchedule(
+	id: string,
+	data: { schedule: string | null; retention?: number }
+): Promise<DatabaseBackupStatus> {
+	return request<DatabaseBackupStatus>(`/databases/${id}/backup-schedule`, {
+		method: 'PUT',
+		body: JSON.stringify(data)
+	});
+}
+
+/** A PostgreSQL extension offered for a database. */
+export interface DatabaseExtension {
+	name: string;
+	/** The image ships it */
+	available: boolean;
+	installed_version: string | null;
+	default_version: string | null;
+	comment: string | null;
+}
+
+export async function listDatabaseExtensions(id: string): Promise<DatabaseExtension[]> {
+	return request<DatabaseExtension[]>(`/databases/${id}/extensions`);
+}
+
+/** CREATE EXTENSION for one of the offered extensions. */
+export async function enableDatabaseExtension(
+	id: string,
+	name: string
+): Promise<{ message: string }> {
+	return request<{ message: string }>(`/databases/${id}/extensions`, {
+		method: 'POST',
+		body: JSON.stringify({ name })
+	});
+}
+
+/** Start a guarded major-version upgrade (admin). Returns the initial state. */
+export async function upgradeDatabase(id: string, version: string): Promise<DbUpgradeState> {
+	return request<DbUpgradeState>(`/databases/${id}/upgrade`, {
+		method: 'POST',
+		body: JSON.stringify({ version })
+	});
+}
+
+/** Keep the new version: the old data directory is deleted. */
+export async function confirmDatabaseUpgrade(id: string): Promise<{ message: string }> {
+	return request<{ message: string }>(`/databases/${id}/upgrade/confirm`, { method: 'POST' });
+}
+
+/** Go back to the old version and its data (writes since the upgrade are lost). */
+export async function rollbackDatabaseUpgrade(id: string): Promise<{ message: string }> {
+	return request<{ message: string }>(`/databases/${id}/upgrade/rollback`, { method: 'POST' });
+}
+
+/** Clear a failed upgrade's notice. */
+export async function dismissDatabaseUpgrade(id: string): Promise<void> {
+	await request(`/databases/${id}/upgrade/dismiss`, { method: 'POST' });
+}
+
+export interface RestoredDatabase {
+	message: string;
+	database: ManagedDatabase;
+}
+
+/** Restore one database of a backup into a NEW database; the original is untouched. */
+export async function restoreDatabaseToNew(
+	snapshotId: string,
+	data: { source: string; name: string; project_id?: string | null }
+): Promise<RestoredDatabase> {
+	return request<RestoredDatabase>(`/snapshots/${snapshotId}/restore-new-database`, {
+		method: 'POST',
+		body: JSON.stringify(data)
+	});
 }
 
 // ── Database access (links) ──
@@ -3030,6 +3850,12 @@ export async function createDatabase(data: {
 	db_type: string;
 	project_id?: string;
 	memory_limit?: number;
+	/** Major version (default: the engine's default) */
+	version?: string;
+	/** Image variant: "pgvector" | "postgis" */
+	variant?: string;
+	/** Cron expression for this database's own backups */
+	backup_schedule?: string;
 }): Promise<CreatedDatabase> {
 	return request<CreatedDatabase>('/databases', {
 		method: 'POST',
@@ -3058,6 +3884,10 @@ export async function updateDatabase(
 		memory_limit?: number | null;
 		/** Admin only. The container is recreated immediately. */
 		public_access?: boolean;
+		/** Admin only. Addresses allowed while public; [] = anyone. */
+		allowlist?: string[];
+		/** Admin only. Recreates the container. */
+		tls?: boolean;
 	}
 ): Promise<ManagedDatabaseDetail> {
 	return request<ManagedDatabaseDetail>(`/databases/${id}`, {
@@ -3301,7 +4131,7 @@ export async function listCronJobRuns(
 
 // ── Log streaming (WebSocket) ──────────────────────────────────────────────
 //
-// The backend sends JSON frames over a WebSocket at /api/apps/{id}/logs/stream.
+// The backend sends JSON frames over a WebSocket at /api/v1/apps/{id}/logs/stream.
 //
 // Frame types:
 //   { type: "snapshot", deploy_logs: DeployLog[], container_logs: {ts: string|null, line: string}[] }
@@ -3319,6 +4149,8 @@ export interface LogLine {
 	ts?: string;
 	/** Present on system log stream frames; identifies the source app */
 	appName?: string;
+	/** Compose apps: the service that wrote the line */
+	service?: string;
 }
 
 export interface LogStreamCallbacks {
@@ -3409,7 +4241,7 @@ function emitCronRun(
  * tond-server restarted). Returns a `close()` function — call it in $effect
  * cleanup.
  *
- * Pass a relative URL like `/api/apps/{id}/logs/stream`; it will be resolved
+ * Pass a relative URL like `/api/v1/apps/{id}/logs/stream`; it will be resolved
  * to `ws://` or `wss://` automatically based on the current page protocol.
  */
 export function openLogStream(path: string, callbacks: LogStreamCallbacks): () => void {
@@ -3443,7 +4275,12 @@ function handleLogFrame(ev: MessageEvent, callbacks: LogStreamCallbacks) {
 			});
 		}
 		for (const line of frame.container_logs ?? []) {
-			callbacks.onLine({ source: 'container', text: line.line, ts: line.ts ?? undefined });
+			callbacks.onLine({
+				source: 'container',
+				text: line.line,
+				ts: line.ts ?? undefined,
+				service: line.service ?? undefined
+			});
 		}
 		// Cron run snapshot: single run object (may be null)
 		if (frame.run) {
@@ -3462,7 +4299,8 @@ function handleLogFrame(ev: MessageEvent, callbacks: LogStreamCallbacks) {
 			source: 'container',
 			text: frame.line,
 			ts: frame.ts ?? undefined,
-			appName: frame.app_name
+			appName: frame.app_name,
+			service: frame.service ?? undefined
 		});
 	} else if (frame.type === 'run') {
 		// Cron run completed frame
@@ -3737,7 +4575,7 @@ export interface Snapshot {
 	id: string;
 	name: string;
 	status: string; // "pending" | "running" | "completed" | "failed"
-	trigger: string; // "scheduled" | "manual" | "pre_deploy" | "pre_restore"
+	trigger: string; // "scheduled" | "manual" | "pre_deploy" | "pre_restore" | "pre_update" | "pre_upgrade"
 	scope: string; // "full" | "app:name" | "database:name"
 	trigger_app: string | null;
 	deployment_id: string | null;
@@ -3843,4 +4681,4 @@ export async function updateBackupConfig(config: Partial<BackupConfig>): Promise
 		body: JSON.stringify(config)
 	});
 }
-// Download: window.open(`/api/snapshots/${id}/download`) — no fetch wrapper needed
+// Download: window.open(`/api/v1/snapshots/${id}/download`) — no fetch wrapper needed

@@ -3,6 +3,7 @@
  * All IDs are stable so navigation between pages works (e.g. /apps/:id links).
  */
 
+import templatesJson from './templates.json';
 import type {
 	App,
 	ActiveAlert,
@@ -12,8 +13,10 @@ import type {
 	AlertRule,
 	AlertSettings,
 	AuditLogEntry,
+	AppDomain,
 	BackupConfig,
 	Certificate,
+	DnsProvider,
 	RetentionSettings,
 	AuditShipping,
 	AppEvent,
@@ -30,7 +33,9 @@ import type {
 	Integration,
 	LoopStats,
 	ManagedDatabase,
-	TemplateCatalogEntry,
+	Template,
+	TemplateHostMemory,
+	DbCatalogEntry,
 	MetricsRange,
 	MetricsResponse,
 	RequestMetricsResponse,
@@ -346,71 +351,14 @@ export const MOCK_PROJECTS: Project[] = [
 	}
 ];
 
-export const MOCK_TEMPLATES: TemplateCatalogEntry[] = [
-	{
-		id: 'plausible',
-		name: 'Plausible Analytics',
-		description: 'Self-hosted privacy-friendly analytics',
-		category: 'analytics',
-		tags: ['analytics', 'privacy'],
-		maintainers: ['tond'],
-		project: {
-			name: 'plausible',
-			description: 'Plausible app and supporting services'
-		},
-		source: {
-			kind: 'image',
-			url: 'ghcr.io/plausible/community-edition',
-			ref: 'latest'
-		},
-		deploy: {
-			method: 'image',
-			default_port: 8000,
-			health_check_path: '/',
-			volumes: [
-				{
-					container_path: '/var/lib/plausible',
-					description: 'Persistent application data and uploaded assets'
-				}
-			]
-		},
-		required_env: [
-			{
-				key: 'BASE_URL',
-				description: 'Public URL for the instance',
-				required: true,
-				value: null
-			},
-			{
-				key: 'SECRET_KEY_BASE',
-				description: 'Secret key used by Plausible',
-				required: true,
-				value: null
-			},
-			{
-				key: 'DATABASE_URL',
-				description: 'Primary PostgreSQL connection string',
-				required: true,
-				value: '${db.plausible-db.internal_connection_string}'
-			}
-		],
-		optional_env: [],
-		dependencies: [
-			{
-				name: 'plausible-db',
-				kind: 'database',
-				engine: 'postgres',
-				required: true
-			}
-		],
-		recommended_domains: ['stats.example.com'],
-		post_deploy_checks: [
-			'Open / to verify the dashboard loads',
-			'Add your site domain inside Plausible after the first login'
-		],
-		setup_notes: 'Configure BASE_URL and a PostgreSQL connection before first deploy.'
-	}
-];
+/** The real catalog (generated from templates/ by a tond-common test). */
+export const MOCK_TEMPLATES: Template[] = templatesJson as Template[];
+
+/** Host memory the mock catalog reports: small enough that heavy templates warn. */
+export const MOCK_TEMPLATE_MEMORY: TemplateHostMemory = { total_mb: 2048, available_mb: 1400 };
+
+/** The mock server's CPU (ARM64, so x86_64-only templates show as unavailable). */
+export const MOCK_SERVER_ARCH = 'arm64';
 
 // ── App environment variables (served masked by GET /apps/:id/env) ─────────
 
@@ -859,6 +807,7 @@ export const MOCK_CERTIFICATES: Certificate[] = [
 		issuer: "Let's Encrypt R11",
 		issuer_kind: 'letsencrypt',
 		last_renewed_at: daysFromNow(-24),
+		challenge: 'http-01',
 		serves: { kind: 'app', app_id: 'app_running', app_name: 'api-service' }
 	},
 	{
@@ -876,6 +825,7 @@ export const MOCK_CERTIFICATES: Certificate[] = [
 		issuer: null,
 		issuer_kind: 'unknown',
 		last_renewed_at: null,
+		challenge: 'http-01',
 		serves: { kind: 'app', app_id: 'app_stopped', app_name: 'web-frontend' }
 	},
 	{
@@ -893,6 +843,7 @@ export const MOCK_CERTIFICATES: Certificate[] = [
 		issuer: null,
 		issuer_kind: 'unknown',
 		last_renewed_at: null,
+		challenge: 'http-01',
 		serves: { kind: 'dashboard' }
 	},
 	{
@@ -910,6 +861,7 @@ export const MOCK_CERTIFICATES: Certificate[] = [
 		issuer: "Let's Encrypt R10",
 		issuer_kind: 'letsencrypt',
 		last_renewed_at: daysFromNow(-80),
+		challenge: 'http-01',
 		serves: { kind: 'app', app_id: 'app_running', app_name: 'api-service' }
 	},
 	{
@@ -926,6 +878,7 @@ export const MOCK_CERTIFICATES: Certificate[] = [
 		issuer: "(STAGING) Let's Encrypt (STAGING) Riddling Rhubarb R12",
 		issuer_kind: 'letsencrypt_staging',
 		last_renewed_at: daysFromNow(-2),
+		challenge: 'http-01',
 		serves: {
 			kind: 'preview',
 			app_id: 'app_running',
@@ -948,7 +901,93 @@ export const MOCK_CERTIFICATES: Certificate[] = [
 		issuer: "Let's Encrypt R11",
 		issuer_kind: 'letsencrypt',
 		last_renewed_at: daysFromNow(-50),
+		challenge: 'http-01',
 		serves: { kind: 'unused' }
+	},
+	{
+		id: 'cert-007',
+		domain: '*.example-apps.com',
+		cert_type: 'acme',
+		status: 'active',
+		issued_at: daysFromNow(-12),
+		expires_at: daysFromNow(78),
+		last_error: null,
+		last_attempt_at: daysFromNow(-12),
+		next_retry_at: null,
+		failure_count: 0,
+		issuer: "Let's Encrypt R11",
+		issuer_kind: 'letsencrypt',
+		last_renewed_at: daysFromNow(-12),
+		challenge: 'dns-01',
+		serves: { kind: 'wildcard', purpose: 'apps', hosts: 2 }
+	},
+	{
+		id: 'cert-008',
+		domain: 'intranet.example.org',
+		cert_type: 'custom',
+		status: 'active',
+		issued_at: daysFromNow(-340),
+		expires_at: daysFromNow(25),
+		last_error: null,
+		last_attempt_at: daysFromNow(-5),
+		next_retry_at: null,
+		failure_count: 0,
+		issuer: 'Example Corp Issuing CA',
+		issuer_kind: 'uploaded',
+		last_renewed_at: daysFromNow(-5),
+		challenge: null,
+		serves: { kind: 'app', app_id: 'app_unhealthy', app_name: 'postgres-proxy' }
+	}
+];
+
+// ── App domains ──────────────────────────────────────────────────────────────
+
+const domainRow = (
+	domain: string,
+	kind: AppDomain['kind'],
+	extra: Partial<AppDomain> = {}
+): AppDomain => ({
+	domain,
+	kind,
+	redirect_to: null,
+	redirect_code: 308,
+	service: null,
+	port: null,
+	created_at: daysFromNow(-30),
+	automatic: domain.endsWith('.example-apps.com'),
+	warning: null,
+	...extra
+});
+
+/** Domains per app id; the primary mirrors `App.domain`. */
+export const MOCK_APP_DOMAINS: Record<string, AppDomain[]> = {
+	app_running: [
+		domainRow('api.example.com', 'primary'),
+		domainRow('shop.example.com', 'alias'),
+		domainRow('api-service.example-apps.com', 'alias'),
+		domainRow('www.api.example.com', 'redirect', { redirect_to: 'api.example.com' })
+	],
+	app_stopped: [domainRow('app.example.com', 'primary')],
+	app_unhealthy: [
+		domainRow('db.example.com', 'primary'),
+		domainRow('intranet.example.org', 'alias')
+	]
+};
+
+// ── DNS providers ───────────────────────────────────────────────────────────
+
+export const MOCK_DNS_PROVIDERS: DnsProvider[] = [
+	{
+		id: 'dns_cf',
+		name: 'Cloudflare',
+		kind: 'cloudflare',
+		zones: ['example-apps.com'],
+		config: {},
+		token_set: true,
+		created_at: daysFromNow(-12),
+		updated_at: daysFromNow(-12),
+		last_used_at: daysFromNow(-12),
+		last_error: null
 	}
 ];
 
@@ -2410,11 +2449,18 @@ export const MOCK_DATABASES: ManagedDatabase[] = [
 		memory_limit: 268435456,
 		custom_external_url: null,
 		custom_internal_url: null,
-		image_used: 'postgres:16-alpine',
+		image_used: 'pgvector/pgvector:0.8.1-pg16',
 		custom_image: null,
 		created_at: '2025-02-01T10:00:00.000Z',
 		updated_at: '2025-03-01T09:00:00.000Z',
-		public_access: false
+		public_access: false,
+		version: '16',
+		variant: 'pgvector',
+		backup_schedule: '0 3 * * *',
+		backup_retention: 7,
+		allowlist: [],
+		tls: false,
+		upgrade: null
 	},
 	{
 		id: 'db_redis1',
@@ -2434,7 +2480,14 @@ export const MOCK_DATABASES: ManagedDatabase[] = [
 		custom_image: null,
 		created_at: '2025-02-10T14:00:00.000Z',
 		updated_at: '2025-02-10T14:00:00.000Z',
-		public_access: false
+		public_access: false,
+		version: '7',
+		variant: '',
+		backup_schedule: null,
+		backup_retention: 7,
+		allowlist: [],
+		tls: false,
+		upgrade: null
 	},
 	{
 		id: 'db_mysql1',
@@ -2450,11 +2503,18 @@ export const MOCK_DATABASES: ManagedDatabase[] = [
 		memory_limit: 536870912,
 		custom_external_url: null,
 		custom_internal_url: null,
-		image_used: 'mysql:8',
+		image_used: 'mysql:8.0',
 		custom_image: null,
 		created_at: '2025-01-20T08:00:00.000Z',
 		updated_at: '2025-02-28T12:00:00.000Z',
-		public_access: false
+		public_access: false,
+		version: '8.0',
+		variant: '',
+		backup_schedule: null,
+		backup_retention: 7,
+		allowlist: [],
+		tls: false,
+		upgrade: null
 	},
 	{
 		id: 'db_mariadb1',
@@ -2470,11 +2530,129 @@ export const MOCK_DATABASES: ManagedDatabase[] = [
 		memory_limit: 268435456,
 		custom_external_url: null,
 		custom_internal_url: null,
-		image_used: 'mariadb:11',
+		image_used: 'mariadb:11.4',
 		custom_image: null,
 		created_at: '2025-03-01T12:00:00.000Z',
 		updated_at: '2025-03-01T12:00:00.000Z',
-		public_access: true
+		public_access: true,
+		version: '11.4',
+		variant: '',
+		backup_schedule: '30 2 * * *',
+		backup_retention: 14,
+		allowlist: [],
+		tls: true,
+		upgrade: null
+	}
+];
+
+/** What the server can run (GET /api/databases/catalog), as on an x86_64 server. */
+export const MOCK_DB_CATALOG: DbCatalogEntry[] = [
+	{
+		db_type: 'postgres',
+		variant: '',
+		label: '',
+		description: '',
+		versions: ['14', '15', '16', '17', '18'],
+		default_version: '16',
+		extensions: [
+			'pg_stat_statements',
+			'pg_trgm',
+			'pgcrypto',
+			'uuid-ossp',
+			'citext',
+			'hstore',
+			'btree_gin',
+			'btree_gist',
+			'unaccent',
+			'ltree'
+		],
+		available: true,
+		supports_tls: true,
+		supports_upgrade: true
+	},
+	{
+		db_type: 'postgres',
+		variant: 'pgvector',
+		label: 'PostgreSQL + pgvector',
+		description: 'Vector similarity search for embeddings (the pgvector image).',
+		versions: ['14', '15', '16', '17', '18'],
+		default_version: '16',
+		extensions: ['vector', 'pg_stat_statements', 'pg_trgm', 'pgcrypto', 'uuid-ossp', 'citext'],
+		available: true,
+		supports_tls: true,
+		supports_upgrade: true
+	},
+	{
+		db_type: 'postgres',
+		variant: 'postgis',
+		label: 'PostgreSQL + PostGIS',
+		description: 'Geographic objects and spatial queries (the PostGIS image). x86_64 servers only.',
+		versions: ['14', '15', '16', '17', '18'],
+		default_version: '16',
+		extensions: ['postgis', 'postgis_topology', 'fuzzystrmatch', 'pg_trgm', 'uuid-ossp'],
+		available: true,
+		supports_tls: true,
+		supports_upgrade: true
+	},
+	{
+		db_type: 'mysql',
+		variant: '',
+		label: '',
+		description: '',
+		versions: ['8.0', '8.4'],
+		default_version: '8.4',
+		extensions: [],
+		available: true,
+		supports_tls: true,
+		supports_upgrade: true
+	},
+	{
+		db_type: 'mariadb',
+		variant: '',
+		label: '',
+		description: '',
+		versions: ['10.11', '11.4', '11.8'],
+		default_version: '11.8',
+		extensions: [],
+		available: true,
+		supports_tls: true,
+		supports_upgrade: true
+	},
+	{
+		db_type: 'redis',
+		variant: '',
+		label: '',
+		description: '',
+		versions: ['6', '7', '8'],
+		default_version: '7',
+		extensions: [],
+		available: true,
+		supports_tls: false,
+		supports_upgrade: true
+	},
+	{
+		db_type: 'keydb',
+		variant: '',
+		label: '',
+		description: '',
+		versions: ['latest'],
+		default_version: 'latest',
+		extensions: [],
+		available: true,
+		supports_tls: false,
+		supports_upgrade: false
+	},
+	{
+		db_type: 'mongodb',
+		variant: '',
+		label: '',
+		description: '',
+		versions: ['6', '7', '8'],
+		default_version: '7',
+		extensions: [],
+		available: true,
+		supports_tls: false,
+		supports_upgrade: true
 	}
 ];
 
@@ -3100,7 +3278,7 @@ export function makeMockSystemSelf(): SystemSelf {
 		http: [
 			{
 				method: 'GET',
-				route: '/api/apps',
+				route: '/api/v1/apps',
 				count: 120,
 				errors: 0,
 				sum_ms: 240,

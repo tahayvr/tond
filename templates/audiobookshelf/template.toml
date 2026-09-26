@@ -1,0 +1,40 @@
+id = "audiobookshelf"
+name = "Audiobookshelf"
+description = "Audiobook and podcast server with progress sync and mobile apps."
+about = "Audiobookshelf streams your audiobooks and podcasts to the web and its Android and iOS apps, keeps listening progress in sync across devices, fetches metadata and covers, and downloads new podcast episodes automatically. Upload books from the web UI; they are stored in the app's volume."
+category = "media"
+tags = ["audiobooks", "podcasts", "media", "library"]
+logo = "audiobookshelf"
+version = "2.36"
+website = "https://www.audiobookshelf.org"
+docs = "https://www.audiobookshelf.org/docs"
+repository = "https://github.com/advplyr/audiobookshelf"
+ram_mb = 200
+setup_notes = "Open the app right away and create the root user (the first visitor sets it). Then add a library pointing at /audiobooks or /podcasts."
+upgrade_notes = "Change the image to a newer 2.x tag and redeploy; the database is migrated on start. Snapshot the app first."
+post_deploy_checks = ["Create the root user", "Add a library for /audiobooks"]
+
+[public]
+service = "audiobookshelf"
+port = 80
+health_path = "/healthcheck"
+
+[[volumes]]
+service = "audiobookshelf"
+path = "./config"
+description = "The database and settings"
+
+[[volumes]]
+service = "audiobookshelf"
+path = "./metadata"
+description = "Covers, cache, backups and logs"
+
+[[volumes]]
+service = "audiobookshelf"
+path = "./audiobooks"
+description = "Your audiobooks (/audiobooks)"
+
+[[volumes]]
+service = "audiobookshelf"
+path = "./podcasts"
+description = "Downloaded podcast episodes (/podcasts)"

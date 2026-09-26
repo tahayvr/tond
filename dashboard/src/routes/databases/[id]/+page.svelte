@@ -3,6 +3,11 @@
 	import ConnectionString from '$lib/components/databases/connection-string.svelte';
 	import DatabaseBackups from '$lib/components/databases/database-backups.svelte';
 	import DatabaseAccess from '$lib/components/databases/database-access.svelte';
+	import DatabaseUpgradeBanner from '$lib/components/databases/database-upgrade-banner.svelte';
+	import DatabaseVersion from '$lib/components/databases/database-version.svelte';
+	import DatabaseExtensions from '$lib/components/databases/database-extensions.svelte';
+	import DatabasePublicSecurity from '$lib/components/databases/database-public-security.svelte';
+	import { engineLabel } from '$lib/database-ops';
 	import { page } from '$app/state';
 	import {
 		getDatabase,
@@ -651,7 +656,7 @@
 		<PageHeader title={db.name} section={DATABASE_TABS.find((t) => t.id === tab)?.label}>
 			{#snippet meta()}
 				<StatusBadge status={current.status} kind="database" />
-				<span class="font-mono text-xs">{current.db_type}</span>
+				<span class="text-xs" data-testid="db-engine">{engineLabel(current)}</span>
 				{#if current.host_port}
 					<span class="font-mono text-xs">:{current.host_port}</span>
 				{/if}
@@ -662,7 +667,7 @@
 						<Button
 							variant="outline"
 							size="sm"
-							disabled={acting || redeploying}
+							disabled={acting || redeploying || current.upgrade?.status === 'running'}
 							onclick={handleStop}
 						>
 							{acting ? 'Stopping…' : 'Stop'}
@@ -671,7 +676,7 @@
 						<Button
 							variant="outline"
 							size="sm"
-							disabled={acting || redeploying}
+							disabled={acting || redeploying || current.upgrade?.status === 'running'}
 							aria-busy={acting}
 							onclick={handleStart}
 						>
@@ -681,7 +686,7 @@
 					<Button
 						variant="outline"
 						size="sm"
-						disabled={acting || redeploying}
+						disabled={acting || redeploying || current.upgrade?.status === 'running'}
 						onclick={handleRedeploy}
 					>
 						{redeploying ? 'Redeploying…' : 'Redeploy'}
@@ -691,6 +696,8 @@
 		</PageHeader>
 
 		<InlineError message={error} ondismiss={() => (error = '')} />
+
+		<DatabaseUpgradeBanner db={current} canManage={isAdmin()} onchange={(d) => (db = d)} />
 
 		<LinkTabs
 			label="Database sections"
@@ -704,7 +711,7 @@
 			{#if tab === 'logs'}
 				<div class="mt-4">
 					<StreamLogViewer
-						wsUrl="/api/databases/{db.id}/logs/stream"
+						wsUrl="/api/v1/databases/{db.id}/logs/stream"
 						downloadName="{db.name}-logs"
 						label="{db.name} logs"
 						showPrefix={false}
@@ -715,6 +722,22 @@
 			<!-- ── Overview tab ── -->
 			{#if tab === 'overview'}
 				<div class="mt-4 space-y-4">
+					{#if db.backup_warning}
+						<div
+							class="flex flex-wrap items-start gap-2 rounded-sm border border-warn/40 bg-warn/10 px-3 py-2 text-sm text-warn"
+							role="note"
+							data-testid="db-backup-warning"
+						>
+							<AlertIcon class="mt-0.5 size-4 shrink-0" />
+							<span class="min-w-0 flex-1">{db.backup_warning}</span>
+							<a
+								class="font-medium underline"
+								href={tabHref(page.url.pathname, 'backups', 'overview')}
+							>
+								Set up backups
+							</a>
+						</div>
+					{/if}
 					<!-- Info grid -->
 					<div class="grid gap-4 sm:grid-cols-2 [&>*]:min-w-0">
 						<!-- Connection strings -->
@@ -876,7 +899,7 @@
 							<dl class="space-y-2 text-sm">
 								<div class="flex justify-between">
 									<dt class="text-muted-foreground">Engine</dt>
-									<dd class="font-mono font-medium uppercase">{db.db_type}</dd>
+									<dd class="font-medium">{engineLabel(db)}</dd>
 								</div>
 
 								<!-- Docker image row -->
@@ -1012,8 +1035,10 @@
 							</p>
 						{/if}
 
+						<DatabasePublicSecurity {db} canEdit={isAdmin()} onchange={(d) => (db = d)} />
+
 						{#if isAdmin()}
-							<div class="flex flex-wrap items-center gap-3">
+							<div class="flex flex-wrap items-center gap-3 border-t pt-4">
 								{#if db.public_access}
 									<Button
 										variant="outline"
@@ -1273,6 +1298,7 @@
 						dbName={db.name}
 						canRestore={can('snapshots:restore')}
 						canBackup={can('snapshots:create')}
+						canWrite={can('db:write')}
 					/>
 				</div>
 			{/if}
@@ -1321,6 +1347,17 @@
 							/>
 						</div>
 					</div>
+					<DatabaseVersion {db} canUpgrade={isAdmin()} onstarted={(d) => (db = d)} />
+
+					{#if db.db_type === 'postgres'}
+						<DatabaseExtensions
+							dbId={db.id}
+							dbName={db.name}
+							running={db.status === 'running'}
+							canEnable={can('db:write')}
+						/>
+					{/if}
+
 					{#if can('db:delete')}
 						<section
 							aria-labelledby="db-danger-heading"

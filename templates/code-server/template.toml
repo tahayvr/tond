@@ -1,0 +1,45 @@
+id = "code-server"
+name = "code-server"
+description = "VS Code in the browser, running on your server."
+about = "code-server runs Visual Studio Code on your server so you can code from any browser, with extensions, a terminal and your files in one place. The terminal runs inside the app's container, not on the host."
+category = "developer"
+tags = ["ide", "vscode", "editor", "development"]
+logo = "coder"
+version = "4.139"
+website = "https://coder.com/docs/code-server"
+docs = "https://coder.com/docs/code-server/install#docker"
+repository = "https://github.com/coder/code-server"
+ram_mb = 350
+setup_notes = "Open the app and sign in with the password Tond showed after the deploy. Your work lives in /home/coder/project."
+upgrade_notes = "Change the image to a newer 4.x tag and redeploy. Extensions and settings are kept in the volumes."
+post_deploy_checks = ["Sign in with the password", "Open a terminal and clone a repository"]
+
+[public]
+service = "code-server"
+port = 8080
+health_path = "/healthz"
+
+[[inputs]]
+key = "PASSWORD"
+label = "Password"
+kind = "password"
+generate = "password"
+credential = true
+
+[[volumes]]
+service = "code-server"
+path = "./project"
+description = "Your workspace (/home/coder/project)"
+owner = "1000:1000"
+
+[[volumes]]
+service = "code-server"
+path = "./config"
+description = "Settings (/home/coder/.config)"
+owner = "1000:1000"
+
+[[volumes]]
+service = "code-server"
+path = "./local"
+description = "Extensions and editor state (/home/coder/.local)"
+owner = "1000:1000"

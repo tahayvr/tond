@@ -1,0 +1,23 @@
+{
+	"name": "tond-docs",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"gen": "node scripts/generate.mjs",
+		"dev": "node scripts/generate.mjs && ASTRO_TELEMETRY_DISABLED=1 astro dev",
+		"build": "node scripts/generate.mjs && ASTRO_TELEMETRY_DISABLED=1 astro build && pagefind --site dist --output-subdir pagefind && node scripts/check-links.mjs",
+		"preview": "ASTRO_TELEMETRY_DISABLED=1 astro preview",
+		"screenshots": "node scripts/screenshots.mjs"
+	},
+	"devDependencies": {
+		"@astrojs/markdown-remark": "^7.3.1",
+		"@fontsource-variable/jetbrains-mono": "^5.3.0",
+		"@iconify-json/ri": "1.2.10",
+		"astro": "7.3.5",
+		"pagefind": "1.5.2",
+		"playwright-core": "^1.63.0",
+		"sharp": "^0.35.4",
+		"unist-util-visit": "^5.1.0"
+	},
+	"packageManager": "pnpm@10.30.0+sha512.2b5753de015d480eeb88f5b5b61e0051f05b4301808a82ec8b840c9d2adf7748eb352c83f5c1593ca703ff1017295bc3fdd3119abb9686efc96b9fcb18200937"
+}

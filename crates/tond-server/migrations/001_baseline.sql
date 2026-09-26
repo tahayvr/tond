@@ -4,7 +4,10 @@
 -- migrations 001-049, then Phase 0 (lock down), Phase 1 (solid core) and
 -- Phase 2 (observable): request metrics and access logs, the alert engine,
 -- host history, uptime checks and heartbeat, certificate issuer, audit
--- shipping. Add new migrations as 002_..., 003_... from here on.
+-- shipping; and Phase 3 (v1): compose services, app templates, several
+-- domains per app with DNS providers, idempotency keys, managed database
+-- essentials, Gitea tokens and the update check. Add new migrations as
+-- 002_..., 003_... from here on.
 
 CREATE TABLE apps(
   id TEXT PRIMARY KEY NOT NULL,
@@ -47,7 +50,15 @@ CREATE TABLE apps(
   readiness TEXT NOT NULL DEFAULT 'http',
   ready_after_secs INTEGER NOT NULL DEFAULT 10,
   access_log INTEGER NOT NULL DEFAULT 0,
-  access_log_query INTEGER NOT NULL DEFAULT 0
+  access_log_query INTEGER NOT NULL DEFAULT 0,
+  -- Git-sourced compose apps: path of the compose file inside the repository.
+  compose_path TEXT,
+  -- The one-click template an app came from, set by
+  -- POST /api/v1/templates/{id}/deploy so the app page can link the
+  -- template's upgrade notes. NULL for apps created any other way.
+  template_id TEXT,
+  template_version TEXT,
+  gitea_token_id TEXT REFERENCES gitea_tokens(id) ON DELETE SET NULL
 );
 
 CREATE TABLE deploy_logs(
@@ -62,6 +73,53 @@ CREATE TABLE deploy_logs(
 );
 CREATE INDEX idx_apps_name ON apps(name);
 CREATE INDEX idx_apps_domain ON apps(domain);
+
+-- Every domain an app answers on. `apps.domain` stays as a read-only mirror
+-- of the primary domain (maintained by the triggers below); write here.
+CREATE TABLE app_domains(
+  domain TEXT PRIMARY KEY NOT NULL,
+  app_id TEXT NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
+  -- NULL: the app's main container; else a compose service name
+  service TEXT,
+  -- container port of `service` (NULL: the app's container_port)
+  port INTEGER,
+  -- "primary" | "alias" | "redirect"
+  kind TEXT NOT NULL DEFAULT 'alias' CHECK(kind IN ('primary', 'alias', 'redirect')),
+  -- redirect target (another domain of the same app), set iff kind = 'redirect'
+  redirect_to TEXT,
+  redirect_code INTEGER NOT NULL DEFAULT 308 CHECK(redirect_code IN (301, 308)),
+  created_at TEXT NOT NULL DEFAULT(strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+  CHECK((kind = 'redirect') = (redirect_to IS NOT NULL))
+);
+CREATE INDEX app_domains_app_idx ON app_domains(app_id);
+CREATE UNIQUE INDEX app_domains_one_primary ON app_domains(app_id) WHERE kind = 'primary';
+
+-- apps.domain mirrors the primary domain.
+CREATE TRIGGER app_domains_primary_insert AFTER INSERT ON app_domains
+WHEN NEW.kind = 'primary'
+BEGIN
+  UPDATE apps SET domain = NEW.domain WHERE id = NEW.app_id;
+END;
+CREATE TRIGGER app_domains_primary_update AFTER UPDATE ON app_domains
+WHEN OLD.kind = 'primary' OR NEW.kind = 'primary'
+BEGIN
+  UPDATE apps SET domain = (
+    SELECT domain FROM app_domains WHERE app_id = NEW.app_id AND kind = 'primary'
+  ) WHERE id = NEW.app_id;
+END;
+CREATE TRIGGER app_domains_primary_delete AFTER DELETE ON app_domains
+WHEN OLD.kind = 'primary'
+BEGIN
+  UPDATE apps SET domain = (
+    SELECT domain FROM app_domains WHERE app_id = OLD.app_id AND kind = 'primary'
+  ) WHERE id = OLD.app_id;
+END;
+-- An app created with a domain gets it as its primary domain.
+CREATE TRIGGER apps_domain_seed AFTER INSERT ON apps
+WHEN NEW.domain IS NOT NULL AND NEW.domain != ''
+BEGIN
+  INSERT OR IGNORE INTO app_domains(domain, app_id, kind) VALUES (NEW.domain, NEW.id, 'primary');
+END;
 
 CREATE TABLE users(
   id TEXT PRIMARY KEY,
@@ -92,7 +150,7 @@ CREATE INDEX idx_sessions_user_id ON sessions(user_id);
 CREATE TABLE certificates(
   id TEXT PRIMARY KEY,
   domain TEXT NOT NULL UNIQUE,
-  -- "acme" | "self_signed"
+  -- "acme" | "custom" (uploaded; never renewed) | "self_signed"
   cert_type TEXT NOT NULL DEFAULT 'acme',
   -- Filesystem paths to PEM files
   cert_path TEXT NOT NULL,
@@ -109,7 +167,29 @@ CREATE TABLE certificates(
   next_retry_at TEXT,
   failure_count INTEGER NOT NULL DEFAULT 0,
   issuer TEXT,
-  last_renewed_at TEXT
+  last_renewed_at TEXT,
+  -- How the CA validated an ACME certificate: "http-01" | "dns-01".
+  challenge TEXT
+);
+
+-- DNS hosting APIs Tond may publish ACME DNS-01 TXT records with. The token
+-- is write-only: encrypted (secret_key.rs, Purpose::DnsProviderToken) and
+-- never returned. tond-proxy reads `zones` (read-only) to decide which
+-- domains use DNS-01; it never reads or needs the token.
+CREATE TABLE dns_providers(
+  id TEXT PRIMARY KEY NOT NULL,
+  name TEXT NOT NULL,
+  -- "cloudflare" | "hetzner" | "digitalocean" | "route53" | "challtestsrv" (test only)
+  kind TEXT NOT NULL,
+  -- JSON array of zone names this provider may write, e.g. ["example.com"]
+  zones TEXT NOT NULL DEFAULT '[]',
+  -- non-secret settings (Route 53 access key id, challtestsrv URL), JSON
+  config TEXT NOT NULL DEFAULT '{}',
+  token_enc TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  last_used_at TEXT,
+  last_error TEXT
 );
 
 CREATE TABLE settings(
@@ -140,9 +220,77 @@ CREATE TABLE deployments(
   trigger_detail TEXT,
   rollback_of TEXT,
   phases TEXT NOT NULL DEFAULT '[]',
-  failure TEXT
+  failure TEXT,
+  -- The compose file a deployment ran (as written by the user or read from
+  -- the repository), for rollback.
+  compose_source TEXT
 );
 CREATE INDEX deployments_app_id_idx ON deployments(app_id, created_at DESC);
+
+-- Docker Compose as a first-class app type.
+--
+-- compose_services: one row per service of a compose app, synced from the
+-- compose file on save and on every deploy. User intent (the container port
+-- Tond publishes for routing; its domains are app_domains rows with this
+-- service set) survives redeploys; what Docker reports (container, state,
+-- health) is refreshed on deploy, on service actions and when the dashboard
+-- lists the services.
+CREATE TABLE compose_services(
+  app_id TEXT NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  -- order in the compose file
+  position INTEGER NOT NULL DEFAULT 0,
+  -- image ref from the compose file (NULL for build-only services)
+  image TEXT,
+  -- 1 when the service has a build: section
+  builds INTEGER NOT NULL DEFAULT 0,
+  -- JSON array of container ports the file declares (ports: and expose:)
+  ports TEXT NOT NULL DEFAULT '[]',
+  -- 1 when the service defines a healthcheck (compose healthchecks are
+  -- waited for on deploy)
+  has_healthcheck INTEGER NOT NULL DEFAULT 0,
+  -- container port Tond publishes on 127.0.0.1:host_port for routing
+  published_port INTEGER,
+  -- loopback host port allocated for published_port (stable across deploys)
+  host_port INTEGER,
+  -- container port host_port maps to in the running containers (differs
+  -- from published_port until the next deploy after a change)
+  routed_port INTEGER,
+  container_id TEXT,
+  -- "pending" | "running" | "restarting" | "paused" | "created" | "exited"
+  -- | "dead" | "missing"
+  status TEXT NOT NULL DEFAULT 'pending',
+  -- "healthy" | "unhealthy" | "starting"; NULL without a healthcheck
+  health TEXT,
+  exit_code INTEGER,
+  -- the pinned local image the running container uses
+  running_image TEXT,
+  -- its image id (sha256:...)
+  image_digest TEXT,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY(app_id, name)
+) WITHOUT ROWID;
+
+-- What a compose deployment ran, per service: the image it was built or
+-- pulled as and the pinned local tag (tond-<app>/<service>:<image id prefix>) with
+-- its image id, so a rollback restores exactly that set.
+CREATE TABLE deployment_services(
+  deployment_id TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
+  service TEXT NOT NULL,
+  -- "build" | "pull" | "reuse" (rollback)
+  source TEXT NOT NULL,
+  -- image ref from the compose file, or the build context
+  source_image TEXT,
+  -- pinned local tag
+  image TEXT,
+  -- image id (sha256:...) of the pinned tag, plus the registry digest of a
+  -- pulled image when known ("sha256:...@repo@sha256:...")
+  digest TEXT,
+  -- "pending" | "building" | "pulling" | "ready" | "starting" | "healthy"
+  -- | "running" | "failed"
+  status TEXT NOT NULL DEFAULT 'pending',
+  PRIMARY KEY(deployment_id, service)
+) WITHOUT ROWID;
 
 CREATE TABLE preview_deployments(
   id TEXT PRIMARY KEY NOT NULL,
@@ -199,7 +347,25 @@ CREATE TABLE databases(
   image_used TEXT,
   custom_image TEXT,
   root_password TEXT,
-  public_access INTEGER NOT NULL DEFAULT 0
+  public_access INTEGER NOT NULL DEFAULT 0,
+  -- Per-database backup schedule (tond::cron syntax; NULL = no schedule of
+  -- its own) and how many scheduled backups of it to keep.
+  backup_schedule TEXT,
+  backup_retention INTEGER NOT NULL DEFAULT 7,
+  -- Engine major version (e.g. "16") and image variant ("" | "pgvector" |
+  -- "postgis"); together they pick the image (tond_common::image_for).
+  -- NULL version = the engine's default.
+  version TEXT,
+  variant TEXT NOT NULL DEFAULT '',
+  -- Public access: JSON array of allowed source addresses (IP or CIDR).
+  -- Empty = any address. Enforced in the kernel (db_firewall.rs).
+  allowlist TEXT NOT NULL DEFAULT '[]',
+  -- Serve TLS (postgres, mysql, mariadb) with a certificate mounted from
+  -- <data>/databases/.<name>.tls/.
+  tls INTEGER NOT NULL DEFAULT 0,
+  -- A major-version upgrade in progress or waiting for confirmation
+  -- (JSON, db_upgrade::UpgradeState). NULL = none.
+  upgrade TEXT
 );
 
 CREATE TABLE cron_jobs(
@@ -284,6 +450,20 @@ CREATE TABLE gitlab_tokens(
   name TEXT NOT NULL,
   token_enc TEXT NOT NULL,
   gitlab_url TEXT NOT NULL DEFAULT 'https://gitlab.com',
+  username TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT(datetime('now'))
+);
+
+-- Gitea/Forgejo access tokens, for commit statuses, PR preview comments and
+-- cloning private repositories (like gitlab_tokens).
+CREATE TABLE gitea_tokens(
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  -- secret_key Purpose::GiteaToken
+  token_enc TEXT NOT NULL,
+  -- Instance URL, e.g. https://codeberg.org
+  base_url TEXT NOT NULL,
+  -- Account the token belongs to (from /api/v1/user at creation)
   username TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT(datetime('now'))
 );
@@ -412,6 +592,26 @@ CREATE TABLE webhook_deliveries(
 CREATE INDEX idx_webhook_deliveries_received_at ON webhook_deliveries(
   received_at
 );
+
+-- Idempotency keys (idempotency.rs): the first successful response to a
+-- mutation sent with `Idempotency-Key`, replayed for repeats within 24 h.
+-- Scoped per caller (actor), method and concrete path. `status` is NULL
+-- while the first request is still running. `response` is the body,
+-- encrypted with TOND_SECRET_KEY (it can hold a new token or database
+-- password). Bounded: at most a few thousand rows, pruned by age.
+CREATE TABLE idempotency_keys (
+    actor TEXT NOT NULL,
+    method TEXT NOT NULL,
+    path TEXT NOT NULL,
+    key TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    status INTEGER,
+    content_type TEXT,
+    response TEXT,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (actor, method, path, key)
+) WITHOUT ROWID;
+CREATE INDEX idx_idempotency_keys_created ON idempotency_keys (created_at);
 
 CREATE TABLE github_app_flows(
   state TEXT PRIMARY KEY NOT NULL,
@@ -569,6 +769,58 @@ BEGIN
 END;
 CREATE TRIGGER route_settings_delete AFTER DELETE ON settings
 WHEN OLD.key IN ('dashboard_domain', 'preview_domain')
+BEGIN
+  UPDATE route_state SET version = version + 1 WHERE id = 1;
+END;
+-- The apps domain decides which wildcard certificate tond-proxy orders.
+CREATE TRIGGER route_settings_apps_domain_insert AFTER INSERT ON settings
+WHEN NEW.key = 'apps_domain'
+BEGIN
+  UPDATE route_state SET version = version + 1 WHERE id = 1;
+END;
+CREATE TRIGGER route_settings_apps_domain_update AFTER UPDATE ON settings
+WHEN NEW.key = 'apps_domain' AND OLD.value IS NOT NEW.value
+BEGIN
+  UPDATE route_state SET version = version + 1 WHERE id = 1;
+END;
+-- tond-proxy reloads its routing table when any domain changes.
+CREATE TRIGGER route_app_domains_insert AFTER INSERT ON app_domains
+BEGIN
+  UPDATE route_state SET version = version + 1 WHERE id = 1;
+END;
+CREATE TRIGGER route_app_domains_delete AFTER DELETE ON app_domains
+BEGIN
+  UPDATE route_state SET version = version + 1 WHERE id = 1;
+END;
+CREATE TRIGGER route_app_domains_update AFTER UPDATE ON app_domains
+BEGIN
+  UPDATE route_state SET version = version + 1 WHERE id = 1;
+END;
+CREATE TRIGGER route_compose_services_delete AFTER DELETE ON compose_services
+BEGIN
+  UPDATE route_state SET version = version + 1 WHERE id = 1;
+END;
+CREATE TRIGGER route_compose_services_update AFTER UPDATE OF host_port ON compose_services
+WHEN OLD.host_port IS NOT NEW.host_port
+BEGIN
+  UPDATE route_state SET version = version + 1 WHERE id = 1;
+END;
+CREATE TRIGGER route_compose_services_insert AFTER INSERT ON compose_services
+WHEN NEW.host_port IS NOT NULL
+BEGIN
+  UPDATE route_state SET version = version + 1 WHERE id = 1;
+END;
+-- DNS-01 zones decide how tond-proxy validates certificates.
+CREATE TRIGGER route_dns_providers_insert AFTER INSERT ON dns_providers
+BEGIN
+  UPDATE route_state SET version = version + 1 WHERE id = 1;
+END;
+CREATE TRIGGER route_dns_providers_delete AFTER DELETE ON dns_providers
+BEGIN
+  UPDATE route_state SET version = version + 1 WHERE id = 1;
+END;
+CREATE TRIGGER route_dns_providers_zones AFTER UPDATE OF zones ON dns_providers
+WHEN OLD.zones IS NOT NEW.zones
 BEGIN
   UPDATE route_state SET version = version + 1 WHERE id = 1;
 END;
@@ -923,6 +1175,24 @@ CREATE TABLE audit_ship_state(
   dropped INTEGER NOT NULL DEFAULT 0
 ) WITHOUT ROWID;
 
+-- Tond self-update: the cached release check (updates/releases.rs).
+--
+-- One row. The update run itself is NOT stored here: its status lives in
+-- <data>/update/status.json, written by update.sh, because a failed update
+-- may restore an older copy of this database.
+CREATE TABLE update_check(
+  id INTEGER PRIMARY KEY CHECK(id = 1),
+  -- Look for new releases at most once a day (folded into the janitor pass).
+  enabled INTEGER NOT NULL DEFAULT 1,
+  -- Unix seconds of the last attempt, successful or not.
+  checked_at INTEGER,
+  -- Why the last attempt failed (NULL when it worked).
+  error TEXT,
+  -- The published releases, newest first: [{version, tag, name, body, url, published_at}]
+  releases_json TEXT NOT NULL DEFAULT '[]',
+  -- The last finished update run written to the audit log (status.json id).
+  audited_run_id TEXT
+);
 
 -- Seed rows
 INSERT OR IGNORE INTO settings (key, value) VALUES ('dashboard_domain', '');
@@ -934,3 +1204,4 @@ INSERT INTO route_state (id, version) VALUES (1, 0);
 INSERT INTO uptime_checks (kind, owner_id, path) VALUES ('dashboard', '', '/health');
 INSERT INTO heartbeat_config (id) VALUES ('heartbeat');
 INSERT INTO audit_shipping (id) VALUES ('default');
+INSERT INTO update_check (id) VALUES (1);

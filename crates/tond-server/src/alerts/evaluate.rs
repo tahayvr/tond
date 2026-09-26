@@ -357,7 +357,7 @@ async fn observe(
         AlertScope::Certificate => {
             let certs: Vec<(String, String)> = sqlx::query_as(
                 "SELECT domain, expires_at FROM certificates
-                 WHERE cert_type = 'acme' AND status IN ('active', 'expired')",
+                 WHERE cert_type IN ('acme', 'custom') AND status IN ('active', 'expired')",
             )
             .fetch_all(ctx.db)
             .await?;
@@ -376,23 +376,26 @@ async fn observe(
             }
         }
         AlertScope::Backup => {
-            let latest: Option<(String, Option<String>)> = sqlx::query_as(
-                "SELECT status, remote_status FROM snapshots
-                 WHERE status IN ('completed', 'failed')
-                 ORDER BY created_at DESC LIMIT 1",
+            // The latest attempt per scope: full snapshots, each database's
+            // own backups (scheduled or not) and pre-deploy snapshots are
+            // judged separately, so a good full snapshot can't hide a
+            // database whose scheduled backups keep failing.
+            let latest: Vec<(String, String, Option<String>)> = sqlx::query_as(
+                "SELECT scope, status, remote_status FROM (
+                     SELECT scope, status, remote_status,
+                            ROW_NUMBER() OVER (PARTITION BY scope ORDER BY created_at DESC) AS rn
+                     FROM snapshots WHERE status IN ('completed', 'failed'))
+                 WHERE rn = 1 ORDER BY scope",
             )
-            .fetch_optional(ctx.db)
+            .fetch_all(ctx.db)
             .await?;
-            let failed = latest.is_some_and(|(status, remote)| {
-                status == "failed" || remote.as_deref() == Some("failed")
-            });
-            out.push(Observation {
-                target: "backup".to_string(),
-                label: "Backups".to_string(),
-                app_id: None,
-                value: Some(f64::from(u8::from(failed))),
-                holds: Some(failed),
-            });
+            if latest.is_empty() {
+                out.push(backup_observation("full", false));
+            }
+            for (scope, status, remote) in latest {
+                let failed = status == "failed" || remote.as_deref() == Some("failed");
+                out.push(backup_observation(&scope, failed));
+            }
         }
         AlertScope::Cron => {
             let jobs: Vec<(String, String, Option<String>)> =
@@ -412,6 +415,29 @@ async fn observe(
         }
     }
     Ok(out)
+}
+
+/// The "backup failed" observation of one snapshot scope: full snapshots
+/// keep the target "backup"; a database's backups are "backup:database:<name>".
+pub fn backup_observation(scope: &str, failed: bool) -> Observation {
+    let (target, label) = match scope {
+        "full" => ("backup".to_string(), "Backups".to_string()),
+        s => {
+            let label = match s.split_once(':') {
+                Some(("database", name)) => format!("Backups of {name}"),
+                Some(("app", name)) => format!("Pre-deploy snapshots of {name}"),
+                _ => format!("Backups ({s})"),
+            };
+            (format!("backup:{s}"), label)
+        }
+    };
+    Observation {
+        target,
+        label,
+        app_id: None,
+        value: Some(f64::from(u8::from(failed))),
+        holds: Some(failed),
+    }
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -666,7 +692,7 @@ async fn begin<'t>(
     tx: &'t mut Option<Transaction<'static, Sqlite>>,
 ) -> Result<&'t mut Transaction<'static, Sqlite>> {
     if tx.is_none() {
-        *tx = Some(db.begin().await?);
+        *tx = Some(crate::db::begin_write(db).await?);
     }
     Ok(tx.as_mut().unwrap_or_else(|| unreachable!("just set")))
 }
@@ -765,7 +791,7 @@ async fn enqueue(
 /// notifications, and forget its states.
 pub async fn close_rule(db: &SqlitePool, rule_id: &str, now: i64) -> Result<()> {
     let _guard = EVAL_LOCK.lock().await;
-    let mut tx = db.begin().await?;
+    let mut tx = crate::db::begin_write(db).await?;
     sqlx::query(
         "UPDATE alert_history SET resolved_at = ?
          WHERE resolved_at IS NULL AND id IN (SELECT episode_id FROM alert_states WHERE rule_id = ?)",

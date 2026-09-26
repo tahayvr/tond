@@ -139,7 +139,7 @@ pub struct Update {
 }
 
 pub async fn save(db: &SqlitePool, update: &Update) -> anyhow::Result<()> {
-    let mut tx = db.begin().await?;
+    let mut tx = crate::db::begin_write(db).await?;
     if let Some(url) = &update.url {
         let url = url.trim();
         let enc = if url.is_empty() {
@@ -181,6 +181,7 @@ pub async fn save(db: &SqlitePool, update: &Update) -> anyhow::Result<()> {
 
 /// What one heartbeat did.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum Outcome {
     /// The monitor answered 2xx.

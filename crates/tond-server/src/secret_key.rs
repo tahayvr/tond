@@ -49,6 +49,7 @@ const NONCE_LEN: usize = 12;
 pub enum Purpose {
     RegistryPassword,
     GitlabToken,
+    GiteaToken,
     StorageSecretKey,
     TotpSecret,
     /// apps.env_vars (the whole JSON object, see `seal_map`)
@@ -78,6 +79,11 @@ pub enum Purpose {
     HeartbeatUrl,
     /// audit_shipping.webhook_secret (HMAC key for shipped audit entries)
     AuditWebhookSecret,
+    /// dns_providers.token_enc (DNS API token / Route 53 secret key)
+    DnsProviderToken,
+    /// idempotency_keys.response (a stored response can hold a new token or
+    /// database password). A cache: key rotation drops it instead.
+    IdempotentResponse,
 }
 
 impl Purpose {
@@ -85,6 +91,7 @@ impl Purpose {
         match self {
             Purpose::RegistryPassword => b"tond:registry_credentials.password_enc",
             Purpose::GitlabToken => b"tond:gitlab_tokens.token_enc",
+            Purpose::GiteaToken => b"tond:gitea_tokens.token_enc",
             Purpose::StorageSecretKey => b"tond:storage_providers.secret_access_key_enc",
             Purpose::TotpSecret => b"tond:users.totp_secret_enc",
             Purpose::AppEnv => b"tond:apps.env_vars",
@@ -102,6 +109,8 @@ impl Purpose {
             Purpose::IntegrationSecret => b"tond:integrations.config",
             Purpose::HeartbeatUrl => b"tond:heartbeat_config.url_enc",
             Purpose::AuditWebhookSecret => b"tond:audit_shipping.webhook_secret",
+            Purpose::DnsProviderToken => b"tond:dns_providers.token_enc",
+            Purpose::IdempotentResponse => b"tond:idempotency_keys.response",
         }
     }
 }
@@ -383,7 +392,7 @@ pub async fn reencrypt_stored_secrets(
     if current == previous {
         return Ok(report);
     }
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::begin_write(pool).await?;
 
     for (table, column, purpose) in SCALAR_SECRET_COLUMNS {
         // `table` and `column` come from the literal list: injection-safe.
@@ -452,6 +461,12 @@ pub async fn reencrypt_stored_secrets(
         }
     }
 
+    // Stored idempotent responses are a 24 h cache: drop them rather than
+    // re-encrypt (a retry then simply runs again).
+    sqlx::query("DELETE FROM idempotency_keys")
+        .execute(&mut *tx)
+        .await?;
+
     tx.commit().await?;
     Ok(report)
 }
@@ -467,6 +482,8 @@ pub const SCALAR_SECRET_COLUMNS: &[(&str, &str, Purpose)] = &[
         Purpose::RegistryPassword,
     ),
     ("gitlab_tokens", "token_enc", Purpose::GitlabToken),
+    ("dns_providers", "token_enc", Purpose::DnsProviderToken),
+    ("gitea_tokens", "token_enc", Purpose::GiteaToken),
     ("users", "totp_secret_enc", Purpose::TotpSecret),
     ("apps", "env_vars", Purpose::AppEnv),
     ("apps", "preview_env_vars", Purpose::AppPreviewEnv),

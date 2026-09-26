@@ -11,6 +11,10 @@
 //     in-memory RouteMap (domain -> 127.0.0.1:{host_port}), and forwards
 //     the request to the correct running container. If the host matches
 //     dashboard_domain, it routes to tond-server (127.0.0.1:3001).
+//     An app has any number of domains (app_domains): primary and aliases
+//     are proxied; redirect domains are answered here with a 301/308 to
+//     their target domain, path and query preserved, without touching the
+//     container (port 80 sends them straight to the target over HTTPS).
 //     If no route is found, `request_filter` short-circuits and returns a
 //     friendly HTML 502 error page directly (no upstream connection made).
 //
@@ -23,10 +27,13 @@
 //   TLS — TondTlsAccept (Pingora TlsAccept)
 //     Implements SNI-based certificate selection. On each TLS handshake
 //     it reads the server name from the ClientHello, looks up the cert
-//     in CertStore, and injects the right cert+key into the SSL context.
+//     in CertStore (exact name, else the wildcard one label up), and
+//     injects the right cert+key into the SSL context.
 //     Falls back to a self-signed cert for unknown domains.
 //
 //   Port 80 — run_http_server() (raw Tokio TCP)
+//     Both ports listen on IPv4 (0.0.0.0) and, when the host has IPv6, on
+//     [::] with IPV6_V6ONLY (a host booted without IPv6 gets IPv4 only).
 //     A hand-rolled HTTP/1.1 server. Three behaviours:
 //       /.well-known/acme-challenge/{token} — serves ACME HTTP-01 responses
 //       a host Tond serves                  — 301 redirect to https://
@@ -39,7 +46,8 @@
 //     - Routing: one persistent read-only SQLite connection (mode=ro; tond.db
 //       is 0640 root:tond-proxy, see tond-server's db.rs). tond-server bumps
 //       `route_state.version` (SQL triggers) and nudges the proxy over the
-//       control socket; the proxy reloads — running apps and previews with a
+//       control socket; the proxy reloads — running apps, compose service
+//       domains (app_domains -> compose_services.host_port) and previews with a
 //       stored host_port, plus dashboard_domain / preview_domain — only when
 //       the version moved, in one read transaction, and acknowledges with the
 //       version it loaded. A deploy stops the old container only after that
@@ -78,7 +86,9 @@ mod access_log;
 mod acme;
 mod certs;
 mod control;
+mod dns01;
 mod issuance;
+mod log_limit;
 mod meters;
 mod traffic;
 
@@ -106,8 +116,18 @@ use tond_common::traffic::RouteKind;
 use crate::access_log::{AccessConfig, AccessLog};
 use crate::acme::ChallengeMap;
 use crate::certs::CertStore;
-use crate::issuance::{IssuanceLoop, Outbox};
+use crate::dns01::DnsBridge;
+use crate::issuance::{CertConfig, IssuanceLoop, Outbox, SharedCertConfig};
 use crate::traffic::{Registry, RouteStats};
+
+/// A redirect domain: answered by the proxy itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Redirect {
+    /// Target host (another domain of the same app).
+    pub to: String,
+    /// 301 or 308.
+    pub code: u16,
+}
 
 /// One routed domain.
 #[derive(Clone)]
@@ -118,12 +138,35 @@ pub struct Route {
     pub stats: Arc<RouteStats>,
     /// Access logging, when the app opted in.
     pub access: Option<AccessConfig>,
+    /// Set for redirect domains: no upstream request is made.
+    pub redirect: Option<Redirect>,
+}
+
+impl Route {
+    /// What the route does, for change logs.
+    fn describe(&self) -> String {
+        match &self.redirect {
+            Some(r) => format!("{} redirect to {}", r.code, r.to),
+            None => self.upstream.clone(),
+        }
+    }
 }
 
 impl std::fmt::Debug for Route {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.upstream)
+        f.write_str(&self.describe())
     }
+}
+
+/// `Location` for a redirect domain: the target host with the request's
+/// path and query (an origin-form path only; anything else becomes `/`).
+fn redirect_location(to: &str, path_and_query: &str) -> String {
+    let path = if path_and_query.starts_with('/') {
+        path_and_query
+    } else {
+        "/"
+    };
+    format!("https://{to}{path}")
 }
 
 /// Route map: domain -> route
@@ -231,6 +274,8 @@ struct TondProxy {
     traffic: Arc<Registry>,
     /// Opt-in access logs.
     access: Arc<AccessLog>,
+    /// Apps / preview domains and DNS provider zones for the certificate loop.
+    cert_config: SharedCertConfig,
 }
 
 /// Per-request state (lives inline in Pingora's session: no allocation).
@@ -445,18 +490,23 @@ impl HttpContext {
         }
         // Redirect only hosts that HTTPS would actually serve: unknown hosts
         // and unmatched hosts under the preview domain get a 404.
-        let known = {
+        // Redirect domains go straight to their target (one hop, not two).
+        let target = {
             let dd = self.dashboard_domain.read().await;
             let pd = self.preview_domain.read().await;
             let routes = self.routes.read().await;
-            matches!(
-                resolve_route(&host, dd.as_deref(), pd.as_deref(), &routes),
-                RouteTarget::Dashboard | RouteTarget::Upstream(_)
-            )
+            match resolve_route(&host, dd.as_deref(), pd.as_deref(), &routes) {
+                RouteTarget::Dashboard => Some((host.clone(), 301)),
+                RouteTarget::Upstream(route) => Some(match &route.redirect {
+                    Some(r) => (r.to.clone(), r.code),
+                    None => (host.clone(), 301),
+                }),
+                RouteTarget::Missing | RouteTarget::NotFound => None,
+            }
         };
-        if !known {
+        let Some((to, code)) = target else {
             return HTTP_NOT_FOUND.to_string();
-        }
+        };
 
         // Only an origin-form path goes into the Location header.
         let path = if path.starts_with('/') && !path.starts_with("//") {
@@ -464,8 +514,13 @@ impl HttpContext {
         } else {
             "/"
         };
+        let reason = if code == 308 {
+            "Permanent Redirect"
+        } else {
+            "Moved Permanently"
+        };
         format!(
-            "HTTP/1.1 301 Moved Permanently\r\nLocation: https://{host}{path}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            "HTTP/1.1 {code} {reason}\r\nLocation: https://{to}{path}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         )
     }
 }
@@ -474,7 +529,7 @@ impl HttpContext {
 fn upstreams(routes: &HashMap<String, Arc<Route>>) -> HashMap<String, String> {
     routes
         .iter()
-        .map(|(d, r)| (d.clone(), r.upstream.clone()))
+        .map(|(d, r)| (d.clone(), r.describe()))
         .collect()
 }
 
@@ -514,6 +569,7 @@ impl TondProxy {
             // Replaced by with_access_log in main(); without a writer every
             // line is dropped (and counted).
             access: Arc::new(access_log::channel(std::path::Path::new("/nonexistent")).0),
+            cert_config: Arc::new(RwLock::new(CertConfig::default())),
         }
     }
 
@@ -581,7 +637,8 @@ impl TondProxy {
             .await?;
 
         let settings: Vec<(String, String)> = sqlx::query_as(
-            "SELECT key, value FROM settings WHERE key IN ('dashboard_domain', 'preview_domain')",
+            "SELECT key, value FROM settings
+             WHERE key IN ('dashboard_domain', 'preview_domain', 'apps_domain')",
         )
         .fetch_all(&mut *tx)
         .await?;
@@ -621,20 +678,69 @@ impl TondProxy {
         };
 
         #[allow(clippy::type_complexity)]
-        let rows: Vec<(String, String, String, i64, bool, bool)> = sqlx::query_as(
-            // Background workers (readiness 'none') serve nothing: never routed,
-            // even if a domain lingers on the row.
-            "SELECT id, name, domain, host_port, access_log, access_log_query FROM apps
-             WHERE status = 'running' AND domain IS NOT NULL AND host_port IS NOT NULL
-               AND readiness != 'none'",
+        let rows: Vec<(
+            String,
+            String,
+            Option<String>,
+            i64,
+            String,
+            String,
+            i64,
+            bool,
+            bool,
+        )> = sqlx::query_as(
+            // Background workers (readiness 'none') serve nothing: never
+            // routed, even if a domain lingers. Domains of compose
+            // services (service IS NOT NULL) are routed by the compose
+            // workstream's per-service ports, not the app's host_port.
+            "SELECT d.domain, d.kind, d.redirect_to, d.redirect_code,
+                        a.id, a.name, a.host_port, a.access_log, a.access_log_query
+                 FROM app_domains d JOIN apps a ON a.id = d.app_id
+                 WHERE a.status = 'running' AND a.host_port IS NOT NULL
+                   AND a.readiness != 'none' AND d.service IS NULL",
         )
         .fetch_all(&mut *tx)
         .await?;
 
+        // Zones a DNS provider can publish ACME DNS-01 records in (never
+        // the tokens: the proxy has no use for them and can't decrypt them).
+        let zone_lists: Vec<String> = sqlx::query_scalar("SELECT zones FROM dns_providers")
+            .fetch_all(&mut *tx)
+            .await?;
+        let mut dns_zones: Vec<String> = zone_lists
+            .iter()
+            .flat_map(|z| serde_json::from_str::<Vec<String>>(z).unwrap_or_default())
+            .collect();
+        dns_zones.sort();
+        dns_zones.dedup();
+        let new_cert_config = CertConfig {
+            apps_domain: setting("apps_domain"),
+            preview_domain: new_preview_domain.clone(),
+            dns_zones,
+        };
+        {
+            let mut cfg = self.cert_config.write().await;
+            if *cfg != new_cert_config {
+                *cfg = new_cert_config;
+                domains_changed = true;
+            }
+        }
+
         let mut new_routes: HashMap<String, Arc<Route>> = HashMap::new();
         let mut live: Vec<(RouteKind, String)> = Vec::new();
 
-        for (id, name, domain, host_port, access_log, access_query) in &rows {
+        for (
+            domain,
+            kind,
+            redirect_to,
+            redirect_code,
+            id,
+            name,
+            host_port,
+            access_log,
+            access_query,
+        ) in &rows
+        {
             // The preview domain is reserved for previews.
             if under_preview_domain(domain) {
                 tracing::warn!(
@@ -649,15 +755,96 @@ impl TondProxy {
                 app_id: Arc::from(id.as_str()),
                 include_query: *access_query,
             });
+            let redirect = match (kind.as_str(), redirect_to) {
+                ("redirect", Some(to)) => Some(Redirect {
+                    to: to.clone(),
+                    code: u16::try_from(*redirect_code).unwrap_or(308),
+                }),
+                _ => None,
+            };
             new_routes.insert(
                 domain.clone(),
                 Arc::new(Route {
                     upstream,
                     stats: self.traffic.route(RouteKind::App, id),
                     access,
+                    redirect,
                 }),
             );
-            live.push((RouteKind::App, id.clone()));
+            if !live.iter().any(|(k, l)| *k == RouteKind::App && l == id) {
+                live.push((RouteKind::App, id.clone()));
+            }
+        }
+
+        // Compose services: domain -> (app, service) -> the loopback host port
+        // tond-server allocated for the service's published container port.
+        // The port is stable across deploys and compose only recreates
+        // changed services, so routes stay up while the app is building.
+        // Requests are counted per app (all its services share one bucket).
+        #[allow(clippy::type_complexity)]
+        let service_rows: Vec<(String, String, String, String, i64, bool, bool)> =
+            sqlx::query_as(tond_common::route_queries::COMPOSE_SERVICE_ROUTES)
+                .fetch_all(&mut *tx)
+                .await?;
+        for (domain, id, name, service, host_port, access_log, access_query) in &service_rows {
+            if under_preview_domain(domain) {
+                tracing::warn!(
+                    "Service {}/{} uses domain {} under the preview domain — not routed",
+                    name,
+                    service,
+                    domain
+                );
+                continue;
+            }
+            if new_routes.contains_key(domain) {
+                continue; // an app's own domain wins over a stale service row
+            }
+            let access = access_log.then(|| AccessConfig {
+                app_id: Arc::from(id.as_str()),
+                include_query: *access_query,
+            });
+            new_routes.insert(
+                domain.clone(),
+                Arc::new(Route {
+                    upstream: format!("127.0.0.1:{}", host_port),
+                    stats: self.traffic.route(RouteKind::App, id),
+                    access,
+                    redirect: None,
+                }),
+            );
+            if !live.iter().any(|(k, l)| *k == RouteKind::App && l == id) {
+                live.push((RouteKind::App, id.clone()));
+            }
+        }
+
+        // Redirect domains of compose apps: answered here, no upstream (the
+        // app-domain query above only covers apps with their own host_port).
+        #[allow(clippy::type_complexity)]
+        let compose_redirects: Vec<(String, String, String, i64)> = sqlx::query_as(
+            "SELECT d.domain, a.id, d.redirect_to, d.redirect_code
+             FROM app_domains d JOIN apps a ON a.id = d.app_id
+             WHERE d.kind = 'redirect' AND d.redirect_to IS NOT NULL
+               AND a.source_type = 'compose'
+               AND a.status IN ('running', 'building', 'unhealthy')",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        for (domain, id, to, code) in compose_redirects {
+            if under_preview_domain(&domain) || new_routes.contains_key(&domain) {
+                continue;
+            }
+            new_routes.insert(
+                domain,
+                Arc::new(Route {
+                    upstream: String::new(),
+                    stats: self.traffic.route(RouteKind::App, &id),
+                    access: None,
+                    redirect: Some(Redirect {
+                        to,
+                        code: u16::try_from(code).unwrap_or(308),
+                    }),
+                }),
+            );
         }
 
         // Also load active preview deployments (subdomain routing).
@@ -685,6 +872,7 @@ impl TondProxy {
                         upstream: format!("127.0.0.1:{}", host_port),
                         stats: self.traffic.route(RouteKind::Preview, &id),
                         access: None,
+                        redirect: None,
                     }),
                 );
                 live.push((RouteKind::Preview, id));
@@ -749,6 +937,23 @@ impl ProxyHttp for TondProxy {
             }
             RouteTarget::Upstream(route) => {
                 ctx.stats = Some(route.stats.clone());
+                if let Some(redirect) = &route.redirect {
+                    let location = redirect_location(
+                        &redirect.to,
+                        session
+                            .req_header()
+                            .uri
+                            .path_and_query()
+                            .map_or("/", |pq| pq.as_str()),
+                    );
+                    let mut resp = pingora::http::ResponseHeader::build(redirect.code, None)?;
+                    resp.insert_header("Location", location)?;
+                    resp.insert_header("Content-Length", "0")?;
+                    resp.insert_header("Cache-Control", "no-store")?;
+                    ctx.route = Some(route);
+                    session.write_response_header(Box::new(resp), true).await?;
+                    return Ok(true);
+                }
                 ctx.route = Some(route);
                 return Ok(false);
             }
@@ -879,6 +1084,16 @@ impl ProxyHttp for TondProxy {
         Ok(())
     }
 
+    /// Pingora logs every failed request at ERROR; they are counted in the
+    /// request metrics, so the journal gets the first one and then at most
+    /// one an hour (log_limit.rs), plus a summary of what was held back.
+    fn suppress_error_log(&self, session: &Session, _ctx: &Self::CTX, e: &pingora::Error) -> bool {
+        tracing::debug!("Fail to proxy: {e}, Host: {}", request_host(session));
+        !log_limit::LIMITER.allow(log_limit::FAIL_TO_PROXY, Instant::now(), || {
+            format!("Fail to proxy: {e}, Host: {}", request_host(session))
+        })
+    }
+
     /// Pingora's default error response, except that upstream timeouts are
     /// a 504 (so request metrics can tell them from a refused connection).
     async fn fail_to_proxy(
@@ -948,9 +1163,10 @@ fn main() {
     {
         use tracing_subscriber::prelude::*;
         tracing_subscriber::registry()
-            .with(tond_common::logging::fmt_layer(
-                tond_common::logging::LogFormat::from_env(),
-            ))
+            .with(
+                tond_common::logging::fmt_layer(tond_common::logging::LogFormat::from_env())
+                    .with_filter(log_limit::RateLimit),
+            )
             .init();
     }
 
@@ -1019,20 +1235,34 @@ fn main() {
         .expect("failed to start the background thread");
 
     // ── TLS Proxy on port 443 ──
-    let tls_accept = TondTlsAccept {
-        cert_store: cert_store.clone(),
+    let tls_settings = || {
+        let tls_accept = TondTlsAccept {
+            cert_store: cert_store.clone(),
+        };
+        TlsSettings::with_callbacks(Box::new(tls_accept)).expect("Failed to create TLS settings")
     };
-    let tls_settings =
-        TlsSettings::with_callbacks(Box::new(tls_accept)).expect("Failed to create TLS settings");
 
     let mut proxy_service = pingora::proxy::http_proxy_service(&server.configuration, proxy);
 
-    // Add TLS listener on port 443 with SNI-based cert selection
-    proxy_service.add_tls_with_settings("0.0.0.0:443", None, tls_settings);
+    // TLS listeners on port 443 with SNI-based cert selection: IPv4, and
+    // IPv6 (IPv6-only, so it never collides with the IPv4 socket) when the
+    // host has IPv6 at all.
+    proxy_service.add_tls_with_settings("0.0.0.0:443", None, tls_settings());
+    let ipv6 = ipv6_available();
+    if ipv6 {
+        let mut v6only = pingora::listeners::TcpSocketOptions::default();
+        v6only.ipv6_only = Some(true);
+        proxy_service.add_tls_with_settings("[::]:443", Some(v6only), tls_settings());
+    } else {
+        tracing::info!("IPv6 is not available on this host: listening on IPv4 only");
+    }
 
     server.add_service(proxy_service);
 
-    tracing::info!("Tond Proxy listening on :443 (TLS) and :80 (HTTP redirect + ACME)");
+    tracing::info!(
+        "Tond Proxy listening on :443 (TLS) and :80 (HTTP redirect + ACME), {}",
+        if ipv6 { "IPv4 and IPv6" } else { "IPv4 only" }
+    );
     server.run_forever();
 }
 
@@ -1075,13 +1305,17 @@ async fn background(
         }
     });
 
-    // Certificate loop: results go to tond-server through the outbox.
+    // Certificate loop: results go to tond-server through the outbox;
+    // DNS-01 records are published by tond-server through the bridge.
     let outbox = Arc::new(Outbox::default());
+    let dns = Arc::new(DnsBridge::default());
     tokio::spawn(
         IssuanceLoop {
             routes: proxy.routes.clone(),
             dashboard_domain: proxy.dashboard_domain.clone(),
-            cert_store,
+            config: proxy.cert_config.clone(),
+            dns: dns.clone(),
+            cert_store: cert_store.clone(),
             challenges,
             data_dir: data_dir.clone(),
             db: proxy.db.pool.clone(),
@@ -1104,6 +1338,8 @@ async fn background(
                 proxy: proxy.clone(),
                 outbox,
                 cert_wake: proxy.domains_changed.clone(),
+                cert_store,
+                dns,
                 started,
             });
             tokio::spawn(control::serve(listener, own_uid, ctl));
@@ -1134,6 +1370,11 @@ async fn background(
             _ => {}
         }
         meter.ran(run, result.err().map(|e| format!("{e:#}")));
+        if let Some((n, example)) = log_limit::LIMITER.take_summary(Instant::now()) {
+            tracing::warn!(
+                "{n} repeated warning(s) from the proxy's libraries were not logged in the last hour, e.g. \"{example}\". Failed requests are counted in the request metrics; set RUST_LOG=debug for every one."
+            );
+        }
     }
 }
 
@@ -1143,6 +1384,29 @@ const HTTP_MAX_CONNECTIONS: usize = 512;
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Largest request head we read.
 const HTTP_MAX_HEAD_BYTES: usize = 8 * 1024;
+
+/// Whether this host can open IPv6 sockets at all. A kernel booted with
+/// `ipv6.disable=1` can't (EAFNOSUPPORT), and binding `[::]` there would stop
+/// the proxy from starting; with IPv6 merely unconfigured the listener binds
+/// and simply gets no traffic.
+fn ipv6_available() -> bool {
+    std::net::TcpListener::bind((std::net::Ipv6Addr::UNSPECIFIED, 0)).is_ok()
+}
+
+/// A listening socket on `[::]:port` that accepts IPv6 only (IPV6_V6ONLY),
+/// so it coexists with the `0.0.0.0:port` socket whatever the host's
+/// `net.ipv6.bindv6only` default is.
+fn bind_ipv6_only(port: u16) -> std::io::Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_only_v6(true)?;
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    tokio::net::TcpListener::from_std(socket.into())
+}
 
 /// HTTP server on port 80 that:
 /// - Serves ACME HTTP-01 challenge responses at `/.well-known/acme-challenge/{token}`
@@ -1155,9 +1419,31 @@ async fn run_http_server(ctx: HttpContext) -> Result<()> {
     use tokio::net::TcpListener;
 
     let listener = TcpListener::bind("0.0.0.0:80").await?;
-    tracing::info!("HTTP redirect server listening on :80");
-
     let permits = Arc::new(Semaphore::new(HTTP_MAX_CONNECTIONS));
+    // IPv6 as well when the host has it; a failure there never costs IPv4.
+    if ipv6_available() {
+        match bind_ipv6_only(80) {
+            Ok(v6) => {
+                tokio::spawn(serve_http_listener(v6, ctx.clone(), permits.clone()));
+                tracing::info!("HTTP redirect server listening on :80 (IPv4 and IPv6)");
+            }
+            Err(e) => {
+                tracing::warn!("HTTP server: can't listen on [::]:80 ({e}); IPv4 only");
+            }
+        }
+    } else {
+        tracing::info!("HTTP redirect server listening on :80 (IPv4 only)");
+    }
+    serve_http_listener(listener, ctx, permits).await;
+    Ok(())
+}
+
+/// Accept loop of one port-80 listener; `permits` is shared by all of them.
+async fn serve_http_listener(
+    listener: tokio::net::TcpListener,
+    ctx: HttpContext,
+    permits: Arc<Semaphore>,
+) {
     let mut last_accept_warning: Option<Instant> = None;
 
     loop {
@@ -1276,6 +1562,7 @@ mod tests {
                 id TEXT PRIMARY KEY NOT NULL,
                 name TEXT NOT NULL UNIQUE,
                 domain TEXT,
+                source_type TEXT NOT NULL DEFAULT 'git',
                 container_port INTEGER NOT NULL DEFAULT 3000,
                 status TEXT NOT NULL DEFAULT 'pending',
                 host_port INTEGER,
@@ -1289,6 +1576,27 @@ mod tests {
         .unwrap_or_else(|err| panic!("failed to create apps table: {err}"));
 
         sqlx::query(
+            "CREATE TABLE app_domains (
+                domain TEXT PRIMARY KEY NOT NULL,
+                app_id TEXT NOT NULL,
+                service TEXT,
+                port INTEGER,
+                kind TEXT NOT NULL DEFAULT 'alias',
+                redirect_to TEXT,
+                redirect_code INTEGER NOT NULL DEFAULT 308
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|err| panic!("failed to create app_domains table: {err}"));
+        sqlx::query(
+            "CREATE TABLE dns_providers (id TEXT PRIMARY KEY, zones TEXT NOT NULL DEFAULT '[]')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|err| panic!("failed to create dns_providers table: {err}"));
+
+        sqlx::query(
             "CREATE TABLE preview_deployments (
                 id TEXT PRIMARY KEY NOT NULL,
                 subdomain TEXT,
@@ -1300,6 +1608,15 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap_or_else(|err| panic!("failed to create preview_deployments table: {err}"));
+
+        for stmt in [
+            "CREATE TABLE compose_services (app_id TEXT NOT NULL, name TEXT NOT NULL, host_port INTEGER, PRIMARY KEY(app_id, name))",
+        ] {
+            sqlx::query(stmt)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|err| panic!("{stmt}: {err}"));
+        }
 
         pool
     }
@@ -1448,7 +1765,7 @@ mod tests {
 
     #[test]
     fn dashboard_forwarding_headers_replace_client_supplied_values() {
-        let mut req = pingora::http::RequestHeader::build("POST", b"/api/auth/login", None)
+        let mut req = pingora::http::RequestHeader::build("POST", b"/api/v1/auth/login", None)
             .unwrap_or_else(|err| panic!("failed to build request header: {err}"));
         req.insert_header("X-Forwarded-For", "1.2.3.4")
             .unwrap_or_else(|err| panic!("{err}"));
@@ -1505,6 +1822,7 @@ mod tests {
             upstream: upstream.to_string(),
             stats: Registry::default().route(RouteKind::App, "test"),
             access: None,
+            redirect: None,
         })
     }
 
@@ -1846,6 +2164,31 @@ mod tests {
         .execute(pool)
         .await
         .unwrap_or_else(|err| panic!("failed to insert app {name}: {err}"));
+        // tond-server's trigger seeds the primary domain the same way.
+        if let Some(domain) = domain {
+            insert_domain(pool, id, domain, "primary", None).await;
+        }
+    }
+
+    async fn insert_domain(
+        pool: &SqlitePool,
+        app_id: &str,
+        domain: &str,
+        kind: &str,
+        redirect_to: Option<(&str, i64)>,
+    ) {
+        sqlx::query(
+            "INSERT INTO app_domains (domain, app_id, kind, redirect_to, redirect_code)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(domain)
+        .bind(app_id)
+        .bind(kind)
+        .bind(redirect_to.map(|(to, _)| to))
+        .bind(redirect_to.map_or(308, |(_, code)| code))
+        .execute(pool)
+        .await
+        .unwrap_or_else(|err| panic!("failed to insert domain {domain}: {err}"));
     }
 
     async fn insert_preview(
@@ -1868,6 +2211,81 @@ mod tests {
         .execute(pool)
         .await
         .unwrap_or_else(|err| panic!("failed to insert preview {id}: {err}"));
+    }
+
+    #[tokio::test]
+    async fn ipv6_listener_coexists_with_the_ipv4_one_on_the_same_port() {
+        if !ipv6_available() {
+            return; // an IPv4-only host: the proxy skips IPv6 (tested by the smoke run)
+        }
+        let v4 = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+            .unwrap_or_else(|e| panic!("v4: {e}"));
+        let port = v4.local_addr().map(|a| a.port()).unwrap_or_default();
+        let v6 =
+            bind_ipv6_only(port).unwrap_or_else(|e| panic!("[::]:{port} next to 0.0.0.0: {e}"));
+        let accept = tokio::spawn(async move { v6.accept().await.map(|(_, peer)| peer) });
+        let _client = tokio::net::TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, port))
+            .await
+            .unwrap_or_else(|e| panic!("connect [::1]:{port}: {e}"));
+        let peer = accept
+            .await
+            .unwrap_or_else(|e| panic!("join: {e}"))
+            .unwrap_or_else(|e| panic!("accept: {e}"));
+        assert!(peer.is_ipv6(), "{peer}");
+    }
+
+    #[tokio::test]
+    async fn refresh_routes_routes_compose_service_domains_to_their_host_ports() {
+        let dir = temp_dir();
+        let db_path = temp_db_path(dir.path());
+        let pool = create_test_db(&db_path).await;
+        insert_setting_key(&pool, "preview_domain", "previews.test").await;
+        insert_app(&pool, "shop", "shop", None, "running", 80, None).await;
+        insert_app(&pool, "down", "down", None, "stopped", 80, None).await;
+        insert_app(&pool, "blog", "blog", None, "building", 80, None).await;
+        for stmt in [
+            "INSERT INTO compose_services (app_id, name, host_port) VALUES
+               ('shop', 'web', 8300), ('shop', 'admin', 8301), ('shop', 'cache', NULL),
+               ('down', 'web', 8302), ('blog', 'web', 8303)",
+            "INSERT INTO app_domains (domain, app_id, service, port) VALUES
+               ('shop.example.com', 'shop', 'web', 80),
+               ('www.shop.example.com', 'shop', 'web', 80),
+               ('admin.shop.example.com', 'shop', 'admin', 8080),
+               ('cache.shop.example.com', 'shop', 'cache', 6379),
+               ('x.previews.test', 'shop', 'web', 80),
+               ('down.example.com', 'down', 'web', 80),
+               ('blog.example.com', 'blog', 'web', 80),
+               ('single.example.com', 'shop', NULL, NULL)",
+            "UPDATE apps SET source_type = 'compose' WHERE id IN ('shop', 'down', 'blog')",
+            "INSERT INTO app_domains (domain, app_id, service, port, kind, redirect_to) VALUES
+               ('old-shop.example.com', 'shop', 'web', 80, 'redirect', 'shop.example.com')",
+        ] {
+            sqlx::query(stmt)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|err| panic!("{stmt}: {err}"));
+        }
+        let proxy = TondProxy::new(test_route_db(&db_path), "127.0.0.1:3001".to_string());
+        proxy
+            .refresh_routes()
+            .await
+            .unwrap_or_else(|err| panic!("refresh: {err}"));
+        let routes = upstreams(&*proxy.routes.read().await);
+        let expected: HashMap<String, String> = [
+            ("shop.example.com", "127.0.0.1:8300"),
+            ("www.shop.example.com", "127.0.0.1:8300"),
+            ("admin.shop.example.com", "127.0.0.1:8301"),
+            // A redeploy keeps serving: unchanged services keep their port.
+            ("blog.example.com", "127.0.0.1:8303"),
+            ("old-shop.example.com", "308 redirect to shop.example.com"),
+        ]
+        .into_iter()
+        .map(|(d, u)| (d.to_string(), u.to_string()))
+        .collect();
+        assert_eq!(
+            routes, expected,
+            "unpublished services, stopped apps and preview-domain hosts are not routed"
+        );
     }
 
     #[tokio::test]
@@ -2225,6 +2643,115 @@ mod tests {
         assert_eq!(proxy.route_db().reloads(), 2);
     }
 
+    #[test]
+    fn redirect_locations_keep_path_and_query() {
+        assert_eq!(
+            redirect_location("example.com", "/shop?item=1&x=%20"),
+            "https://example.com/shop?item=1&x=%20"
+        );
+        assert_eq!(
+            redirect_location("example.com", "/"),
+            "https://example.com/"
+        );
+        assert_eq!(
+            redirect_location("example.com", "http://evil.test/x"),
+            "https://example.com/",
+            "absolute-form targets never pick the host"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_domain_of_an_app_is_routed_and_redirects_carry_their_target() {
+        let dir = temp_dir();
+        let db_path = temp_db_path(dir.path());
+        let pool = create_test_db(&db_path).await;
+        insert_setting_key(&pool, "apps_domain", "apps.test").await;
+        insert_app(
+            &pool,
+            "a1",
+            "web",
+            Some("example.com"),
+            "running",
+            3000,
+            Some(4100),
+        )
+        .await;
+        insert_domain(&pool, "a1", "shop.example.com", "alias", None).await;
+        insert_domain(
+            &pool,
+            "a1",
+            "www.example.com",
+            "redirect",
+            Some(("example.com", 301)),
+        )
+        .await;
+        // Compose service domains are not routed on the app's port.
+        sqlx::query("INSERT INTO app_domains (domain, app_id, kind, service) VALUES ('db.example.com', 'a1', 'alias', 'admin')")
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|err| panic!("insert: {err}"));
+        sqlx::query("INSERT INTO dns_providers (id, zones) VALUES ('p1', '[\"apps.test\"]')")
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|err| panic!("insert: {err}"));
+
+        let proxy = TondProxy::new(test_route_db(&db_path), "127.0.0.1:3001".into());
+        proxy
+            .refresh_routes()
+            .await
+            .unwrap_or_else(|err| panic!("refresh: {err}"));
+        let routes = proxy.routes.read().await;
+        assert_eq!(upstream_of(&routes, "example.com"), Some("127.0.0.1:4100"));
+        assert_eq!(
+            upstream_of(&routes, "shop.example.com"),
+            Some("127.0.0.1:4100")
+        );
+        assert!(routes["example.com"].redirect.is_none());
+        assert_eq!(
+            routes["www.example.com"].redirect,
+            Some(Redirect {
+                to: "example.com".into(),
+                code: 301
+            })
+        );
+        assert!(!routes.contains_key("db.example.com"));
+        assert!(
+            Arc::ptr_eq(
+                &routes["example.com"].stats,
+                &routes["www.example.com"].stats
+            ),
+            "all domains of an app count into the app's metrics"
+        );
+        drop(routes);
+        let cfg = proxy.cert_config.read().await.clone();
+        assert_eq!(cfg.apps_domain.as_deref(), Some("apps.test"));
+        assert_eq!(cfg.dns_zones, vec!["apps.test".to_string()]);
+
+        // Port 80 sends a redirect domain straight to its target.
+        let ctx = HttpContext {
+            challenges: acme::new_challenge_map(),
+            routes: proxy.routes.clone(),
+            dashboard_domain: proxy.dashboard_domain.clone(),
+            preview_domain: proxy.preview_domain.clone(),
+        };
+        let response = ctx
+            .respond(&sample_http_request("/a?b=c", Some("www.example.com")))
+            .await;
+        assert!(
+            response.starts_with(
+                "HTTP/1.1 301 Moved Permanently\r\nLocation: https://example.com/a?b=c\r\n"
+            ),
+            "{response}"
+        );
+        let response = ctx
+            .respond(&sample_http_request("/a", Some("shop.example.com")))
+            .await;
+        assert!(
+            response.contains("Location: https://shop.example.com/a\r\n"),
+            "{response}"
+        );
+    }
+
     #[tokio::test]
     async fn the_route_connection_is_read_only_and_follows_a_wal_writer() {
         // Server-like writer: WAL mode, files 0440 for us (read-only access,
@@ -2242,9 +2769,13 @@ mod tests {
             "CREATE TABLE route_state (id INTEGER PRIMARY KEY, version INTEGER NOT NULL)",
             "INSERT INTO route_state VALUES (1, 1)",
             "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-            "CREATE TABLE apps (id TEXT PRIMARY KEY, name TEXT, domain TEXT, status TEXT, host_port INTEGER, readiness TEXT NOT NULL DEFAULT 'http', access_log INTEGER NOT NULL DEFAULT 0, access_log_query INTEGER NOT NULL DEFAULT 0)",
+            "CREATE TABLE apps (id TEXT PRIMARY KEY, name TEXT, domain TEXT, status TEXT, source_type TEXT NOT NULL DEFAULT 'git', host_port INTEGER, readiness TEXT NOT NULL DEFAULT 'http', access_log INTEGER NOT NULL DEFAULT 0, access_log_query INTEGER NOT NULL DEFAULT 0)",
             "CREATE TABLE preview_deployments (id TEXT PRIMARY KEY, subdomain TEXT, host_port INTEGER, status TEXT, expires_at TEXT)",
+            "CREATE TABLE compose_services (app_id TEXT NOT NULL, name TEXT NOT NULL, host_port INTEGER, PRIMARY KEY(app_id, name))",
             "INSERT INTO apps (id, name, domain, status, host_port) VALUES ('a', 'web', 'web.example.com', 'running', 4100)",
+            "CREATE TABLE app_domains (domain TEXT PRIMARY KEY, app_id TEXT, service TEXT, port INTEGER, kind TEXT, redirect_to TEXT, redirect_code INTEGER NOT NULL DEFAULT 308)",
+            "INSERT INTO app_domains (domain, app_id, kind) VALUES ('web.example.com', 'a', 'primary')",
+            "CREATE TABLE dns_providers (id TEXT PRIMARY KEY, zones TEXT NOT NULL)",
         ] {
             sqlx::query(stmt)
                 .execute(&writer)
@@ -2280,6 +2811,12 @@ mod tests {
             .execute(&writer)
             .await
             .unwrap_or_else(|err| panic!("insert: {err}"));
+        sqlx::query(
+            "INSERT INTO app_domains (domain, app_id, kind) VALUES ('api.example.com', 'b', 'primary')",
+        )
+        .execute(&writer)
+        .await
+        .unwrap_or_else(|err| panic!("insert domain: {err}"));
         sqlx::query("UPDATE route_state SET version = 2")
             .execute(&writer)
             .await

@@ -1,9 +1,9 @@
 // handlers/deployments.rs — deployment history and rollback
 //
-// GET  /api/apps/{id}/deployments  — list last 20 deployments for an app
-// GET  /api/apps/{id}/deployments/{deployment_id}         — one deployment + its log
-// GET  /api/apps/{id}/deployments/{deployment_id}/stream  — live deploy view (WebSocket)
-// POST /api/apps/{id}/rollback     — redeploy the exact image of an earlier deployment
+// GET  /api/v1/apps/{id}/deployments  — list last 20 deployments for an app
+// GET  /api/v1/apps/{id}/deployments/{deployment_id}         — one deployment + its log
+// GET  /api/v1/apps/{id}/deployments/{deployment_id}/stream  — live deploy view (WebSocket)
+// POST /api/v1/apps/{id}/rollback     — redeploy the exact image of an earlier deployment
 //
 // Deployments are the source of truth for what ran: commit (git deploys),
 // trigger (manual / webhook / rollback / upload / cli / api, plus who),
@@ -51,7 +51,7 @@ use crate::{
 use super::fetch_app;
 use super::logs;
 
-/// POST /api/apps/{id}/rollback body (optional).
+/// POST /api/v1/apps/{id}/rollback body (optional).
 #[derive(Debug, Default, Deserialize)]
 pub struct RollbackRequest {
     /// Deployment whose image to restore; default: the previous distinct image.
@@ -73,9 +73,6 @@ fn parse_rollback_request(body: &[u8]) -> Result<RollbackRequest, AppError> {
 
 /// Why a deployment can't be rolled back to, or `None` if it can.
 fn rollback_blocker(app: &App, d: &Deployment, current_tag: Option<&str>) -> Option<String> {
-    if app.source_type == "compose" {
-        return Some("Rollback isn't available for Docker Compose apps".to_string());
-    }
     if d.status != "succeeded" {
         return Some("Only successful deployments can be restored".to_string());
     }
@@ -84,6 +81,9 @@ fn rollback_blocker(app: &App, d: &Deployment, current_tag: Option<&str>) -> Opt
     };
     if !images::is_deployment_image(&app.name, tag) {
         return Some("This deployment predates per-deployment images".to_string());
+    }
+    if app.source_type == "compose" && d.compose_source.is_none() {
+        return Some("This deployment has no recorded compose file".to_string());
     }
     if d.image_pruned {
         return Some("This deployment's image was pruned to save disk space".to_string());
@@ -124,12 +124,6 @@ fn pick_rollback_target<'a>(
         };
     }
 
-    if app.source_type == "compose" {
-        return Err(invalid(
-            "Rollback isn't available for Docker Compose apps; update the compose file and redeploy instead"
-                .to_string(),
-        ));
-    }
     deployments
         .iter()
         .find(|d| rollback_blocker(app, d, current).is_none())
@@ -217,7 +211,24 @@ pub async fn rollback_app(
     let image_tag = target.image_tag.clone().unwrap_or_default();
 
     // The image must still exist; if it vanished, record that and say so now.
-    if state.docker.inspect_image(&image_tag).await.is_err() {
+    // A compose deployment's tag names its set of service images.
+    let missing = if app.source_type == "compose" {
+        let mut missing = None;
+        for svc in deploy::deployment_services(&state.db, &target_id).await? {
+            if let Some(image) = svc.image
+                && state.docker.inspect_image(&image).await.is_err()
+            {
+                missing = Some(image);
+                break;
+            }
+        }
+        missing
+    } else if state.docker.inspect_image(&image_tag).await.is_err() {
+        Some(image_tag.clone())
+    } else {
+        None
+    };
+    if let Some(missing) = missing {
         let _ = sqlx::query(
             "UPDATE deployments SET image_pruned = 1 WHERE app_id = ? AND image_tag = ?",
         )
@@ -226,7 +237,7 @@ pub async fn rollback_app(
         .execute(&state.db)
         .await;
         return Err(AppError(TondError::InvalidInput(format!(
-            "Can't roll back: image {image_tag} is no longer on this server"
+            "Can't roll back: image {missing} is no longer on this server"
         ))));
     }
 
@@ -262,8 +273,8 @@ pub async fn rollback_app(
     .await;
 
     let mut body = crate::handlers::queued_response("Rollback queued", &app_id, &queued);
-    body["image_tag"] = json!(image_tag);
-    body["target_deployment_id"] = json!(target_id);
+    body.image_tag = Some(image_tag);
+    body.target_deployment_id = Some(target_id);
     Ok((StatusCode::ACCEPTED, Json(ApiResponse::ok(body))))
 }
 
@@ -300,10 +311,14 @@ async fn deployment_response(
     .await?;
     let id = deployment.id.clone();
     let mut responses = deployment_responses(app, history);
-    Ok(match responses.iter().position(|r| r.id == id) {
+    let mut response = match responses.iter().position(|r| r.id == id) {
         Some(pos) => responses.swap_remove(pos),
         None => DeploymentResponse::from(deployment),
-    })
+    };
+    if app.source_type == "compose" {
+        response.services = deploy::deployment_services(db, &id).await?;
+    }
+    Ok(response)
 }
 
 /// A deployment's log: `(lines oldest first, truncated?)`.
@@ -329,7 +344,7 @@ async fn deployment_logs(
     Ok((lines, truncated))
 }
 
-/// GET /api/apps/{id}/deployments/{deployment_id}
+/// GET /api/v1/apps/{id}/deployments/{deployment_id}
 pub async fn get_deployment(
     _rate: RateLimit,
     _auth: Authz<(scope::AppsRead, scope::LogsRead)>,
@@ -353,7 +368,7 @@ pub async fn get_deployment(
     ))
 }
 
-/// GET /api/apps/{id}/deployments/{deployment_id}/stream (WebSocket)
+/// GET /api/v1/apps/{id}/deployments/{deployment_id}/stream (WebSocket)
 ///
 /// On connect: `{"type":"snapshot","deployment":{…},"logs":[…],"logs_truncated":bool,
 /// "container_port":n,"health_check_path":…}` — the same shape as the GET.
@@ -594,6 +609,7 @@ mod tests {
             rollback_of: None,
             phases: "[]".to_string(),
             failure: None,
+            compose_source: None,
         }
     }
 
@@ -666,18 +682,39 @@ mod tests {
             "{}",
             err.0
         );
+    }
 
+    #[test]
+    fn compose_apps_roll_back_to_a_recorded_release() {
+        let with_file = |id: &str, tag: &str| {
+            let mut d = deployment(id, Some(tag));
+            d.compose_source = Some("services:\n  web:\n    image: nginx\n".into());
+            d
+        };
+        let deployments = vec![
+            with_file("dep-3", "tond-frontend:ccc"),
+            deployment("dep-2", Some("tond-frontend:bbb")), // no compose file
+            with_file("dep-1", "tond-frontend:aaa"),
+        ];
+        let target = pick_rollback_target(&app("compose"), &deployments, None)
+            .unwrap_or_else(|e| panic!("target expected: {}", e.0));
+        assert_eq!(target.id, "dep-1");
+        let err = pick_rollback_target(&app("compose"), &deployments, Some("dep-2"))
+            .err()
+            .unwrap_or_else(|| panic!("a release without its compose file can't be restored"));
+        assert!(err.0.to_string().contains("compose file"), "{}", err.0);
         let err = pick_rollback_target(
             &app("compose"),
-            &[
-                deployment("dep-2", Some("tond-compose-frontend")),
-                deployment("dep-1", Some("tond-compose-frontend")),
-            ],
+            &[with_file("dep-1", "tond-compose-frontend")],
             None,
         )
         .err()
-        .unwrap_or_else(|| panic!("compose apps can't roll back"));
-        assert!(err.0.to_string().contains("Docker Compose"), "{}", err.0);
+        .unwrap_or_else(|| panic!("legacy sentinels are not releases"));
+        assert!(
+            err.0.to_string().contains("No previous deployment"),
+            "{}",
+            err.0
+        );
     }
 
     #[test]

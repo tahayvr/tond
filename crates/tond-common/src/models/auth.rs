@@ -23,6 +23,7 @@ pub fn hash_key(raw_key: &str) -> String {
 // ── User (dashboard account) ──
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct User {
     pub id: String,
     pub email: String,
@@ -57,6 +58,7 @@ impl User {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UserResponse {
     pub id: String,
     pub email: String,
@@ -94,8 +96,9 @@ impl From<User> for UserResponse {
     }
 }
 
-/// Request body for `POST /api/auth/setup` (first-run admin account).
+/// Request body for `POST /api/v1/auth/setup` (first-run admin account).
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SetupRequest {
     /// One-time setup token from the installer (`<data dir>/setup-token`).
     pub token: String,
@@ -103,21 +106,24 @@ pub struct SetupRequest {
     pub password: String,
 }
 
-/// Request body for `POST /api/auth/setup/check`.
+/// Request body for `POST /api/v1/auth/setup/check`.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SetupCheckRequest {
     pub token: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct LoginRequest {
     pub email: String,
     pub password: String,
 }
 
-/// Body of POST /api/users: invite a user. No password: the response carries a
+/// Body of POST /api/v1/users: invite a user. No password: the response carries a
 /// one-time set-password link valid for 24 hours.
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreateUserRequest {
     pub email: String,
     #[serde(default = "default_role")]
@@ -128,8 +134,9 @@ fn default_role() -> Role {
     Role::Viewer
 }
 
-/// Body of PATCH /api/users/{id}.
+/// Body of PATCH /api/v1/users/{id}.
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateUserRequest {
     #[serde(default)]
     pub role: Option<Role>,
@@ -139,6 +146,7 @@ pub struct UpdateUserRequest {
 
 /// A one-time set-password link (invite or reset).
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PasswordLinkResponse {
     pub user: UserResponse,
     /// Path + token for the dashboard, e.g. `/set-password?token=…`.
@@ -147,14 +155,16 @@ pub struct PasswordLinkResponse {
     pub expires_at: String,
 }
 
-/// Body of POST /api/auth/password-link/check.
+/// Body of POST /api/v1/auth/password-link/check.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PasswordLinkCheckRequest {
     pub token: String,
 }
 
-/// Body of POST /api/auth/password-link/complete.
+/// Body of POST /api/v1/auth/password-link/complete.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PasswordLinkCompleteRequest {
     pub token: String,
     pub password: String,
@@ -163,6 +173,7 @@ pub struct PasswordLinkCompleteRequest {
 // ── Session (dashboard login session) ──
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Session {
     pub id: String,
     pub user_id: String,
@@ -179,6 +190,7 @@ pub struct Session {
 /// Public API view of a session — never includes the raw token (the token
 /// is the session ID, which is never returned after creation).
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionResponse {
     pub id: String,
     pub user_agent: Option<String>,
@@ -196,16 +208,18 @@ pub struct SessionResponse {
 // ── Phase 7.1 — Password & 2FA request types ──
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ChangePasswordRequest {
     pub current_password: String,
     pub new_password: String,
 }
 
-/// Returned by `POST /api/auth/2fa/setup`. Contains the plain-text secret,
+/// Returned by `POST /api/v1/auth/2fa/setup`. Contains the plain-text secret,
 /// an `otpauth://` URI, and a base64-encoded PNG QR code ready for use as
 /// `<img src="data:image/png;base64,{qr_code}">`. 2FA is **not** active
-/// until `POST /api/auth/2fa/confirm` is called with a valid code.
+/// until `POST /api/v1/auth/2fa/confirm` is called with a valid code.
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TotpSetupResponse {
     pub secret: String,
     pub otpauth_uri: String,
@@ -213,28 +227,32 @@ pub struct TotpSetupResponse {
     pub qr_code: String,
 }
 
-/// Request body for `POST /api/auth/2fa/setup`: the current password, so a
+/// Request body for `POST /api/v1/auth/2fa/setup`: the current password, so a
 /// hijacked session can't silently enroll an attacker's authenticator.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TotpSetupRequest {
     pub password: String,
 }
 
-/// Request body for `POST /api/auth/2fa/confirm`.
+/// Request body for `POST /api/v1/auth/2fa/confirm`.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TotpConfirmRequest {
     pub code: String,
 }
 
-/// Request body for `POST /api/auth/2fa/disable`.
+/// Request body for `POST /api/v1/auth/2fa/disable`.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TotpDisableRequest {
     pub password: String,
     pub code: String,
 }
 
-/// Request body for `POST /api/auth/2fa/verify`.
+/// Request body for `POST /api/v1/auth/2fa/verify`.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TotpVerifyRequest {
     /// Either a 6-digit TOTP code or one of the 16-char hex backup codes.
     pub code: String,

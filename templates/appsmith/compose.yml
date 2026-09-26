@@ -1,0 +1,17 @@
+services:
+  appsmith:
+    image: appsmith/appsmith-ce:v2.4.2
+    restart: unless-stopped
+    mem_limit: 3g
+    ports: ["80"]
+    environment:
+      APPSMITH_DISABLE_TELEMETRY: "true"
+    volumes:
+      - ./stacks:/appsmith-stacks
+    # Timings only: the image's own HEALTHCHECK test is kept, but its 15s interval
+    # would keep the deploy waiting.
+    healthcheck:
+      interval: 10s
+      timeout: 15s
+      start_period: 180s
+      start_interval: 3s

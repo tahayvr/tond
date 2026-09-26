@@ -1,0 +1,30 @@
+id = "ntfy"
+name = "ntfy"
+description = "Push notifications to your phone or desktop with a simple HTTP request."
+about = "ntfy is a pub-sub notification service: send a message with curl (or from scripts, cron jobs, Tond alerts and home automation) and receive it on the ntfy Android/iOS apps or the web. Access is deny-all by default, so only users you create can publish or subscribe."
+category = "communication"
+tags = ["notifications", "push", "alerts", "pubsub"]
+logo = "ntfy"
+version = "2.28"
+website = "https://ntfy.sh"
+docs = "https://docs.ntfy.sh/config/"
+repository = "https://github.com/binwiederhier/ntfy"
+ram_mb = 40
+setup_notes = "Create a user from the app's Terminal tab: `ntfy user add --role=admin admin`. Then sign in from the web app or the mobile apps with this address."
+upgrade_notes = "Change the image to a newer 2.x tag and redeploy."
+post_deploy_checks = ["Create an admin user from the app terminal", "Send a test message with curl"]
+
+[public]
+service = "ntfy"
+port = 80
+health_path = "/v1/health"
+
+[[inputs]]
+key = "NTFY_BASE_URL"
+label = "Public URL"
+value = "{app_url}"
+
+[[volumes]]
+service = "ntfy"
+path = "./data"
+description = "Message cache, users and access control"

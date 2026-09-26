@@ -5,10 +5,12 @@ use serde::{Deserialize, Serialize};
 // ── Certificate (TLS cert tracking) ──
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Certificate {
     pub id: String,
     pub domain: String,
-    /// "acme" | "self_signed"
+    /// "acme" (issued and renewed by tond-proxy) | "custom" (uploaded; never
+    /// renewed, expiry alerts still apply)
     pub cert_type: String,
     pub cert_path: String,
     pub key_path: String,
@@ -31,10 +33,13 @@ pub struct Certificate {
     pub issuer: Option<String>,
     /// RFC 3339 time of the last successful issuance or renewal.
     pub last_renewed_at: Option<String>,
+    /// "http-01" | "dns-01" for ACME certificates.
+    pub challenge: Option<String>,
 }
 
 /// Which CA family issued a certificate, from its issuer name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum IssuerKind {
     /// Let's Encrypt production: trusted by browsers.
@@ -43,6 +48,8 @@ pub enum IssuerKind {
     LetsencryptStaging,
     /// Any other CA (a custom `TOND_ACME_DIRECTORY`, e.g. a private ACME CA).
     Custom,
+    /// Uploaded by an admin (cert_type 'custom'): Tond does not renew it.
+    Uploaded,
     /// No certificate issued yet.
     Unknown,
 }
@@ -66,6 +73,7 @@ impl IssuerKind {
 
 /// What a certificate's domain is used for right now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CertificateTarget {
     /// The Tond dashboard (`dashboard_domain`).
@@ -79,11 +87,16 @@ pub enum CertificateTarget {
         preview_id: String,
         pr_number: Option<i64>,
     },
+    /// A wildcard certificate: `purpose` is "apps" (the apps domain),
+    /// "previews" (the preview domain) or "custom" (any other wildcard);
+    /// `hosts` is how many served hosts it covers.
+    Wildcard { purpose: String, hosts: u32 },
     /// Nothing is served on this domain any more (a leftover certificate).
     Unused,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CertificateResponse {
     /// Empty for a served domain that has no certificate row yet.
     pub id: String,
@@ -99,13 +112,21 @@ pub struct CertificateResponse {
     pub issuer: Option<String>,
     pub issuer_kind: IssuerKind,
     pub last_renewed_at: Option<String>,
+    /// "http-01" | "dns-01" for ACME certificates.
+    pub challenge: Option<String>,
     pub serves: CertificateTarget,
 }
 
 impl CertificateResponse {
     pub fn from_row(c: Certificate, serves: CertificateTarget) -> Self {
+        let issuer_kind = if c.cert_type == "custom" {
+            IssuerKind::Uploaded
+        } else {
+            IssuerKind::from_issuer(c.issuer.as_deref())
+        };
         Self {
-            issuer_kind: IssuerKind::from_issuer(c.issuer.as_deref()),
+            issuer_kind,
+            challenge: c.challenge,
             id: c.id,
             domain: c.domain,
             cert_type: c.cert_type,
@@ -138,6 +159,7 @@ impl CertificateResponse {
             issuer: None,
             issuer_kind: IssuerKind::Unknown,
             last_renewed_at: None,
+            challenge: None,
             serves,
         }
     }

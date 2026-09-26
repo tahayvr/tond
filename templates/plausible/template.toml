@@ -1,0 +1,51 @@
+id = "plausible"
+name = "Plausible Analytics"
+description = "Lightweight, cookie-free web analytics with a single-page dashboard."
+about = "Plausible Community Edition gives you traffic, sources, goals and funnels on one clear page, without cookies or personal data. Events are stored in ClickHouse, which needs more memory than simpler analytics tools; on a small server, Umami is the lighter choice."
+category = "analytics"
+tags = ["analytics", "privacy", "google analytics alternative", "clickhouse"]
+logo = "plausibleanalytics"
+version = "3.2"
+website = "https://plausible.io"
+docs = "https://github.com/plausible/community-edition"
+repository = "https://github.com/plausible/analytics"
+ram_mb = 1200
+setup_notes = "Open the app and register: the first account becomes the owner, and registration then switches to invite-only. Add your site and paste the script into its <head>."
+upgrade_notes = "Change the plausible image to a newer v3.x tag and redeploy; migrations run on start. Keep ClickHouse on a version the release notes list as supported, and snapshot the app first."
+post_deploy_checks = ["Register the owner account right away", "Add a site and check a page view arrives"]
+
+[public]
+service = "plausible"
+port = 8000
+health_path = "/api/health"
+
+[[inputs]]
+key = "BASE_URL"
+label = "Public URL"
+value = "{app_url}"
+
+[[inputs]]
+key = "SECRET_KEY_BASE"
+label = "Secret key base"
+generate = "base64"
+
+[[inputs]]
+key = "DB_PASSWORD"
+label = "Database password"
+generate = "password"
+
+[[volumes]]
+service = "plausible"
+path = "./plausible"
+description = "Plausible's own files (GeoIP database, uploads)"
+owner = "999:65533"
+
+[[volumes]]
+service = "db"
+path = "./postgres"
+description = "PostgreSQL data: users, sites, goals"
+
+[[volumes]]
+service = "events"
+path = "./clickhouse"
+description = "ClickHouse data: every page view and event"

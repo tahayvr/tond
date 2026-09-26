@@ -1,0 +1,8 @@
+services:
+  actual:
+    image: actualbudget/actual-server:26.9.0-alpine
+    restart: unless-stopped
+    mem_limit: 256m
+    ports: ["5006"]
+    volumes:
+      - ./data:/data

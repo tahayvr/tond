@@ -1,0 +1,17 @@
+services:
+  pocketbase:
+    image: ghcr.io/muchobien/pocketbase:0.40.4
+    restart: unless-stopped
+    mem_limit: 256m
+    ports: ["8090"]
+    environment:
+      PB_SUPERUSER_EMAIL: ${SUPERUSER_EMAIL}
+      PB_SUPERUSER_PASSWORD: ${SUPERUSER_PASSWORD}
+    # Create (or update) the superuser, then serve.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        /usr/local/bin/pocketbase superuser upsert "$$PB_SUPERUSER_EMAIL" "$$PB_SUPERUSER_PASSWORD" --dir=/pb_data
+        && exec /usr/local/bin/pocketbase serve --http=0.0.0.0:8090 --dir=/pb_data
+    volumes:
+      - ./pb_data:/pb_data

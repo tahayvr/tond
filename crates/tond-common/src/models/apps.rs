@@ -13,6 +13,7 @@ use uuid::Uuid;
 /// (informational — deploys re-derive the path from `name`).
 /// `container_path` is the mount point inside the container (e.g. `/data`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Volume {
     /// Directory name under the app's volume directory (e.g. `data`)
     #[serde(default)]
@@ -24,7 +25,12 @@ pub struct Volume {
 
 // ── App (a deployed service) ──
 
+/// Every `source_type` an app can have (the server validates against this
+/// list and the CLI derives `--source-type`'s possible values from it).
+pub const APP_SOURCE_TYPES: &[&str] = &["git", "image", "tarball", "dockerfile", "compose"];
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct App {
     pub id: String,
     pub name: String,
@@ -94,6 +100,8 @@ pub struct App {
     // ── Phase 4.5: GitLab PAT Integration ──
     /// GitLab token ID used to clone private GitLab repos
     pub gitlab_token_id: Option<String>,
+    /// Gitea/Forgejo token used for commit statuses, PR comments and clones
+    pub gitea_token_id: Option<String>,
     // ── Phase 4.6: PR Preview Deployments ──
     /// 1 = automatically create a preview deployment when a GitHub pull_request
     /// webhook event is received for this app; 0 = opt-out (default).
@@ -111,6 +119,10 @@ pub struct App {
     pub dockerfile_content: Option<String>,
     /// Raw docker-compose.yml content supplied by the user (used when source_type = "compose")
     pub compose_content: Option<String>,
+    /// Compose apps deployed from a git repository: path of the compose file
+    /// inside the repository (None = inline compose_content)
+    #[sqlx(default)]
+    pub compose_path: Option<String>,
     /// Subdirectory to use as the build root (useful for monorepos); None = repo root
     pub base_dir: Option<String>,
     /// 1 = serve final build output as a static site; 0 = run as a process
@@ -122,6 +134,12 @@ pub struct App {
     /// For readiness "none": seconds the container must stay up
     #[sqlx(default)]
     pub ready_after_secs: i64,
+    /// One-click template the app was deployed from (None otherwise)
+    #[sqlx(default)]
+    pub template_id: Option<String>,
+    /// The template's version at deploy time
+    #[sqlx(default)]
+    pub template_version: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -220,15 +238,19 @@ impl App {
             registry_credential_id: None,
             github_app_id: None,
             gitlab_token_id: None,
+            gitea_token_id: None,
             preview_enabled: 0,
             preview_shared_keys: "[]".to_string(),
             preview_env_vars: "{}".to_string(),
             dockerfile_content: None,
             compose_content: None,
+            compose_path: None,
             base_dir: None,
             static_build: 0,
             readiness: Readiness::Http.as_str().to_string(),
             ready_after_secs: DEFAULT_READY_AFTER_SECS,
+            template_id: None,
+            template_version: None,
             created_at: now.clone(),
             updated_at: now,
         }
@@ -238,6 +260,7 @@ impl App {
 // ── API request/response types ──
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreateAppRequest {
     pub name: String,
     /// "git" | "image" | "dockerfile" | "compose"
@@ -280,6 +303,14 @@ pub struct CreateAppRequest {
     pub dockerfile_content: Option<String>,
     /// Raw docker-compose.yml content (used when source_type = "compose")
     pub compose_content: Option<String>,
+    /// Compose from a git repository (source_url + branch): path of the
+    /// compose file in the repository (default "docker-compose.yml")
+    #[serde(default)]
+    pub compose_path: Option<String>,
+    /// Compose apps: the service that answers web traffic on
+    /// `container_port` and gets `domain` (default: detected from the file)
+    #[serde(default)]
+    pub compose_service: Option<String>,
     /// Subdirectory to use as the build root (None = repo root)
     pub base_dir: Option<String>,
     /// Serve build output as a static site (default false)
@@ -298,16 +329,26 @@ fn default_port() -> i64 {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AppResponse {
     pub id: String,
     pub name: String,
     pub domain: Option<String>,
-    /// Set (on GET /api/apps/{id}) when the app's domain is on the same site
+    /// Set (on GET /api/v1/apps/{id}) when the app's domain is on the same site
     /// as the dashboard: allowed, but the dashboard shows this warning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain_warning: Option<String>,
+    /// One-click template the app was deployed from (see GET /api/v1/templates)
+    #[serde(default)]
+    pub template_id: Option<String>,
+    /// The template's version at deploy time
+    #[serde(default)]
+    pub template_version: Option<String>,
     pub source_type: String,
     pub source_url: Option<String>,
+    /// Branch deployed from `source_url` (git and git-sourced compose apps)
+    #[serde(default)]
+    pub branch: Option<String>,
     pub status: String,
     pub container_port: i64,
     pub host_port: Option<i64>,
@@ -341,18 +382,24 @@ pub struct AppResponse {
     // ── Phase 4.5: GitLab PAT Integration ──
     /// GitLab token ID used to clone this app's repo
     pub gitlab_token_id: Option<String>,
+    /// Gitea/Forgejo token linked to this app
+    #[serde(default)]
+    pub gitea_token_id: Option<String>,
     // ── Phase 4.6: PR Preview Deployments ──
     /// Whether PR preview deployments are enabled for this app
     pub preview_enabled: bool,
     /// App env var keys shared with preview containers (all others are withheld)
     pub preview_shared_keys: Vec<String>,
     // Preview override values are secrets: read them (masked) through
-    // GET /api/apps/{id}/env, never through the app response.
+    // GET /api/v1/apps/{id}/env, never through the app response.
     // ── Inline source content ──
     /// Raw Dockerfile content (used when source_type = "dockerfile")
     pub dockerfile_content: Option<String>,
     /// Raw docker-compose.yml content (used when source_type = "compose")
     pub compose_content: Option<String>,
+    /// Git-sourced compose apps: compose file path in the repository
+    #[serde(default)]
+    pub compose_path: Option<String>,
     /// Subdirectory used as build root (None = repo root)
     pub base_dir: Option<String>,
     /// Whether the build output is served as a static site
@@ -380,6 +427,7 @@ impl From<App> for AppResponse {
             domain: app.domain,
             source_type: app.source_type,
             source_url: app.source_url,
+            branch: app.branch,
             status: app.status,
             container_port: app.container_port,
             host_port: app.host_port,
@@ -399,14 +447,18 @@ impl From<App> for AppResponse {
             registry_credential_id: app.registry_credential_id,
             github_app_id: app.github_app_id,
             gitlab_token_id: app.gitlab_token_id,
+            gitea_token_id: app.gitea_token_id,
             preview_enabled: app.preview_enabled != 0,
             preview_shared_keys,
             dockerfile_content: app.dockerfile_content,
             compose_content: app.compose_content,
+            compose_path: app.compose_path,
             base_dir: app.base_dir,
             static_build: app.static_build != 0,
             readiness: Readiness::parse(&app.readiness).as_str().to_string(),
             ready_after_secs: app.ready_after_secs,
+            template_id: app.template_id,
+            template_version: app.template_version,
             created_at: app.created_at,
             updated_at: app.updated_at,
             domain_warning: None,
@@ -426,6 +478,7 @@ pub const ENV_VALUE_MASK: &str = "••••••••";
 
 /// One env var as returned by the list endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct EnvVarEntry {
     pub key: String,
     /// `ENV_VALUE_MASK` for a non-empty value, `""` for an empty one.
@@ -434,6 +487,7 @@ pub struct EnvVarEntry {
 
 /// Preview-only env configuration of an app.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PreviewEnvResponse {
     /// Whether PR preview deployments are enabled for this app
     pub enabled: bool,
@@ -444,23 +498,26 @@ pub struct PreviewEnvResponse {
     pub overrides: Vec<EnvVarEntry>,
 }
 
-/// GET /api/apps/{id}/env
+/// GET /api/v1/apps/{id}/env
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AppEnvResponse {
     pub vars: Vec<EnvVarEntry>,
     pub preview: PreviewEnvResponse,
 }
 
-/// GET /api/apps/{id}/env/{key} and /api/apps/{id}/preview-env/{key}
+/// GET /api/v1/apps/{id}/env/{key} and /api/v1/apps/{id}/preview-env/{key}
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct EnvVarValueResponse {
     pub key: String,
     pub value: String,
 }
 
-/// PATCH /api/apps/{id}/env — set and remove individual variables.
+/// PATCH /api/v1/apps/{id}/env — set and remove individual variables.
 /// Keys that are not mentioned are left unchanged.
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PatchEnvRequest {
     /// Variables to add or overwrite
     #[serde(default)]
@@ -470,8 +527,9 @@ pub struct PatchEnvRequest {
     pub unset: Vec<String>,
 }
 
-/// PATCH /api/apps/{id}/preview-env — edit preview overrides and exclusions.
+/// PATCH /api/v1/apps/{id}/preview-env — edit preview overrides and exclusions.
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PatchPreviewEnvRequest {
     /// Preview overrides to add or overwrite
     #[serde(default)]
@@ -513,11 +571,13 @@ pub fn is_valid_env_key(key: &str) -> bool {
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateDomainRequest {
     pub domain: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateHealthRequest {
     /// HTTP path to poll (e.g. "/health"); set to null to disable
     pub health_check_path: Option<String>,
@@ -528,6 +588,7 @@ pub struct UpdateHealthRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct VolumeRequest {
     /// Mount point inside the container (e.g. "/data")
     pub container_path: String,
@@ -541,14 +602,16 @@ pub struct VolumeRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateDrainTimeoutRequest {
     /// Seconds to wait for the new container to become healthy before
     /// cutting over traffic. Set to 0 to disable graceful draining.
     pub drain_timeout: i64,
 }
 
-/// PATCH /api/apps/{id}/resources — update memory and CPU limits
+/// PATCH /api/v1/apps/{id}/resources — update memory and CPU limits
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateAppResourcesRequest {
     /// Memory limit in bytes (None = no limit / unlimited)
     pub memory_limit: Option<i64>,
@@ -558,8 +621,9 @@ pub struct UpdateAppResourcesRequest {
 
 // ── Phase 4: Git Integration & Automation ──
 
-/// PUT /api/apps/{id}/auto-deploy — toggle automatic deploys on webhook push
+/// PUT /api/v1/apps/{id}/auto-deploy — toggle automatic deploys on webhook push
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateAutoDeployRequest {
     /// true = enable auto-deploy when a webhook fires for the watch_branch
     pub auto_deploy: bool,
@@ -567,10 +631,11 @@ pub struct UpdateAutoDeployRequest {
     pub watch_branch: Option<String>,
 }
 
-/// PUT /api/apps/{id}/webhook-secret — replace the webhook secret with a
+/// PUT /api/v1/apps/{id}/webhook-secret — replace the webhook secret with a
 /// caller-chosen value. Verification cannot be disabled; see
-/// `POST /api/apps/{id}/webhook-secret/rotate` for a server-generated secret.
+/// `POST /api/v1/apps/{id}/webhook-secret/rotate` for a server-generated secret.
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateWebhookSecretRequest {
     /// New secret (at least `MIN_WEBHOOK_SECRET_LEN` characters).
     pub secret: String,
@@ -581,6 +646,7 @@ pub const MIN_WEBHOOK_SECRET_LEN: usize = 16;
 
 /// Per-provider webhook URL paths for an app (relative to the dashboard origin).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WebhookUrls {
     pub github: String,
     pub gitlab: String,
@@ -592,45 +658,49 @@ impl WebhookUrls {
     /// Webhook paths are addressed by app UUID only (never by name).
     pub fn for_app(app_id: &str) -> Self {
         Self {
-            github: format!("/api/webhooks/github/{app_id}"),
-            gitlab: format!("/api/webhooks/gitlab/{app_id}"),
-            gitea: format!("/api/webhooks/gitea/{app_id}"),
-            generic: format!("/api/webhooks/generic/{app_id}"),
+            github: format!("/api/v1/webhooks/github/{app_id}"),
+            gitlab: format!("/api/v1/webhooks/gitlab/{app_id}"),
+            gitea: format!("/api/v1/webhooks/gitea/{app_id}"),
+            generic: format!("/api/v1/webhooks/generic/{app_id}"),
         }
     }
 }
 
-/// GET /api/apps/{id}/webhook and POST /api/apps/{id}/webhook-secret/rotate
+/// GET /api/v1/apps/{id}/webhook and POST /api/v1/apps/{id}/webhook-secret/rotate
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WebhookConfigResponse {
     pub app_id: String,
-    /// Paths relative to the server origin, e.g. `/api/webhooks/github/<uuid>`.
+    /// Paths relative to the server origin, e.g. `/api/v1/webhooks/github/<uuid>`.
     pub paths: WebhookUrls,
     /// Absolute URLs when `dashboard_domain` is configured, else None.
     pub urls: Option<WebhookUrls>,
     /// Whether a webhook secret is set. The secret itself is write-only: read
-    /// it with GET /api/apps/{id}/webhook-secret (admin only, audit-logged).
+    /// it with GET /api/v1/apps/{id}/webhook-secret (admin only, audit-logged).
     pub has_secret: bool,
     pub auto_deploy: bool,
     pub watch_branch: Option<String>,
 }
 
-/// GET /api/apps/{id}/webhook-secret (reveal) and
-/// POST /api/apps/{id}/webhook-secret/rotate (the new secret, shown once).
+/// GET /api/v1/apps/{id}/webhook-secret (reveal) and
+/// POST /api/v1/apps/{id}/webhook-secret/rotate (the new secret, shown once).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WebhookSecretResponse {
     pub secret: String,
 }
 
 /// Response returned after generating or fetching a deploy key.
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DeployKeyResponse {
     pub app_id: String,
     pub public_key: String,
 }
 
-/// PUT /api/apps/{id}/source — update the deployment source
+/// PUT /api/v1/apps/{id}/source — update the deployment source
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateSourceRequest {
     /// "git" | "image" | "tarball"
     pub source_type: String,
@@ -640,9 +710,10 @@ pub struct UpdateSourceRequest {
 
 // ── Phase 4.6: PR Preview configuration ──
 
-/// PUT /api/apps/{id}/preview-config — enable or disable PR preview deployments.
-/// Preview env overrides and exclusions are edited with PATCH /api/apps/{id}/preview-env.
+/// PUT /api/v1/apps/{id}/preview-config — enable or disable PR preview deployments.
+/// Preview env overrides and exclusions are edited with PATCH /api/v1/apps/{id}/preview-env.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdatePreviewConfigRequest {
     /// true = automatically deploy on pull_request events from GitHub
     pub preview_enabled: bool,
@@ -651,6 +722,7 @@ pub struct UpdatePreviewConfigRequest {
 // ── Deploy log ──
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DeployLog {
     pub id: String,
     pub app_id: String,

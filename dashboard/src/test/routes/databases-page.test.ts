@@ -48,7 +48,14 @@ describe('databases page', () => {
 							custom_image: null,
 							created_at: '2026-01-01T00:00:00.000Z',
 							updated_at: '2026-01-01T00:00:00.000Z',
-							public_access: false
+							public_access: false,
+							version: '16',
+							variant: '',
+							backup_schedule: null,
+							backup_retention: 7,
+							allowlist: [],
+							tls: false,
+							upgrade: null
 						}
 					]
 				}

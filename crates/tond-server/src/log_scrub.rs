@@ -2,18 +2,20 @@
 //
 // Every line written with `deploy::log_deploy` passes through `scrub_for_app`
 // before it is stored, and so does every container log line the API returns
-// or streams (handlers/logs.rs, GET /api/apps/{id}/logs); database container
+// or streams (handlers/logs.rs, GET /api/v1/apps/{id}/logs); database container
 // logs get the same treatment without app secrets (`scrub(line, &[])`):
 //
 //   1. credentials in URLs (`https://user:token@host` → `https://***@host`);
-//   2. the app's own secret values — env vars and preview overrides of at
+//   2. the app's own secret values — env vars (its project's shared env
+//      included, since the container gets it too) and preview overrides of at
 //      least `MIN_SECRET_LEN` characters (and each line of a multi-line value,
 //      e.g. a PEM key), plus its webhook secret;
 //   3. common key patterns: AWS access key ids, GitHub/GitLab/Slack/Tond
 //      tokens, and private key blocks.
 //
 // Decrypting the env for every build line would be wasteful, so an app's
-// secret values are cached for `CACHE_TTL`; env edits call `forget_app`.
+// secret values are cached for `CACHE_TTL`; app env edits call `forget_app`,
+// project env edits (which touch every member app) call `forget_all`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -37,6 +39,14 @@ static CACHE: LazyLock<Mutex<SecretCache>> = LazyLock::new(|| Mutex::new(HashMap
 pub fn forget_app(app_id: &str) {
     if let Ok(mut cache) = CACHE.lock() {
         cache.remove(app_id);
+    }
+}
+
+/// Drop every cached app (call after a project's shared env changes or an
+/// app moves between projects).
+pub fn forget_all() {
+    if let Ok(mut cache) = CACHE.lock() {
+        cache.clear();
     }
 }
 
@@ -73,18 +83,23 @@ async fn app_secrets(db: &SqlitePool, app_id: &str) -> Arc<Vec<String>> {
         return secrets.clone();
     }
 
-    let row: Option<(Option<String>, String, Option<String>)> =
-        sqlx::query_as("SELECT env_vars, preview_env_vars, webhook_secret FROM apps WHERE id = ?")
-            .bind(app_id)
-            .fetch_optional(db)
-            .await
-            .ok()
-            .flatten();
+    type Row = (Option<String>, String, Option<String>, Option<String>);
+    let row: Option<Row> = sqlx::query_as(
+        "SELECT a.env_vars, a.preview_env_vars, a.webhook_secret, p.env_vars
+         FROM apps a LEFT JOIN projects p ON p.id = a.project_id
+         WHERE a.id = ?",
+    )
+    .bind(app_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
     let mut values = Vec::new();
-    if let Some((env, preview, webhook)) = row {
+    if let Some((env, preview, webhook, project_env)) = row {
         for map in [
             secret_key::open_map(Purpose::AppEnv, env.as_deref()),
             secret_key::open_map(Purpose::AppPreviewEnv, Some(&preview)),
+            secret_key::open_map(Purpose::ProjectEnv, project_env.as_deref()),
         ]
         .into_iter()
         .flatten()
@@ -277,6 +292,45 @@ mod tests {
                 "GET https://***@api.internal/x".to_string()
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn container_lines_lose_the_projects_shared_secret_values() {
+        let db = SqlitePool::connect("sqlite::memory:")
+            .await
+            .unwrap_or_else(|e| panic!("pool: {e}"));
+        crate::db::migrate(&db)
+            .await
+            .unwrap_or_else(|e| panic!("migrate: {e}"));
+        let project_env = std::collections::BTreeMap::from([(
+            "SHARED_TOKEN".to_string(),
+            "project-wide-secret-42".to_string(),
+        )]);
+        let sealed =
+            crate::secrets::seal_project_env(&project_env).unwrap_or_else(|e| panic!("seal: {e}"));
+        sqlx::query(
+            "INSERT INTO projects (id, name, env_vars, created_at, updated_at)
+             VALUES ('scrub-proj', 'shop', ?, 'x', 'x')",
+        )
+        .bind(sealed)
+        .execute(&db)
+        .await
+        .unwrap_or_else(|e| panic!("project: {e}"));
+        sqlx::query(
+            "INSERT INTO apps (id, name, project_id, created_at, updated_at)
+             VALUES ('scrub-proj-app', 'api', 'scrub-proj', 'x', 'x')",
+        )
+        .execute(&db)
+        .await
+        .unwrap_or_else(|e| panic!("app: {e}"));
+        forget_app("scrub-proj-app");
+        let out = scrub_lines_for_app(
+            &db,
+            "scrub-proj-app",
+            vec!["token=project-wide-secret-42".to_string()],
+        )
+        .await;
+        assert_eq!(out, vec!["token=[redacted]".to_string()]);
     }
 
     #[test]

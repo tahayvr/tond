@@ -32,8 +32,6 @@
 		composeContent: string;
 		registryCredentialId: string;
 		buildMethod: 'dockerfile' | 'tbuild';
-		/** A template's default port, when a template is selected. */
-		templatePort: number | null;
 		/** The user typed a port; don't overwrite it with a detected one. */
 		portTouched: boolean;
 		/** Web app (http), TCP service (tcp) or background worker (none). */
@@ -58,7 +56,6 @@
 		composeContent,
 		registryCredentialId,
 		buildMethod,
-		templatePort,
 		portTouched = $bindable(false),
 		readiness = $bindable<Readiness>('http'),
 		readyAfterSecs = $bindable(10)
@@ -121,7 +118,6 @@
 
 	/** The port Tond would suggest from what it knows, if anything. */
 	let suggested = $derived.by((): number | null => {
-		if (sourceSubType === 'template') return templatePort;
 		if (sourceSubType === 'dockerfile' || sourceSubType === 'compose') return filePorts[0] ?? null;
 		if (sourceSubType === 'image') {
 			if (imageEnvPort && (!imagePorts?.length || imagePorts.includes(imageEnvPort)))
@@ -288,11 +284,9 @@
 					{:else if sourceSubType === 'compose'}
 						<p>
 							{filePorts.length
-								? `Your compose file uses container port${filePorts.length > 1 ? 's' : ''} ${filePorts.join(', ')}. Tond routes to the service that publishes the port you pick.`
-								: 'Publish the web service’s port in your compose file (ports: ["80"]) and enter it here.'}
+								? `Your compose file uses container port${filePorts.length > 1 ? 's' : ''} ${filePorts.join(', ')}. The web service gets this port on 127.0.0.1 and the domain below.`
+								: 'Enter the port your web service listens on (its ports: or expose: entry in the compose file).'}
 						</p>
-					{:else if sourceSubType === 'template'}
-						<p>The template's default{templatePort ? ` is ${templatePort}` : ''}.</p>
 					{:else if buildMethod === 'tbuild'}
 						<p>
 							Images TBuild generates listen on <code>$PORT</code>, so 8080 works unless your code

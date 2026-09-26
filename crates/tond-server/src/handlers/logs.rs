@@ -1,8 +1,10 @@
 // handlers/logs.rs — WebSocket live log streaming
 //
-// GET /api/apps/{id}/logs/stream
+// GET /api/v1/apps/{id}/logs/stream[?service=<name>]
 //
-//   Streams deploy logs and container logs for a single app.
+//   Streams deploy logs and container logs for a single app. For a compose
+//   app every service is followed (frames carry `service`); `?service=`
+//   limits the container logs to one service.
 //
 //   On connect — snapshot:
 //     {"type":"snapshot","deploy_logs":[...],"container_logs":["..."]}
@@ -10,7 +12,7 @@
 //     {"type":"deploy","level":"info","message":"...","ts":"..."}
 //     {"type":"container","line":"..."}
 //
-// GET /api/system/logs/stream
+// GET /api/v1/system/logs/stream
 //
 //   Streams deploy logs and container logs across *all* apps.
 //   Each incremental frame carries `app_id` and `app_name` so the client can
@@ -22,8 +24,8 @@
 //     {"type":"deploy","app_id":"...","app_name":"...","level":"...","message":"...","ts":"..."}
 //     {"type":"container","app_id":"...","app_name":"...","line":"..."}
 //
-// GET /api/databases/logs/stream, GET /api/databases/{id}/logs/stream,
-// GET /api/cron/{id}/runs/stream — see the handlers below.
+// GET /api/v1/databases/logs/stream, GET /api/v1/databases/{id}/logs/stream,
+// GET /api/v1/cron/{id}/runs/stream — see the handlers below.
 //
 // Authentication (all endpoints): the local Unix socket (CLI on the host),
 // `?token=<tond_pat_…>` query param, or `__Host-tond_session` cookie (browser
@@ -52,7 +54,7 @@ use std::time::{Duration, Instant};
 
 use axum::{
     extract::{
-        Path, State,
+        Path, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     response::IntoResponse,
@@ -240,7 +242,10 @@ async fn forward_deploy_logs(
 /// Which containers a stream follows.
 #[derive(Clone)]
 enum ContainerScope {
+    /// An app: its container, or every service of a compose app.
     App(String),
+    /// One service of a compose app: (app id, service).
+    Service(String, String),
     AllApps,
     Database(String),
     AllDatabases,
@@ -249,40 +254,67 @@ enum ContainerScope {
 /// A container to follow and the fields its frames carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FollowTarget {
-    /// Stable key (app or database id).
+    /// Stable key (app or database id; `<app id>/<service>` for compose).
     key: String,
+    /// Whose secrets to scrub (the app id).
+    owner: String,
     container_id: String,
     /// `(id_field, name_field, id, name)` added to each frame, if tagged.
     tag: Option<(&'static str, &'static str, String, String)>,
+    /// Compose service, added to each frame as `service`.
+    service: Option<String>,
 }
 
 impl ContainerScope {
     /// App containers are scrubbed with their app's secrets; database
     /// containers only for URL credentials and key patterns.
     fn is_app(&self) -> bool {
-        matches!(self, Self::App(_) | Self::AllApps)
+        matches!(self, Self::App(_) | Self::Service(..) | Self::AllApps)
     }
 
     async fn targets(&self, db: &sqlx::SqlitePool) -> Result<Vec<FollowTarget>, sqlx::Error> {
-        let rows: Vec<(String, String, String)> = match self {
+        // Compose apps keep a release tag in apps.container_id; their
+        // containers are the services' (compose_services).
+        let rows: Vec<(String, String, String, Option<String>)> = match self {
             Self::App(id) => {
                 sqlx::query_as(
-                    "SELECT id, name, container_id FROM apps WHERE id = ? AND container_id IS NOT NULL",
+                    "SELECT id, name, container_id, NULL FROM apps
+                     WHERE id = ? AND container_id IS NOT NULL AND source_type != 'compose'
+                     UNION ALL
+                     SELECT a.id, a.name, s.container_id, s.name FROM compose_services s
+                     JOIN apps a ON a.id = s.app_id
+                     WHERE s.app_id = ? AND s.container_id IS NOT NULL",
                 )
                 .bind(id)
+                .bind(id)
+                .fetch_all(db)
+                .await?
+            }
+            Self::Service(id, service) => {
+                sqlx::query_as(
+                    "SELECT a.id, a.name, s.container_id, s.name FROM compose_services s
+                     JOIN apps a ON a.id = s.app_id
+                     WHERE s.app_id = ? AND s.name = ? AND s.container_id IS NOT NULL",
+                )
+                .bind(id)
+                .bind(service)
                 .fetch_all(db)
                 .await?
             }
             Self::AllApps => {
                 sqlx::query_as(
-                    "SELECT id, name, container_id FROM apps WHERE container_id IS NOT NULL",
+                    "SELECT id, name, container_id, NULL FROM apps
+                     WHERE container_id IS NOT NULL AND source_type != 'compose'
+                     UNION ALL
+                     SELECT a.id, a.name, s.container_id, s.name FROM compose_services s
+                     JOIN apps a ON a.id = s.app_id WHERE s.container_id IS NOT NULL",
                 )
                 .fetch_all(db)
                 .await?
             }
             Self::Database(id) => {
                 sqlx::query_as(
-                    "SELECT id, name, container_id FROM databases WHERE id = ? AND container_id IS NOT NULL",
+                    "SELECT id, name, container_id, NULL FROM databases WHERE id = ? AND container_id IS NOT NULL",
                 )
                 .bind(id)
                 .fetch_all(db)
@@ -290,7 +322,7 @@ impl ContainerScope {
             }
             Self::AllDatabases => {
                 sqlx::query_as(
-                    "SELECT id, name, container_id FROM databases WHERE container_id IS NOT NULL",
+                    "SELECT id, name, container_id, NULL FROM databases WHERE container_id IS NOT NULL",
                 )
                 .fetch_all(db)
                 .await?
@@ -299,14 +331,19 @@ impl ContainerScope {
         let tag_fields = match self {
             Self::AllApps => Some(("app_id", "app_name")),
             Self::AllDatabases => Some(("db_id", "db_name")),
-            Self::App(_) | Self::Database(_) => None,
+            Self::App(_) | Self::Service(..) | Self::Database(_) => None,
         };
         Ok(rows
             .into_iter()
-            .map(|(id, name, container_id)| FollowTarget {
+            .map(|(id, name, container_id, service)| FollowTarget {
                 tag: tag_fields.map(|(i, n)| (i, n, id.clone(), name)),
-                key: id,
+                key: match &service {
+                    Some(s) => format!("{id}/{s}"),
+                    None => id.clone(),
+                },
+                owner: id,
                 container_id,
+                service,
             })
             .collect())
     }
@@ -422,7 +459,7 @@ async fn supervise_containers(
                 Some(last_scan_unix)
             };
             let scrub = if scope.is_app() {
-                Scrub::App(db.clone(), target.key.clone())
+                Scrub::App(db.clone(), target.owner.clone())
             } else {
                 Scrub::Generic
             };
@@ -430,7 +467,10 @@ async fn supervise_containers(
                 tx.clone(),
                 docker.clone(),
                 target.container_id.clone(),
-                target.tag.clone(),
+                FrameTags {
+                    tag: target.tag.clone(),
+                    service: target.service.clone(),
+                },
                 since,
                 scrub,
             ));
@@ -476,12 +516,18 @@ async fn snapshot_lines_of(raw: Vec<String>, scrub: &Scrub) -> Vec<(Option<Strin
     out
 }
 
+/// Fields added to every frame of a follower.
+struct FrameTags {
+    tag: Option<(&'static str, &'static str, String, String)>,
+    service: Option<String>,
+}
+
 /// Follow one container's logs until the stream ends or the receiver is gone.
 async fn follow_container(
     tx: mpsc::Sender<String>,
     docker: bollard::Docker,
     container_id: String,
-    tag: Option<(&'static str, &'static str, String, String)>,
+    tags: FrameTags,
     since_unix: Option<i64>,
     scrub: Scrub,
 ) {
@@ -503,9 +549,12 @@ async fn follow_container(
                 let (ts, line) = split_docker_ts(&raw);
                 let line = scrub.line(line).await;
                 let mut frame = json!({ "type": "container", "ts": ts, "line": line });
-                if let Some((id_field, name_field, id, name)) = &tag {
+                if let Some((id_field, name_field, id, name)) = &tags.tag {
                     frame[*id_field] = json!(id);
                     frame[*name_field] = json!(name);
+                }
+                if let Some(service) = &tags.service {
+                    frame["service"] = json!(service);
                 }
                 if tx.send(frame.to_string()).await.is_err() {
                     return;
@@ -521,20 +570,62 @@ async fn follow_container(
 
 // ── App log stream ────────────────────────────────────────────────────────────
 
+/// `?service=<name>`: only one service of a compose app.
+#[derive(Debug, Default, serde::Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct AppLogStreamQuery {
+    pub service: Option<String>,
+}
+
 /// Axum handler — upgrades to WebSocket and streams logs.
 pub async fn stream_logs(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<AppLogStreamQuery>,
     MaybePrincipal(auth): MaybePrincipal,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state, id, auth))
+    let service = q.service.filter(|s| !s.trim().is_empty());
+    ws.on_upgrade(move |socket| handle_socket(socket, state, id, service, auth))
+}
+
+/// Snapshot of a compose app's service logs: `(ts, service, line)`, oldest
+/// first, scrubbed.
+async fn compose_snapshot(
+    state: &AppState,
+    app_id: &str,
+    only: Option<&str>,
+) -> Vec<(Option<String>, String, String)> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT name, container_id FROM compose_services
+         WHERE app_id = ? AND container_id IS NOT NULL",
+    )
+    .bind(app_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    let scrub = Scrub::App(state.db.clone(), app_id.to_string());
+    let mut out = Vec::new();
+    for (service, cid) in rows {
+        if only.is_some_and(|o| o != service) {
+            continue;
+        }
+        let raw = docker::get_logs(&state.docker, &cid, 100)
+            .await
+            .unwrap_or_default();
+        for (ts, line) in snapshot_lines_of(raw, &scrub).await {
+            out.push((ts, service.clone(), line));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 async fn handle_socket(
     mut socket: WebSocket,
     state: AppState,
     id: String,
+    service: Option<String>,
     auth: Result<Principal, AuthFailure>,
 ) {
     if let Err((code, reason)) = authorize(&state, auth, Scope::LogsRead, Some(&id)).await {
@@ -566,18 +657,26 @@ async fn handle_socket(
     .await
     .unwrap_or_default();
 
-    let container_logs = if let Some(ref cid) = app.container_id {
-        docker::get_logs(&state.docker, cid, 100)
-            .await
-            .unwrap_or_default()
-    } else {
-        vec![]
-    };
-    let container_logs = snapshot_lines_of(
-        container_logs,
-        &Scrub::App(state.db.clone(), app.id.clone()),
-    )
-    .await;
+    let container_logs: Vec<(Option<String>, Option<String>, String)> =
+        if app.source_type == "compose" {
+            compose_snapshot(&state, &app.id, service.as_deref())
+                .await
+                .into_iter()
+                .map(|(ts, service, line)| (ts, Some(service), line))
+                .collect()
+        } else {
+            let raw = match app.container_id {
+                Some(ref cid) => docker::get_logs(&state.docker, cid, 100)
+                    .await
+                    .unwrap_or_default(),
+                None => vec![],
+            };
+            snapshot_lines_of(raw, &Scrub::App(state.db.clone(), app.id.clone()))
+                .await
+                .into_iter()
+                .map(|(ts, line)| (ts, None, line))
+                .collect()
+        };
 
     // Deploy logs arrive newest-first from DB; reverse so they appear chronologically
     let snapshot = json!({
@@ -587,8 +686,12 @@ async fn handle_socket(
             "message": l.message,
             "ts": l.created_at,
         })).collect::<Vec<_>>(),
-        "container_logs": container_logs.iter().map(|(ts, line)| {
-            json!({ "ts": ts, "line": line })
+        "container_logs": container_logs.iter().map(|(ts, service, line)| {
+            let mut entry = json!({ "ts": ts, "line": line });
+            if let Some(service) = service {
+                entry["service"] = json!(service);
+            }
+            entry
         }).collect::<Vec<_>>(),
     });
     if socket
@@ -610,11 +713,15 @@ async fn handle_socket(
         deploy_logs.into_iter().map(|l| l.id).collect(),
         HashMap::new(),
     ));
+    let scope = match service {
+        Some(service) if app.source_type == "compose" => ContainerScope::Service(app.id, service),
+        _ => ContainerScope::App(app.id),
+    };
     tasks.spawn(supervise_containers(
         tx,
         state.db.clone(),
         state.docker.clone(),
-        ContainerScope::App(app.id),
+        scope,
     ));
 
     serve(&mut socket, rx, tasks).await;
@@ -868,7 +975,7 @@ pub(crate) async fn authorize(
 
 // ── Cron run output stream ────────────────────────────────────────────────────
 //
-// GET /api/cron/{id}/runs/stream
+// GET /api/v1/cron/{id}/runs/stream
 //
 // Streams cron job run history for the given job as new runs complete.
 //
@@ -1008,9 +1115,67 @@ mod tests {
     fn target(key: &str, cid: &str) -> FollowTarget {
         FollowTarget {
             key: key.to_string(),
+            owner: key.to_string(),
             container_id: cid.to_string(),
             tag: None,
+            service: None,
         }
+    }
+
+    #[tokio::test]
+    async fn compose_apps_follow_every_service_container() {
+        let db = test_db().await;
+        for sql in [
+            "INSERT INTO apps (id, name, source_type, container_id, created_at, updated_at)
+             VALUES ('a1', 'shop', 'compose', 'tond-shop:abc', 'now', 'now'),
+                    ('a2', 'web', 'image', 'c-web', 'now', 'now')",
+            "INSERT INTO compose_services (app_id, name, container_id) VALUES
+             ('a1', 'web', 'c1'), ('a1', 'cache', 'c2'), ('a1', 'init', NULL)",
+        ] {
+            sqlx::query(sql)
+                .execute(&db)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let mut app = ContainerScope::App("a1".into())
+            .targets(&db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        app.sort_by(|a, b| a.key.cmp(&b.key));
+        let keys: Vec<(&str, &str, Option<&str>)> = app
+            .iter()
+            .map(|t| {
+                (
+                    t.key.as_str(),
+                    t.container_id.as_str(),
+                    t.service.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                ("a1/cache", "c2", Some("cache")),
+                ("a1/web", "c1", Some("web"))
+            ],
+            "the release tag in apps.container_id is not a container"
+        );
+        assert!(
+            app.iter().all(|t| t.owner == "a1"),
+            "scrubbed with the app's secrets"
+        );
+
+        let one = ContainerScope::Service("a1".into(), "web".into())
+            .targets(&db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(one.len(), 1);
+        let all = ContainerScope::AllApps
+            .targets(&db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(all.len(), 3, "two services and one single-container app");
+        assert!(all.iter().all(|t| t.tag.is_some()));
     }
 
     #[test]

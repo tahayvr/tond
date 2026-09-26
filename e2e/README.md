@@ -37,6 +37,12 @@ What the smoke test covers:
 - a real certificate issued over ACME HTTP-01 and verified against the CA
 - a managed Redis database, a cron job run, a full snapshot
 - apps survive restarting `tond-server` and `tond-proxy`
+- self-update: the release check (against a local releases file), refused
+  rollbacks and downgrades, an API-driven update that can't be downloaded
+  (pre-update snapshot, `tond-update.service`, failed with nothing changed,
+  audited), and with the installed bundle (`E2E_BUNDLE`, set by `run.sh`) a
+  forced reinstall through `update.sh` and an update whose `tond-server` never
+  starts, which must roll back binaries and database by itself
 
 ## Where it runs
 

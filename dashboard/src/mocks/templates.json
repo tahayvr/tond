@@ -1,0 +1,2541 @@
+[
+  {
+    "id": "actual",
+    "name": "Actual Budget",
+    "description": "Local-first personal finance app with envelope budgeting and sync.",
+    "about": "Actual is a fast, privacy-focused budgeting app based on envelope budgeting. The server syncs your budget between devices (with optional end-to-end encryption) and serves the web app.",
+    "category": "finance",
+    "tags": [
+      "budget",
+      "finance",
+      "money",
+      "ynab alternative"
+    ],
+    "logo": "actualbudget",
+    "version": "26.9",
+    "website": "https://actualbudget.org",
+    "docs": "https://actualbudget.org/docs/install/docker",
+    "repository": "https://github.com/actualbudget/actual",
+    "ram_mb": 120,
+    "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "actual",
+      "port": 5006,
+      "health_path": "/health"
+    },
+    "services": [
+      {
+        "name": "actual",
+        "image": "actualbudget/actual-server:26.9.0-alpine",
+        "public": true,
+        "memory_limit_mb": 256
+      }
+    ],
+    "volumes": [
+      {
+        "service": "actual",
+        "path": "./data",
+        "description": "Budget files and the server's account database",
+        "owner": null
+      }
+    ],
+    "inputs": [],
+    "setup_notes": "Open the app right away and set the server password; anyone who opens it first could set it otherwise. Then create or import a budget.",
+    "upgrade_notes": "Actual releases monthly (YY.M). Change the image tag and redeploy; snapshot the app first.",
+    "post_deploy_checks": [
+      "Set the server password",
+      "Create or import a budget"
+    ],
+    "compose": "services:\n  actual:\n    image: actualbudget/actual-server:26.9.0-alpine\n    restart: unless-stopped\n    mem_limit: 256m\n    ports: [\"5006\"]\n    volumes:\n      - ./data:/data\n"
+  },
+  {
+    "id": "appsmith",
+    "name": "Appsmith",
+    "description": "Low-code builder for internal tools, admin panels and dashboards.",
+    "about": "Appsmith lets you drag and drop widgets, connect them to databases and APIs, and write JavaScript where needed to build internal apps fast. The image bundles MongoDB, Redis and PostgreSQL in one container, so it needs a server with 4 GB of memory or more.",
+    "category": "developer",
+    "tags": [
+      "low-code",
+      "internal tools",
+      "retool alternative",
+      "admin panel"
+    ],
+    "logo": "appsmith",
+    "version": "2.4",
+    "website": "https://www.appsmith.com",
+    "docs": "https://docs.appsmith.com/getting-started/setup/installation-guides/docker",
+    "repository": "https://github.com/appsmithorg/appsmith",
+    "ram_mb": 2500,
+    "fits_2gb": false,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "appsmith",
+      "port": 80,
+      "health_path": "/api/v1/health"
+    },
+    "services": [
+      {
+        "name": "appsmith",
+        "image": "appsmith/appsmith-ce:v2.4.2",
+        "public": true,
+        "memory_limit_mb": 3072
+      }
+    ],
+    "volumes": [
+      {
+        "service": "appsmith",
+        "path": "./stacks",
+        "description": "Bundled databases, configuration and logs",
+        "owner": null
+      }
+    ],
+    "inputs": [],
+    "setup_notes": "The first start takes several minutes. Then open the app right away and create the admin account.",
+    "upgrade_notes": "Change the image to a newer tag and redeploy. Appsmith migrates its bundled databases on start: snapshot the app first.",
+    "post_deploy_checks": [
+      "Create the admin account",
+      "Build a first app against a data source"
+    ],
+    "compose": "services:\n  appsmith:\n    image: appsmith/appsmith-ce:v2.4.2\n    restart: unless-stopped\n    mem_limit: 3g\n    ports: [\"80\"]\n    environment:\n      APPSMITH_DISABLE_TELEMETRY: \"true\"\n    volumes:\n      - ./stacks:/appsmith-stacks\n    # Timings only: the image's own HEALTHCHECK test is kept, but its 15s interval\n    # would keep the deploy waiting.\n    healthcheck:\n      interval: 10s\n      timeout: 15s\n      start_period: 180s\n      start_interval: 3s\n"
+  },
+  {
+    "id": "audiobookshelf",
+    "name": "Audiobookshelf",
+    "description": "Audiobook and podcast server with progress sync and mobile apps.",
+    "about": "Audiobookshelf streams your audiobooks and podcasts to the web and its Android and iOS apps, keeps listening progress in sync across devices, fetches metadata and covers, and downloads new podcast episodes automatically. Upload books from the web UI; they are stored in the app's volume.",
+    "category": "media",
+    "tags": [
+      "audiobooks",
+      "podcasts",
+      "media",
+      "library"
+    ],
+    "logo": "audiobookshelf",
+    "version": "2.36",
+    "website": "https://www.audiobookshelf.org",
+    "docs": "https://www.audiobookshelf.org/docs",
+    "repository": "https://github.com/advplyr/audiobookshelf",
+    "ram_mb": 200,
+    "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "audiobookshelf",
+      "port": 80,
+      "health_path": "/healthcheck"
+    },
+    "services": [
+      {
+        "name": "audiobookshelf",
+        "image": "ghcr.io/advplyr/audiobookshelf:2.36.1",
+        "public": true,
+        "memory_limit_mb": 512
+      }
+    ],
+    "volumes": [
+      {
+        "service": "audiobookshelf",
+        "path": "./config",
+        "description": "The database and settings",
+        "owner": null
+      },
+      {
+        "service": "audiobookshelf",
+        "path": "./metadata",
+        "description": "Covers, cache, backups and logs",
+        "owner": null
+      },
+      {
+        "service": "audiobookshelf",
+        "path": "./audiobooks",
+        "description": "Your audiobooks (/audiobooks)",
+        "owner": null
+      },
+      {
+        "service": "audiobookshelf",
+        "path": "./podcasts",
+        "description": "Downloaded podcast episodes (/podcasts)",
+        "owner": null
+      }
+    ],
+    "inputs": [],
+    "setup_notes": "Open the app right away and create the root user (the first visitor sets it). Then add a library pointing at /audiobooks or /podcasts.",
+    "upgrade_notes": "Change the image to a newer 2.x tag and redeploy; the database is migrated on start. Snapshot the app first.",
+    "post_deploy_checks": [
+      "Create the root user",
+      "Add a library for /audiobooks"
+    ],
+    "compose": "services:\n  audiobookshelf:\n    image: ghcr.io/advplyr/audiobookshelf:2.36.1\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"80\"]\n    environment:\n      TZ: UTC\n    volumes:\n      - ./config:/config\n      - ./metadata:/metadata\n      - ./audiobooks:/audiobooks\n      - ./podcasts:/podcasts\n"
+  },
+  {
+    "id": "code-server",
+    "name": "code-server",
+    "description": "VS Code in the browser, running on your server.",
+    "about": "code-server runs Visual Studio Code on your server so you can code from any browser, with extensions, a terminal and your files in one place. The terminal runs inside the app's container, not on the host.",
+    "category": "developer",
+    "tags": [
+      "ide",
+      "vscode",
+      "editor",
+      "development"
+    ],
+    "logo": "coder",
+    "version": "4.139",
+    "website": "https://coder.com/docs/code-server",
+    "docs": "https://coder.com/docs/code-server/install#docker",
+    "repository": "https://github.com/coder/code-server",
+    "ram_mb": 350,
+    "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "code-server",
+      "port": 8080,
+      "health_path": "/healthz"
+    },
+    "services": [
+      {
+        "name": "code-server",
+        "image": "codercom/code-server:4.139.1",
+        "public": true,
+        "memory_limit_mb": 1024
+      }
+    ],
+    "volumes": [
+      {
+        "service": "code-server",
+        "path": "./project",
+        "description": "Your workspace (/home/coder/project)",
+        "owner": "1000:1000"
+      },
+      {
+        "service": "code-server",
+        "path": "./config",
+        "description": "Settings (/home/coder/.config)",
+        "owner": "1000:1000"
+      },
+      {
+        "service": "code-server",
+        "path": "./local",
+        "description": "Extensions and editor state (/home/coder/.local)",
+        "owner": "1000:1000"
+      }
+    ],
+    "inputs": [
+      {
+        "key": "PASSWORD",
+        "label": "Password",
+        "description": null,
+        "kind": "password",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": true
+      }
+    ],
+    "setup_notes": "Open the app and sign in with the password Tond showed after the deploy. Your work lives in /home/coder/project.",
+    "upgrade_notes": "Change the image to a newer 4.x tag and redeploy. Extensions and settings are kept in the volumes.",
+    "post_deploy_checks": [
+      "Sign in with the password",
+      "Open a terminal and clone a repository"
+    ],
+    "compose": "services:\n  code-server:\n    image: codercom/code-server:4.139.1\n    restart: unless-stopped\n    mem_limit: 1g\n    ports: [\"8080\"]\n    environment:\n      PASSWORD: ${PASSWORD}\n    command: [\"--bind-addr\", \"0.0.0.0:8080\", \"--disable-telemetry\", \"/home/coder/project\"]\n    volumes:\n      - ./project:/home/coder/project\n      - ./config:/home/coder/.config\n      - ./local:/home/coder/.local\n"
+  },
+  {
+    "id": "directus",
+    "name": "Directus",
+    "description": "Headless CMS and instant REST/GraphQL API with a no-code data studio.",
+    "about": "Directus wraps a SQL database with REST and GraphQL APIs and an intuitive admin app for content, files, users, permissions and automation flows. This template uses SQLite; point it at PostgreSQL later if you outgrow it.",
+    "category": "cms",
+    "tags": [
+      "headless cms",
+      "api",
+      "graphql",
+      "backend",
+      "strapi alternative"
+    ],
+    "logo": "directus",
+    "version": "11.17",
+    "website": "https://directus.io",
+    "docs": "https://directus.io/docs/self-hosting/overview",
+    "repository": "https://github.com/directus/directus",
+    "ram_mb": 300,
+    "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "directus",
+      "port": 8055,
+      "health_path": "/server/health"
+    },
+    "services": [
+      {
+        "name": "directus",
+        "image": "directus/directus:11.17.4",
+        "public": true,
+        "memory_limit_mb": 512
+      }
+    ],
+    "volumes": [
+      {
+        "service": "directus",
+        "path": "./database",
+        "description": "The SQLite database",
+        "owner": "1000:1000"
+      },
+      {
+        "service": "directus",
+        "path": "./uploads",
+        "description": "Uploaded files",
+        "owner": "1000:1000"
+      }
+    ],
+    "inputs": [
+      {
+        "key": "SECRET",
+        "label": "Secret",
+        "description": "Signs access tokens.",
+        "kind": "text",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": false
+      },
+      {
+        "key": "ADMIN_EMAIL",
+        "label": "Admin email",
+        "description": null,
+        "kind": "email",
+        "required": true,
+        "generated": false,
+        "default": null,
+        "credential": true
+      },
+      {
+        "key": "ADMIN_PASSWORD",
+        "label": "Admin password",
+        "description": null,
+        "kind": "password",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": true
+      }
+    ],
+    "setup_notes": "Sign in with the admin email and the password Tond showed after the deploy.",
+    "upgrade_notes": "Change the image to a newer 11.x tag and redeploy; migrations run on start. Directus 12 has breaking changes: read its migration guide and snapshot first.",
+    "post_deploy_checks": [
+      "Sign in to the data studio",
+      "Create a collection and fetch it from the API"
+    ],
+    "compose": "services:\n  directus:\n    image: directus/directus:11.17.4\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"8055\"]\n    environment:\n      PUBLIC_URL: ${PUBLIC_URL}\n      SECRET: ${SECRET}\n      ADMIN_EMAIL: ${ADMIN_EMAIL}\n      ADMIN_PASSWORD: ${ADMIN_PASSWORD}\n      DB_CLIENT: sqlite3\n      DB_FILENAME: /directus/database/data.db\n      TELEMETRY: \"false\"\n    volumes:\n      - ./database:/directus/database\n      - ./uploads:/directus/uploads\n"
+  },
+  {
+    "id": "docmost",
+    "name": "Docmost",
+    "description": "Collaborative wiki and documentation, a Confluence and Notion alternative.",
+    "about": "Docmost is a wiki with real-time collaborative editing, spaces, permissions, comments, page history, diagrams (Draw.io, Excalidraw, Mermaid) and full-text search.",
+    "category": "documents",
+    "tags": [
+      "wiki",
+      "documentation",
+      "knowledge base",
+      "confluence alternative",
+      "notion alternative"
+    ],
+    "logo": null,
+    "version": "0.95",
+    "website": "https://docmost.com",
+    "docs": "https://docmost.com/docs/installation",
+    "repository": "https://github.com/docmost/docmost",
+    "ram_mb": 600,
+    "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "docmost",
+      "port": 3000,
+      "health_path": "/api/health"
+    },
+    "services": [
+      {
+        "name": "docmost",
+        "image": "docmost/docmost:0.95.0",
+        "public": true,
+        "memory_limit_mb": 512
+      },
+      {
+        "name": "db",
+        "image": "postgres:17-alpine",
+        "public": false,
+        "memory_limit_mb": 256
+      },
+      {
+        "name": "redis",
+        "image": "valkey/valkey:8-alpine",
+        "public": false,
+        "memory_limit_mb": 128
+      }
+    ],
+    "volumes": [
+      {
+        "service": "docmost",
+        "path": "./storage",
+        "description": "Uploaded files and attachments",
+        "owner": "1000:1000"
+      },
+      {
+        "service": "db",
+        "path": "./postgres",
+        "description": "PostgreSQL data: pages, spaces and users",
+        "owner": null
+      }
+    ],
+    "inputs": [
+      {
+        "key": "APP_SECRET",
+        "label": "App secret",
+        "description": null,
+        "kind": "text",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": false
+      },
+      {
+        "key": "DB_PASSWORD",
+        "label": "Database password",
+        "description": null,
+        "kind": "text",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": false
+      }
+    ],
+    "setup_notes": "Open the app right away and create your workspace and admin account. Add SMTP settings as environment variables to send invitations by email.",
+    "upgrade_notes": "Docmost is pre-1.0. Read the release notes, snapshot the app, then change the image tag and redeploy; migrations run on start.",
+    "post_deploy_checks": [
+      "Create the workspace and admin account",
+      "Create a space and a page"
+    ],
+    "compose": "services:\n  docmost:\n    image: docmost/docmost:0.95.0\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"3000\"]\n    environment:\n      APP_URL: ${APP_URL}\n      APP_SECRET: ${APP_SECRET}\n      DATABASE_URL: postgresql://docmost:${DB_PASSWORD}@db:5432/docmost?schema=public\n      REDIS_URL: redis://redis:6379\n    volumes:\n      - ./storage:/app/data/storage\n    depends_on:\n      db:\n        condition: service_healthy\n      redis:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: docmost\n      POSTGRES_USER: docmost\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U docmost -d docmost\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n\n  redis:\n    image: valkey/valkey:8-alpine\n    restart: unless-stopped\n    mem_limit: 128m\n    healthcheck:\n      test: [\"CMD\", \"valkey-cli\", \"ping\"]\n      interval: 5s\n      timeout: 3s\n      retries: 10\n"
+  },
+  {
+    "id": "excalidraw",
+    "name": "Excalidraw",
+    "description": "Virtual whiteboard for sketching hand-drawn-style diagrams.",
+    "about": "Excalidraw is a collaborative-feeling whiteboard with a hand-drawn look, perfect for diagrams, wireframes and quick sketches. Drawings stay in your browser (or export to files); live collaboration needs a separate room server and is not included. The upstream image is published for x86_64 only.",
+    "category": "productivity",
+    "tags": [
+      "whiteboard",
+      "diagrams",
+      "drawing",
+      "sketch"
+    ],
+    "logo": "excalidraw",
+    "version": "sha-4bfc5bb",
+    "website": "https://excalidraw.com",
+    "docs": "https://github.com/excalidraw/excalidraw#self-hosting",
+    "repository": "https://github.com/excalidraw/excalidraw",
+    "ram_mb": 20,
+    "fits_2gb": true,
+    "architectures": [
+      "amd64"
+    ],
+    "public": {
+      "service": "excalidraw",
+      "port": 80,
+      "health_path": "/"
+    },
+    "services": [
+      {
+        "name": "excalidraw",
+        "image": "excalidraw/excalidraw:sha-4bfc5bb",
+        "public": true,
+        "memory_limit_mb": 64
+      }
+    ],
+    "volumes": [],
+    "inputs": [],
+    "setup_notes": "Open the app and start drawing. Drawings are saved in your browser; export them to keep copies.",
+    "upgrade_notes": "Excalidraw publishes images per commit. Replace the sha-… tag with a newer one from Docker Hub and redeploy.",
+    "post_deploy_checks": [
+      "Open the app and draw something"
+    ],
+    "compose": "services:\n  excalidraw:\n    image: excalidraw/excalidraw:sha-4bfc5bb\n    restart: unless-stopped\n    mem_limit: 64m\n    ports: [\"80\"]\n    # Timings only: the image's own HEALTHCHECK test is kept, but its 30s default interval\n    # would keep the deploy waiting.\n    healthcheck:\n      interval: 10s\n      timeout: 5s\n      start_period: 10s\n      start_interval: 1s\n"
+  },
+  {
+    "id": "forgejo",
+    "name": "Forgejo",
+    "description": "Community-run Git forge: repositories, issues, pull requests and CI.",
+    "about": "Forgejo is a lightweight, community-governed Git forge (a Gitea fork) with repositories, code review, issues, wikis, packages and Actions CI. This template uses SQLite and HTTPS clone URLs; SSH is off because Tond only routes HTTP.",
+    "category": "developer",
+    "tags": [
+      "git",
+      "forge",
+      "code review",
+      "github alternative",
+      "ci"
+    ],
+    "logo": "forgejo",
+    "version": "15",
+    "website": "https://forgejo.org",
+    "docs": "https://forgejo.org/docs/latest/admin/installation-docker/",
+    "repository": "https://codeberg.org/forgejo/forgejo",
+    "ram_mb": 250,
+    "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "forgejo",
+      "port": 3000,
+      "health_path": "/api/healthz"
+    },
+    "services": [
+      {
+        "name": "forgejo",
+        "image": "codeberg.org/forgejo/forgejo:15",
+        "public": true,
+        "memory_limit_mb": 512
+      }
+    ],
+    "volumes": [
+      {
+        "service": "forgejo",
+        "path": "./data",
+        "description": "Repositories, attachments, packages and the SQLite database",
+        "owner": null
+      }
+    ],
+    "inputs": [],
+    "setup_notes": "Open the app right away: the install page is open to the first visitor. Keep the prefilled settings, create the administrator account at the bottom of the page and press Install.",
+    "upgrade_notes": "The image follows Forgejo 15.x. For a new major, change the tag, snapshot the app first and read the release notes; the database is migrated on start.",
+    "post_deploy_checks": [
+      "Finish the install page and create the administrator",
+      "Push a test repository over HTTPS"
+    ],
+    "compose": "services:\n  forgejo:\n    image: codeberg.org/forgejo/forgejo:15\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"3000\"]\n    environment:\n      USER_UID: \"1000\"\n      USER_GID: \"1000\"\n      FORGEJO__database__DB_TYPE: sqlite3\n      FORGEJO__server__ROOT_URL: ${ROOT_URL}\n      FORGEJO__server__DOMAIN: ${DOMAIN}\n      FORGEJO__server__HTTP_PORT: \"3000\"\n      FORGEJO__server__DISABLE_SSH: \"true\"\n      FORGEJO__server__START_SSH_SERVER: \"false\"\n      FORGEJO__service__DISABLE_REGISTRATION: \"true\"\n    volumes:\n      - ./data:/data\n"
+  },
+  {
+    "id": "freshrss",
+    "name": "FreshRSS",
+    "description": "Self-hosted RSS aggregator with multi-user support and mobile app APIs.",
+    "about": "FreshRSS is a fast feed aggregator with a responsive web UI, WebSub push, extensions, and Google Reader/Fever APIs so mobile readers can sync. Feeds are refreshed every 20 minutes by a built-in cron.",
+    "category": "productivity",
+    "tags": [
+      "rss",
+      "feeds",
+      "reader",
+      "news"
+    ],
+    "logo": "freshrss",
+    "version": "1.30",
+    "website": "https://freshrss.org",
+    "docs": "https://freshrss.github.io/FreshRSS/en/admins/01_Index.html",
+    "repository": "https://github.com/FreshRSS/FreshRSS",
+    "ram_mb": 100,
+    "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "freshrss",
+      "port": 80,
+      "health_path": "/i/"
+    },
+    "services": [
+      {
+        "name": "freshrss",
+        "image": "freshrss/freshrss:1.30.0",
+        "public": true,
+        "memory_limit_mb": 256
+      }
+    ],
+    "volumes": [
+      {
+        "service": "freshrss",
+        "path": "./data",
+        "description": "Configuration, users and the SQLite databases",
+        "owner": null
+      },
+      {
+        "service": "freshrss",
+        "path": "./extensions",
+        "description": "Third-party extensions",
+        "owner": null
+      }
+    ],
+    "inputs": [
+      {
+        "key": "ADMIN_EMAIL",
+        "label": "Admin email",
+        "description": null,
+        "kind": "email",
+        "required": true,
+        "generated": false,
+        "default": null,
+        "credential": false
+      },
+      {
+        "key": "ADMIN_PASSWORD",
+        "label": "Admin password",
+        "description": null,
+        "kind": "password",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": true
+      },
+      {
+        "key": "API_PASSWORD",
+        "label": "API password (mobile apps)",
+        "description": null,
+        "kind": "password",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": true
+      }
+    ],
+    "setup_notes": "Sign in as admin with the password Tond showed after the deploy. Mobile apps use the API password (also shown after the deploy) with the address /api/greader.php.",
+    "upgrade_notes": "Change the image to a newer 1.x tag and redeploy.",
+    "post_deploy_checks": [
+      "Sign in as admin",
+      "Subscribe to a feed"
+    ],
+    "compose": "services:\n  freshrss:\n    image: freshrss/freshrss:1.30.0\n    restart: unless-stopped\n    mem_limit: 256m\n    ports: [\"80\"]\n    environment:\n      TZ: UTC\n      CRON_MIN: \"3,23,43\"\n      TRUSTED_PROXY: 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16\n      FRESHRSS_INSTALL: >-\n        --api-enabled\n        --base-url ${BASE_URL}\n        --db-type sqlite\n        --default-user admin\n        --language en\n      FRESHRSS_USER: >-\n        --api-password ${API_PASSWORD}\n        --email ${ADMIN_EMAIL}\n        --language en\n        --password ${ADMIN_PASSWORD}\n        --user admin\n    volumes:\n      - ./data:/var/www/FreshRSS/data\n      - ./extensions:/var/www/FreshRSS/extensions\n"
+  },
+  {
+    "id": "ghost",
+    "name": "Ghost",
+    "description": "Publishing platform for blogs, newsletters and paid memberships.",
+    "about": "Ghost is a fast, modern CMS with a beautiful editor, built-in newsletters, memberships and subscriptions. This template runs Ghost with MySQL 8, the database Ghost supports in production.",
+    "category": "cms",
+    "tags": [
+      "blog",
+      "cms",
+      "newsletter",
+      "publishing",
+      "memberships"
+    ],
+    "logo": "ghost",
+    "version": "6",
+    "website": "https://ghost.org",
+    "docs": "https://ghost.org/docs/config/",
+    "repository": "https://github.com/TryGhost/Ghost",
+    "ram_mb": 700,
+    "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "ghost",
+      "port": 2368,
+      "health_path": "/ghost/api/admin/site/"
+    },
+    "services": [
+      {
+        "name": "ghost",
+        "image": "ghost:6-alpine",
+        "public": true,
+        "memory_limit_mb": 512
+      },
+      {
+        "name": "db",
+        "image": "mysql:8.4",
+        "public": false,
+        "memory_limit_mb": 512
+      }
+    ],
+    "volumes": [
+      {
+        "service": "ghost",
+        "path": "./content",
+        "description": "Themes, images and uploaded files",
+        "owner": null
+      },
+      {
+        "service": "db",
+        "path": "./mysql",
+        "description": "MySQL data: posts, members and settings",
+        "owner": null
+      }
+    ],
+    "inputs": [
+      {
+        "key": "DB_PASSWORD",
+        "label": "Database password",
+        "description": null,
+        "kind": "text",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": false
+      },
+      {
+        "key": "DB_ROOT_PASSWORD",
+        "label": "Database root password",
+        "description": null,
+        "kind": "text",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": false
+      }
+    ],
+    "setup_notes": "Open /ghost on the app's address right away to create the owner account. To send newsletters and sign-in emails, add mail settings (mail__transport and friends) as environment variables on the app's Environment tab.",
+    "upgrade_notes": "The image follows Ghost 6.x: redeploying pulls the tag as stored. To move to a new major, change the tag, take a snapshot first and follow Ghost's upgrade guide.",
+    "post_deploy_checks": [
+      "Create the owner account at /ghost",
+      "Configure mail so members can sign in"
+    ],
+    "compose": "services:\n  ghost:\n    image: ghost:6-alpine\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"2368\"]\n    environment:\n      url: ${GHOST_URL}\n      NODE_ENV: production\n      database__client: mysql\n      database__connection__host: db\n      database__connection__user: ghost\n      database__connection__password: ${DB_PASSWORD}\n      database__connection__database: ghost\n    volumes:\n      - ./content:/var/lib/ghost/content\n    depends_on:\n      db:\n        condition: service_healthy\n\n  db:\n    image: mysql:8.4\n    restart: unless-stopped\n    mem_limit: 512m\n    command: [\"--innodb-buffer-pool-size=64M\", \"--performance-schema=OFF\", \"--skip-log-bin\"]\n    environment:\n      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}\n      MYSQL_DATABASE: ghost\n      MYSQL_USER: ghost\n      MYSQL_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./mysql:/var/lib/mysql\n    healthcheck:\n      test: [\"CMD-SHELL\", \"mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent\"]\n      interval: 5s\n      timeout: 5s\n      retries: 30\n      start_period: 10s\n      start_interval: 1s\n"
+  },
+  {
+    "id": "gitea",
+    "name": "Gitea",
+    "description": "Painless self-hosted Git service with issues, pull requests and Actions.",
+    "about": "Gitea is a fast, lightweight Git server with code review, issues, wikis, a package registry and GitHub Actions-compatible CI. This template uses SQLite and HTTPS clone URLs; SSH is off because Tond only routes HTTP.",
+    "category": "developer",
+    "tags": [
+      "git",
+      "forge",
+      "code review",
+      "github alternative",
+      "ci"
+    ],
+    "logo": "gitea",
+    "version": "1.27",
+    "website": "https://about.gitea.com",
+    "docs": "https://docs.gitea.com/installation/install-with-docker",
+    "repository": "https://github.com/go-gitea/gitea",
+    "ram_mb": 220,
+    "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "gitea",
+      "port": 3000,
+      "health_path": "/api/healthz"
+    },
+    "services": [
+      {
+        "name": "gitea",
+        "image": "gitea/gitea:1.27",
+        "public": true,
+        "memory_limit_mb": 512
+      }
+    ],
+    "volumes": [
+      {
+        "service": "gitea",
+        "path": "./data",
+        "description": "Repositories, attachments, packages and the SQLite database",
+        "owner": null
+      }
+    ],
+    "inputs": [],
+    "setup_notes": "Open the app right away: the install page is open to the first visitor. Keep the prefilled settings, create the administrator account at the bottom of the page and press Install.",
+    "upgrade_notes": "The image follows Gitea 1.27.x. For a newer minor version change the tag, take a snapshot and redeploy; the database is migrated on start.",
+    "post_deploy_checks": [
+      "Finish the install page and create the administrator",
+      "Push a test repository over HTTPS"
+    ],
+    "compose": "services:\n  gitea:\n    image: gitea/gitea:1.27\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"3000\"]\n    environment:\n      USER_UID: \"1000\"\n      USER_GID: \"1000\"\n      GITEA__database__DB_TYPE: sqlite3\n      GITEA__server__ROOT_URL: ${ROOT_URL}\n      GITEA__server__DOMAIN: ${DOMAIN}\n      GITEA__server__HTTP_PORT: \"3000\"\n      GITEA__server__DISABLE_SSH: \"true\"\n      GITEA__server__START_SSH_SERVER: \"false\"\n      GITEA__service__DISABLE_REGISTRATION: \"true\"\n    volumes:\n      - ./data:/data\n"
+  },
+  {
+    "id": "gotify",
+    "name": "Gotify",
+    "description": "Simple self-hosted push notifications with a REST API and Android app.",
+    "about": "Gotify sends and receives messages in real time: scripts and services post to its REST API with an app token, and the web UI and Android app show them instantly over WebSockets. A small Go server with an SQLite database.",
+    "category": "communication",
+    "tags": [
+      "notifications",
+      "push",
+      "alerts",
+      "websocket"
+    ],
+    "logo": null,
+    "version": "2.9",
+    "website": "https://gotify.net",
+    "docs": "https://gotify.net/docs/",
+    "repository": "https://github.com/gotify/server",
+    "ram_mb": 30,
+    "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "gotify",
+      "port": 80,
+      "health_path": "/health"
+    },
+    "services": [
+      {
+        "name": "gotify",
+        "image": "gotify/server:2.9.1",
+        "public": true,
+        "memory_limit_mb": 128
+      }
+    ],
+    "volumes": [
+      {
+        "service": "gotify",
+        "path": "./data",
+        "description": "Messages, users, applications and uploaded images (SQLite)",
+        "owner": null
+      }
+    ],
+    "inputs": [
+      {
+        "key": "ADMIN_PASSWORD",
+        "label": "Admin password",
+        "description": null,
+        "kind": "password",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": true
+      }
+    ],
+    "setup_notes": "Sign in as admin with the password Tond showed after the deploy, then create an application to get a token for sending messages.",
+    "upgrade_notes": "Change the image to a newer 2.x tag and redeploy.",
+    "post_deploy_checks": [
+      "Sign in as admin",
+      "Create an application and send a test message"
+    ],
+    "compose": "services:\n  gotify:\n    image: gotify/server:2.9.1\n    restart: unless-stopped\n    mem_limit: 128m\n    ports: [\"80\"]\n    environment:\n      GOTIFY_DEFAULTUSER_NAME: admin\n      GOTIFY_DEFAULTUSER_PASS: ${ADMIN_PASSWORD}\n      GOTIFY_REGISTRATION: \"false\"\n      TZ: UTC\n    volumes:\n      - ./data:/app/data\n    # Timings only: the image's own HEALTHCHECK test is kept, but its 30s interval\n    # would keep the deploy waiting.\n    healthcheck:\n      interval: 10s\n      timeout: 5s\n      start_period: 10s\n      start_interval: 1s\n"
+  },
+  {
+    "id": "grafana",
+    "name": "Grafana",
+    "description": "Dashboards and alerting for metrics, logs and traces from any data source.",
+    "about": "Grafana visualises data from Prometheus, Loki, PostgreSQL, MySQL, InfluxDB and dozens of other sources in shareable dashboards with alerting. Pick 'Grafana + Prometheus' instead if you also want a metrics database.",
+    "category": "monitoring",
+    "tags": [
+      "dashboards",
+      "metrics",
+      "observability",
+      "alerting",
+      "charts"
+    ],
+    "logo": "grafana",
+    "version": "12.4",
+    "website": "https://grafana.com/oss/grafana/",
+    "docs": "https://grafana.com/docs/grafana/latest/setup-grafana/installation/docker/",
+    "repository": "https://github.com/grafana/grafana",
+    "ram_mb": 150,
+    "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "grafana",
+      "port": 3000,
+      "health_path": "/api/health"
+    },
+    "services": [
+      {
+        "name": "grafana",
+        "image": "grafana/grafana-oss:12.4.3",
+        "public": true,
+        "memory_limit_mb": 384
+      }
+    ],
+    "volumes": [
+      {
+        "service": "grafana",
+        "path": "./data",
+        "description": "Dashboards, users, plugins and settings (SQLite)",
+        "owner": "472:0"
+      }
+    ],
+    "inputs": [
+      {
+        "key": "ADMIN_PASSWORD",
+        "label": "Admin password",
+        "description": null,
+        "kind": "password",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": true
+      }
+    ],
+    "setup_notes": "Sign in as admin with the password Tond showed after the deploy, then add a data source under Connections.",
+    "upgrade_notes": "Change the image to a newer tag and redeploy; the SQLite database is migrated on start. Snapshot first before a major version.",
+    "post_deploy_checks": [
+      "Sign in as admin",
+      "Add a data source"
+    ],
+    "compose": "services:\n  grafana:\n    image: grafana/grafana-oss:12.4.3\n    restart: unless-stopped\n    mem_limit: 384m\n    ports: [\"3000\"]\n    environment:\n      GF_SERVER_ROOT_URL: ${GF_SERVER_ROOT_URL}\n      GF_SECURITY_ADMIN_USER: admin\n      GF_SECURITY_ADMIN_PASSWORD: ${ADMIN_PASSWORD}\n      GF_USERS_ALLOW_SIGN_UP: \"false\"\n      GF_ANALYTICS_REPORTING_ENABLED: \"false\"\n      GF_ANALYTICS_CHECK_FOR_UPDATES: \"false\"\n    volumes:\n      - ./data:/var/lib/grafana\n"
+  },
+  {
+    "id": "prometheus-grafana",
+    "name": "Grafana + Prometheus",
+    "description": "A metrics stack: Prometheus collects and stores, Grafana shows and alerts.",
+    "about": "Prometheus scrapes metrics from your services and stores them as time series; Grafana comes pre-connected to it for dashboards and alerts. Prometheus stays private on the app network, only Grafana is public. Add scrape targets in the prometheus_config block of the app's compose file, then redeploy. Host metrics (node-exporter) aren't included: it needs host access Tond doesn't grant to apps.",
+    "category": "monitoring",
+    "tags": [
+      "prometheus",
+      "grafana",
+      "metrics",
+      "observability",
+      "monitoring"
+    ],
+    "logo": "prometheus",
+    "version": "Prometheus 3.14 · Grafana 12.4",
+    "website": "https://prometheus.io",
+    "docs": "https://prometheus.io/docs/prometheus/latest/configuration/configuration/",
+    "repository": "https://github.com/prometheus/prometheus",
+    "ram_mb": 350,
+    "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "grafana",
+      "port": 3000,
+      "health_path": "/api/health"
+    },
+    "services": [
+      {
+        "name": "grafana",
+        "image": "grafana/grafana-oss:12.4.3",
+        "public": true,
+        "memory_limit_mb": 384
+      },
+      {
+        "name": "prometheus",
+        "image": "prom/prometheus:v3.14.0",
+        "public": false,
+        "memory_limit_mb": 512
+      }
+    ],
+    "volumes": [
+      {
+        "service": "grafana",
+        "path": "./grafana",
+        "description": "Grafana dashboards, users and settings",
+        "owner": "472:0"
+      },
+      {
+        "service": "prometheus",
+        "path": "./prometheus",
+        "description": "Prometheus time-series data (15 days)",
+        "owner": "65534:65534"
+      }
+    ],
+    "inputs": [
+      {
+        "key": "ADMIN_PASSWORD",
+        "label": "Grafana admin password",
+        "description": null,
+        "kind": "password",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": true
+      }
+    ],
+    "setup_notes": "Sign in to Grafana as admin with the password Tond showed after the deploy; the Prometheus data source is already set up. Metrics are kept for 15 days.",
+    "upgrade_notes": "Change either image tag and redeploy. Prometheus keeps its data format across 3.x releases; snapshot the app before a major version.",
+    "post_deploy_checks": [
+      "Sign in to Grafana",
+      "Open Explore and query the 'up' metric"
+    ],
+    "compose": "services:\n  grafana:\n    image: grafana/grafana-oss:12.4.3\n    restart: unless-stopped\n    mem_limit: 384m\n    ports: [\"3000\"]\n    environment:\n      GF_SERVER_ROOT_URL: ${GF_SERVER_ROOT_URL}\n      GF_SECURITY_ADMIN_USER: admin\n      GF_SECURITY_ADMIN_PASSWORD: ${ADMIN_PASSWORD}\n      GF_USERS_ALLOW_SIGN_UP: \"false\"\n      GF_ANALYTICS_REPORTING_ENABLED: \"false\"\n      GF_ANALYTICS_CHECK_FOR_UPDATES: \"false\"\n    volumes:\n      - ./grafana:/var/lib/grafana\n    configs:\n      - source: grafana_datasource\n        target: /etc/grafana/provisioning/datasources/prometheus.yml\n    depends_on:\n      - prometheus\n\n  prometheus:\n    image: prom/prometheus:v3.14.0\n    restart: unless-stopped\n    mem_limit: 512m\n    command:\n      - --config.file=/etc/prometheus/prometheus.yml\n      - --storage.tsdb.path=/prometheus\n      - --storage.tsdb.retention.time=15d\n    volumes:\n      - ./prometheus:/prometheus\n    configs:\n      - source: prometheus_config\n        target: /etc/prometheus/prometheus.yml\n\nconfigs:\n  grafana_datasource:\n    content: |\n      apiVersion: 1\n      datasources:\n        - name: Prometheus\n          type: prometheus\n          access: proxy\n          url: http://prometheus:9090\n          isDefault: true\n  prometheus_config:\n    content: |\n      global:\n        scrape_interval: 30s\n        evaluation_interval: 30s\n      scrape_configs:\n        - job_name: prometheus\n          static_configs:\n            - targets: [\"localhost:9090\"]\n        - job_name: grafana\n          static_configs:\n            - targets: [\"grafana:3000\"]\n"
+  },
+  {
+    "id": "immich",
+    "name": "Immich",
+    "description": "High-performance photo and video backup, a Google Photos alternative.",
+    "about": "Immich backs up photos and videos from your phone automatically and gives you timelines, albums, sharing, maps and a fast web app. This template leaves out the machine-learning service to save 1–2 GB of memory, so smart search and face recognition are off; everything else works. Photo libraries grow fast: watch your disk.",
+    "category": "media",
+    "tags": [
+      "photos",
+      "videos",
+      "backup",
+      "google photos alternative",
+      "gallery"
+    ],
+    "logo": "immich",
+    "version": "2.7",
+    "website": "https://immich.app",
+    "docs": "https://immich.app/docs/install/docker-compose",
+    "repository": "https://github.com/immich-app/immich",
+    "ram_mb": 1600,
+    "fits_2gb": false,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "immich-server",
+      "port": 2283,
+      "health_path": "/api/server/ping"
+    },
+    "services": [
+      {
+        "name": "immich-server",
+        "image": "ghcr.io/immich-app/immich-server:v2.7.0",
+        "public": true,
+        "memory_limit_mb": 2048
+      },
+      {
+        "name": "database",
+        "image": "ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0",
+        "public": false,
+        "memory_limit_mb": 512
+      },
+      {
+        "name": "redis",
+        "image": "valkey/valkey:8-alpine",
+        "public": false,
+        "memory_limit_mb": 128
+      }
+    ],
+    "volumes": [
+      {
+        "service": "immich-server",
+        "path": "./library",
+        "description": "Your photos and videos, thumbnails and transcodes",
+        "owner": null
+      },
+      {
+        "service": "database",
+        "path": "./postgres",
+        "description": "PostgreSQL data: albums, people, metadata",
+        "owner": null
+      }
+    ],
+    "inputs": [
+      {
+        "key": "DB_PASSWORD",
+        "label": "Database password",
+        "description": null,
+        "kind": "text",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": false
+      }
+    ],
+    "setup_notes": "Open the app and create the admin account (the first user). Then install the mobile app, sign in with this address and turn on backup.",
+    "upgrade_notes": "Immich releases often and sometimes changes its compose setup. Read the release notes, snapshot the app, then change the immich-server tag and redeploy. Keep the database image on the version the release notes name.",
+    "post_deploy_checks": [
+      "Create the admin account",
+      "Connect the mobile app and back up a photo"
+    ],
+    "compose": "services:\n  immich-server:\n    image: ghcr.io/immich-app/immich-server:v2.7.0\n    restart: unless-stopped\n    mem_limit: 2g\n    ports: [\"2283\"]\n    environment:\n      DB_HOSTNAME: database\n      DB_USERNAME: immich\n      DB_PASSWORD: ${DB_PASSWORD}\n      DB_DATABASE_NAME: immich\n      REDIS_HOSTNAME: redis\n      IMMICH_MACHINE_LEARNING_ENABLED: \"false\"\n    volumes:\n      - ./library:/data\n    depends_on:\n      redis:\n        condition: service_healthy\n      database:\n        condition: service_healthy\n    # Timings only: the image's own HEALTHCHECK test is kept, but its 30s default interval\n    # would keep the deploy waiting.\n    healthcheck:\n      interval: 10s\n      timeout: 5s\n      start_period: 60s\n      start_interval: 2s\n\n  redis:\n    image: valkey/valkey:8-alpine\n    restart: unless-stopped\n    mem_limit: 128m\n    healthcheck:\n      test: [\"CMD\", \"valkey-cli\", \"ping\"]\n      interval: 5s\n      timeout: 3s\n      retries: 10\n\n  database:\n    image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0\n    restart: unless-stopped\n    mem_limit: 512m\n    shm_size: 128mb\n    environment:\n      POSTGRES_USER: immich\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n      POSTGRES_DB: immich\n      POSTGRES_INITDB_ARGS: --data-checksums\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U immich -d immich\"]\n      interval: 5s\n      timeout: 5s\n      retries: 20\n"
+  },
+  {
+    "id": "it-tools",
+    "name": "IT Tools",
+    "description": "Handy online tools for developers: encoders, generators, converters and more.",
+    "about": "IT Tools bundles 80+ small utilities (UUID and hash generators, JWT and base64 decoders, cron parser, JSON/YAML converters, QR codes, subnet calculator…) in one fast static web app. Everything runs in your browser.",
+    "category": "developer",
+    "tags": [
+      "tools",
+      "developer",
+      "converter",
+      "utilities"
+    ],
+    "logo": null,
+    "version": "2024.10.22",
+    "website": "https://it-tools.tech",
+    "docs": "https://github.com/CorentinTh/it-tools#self-host",
+    "repository": "https://github.com/CorentinTh/it-tools",
+    "ram_mb": 20,
+    "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "it-tools",
+      "port": 80,
+      "health_path": "/"
+    },
+    "services": [
+      {
+        "name": "it-tools",
+        "image": "corentinth/it-tools:2024.10.22-7ca5933",
+        "public": true,
+        "memory_limit_mb": 64
+      }
+    ],
+    "volumes": [],
+    "inputs": [],
+    "setup_notes": "Open the app; there is nothing to configure. It has no login, so anyone with the address can use it.",
+    "upgrade_notes": "Change the image to a newer tag and redeploy.",
+    "post_deploy_checks": [
+      "Open the app and try a tool"
+    ],
+    "compose": "services:\n  it-tools:\n    image: corentinth/it-tools:2024.10.22-7ca5933\n    restart: unless-stopped\n    mem_limit: 64m\n    ports: [\"80\"]\n"
+  },
+  {
+    "id": "linkding",
+    "name": "linkding",
+    "description": "Minimal, fast bookmark manager with tags, search and archiving.",
+    "about": "linkding stores and organises bookmarks with tags, full-text search, read-later and optional web archive snapshots. It has browser extensions and a REST API, and runs happily on a few dozen megabytes.",
+    "category": "productivity",
+    "tags": [
+      "bookmarks",
+      "links",
+      "read later",
+      "pocket alternative"
+    ],
+    "logo": null,
+    "version": "1.47",
+    "website": "https://linkding.link",
+    "docs": "https://linkding.link/installation/",
+    "repository": "https://github.com/sissbruecker/linkding",
+    "ram_mb": 150,
+    "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "linkding",
+      "port": 9090,
+      "health_path": "/health"
+    },
+    "services": [
+      {
+        "name": "linkding",
+        "image": "sissbruecker/linkding:1.47.0",
+        "public": true,
+        "memory_limit_mb": 256
+      }
+    ],
+    "volumes": [
+      {
+        "service": "linkding",
+        "path": "./data",
+        "description": "Bookmarks database, favicons and archived pages",
+        "owner": null
+      }
+    ],
+    "inputs": [
+      {
+        "key": "ADMIN_PASSWORD",
+        "label": "Admin password",
+        "description": null,
+        "kind": "password",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": true
+      }
+    ],
+    "setup_notes": "Sign in as admin with the password Tond showed after the deploy, then install the browser extension from Settings → Integrations.",
+    "upgrade_notes": "Change the image to a newer 1.x tag and redeploy; migrations run on start.",
+    "post_deploy_checks": [
+      "Sign in as admin",
+      "Save a bookmark"
+    ],
+    "compose": "services:\n  linkding:\n    image: sissbruecker/linkding:1.47.0\n    restart: unless-stopped\n    mem_limit: 256m\n    ports: [\"9090\"]\n    environment:\n      LD_SUPERUSER_NAME: admin\n      LD_SUPERUSER_PASSWORD: ${ADMIN_PASSWORD}\n      LD_CSRF_TRUSTED_ORIGINS: ${TRUSTED_ORIGIN}\n    volumes:\n      - ./data:/etc/linkding/data\n    # Timings only: the image's own HEALTHCHECK test is kept, but its 30s interval\n    # would keep the deploy waiting.\n    healthcheck:\n      interval: 10s\n      timeout: 5s\n      start_period: 30s\n      start_interval: 2s\n"
+  },
+  {
+    "id": "listmonk",
+    "name": "listmonk",
+    "description": "Fast newsletter and mailing-list manager in a single binary.",
+    "about": "listmonk manages subscribers, lists and campaigns, with templates, analytics and transactional mail over any SMTP provider. It handles millions of subscribers on very little memory.",
+    "category": "communication",
+    "tags": [
+      "newsletter",
+      "email",
+      "mailing list",
+      "mailchimp alternative"
+    ],
+    "logo": "listmonk",
+    "version": "6.2",
+    "website": "https://listmonk.app",
+    "docs": "https://listmonk.app/docs/installation/",
+    "repository": "https://github.com/knadh/listmonk",
+    "ram_mb": 120,
+    "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "listmonk",
+      "port": 9000,
+      "health_path": "/health"
+    },
+    "services": [
+      {
+        "name": "listmonk",
+        "image": "listmonk/listmonk:v6.2.0",
+        "public": true,
+        "memory_limit_mb": 256
+      },
+      {
+        "name": "db",
+        "image": "postgres:17-alpine",
+        "public": false,
+        "memory_limit_mb": 256
+      }
+    ],
+    "volumes": [
+      {
+        "service": "listmonk",
+        "path": "./uploads",
+        "description": "Uploaded media for campaigns",
+        "owner": null
+      },
+      {
+        "service": "db",
+        "path": "./postgres",
+        "description": "PostgreSQL data: subscribers, lists and campaigns",
+        "owner": null
+      }
+    ],
+    "inputs": [
+      {
+        "key": "ADMIN_PASSWORD",
+        "label": "Admin password",
+        "description": null,
+        "kind": "password",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": true
+      },
+      {
+        "key": "DB_PASSWORD",
+        "label": "Database password",
+        "description": null,
+        "kind": "text",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": false
+      },
+      {
+        "key": "TZ",
+        "label": "Time zone",
+        "description": "For scheduled campaigns, e.g. Europe/Berlin.",
+        "kind": "text",
+        "required": false,
+        "generated": false,
+        "default": "UTC",
+        "credential": false
+      }
+    ],
+    "setup_notes": "Sign in as admin with the password Tond showed after the deploy. Set the root URL under Settings → General to this app's address and add your SMTP server under Settings → SMTP.",
+    "upgrade_notes": "Change the image to a newer tag and redeploy; the container runs listmonk --upgrade on every start. Snapshot the app first.",
+    "post_deploy_checks": [
+      "Sign in and set the root URL",
+      "Configure SMTP and send a test campaign"
+    ],
+    "compose": "services:\n  listmonk:\n    image: listmonk/listmonk:v6.2.0\n    restart: unless-stopped\n    mem_limit: 256m\n    ports: [\"9000\"]\n    command: [sh, -c, \"./listmonk --install --idempotent --yes --config '' && ./listmonk --upgrade --yes --config '' && ./listmonk --config ''\"]\n    environment:\n      LISTMONK_app__address: 0.0.0.0:9000\n      LISTMONK_db__host: db\n      LISTMONK_db__port: \"5432\"\n      LISTMONK_db__user: listmonk\n      LISTMONK_db__password: ${DB_PASSWORD}\n      LISTMONK_db__database: listmonk\n      LISTMONK_db__ssl_mode: disable\n      LISTMONK_ADMIN_USER: admin\n      LISTMONK_ADMIN_PASSWORD: ${ADMIN_PASSWORD}\n      TZ: ${TZ}\n    volumes:\n      - ./uploads:/listmonk/uploads\n    depends_on:\n      db:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: listmonk\n      POSTGRES_USER: listmonk\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U listmonk -d listmonk\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n"
+  },
+  {
+    "id": "mattermost",
+    "name": "Mattermost",
+    "description": "Team chat with channels, threads, calls and integrations, a Slack alternative.",
+    "about": "Mattermost Team Edition is an open-source messaging platform with channels, threads, file sharing, search, playbooks and a large integration ecosystem, with desktop and mobile apps. Its configuration is stored in the database, so settings you change in the System Console survive redeploys. The Team Edition image is published for x86_64 only.",
+    "category": "communication",
+    "tags": [
+      "chat",
+      "slack alternative",
+      "team",
+      "messaging"
+    ],
+    "logo": "mattermost",
+    "version": "11.11",
+    "website": "https://mattermost.com",
+    "docs": "https://docs.mattermost.com/deployment-guide/server/deploy-containers.html",
+    "repository": "https://github.com/mattermost/mattermost",
+    "ram_mb": 800,
+    "fits_2gb": true,
+    "architectures": [
+      "amd64"
+    ],
+    "public": {
+      "service": "mattermost",
+      "port": 8065,
+      "health_path": "/api/v4/system/ping"
+    },
+    "services": [
+      {
+        "name": "mattermost",
+        "image": "mattermost/mattermost-team-edition:11.11",
+        "public": true,
+        "memory_limit_mb": 1024
+      },
+      {
+        "name": "db",
+        "image": "postgres:17-alpine",
+        "public": false,
+        "memory_limit_mb": 384
+      }
+    ],
+    "volumes": [
+      {
+        "service": "mattermost",
+        "path": "./data",
+        "description": "Uploaded files and images",
+        "owner": "2000:2000"
+      },
+      {
+        "service": "mattermost",
+        "path": "./plugins",
+        "description": "Server plugins",
+        "owner": "2000:2000"
+      },
+      {
+        "service": "mattermost",
+        "path": "./client-plugins",
+        "description": "Web app plugins",
+        "owner": "2000:2000"
+      },
+      {
+        "service": "db",
+        "path": "./postgres",
+        "description": "PostgreSQL data: messages, users, channels and settings",
+        "owner": null
+      }
+    ],
+    "inputs": [
+      {
+        "key": "DB_PASSWORD",
+        "label": "Database password",
+        "description": null,
+        "kind": "text",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": false
+      }
+    ],
+    "setup_notes": "Open the app right away: the first account created becomes the system admin. Then create a team and invite people.",
+    "upgrade_notes": "Change the image to a newer tag and redeploy; the database is migrated on start. Stay on Extended Support Releases for fewer upgrades, and snapshot first.",
+    "post_deploy_checks": [
+      "Create the admin account",
+      "Configure SMTP in the System Console for invites and notifications"
+    ],
+    "compose": "services:\n  mattermost:\n    image: mattermost/mattermost-team-edition:11.11\n    restart: unless-stopped\n    mem_limit: 1g\n    ports: [\"8065\"]\n    environment:\n      TZ: UTC\n      MM_SQLSETTINGS_DRIVERNAME: postgres\n      MM_SQLSETTINGS_DATASOURCE: postgres://mattermost:${DB_PASSWORD}@db:5432/mattermost?sslmode=disable&connect_timeout=10\n      MM_CONFIG: postgres://mattermost:${DB_PASSWORD}@db:5432/mattermost?sslmode=disable&connect_timeout=10\n      MM_SERVICESETTINGS_SITEURL: ${MM_SERVICESETTINGS_SITEURL}\n      MM_BLEVESETTINGS_INDEXDIR: /mattermost/data/bleve-indexes\n    volumes:\n      - ./data:/mattermost/data\n      - ./plugins:/mattermost/plugins\n      - ./client-plugins:/mattermost/client/plugins\n    depends_on:\n      db:\n        condition: service_healthy\n    # Timings only: the image's own HEALTHCHECK test is kept, but its 30s interval\n    # would keep the deploy waiting.\n    healthcheck:\n      interval: 10s\n      timeout: 10s\n      start_period: 60s\n      start_interval: 2s\n\n  db:\n    image: postgres:17-alpine\n    restart: unless-stopped\n    mem_limit: 384m\n    environment:\n      POSTGRES_DB: mattermost\n      POSTGRES_USER: mattermost\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U mattermost -d mattermost\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n"
+  },
+  {
+    "id": "mealie",
+    "name": "Mealie",
+    "description": "Recipe manager and meal planner that imports recipes from any website.",
+    "about": "Mealie scrapes recipes from a URL, organises them with tags and categories, plans meals and builds shopping lists, for your whole household.",
+    "category": "productivity",
+    "tags": [
+      "recipes",
+      "cooking",
+      "meal planning",
+      "shopping list"
+    ],
+    "logo": "mealie",
+    "version": "3.28",
+    "website": "https://mealie.io",
+    "docs": "https://docs.mealie.io/documentation/getting-started/installation/installation-checklist/",
+    "repository": "https://github.com/mealie-recipes/mealie",
+    "ram_mb": 300,
+    "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "mealie",
+      "port": 9000,
+      "health_path": "/api/app/about"
+    },
+    "services": [
+      {
+        "name": "mealie",
+        "image": "ghcr.io/mealie-recipes/mealie:v3.28.0",
+        "public": true,
+        "memory_limit_mb": 512
+      }
+    ],
+    "volumes": [
+      {
+        "service": "mealie",
+        "path": "./data",
+        "description": "Recipes, images and the SQLite database",
+        "owner": null
+      }
+    ],
+    "inputs": [
+      {
+        "key": "TZ",
+        "label": "Time zone",
+        "description": "For meal plans, e.g. Europe/Berlin.",
+        "kind": "text",
+        "required": false,
+        "generated": false,
+        "default": "UTC",
+        "credential": false
+      }
+    ],
+    "setup_notes": "Sign in with changeme@example.com and password MyPassword, then change the email and password immediately under your profile.",
+    "upgrade_notes": "Change the image to a newer tag and redeploy; migrations run on start. Snapshot the app first.",
+    "post_deploy_checks": [
+      "Sign in and change the default credentials",
+      "Import a recipe from a URL"
+    ],
+    "compose": "services:\n  mealie:\n    image: ghcr.io/mealie-recipes/mealie:v3.28.0\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"9000\"]\n    environment:\n      BASE_URL: ${BASE_URL}\n      TZ: ${TZ}\n      ALLOW_SIGNUP: \"false\"\n      MAX_WORKERS: \"1\"\n      WEB_CONCURRENCY: \"1\"\n    volumes:\n      - ./data:/app/data\n    # Timings only: the image's own HEALTHCHECK test is kept, but its 30s default interval\n    # would keep the deploy waiting.\n    healthcheck:\n      interval: 10s\n      timeout: 5s\n      start_period: 60s\n      start_interval: 2s\n"
+  },
+  {
+    "id": "memos",
+    "name": "Memos",
+    "description": "Lightweight note-taking for quick thoughts, like a private timeline.",
+    "about": "Memos is a privacy-first, Markdown-native notes service for capturing ideas quickly, with tags, a timeline, sharing and an API. It runs on SQLite with a tiny footprint.",
+    "category": "productivity",
+    "tags": [
+      "notes",
+      "markdown",
+      "journal",
+      "microblog"
+    ],
+    "logo": null,
+    "version": "0.31",
+    "website": "https://usememos.com",
+    "docs": "https://usememos.com/docs/install/container-install",
+    "repository": "https://github.com/usememos/memos",
+    "ram_mb": 40,
+    "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "memos",
+      "port": 5230,
+      "health_path": "/healthz"
+    },
+    "services": [
+      {
+        "name": "memos",
+        "image": "neosmemo/memos:0.31.0",
+        "public": true,
+        "memory_limit_mb": 128
+      }
+    ],
+    "volumes": [
+      {
+        "service": "memos",
+        "path": "./data",
+        "description": "Notes, resources and the SQLite database",
+        "owner": null
+      }
+    ],
+    "inputs": [],
+    "setup_notes": "Open the app right away: the first account you create becomes the admin. Then turn off sign-ups in Settings if you use it alone.",
+    "upgrade_notes": "Memos is pre-1.0 and minor versions can change the database. Snapshot the app, then change the image tag and redeploy.",
+    "post_deploy_checks": [
+      "Create the admin account",
+      "Disable public sign-ups"
+    ],
+    "compose": "services:\n  memos:\n    image: neosmemo/memos:0.31.0\n    restart: unless-stopped\n    mem_limit: 128m\n    ports: [\"5230\"]\n    volumes:\n      - ./data:/var/opt/memos\n"
+  },
+  {
+    "id": "metabase",
+    "name": "Metabase",
+    "description": "Business intelligence: ask questions of your data and build dashboards.",
+    "about": "Metabase lets anyone query databases with a visual question builder or SQL, then share charts and dashboards. It runs on the JVM, so it needs about a gigabyte of memory; its own settings live in a bundled PostgreSQL database.",
+    "category": "analytics",
+    "tags": [
+      "bi",
+      "dashboards",
+      "sql",
+      "reporting",
+      "charts"
+    ],
+    "logo": "metabase",
+    "version": "0.58 LTS",
+    "website": "https://www.metabase.com",
+    "docs": "https://www.metabase.com/docs/latest/installation-and-operation/running-metabase-on-docker",
+    "repository": "https://github.com/metabase/metabase",
+    "ram_mb": 1200,
+    "fits_2gb": false,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "metabase",
+      "port": 3000,
+      "health_path": "/api/health"
+    },
+    "services": [
+      {
+        "name": "metabase",
+        "image": "metabase/metabase:v0.58.34",
+        "public": true,
+        "memory_limit_mb": 1280
+      },
+      {
+        "name": "db",
+        "image": "postgres:17-alpine",
+        "public": false,
+        "memory_limit_mb": 256
+      }
+    ],
+    "volumes": [
+      {
+        "service": "db",
+        "path": "./postgres",
+        "description": "Metabase's own settings, questions and dashboards",
+        "owner": null
+      }
+    ],
+    "inputs": [
+      {
+        "key": "DB_PASSWORD",
+        "label": "Database password",
+        "description": null,
+        "kind": "text",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": false
+      }
+    ],
+    "setup_notes": "The first start takes two or three minutes. Then open the app and complete the setup wizard to create the admin account and connect your first database.",
+    "upgrade_notes": "Metabase 0.58 is a long-term support release. To upgrade, change the image tag, snapshot the app first and redeploy; the application database is migrated on start and can't be downgraded.",
+    "post_deploy_checks": [
+      "Complete the setup wizard",
+      "Connect a database and build a question"
+    ],
+    "compose": "services:\n  metabase:\n    image: metabase/metabase:v0.58.34\n    restart: unless-stopped\n    mem_limit: 1280m\n    ports: [\"3000\"]\n    environment:\n      MB_DB_TYPE: postgres\n      MB_DB_HOST: db\n      MB_DB_PORT: \"5432\"\n      MB_DB_DBNAME: metabase\n      MB_DB_USER: metabase\n      MB_DB_PASS: ${DB_PASSWORD}\n      MB_SITE_URL: ${MB_SITE_URL}\n      MB_ANON_TRACKING_ENABLED: \"false\"\n      JAVA_OPTS: -Xmx768m -XX:+UseSerialGC\n    depends_on:\n      db:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: metabase\n      POSTGRES_USER: metabase\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U metabase -d metabase\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n"
+  },
+  {
+    "id": "miniflux",
+    "name": "Miniflux",
+    "description": "Minimalist, fast RSS and Atom feed reader.",
+    "about": "Miniflux is an opinionated feed reader: a clean, keyboard-friendly web UI, readability extraction, integrations with read-later services and a Fever/Google Reader API for mobile apps. It uses a few dozen megabytes of memory.",
+    "category": "productivity",
+    "tags": [
+      "rss",
+      "feeds",
+      "reader",
+      "news"
+    ],
+    "logo": null,
+    "version": "2.3",
+    "website": "https://miniflux.app",
+    "docs": "https://miniflux.app/docs/docker.html",
+    "repository": "https://github.com/miniflux/v2",
+    "ram_mb": 100,
+    "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "miniflux",
+      "port": 8080,
+      "health_path": "/healthcheck"
+    },
+    "services": [
+      {
+        "name": "miniflux",
+        "image": "miniflux/miniflux:2.3.3",
+        "public": true,
+        "memory_limit_mb": 128
+      },
+      {
+        "name": "db",
+        "image": "postgres:17-alpine",
+        "public": false,
+        "memory_limit_mb": 256
+      }
+    ],
+    "volumes": [
+      {
+        "service": "db",
+        "path": "./postgres",
+        "description": "PostgreSQL data: feeds, entries and users",
+        "owner": null
+      }
+    ],
+    "inputs": [
+      {
+        "key": "ADMIN_PASSWORD",
+        "label": "Admin password",
+        "description": null,
+        "kind": "password",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": true
+      },
+      {
+        "key": "DB_PASSWORD",
+        "label": "Database password",
+        "description": null,
+        "kind": "text",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": false
+      }
+    ],
+    "setup_notes": "Sign in as admin with the password Tond showed after the deploy and add your first feeds, or import an OPML file.",
+    "upgrade_notes": "Change the image to a newer 2.x tag and redeploy; migrations run on start.",
+    "post_deploy_checks": [
+      "Sign in as admin",
+      "Import an OPML file or add a feed"
+    ],
+    "compose": "services:\n  miniflux:\n    image: miniflux/miniflux:2.3.3\n    restart: unless-stopped\n    mem_limit: 128m\n    ports: [\"8080\"]\n    environment:\n      DATABASE_URL: postgres://miniflux:${DB_PASSWORD}@db/miniflux?sslmode=disable\n      RUN_MIGRATIONS: \"1\"\n      CREATE_ADMIN: \"1\"\n      ADMIN_USERNAME: admin\n      ADMIN_PASSWORD: ${ADMIN_PASSWORD}\n      BASE_URL: ${BASE_URL}\n      LISTEN_ADDR: 0.0.0.0:8080\n    depends_on:\n      db:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: miniflux\n      POSTGRES_USER: miniflux\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U miniflux -d miniflux\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n"
+  },
+  {
+    "id": "n8n",
+    "name": "n8n",
+    "description": "Workflow automation with 400+ integrations, code steps and AI nodes.",
+    "about": "n8n connects APIs, databases and services with visual workflows, triggered by webhooks, schedules or events. Mix drag-and-drop nodes with JavaScript or Python where you need them. This template uses SQLite, which is plenty for personal and small-team use.",
+    "category": "automation",
+    "tags": [
+      "automation",
+      "workflows",
+      "zapier alternative",
+      "webhooks",
+      "ai"
+    ],
+    "logo": "n8n",
+    "version": "2.41",
+    "website": "https://n8n.io",
+    "docs": "https://docs.n8n.io/hosting/",
+    "repository": "https://github.com/n8n-io/n8n",
+    "ram_mb": 350,
+    "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "n8n",
+      "port": 5678,
+      "health_path": "/healthz"
+    },
+    "services": [
+      {
+        "name": "n8n",
+        "image": "n8nio/n8n:2.41.3",
+        "public": true,
+        "memory_limit_mb": 1024
+      }
+    ],
+    "volumes": [
+      {
+        "service": "n8n",
+        "path": "./data",
+        "description": "Workflows, credentials and execution history (SQLite)",
+        "owner": "1000:1000"
+      }
+    ],
+    "inputs": [
+      {
+        "key": "N8N_ENCRYPTION_KEY",
+        "label": "Encryption key",
+        "description": "Encrypts saved credentials. Keep it if you move the data.",
+        "kind": "text",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": false
+      },
+      {
+        "key": "GENERIC_TIMEZONE",
+        "label": "Time zone",
+        "description": "Used by schedule triggers, e.g. Europe/Berlin.",
+        "kind": "text",
+        "required": false,
+        "generated": false,
+        "default": "UTC",
+        "credential": false
+      }
+    ],
+    "setup_notes": "Open the app right away and create the owner account. Webhook URLs use this app's address, so set the domain before building workflows.",
+    "upgrade_notes": "Change the image to a newer 2.x tag and redeploy. Keep the encryption key: without it saved credentials can't be decrypted. Read the breaking-changes page before a major version.",
+    "post_deploy_checks": [
+      "Create the owner account",
+      "Build a test workflow with a webhook trigger"
+    ],
+    "compose": "services:\n  n8n:\n    image: n8nio/n8n:2.41.3\n    restart: unless-stopped\n    mem_limit: 1g\n    ports: [\"5678\"]\n    environment:\n      N8N_HOST: ${N8N_HOST}\n      N8N_PROTOCOL: https\n      N8N_PORT: \"5678\"\n      WEBHOOK_URL: ${WEBHOOK_URL}\n      N8N_PROXY_HOPS: \"1\"\n      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}\n      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE}\n      TZ: ${GENERIC_TIMEZONE}\n      N8N_DIAGNOSTICS_ENABLED: \"false\"\n      N8N_PERSONALIZATION_ENABLED: \"false\"\n      EXECUTIONS_DATA_PRUNE: \"true\"\n      EXECUTIONS_DATA_MAX_AGE: \"336\"\n      DB_SQLITE_POOL_SIZE: \"2\"\n    volumes:\n      - ./data:/home/node/.n8n\n"
+  },
+  {
+    "id": "nextcloud",
+    "name": "Nextcloud",
+    "description": "Files, calendars, contacts and office apps in your own cloud.",
+    "about": "Nextcloud syncs files across your devices and adds calendars, contacts, notes and hundreds of apps. This lite setup runs Nextcloud with PostgreSQL and no extra cache server, which suits a handful of users on a small VPS.",
+    "category": "storage",
+    "tags": [
+      "files",
+      "sync",
+      "dropbox alternative",
+      "calendar",
+      "contacts",
+      "cloud"
+    ],
+    "logo": "nextcloud",
+    "version": "34",
+    "website": "https://nextcloud.com",
+    "docs": "https://github.com/nextcloud/docker",
+    "repository": "https://github.com/nextcloud/server",
+    "ram_mb": 600,
+    "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "nextcloud",
+      "port": 80,
+      "health_path": "/status.php"
+    },
+    "services": [
+      {
+        "name": "nextcloud",
+        "image": "nextcloud:34-apache",
+        "public": true,
+        "memory_limit_mb": 768
+      },
+      {
+        "name": "db",
+        "image": "postgres:17-alpine",
+        "public": false,
+        "memory_limit_mb": 256
+      }
+    ],
+    "volumes": [
+      {
+        "service": "nextcloud",
+        "path": "./html",
+        "description": "Nextcloud's code, config, apps and every user's files",
+        "owner": null
+      },
+      {
+        "service": "db",
+        "path": "./postgres",
+        "description": "PostgreSQL data: users, shares, calendars and file metadata",
+        "owner": null
+      }
+    ],
+    "inputs": [
+      {
+        "key": "ADMIN_PASSWORD",
+        "label": "Admin password",
+        "description": null,
+        "kind": "password",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": true
+      },
+      {
+        "key": "DB_PASSWORD",
+        "label": "Database password",
+        "description": null,
+        "kind": "text",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": false
+      }
+    ],
+    "setup_notes": "The first start installs Nextcloud and takes a minute or two. Then sign in as admin with the password Tond showed after the deploy. Install the desktop and mobile clients and point them at this address.",
+    "upgrade_notes": "Nextcloud only upgrades one major version at a time (34 → 35, never 34 → 36). Snapshot the app, change the image tag to the next major and redeploy; the upgrade runs on start.",
+    "post_deploy_checks": [
+      "Sign in as admin",
+      "Check Administration → Overview for warnings"
+    ],
+    "compose": "services:\n  nextcloud:\n    image: nextcloud:34-apache\n    restart: unless-stopped\n    mem_limit: 768m\n    ports: [\"80\"]\n    environment:\n      POSTGRES_HOST: db\n      POSTGRES_DB: nextcloud\n      POSTGRES_USER: nextcloud\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n      NEXTCLOUD_ADMIN_USER: admin\n      NEXTCLOUD_ADMIN_PASSWORD: ${ADMIN_PASSWORD}\n      NEXTCLOUD_TRUSTED_DOMAINS: ${NEXTCLOUD_TRUSTED_DOMAINS}\n      OVERWRITEPROTOCOL: https\n      OVERWRITECLIURL: ${OVERWRITE_CLI_URL}\n      TRUSTED_PROXIES: 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16\n      PHP_MEMORY_LIMIT: 512M\n      PHP_UPLOAD_LIMIT: 2G\n    volumes:\n      - ./html:/var/www/html\n    depends_on:\n      db:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: nextcloud\n      POSTGRES_USER: nextcloud\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U nextcloud -d nextcloud\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n"
+  },
+  {
+    "id": "ntfy",
+    "name": "ntfy",
+    "description": "Push notifications to your phone or desktop with a simple HTTP request.",
+    "about": "ntfy is a pub-sub notification service: send a message with curl (or from scripts, cron jobs, Tond alerts and home automation) and receive it on the ntfy Android/iOS apps or the web. Access is deny-all by default, so only users you create can publish or subscribe.",
+    "category": "communication",
+    "tags": [
+      "notifications",
+      "push",
+      "alerts",
+      "pubsub"
+    ],
+    "logo": "ntfy",
+    "version": "2.28",
+    "website": "https://ntfy.sh",
+    "docs": "https://docs.ntfy.sh/config/",
+    "repository": "https://github.com/binwiederhier/ntfy",
+    "ram_mb": 40,
+    "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "ntfy",
+      "port": 80,
+      "health_path": "/v1/health"
+    },
+    "services": [
+      {
+        "name": "ntfy",
+        "image": "binwiederhier/ntfy:v2.28.0",
+        "public": true,
+        "memory_limit_mb": 128
+      }
+    ],
+    "volumes": [
+      {
+        "service": "ntfy",
+        "path": "./data",
+        "description": "Message cache, users and access control",
+        "owner": null
+      }
+    ],
+    "inputs": [],
+    "setup_notes": "Create a user from the app's Terminal tab: `ntfy user add --role=admin admin`. Then sign in from the web app or the mobile apps with this address.",
+    "upgrade_notes": "Change the image to a newer 2.x tag and redeploy.",
+    "post_deploy_checks": [
+      "Create an admin user from the app terminal",
+      "Send a test message with curl"
+    ],
+    "compose": "services:\n  ntfy:\n    image: binwiederhier/ntfy:v2.28.0\n    restart: unless-stopped\n    mem_limit: 128m\n    command: serve\n    ports: [\"80\"]\n    environment:\n      NTFY_BASE_URL: ${NTFY_BASE_URL}\n      NTFY_LISTEN_HTTP: \":80\"\n      NTFY_BEHIND_PROXY: \"true\"\n      NTFY_CACHE_FILE: /var/lib/ntfy/cache.db\n      NTFY_AUTH_FILE: /var/lib/ntfy/auth.db\n      NTFY_AUTH_DEFAULT_ACCESS: deny-all\n      NTFY_ENABLE_LOGIN: \"true\"\n      NTFY_ATTACHMENT_CACHE_DIR: /var/lib/ntfy/attachments\n    volumes:\n      - ./data:/var/lib/ntfy\n"
+  },
+  {
+    "id": "paperless-ngx",
+    "name": "Paperless-ngx",
+    "description": "Scan, OCR, tag and search all your paper documents.",
+    "about": "Paperless-ngx turns scanned documents into a searchable archive: OCR, automatic tagging and matching, full-text search and a clean web UI. This template uses SQLite and one worker to stay frugal; OCR of large batches takes a while on a small server.",
+    "category": "documents",
+    "tags": [
+      "documents",
+      "ocr",
+      "scanner",
+      "archive",
+      "paperless"
+    ],
+    "logo": "paperlessngx",
+    "version": "2.20",
+    "website": "https://docs.paperless-ngx.com",
+    "docs": "https://docs.paperless-ngx.com/setup/",
+    "repository": "https://github.com/paperless-ngx/paperless-ngx",
+    "ram_mb": 800,
+    "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "paperless",
+      "port": 8000,
+      "health_path": "/accounts/login/"
+    },
+    "services": [
+      {
+        "name": "paperless",
+        "image": "ghcr.io/paperless-ngx/paperless-ngx:2.20.15",
+        "public": true,
+        "memory_limit_mb": 1024
+      },
+      {
+        "name": "redis",
+        "image": "valkey/valkey:8-alpine",
+        "public": false,
+        "memory_limit_mb": 128
+      }
+    ],
+    "volumes": [
+      {
+        "service": "paperless",
+        "path": "./data",
+        "description": "The database, search index and classifier",
+        "owner": null
+      },
+      {
+        "service": "paperless",
+        "path": "./media",
+        "description": "Original and archived documents",
+        "owner": null
+      },
+      {
+        "service": "paperless",
+        "path": "./consume",
+        "description": "Drop folder: files placed here are imported",
+        "owner": null
+      }
+    ],
+    "inputs": [
+      {
+        "key": "PAPERLESS_SECRET_KEY",
+        "label": "Secret key",
+        "description": null,
+        "kind": "text",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": false
+      },
+      {
+        "key": "ADMIN_PASSWORD",
+        "label": "Admin password",
+        "description": null,
+        "kind": "password",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": true
+      },
+      {
+        "key": "PAPERLESS_OCR_LANGUAGE",
+        "label": "OCR language",
+        "description": "Tesseract language code of most documents, e.g. eng, deu, fra.",
+        "kind": "text",
+        "required": false,
+        "generated": false,
+        "default": "eng",
+        "credential": false
+      }
+    ],
+    "setup_notes": "Sign in as admin with the password Tond showed after the deploy, then upload a document from the web UI or the mobile apps.",
+    "upgrade_notes": "Change the image to a newer 2.x tag and redeploy; migrations run on start. Paperless 3 has breaking changes: read its release notes and snapshot first.",
+    "post_deploy_checks": [
+      "Sign in as admin",
+      "Upload a PDF and search for a word in it"
+    ],
+    "compose": "services:\n  paperless:\n    image: ghcr.io/paperless-ngx/paperless-ngx:2.20.15\n    restart: unless-stopped\n    mem_limit: 1g\n    ports: [\"8000\"]\n    environment:\n      PAPERLESS_REDIS: redis://redis:6379\n      PAPERLESS_URL: ${PAPERLESS_URL}\n      PAPERLESS_SECRET_KEY: ${PAPERLESS_SECRET_KEY}\n      PAPERLESS_ADMIN_USER: admin\n      PAPERLESS_ADMIN_PASSWORD: ${ADMIN_PASSWORD}\n      PAPERLESS_OCR_LANGUAGE: ${PAPERLESS_OCR_LANGUAGE}\n      PAPERLESS_TASK_WORKERS: \"1\"\n      PAPERLESS_THREADS_PER_WORKER: \"1\"\n      PAPERLESS_WEBSERVER_WORKERS: \"1\"\n    volumes:\n      - ./data:/usr/src/paperless/data\n      - ./media:/usr/src/paperless/media\n      - ./consume:/usr/src/paperless/consume\n    depends_on:\n      redis:\n        condition: service_healthy\n    # Timings only: the image's own HEALTHCHECK test is kept, but its 30s interval\n    # would keep the deploy waiting.\n    healthcheck:\n      interval: 10s\n      timeout: 10s\n      start_period: 120s\n      start_interval: 2s\n      retries: 5\n\n  redis:\n    image: valkey/valkey:8-alpine\n    restart: unless-stopped\n    mem_limit: 128m\n    healthcheck:\n      test: [\"CMD\", \"valkey-cli\", \"ping\"]\n      interval: 5s\n      timeout: 3s\n      retries: 10\n"
+  },
+  {
+    "id": "plausible",
+    "name": "Plausible Analytics",
+    "description": "Lightweight, cookie-free web analytics with a single-page dashboard.",
+    "about": "Plausible Community Edition gives you traffic, sources, goals and funnels on one clear page, without cookies or personal data. Events are stored in ClickHouse, which needs more memory than simpler analytics tools; on a small server, Umami is the lighter choice.",
+    "category": "analytics",
+    "tags": [
+      "analytics",
+      "privacy",
+      "google analytics alternative",
+      "clickhouse"
+    ],
+    "logo": "plausibleanalytics",
+    "version": "3.2",
+    "website": "https://plausible.io",
+    "docs": "https://github.com/plausible/community-edition",
+    "repository": "https://github.com/plausible/analytics",
+    "ram_mb": 1200,
+    "fits_2gb": false,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "plausible",
+      "port": 8000,
+      "health_path": "/api/health"
+    },
+    "services": [
+      {
+        "name": "plausible",
+        "image": "ghcr.io/plausible/community-edition:v3.2.1",
+        "public": true,
+        "memory_limit_mb": 768
+      },
+      {
+        "name": "db",
+        "image": "postgres:17-alpine",
+        "public": false,
+        "memory_limit_mb": 256
+      },
+      {
+        "name": "events",
+        "image": "clickhouse/clickhouse-server:24.12-alpine",
+        "public": false,
+        "memory_limit_mb": 1024
+      }
+    ],
+    "volumes": [
+      {
+        "service": "plausible",
+        "path": "./plausible",
+        "description": "Plausible's own files (GeoIP database, uploads)",
+        "owner": "999:65533"
+      },
+      {
+        "service": "db",
+        "path": "./postgres",
+        "description": "PostgreSQL data: users, sites, goals",
+        "owner": null
+      },
+      {
+        "service": "events",
+        "path": "./clickhouse",
+        "description": "ClickHouse data: every page view and event",
+        "owner": null
+      }
+    ],
+    "inputs": [
+      {
+        "key": "SECRET_KEY_BASE",
+        "label": "Secret key base",
+        "description": null,
+        "kind": "text",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": false
+      },
+      {
+        "key": "DB_PASSWORD",
+        "label": "Database password",
+        "description": null,
+        "kind": "text",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": false
+      }
+    ],
+    "setup_notes": "Open the app and register: the first account becomes the owner, and registration then switches to invite-only. Add your site and paste the script into its <head>.",
+    "upgrade_notes": "Change the plausible image to a newer v3.x tag and redeploy; migrations run on start. Keep ClickHouse on a version the release notes list as supported, and snapshot the app first.",
+    "post_deploy_checks": [
+      "Register the owner account right away",
+      "Add a site and check a page view arrives"
+    ],
+    "compose": "services:\n  plausible:\n    image: ghcr.io/plausible/community-edition:v3.2.1\n    restart: unless-stopped\n    mem_limit: 768m\n    command: sh -c \"/entrypoint.sh db createdb && /entrypoint.sh db migrate && /entrypoint.sh run\"\n    ports: [\"8000\"]\n    environment:\n      BASE_URL: ${BASE_URL}\n      SECRET_KEY_BASE: ${SECRET_KEY_BASE}\n      HTTP_PORT: \"8000\"\n      DATABASE_URL: postgres://plausible:${DB_PASSWORD}@db:5432/plausible\n      CLICKHOUSE_DATABASE_URL: http://events:8123/plausible_events\n      DISABLE_REGISTRATION: invite_only\n    volumes:\n      - ./plausible:/var/lib/plausible\n    depends_on:\n      db:\n        condition: service_healthy\n      events:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: plausible\n      POSTGRES_USER: plausible\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U plausible -d plausible\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n\n  events:\n    image: clickhouse/clickhouse-server:24.12-alpine\n    restart: unless-stopped\n    mem_limit: 1g\n    environment:\n      CLICKHOUSE_SKIP_USER_SETUP: \"1\"\n    volumes:\n      - ./clickhouse:/var/lib/clickhouse\n    configs:\n      - source: clickhouse_logs\n        target: /etc/clickhouse-server/config.d/logs.xml\n      - source: clickhouse_ipv4\n        target: /etc/clickhouse-server/config.d/ipv4-only.xml\n      - source: clickhouse_low_resources\n        target: /etc/clickhouse-server/users.d/low-resources.xml\n    ulimits:\n      nofile:\n        soft: 262144\n        hard: 262144\n    healthcheck:\n      test: [\"CMD-SHELL\", \"wget --no-verbose --tries=1 -O - http://127.0.0.1:8123/ping || exit 1\"]\n      interval: 5s\n      timeout: 5s\n      retries: 20\n      start_period: 5s\n      start_interval: 1s\n\nconfigs:\n  clickhouse_logs:\n    content: |\n      <clickhouse>\n        <logger><level>warning</level><console>true</console></logger>\n        <query_log replace=\"1\"><database>system</database><table>query_log</table><flush_interval_milliseconds>7500</flush_interval_milliseconds><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></query_log>\n        <query_thread_log remove=\"remove\"/>\n        <metric_log remove=\"remove\"/>\n        <asynchronous_metric_log remove=\"remove\"/>\n        <trace_log remove=\"remove\"/>\n        <text_log remove=\"remove\"/>\n        <session_log remove=\"remove\"/>\n        <part_log remove=\"remove\"/>\n      </clickhouse>\n  clickhouse_ipv4:\n    content: |\n      <clickhouse>\n        <listen_host>0.0.0.0</listen_host>\n      </clickhouse>\n  clickhouse_low_resources:\n    content: |\n      <clickhouse>\n        <profiles>\n          <default>\n            <max_threads>1</max_threads>\n            <max_block_size>8192</max_block_size>\n            <max_download_threads>1</max_download_threads>\n            <input_format_parallel_parsing>0</input_format_parallel_parsing>\n            <output_format_parallel_formatting>0</output_format_parallel_formatting>\n          </default>\n        </profiles>\n      </clickhouse>\n"
+  },
+  {
+    "id": "pocketbase",
+    "name": "PocketBase",
+    "description": "Open-source backend in one file: database, auth, file storage and realtime.",
+    "about": "PocketBase gives you an embedded SQLite database with a realtime API, user authentication, file storage and an admin dashboard, all in a single tiny Go binary. A great backend for prototypes, mobile apps and SPAs.",
+    "category": "developer",
+    "tags": [
+      "backend",
+      "baas",
+      "firebase alternative",
+      "sqlite",
+      "realtime",
+      "api"
+    ],
+    "logo": "pocketbase",
+    "version": "0.40",
+    "website": "https://pocketbase.io",
+    "docs": "https://pocketbase.io/docs/",
+    "repository": "https://github.com/pocketbase/pocketbase",
+    "ram_mb": 40,
+    "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "pocketbase",
+      "port": 8090,
+      "health_path": "/api/health"
+    },
+    "services": [
+      {
+        "name": "pocketbase",
+        "image": "ghcr.io/muchobien/pocketbase:0.40.4",
+        "public": true,
+        "memory_limit_mb": 256
+      }
+    ],
+    "volumes": [
+      {
+        "service": "pocketbase",
+        "path": "./pb_data",
+        "description": "The database and uploaded files",
+        "owner": null
+      }
+    ],
+    "inputs": [
+      {
+        "key": "SUPERUSER_EMAIL",
+        "label": "Superuser email",
+        "description": null,
+        "kind": "email",
+        "required": true,
+        "generated": false,
+        "default": null,
+        "credential": true
+      },
+      {
+        "key": "SUPERUSER_PASSWORD",
+        "label": "Superuser password",
+        "description": null,
+        "kind": "password",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": true
+      }
+    ],
+    "setup_notes": "Open /_/ on the app's address and sign in with the superuser email and the password Tond showed after the deploy.",
+    "upgrade_notes": "PocketBase is pre-1.0 and minor versions can break. Read the changelog, snapshot the app, then change the image tag and redeploy.",
+    "post_deploy_checks": [
+      "Sign in to the dashboard at /_/",
+      "Create your first collection"
+    ],
+    "compose": "services:\n  pocketbase:\n    image: ghcr.io/muchobien/pocketbase:0.40.4\n    restart: unless-stopped\n    mem_limit: 256m\n    ports: [\"8090\"]\n    environment:\n      PB_SUPERUSER_EMAIL: ${SUPERUSER_EMAIL}\n      PB_SUPERUSER_PASSWORD: ${SUPERUSER_PASSWORD}\n    # Create (or update) the superuser, then serve.\n    entrypoint: [\"/bin/sh\", \"-c\"]\n    command:\n      - >-\n        /usr/local/bin/pocketbase superuser upsert \"$$PB_SUPERUSER_EMAIL\" \"$$PB_SUPERUSER_PASSWORD\" --dir=/pb_data\n        && exec /usr/local/bin/pocketbase serve --http=0.0.0.0:8090 --dir=/pb_data\n    volumes:\n      - ./pb_data:/pb_data\n"
+  },
+  {
+    "id": "stirling-pdf",
+    "name": "Stirling-PDF",
+    "description": "Merge, split, convert, compress, sign and OCR PDFs in your browser.",
+    "about": "Stirling-PDF offers 50+ PDF tools in a web UI and an API: merge, split, rotate, compress, convert to and from images and Office formats, OCR, sign, redact and more. Files are processed on your server and never stored. Login is on, so the tools aren't open to the internet.",
+    "category": "documents",
+    "tags": [
+      "pdf",
+      "documents",
+      "ocr",
+      "convert",
+      "tools"
+    ],
+    "logo": null,
+    "version": "2.14",
+    "website": "https://www.stirling.com",
+    "docs": "https://docs.stirlingpdf.com",
+    "repository": "https://github.com/Stirling-Tools/Stirling-PDF",
+    "ram_mb": 1100,
+    "fits_2gb": false,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "stirling-pdf",
+      "port": 8080,
+      "health_path": "/api/v1/info/status"
+    },
+    "services": [
+      {
+        "name": "stirling-pdf",
+        "image": "stirlingtools/stirling-pdf:2.14.3",
+        "public": true,
+        "memory_limit_mb": 2048
+      }
+    ],
+    "volumes": [
+      {
+        "service": "stirling-pdf",
+        "path": "./configs",
+        "description": "Settings and the user database",
+        "owner": null
+      }
+    ],
+    "inputs": [
+      {
+        "key": "ADMIN_PASSWORD",
+        "label": "Initial admin password",
+        "description": null,
+        "kind": "password",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": true
+      }
+    ],
+    "setup_notes": "Sign in as admin with the password Tond showed after the deploy; you'll be asked to change it. Add more users under Settings.",
+    "upgrade_notes": "Change the image to a newer tag and redeploy. Read the release notes before a major version.",
+    "post_deploy_checks": [
+      "Sign in and change the password",
+      "Merge two PDFs"
+    ],
+    "compose": "services:\n  stirling-pdf:\n    image: stirlingtools/stirling-pdf:2.14.3\n    restart: unless-stopped\n    mem_limit: 2g\n    ports: [\"8080\"]\n    environment:\n      SECURITY_ENABLELOGIN: \"true\"\n      SECURITY_INITIALLOGIN_USERNAME: admin\n      SECURITY_INITIALLOGIN_PASSWORD: ${ADMIN_PASSWORD}\n      SYSTEM_ENABLEANALYTICS: \"false\"\n      LANGS: en_GB\n    volumes:\n      - ./configs:/configs\n    # Timings only: the image's own HEALTHCHECK test is kept, but its 30s interval\n    # would keep the deploy waiting.\n    healthcheck:\n      interval: 15s\n      timeout: 15s\n      start_period: 120s\n      start_interval: 2s\n      retries: 5\n"
+  },
+  {
+    "id": "twenty",
+    "name": "Twenty",
+    "description": "Modern open-source CRM for contacts, companies and deals, a Salesforce alternative.",
+    "about": "Twenty is a customisable CRM with a Notion-like interface: people, companies, opportunities, custom objects, views, workflows and an API. It runs a server, a background worker, PostgreSQL and Redis, so plan for 2 GB of memory for it alone.",
+    "category": "productivity",
+    "tags": [
+      "crm",
+      "sales",
+      "salesforce alternative",
+      "contacts"
+    ],
+    "logo": "twenty",
+    "version": "2.42",
+    "website": "https://twenty.com",
+    "docs": "https://twenty.com/developers/section/self-hosting/docker-compose",
+    "repository": "https://github.com/twentyhq/twenty",
+    "ram_mb": 1500,
+    "fits_2gb": false,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "server",
+      "port": 3000,
+      "health_path": "/healthz"
+    },
+    "services": [
+      {
+        "name": "server",
+        "image": "twentycrm/twenty:v2.42.6",
+        "public": true,
+        "memory_limit_mb": 1024
+      },
+      {
+        "name": "db",
+        "image": "postgres:16-alpine",
+        "public": false,
+        "memory_limit_mb": 384
+      },
+      {
+        "name": "redis",
+        "image": "valkey/valkey:8-alpine",
+        "public": false,
+        "memory_limit_mb": 128
+      },
+      {
+        "name": "worker",
+        "image": "twentycrm/twenty:v2.42.6",
+        "public": false,
+        "memory_limit_mb": 768
+      }
+    ],
+    "volumes": [
+      {
+        "service": "server",
+        "path": "./storage",
+        "description": "Uploaded files and attachments",
+        "owner": "1000:1000"
+      },
+      {
+        "service": "db",
+        "path": "./postgres",
+        "description": "PostgreSQL data: all CRM records",
+        "owner": null
+      }
+    ],
+    "inputs": [
+      {
+        "key": "APP_SECRET",
+        "label": "App secret",
+        "description": null,
+        "kind": "text",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": false
+      },
+      {
+        "key": "DB_PASSWORD",
+        "label": "Database password",
+        "description": null,
+        "kind": "text",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": false
+      }
+    ],
+    "setup_notes": "The first start runs migrations and takes a few minutes. Then open the app and sign up: the first account creates the workspace.",
+    "upgrade_notes": "Upgrade one minor version at a time and read Twenty's upgrade guide: some releases need a manual upgrade command. Snapshot the app first.",
+    "post_deploy_checks": [
+      "Create the workspace",
+      "Import contacts from CSV"
+    ],
+    "compose": "services:\n  server:\n    image: twentycrm/twenty:v2.42.6\n    restart: unless-stopped\n    mem_limit: 1g\n    ports: [\"3000\"]\n    environment:\n      NODE_PORT: \"3000\"\n      SERVER_URL: ${SERVER_URL}\n      APP_SECRET: ${APP_SECRET}\n      PG_DATABASE_URL: postgres://twenty:${DB_PASSWORD}@db:5432/twenty\n      REDIS_URL: redis://redis:6379\n      STORAGE_TYPE: local\n    volumes:\n      - ./storage:/app/packages/twenty-server/.local-storage\n    depends_on:\n      db:\n        condition: service_healthy\n      redis:\n        condition: service_healthy\n\n  worker:\n    image: twentycrm/twenty:v2.42.6\n    restart: unless-stopped\n    mem_limit: 768m\n    command: [\"yarn\", \"worker:prod\"]\n    environment:\n      SERVER_URL: ${SERVER_URL}\n      APP_SECRET: ${APP_SECRET}\n      PG_DATABASE_URL: postgres://twenty:${DB_PASSWORD}@db:5432/twenty\n      REDIS_URL: redis://redis:6379\n      STORAGE_TYPE: local\n      DISABLE_DB_MIGRATIONS: \"true\"\n      DISABLE_CRON_JOBS_REGISTRATION: \"true\"\n    depends_on:\n      - server\n\n  db:\n    image: postgres:16-alpine\n    restart: unless-stopped\n    mem_limit: 384m\n    environment:\n      POSTGRES_DB: twenty\n      POSTGRES_USER: twenty\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U twenty -d twenty\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n\n  redis:\n    image: valkey/valkey:8-alpine\n    restart: unless-stopped\n    mem_limit: 128m\n    command: [\"valkey-server\", \"--maxmemory-policy\", \"noeviction\"]\n    healthcheck:\n      test: [\"CMD\", \"valkey-cli\", \"ping\"]\n      interval: 5s\n      timeout: 3s\n      retries: 10\n"
+  },
+  {
+    "id": "umami",
+    "name": "Umami",
+    "description": "Simple, privacy-focused web analytics without cookies.",
+    "about": "Umami tracks page views, referrers, devices and custom events for any number of websites, without cookies or personal data, so no consent banner is needed. Add its tracking script to your sites and watch the dashboard fill in real time.",
+    "category": "analytics",
+    "tags": [
+      "analytics",
+      "privacy",
+      "google analytics alternative",
+      "gdpr"
+    ],
+    "logo": "umami",
+    "version": "3.4",
+    "website": "https://umami.is",
+    "docs": "https://umami.is/docs",
+    "repository": "https://github.com/umami-software/umami",
+    "ram_mb": 300,
+    "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "umami",
+      "port": 3000,
+      "health_path": "/api/heartbeat"
+    },
+    "services": [
+      {
+        "name": "umami",
+        "image": "ghcr.io/umami-software/umami:3.4.0",
+        "public": true,
+        "memory_limit_mb": 512
+      },
+      {
+        "name": "db",
+        "image": "postgres:17-alpine",
+        "public": false,
+        "memory_limit_mb": 256
+      }
+    ],
+    "volumes": [
+      {
+        "service": "db",
+        "path": "./postgres",
+        "description": "PostgreSQL data: websites, users and all analytics events",
+        "owner": null
+      }
+    ],
+    "inputs": [
+      {
+        "key": "APP_SECRET",
+        "label": "App secret",
+        "description": "Signs sessions.",
+        "kind": "text",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": false
+      },
+      {
+        "key": "DB_PASSWORD",
+        "label": "Database password",
+        "description": null,
+        "kind": "text",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": false
+      }
+    ],
+    "setup_notes": "Sign in with username admin and password umami, then change the password right away under Settings → Profile. Add a website to get its tracking script.",
+    "upgrade_notes": "Change the image tag to a newer 3.x release and redeploy; database migrations run on start. Read the release notes before a major version.",
+    "post_deploy_checks": [
+      "Sign in and change the default admin password",
+      "Add your first website and install the tracking script"
+    ],
+    "compose": "services:\n  umami:\n    image: ghcr.io/umami-software/umami:3.4.0\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"3000\"]\n    environment:\n      DATABASE_URL: postgresql://umami:${DB_PASSWORD}@db:5432/umami\n      APP_SECRET: ${APP_SECRET}\n      DISABLE_TELEMETRY: \"1\"\n    depends_on:\n      db:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: umami\n      POSTGRES_USER: umami\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U umami -d umami\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n"
+  },
+  {
+    "id": "uptime-kuma",
+    "name": "Uptime Kuma",
+    "description": "Friendly uptime monitoring with status pages and 90+ notification services.",
+    "about": "Uptime Kuma checks your websites, APIs, ports, DNS records and more every few seconds, alerts you on Telegram, Slack, email and dozens of other channels, and publishes public status pages.",
+    "category": "monitoring",
+    "tags": [
+      "uptime",
+      "monitoring",
+      "status page",
+      "alerts"
+    ],
+    "logo": "uptimekuma",
+    "version": "2.5",
+    "website": "https://uptime.kuma.pet",
+    "docs": "https://github.com/louislam/uptime-kuma/wiki",
+    "repository": "https://github.com/louislam/uptime-kuma",
+    "ram_mb": 230,
+    "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "uptime-kuma",
+      "port": 3001,
+      "health_path": null
+    },
+    "services": [
+      {
+        "name": "uptime-kuma",
+        "image": "louislam/uptime-kuma:2.5.5",
+        "public": true,
+        "memory_limit_mb": 384
+      }
+    ],
+    "volumes": [
+      {
+        "service": "uptime-kuma",
+        "path": "./data",
+        "description": "Settings, monitors and check history (SQLite)",
+        "owner": null
+      }
+    ],
+    "inputs": [],
+    "setup_notes": "Open the app right away: the first visitor creates the admin account. Choose the embedded SQLite database when asked.",
+    "upgrade_notes": "Change the image to a newer 2.x tag and redeploy. Take a snapshot first; the database is migrated on start.",
+    "post_deploy_checks": [
+      "Create the admin account",
+      "Add a monitor and a notification channel"
+    ],
+    "compose": "services:\n  uptime-kuma:\n    image: louislam/uptime-kuma:2.5.5\n    restart: unless-stopped\n    mem_limit: 384m\n    ports: [\"3001\"]\n    # Ping monitors need raw sockets, which Tond drops by default.\n    cap_add: [NET_RAW]\n    volumes:\n      - ./data:/app/data\n    # Timings only: the image's own HEALTHCHECK test is kept, but its 60s interval\n    # would keep the deploy waiting.\n    healthcheck:\n      interval: 20s\n      timeout: 10s\n      start_period: 60s\n      start_interval: 2s\n      retries: 5\n"
+  },
+  {
+    "id": "vaultwarden",
+    "name": "Vaultwarden",
+    "description": "Lightweight Bitwarden-compatible password manager server.",
+    "about": "Vaultwarden implements the Bitwarden API in Rust, so the official Bitwarden apps and browser extensions work with it, in a fraction of the memory of the official server. It needs HTTPS, which Tond provides on the app's domain.",
+    "category": "security",
+    "tags": [
+      "passwords",
+      "bitwarden",
+      "vault",
+      "security"
+    ],
+    "logo": "vaultwarden",
+    "version": "1.37",
+    "website": "https://github.com/dani-garcia/vaultwarden",
+    "docs": "https://github.com/dani-garcia/vaultwarden/wiki",
+    "repository": "https://github.com/dani-garcia/vaultwarden",
+    "ram_mb": 60,
+    "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "vaultwarden",
+      "port": 80,
+      "health_path": "/alive"
+    },
+    "services": [
+      {
+        "name": "vaultwarden",
+        "image": "vaultwarden/server:1.37.3-alpine",
+        "public": true,
+        "memory_limit_mb": 256
+      }
+    ],
+    "volumes": [
+      {
+        "service": "vaultwarden",
+        "path": "./data",
+        "description": "The vault database, attachments and keys",
+        "owner": null
+      }
+    ],
+    "inputs": [
+      {
+        "key": "ADMIN_TOKEN",
+        "label": "Admin panel token",
+        "description": "Opens /admin. Keep it secret.",
+        "kind": "password",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": true
+      }
+    ],
+    "setup_notes": "Open the app and create your account. Then open /admin with the admin token Tond showed after the deploy and turn off 'Allow new signups' so nobody else can register.",
+    "upgrade_notes": "Change the image to a newer 1.x tag and redeploy. Snapshot the app first: the SQLite database holds every vault.",
+    "post_deploy_checks": [
+      "Create your account",
+      "Disable new signups in /admin",
+      "Set up backups of this app"
+    ],
+    "compose": "services:\n  vaultwarden:\n    image: vaultwarden/server:1.37.3-alpine\n    restart: unless-stopped\n    mem_limit: 256m\n    ports: [\"80\"]\n    environment:\n      DOMAIN: ${DOMAIN}\n      ADMIN_TOKEN: ${ADMIN_TOKEN}\n      SIGNUPS_ALLOWED: \"true\"\n      WEBSOCKET_ENABLED: \"true\"\n    volumes:\n      - ./data:/data\n    # Timings only: the image's own HEALTHCHECK test is kept, but its 60s interval\n    # would keep the deploy waiting.\n    healthcheck:\n      interval: 10s\n      timeout: 5s\n      start_period: 10s\n      start_interval: 1s\n"
+  },
+  {
+    "id": "wikijs",
+    "name": "Wiki.js",
+    "description": "Modern wiki with a Markdown, WYSIWYG and code editor, search and Git sync.",
+    "about": "Wiki.js is a powerful wiki with several editors, page history, fine-grained permissions, many login providers, full-text search and optional two-way Git synchronisation of your content.",
+    "category": "documents",
+    "tags": [
+      "wiki",
+      "documentation",
+      "knowledge base",
+      "markdown"
+    ],
+    "logo": "wikidotjs",
+    "version": "2.5",
+    "website": "https://js.wiki",
+    "docs": "https://docs.requarks.io/install/docker",
+    "repository": "https://github.com/requarks/wiki",
+    "ram_mb": 350,
+    "fits_2gb": true,
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "public": {
+      "service": "wiki",
+      "port": 3000,
+      "health_path": "/healthz"
+    },
+    "services": [
+      {
+        "name": "wiki",
+        "image": "ghcr.io/requarks/wiki:2.5.315",
+        "public": true,
+        "memory_limit_mb": 512
+      },
+      {
+        "name": "db",
+        "image": "postgres:17-alpine",
+        "public": false,
+        "memory_limit_mb": 256
+      }
+    ],
+    "volumes": [
+      {
+        "service": "db",
+        "path": "./postgres",
+        "description": "PostgreSQL data: pages, users and settings",
+        "owner": null
+      }
+    ],
+    "inputs": [
+      {
+        "key": "DB_PASSWORD",
+        "label": "Database password",
+        "description": null,
+        "kind": "text",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": false
+      }
+    ],
+    "setup_notes": "Open the app right away: the setup page creates the administrator account and asks for the site URL (use this app's address).",
+    "upgrade_notes": "Change the image to a newer 2.5.x tag and redeploy. Wiki.js 3 is a different product line with its own migration.",
+    "post_deploy_checks": [
+      "Finish the setup page",
+      "Create the home page"
+    ],
+    "compose": "services:\n  wiki:\n    image: ghcr.io/requarks/wiki:2.5.315\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"3000\"]\n    environment:\n      DB_TYPE: postgres\n      DB_HOST: db\n      DB_PORT: \"5432\"\n      DB_USER: wikijs\n      DB_PASS: ${DB_PASSWORD}\n      DB_NAME: wiki\n    depends_on:\n      db:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: wiki\n      POSTGRES_USER: wikijs\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U wikijs -d wiki\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n"
+  }
+]

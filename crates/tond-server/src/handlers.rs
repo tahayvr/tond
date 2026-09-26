@@ -15,20 +15,20 @@
 // Handler summary:
 //
 //   health()            GET  /health              — liveness probe, no auth
-//   list_apps()         GET  /api/apps             — all apps ordered by created_at
-//   get_app()           GET  /api/apps/{id}        — single app by ID or name
-//   create_app()        POST /api/apps             — validate name, insert, 409 on duplicate
-//   delete_app()        DEL  /api/apps/{id}        — remove container (best-effort) then DB row
-//   deploy_app()        POST /api/apps/{id}/deploy — spawns background deploy task, returns 202
-//   stop_app()          POST /api/apps/{id}/stop   — Docker stop + set status=stopped
-//   start_app()         POST /api/apps/{id}/start  — Docker start + set status=running
-//   restart_app()       POST /api/apps/{id}/restart— sequential stop+start
-//   app_logs()          GET  /api/apps/{id}/logs   — last 50 deploy_logs + 100 container lines
+//   list_apps()         GET  /api/v1/apps             — all apps ordered by created_at
+//   get_app()           GET  /api/v1/apps/{id}        — single app by ID or name
+//   create_app()        POST /api/v1/apps             — validate name, insert, 409 on duplicate
+//   delete_app()        DEL  /api/v1/apps/{id}        — remove container (best-effort) then DB row
+//   deploy_app()        POST /api/v1/apps/{id}/deploy — spawns background deploy task, returns 202
+//   stop_app()          POST /api/v1/apps/{id}/stop   — Docker stop + set status=stopped
+//   start_app()         POST /api/v1/apps/{id}/start  — Docker start + set status=running
+//   restart_app()       POST /api/v1/apps/{id}/restart— sequential stop+start
+//   app_logs()          GET  /api/v1/apps/{id}/logs   — last 50 deploy_logs + 100 container lines
 //   (env vars live in handlers/env.rs: masked GET, PATCH, per-key reveal)
-//   update_domain()     PUT  /api/apps/{id}/domain — set domain, upsert 'pending' cert record
-//   update_port()       PUT  /api/apps/{id}/port   — container port (next deploy)
+//   update_domain()     PUT  /api/v1/apps/{id}/domain — set domain, upsert 'pending' cert record
+//   update_port()       PUT  /api/v1/apps/{id}/port   — container port (next deploy)
 //   (certificates live in handlers/certificates.rs)
-//   upload_deploy()     POST /api/apps/{id}/upload — accept .tar.gz, extract, build,
+//   upload_deploy()     POST /api/v1/apps/{id}/upload — accept .tar.gz, extract, build,
 //                                                    then deploy — all in background, returns 202
 //
 // Deploy flow for git source (triggered by deploy_app or upload_deploy):
@@ -37,20 +37,25 @@
 
 pub mod access_log;
 pub mod alerts;
+pub mod app_domains;
 pub mod app_events;
 pub mod audit_log;
 pub mod audit_shipping;
 pub mod auth;
 pub mod backups;
 pub mod certificates;
+pub mod compose;
 pub mod cron;
 pub mod database_links;
+pub mod database_ops;
 pub mod databases;
 pub mod deploy_stats;
 pub mod deployments;
+pub mod dns_providers;
 pub mod domains;
 pub mod env;
 pub mod git;
+pub mod gitea_tokens;
 pub mod github_apps;
 pub mod gitlab_tokens;
 pub mod host;
@@ -71,6 +76,7 @@ pub mod system_self;
 pub mod templates;
 pub mod terminal;
 pub mod tokens;
+pub mod updates;
 pub mod uptime;
 pub mod users;
 pub mod webhooks;
@@ -154,6 +160,7 @@ async fn fetch_app(db: &sqlx::SqlitePool, id_or_name: &str) -> Result<App, AppEr
 // name-based lookup. When present, returns only the matching app (or 404).
 
 #[derive(Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ListAppsQuery {
     pub name: Option<String>,
 }
@@ -233,6 +240,20 @@ pub async fn create_app(
     State(state): State<AppState>,
     Json(req): Json<CreateAppRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    let app = insert_app(&state, &auth, req).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiResponse::ok(AppResponse::from(app))),
+    ))
+}
+
+/// Validate a create request and insert the app (POST /api/apps and template
+/// deploys). `auth` must already hold `apps:write`.
+pub(crate) async fn insert_app(
+    state: &AppState,
+    auth: &Principal,
+    req: CreateAppRequest,
+) -> Result<App, AppError> {
     // Volumes and compose files reach the host: they also need an admin scope.
     if req.volumes.as_ref().is_some_and(|v| !v.is_empty()) {
         auth.require_to(Scope::SettingsWrite, "configure volumes")?;
@@ -243,18 +264,20 @@ pub async fn create_app(
 
     // Validate name (alphanumeric + hyphens)
     if !req.name.chars().all(|c| c.is_alphanumeric() || c == '-') {
-        return Err(AppError(TondError::InvalidInput(
-            "App name must be alphanumeric (hyphens allowed)".to_string(),
+        return Err(AppError(TondError::invalid_field(
+            "name",
+            "App name must be alphanumeric (hyphens allowed)",
         )));
     }
 
     // Validate source_type
-    if !matches!(
-        req.source_type.as_str(),
-        "git" | "image" | "tarball" | "dockerfile" | "compose"
-    ) {
-        return Err(AppError(TondError::InvalidInput(
-            "source_type must be one of: git, image, tarball, dockerfile, compose".to_string(),
+    if !APP_SOURCE_TYPES.contains(&req.source_type.as_str()) {
+        return Err(AppError(TondError::invalid_field(
+            "source_type",
+            format!(
+                "source_type must be one of: {}",
+                APP_SOURCE_TYPES.join(", ")
+            ),
         )));
     }
 
@@ -267,11 +290,20 @@ pub async fn create_app(
             .trim()
             .is_empty()
     {
-        return Err(AppError(TondError::InvalidInput(
-            "dockerfile_content is required when source_type is 'dockerfile'".to_string(),
+        return Err(AppError(TondError::invalid_field(
+            "dockerfile_content",
+            "dockerfile_content is required when source_type is 'dockerfile'",
         )));
     }
+    // Compose apps: an inline file, or a git repository with a compose file
+    // path (read at deploy time).
+    let compose_from_git = req.source_type == "compose"
+        && req
+            .source_url
+            .as_deref()
+            .is_some_and(|u| !u.trim().is_empty());
     if req.source_type == "compose"
+        && !compose_from_git
         && req
             .compose_content
             .as_deref()
@@ -279,20 +311,33 @@ pub async fn create_app(
             .trim()
             .is_empty()
     {
-        return Err(AppError(TondError::InvalidInput(
-            "compose_content is required when source_type is 'compose'".to_string(),
+        return Err(AppError(TondError::invalid_field(
+            "compose_content",
+            "compose_content (or a git source_url with compose_path) is required when source_type is 'compose'",
         )));
     }
+    let compose_path = if compose_from_git {
+        Some(
+            deploy::compose_path_in_repo(req.compose_path.as_deref())
+                .map_err(|e| AppError(TondError::InvalidInput(e.to_string())))?
+                .to_string_lossy()
+                .into_owned(),
+        )
+    } else {
+        None
+    };
     // Reject host-level compose options up front (privileged, host binds, …) so
     // the user sees every problem now instead of at deploy time.
     if req.source_type == "compose"
+        && !compose_from_git
         && let Some(content) = req.compose_content.as_deref()
     {
         let volume_dir = volumes::app_volume_dir(&volumes::data_dir(), &req.name);
         compose_policy::validate(content, &volume_dir).map_err(|errors| {
-            AppError(TondError::InvalidInput(compose_policy::format_errors(
-                &errors,
-            )))
+            AppError(TondError::invalid_field(
+                "compose_content",
+                compose_policy::format_errors(&errors),
+            ))
         })?;
     }
 
@@ -300,8 +345,9 @@ pub async fn create_app(
     if let Some(build_method) = requested_build_method.as_deref()
         && !matches!(build_method, "dockerfile" | "tbuild")
     {
-        return Err(AppError(TondError::InvalidInput(
-            "build_method must be one of: tbuild, dockerfile".to_string(),
+        return Err(AppError(TondError::invalid_field(
+            "build_method",
+            "build_method must be one of: tbuild, dockerfile",
         )));
     }
 
@@ -310,18 +356,18 @@ pub async fn create_app(
             if let Some(build_method) = requested_build_method.as_deref()
                 && build_method != "dockerfile"
             {
-                return Err(AppError(TondError::InvalidInput(
-                    "build_method must be 'dockerfile' when source_type is 'dockerfile'"
-                        .to_string(),
+                return Err(AppError(TondError::invalid_field(
+                    "build_method",
+                    "build_method must be 'dockerfile' when source_type is 'dockerfile'",
                 )));
             }
         }
         "git" | "tarball" => {}
         _ => {
             if requested_build_method.is_some() {
-                return Err(AppError(TondError::InvalidInput(
-                    "build_method is only supported for git, tarball, and dockerfile sources"
-                        .to_string(),
+                return Err(AppError(TondError::invalid_field(
+                    "build_method",
+                    "build_method is only supported for git, tarball, and dockerfile sources",
                 )));
             }
         }
@@ -336,8 +382,49 @@ pub async fn create_app(
     );
 
     if let Some(domain) = req.domain.filter(|d| !d.trim().is_empty()) {
-        app.domain = Some(check_app_domain(&state, &domain).await?.0);
+        let domain = check_app_domain(state, &domain).await?.0;
+        let taken: Option<String> = sqlx::query_scalar(
+            "SELECT a.name FROM app_domains d JOIN apps a ON a.id = d.app_id WHERE d.domain = ?",
+        )
+        .bind(&domain)
+        .fetch_optional(&state.db)
+        .await?;
+        if let Some(other) = taken {
+            return Err(AppError(TondError::InvalidInput(format!(
+                "{domain} is already used by the app '{other}'"
+            ))));
+        }
+        app.domain = Some(domain);
     }
+    app.compose_path = compose_path;
+    // Compose apps: the services of an inline file, and the web service that
+    // gets the app's port and domain.
+    let compose_plan = match (app.source_type.as_str(), req.compose_content.as_deref()) {
+        ("compose", Some(content)) if !compose_from_git => {
+            let specs = crate::compose::service_specs(content)
+                .map_err(|e| AppError(TondError::InvalidInput(e)))?;
+            let port = u16::try_from(app.container_port).unwrap_or(80);
+            let web =
+                crate::compose::pick_web_service(&specs, req.compose_service.as_deref(), port);
+            if web.is_none()
+                && let Some(name) = req.compose_service.as_deref().filter(|n| !n.is_empty())
+            {
+                return Err(AppError(TondError::InvalidInput(format!(
+                    "The compose file has no service named '{name}'"
+                ))));
+            }
+            Some((specs, web))
+        }
+        ("compose", _) => req
+            .compose_service
+            .as_deref()
+            .filter(|n| !n.trim().is_empty())
+            .map(|name| {
+                let port = u16::try_from(app.container_port).unwrap_or(80);
+                (Vec::new(), Some((name.trim().to_string(), port)))
+            }),
+        _ => None,
+    };
 
     let env = match req.env_vars {
         Some(value) => env_map_from_json(&value)?,
@@ -425,8 +512,8 @@ pub async fn create_app(
     )?;
 
     sqlx::query(
-		"INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, status, env_vars, memory_limit, cpu_limit, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, project_id, github_app_id, registry_credential_id, dockerfile_content, compose_content, base_dir, static_build, readiness, ready_after_secs, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		"INSERT INTO apps (id, name, domain, source_type, source_url, branch, container_port, container_id, status, env_vars, memory_limit, cpu_limit, health_check_path, health_check_interval, health_failure_threshold, health_consecutive_failures, volumes, drain_timeout, build_method, webhook_secret, auto_deploy, watch_branch, project_id, github_app_id, registry_credential_id, dockerfile_content, compose_content, compose_path, base_dir, static_build, readiness, ready_after_secs, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 	)
 	.bind(&app.id)
 	.bind(&app.name)
@@ -455,6 +542,7 @@ pub async fn create_app(
 	.bind(&app.registry_credential_id)
 	.bind(&app.dockerfile_content)
 	.bind(&app.compose_content)
+	.bind(&app.compose_path)
 	.bind(&app.base_dir)
 	.bind(app.static_build)
 	.bind(&app.readiness)
@@ -471,6 +559,10 @@ pub async fn create_app(
 		}
 	})?;
 
+    if let Some((specs, web)) = compose_plan {
+        apply_compose_plan(state, &mut app, &specs, web).await?;
+    }
+
     write_audit_log(
         &state.db,
         Some(&app.id),
@@ -481,18 +573,58 @@ pub async fn create_app(
     )
     .await;
 
-    Ok((
-        StatusCode::CREATED,
-        Json(ApiResponse::ok(AppResponse::from(app))),
-    ))
+    Ok(app)
+}
+
+/// A new compose app: store its services, publish the web service's port and
+/// move the requested domain onto that service.
+async fn apply_compose_plan(
+    state: &AppState,
+    app: &mut App,
+    specs: &[ComposeServiceSpec],
+    web: Option<(String, u16)>,
+) -> Result<(), AppError> {
+    let from_file = !specs.is_empty();
+    let specs: Vec<ComposeServiceSpec> = if !from_file {
+        // From a repository: the file is read at deploy time; remember the
+        // choice (the first deploy moves the domain once it knows the services).
+        web.iter()
+            .map(|(name, _)| ComposeServiceSpec {
+                name: name.clone(),
+                image: None,
+                builds: false,
+                ports: Vec::new(),
+                has_healthcheck: false,
+            })
+            .collect()
+    } else {
+        specs.to_vec()
+    };
+    crate::compose::sync_specs(&state.db, &app.id, &specs).await?;
+    let Some((service, port)) = web else {
+        return Ok(());
+    };
+    sqlx::query("UPDATE compose_services SET published_port = ? WHERE app_id = ? AND name = ?")
+        .bind(port as i64)
+        .bind(&app.id)
+        .bind(&service)
+        .execute(&state.db)
+        .await?;
+    // The domain given at creation was seeded as the app's primary domain
+    // (apps_domain_seed): it belongs to the web service.
+    if from_file {
+        crate::app_domains::attach_to_service(&state.db, &app.id, &service, port as i64).await?;
+    }
+    Ok(())
 }
 
 // ── Validate Compose ──
 //
-// POST /api/compose/validate — lets the dashboard show compose policy problems
+// POST /api/v1/compose/validate — lets the dashboard show compose policy problems
 // under the editor while the user types, before they create the app.
 
 #[derive(Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ValidateComposeRequest {
     /// App name, used to show where bind mounts will be stored (default "app")
     pub app_name: Option<String>,
@@ -515,10 +647,12 @@ pub async fn validate_compose(
         Ok(()) => Vec::new(),
         Err(errors) => errors,
     };
+    // The services (for picking the web service), when the file parses.
+    let services = crate::compose::service_specs(&req.compose_content).unwrap_or_default();
     Ok((
         StatusCode::OK,
         Json(ApiResponse::ok(
-            json!({ "valid": errors.is_empty(), "errors": errors }),
+            json!({ "valid": errors.is_empty(), "errors": errors, "services": services }),
         )),
     ))
 }
@@ -536,8 +670,12 @@ pub async fn delete_app(
     // Stop and remove container if running (best-effort). Compose apps store a
     // sentinel instead of a container id, so remove the whole compose project.
     if app.source_type == "compose" {
-        docker::remove_compose_project(&state.docker, &deploy::compose_project_name(&app.name))
-            .await;
+        // Containers, networks, named volumes and the pinned service images.
+        let project = deploy::compose_project_name(&app.name);
+        docker::remove_compose_project(&state.docker, &project).await;
+        docker::remove_compose_volumes(&state.docker, &project).await;
+        deploy::images::remove_compose_images(&state, &app.name).await;
+        let _ = tokio::fs::remove_dir_all(deploy::compose_work_dir_for(&app.name)).await;
     } else if let Some(container_id) = &app.container_id {
         let _ = docker::remove_container(&state.docker, container_id).await;
     }
@@ -585,7 +723,7 @@ pub(crate) fn deployment_started(
     message: &str,
     app_id: &str,
     queued: &deploy::queue::Enqueued,
-) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+) -> (StatusCode, Json<ApiResponse<QueuedDeploymentResponse>>) {
     (
         StatusCode::ACCEPTED,
         Json(ApiResponse::ok(queued_response(message, app_id, queued))),
@@ -621,26 +759,91 @@ pub async fn deploy_app(
 }
 
 /// Body of a 202 answer to a queued deployment (deploy/queue.rs).
+#[derive(Debug, Clone, serde::Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct QueuedDeploymentResponse {
+    /// Human summary, with the place in line when it waits.
+    pub message: String,
+    pub app_id: String,
+    /// Follow it at /api/v1/apps/{app_id}/deployments/{deployment_id}(/stream).
+    pub deployment_id: String,
+    /// `queued` (waits for a build slot or the app's running deploy).
+    pub status: String,
+    /// 1-based place in line.
+    pub queue_position: usize,
+    /// The waiting deployment this one replaced, if any.
+    pub superseded: Option<String>,
+    /// Rollbacks: the image being redeployed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_tag: Option<String>,
+    /// Rollbacks: the deployment whose image is redeployed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_deployment_id: Option<String>,
+}
+
 pub(crate) fn queued_response(
     message: &str,
     app_id: &str,
     queued: &deploy::queue::Enqueued,
-) -> serde_json::Value {
-    json!({
-        "message": if queued.queue_position > 1 {
-            format!("{message} (position {} in the queue)", queued.queue_position)
+) -> QueuedDeploymentResponse {
+    QueuedDeploymentResponse {
+        message: if queued.queue_position > 1 {
+            format!(
+                "{message} (position {} in the queue)",
+                queued.queue_position
+            )
         } else {
             message.to_string()
         },
-        "app_id": app_id,
-        "deployment_id": queued.deployment_id,
-        "status": queued.status,
-        "queue_position": queued.queue_position,
-        "superseded": queued.superseded,
-    })
+        app_id: app_id.to_string(),
+        deployment_id: queued.deployment_id.clone(),
+        status: queued.status.to_string(),
+        queue_position: queued.queue_position,
+        superseded: queued.superseded.clone(),
+        image_tag: None,
+        target_deployment_id: None,
+    }
 }
 
 // ── Stop App ──
+
+/// Stop / start / restart every service of a compose app.
+async fn compose_control(
+    state: &AppState,
+    app: &App,
+    auth: &Principal,
+    action: &str,
+) -> Result<(StatusCode, Json<ApiResponse<serde_json::Value>>), AppError> {
+    compose::control_all(state, app, action).await?;
+    let status = if action == "stop" {
+        "stopped"
+    } else {
+        "running"
+    };
+    sqlx::query("UPDATE apps SET status = ?, updated_at = datetime('now') WHERE id = ?")
+        .bind(status)
+        .bind(&app.id)
+        .execute(&state.db)
+        .await?;
+    write_audit_log(
+        &state.db,
+        Some(&app.id),
+        Some(&app.name),
+        action,
+        &auth.audit_actor(),
+        None,
+    )
+    .await;
+    let message = match action {
+        "stop" => "App stopped",
+        "start" => "App started",
+        _ => "App restarted",
+    };
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(json!({ "message": message }))),
+    ))
+}
 
 pub async fn stop_app(
     _rate: RateLimit,
@@ -649,6 +852,9 @@ pub async fn stop_app(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let app = fetch_app(&state.db, &id).await?;
+    if app.source_type == "compose" {
+        return compose_control(&state, &app, &auth, "stop").await;
+    }
 
     let container_id = app
         .container_id
@@ -689,6 +895,9 @@ pub async fn start_app(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let app = fetch_app(&state.db, &id).await?;
+    if app.source_type == "compose" {
+        return compose_control(&state, &app, &auth, "start").await;
+    }
 
     let container_id = app
         .container_id
@@ -729,6 +938,9 @@ pub async fn restart_app(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let app = fetch_app(&state.db, &id).await?;
+    if app.source_type == "compose" {
+        return compose_control(&state, &app, &auth, "restart").await;
+    }
 
     let container_id = app
         .container_id
@@ -782,8 +994,11 @@ pub async fn app_logs(
     .await
     .unwrap_or_default();
 
-    // Get container logs if running, without the app's secrets
-    let container_logs = if let Some(container_id) = &app.container_id {
+    // Get container logs if running, without the app's secrets (compose
+    // apps: every service, prefixed with its name).
+    let container_logs = if app.source_type == "compose" {
+        compose::combined_logs(&state, &app, 100).await
+    } else if let Some(container_id) = &app.container_id {
         docker::get_logs(&state.docker, container_id, 100)
             .await
             .unwrap_or_default()
@@ -802,6 +1017,10 @@ pub async fn app_logs(
 }
 
 // ── Update Domain ──
+//
+// PUT /api/apps/{id}/domain {"domain": "..."}: make a domain the app's
+// primary domain, adding it if needed (the previous primary stays as an
+// alias). The full list lives under /api/apps/{id}/domains (handlers/app_domains.rs).
 
 pub async fn update_domain(
     _rate: RateLimit,
@@ -811,62 +1030,15 @@ pub async fn update_domain(
     Json(req): Json<UpdateDomainRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let app = fetch_app(&state.db, &id).await?;
-    let (domain, warning) = check_app_domain(&state, &req.domain).await?;
-    let req = UpdateDomainRequest { domain };
-
-    let taken: Option<String> =
-        sqlx::query_scalar("SELECT name FROM apps WHERE domain = ? AND id != ? LIMIT 1")
-            .bind(&req.domain)
-            .bind(&app.id)
-            .fetch_optional(&state.db)
-            .await?;
-    if let Some(other) = taken {
-        return Err(AppError(TondError::InvalidInput(format!(
-            "{} is already used by the app '{other}'",
-            req.domain
-        ))));
+    if app.source_type == "compose" {
+        return Err(AppError(TondError::InvalidInput(
+            "Compose apps route domains per service: add the domain to a service in the app's Services list".to_string(),
+        )));
     }
-
-    sqlx::query("UPDATE apps SET domain = ?, updated_at = datetime('now') WHERE id = ?")
-        .bind(&req.domain)
-        .bind(&app.id)
-        .execute(&state.db)
-        .await?;
-
-    // Create a pending certificate record for ACME provisioning
-    let data_dir = std::env::var("TOND_DATA_DIR").unwrap_or_else(|_| "/opt/tond/data".to_string());
-    let certs_dir = format!("{}/certs", data_dir);
-    let cert_path = format!("{}/{}/cert.pem", certs_dir, req.domain);
-    let key_path = format!("{}/{}/key.pem", certs_dir, req.domain);
-
-    let cert_id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-    // Placeholder expiry — updated when cert is actually provisioned
-    let expires_at = (chrono::Utc::now() + chrono::Duration::days(90)).to_rfc3339();
-
-    // Insert or update certificate record (best-effort; don't fail the domain update)
-    let _ = sqlx::query(
-		"INSERT INTO certificates (id, domain, cert_type, cert_path, key_path, issued_at, expires_at, status, created_at, updated_at)
-         VALUES (?, ?, 'acme', ?, ?, ?, ?, 'pending', ?, ?)
-         ON CONFLICT(domain) DO UPDATE SET status = 'pending', updated_at = ?,
-            last_error = NULL, next_retry_at = NULL, failure_count = 0",
-	)
-	.bind(&cert_id)
-	.bind(&req.domain)
-	.bind(&cert_path)
-	.bind(&key_path)
-	.bind(&now)
-	.bind(&expires_at)
-	.bind(&now)
-	.bind(&now)
-	.bind(&now)
-	.execute(&state.db)
-	.await;
-
-    tracing::info!(
-        "Domain set to {}, certificate provisioning queued",
-        req.domain
-    );
+    let (_, warning) = check_app_domain(&state, &req.domain).await?;
+    let ctx = crate::app_domains::DomainContext::load(&state).await;
+    let row = crate::app_domains::set_primary(&state.db, &ctx, &app.id, &req.domain).await?;
+    tokio::spawn(crate::proxy_link::request_certs(Some(row.domain.clone())));
 
     write_audit_log(
         &state.db,
@@ -874,7 +1046,7 @@ pub async fn update_domain(
         Some(&app.name),
         "domain_update",
         &auth.audit_actor(),
-        Some(&format!("domain={}", req.domain)),
+        Some(&format!("domain={}", row.domain)),
     )
     .await;
 
@@ -882,7 +1054,7 @@ pub async fn update_domain(
         StatusCode::OK,
         Json(ApiResponse::ok(json!({
             "message": "Domain updated, certificate provisioning queued",
-            "domain": req.domain,
+            "domain": row.domain,
             "warning": warning,
         }))),
     ))
@@ -1242,8 +1414,9 @@ pub(crate) fn apply_readiness(
     Ok(())
 }
 
-/// PUT /api/apps/{id}/readiness body.
+/// PUT /api/v1/apps/{id}/readiness body.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct UpdateReadinessRequest {
     /// "http" | "tcp" | "none"
     pub readiness: String,
@@ -1251,7 +1424,7 @@ pub struct UpdateReadinessRequest {
     pub ready_after_secs: Option<i64>,
 }
 
-// PUT /api/apps/{id}/readiness
+// PUT /api/v1/apps/{id}/readiness
 // How deploys decide the new container is ready. Switching to a background
 // worker ("none") removes the app's domain and health check path: a worker
 // serves no traffic and is never routed. Takes effect on the next deploy.
@@ -1271,18 +1444,24 @@ pub async fn update_readiness(
         ReadinessChange::Update,
     )?;
     sqlx::query(
-        "UPDATE apps SET readiness = ?, ready_after_secs = ?, domain = ?, health_check_path = ?,
+        "UPDATE apps SET readiness = ?, ready_after_secs = ?, health_check_path = ?,
                 updated_at = datetime('now') WHERE id = ?",
     )
     .bind(&app.readiness)
     .bind(app.ready_after_secs)
-    .bind(&app.domain)
     .bind(&app.health_check_path)
     .bind(&app.id)
     .execute(&state.db)
     .await?;
-    let removed = match (&had_domain, &app.domain) {
-        (Some(d), None) => format!(" domain_removed={d}"),
+    // A background worker serves nothing: all of its domains go
+    // (apps.domain follows through the app_domains triggers).
+    let removed = if app.domain.is_none() {
+        crate::app_domains::clear(&state.db, &app.id).await?
+    } else {
+        Vec::new()
+    };
+    let removed = match (&had_domain, removed.is_empty()) {
+        (Some(_), false) => format!(" domain_removed={}", removed.join(",")),
         _ => String::new(),
     };
     write_audit_log(
@@ -1306,11 +1485,12 @@ pub async fn update_readiness(
 
 // ── Update Container Port ──
 //
-// PUT /api/apps/{id}/port  { "container_port": 80 }
+// PUT /api/v1/apps/{id}/port  { "container_port": 80 }
 // The port the app listens on inside its container (also passed as $PORT).
 // Takes effect on the next deploy.
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct UpdatePortRequest {
     pub container_port: i64,
 }
@@ -1421,7 +1601,7 @@ pub async fn upload_deploy(
 
 // ── Assign / Remove Project ──
 //
-// PUT /api/apps/{id}/project
+// PUT /api/v1/apps/{id}/project
 //   { "project_id": "<uuid>" }  — assign app to project
 //   { "project_id": null }      — remove app from project
 
@@ -1456,6 +1636,8 @@ pub async fn assign_project(
         .bind(&app.id)
         .execute(&state.db)
         .await?;
+    // Its logs are scrubbed with the new project's shared env.
+    log_scrub::forget_app(&app.id);
 
     // Move the running container to its new home network (project or own)
     // and re-attach linked databases there; drop the now-unused own network.
@@ -1637,6 +1819,8 @@ mod tests {
                 build_method: None,
                 dockerfile_content: None,
                 compose_content: None,
+                compose_path: None,
+                compose_service: None,
                 base_dir: None,
                 static_build: false,
                 readiness: None,
@@ -1685,6 +1869,8 @@ mod tests {
                 build_method: None,
                 dockerfile_content: None,
                 compose_content: None,
+                compose_path: None,
+                compose_service: None,
                 base_dir: None,
                 static_build: false,
                 readiness: None,
@@ -1733,6 +1919,8 @@ mod tests {
                 build_method: None,
                 dockerfile_content: None,
                 compose_content: None,
+                compose_path: None,
+                compose_service: None,
                 base_dir: None,
                 static_build: false,
                 readiness: None,
@@ -1781,6 +1969,8 @@ mod tests {
                 build_method: Some("manual".to_string()),
                 dockerfile_content: None,
                 compose_content: None,
+                compose_path: None,
+                compose_service: None,
                 base_dir: None,
                 static_build: false,
                 readiness: None,
@@ -1829,6 +2019,8 @@ mod tests {
                 build_method: Some("auto".to_string()),
                 dockerfile_content: None,
                 compose_content: None,
+                compose_path: None,
+                compose_service: None,
                 base_dir: None,
                 static_build: false,
                 readiness: None,
@@ -1877,6 +2069,8 @@ mod tests {
                 build_method: Some("nixpacks".to_string()),
                 dockerfile_content: None,
                 compose_content: None,
+                compose_path: None,
+                compose_service: None,
                 base_dir: None,
                 static_build: false,
                 readiness: None,
@@ -1925,6 +2119,8 @@ mod tests {
                 build_method: Some("tbuild".to_string()),
                 dockerfile_content: None,
                 compose_content: None,
+                compose_path: None,
+                compose_service: None,
                 base_dir: None,
                 static_build: false,
                 readiness: None,
@@ -1973,6 +2169,8 @@ mod tests {
                 build_method: Some("tbuild".to_string()),
                 dockerfile_content: Some("FROM nginx:alpine".to_string()),
                 compose_content: None,
+                compose_path: None,
+                compose_service: None,
                 base_dir: None,
                 static_build: false,
                 readiness: None,
@@ -2020,6 +2218,8 @@ mod tests {
                 build_method: None,
                 dockerfile_content: Some("FROM nginx:alpine".to_string()),
                 compose_content: None,
+                compose_path: None,
+                compose_service: None,
                 base_dir: None,
                 static_build: false,
                 readiness: None,
@@ -2070,6 +2270,8 @@ mod tests {
                 build_method: None,
                 dockerfile_content: None,
                 compose_content: None,
+                compose_path: None,
+                compose_service: None,
                 base_dir: None,
                 static_build: false,
                 readiness: None,
@@ -2123,6 +2325,8 @@ mod tests {
                 build_method: Some("tbuild".to_string()),
                 dockerfile_content: None,
                 compose_content: None,
+                compose_path: None,
+                compose_service: None,
                 base_dir: Some("services/api".to_string()),
                 static_build: true,
                 readiness: None,
@@ -2262,11 +2466,18 @@ mod tests {
     async fn update_readiness_switches_to_a_worker_and_drops_the_domain() {
         let state = test_state().await;
         let app = seed_app(&state, "jobs").await;
-        sqlx::query("UPDATE apps SET domain = 'jobs.example.com' WHERE id = ?")
-            .bind(&app.id)
-            .execute(&state.db)
-            .await
-            .unwrap_or_else(|err| panic!("seed domain: {err}"));
+        for (domain, kind) in [
+            ("jobs.example.com", "primary"),
+            ("jobs2.example.com", "alias"),
+        ] {
+            sqlx::query("INSERT INTO app_domains (domain, app_id, kind) VALUES (?, ?, ?)")
+                .bind(domain)
+                .bind(&app.id)
+                .bind(kind)
+                .execute(&state.db)
+                .await
+                .unwrap_or_else(|err| panic!("seed domain: {err}"));
+        }
         update_readiness(
             RateLimit,
             Authz::unchecked(Principal::test_user(Role::Admin)),
@@ -2286,6 +2497,12 @@ mod tests {
                 .await
                 .unwrap_or_else(|err| panic!("read: {err}"));
         assert_eq!((readiness.as_str(), secs, domain), ("none", 15, None));
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app_domains WHERE app_id = ?")
+            .bind(&app.id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_default();
+        assert_eq!(left, 0, "a worker keeps none of its domains");
     }
 
     #[test]
@@ -2590,6 +2807,8 @@ mod tests {
             github_app_id: None,
             dockerfile_content: None,
             compose_content: None,
+            compose_path: None,
+            compose_service: None,
             base_dir: None,
             static_build: false,
             readiness: None,
@@ -2641,6 +2860,8 @@ mod tests {
             github_app_id: None,
             dockerfile_content: None,
             compose_content: None,
+            compose_path: None,
+            compose_service: None,
             base_dir: None,
             static_build: false,
             readiness: None,
@@ -2682,6 +2903,8 @@ mod tests {
             github_app_id: None,
             dockerfile_content: None,
             compose_content: Some(content.to_string()),
+            compose_path: None,
+            compose_service: None,
             base_dir: None,
             static_build: false,
             readiness: None,

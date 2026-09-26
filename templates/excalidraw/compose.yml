@@ -1,0 +1,13 @@
+services:
+  excalidraw:
+    image: excalidraw/excalidraw:sha-4bfc5bb
+    restart: unless-stopped
+    mem_limit: 64m
+    ports: ["80"]
+    # Timings only: the image's own HEALTHCHECK test is kept, but its 30s default interval
+    # would keep the deploy waiting.
+    healthcheck:
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      start_interval: 1s

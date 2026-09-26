@@ -2,26 +2,26 @@
 //
 // Endpoints:
 //
-//   GET    /api/gitlab-tokens
+//   GET    /api/v1/gitlab-tokens
 //     List all stored GitLab tokens. The PAT value is never returned.
 //
-//   POST   /api/gitlab-tokens
+//   POST   /api/v1/gitlab-tokens
 //     Store a new PAT. The token is validated by calling GET <gitlab_url>/api/v4/user
 //     before saving. The username returned by GitLab is stored for display.
 //     The PAT itself is AES-256-GCM encrypted at rest (same scheme as registry_credentials).
 //
-//   DELETE /api/gitlab-tokens/{id}
+//   DELETE /api/v1/gitlab-tokens/{id}
 //     Remove a stored token. Also detaches it from any apps that reference it
 //     (handled automatically by the ON DELETE SET NULL FK constraint).
 //
-//   GET    /api/gitlab-tokens/{id}/repos
+//   GET    /api/v1/gitlab-tokens/{id}/repos
 //     Fetch accessible projects from GitLab using the stored PAT and return
 //     a flattened list suitable for a repo picker UI.
 //
-//   GET    /api/gitlab-tokens/{id}/repos/{project_id}/branches
+//   GET    /api/v1/gitlab-tokens/{id}/repos/{project_id}/branches
 //     Fetch branches for a specific GitLab project.
 //
-//   PUT    /api/apps/{id}/gitlab-token
+//   PUT    /api/v1/apps/{id}/gitlab-token
 //     Attach or detach a GitLab token from an app.
 
 use axum::{
@@ -47,7 +47,7 @@ use crate::{
 
 // ── Handlers ────────────────────────────────────────────────────────────────
 
-/// GET /api/gitlab-tokens
+/// GET /api/v1/gitlab-tokens
 pub async fn list_gitlab_tokens(
     _rate: RateLimit,
     _auth: Authz<scope::AppsRead>,
@@ -61,7 +61,7 @@ pub async fn list_gitlab_tokens(
     Ok((StatusCode::OK, Json(ApiResponse::ok(responses))))
 }
 
-/// POST /api/gitlab-tokens
+/// POST /api/v1/gitlab-tokens
 pub async fn create_gitlab_token(
     _rate: RateLimit,
     auth: Authz<scope::SettingsWrite>,
@@ -157,7 +157,7 @@ pub async fn create_gitlab_token(
     ))
 }
 
-/// DELETE /api/gitlab-tokens/{id}
+/// DELETE /api/v1/gitlab-tokens/{id}
 pub async fn delete_gitlab_token(
     _rate: RateLimit,
     auth: Authz<scope::SettingsWrite>,
@@ -186,7 +186,7 @@ pub async fn delete_gitlab_token(
     Ok((StatusCode::OK, Json(ApiResponse::<()>::ok(()))))
 }
 
-/// GET /api/gitlab-tokens/{id}/repos
+/// GET /api/v1/gitlab-tokens/{id}/repos
 pub async fn list_gitlab_repos(
     _rate: RateLimit,
     _auth: Authz<scope::AppsWrite>,
@@ -288,7 +288,7 @@ pub async fn list_gitlab_repos(
     Ok((StatusCode::OK, Json(ApiResponse::ok(all_repos))))
 }
 
-/// GET /api/gitlab-tokens/{id}/repos/{project_id}/branches
+/// GET /api/v1/gitlab-tokens/{id}/repos/{project_id}/branches
 pub async fn list_gitlab_branches(
     _rate: RateLimit,
     _auth: Authz<scope::AppsWrite>,
@@ -350,7 +350,7 @@ pub async fn list_gitlab_branches(
     Ok((StatusCode::OK, Json(ApiResponse::ok(branches))))
 }
 
-/// PUT /api/apps/{id}/gitlab-token
+/// PUT /api/v1/apps/{id}/gitlab-token
 ///
 /// Attach or detach a GitLab token from an app.
 pub async fn set_app_gitlab_token(
@@ -433,49 +433,6 @@ pub fn gitlab_git_credentials(token: &GitLabToken) -> anyhow::Result<GitHttpAuth
         username: "oauth2".to_string(),
         password: pat,
     })
-}
-
-/// Post a commit status to GitLab (best-effort — errors are logged, not propagated).
-///
-/// `state` maps to GitLab commit status states: "pending", "running", "success", "failed",
-/// "canceled".
-/// `gitlab_project_id` is the numeric project ID (from `project.id` in webhook payloads).
-pub async fn post_gitlab_commit_status(
-    token: &GitLabToken,
-    gitlab_project_id: i64,
-    sha: &str,
-    state_str: &str,
-    description: &str,
-    target_url: Option<&str>,
-) -> anyhow::Result<()> {
-    let pat = secret_key::decrypt(Purpose::GitlabToken, &token.token_enc)?;
-    let base = token.gitlab_url.trim_end_matches('/');
-    let url = format!(
-        "{}/api/v4/projects/{}/statuses/{}",
-        base, gitlab_project_id, sha
-    );
-    let mut body = serde_json::json!({
-        "state": state_str,
-        "description": description,
-        "context": "tond/preview",
-    });
-    if let Some(u) = target_url {
-        body["target_url"] = serde_json::Value::String(u.to_string());
-    }
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
-        .header("PRIVATE-TOKEN", &pat)
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("GitLab status API {} {}: {}", url, status, text);
-    }
-    Ok(())
 }
 
 #[cfg(test)]

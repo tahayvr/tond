@@ -1,0 +1,17 @@
+services:
+  directus:
+    image: directus/directus:11.17.4
+    restart: unless-stopped
+    mem_limit: 512m
+    ports: ["8055"]
+    environment:
+      PUBLIC_URL: ${PUBLIC_URL}
+      SECRET: ${SECRET}
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      DB_CLIENT: sqlite3
+      DB_FILENAME: /directus/database/data.db
+      TELEMETRY: "false"
+    volumes:
+      - ./database:/directus/database
+      - ./uploads:/directus/uploads

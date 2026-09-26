@@ -1,14 +1,14 @@
 // handlers/access_log.rs — opt-in per-app access logs
 //
 // Routes:
-//   GET    /api/apps/{id}/access-log?lines=500&q=   (logs:read)
+//   GET    /api/v1/apps/{id}/access-log?lines=500&q=   (logs:read)
 //     Settings, size on disk and the last matching lines.
-//   GET    /api/apps/{id}/access-log/download       (logs:read)
+//   GET    /api/v1/apps/{id}/access-log/download       (logs:read)
 //     The whole log (rotated half first) as text/plain.
-//   PUT    /api/apps/{id}/access-log                (apps:write)
+//   PUT    /api/v1/apps/{id}/access-log                (apps:write)
 //     { enabled, include_query }: tond-proxy picks it up on its next route
 //     reload (the column is in a route_state trigger).
-//   DELETE /api/apps/{id}/access-log                (apps:write)
+//   DELETE /api/v1/apps/{id}/access-log                (apps:write)
 //     Delete the files; the proxy reopens a fresh file on its next line.
 //
 // The files live in <data>/access, written by tond-proxy (see

@@ -2,13 +2,15 @@
 
 use anyhow::Result;
 use clap::Subcommand;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::client::TondClient;
+use crate::error::CliError;
+use crate::output::{Output, outln};
 
 #[derive(Subcommand)]
 pub enum SnapshotAction {
-    /// Create a manual full snapshot (streams progress)
+    /// Create a manual full snapshot
     Create {
         /// Optional human-readable label for this snapshot
         #[arg(long)]
@@ -16,19 +18,25 @@ pub enum SnapshotAction {
     },
 
     /// List snapshots
+    #[command(visible_alias = "ls")]
     List {
         /// Filter to snapshots for a specific app name
         #[arg(long)]
         app: Option<String>,
     },
 
-    /// Restore a full snapshot (prompts for confirmation; server will restart)
+    /// Restore a full snapshot (asks first; the server restarts)
     Restore {
         /// Snapshot ID to restore from
         id: String,
+
+        /// Don't ask for confirmation (required when stdin is not a terminal)
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 
-    /// Roll back a single app or database to a snapshot state (no server restart)
+    /// Roll back a single app or database to a snapshot state (no server
+    /// restart; asks first)
     Rollback {
         /// Snapshot ID to roll back from
         id: String,
@@ -40,12 +48,21 @@ pub enum SnapshotAction {
         /// Name of the managed database to restore
         #[arg(long, conflicts_with = "app")]
         database: Option<String>,
+
+        /// Don't ask for confirmation (required when stdin is not a terminal)
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 
-    /// Delete a snapshot
+    /// Delete a snapshot (asks first)
+    #[command(visible_alias = "rm")]
     Delete {
         /// Snapshot ID to delete
         id: String,
+
+        /// Don't ask for confirmation (required when stdin is not a terminal)
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 
     /// Backup configuration sub-commands
@@ -58,9 +75,11 @@ pub enum SnapshotAction {
 #[derive(Subcommand)]
 pub enum ConfigAction {
     /// Show current backup configuration
+    #[command(visible_alias = "get")]
     Show,
 
     /// Update backup configuration
+    #[command(visible_alias = "update")]
     Set {
         /// Cron expression for scheduled backups (e.g. "0 3 * * *")
         #[arg(long)]
@@ -88,18 +107,21 @@ pub enum ConfigAction {
     },
 }
 
-pub async fn handle(client: &TondClient, action: SnapshotAction) -> Result<()> {
+pub async fn handle(client: &TondClient, out: &Output, action: SnapshotAction) -> Result<()> {
     match action {
         SnapshotAction::Create { name } => {
-            println!("Creating snapshot…");
+            outln!(out, "Creating snapshot…");
             let snapshot = client.create_snapshot(name.as_deref()).await?;
-            println!("Snapshot created: {} ({})", snapshot.name, snapshot.id);
+            out.json(&snapshot)?;
+            outln!(out, "Snapshot created: {} ({})", snapshot.name, snapshot.id);
             if snapshot.remote_status.as_deref() == Some("uploading") {
-                println!(
+                outln!(
+                    out,
                     "An encrypted copy is uploading to remote storage; check with: tond snapshot list"
                 );
             }
-            println!(
+            outln!(
+                out,
                 "Remote copies are encrypted with this server's TOND_SECRET_KEY \
                  (/opt/tond/data/tond.env). Keep a copy of it somewhere safe: restoring \
                  on a new server needs the same key."
@@ -108,76 +130,126 @@ pub async fn handle(client: &TondClient, action: SnapshotAction) -> Result<()> {
 
         SnapshotAction::List { app } => {
             let list = client.list_snapshots(app.as_deref()).await?;
+            out.json(&list)?;
             if list.is_empty() {
-                println!("No snapshots found.");
+                outln!(out, "No snapshots found.");
             } else {
-                println!(
+                outln!(
+                    out,
                     "{:<28} {:<10} {:<12} {:<8} CREATED AT",
-                    "ID", "TRIGGER", "SCOPE", "STATUS"
+                    "ID",
+                    "TRIGGER",
+                    "SCOPE",
+                    "STATUS"
                 );
-                println!("{}", "-".repeat(90));
+                outln!(out, "{}", "-".repeat(90));
                 for s in &list {
-                    println!(
+                    outln!(
+                        out,
                         "{:<28} {:<10} {:<12} {:<8} {}",
-                        s.id, s.trigger, s.scope, s.status, s.created_at,
+                        s.id,
+                        s.trigger,
+                        s.scope,
+                        s.status,
+                        s.created_at,
                     );
                 }
             }
         }
 
-        SnapshotAction::Restore { id } => {
-            println!("WARNING: Full restore will restart the Tond server.");
-            println!("A pre-restore snapshot will be created automatically first.");
-            println!();
-            print!("Type 'yes' to confirm: ");
-            // Flush stdout so prompt appears before we read
-            use std::io::Write;
-            std::io::stdout().flush()?;
-
-            let mut input = String::new();
-            std::io::stdin().read_line(&mut input)?;
-            if input.trim() != "yes" {
-                println!("Aborted.");
-                return Ok(());
+        SnapshotAction::Restore { id, yes } => {
+            out.confirm(
+                yes,
+                &format!(
+                    "Restore snapshot {id}? Every app, database and setting is replaced with the \
+                     snapshot's state and the Tond server restarts. A pre-restore snapshot is \
+                     taken first."
+                ),
+                &format!("restore snapshot {id}"),
+            )?;
+            outln!(out, "Initiating restore…");
+            let data = client.restore_snapshot_full(&id).await?;
+            out.done("restore", "snapshot", &id, data.clone())?;
+            if let Some(pre) = data.get("pre_restore_snapshot_id").and_then(Value::as_str) {
+                outln!(out, "Pre-restore snapshot: {pre}");
             }
-
-            println!("Initiating restore…");
-            let msg = client.restore_snapshot_full(&id).await?;
-            println!("{}", msg);
-            println!("The server is restarting. Reconnect in a few seconds.");
+            outln!(out, "The server is restarting. Reconnect in a few seconds.");
         }
 
-        SnapshotAction::Rollback { id, app, database } => match (app, database) {
+        SnapshotAction::Rollback {
+            id,
+            app,
+            database,
+            yes,
+        } => match (app, database) {
             (Some(app_name), None) => {
-                println!("Rolling back app '{}' to snapshot {}…", app_name, id);
-                client.restore_app_from_snapshot(&id, &app_name).await?;
-                println!("App '{}' rolled back successfully.", app_name);
+                out.confirm(
+                    yes,
+                    &format!(
+                        "Roll app {app_name} back to snapshot {id}? Its volumes and settings are overwritten."
+                    ),
+                    &format!("roll back app {app_name}"),
+                )?;
+                outln!(out, "Rolling back app '{}' to snapshot {}…", app_name, id);
+                let data = client.restore_app_from_snapshot(&id, &app_name).await?;
+                out.json(&json!({
+                    "ok": true, "action": "rollback", "resource": "app", "id": app_name,
+                    "snapshot_id": id, "data": data,
+                }))?;
+                outln!(out, "App '{}' rolled back successfully.", app_name);
             }
             (None, Some(db_name)) => {
-                println!("Restoring database '{}' from snapshot {}…", db_name, id);
-                client.rollback_database(&id, &db_name).await?;
-                println!("Database '{}' restored successfully.", db_name);
+                out.confirm(
+                    yes,
+                    &format!(
+                        "Restore database {db_name} from snapshot {id}? Its current data is overwritten."
+                    ),
+                    &format!("restore database {db_name}"),
+                )?;
+                outln!(
+                    out,
+                    "Restoring database '{}' from snapshot {}…",
+                    db_name,
+                    id
+                );
+                let data = client.rollback_database(&id, &db_name).await?;
+                out.json(&json!({
+                    "ok": true, "action": "rollback", "resource": "database", "id": db_name,
+                    "snapshot_id": id, "data": data,
+                }))?;
+                outln!(out, "Database '{}' restored successfully.", db_name);
             }
             _ => {
-                anyhow::bail!("Specify either --app <name> or --database <name>");
+                return Err(
+                    CliError::usage("Specify either --app <name> or --database <name>").into(),
+                );
             }
         },
 
-        SnapshotAction::Delete { id } => {
-            client.delete_snapshot(&id).await?;
-            println!("Snapshot {} deleted.", id);
+        SnapshotAction::Delete { id, yes } => {
+            out.confirm(
+                yes,
+                &format!("Delete snapshot {id}? This cannot be undone."),
+                &format!("delete snapshot {id}"),
+            )?;
+            let data = client.delete_snapshot(&id).await?;
+            out.done("delete", "snapshot", &id, data)?;
+            outln!(out, "Snapshot {} deleted.", id);
         }
 
         SnapshotAction::Config { action } => match action {
             ConfigAction::Show => {
                 let cfg = client.get_backup_config().await?;
-                println!(
+                out.json(&cfg)?;
+                outln!(
+                    out,
                     "Scheduled backups:   {}",
                     if cfg.enabled { "enabled" } else { "disabled" }
                 );
-                println!("Schedule (cron):     {}", cfg.full_schedule_cron);
-                println!("Retain (full):       {}", cfg.full_retention_count);
-                println!(
+                outln!(out, "Schedule (cron):     {}", cfg.full_schedule_cron);
+                outln!(out, "Retain (full):       {}", cfg.full_retention_count);
+                outln!(
+                    out,
                     "Pre-deploy:          {}",
                     if cfg.pre_deploy_enabled {
                         "enabled"
@@ -185,14 +257,19 @@ pub async fn handle(client: &TondClient, action: SnapshotAction) -> Result<()> {
                         "disabled"
                     }
                 );
-                println!("Pre-deploy retain:   {}", cfg.pre_deploy_retention_per_app);
-                println!(
+                outln!(
+                    out,
+                    "Pre-deploy retain:   {}",
+                    cfg.pre_deploy_retention_per_app
+                );
+                outln!(
+                    out,
                     "Keep local:          {}",
                     if cfg.keep_local { "yes" } else { "no" }
                 );
                 match &cfg.storage_provider_id {
-                    Some(pid) => println!("Storage provider:    {}", pid),
-                    None => println!("Storage provider:    (none — local only)"),
+                    Some(pid) => outln!(out, "Storage provider:    {}", pid),
+                    None => outln!(out, "Storage provider:    (none — local only)"),
                 }
             }
 
@@ -229,17 +306,22 @@ pub async fn handle(client: &TondClient, action: SnapshotAction) -> Result<()> {
                 }
 
                 if body.as_object().map(|o| o.is_empty()).unwrap_or(true) {
-                    anyhow::bail!("No fields specified. Use --help to see available options.");
+                    return Err(CliError::usage(
+                        "No fields specified. Use --help to see available options.",
+                    )
+                    .into());
                 }
 
                 let cfg = client.update_backup_config(body).await?;
-                println!("Backup configuration updated.");
-                println!(
+                out.json(&cfg)?;
+                outln!(out, "Backup configuration updated.");
+                outln!(
+                    out,
                     "Scheduled backups:   {}",
                     if cfg.enabled { "enabled" } else { "disabled" }
                 );
-                println!("Schedule (cron):     {}", cfg.full_schedule_cron);
-                println!("Retain (full):       {}", cfg.full_retention_count);
+                outln!(out, "Schedule (cron):     {}", cfg.full_schedule_cron);
+                outln!(out, "Retain (full):       {}", cfg.full_retention_count);
             }
         },
     }

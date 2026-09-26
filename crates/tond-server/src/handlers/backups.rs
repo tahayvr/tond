@@ -1,17 +1,17 @@
 // handlers/backups.rs — Snapshot API handlers + SSE progress stream
 //
 // Routes:
-//   POST   /api/snapshots                       — trigger manual Full snapshot
-//   GET    /api/snapshots                        — list snapshots (filters: scope, trigger, app)
-//   DELETE /api/snapshots/{id}                   — delete record + local dir + remote object
-//   GET    /api/snapshots/config                 — get backup configuration
-//   PUT    /api/snapshots/config                 — update backup configuration
-//   GET    /api/snapshots/{id}/logs/stream       — SSE progress stream
-//   POST   /api/snapshots/{id}/restore           — Full restore (server restart)
-//   POST   /api/snapshots/{id}/restore-app       — App-scope rollback (no restart)
-//   POST   /api/snapshots/{id}/restore-database  — Database-scope restore (no restart)
-//   GET    /api/databases/{id}/backups           — snapshots that hold one database
-//   POST   /api/databases/{id}/backups           — back up one database now
+//   POST   /api/v1/snapshots                       — trigger manual Full snapshot
+//   GET    /api/v1/snapshots                        — list snapshots (filters: scope, trigger, app)
+//   DELETE /api/v1/snapshots/{id}                   — delete record + local dir + remote object
+//   GET    /api/v1/snapshots/config                 — get backup configuration
+//   PUT    /api/v1/snapshots/config                 — update backup configuration
+//   GET    /api/v1/snapshots/{id}/logs/stream       — SSE progress stream
+//   POST   /api/v1/snapshots/{id}/restore           — Full restore (server restart)
+//   POST   /api/v1/snapshots/{id}/restore-app       — App-scope rollback (no restart)
+//   POST   /api/v1/snapshots/{id}/restore-database  — Database-scope restore (no restart)
+//   GET    /api/v1/databases/{id}/backups           — snapshots that hold one database
+//   POST   /api/v1/databases/{id}/backups           — back up one database now
 //
 // Remote copies of snapshots are encrypted with a key derived from
 // TOND_SECRET_KEY: restoring them on another server needs the same key.
@@ -91,7 +91,7 @@ async fn database_name(state: &AppState, id_or_name: &str) -> Result<String, App
         .ok_or_else(|| AppError(TondError::NotFound(format!("database '{id_or_name}'"))))
 }
 
-/// GET /api/databases/{id}/backups — this database's own backups and the
+/// GET /api/v1/databases/{id}/backups — this database's own backups and the
 /// full snapshots (which hold every database), newest first.
 pub async fn list_database_backups(
     _rate: RateLimit,
@@ -110,7 +110,7 @@ pub async fn list_database_backups(
     Ok((StatusCode::OK, Json(ApiResponse::ok(resp))))
 }
 
-/// POST /api/databases/{id}/backups — back up one database now.
+/// POST /api/v1/databases/{id}/backups — back up one database now.
 pub async fn create_database_backup(
     _rate: RateLimit,
     auth: Authz<scope::SnapshotsCreate>,
@@ -139,6 +139,7 @@ pub async fn create_database_backup(
 // ── List snapshots ────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct ListSnapshotsQuery {
     pub scope: Option<String>,
     pub trigger: Option<String>,
@@ -259,6 +260,15 @@ pub async fn update_backup_config(
         Some(v) => Some(v),
         None => current.storage_provider_id,
     };
+
+    // A retention of zero would delete every snapshot right after taking it.
+    if full_retention_count < 1 || pre_deploy_retention_per_app < 1 {
+        return Err(AppError(TondError::InvalidInput(
+            "Keep at least one snapshot: a retention of 0 deletes each snapshot right after \
+             taking it. Turn the schedule off instead."
+                .to_string(),
+        )));
+    }
 
     // Validate with the same parser the scheduler uses (standard 5-field cron,
     // 0/7 = Sunday, @daily-style macros).
@@ -487,6 +497,49 @@ pub async fn restore_database(
     ))
 }
 
+// ── Restore into a new database ───────────────────────────────────────────────
+
+/// POST /api/snapshots/{id}/restore-new-database — restore one database of
+/// a snapshot into a new managed database (same engine and version, fresh
+/// credentials), leaving the original untouched: for recovery drills, or to
+/// pull old rows out of a backup.
+pub async fn restore_to_new_database(
+    _rate: RateLimit,
+    auth: Authz<scope::SnapshotsRestore>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<RestoreToNewDatabaseRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    auth.require_to(Scope::DbWrite, "create a database from a backup")?;
+    let name = req.name.trim().to_string();
+    let source = req.source.trim().to_string();
+    let worker = state.clone();
+    let (snap, src, target, project) = (id.clone(), source.clone(), name.clone(), req.project_id);
+    // Tracked: a graceful shutdown lets the restore finish (or clean up).
+    let db = crate::runtime::shutdown::spawn_tracked(async move {
+        backup::restore_to_new_database(&worker, &snap, &src, &target, project).await
+    })
+    .await
+    .map_err(|e| AppError(TondError::Internal(format!("Restore task failed: {e}"))))?
+    .map_err(|e| AppError(TondError::InvalidInput(format!("{e:#}"))))?;
+
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("snapshot_restore_new_database")
+            .resource("snapshot", &id, &id)
+            .detail(format!("source={source} new={name}")),
+    )
+    .await;
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiResponse::ok(json!({
+            "message": format!("Restored {source} into the new database {name}. {source} was not changed."),
+            "database": ManagedDatabaseResponse::from(db),
+        }))),
+    ))
+}
+
 // ── Shared helper ─────────────────────────────────────────────────────────────
 
 async fn fetch_snapshot_row(state: &AppState, id: &str) -> Result<Snapshot, AppError> {
@@ -537,6 +590,37 @@ mod tests {
                 .unwrap_or_else(|err| panic!("read default: {err}"));
         assert_eq!(schedule, "0 3 * * *");
         assert!(crate::cron::parse_schedule(&schedule).is_ok());
+    }
+
+    #[tokio::test]
+    async fn backup_config_refuses_a_retention_below_one() {
+        let state = test_state().await;
+        for body in [
+            r#"{"full_retention_count":0}"#,
+            r#"{"pre_deploy_retention_per_app":0}"#,
+            r#"{"full_retention_count":-1}"#,
+        ] {
+            let req: UpdateBackupConfigRequest =
+                serde_json::from_str(body).unwrap_or_else(|err| panic!("{body}: {err}"));
+            let result = update_backup_config(
+                RateLimit,
+                Authz::unchecked(Principal::test_user(Role::Admin)),
+                State(state.clone()),
+                Json(req),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(AppError(TondError::InvalidInput(_)))),
+                "{body} must be refused"
+            );
+        }
+        let (full, pre): (i64, i64) = sqlx::query_as(
+            "SELECT full_retention_count, pre_deploy_retention_per_app FROM backup_config WHERE id = 1",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or_else(|err| panic!("read: {err}"));
+        assert!(full >= 1 && pre >= 1, "nothing was stored");
     }
 
     #[tokio::test]

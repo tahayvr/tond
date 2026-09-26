@@ -7,7 +7,6 @@
 		startApp,
 		restartApp,
 		deleteApp,
-		updateDomain,
 		updateHealth,
 		updateDrainTimeout,
 		updateAppResources,
@@ -47,7 +46,7 @@
 		appReadiness,
 		openLogStream
 	} from '$lib/api';
-	import { goto } from '$app/navigation';
+	import { goto, invalidateAll } from '$app/navigation';
 	import { isAdmin, can } from '$lib/auth.svelte';
 	import { confirmAction } from '$lib/confirm.svelte';
 	import { useAction } from '$lib/action.svelte';
@@ -55,7 +54,9 @@
 		APP_TABS,
 		APP_SETTINGS_SECTIONS,
 		allowedTabs,
+		appSectionsFor,
 		appTabHref,
+		appTabsFor,
 		appViewFromUrl,
 		type AppSettingsSection
 	} from '$lib/tabs';
@@ -92,6 +93,9 @@
 	import RequestMetricsPanel from '$lib/components/metrics/request-metrics-panel.svelte';
 	import AppHistory from '$lib/components/tabs/app-page/app-history.svelte';
 	import AppWebhooks from '$lib/components/tabs/app-page/app-webhooks.svelte';
+	import ComposeServices from '$lib/components/compose/compose-services.svelte';
+	import ComposeFileSettings from '$lib/components/compose/compose-file-settings.svelte';
+	import AppGitReporting from '$lib/components/tabs/app-page/app-git-reporting.svelte';
 	import { safeUrl } from '$lib/utils';
 	import { SecretInput } from '$lib/components/ui/secret-input/index.js';
 	import Github from '~icons/ri/github-fill';
@@ -118,13 +122,20 @@
 	// request) and stops on a terminal status. See the effects at the bottom.
 	let statusPollRequested = $state(false);
 	let appStatus = $derived(app?.status);
+	/** A deployment is queued or running (or a first deploy is building). */
+	let deployInProgress = $derived(activeDeploymentId !== null || appStatus === 'building');
 	/** Tab (and Settings section) from `?tab=` / `?section=`: deep-linkable. */
 	let view = $derived(appViewFromUrl(page.url));
 	/** Leaf view: a tab, or the Settings section when Settings is open. */
 	let activeTab = $derived<string>(view.tab === 'settings' ? view.section : view.tab);
 	// Only offer what the user's scopes allow (the server enforces it either way).
-	let appTabs = $derived(allowedTabs(APP_TABS, can));
-	let settingsSections = $derived(allowedTabs(APP_SETTINGS_SECTIONS, can));
+	// Compose apps get Services and a Compose file section instead of the
+	// single-container ones (domains are per service).
+	let isCompose = $derived(app?.source_type === 'compose');
+	let appTabs = $derived(appTabsFor(allowedTabs(APP_TABS, can), app?.source_type ?? ''));
+	let settingsSections = $derived(
+		appSectionsFor(allowedTabs(APP_SETTINGS_SECTIONS, can), app?.source_type ?? '')
+	);
 	let viewAllowed = $derived(
 		appTabs.some((t) => t.id === view.tab) &&
 			(view.tab !== 'settings' || settingsSections.some((s) => s.id === view.section))
@@ -137,7 +148,6 @@
 	);
 
 	// Domain form
-	let certRefreshKey = $state(0);
 
 	// Health form
 	let healthPath = $state('');
@@ -257,10 +267,28 @@
 		}
 	}
 
+	/**
+	 * The app's queued or running deployment, if any. A running app keeps its
+	 * 'running' status while it redeploys (it keeps serving the old version),
+	 * so progress comes from the deployment, not from app.status.
+	 */
+	async function refreshActiveDeployment(): Promise<string | null> {
+		const id = appId;
+		try {
+			const list = await listDeployments(id);
+			if (id !== appId) return activeDeploymentId;
+			activeDeploymentId =
+				list.find((d) => d.status === 'running' || d.status === 'queued')?.id ?? null;
+		} catch {
+			// Non-critical: the header just won't link to the live view.
+		}
+		return activeDeploymentId;
+	}
+
 	async function pollStatus() {
 		try {
-			const latest = await getApp(appId);
-			if (latest.status !== 'building') {
+			const [latest, active] = await Promise.all([getApp(appId), refreshActiveDeployment()]);
+			if (latest.status !== 'building' && !active) {
 				// Terminal state: reload everything once; the polling effect stops.
 				statusPollRequested = false;
 				await loadApp();
@@ -284,7 +312,7 @@
 		stopLogStream();
 		logBuffer.clear();
 		logStreaming = true;
-		const close = openLogStream(`/api/apps/${appId}/logs/stream`, {
+		const close = openLogStream(`/api/v1/apps/${appId}/logs/stream`, {
 			onLine(line) {
 				logBuffer.push(line);
 			},
@@ -379,11 +407,9 @@
 		await startDeploy();
 	}
 
-	/** Domain card save; errors are shown in the card, so this rethrows. */
-	async function handleUpdateDomain(domain: string) {
-		await updateDomain(appId, domain);
+	/** The domain card changed the domains; the primary (app.domain) may have moved. */
+	async function handleDomainsChanged() {
 		await loadApp();
-		certRefreshKey += 1;
 	}
 
 	async function handleUpdateHealth() {
@@ -859,9 +885,9 @@
 		setUiContext(activeTab === 'logs' ? { ...ctx, feed: { ...ctx.feed, wsUrl: null } } : ctx);
 	});
 
-	// Status polling while building (paused in hidden tabs).
+	// Status polling while a deployment runs (paused in hidden tabs).
 	$effect(() => {
-		if (appStatus !== 'building' && !statusPollRequested) return;
+		if (!deployInProgress && !statusPollRequested) return;
 		return pollWhileVisible(pollStatus, 2000, { immediate: false });
 	});
 
@@ -889,20 +915,12 @@
 		});
 	});
 
-	// While the app builds, link to the running deployment's live view.
+	// Find a deployment in progress (to link to its live view) when the app
+	// loads or its status changes.
 	$effect(() => {
-		if (appStatus !== 'building') {
-			activeDeploymentId = null;
-			return;
-		}
-		const id = appId;
-		listDeployments(id)
-			.then((list) => {
-				if (id !== appId) return;
-				activeDeploymentId =
-					list.find((d) => d.status === 'running' || d.status === 'queued')?.id ?? null;
-			})
-			.catch(() => (activeDeploymentId = null));
+		void appId;
+		void appStatus;
+		untrack(refreshActiveDeployment);
 	});
 
 	// Mount-only teardown, keyed on the app id (navigating to another app
@@ -929,6 +947,10 @@
 		<PageHeader title={current.name} section={sectionLabel}>
 			{#snippet meta()}
 				<StatusBadge status={current.status} kind="app" />
+				{#if deployInProgress && current.status !== 'building'}
+					<!-- A running app keeps serving while the new version deploys. -->
+					<StatusBadge status="deploying" label="Deploying a new version" />
+				{/if}
 				<span>Source: {current.source_type}</span>
 				{#if current.source_url}
 					<span class="max-w-full min-w-0 truncate font-mono text-xs sm:max-w-md"
@@ -966,14 +988,10 @@
 					<Button
 						size="sm"
 						onclick={() => deploy.run()}
-						disabled={deploy.pending || deploying || current.status === 'building'}
+						disabled={deploy.pending || deploying || deployInProgress}
 						aria-busy={deploy.pending}
 					>
-						{deploy.pending
-							? 'Starting deploy…'
-							: current.status === 'building'
-								? 'Deploying…'
-								: 'Deploy'}
+						{deploy.pending ? 'Starting deploy…' : deployInProgress ? 'Deploying…' : 'Deploy'}
 					</Button>
 				{/if}
 			{/snippet}
@@ -1017,9 +1035,26 @@
 					<div class="pt-4">
 						<AppEventsStrip appId={app.id} />
 					</div>
+					{#if isCompose}
+						<div class="pt-4">
+							<ComposeServices {app} compact />
+						</div>
+					{/if}
 					<AppOverview
 						{app}
 						uptimeHref={can('metrics:read') ? appTabHref(appId, 'uptime') : null}
+					/>
+				{/if}
+
+				<!-- Services tab (compose apps) -->
+				{#if viewAllowed && activeTab === 'services' && isCompose}
+					<ComposeServices
+						{app}
+						canControl={can('apps:control')}
+						canEdit={canEditApp}
+						canReadLogs={can('logs:read')}
+						canDeploy={can('apps:deploy')}
+						onDeploy={() => deploy.run()}
 					/>
 				{/if}
 
@@ -1035,6 +1070,7 @@
 					<AppLogs
 						appId={app.id}
 						appName={app.name}
+						compose={isCompose}
 						{logLines}
 						streaming={logStreaming}
 						onConnect={startLogStream}
@@ -1067,18 +1103,25 @@
 						registryCredentialId={app.registry_credential_id}
 						onRegistryCredentialChange={handleEnvRegistryCredential}
 						previewEnabled={app.preview_enabled}
+						inProject={app.project_id != null}
 						onRedeploy={handleEnvRedeploy}
+					/>
+				{/if}
+
+				<!-- Compose file (compose apps) -->
+				{#if viewAllowed && activeTab === 'compose' && isCompose}
+					<ComposeFileSettings
+						{app}
+						canEdit={can('settings:write')}
+						canDeploy={can('apps:deploy')}
+						onSaved={() => invalidateAll()}
+						onDeploy={() => deploy.run()}
 					/>
 				{/if}
 
 				<!-- Domain tab -->
 				{#if viewAllowed && activeTab === 'domain'}
-					<AppDomain
-						{app}
-						{certRefreshKey}
-						onUpdate={handleUpdateDomain}
-						canEdit={can('apps:write')}
-					/>
+					<AppDomain {app} onChanged={handleDomainsChanged} canEdit={can('apps:write')} />
 				{/if}
 
 				<!-- Databases: what this app can reach (project + links) -->
@@ -1565,6 +1608,9 @@
 
 						{#if canEditApp}
 							<AppWebhooks appId={app.id} />
+							{#if app.source_type === 'git'}
+								<AppGitReporting {app} />
+							{/if}
 						{:else}
 							<p class="text-sm text-muted-foreground">
 								Webhook URLs and secrets are shown to users who can change this app's settings.

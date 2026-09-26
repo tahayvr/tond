@@ -71,8 +71,8 @@
 
 <div class="space-y-4 pt-4">
 	<p class="text-xs text-muted-foreground">
-		Automatic snapshots taken before each deployment. Roll back to any point in seconds — no server
-		restart required.
+		Automatic snapshots taken before each deployment (unless pre-deploy snapshots are turned off on
+		the Snapshots page). Roll back to any point in seconds — no server restart required.
 	</p>
 
 	<InlineError title="History Error" message={error} />
@@ -84,7 +84,7 @@
 	{:else if snapshots.length === 0}
 		<div class="border border-dashed py-12 text-center text-xs text-muted-foreground">
 			No pre-deploy snapshots for {appName} yet. They are created automatically before each deployment
-			when the app has volumes.
+			when the app has volumes and pre-deploy snapshots are on.
 		</div>
 	{:else}
 		<div class="space-y-px">

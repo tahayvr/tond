@@ -36,7 +36,7 @@ export function backoffDelay(attempt: number, minDelayMs = 1000, maxDelayMs = 30
 	return Math.min(maxDelayMs, minDelayMs * 2 ** Math.min(attempt, 30));
 }
 
-/** Resolve a path like `/api/apps/x/logs/stream` to a ws:// or wss:// URL. */
+/** Resolve a path like `/api/v1/apps/x/logs/stream` to a ws:// or wss:// URL. */
 export function wsUrl(path: string): string {
 	const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
 	return `${protocol}://${window.location.host}${path}`;

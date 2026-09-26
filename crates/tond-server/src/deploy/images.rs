@@ -230,10 +230,174 @@ async fn prune_preview_images(state: &AppState, app_id: &str, app_name: &str) {
     }
 }
 
+// ── Compose releases ──
+//
+// A compose deployment's `image_tag` is `tond-<app>:<id>` like any other,
+// but no image carries it: it names the *release*, the set of service images
+// the deployment ran (deployment_services.image). Service images are tagged
+// by content, `tond-<app>/<service>:<image id prefix>`, so an unchanged
+// service keeps its tag across deploys (compose then leaves its container
+// alone) and several releases can share one image. Pruning a release removes
+// the images no kept release still uses.
+
+/// Every local service image tag of the app (`tond-<app>/*`).
+async fn compose_service_tags(state: &AppState, app_name: &str) -> Option<Vec<String>> {
+    let reference = format!("{}/*", image_repo(app_name));
+    let filters = std::collections::HashMap::from([("reference".to_string(), vec![reference])]);
+    let found = state
+        .docker
+        .list_images(Some(
+            ListImagesOptionsBuilder::default()
+                .filters(&filters)
+                .build(),
+        ))
+        .await
+        .ok()?;
+    let prefix = format!("{}/", image_repo(app_name));
+    Some(
+        found
+            .into_iter()
+            .flat_map(|img| img.repo_tags)
+            .filter(|t| t.starts_with(&prefix))
+            .collect(),
+    )
+}
+
+/// What to prune for a compose app: `(releases to mark pruned, image tags to
+/// remove)`. `uses` holds `(release, service image)` of every deployment row;
+/// `local` the app's service tags on the host.
+pub fn compose_prune_plan(
+    app_name: &str,
+    deployments: &[DeploymentImage],
+    uses: &[(String, String)],
+    local: &[String],
+    running: Option<&str>,
+    keep: usize,
+) -> (Vec<String>, Vec<String>) {
+    let pruned = tags_to_prune(app_name, deployments, running, keep);
+    let kept: Vec<&str> = uses
+        .iter()
+        .filter(|(release, _)| !pruned.contains(release))
+        .map(|(_, image)| image.as_str())
+        .collect();
+    let remove = local
+        .iter()
+        .filter(|t| !kept.contains(&t.as_str()))
+        .cloned()
+        .collect();
+    (pruned, remove)
+}
+
+/// Record that a compose deployment's images are gone.
+pub async fn mark_compose_release_pruned(state: &AppState, app_id: &str, deployment_id: &str) {
+    let _ = sqlx::query(
+        "UPDATE deployments SET image_pruned = 1 WHERE app_id = ? AND image_tag =
+           (SELECT image_tag FROM deployments WHERE id = ?)",
+    )
+    .bind(app_id)
+    .bind(deployment_id)
+    .execute(&state.db)
+    .await;
+}
+
+/// Compose flavour of [`prune_app_images`]: releases instead of images.
+async fn prune_compose_images(state: &AppState, app_id: &str, app_name: &str) {
+    let deployments: Vec<DeploymentImage> = sqlx::query_as(
+        "SELECT image_tag, status FROM deployments
+         WHERE app_id = ? AND image_tag IS NOT NULL AND image_pruned = 0
+         ORDER BY created_at DESC",
+    )
+    .bind(app_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    let running: Option<String> = sqlx::query_scalar("SELECT container_id FROM apps WHERE id = ?")
+        .bind(app_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .flatten();
+    // Deployments still running own their images too (tags_to_prune keeps
+    // them): include them through their rows.
+    let uses: Vec<(String, String)> = sqlx::query_as(
+        "SELECT d.image_tag, s.image FROM deployments d
+         JOIN deployment_services s ON s.deployment_id = d.id
+         WHERE d.app_id = ? AND d.image_tag IS NOT NULL AND s.image IS NOT NULL
+           AND (d.image_pruned = 0 OR d.status = 'running')",
+    )
+    .bind(app_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    let Some(local) = compose_service_tags(state, app_name).await else {
+        return;
+    };
+    let (pruned, remove) = compose_prune_plan(
+        app_name,
+        &deployments,
+        &uses,
+        &local,
+        running.as_deref(),
+        KEEP_IMAGES,
+    );
+    for tag in remove {
+        match state
+            .docker
+            .remove_image(
+                &tag,
+                Some(RemoveImageOptionsBuilder::default().build()),
+                None,
+            )
+            .await
+        {
+            Ok(_) => tracing::info!("[prune] removed old image {tag}"),
+            Err(e) => tracing::warn!("[prune] keeping image {tag}: {e}"),
+        }
+    }
+    for release in pruned {
+        let _ = sqlx::query(
+            "UPDATE deployments SET image_pruned = 1 WHERE app_id = ? AND image_tag = ?",
+        )
+        .bind(app_id)
+        .bind(&release)
+        .execute(&state.db)
+        .await;
+    }
+}
+
+/// Remove every service image of a compose app (app deletion).
+pub async fn remove_compose_images(state: &AppState, app_name: &str) {
+    for tag in compose_service_tags(state, app_name)
+        .await
+        .unwrap_or_default()
+    {
+        let _ = state
+            .docker
+            .remove_image(
+                &tag,
+                Some(RemoveImageOptionsBuilder::default().force(true).build()),
+                None,
+            )
+            .await;
+    }
+}
+
 /// Remove the app's old deployment and preview images and mark pruned
 /// deployments. Best-effort: an image Docker refuses to remove (still in use)
 /// is kept.
 pub async fn prune_app_images(state: &AppState, app_id: &str, app_name: &str) {
+    let source_type: Option<String> =
+        sqlx::query_scalar("SELECT source_type FROM apps WHERE id = ?")
+            .bind(app_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
+    if source_type.as_deref() == Some("compose") {
+        prune_compose_images(state, app_id, app_name).await;
+        return;
+    }
     prune_preview_images(state, app_id, app_name).await;
 
     let deployments: Vec<DeploymentImage> = match sqlx::query_as(
@@ -336,6 +500,48 @@ mod tests {
         assert!(!is_deployment_image("web", "tond-compose-web"));
         assert!(!is_deployment_image("web", "nginx:latest"));
         assert!(!is_deployment_image("web", "tond-webapp:3f2a1b9c1234"));
+    }
+
+    #[test]
+    fn compose_pruning_keeps_images_a_kept_release_still_uses() {
+        let deployments = vec![
+            d("tond-shop:4", "succeeded"),
+            d("tond-shop:3", "succeeded"),
+            d("tond-shop:2", "succeeded"),
+            d("tond-shop:1", "succeeded"),
+        ];
+        let u = |r: &str, i: &str| (r.to_string(), i.to_string());
+        let uses = vec![
+            u("tond-shop:4", "tond-shop/web:bbb"),
+            u("tond-shop:4", "tond-shop/db:aaa"),
+            u("tond-shop:3", "tond-shop/web:bbb"),
+            u("tond-shop:3", "tond-shop/db:aaa"),
+            u("tond-shop:1", "tond-shop/web:old"),
+            u("tond-shop:1", "tond-shop/db:aaa"),
+        ];
+        let local: Vec<String> = [
+            "tond-shop/web:bbb",
+            "tond-shop/db:aaa",
+            "tond-shop/web:old",
+            "tond-shop/web:stray",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (pruned, remove) =
+            compose_prune_plan("shop", &deployments, &uses, &local, Some("tond-shop:4"), 2);
+        assert_eq!(
+            pruned,
+            vec!["tond-shop:2".to_string(), "tond-shop:1".to_string()]
+        );
+        assert_eq!(
+            remove,
+            vec![
+                "tond-shop/web:old".to_string(),
+                "tond-shop/web:stray".to_string()
+            ],
+            "db:aaa is shared with kept releases; strays nobody uses go"
+        );
     }
 
     #[test]

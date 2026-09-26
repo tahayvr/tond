@@ -2,12 +2,15 @@
 	import PageTitle from '$lib/components/nav/page-title.svelte';
 	import { page } from '$app/state';
 	import Github from '~icons/ri/github-fill';
+	import Gitlab from '~icons/ri/gitlab-fill';
+	import GitRepo from '~icons/ri/git-repository-line';
+	import GitTokenList from '$lib/components/integrations/git-token-list.svelte';
 	import Package from '~icons/ri/archive-2-line';
 	import ChevronLeft from '~icons/ri/arrow-left-s-line';
 	import { setUiContext, clearUiContext, projectsContext } from '$lib/ui-context.svelte';
 	import GitHubAppList from '$lib/components/integrations/github-app-list.svelte';
 	import RegistryCredentialList from '$lib/components/integrations/registry-credential-list.svelte';
-	import type { GitHubApp, RegistryCredential } from '$lib/api';
+	import type { GitHubApp, GitLabToken, GiteaToken, RegistryCredential } from '$lib/api';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();
@@ -15,6 +18,8 @@
 		((data as { sourceData?: unknown }).sourceData ?? null) as {
 			githubApps?: GitHubApp[];
 			credentials?: RegistryCredential[];
+			gitlabTokens?: GitLabToken[];
+			giteaTokens?: GiteaToken[];
 		} | null
 	);
 
@@ -22,6 +27,8 @@
 
 	const PAGE_META: Record<string, { title: string; icon: typeof Github }> = {
 		github: { title: 'GitHub', icon: Github },
+		gitlab: { title: 'GitLab', icon: Gitlab },
+		gitea: { title: 'Gitea / Forgejo', icon: GitRepo },
 		registry: { title: 'Registry Credentials', icon: Package }
 	};
 
@@ -52,7 +59,7 @@
 		}
 	});
 
-	// Errors reported by the GitHub App callbacks (/api/github-apps/callback and
+	// Errors reported by the GitHub App callbacks (/api/v1/github-apps/callback and
 	// /webhooks/source/github/install redirect here with ?error=<code>).
 	const GITHUB_FLOW_ERRORS: Record<string, string> = {
 		missing_state:
@@ -115,6 +122,10 @@
 
 	{#if source === 'github'}
 		<GitHubAppList bind:this={githubList} initialApps={sourceData?.githubApps ?? []} />
+	{:else if source === 'gitlab'}
+		<GitTokenList kind="gitlab" initialGitLab={sourceData?.gitlabTokens ?? []} />
+	{:else if source === 'gitea'}
+		<GitTokenList kind="gitea" initialGitea={sourceData?.giteaTokens ?? []} />
 	{:else if source === 'registry'}
 		<RegistryCredentialList initialCredentials={sourceData?.credentials ?? []} />
 	{:else}
