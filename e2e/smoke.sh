@@ -830,14 +830,7 @@ tond help exit-codes --json | jq -e '.exit_codes | map(.exit_code) | contains([0
 pass "CLI: --json output, exit codes (3 not found, 2 refused without --yes), completions"
 EXPIRED=$(tond token create --name e2e-expired --preset readonly --expires 1h 2> /dev/null)
 expire_sql="UPDATE api_tokens SET expires_at = '2000-01-01T00:00:00Z' WHERE name = 'e2e-expired'"
-if command -v sqlite3 > /dev/null; then
-    sqlite3 "${DATA_DIR}/tond.db" "$expire_sql"
-elif command -v python3 > /dev/null; then
-    python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(sys.argv[2]); c.commit()" \
-        "${DATA_DIR}/tond.db" "$expire_sql"
-else
-    expire_sql=""
-fi
+db_sql "$expire_sql"
 if [[ -n "$expire_sql" ]]; then
     code=$(api_as "$EXPIRED" GET /api/v1/apps)
     [[ "$code" == 401 && "$(body_code)" == TOKEN_EXPIRED ]] || fail "an expired token must get 401 TOKEN_EXPIRED, got ${code}"
@@ -1500,6 +1493,9 @@ read -r code body < <(api_send POST /api/v1/apps/e2e-whoami/domains/www-pair "{\
 wait_for 60 "route for ${ALIAS_DOMAIN}" \
     bash -c "curl -sk --resolve '${ALIAS_DOMAIN}:443:${IP}' 'https://${ALIAS_DOMAIN}/' | grep -q Hostname:"
 pass "an alias serves the app (${ALIAS_DOMAIN})"
+# The pair was added after the alias, so its route can land a reload later.
+wait_for 60 "route for www.${SITE_DOMAIN}" \
+    bash -c "[[ \$(curl -sk -o /dev/null -w '%{http_code}' --resolve 'www.${SITE_DOMAIN}:443:${IP}' 'https://www.${SITE_DOMAIN}/') != 502 ]]"
 redirect=$(curl -sk -o /dev/null -w '%{http_code} %{redirect_url}' --resolve "www.${SITE_DOMAIN}:443:${IP}" "https://www.${SITE_DOMAIN}/a/b?x=1&y=2")
 [[ "$redirect" == "308 https://${SITE_DOMAIN}/a/b?x=1&y=2" ]] \
     || fail "www.${SITE_DOMAIN} must 308 to https://${SITE_DOMAIN} with path and query, got: ${redirect}"
@@ -1802,7 +1798,7 @@ docker inspect "$VAULT_CID" --format '{{range .Config.Env}}{{println .}}{{end}}'
     || fail "{app_url} should expand to the app's domain"
 ! grep -q "$VAULT_TOKEN" "${DATA_DIR}/compose/e2e-vault/docker-compose.yml" \
     || fail "the generated token must not be written into the compose file on disk"
-! sqlite3 "${DATA_DIR}/tond.db" "SELECT env_vars FROM apps WHERE name = 'e2e-vault'" 2> /dev/null | grep -q "$VAULT_TOKEN" \
+! db_sql "SELECT env_vars FROM apps WHERE name = 'e2e-vault'" | grep -q "$VAULT_TOKEN" \
     || fail "the generated token must be stored encrypted"
 [[ -d "${DATA_DIR}/volumes/e2e-vault/data" ]] || fail "the template's declared volume should be created"
 pass "inputs reach the container through the app env, never plaintext on disk; volume created"
@@ -1852,7 +1848,7 @@ pass "actual: the server password is set before routing (admin_setup done), sign
 code=$(api_req POST /api/v1/apps/e2e-actual/admin-setup/dismiss '{}')
 [[ "$code" == 200 ]] && jq -e '.data.admin_setup == "done"' "$API_BODY" > /dev/null \
     || fail "dismissing must leave a seeded admin alone, got ${code}: $(cat "$API_BODY")"
-sqlite3 "${DATA_DIR}/tond.db" "UPDATE apps SET admin_setup = 'open' WHERE name = 'e2e-actual'"
+db_sql "UPDATE apps SET admin_setup = 'open' WHERE name = 'e2e-actual'"
 code=$(api_req POST /api/v1/apps/e2e-actual/admin-setup/dismiss '{}')
 [[ "$code" == 200 ]] && jq -e '.data.admin_setup == "dismissed"' "$API_BODY" > /dev/null \
     || fail "dismissing a first-visitor warning should mark it dismissed, got ${code}: $(cat "$API_BODY")"

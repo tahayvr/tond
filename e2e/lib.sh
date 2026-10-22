@@ -87,3 +87,14 @@ wait_for_update_run() {
 
 # current_version: the version the running tond-server reports.
 current_version() { api /api/v1/system/update | jq -r .data.current_version; }
+
+# db_sql <sql>: run one statement against tond.db with python3 (installed on
+# every supported host, unlike the sqlite3 CLI) and print the rows, one per
+# line, columns separated by |. Writes are committed.
+db_sql() {
+    python3 -c 'import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+for row in c.execute(sys.argv[2]):
+    print("|".join("" if v is None else str(v) for v in row))
+c.commit()' "${DATA_DIR}/tond.db" "$1"
+}
