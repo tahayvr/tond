@@ -32,6 +32,10 @@ set -euo pipefail
 #   E2E_CLEANUP           1 to delete the created resources at the end (default: 0)
 #   E2E_ADMIN_EMAIL       admin account the auth checks create (via the setup token)
 #   E2E_ADMIN_PASSWORD    or sign in with on re-runs (defaults below)
+#   E2E_CLOUDFLARE_TOKEN  with E2E_CLOUDFLARE_ZONE, E2E_CA_FILE and E2E_APPS_DOMAIN
+#   E2E_CLOUDFLARE_ZONE   (a name under the zone): the DNS-01 wildcard is ordered
+#                         through a real Cloudflare DNS provider instead of
+#                         challtestsrv (the hosted run, e2e/hcloud.sh --dns-zone)
 #   E2E_BUNDLE            the installed release bundle (set by run.sh); enables the
 #                         update.sh install/rollback checks of the self-update step
 
@@ -53,12 +57,10 @@ WHOAMI_DOMAIN="whoami.${BASE}"
 STATIC_DOMAIN="static.${BASE}"
 VAULT_DOMAIN="vault.${BASE}"
 
-# ── Output helpers ────────────────────────────────────────────────────────────
+# ── Helpers (e2e/lib.sh: output, API requests, wait_for, apps, self-update) ───
 
-GREEN='\033[0;32m'; RED='\033[0;31m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
-step() { echo -e "\n${CYAN}▶${NC} ${BOLD}$*${NC}"; }
-pass() { echo -e "  ${GREEN}✓${NC} $*"; }
-fail() { echo -e "  ${RED}✗ $*${NC}" >&2; exit 1; }
+# shellcheck source=lib.sh
+. "$(cd "$(dirname "$0")" && pwd)/lib.sh"
 
 # Dump enough state to debug a failure from CI logs alone.
 diagnostics() {
@@ -80,45 +82,6 @@ diagnostics() {
 }
 trap diagnostics EXIT
 
-# ── Request helpers ───────────────────────────────────────────────────────────
-
-# GET an API path over the CLI's Unix socket (trusted, no credentials).
-api() { curl -sf --unix-socket "$SOCK" "http://localhost$1"; }
-
-# api_req <METHOD> <path> <json>: send JSON over the socket, print the HTTP
-# status; the response body lands in $API_BODY.
-API_BODY=$(mktemp)
-api_req() {
-    curl -s -o "$API_BODY" -w '%{http_code}' --unix-socket "$SOCK" -X "$1" \
-        -H 'Content-Type: application/json' -d "${3:-}" "http://localhost$2"
-}
-
-# api_send <method> <path> <json>: prints "<status> <body>" (does not fail on 4xx).
-api_send() {
-    curl -s --unix-socket "$SOCK" -X "$1" -H 'Content-Type: application/json' -d "$3" \
-        -w ' %{http_code}' "http://localhost$2" | awk '{ code = $NF; $NF = ""; print code " " $0 }'
-}
-
-# "<mode> <owner> <group>" of a path.
-perms() { stat -c '%a %U %G' "$1"; }
-
-# HTTP status code of an HTTPS request to <domain><path> through tond-proxy.
-# -k: before ACME finishes, the proxy serves a self-signed fallback cert.
-proxied_status() {
-    curl -sk -o /dev/null -w '%{http_code}' --resolve "$1:443:${IP}" "https://$1$2"
-}
-proxied_body() { curl -sk --resolve "$1:443:${IP}" "https://$1$2"; }
-
-# wait_for <timeout-seconds> <description> <command...>: retry until the command succeeds.
-wait_for() {
-    local timeout=$1 desc=$2; shift 2
-    local deadline=$((SECONDS + timeout))
-    until "$@" > /dev/null 2>&1; do
-        (( SECONDS < deadline )) || fail "timed out after ${timeout}s waiting for: ${desc}"
-        sleep 3
-    done
-}
-
 # watch_availability <domain> <file>: request https://<domain>/ every 0.2 s
 # until killed, one HTTP status per line (000 when nothing answered).
 watch_availability() {
@@ -139,26 +102,6 @@ assert_no_downtime() {
     pass "$2: ${total} requests during the redeploy, all 2xx"
 }
 
-app_field() { api /api/v1/apps | jq -r --arg n "$1" ".data[] | select(.name == \$n) | .$2"; }
-
-# Wait until an app is running; fail fast (with deploy logs) if it fails.
-wait_for_app_running() {
-    local name=$1 timeout=$2 deadline=$((SECONDS + $2)) status
-    while true; do
-        # Tolerate transient API errors (e.g. during a restart) instead of exiting via set -e.
-        status=$(app_field "$name" status || true)
-        case "$status" in
-            running) return 0 ;;
-            failed)
-                tond apps deployments "$name" || true
-                tond apps logs "$name" || true
-                fail "app ${name} failed to deploy"
-                ;;
-        esac
-        (( SECONDS < deadline )) || fail "timed out after ${timeout}s waiting for ${name} (status: ${status})"
-        sleep 3
-    done
-}
 
 delete_e2e_resources() {
     for app in e2e-whoami e2e-static e2e-rooted e2e-compose e2e-stack e2e-badport e2e-worker e2e-worker-domain e2e-auto e2e-wild e2e-vault; do
@@ -1538,15 +1481,31 @@ tond apps domains list e2e-whoami --json | jq -e --arg d "$WHOAMI_DOMAIN" '.[] |
     || fail "only the primary domain must be left: $(api /api/v1/apps/e2e-whoami/domains | jq -c '.data')"
 pass "tond apps domains add/list/remove"
 
-if [[ -n "$CA_FILE" && -n "$APPS_DOMAIN" ]] && curl -s -o /dev/null "${CHALLTESTSRV}/"; then
+CF_TOKEN="${E2E_CLOUDFLARE_TOKEN:-}"
+CF_ZONE="${E2E_CLOUDFLARE_ZONE:-}"
+DNS01_PROVIDER=""
+if [[ -n "$CA_FILE" && -n "$APPS_DOMAIN" && -n "$CF_TOKEN" && -n "$CF_ZONE" && "$APPS_DOMAIN" == *".${CF_ZONE}" ]]; then
+    DNS01_PROVIDER=cloudflare
+elif [[ -n "$CA_FILE" && -n "$APPS_DOMAIN" ]] && curl -s -o /dev/null "${CHALLTESTSRV}/"; then
+    DNS01_PROVIDER=challtestsrv
+fi
+if [[ -n "$DNS01_PROVIDER" ]]; then
     WILDCARD="*.${APPS_DOMAIN}"
-    read -r code body < <(api_send POST /api/v1/dns-providers "{\"name\": \"e2e challtestsrv\", \"kind\": \"challtestsrv\", \"zones\": [\"${APPS_DOMAIN}\"], \"token\": \"unused\", \"config\": {\"url\": \"${CHALLTESTSRV}\"}}")
-    [[ "$code" == 201 ]] || fail "creating the test DNS provider must succeed (got ${code}: ${body})"
+    if [[ "$DNS01_PROVIDER" == cloudflare ]]; then
+        provider_json=$(jq -nc --arg zone "$CF_ZONE" --arg token "$CF_TOKEN" \
+            '{name: "e2e cloudflare", kind: "cloudflare", zones: [$zone], token: $token, config: {}}')
+        secret="$CF_TOKEN"
+    else
+        provider_json="{\"name\": \"e2e challtestsrv\", \"kind\": \"challtestsrv\", \"zones\": [\"${APPS_DOMAIN}\"], \"token\": \"unused\", \"config\": {\"url\": \"${CHALLTESTSRV}\"}}"
+        secret="unused"
+    fi
+    read -r code body < <(api_send POST /api/v1/dns-providers "$provider_json")
+    [[ "$code" == 201 ]] || fail "creating the ${DNS01_PROVIDER} DNS provider must succeed (got ${code}: ${body//$secret/<token>})"
     DNS_PROVIDER_ID=$(jq -r .data.id <<< "$body")
-    [[ "$body" != *'"unused"'* ]] || fail "the DNS provider token must never be returned"
-    wait_for 240 "a DNS-01 wildcard certificate for ${WILDCARD}" \
+    [[ "$body" != *"\"${secret}\""* ]] || fail "the DNS provider token must never be returned"
+    wait_for 360 "a DNS-01 wildcard certificate for ${WILDCARD}" \
         bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/certs | jq -e '.data[] | select(.domain == \"${WILDCARD}\" and .status == \"active\" and .challenge == \"dns-01\")'"
-    pass "${WILDCARD} issued through DNS-01 (records published by tond-server via the provider)"
+    pass "${WILDCARD} issued through DNS-01 (records published by tond-server via ${DNS01_PROVIDER})"
     tond apps create e2e-wild --source-type image --source traefik/whoami:v1.10 --port 80 > /dev/null
     tond apps deploy e2e-wild > /dev/null
     wait_for_app_running e2e-wild 180
@@ -1565,7 +1524,7 @@ if [[ -n "$CA_FILE" && -n "$APPS_DOMAIN" ]] && curl -s -o /dev/null "${CHALLTEST
     curl -sf --unix-socket "$SOCK" -X DELETE "http://localhost/api/v1/dns-providers/${DNS_PROVIDER_ID}" > /dev/null \
         || fail "deleting the DNS provider must succeed"
 else
-    echo "  - no ACME CA, apps domain or challtestsrv (${CHALLTESTSRV}); skipping the DNS-01 wildcard check"
+    echo "  - no ACME CA, apps domain, Cloudflare zone or challtestsrv (${CHALLTESTSRV}); skipping the DNS-01 wildcard check"
 fi
 
 step "Per-deployment images and rollback"
@@ -2230,9 +2189,7 @@ pass "an older release is refused without force"
 RUN_ID=$(jq -r .data.id "$API_BODY")
 code=$(api_req POST /api/v1/system/update '{"version":"99.0.0"}')
 [[ "$code" == 409 ]] || fail "a second update while one runs must be refused with 409 (got ${code})"
-wait_for 300 "the 99.0.0 update run to finish" \
-    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/system/update | jq -e --arg id '$RUN_ID' '.data.run.id == \$id and .data.run.effective_state != \"running\"'"
-run=$(api /api/v1/system/update | jq -c .data.run)
+run=$(wait_for_update_run "$RUN_ID" 300)
 [[ "$(jq -r .effective_state <<<"$run")" == failed ]] || fail "an update that can't be downloaded must fail: $run"
 jq -e '.message | test("Nothing was changed")' <<<"$run" > /dev/null || fail "the failure must say nothing changed: $run"
 jq -e '.snapshot_id != null' <<<"$run" > /dev/null || fail "the run must record its pre-update snapshot: $run"

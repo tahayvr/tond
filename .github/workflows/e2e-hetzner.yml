@@ -1,22 +1,37 @@
 name: E2E (Hetzner)
 
-# Runs the smoke test on a throwaway Hetzner Cloud server with real public DNS
-# (<ip>.sslip.io) and real ACME (Let's Encrypt staging). The server is deleted
-# at the end of every run. Requires the HCLOUD_TOKEN repository secret.
+# Runs the end-to-end tests on throwaway Hetzner Cloud servers — x86_64 (cx23)
+# and ARM64 (cax11) — with real public DNS (<ip>.sslip.io), real ACME (Let's
+# Encrypt staging or production), real DNS-01 through Cloudflare, and the
+# resource budgets (e2e/budget.sh). Results are uploaded as artifacts. Every
+# server is deleted at the end of the run, also when it fails or is cancelled.
+# Manual only (Actions tab or `gh workflow run`); see dev-docs/hosted-e2e.md.
+#
+# Secrets: HCLOUD_TOKEN (required), CLOUDFLARE_API_TOKEN (for DNS-01).
+# Variable: E2E_DNS_ZONE (the Cloudflare zone the test records go under).
 
 on:
   workflow_dispatch:
     inputs:
+      arch:
+        description: Server architectures (x86_64 → cx23, aarch64 → cax11)
+        type: choice
+        default: both
+        options: [both, x86_64, aarch64]
       acme:
-        description: ACME mode
+        description: ACME CA (letsencrypt = production, mind its rate limits)
         type: choice
         default: letsencrypt-staging
-        options: [letsencrypt-staging, pebble]
-      arch:
-        description: Server architecture (x86_64 → cx23, aarch64 → cax11)
+        options: [letsencrypt-staging, letsencrypt, pebble]
+      test:
+        description: What to run on each server (both = budget on the fresh install, then smoke)
         type: choice
-        default: x86_64
-        options: [x86_64, aarch64]
+        default: both
+        options: [both, smoke, budget]
+      dns01:
+        description: Real DNS-01 wildcard through Cloudflare (needs CLOUDFLARE_API_TOKEN and the E2E_DNS_ZONE variable)
+        type: boolean
+        default: true
 
 concurrency:
   group: e2e-hetzner
@@ -30,16 +45,28 @@ permissions:
 
 jobs:
   e2e:
+    name: e2e ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(inputs.arch == 'both' && '["x86_64","aarch64"]' || format('["{0}"]', inputs.arch)) }}
     # The bundle is built natively, so the runner matches the server's arch.
-    runs-on: ${{ inputs.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
-    timeout-minutes: 60
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 90
     env:
       HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+      CLOUDFLARE_API_TOKEN: ${{ inputs.dns01 && secrets.CLOUDFLARE_API_TOKEN || '' }}
+      E2E_DNS_ZONE: ${{ inputs.dns01 && vars.E2E_DNS_ZONE || '' }}
+      RUN_LABEL: gh-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.arch }}
     steps:
-      - name: Require HCLOUD_TOKEN
+      - name: Require secrets
         run: |
           if [[ -z "$HCLOUD_TOKEN" ]]; then
             echo "::error::Set the HCLOUD_TOKEN repository secret (Hetzner Cloud API token, read/write)."
+            exit 1
+          fi
+          if [[ "${{ inputs.dns01 }}" == true && ( -z "$CLOUDFLARE_API_TOKEN" || -z "$E2E_DNS_ZONE" ) ]]; then
+            echo "::error::dns01 needs the CLOUDFLARE_API_TOKEN secret and the E2E_DNS_ZONE variable (or run with dns01 off)."
             exit 1
           fi
 
@@ -48,13 +75,61 @@ jobs:
       - uses: hetznercloud/setup-hcloud@4ff9bbeda4053fb69dd7fa1fcbdfcce7e648bf33 # v1
 
       - name: Delete stale e2e servers
-        run: e2e/hcloud.sh --gc
+        run: e2e/hcloud.sh --gc ${E2E_DNS_ZONE:+--dns-zone "$E2E_DNS_ZONE"}
 
       - uses: ./.github/actions/build-bundle
         with:
-          arch: ${{ inputs.arch || 'x86_64' }}
+          arch: ${{ matrix.arch }}
 
-      - name: Run smoke test on a throwaway server
+      - name: Run on a throwaway server
         run: |
-          e2e/hcloud.sh --arch "${{ inputs.arch || 'x86_64' }}" \
-            --acme "${{ inputs.acme || 'letsencrypt-staging' }}"
+          e2e/hcloud.sh --arch "${{ matrix.arch }}" --acme "${{ inputs.acme }}" \
+            --test "${{ inputs.test }}" --run-id "$RUN_LABEL" \
+            --artifacts "e2e-results/${{ matrix.arch }}" \
+            ${E2E_DNS_ZONE:+--dns-zone "$E2E_DNS_ZONE"}
+
+      # hcloud.sh deletes its server on exit; this also covers a runner that
+      # was cancelled or timed out in the middle of it.
+      - name: Delete this run's servers
+        if: always()
+        run: e2e/hcloud.sh --delete-run "$RUN_LABEL" ${E2E_DNS_ZONE:+--dns-zone "$E2E_DNS_ZONE"}
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: e2e-hetzner-${{ matrix.arch }}
+          path: e2e-results/${{ matrix.arch }}
+          if-no-files-found: warn
+          retention-days: 30
+
+  # A last sweep after every job, whatever happened to them (even a runner
+  # that died): delete anything labelled with this run.
+  cleanup:
+    name: Delete servers
+    needs: e2e
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+      CLOUDFLARE_API_TOKEN: ${{ inputs.dns01 && secrets.CLOUDFLARE_API_TOKEN || '' }}
+      E2E_DNS_ZONE: ${{ inputs.dns01 && vars.E2E_DNS_ZONE || '' }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          sparse-checkout: e2e/hcloud.sh
+          sparse-checkout-cone-mode: false
+
+      - uses: hetznercloud/setup-hcloud@4ff9bbeda4053fb69dd7fa1fcbdfcce7e648bf33 # v1
+
+      - name: Delete every server of this run
+        run: |
+          for arch in x86_64 aarch64; do
+            e2e/hcloud.sh --delete-run "gh-${{ github.run_id }}-${{ github.run_attempt }}-${arch}" \
+              ${E2E_DNS_ZONE:+--dns-zone "$E2E_DNS_ZONE"}
+          done
+          left="$(hcloud server list -l "tond-e2e=true" -o noheader -o columns=name | grep "" || true)"
+          if [[ -n "$left" ]]; then
+            echo "::warning::e2e servers still exist (other runs, or local ones): ${left//$'\n'/ }"
+          fi
