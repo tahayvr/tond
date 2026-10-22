@@ -204,6 +204,18 @@ pub const ALERT_KINDS: &[AlertKindInfo] = &[
         default_severity: "warning",
     },
     AlertKindInfo {
+        kind: "disk_auto_prune",
+        label: "Automatic disk cleanup",
+        description: "The disk crossed the automatic cleanup threshold (Settings → Disk cleanup), so Tond removed unused images and build cache. The value is the disk use afterwards. Resolves an hour later.",
+        scope: AlertScope::Host,
+        unit: "%",
+        comparison: AlertComparison::None,
+        default_threshold: None,
+        default_window_secs: None,
+        default_for_secs: 0,
+        default_severity: "warning",
+    },
+    AlertKindInfo {
         kind: "cert_expiry",
         label: "Certificate expiry",
         description: "A TLS certificate expires within this many days (renewal should have happened).",

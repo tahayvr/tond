@@ -105,6 +105,7 @@ An alert rule watches one condition and notifies channels when it holds. Create 
 | Deploy failed | A failed deployment | — | Immediately |
 | Disk usage | Disk usage of the data filesystem | 90% | 5 minutes |
 | Disk full forecast | Hours until the disk is full | 48 hours | 15 minutes |
+| Automatic disk cleanup | Tond pruned images and build cache under disk pressure | — | Immediately |
 | Certificate expiry | Days until a certificate expires | 14 days | Immediately |
 | Backup failed | A failed snapshot | — | Immediately |
 | Cron job failed | A failed cron run | — | Immediately |

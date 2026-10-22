@@ -306,6 +306,7 @@ fn condition_phrase(kind: &str) -> &'static str {
         "deploy_failed" => "the latest deploy failed",
         "backup_failed" => "the latest backup failed",
         "cron_failed" => "the latest run failed",
+        "disk_auto_prune" => "Tond pruned unused images and build cache to free disk space",
         _ => "the condition is true",
     }
 }

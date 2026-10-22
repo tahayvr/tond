@@ -1431,6 +1431,11 @@ export interface ServerSettings {
 	session_idle_timeout_hours?: number;
 	/** Sessions end this many days after sign-in (1–365, default 30) */
 	session_max_age_days?: number;
+	/**
+	 * Prune unused images (beyond the kept releases), then the build cache, when
+	 * the disk is at least this full (50–99 %, default 85; 0 = off)
+	 */
+	auto_prune_disk_percent?: number;
 }
 
 export interface LastDeployment {
@@ -3132,6 +3137,7 @@ export type AlertKind =
 	| 'deploy_failed'
 	| 'disk_usage'
 	| 'disk_forecast'
+	| 'disk_auto_prune'
 	| 'cert_expiry'
 	| 'backup_failed'
 	| 'cron_failed';

@@ -881,6 +881,43 @@ async fn memory_disk_and_forecast_rules_use_live_readings() {
 }
 
 #[tokio::test]
+async fn an_automatic_disk_cleanup_fires_for_an_hour() {
+    let state = test_state().await;
+    let db = &state.db;
+    seed_webhook(db, "hook", "http://127.0.0.1:1/hook", None).await;
+    seed_rule(
+        db,
+        Rule {
+            id: "prune",
+            kind: "disk_auto_prune",
+            threshold: 0.0,
+            window: 0,
+            ..Rule::default()
+        },
+    )
+    .await;
+    let ran = |at: i64| Inputs {
+        auto_prune: Some((at, 72.0)),
+        ..Inputs::default()
+    };
+    let r = eval(&state, T0, &Source::Fixed(ran(T0 - 10))).await;
+    assert_eq!(r.fired, 1);
+    let value: Option<f64> =
+        sqlx::query_scalar("SELECT value FROM alert_states WHERE rule_id = 'prune'")
+            .fetch_one(db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(value, Some(72.0), "the disk use after the cleanup");
+    let r = eval(
+        &state,
+        T0 + crate::disk_pressure::ALERT_HOLD_SECS,
+        &Source::Fixed(ran(T0 - 10)),
+    )
+    .await;
+    assert_eq!(r.resolved, 1, "an hour later it resolves");
+}
+
+#[tokio::test]
 async fn disabling_a_rule_closes_its_alerts_without_notifying() {
     let state = test_state().await;
     let db = &state.db;
