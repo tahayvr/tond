@@ -1744,7 +1744,8 @@ jq -e '.data.phases[] | select(.phase == "health") | .label == "Stay up for 5s" 
     || fail "the worker's readiness step must be 'Stay up for 5s': $(jq -c '.data.phases' <<< "$WORKER")"
 [[ "$(app_field e2e-worker domain)" == null ]] || fail "a worker must not get an automatic domain"
 [[ "$(app_field e2e-worker readiness)" == none ]] || fail "the app must report readiness none"
-docker logs tond-e2e-worker 2>&1 | grep -q tick || fail "the worker container should be running its loop"
+worker_logs=$(docker logs tond-e2e-worker 2>&1)
+grep -q tick <<< "$worker_logs" || fail "the worker container should be running its loop"
 pass "a background worker deploys to running with no domain (readiness step: stay up 5s)"
 WORKER_ENV=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' tond-e2e-worker)
 grep -qx 'E2E_SHARED=from-project' <<< "$WORKER_ENV" \
@@ -2252,7 +2253,8 @@ systemctl start tond-server
 wait_for 60 "API health after the restart" curl -sf http://127.0.0.1:3001/health
 wait_for 120 "one catch-up backup of e2e-redis" \
     bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/databases/e2e-redis/backups | jq -e '[.data[] | select(.trigger == \"scheduled\" and (.notes // \"\" | startswith(\"Catch-up\")))] | length == 1'"
-journalctl -u tond-server --since "-3min" --no-pager -o cat | grep -q "Catch-up: the backup due at" \
+server_journal=$(journalctl -u tond-server --since "-3min" --no-pager -o cat)
+grep -q "Catch-up: the backup due at" <<< "$server_journal" \
     || fail "the catch-up must be logged"
 [[ "$(api_req PUT /api/v1/databases/e2e-redis/backup-schedule '{"schedule":null}')" == 200 ]] \
     || fail "turning the schedule off must succeed"
@@ -2264,7 +2266,10 @@ wait_for 30 "API health after restart" curl -sf http://127.0.0.1:3001/health
 [[ "$(app_field e2e-whoami status)" == running ]] || fail "e2e-whoami should still be running after a restart"
 wait_for 60 "route after restart" bash -c "curl -sk --resolve '${WHOAMI_DOMAIN}:443:${IP}' 'https://${WHOAMI_DOMAIN}/' | grep -q Hostname:"
 pass "apps keep running and routing after restarting tond-server and tond-proxy"
-journalctl -u tond-server --since "-2min" --no-pager -o cat | grep -q "SIGTERM received: shutting down gracefully" \
+# Capture first: grep -q stops reading at the first match, and journalctl
+# then dies of SIGPIPE, which pipefail turns into a failure.
+server_journal=$(journalctl -u tond-server --since "-2min" --no-pager -o cat)
+grep -q "SIGTERM received: shutting down gracefully" <<< "$server_journal" \
     || fail "tond-server must shut down gracefully on SIGTERM"
 pass "tond-server shut down gracefully on SIGTERM"
 # A restart in the middle of a deploy: the deployment is marked interrupted,
