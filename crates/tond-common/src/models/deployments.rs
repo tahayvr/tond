@@ -250,6 +250,22 @@ pub struct DeploymentResponse {
     /// Compose apps: per-service images and progress of this deployment
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub services: Vec<crate::DeploymentService>,
+    /// Compose apps: services running now that this deployment's compose file
+    /// lacks. Rolling back to it parks them: they stop, and their domains stop
+    /// being routed until a later deploy brings the service back (the domains
+    /// are kept). Only listed while a rollback to this deployment is available.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rollback_parks: Vec<RollbackPark>,
+}
+
+/// A compose service a rollback would park, with the domains that would stop
+/// being routed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RollbackPark {
+    pub service: String,
+    #[serde(default)]
+    pub domains: Vec<String>,
 }
 
 impl From<Deployment> for DeploymentResponse {
@@ -284,6 +300,7 @@ impl From<Deployment> for DeploymentResponse {
             rollback_available: false,
             rollback_unavailable_reason: None,
             services: Vec::new(),
+            rollback_parks: Vec::new(),
         }
     }
 }

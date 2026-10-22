@@ -881,6 +881,43 @@ async fn memory_disk_and_forecast_rules_use_live_readings() {
 }
 
 #[tokio::test]
+async fn an_automatic_disk_cleanup_fires_for_an_hour() {
+    let state = test_state().await;
+    let db = &state.db;
+    seed_webhook(db, "hook", "http://127.0.0.1:1/hook", None).await;
+    seed_rule(
+        db,
+        Rule {
+            id: "prune",
+            kind: "disk_auto_prune",
+            threshold: 0.0,
+            window: 0,
+            ..Rule::default()
+        },
+    )
+    .await;
+    let ran = |at: i64| Inputs {
+        auto_prune: Some((at, 72.0)),
+        ..Inputs::default()
+    };
+    let r = eval(&state, T0, &Source::Fixed(ran(T0 - 10))).await;
+    assert_eq!(r.fired, 1);
+    let value: Option<f64> =
+        sqlx::query_scalar("SELECT value FROM alert_states WHERE rule_id = 'prune'")
+            .fetch_one(db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(value, Some(72.0), "the disk use after the cleanup");
+    let r = eval(
+        &state,
+        T0 + crate::disk_pressure::ALERT_HOLD_SECS,
+        &Source::Fixed(ran(T0 - 10)),
+    )
+    .await;
+    assert_eq!(r.resolved, 1, "an hour later it resolves");
+}
+
+#[tokio::test]
 async fn disabling_a_rule_closes_its_alerts_without_notifying() {
     let state = test_state().await;
     let db = &state.db;
@@ -941,4 +978,55 @@ async fn app_down_follows_the_uptime_check_of_a_running_app() {
         state_of(db, "down", "app:a1").await.as_deref(),
         Some("firing")
     );
+}
+
+#[tokio::test]
+async fn the_tick_cache_keeps_rules_until_their_table_changes() {
+    use super::evaluate::{EvalCache, evaluate_with};
+    let dir = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
+    let path = dir.path().join("tond.db");
+    // tond-server's pool (change hooks) and a plain one standing in for a
+    // write behind its back (no notification).
+    let db = crate::db::open_pool(&path.to_string_lossy())
+        .await
+        .unwrap_or_else(|err| panic!("pool: {err}"));
+    crate::db::migrate(&db)
+        .await
+        .unwrap_or_else(|err| panic!("migrate: {err}"));
+    let behind = SqlitePool::connect(&format!("sqlite:{}", path.display()))
+        .await
+        .unwrap_or_else(|err| panic!("plain pool: {err}"));
+    let source = Source::Fixed(Inputs::default());
+    let add_rule = |pool: &SqlitePool, id: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query("INSERT INTO alert_rules (id, name, kind) VALUES (?, ?, 'app_down')")
+                .bind(id)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|err| panic!("rule: {err}"));
+        }
+    };
+    let mut cache = EvalCache::default();
+    let rules = async |cache: &mut EvalCache| {
+        evaluate_with(&db, T0, &source, Some(cache))
+            .await
+            .unwrap_or_else(|err| panic!("evaluate: {err}"))
+            .rules
+    };
+
+    add_rule(&db, "r1").await;
+    assert_eq!(rules(&mut cache).await, 1);
+    // Unnotified: the cached rules stay.
+    add_rule(&behind, "r2").await;
+    assert_eq!(rules(&mut cache).await, 1, "served from the cache");
+    // A change through tond-server's pool drops the cache.
+    add_rule(&db, "r3").await;
+    assert_eq!(rules(&mut cache).await, 3);
+    // Without a cache every call reads the table.
+    let uncached = evaluate(&db, T0, &source)
+        .await
+        .unwrap_or_else(|err| panic!("evaluate: {err}"));
+    assert_eq!(uncached.rules, 3);
 }

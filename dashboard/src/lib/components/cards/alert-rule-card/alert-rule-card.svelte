@@ -16,6 +16,7 @@
 		switch (rule.kind) {
 			case 'disk_usage':
 			case 'disk_forecast':
+			case 'disk_auto_prune':
 				return 'Server';
 			case 'cert_expiry':
 				return 'Every certificate';

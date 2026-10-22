@@ -348,27 +348,30 @@ pub async fn query(
         .bind(from)
         .fetch_all(db)
         .await?;
-    let mut s = HostSeries::default();
-    for r in rows {
-        s.t.push(r.ts);
-        s.cpu.push(r.cpu as f64 / 100.0);
-        s.cpu_max.push(r.cpu_max as f64 / 100.0);
-        s.load1.push(r.load1 as f64 / 100.0);
-        s.load5.push(r.load5 as f64 / 100.0);
-        s.load15.push(r.load15 as f64 / 100.0);
-        s.mem_used.push(r.mem_used);
-        s.mem_total.push(r.mem_total);
-        s.swap_used.push(r.swap_used);
-        s.swap_total.push(r.swap_total);
-        s.disk_used.push(r.disk_used);
-        s.disk_total.push(r.disk_total);
-        s.inodes_used.push(r.inodes_used);
-        s.inodes_total.push(r.inodes_total);
-        s.root_used.push(r.root_used);
-        s.root_total.push(r.root_total);
-        s.root_inodes_used.push(r.root_inodes_used);
-        s.root_inodes_total.push(r.root_inodes_total);
-    }
+    // Each column is allocated once at its final size (up to 480 points).
+    let ints = |f: fn(&HostRow) -> i64| rows.iter().map(f).collect::<Vec<_>>();
+    let centi =
+        |f: fn(&HostRow) -> i64| rows.iter().map(|r| f(r) as f64 / 100.0).collect::<Vec<_>>();
+    let s = HostSeries {
+        t: ints(|r| r.ts),
+        cpu: centi(|r| r.cpu),
+        cpu_max: centi(|r| r.cpu_max),
+        load1: centi(|r| r.load1),
+        load5: centi(|r| r.load5),
+        load15: centi(|r| r.load15),
+        mem_used: ints(|r| r.mem_used),
+        mem_total: ints(|r| r.mem_total),
+        swap_used: ints(|r| r.swap_used),
+        swap_total: ints(|r| r.swap_total),
+        disk_used: ints(|r| r.disk_used),
+        disk_total: ints(|r| r.disk_total),
+        inodes_used: ints(|r| r.inodes_used),
+        inodes_total: ints(|r| r.inodes_total),
+        root_used: ints(|r| r.root_used),
+        root_total: ints(|r| r.root_total),
+        root_inodes_used: ints(|r| r.root_inodes_used),
+        root_inodes_total: ints(|r| r.root_inodes_total),
+    };
     Ok((from, step, s))
 }
 

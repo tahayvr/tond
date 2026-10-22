@@ -306,10 +306,22 @@ async fn start_database(state: &AppState, db: ManagedDatabase) -> Result<()> {
 /// Start the app's containers, or queue a redeploy when they don't exist.
 async fn start_or_redeploy(state: &AppState, app: &App) -> Result<Resumed> {
     let containers: Vec<String> = if app.source_type == "compose" {
+        // Parked services (gone from the compose file) stay down.
+        let parked: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM compose_services WHERE app_id = ? AND parked = 1")
+                .bind(&app.id)
+                .fetch_all(&state.db)
+                .await
+                .unwrap_or_default();
         let project = deploy::compose_project_name(&app.name);
         crate::compose::discover(&state.docker, &project)
             .await
-            .map(|v| v.into_iter().map(|s| s.container_id).collect())
+            .map(|v| {
+                v.into_iter()
+                    .filter(|s| !parked.contains(&s.service))
+                    .map(|s| s.container_id)
+                    .collect()
+            })
             .unwrap_or_default()
     } else {
         match app.container_id.as_deref() {

@@ -2,6 +2,7 @@
 //
 // GET  /api/apps/{id}/services                      — services with status, ports, domains, usage
 // PUT  /api/apps/{id}/services/{service}            — publish a container port, route domains to it
+// DELETE /api/apps/{id}/services/{service}          — forget a parked service and its domains
 // POST /api/apps/{id}/services/{service}/restart    — restart one service (also stop, start)
 // GET  /api/apps/{id}/services/{service}/logs       — recent log lines of one service (scrubbed)
 // PUT  /api/apps/{id}/compose                       — replace the compose file / repository path
@@ -110,6 +111,8 @@ pub(crate) async fn services_response(
                 image_digest: r.image_digest.clone(),
                 cpu: usage.map(|u| u.0),
                 mem: usage.map(|u| u.1),
+                replicas: u32::try_from(r.replicas).unwrap_or(1),
+                parked: r.parked != 0,
                 name: r.name,
             }
         })
@@ -160,6 +163,23 @@ pub async fn update_service(
             "published_port",
             format!("Publish a container port of service '{service}' before routing domains to it"),
         ));
+    }
+    if req.published_port.is_some() {
+        if row.parked != 0 {
+            return Err(invalid_field(
+                "published_port",
+                format!(
+                    "Service '{service}' is not in the current compose file: it keeps its \
+                     domains until the file declares it again, but can't be published now. \
+                     Remove it, or add it back to the compose file and deploy."
+                ),
+            ));
+        }
+        if let Some(msg) =
+            compose::replicas_publish_error(&service, u32::try_from(row.replicas).unwrap_or(1))
+        {
+            return Err(invalid_field("published_port", msg));
+        }
     }
     // Same-site warnings (the domain rules themselves are app_domains.rs').
     let mut warnings: Vec<String> = Vec::new();
@@ -228,6 +248,42 @@ pub async fn update_service(
             "warnings": warnings,
         }))),
     ))
+}
+
+// ── Forget a parked service ──
+
+/// A rollback parks services its compose file lacks (kept with their
+/// domains, unrouted). Removing one deletes the row and its domains.
+pub async fn forget_service(
+    _rate: RateLimit,
+    auth: Authz<scope::AppsWrite>,
+    State(state): State<AppState>,
+    Path((id, service)): Path<(String, String)>,
+) -> Result<impl IntoResponse, AppError> {
+    let app = fetch_app(&state.db, &id).await?;
+    require_compose(&app)?;
+    let row = service_row(&state.db, &app, &service).await?;
+    let domains = compose::domains_by_service(&state.db, &app.id)
+        .await?
+        .remove(&service)
+        .unwrap_or_default();
+    if row.parked == 0 || !compose::forget_parked(&state.db, &app.id, &service).await? {
+        return Err(invalid(format!(
+            "Service '{service}' is in the compose file: remove it from the file and deploy instead"
+        )));
+    }
+    let _ = proxy_link::sync_routes(&state).await;
+    write_audit_log(
+        &state.db,
+        Some(&app.id),
+        Some(&app.name),
+        "service_remove",
+        &auth.audit_actor(),
+        Some(&format!("service={service} domains={}", domains.join(","))),
+    )
+    .await;
+    let services = services_response(&state, &app, false).await?;
+    Ok((StatusCode::OK, Json(ApiResponse::ok(services))))
 }
 
 // ── Restart / stop / start one service ──
@@ -444,7 +500,7 @@ pub async fn update_compose(
                 invalid_field("compose_content", compose_policy::format_errors(&errors))
             })?;
             let specs = compose::service_specs(&content).map_err(invalid)?;
-            compose::sync_specs(&state.db, &app.id, &specs).await?;
+            compose::sync_specs(&state.db, &app.id, &specs, compose::Gone::Delete).await?;
             (Some(content), None, None, None)
         }
     };

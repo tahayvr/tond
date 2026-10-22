@@ -571,7 +571,8 @@ export const MOCK_SETTINGS: ServerSettings = {
 	apps_domain: 'example-apps.com',
 	upload_max_bytes: 1024 * 1024 * 1024,
 	session_idle_timeout_hours: 12,
-	session_max_age_days: 30
+	session_max_age_days: 30,
+	auto_prune_disk_percent: 85
 };
 
 /** Database links (database_id → app_id): cache-redis is linked to ml-inference. */

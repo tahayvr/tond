@@ -55,6 +55,11 @@ describe('serviceBadge', () => {
 		});
 		expect(serviceBadge(svc({ status: 'missing' })).label).toBe('Not running');
 		expect(serviceBadge(svc({ status: 'pending' })).label).toBe('Not deployed');
+		expect(serviceBadge(svc({ status: 'parked' }))).toEqual({
+			status: 'parked',
+			label: 'Parked',
+			tone: 'neutral'
+		});
 	});
 });
 
@@ -68,6 +73,9 @@ describe('servicesSummary', () => {
 		expect(servicesSummary([svc({}), svc({ name: 'db', status: 'exited', exit_code: 1 })])).toBe(
 			'1 of 2 running'
 		);
+		const parked = svc({ name: 'old', status: 'parked', parked: true });
+		expect(servicesSummary([svc({}), parked])).toBe('1 service running · 1 parked');
+		expect(servicesSummary([parked])).toBe('No services running · 1 parked');
 	});
 });
 

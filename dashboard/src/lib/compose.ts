@@ -42,21 +42,29 @@ export function serviceBadge(
 			return { status: 'stopped', label: 'Not running' };
 		case 'pending':
 			return { status: 'pending', label: 'Not deployed', tone: 'neutral' };
+		case 'parked':
+			return { status: 'parked', label: 'Parked', tone: 'neutral' };
 		default:
 			return { status: svc.status, label: svc.status };
 	}
 }
 
 /** "2 of 3 running", counting finished one-shot services as fine. */
-export function servicesSummary(services: ComposeService[]): string {
-	if (services.length === 0) return 'No services';
+export function servicesSummary(all: ComposeService[]): string {
+	const parked = all.filter((s) => s.parked).length;
+	const services = all.filter((s) => !s.parked);
+	const tail = parked ? ` · ${parked} parked` : '';
+	if (services.length === 0) return parked ? `No services running${tail}` : 'No services';
 	const up = services.filter(
 		(s) => s.status === 'running' || (s.status === 'exited' && s.exit_code === 0)
 	).length;
 	if (up === services.length) {
-		return services.length === 1 ? '1 service running' : `All ${services.length} services running`;
+		return (
+			(services.length === 1 ? '1 service running' : `All ${services.length} services running`) +
+			tail
+		);
 	}
-	return `${up} of ${services.length} running`;
+	return `${up} of ${services.length} running${tail}`;
 }
 
 /** Memory in MiB/GiB, e.g. "84 MiB"; "—" when unknown. */

@@ -2529,6 +2529,11 @@
           "name": {
             "type": "string"
           },
+          "parked": {
+            "default": false,
+            "description": "The service is no longer in the compose file (for example after a\nrollback to an older file): it does not run and its domains are not\nrouted, but they are kept and come back when the file declares the\nservice again.",
+            "type": "boolean"
+          },
           "ports": {
             "default": [],
             "description": "Container ports declared in the file",
@@ -2556,6 +2561,13 @@
             "description": "The published port changed since the last deploy: redeploy to apply",
             "type": "boolean"
           },
+          "replicas": {
+            "default": 1,
+            "description": "Replicas the file asks for (1 when unset)",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
           "running_image": {
             "default": null,
             "description": "Pinned local image the container runs (`tond-<app>/<service>:<image id prefix>`)",
@@ -2565,7 +2577,7 @@
             ]
           },
           "status": {
-            "description": "\"pending\" | \"running\" | \"restarting\" | \"paused\" | \"created\" | \"exited\"\n| \"dead\" | \"missing\"",
+            "description": "\"pending\" | \"running\" | \"restarting\" | \"paused\" | \"created\" | \"exited\"\n| \"dead\" | \"missing\" | \"parked\"",
             "type": "string"
           }
         },
@@ -2580,6 +2592,8 @@
           "redeploy_required",
           "domains",
           "status",
+          "replicas",
+          "parked",
           "health",
           "exit_code",
           "container_id",
@@ -4787,6 +4801,13 @@
               "null"
             ]
           },
+          "rollback_parks": {
+            "description": "Compose apps: services running now that this deployment's compose file\nlacks. Rolling back to it parks them: they stop, and their domains stop\nbeing routed until a later deploy brings the service back (the domains\nare kept). Only listed while a rollback to this deployment is available.",
+            "items": {
+              "$ref": "#/components/schemas/RollbackPark"
+            },
+            "type": "array"
+          },
           "rollback_unavailable_reason": {
             "default": null,
             "description": "Why rollback is unavailable (for a tooltip); `None` when available",
@@ -5008,6 +5029,13 @@
               "string",
               "null"
             ]
+          },
+          "rollback_parks": {
+            "description": "Compose apps: services running now that this deployment's compose file\nlacks. Rolling back to it parks them: they stop, and their domains stop\nbeing routed until a later deploy brings the service back (the domains\nare kept). Only listed while a rollback to this deployment is available.",
+            "items": {
+              "$ref": "#/components/schemas/RollbackPark"
+            },
+            "type": "array"
           },
           "rollback_unavailable_reason": {
             "default": null,
@@ -9477,6 +9505,26 @@
         ],
         "type": "object"
       },
+      "RollbackPark": {
+        "description": "A compose service a rollback would park, with the domains that would stop\nbeing routed.",
+        "properties": {
+          "domains": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "service": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "service",
+          "domains"
+        ],
+        "type": "object"
+      },
       "RouteLatency": {
         "description": "Latency histogram of one HTTP route.",
         "properties": {
@@ -9981,6 +10029,12 @@
             "description": "The domain automatic app hostnames live under (`<app>.<apps_domain>`).\nMust be a different registrable domain from both `dashboard_domain`\nand `preview_domain`. Empty = apps get no automatic hostname and need\na custom domain.",
             "type": "string"
           },
+          "auto_prune_disk_percent": {
+            "default": 85,
+            "description": "Tond prunes unused images (beyond the kept releases) and then the build\ncache when the disk is at least this full, in percent; 0 = off\n(settings key `auto_prune_disk_percent`). Volumes are never touched.",
+            "format": "int64",
+            "type": "integer"
+          },
           "dashboard_domain": {
             "description": "The domain at which the Tond dashboard itself is accessible.\nWhen set, tond-proxy will route this domain to the dashboard.",
             "type": "string"
@@ -10022,7 +10076,8 @@
           "apps_domain",
           "upload_max_bytes",
           "session_idle_timeout_hours",
-          "session_max_age_days"
+          "session_max_age_days",
+          "auto_prune_disk_percent"
         ],
         "type": "object"
       },
@@ -10622,6 +10677,78 @@
         ],
         "type": "object"
       },
+      "TemplateAppStatus": {
+        "description": "`GET /api/v1/apps/{id}/template`: where an app deployed from a template\nstands against the catalog.",
+        "properties": {
+          "domain_env": {
+            "description": "Env values derived from the app's address (`{app_url}`, `{app_host}`)\nthat don't match its current primary domain.",
+            "items": {
+              "$ref": "#/components/schemas/TemplateDomainEnvChange"
+            },
+            "type": "array"
+          },
+          "domain_env_edited": {
+            "description": "Domain-derived keys left alone because their value was edited by hand.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "latest_version": {
+            "description": "The catalog's version (None when the catalog no longer has it).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "template_id": {
+            "type": "string"
+          },
+          "template_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "update_available": {
+            "description": "The catalog has a newer version.",
+            "type": "boolean"
+          },
+          "upgrade_blocked": {
+            "description": "Why a one-click upgrade isn't possible (for example, the compose file\nwas edited since it was deployed); None when it is.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "upgrade_notes": {
+            "description": "The newer version's upgrade notes.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "version": {
+            "description": "The template version the app runs.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "template_id",
+          "template_name",
+          "version",
+          "latest_version",
+          "update_available",
+          "upgrade_notes",
+          "upgrade_blocked",
+          "domain_env",
+          "domain_env_edited"
+        ],
+        "type": "object"
+      },
       "TemplateCatalogResponse": {
         "description": "GET /api/templates",
         "properties": {
@@ -10754,6 +10881,62 @@
           "deployment_id",
           "credentials",
           "setup_notes"
+        ],
+        "type": "object"
+      },
+      "TemplateDomainEnvChange": {
+        "description": "One env value derived from the app's address that no longer matches it.",
+        "properties": {
+          "current": {
+            "description": "The value the app has now.",
+            "type": "string"
+          },
+          "key": {
+            "type": "string"
+          },
+          "proposed": {
+            "description": "The value for the app's current primary domain.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "current",
+          "proposed"
+        ],
+        "type": "object"
+      },
+      "TemplateDomainEnvRequest": {
+        "description": "`POST /api/v1/apps/{id}/template/domain-env`",
+        "properties": {
+          "redeploy": {
+            "default": false,
+            "description": "Start a deploy afterwards so the containers get the new values.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "TemplateDomainEnvResponse": {
+        "description": "`POST /api/v1/apps/{id}/template/domain-env` result.",
+        "properties": {
+          "deployment_id": {
+            "description": "The deploy started with `redeploy: true`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated": {
+            "items": {
+              "$ref": "#/components/schemas/TemplateDomainEnvChange"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "updated",
+          "deployment_id"
         ],
         "type": "object"
       },
@@ -11028,6 +11211,60 @@
           "image",
           "public",
           "memory_limit_mb"
+        ],
+        "type": "object"
+      },
+      "TemplateUpgradeResponse": {
+        "description": "`POST /api/v1/apps/{id}/template/upgrade` result.",
+        "properties": {
+          "added_env": {
+            "description": "Env vars the new version added (generated or defaulted).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "credentials": {
+            "description": "New `credential` inputs, shown once.",
+            "items": {
+              "$ref": "#/components/schemas/TemplateCredential"
+            },
+            "type": "array"
+          },
+          "deployment_id": {
+            "type": "string"
+          },
+          "from_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "snapshot_id": {
+            "description": "The snapshot of the app's data taken before anything changed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "to_version": {
+            "type": "string"
+          },
+          "upgrade_notes": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "from_version",
+          "to_version",
+          "snapshot_id",
+          "deployment_id",
+          "added_env",
+          "credentials",
+          "upgrade_notes"
         ],
         "type": "object"
       },
@@ -12323,6 +12560,14 @@
             "default": null,
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "auto_prune_disk_percent": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
               "null"
             ]
           },
@@ -19054,6 +19299,103 @@
       }
     },
     "/api/v1/apps/{id}/services/{service}": {
+      "delete": {
+        "description": "Only for a service a rollback parked (`parked: true`, no longer in the compose file). Its domains, and redirects to them, are deleted; the remaining services are returned.",
+        "operationId": "forget_service",
+        "parameters": [
+          {
+            "description": "App id or name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "service",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "items": {
+                        "$ref": "#/components/schemas/ComposeServiceResponse"
+                      },
+                      "type": "array"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Remove a parked service and its domains",
+        "tags": [
+          "Apps"
+        ],
+        "x-tond-scopes": [
+          "apps:write"
+        ]
+      },
       "put": {
         "description": "Domains route at once when the service already publishes that port; a new published port is bound on the next deploy (`redeploy_required`).",
         "operationId": "update_service",
@@ -19628,6 +19970,272 @@
         ],
         "x-tond-scopes": [
           "apps:control"
+        ]
+      }
+    },
+    "/api/v1/apps/{id}/template": {
+      "get": {
+        "description": "For apps deployed from a template. `domain_env` lists env values made from the app's address (`{app_url}`, `{app_host}`) that no longer match its primary domain; hand-edited ones are in `domain_env_edited` and never changed.",
+        "operationId": "get_app_template",
+        "parameters": [
+          {
+            "description": "App id or name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/TemplateAppStatus"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "An app's template: update available, upgrade notes, stale domain values",
+        "tags": [
+          "Apps"
+        ],
+        "x-tond-scopes": [
+          "apps:read"
+        ]
+      }
+    },
+    "/api/v1/apps/{id}/template/domain-env": {
+      "post": {
+        "description": "Applies `domain_env` from GET …/template. `redeploy: true` (needs `apps:deploy`) also starts a deploy so the containers get the new values.",
+        "operationId": "sync_template_domain_env",
+        "parameters": [
+          {
+            "description": "App id or name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TemplateDomainEnvRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/TemplateDomainEnvResponse"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Update the env values made from the app's old domain",
+        "tags": [
+          "Apps"
+        ],
+        "x-tond-scopes": [
+          "env:write"
+        ]
+      }
+    },
+    "/api/v1/apps/{id}/template/upgrade": {
+      "post": {
+        "description": "Takes a snapshot of the app's data first (nothing changes if it fails), replaces the compose file with the new version's, keeps every env value and generated secret (inputs the new version adds are generated or defaulted; new credentials are returned once) and deploys. 409 when the compose file was edited since it was deployed, or the app is already current. Roll back with the normal deployment rollback.",
+        "operationId": "upgrade_app_template",
+        "parameters": [
+          {
+            "description": "App id or name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/TemplateUpgradeResponse"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Accepted: the work continues in the background."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Move an app to the catalog's newer template version",
+        "tags": [
+          "Apps"
+        ],
+        "x-tond-scopes": [
+          "apps:write",
+          "apps:deploy",
+          "settings:write"
         ]
       }
     },
@@ -24164,7 +24772,7 @@
                 "schema": {
                   "properties": {
                     "data": {
-                      "description": "`{database, changed}`"
+                      "description": "`{database, changed, apps_to_update}`: `apps_to_update` lists `{id, name, keys}` of apps whose own environment still holds the old password"
                     },
                     "message": {
                       "description": "Informational note, when there is one.",
@@ -24218,7 +24826,7 @@
             "sessionCookie": []
           }
         ],
-        "summary": "Change a database's credentials",
+        "summary": "Change a database's password in place",
         "tags": [
           "Databases"
         ],

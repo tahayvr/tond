@@ -108,6 +108,12 @@ fn fmt_time(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+/// `next_before`: the oldest event's instant at full precision, so the next
+/// page starts right below it (millisecond rounding could skip events).
+fn cursor(t: DateTime<Utc>) -> String {
+    t.to_rfc3339_opts(SecondsFormat::AutoSi, true)
+}
+
 fn event(
     at: DateTime<Utc>,
     kind: AppEventKind,
@@ -226,6 +232,14 @@ pub async fn app_events(
     let limit = limit.clamp(1, MAX_LIMIT);
     let mut all: Vec<(DateTime<Utc>, AppEvent)> = Vec::new();
     let mut some_source_full = false;
+    // Sources stored in whole seconds: an event at second S is before
+    // `before` when S < before, i.e. S < ceil(before). Flooring would drop
+    // events in the same second as a millisecond-precise cursor.
+    let before_secs = if before.timestamp_subsec_nanos() > 0 {
+        before.timestamp() + 1
+    } else {
+        before.timestamp()
+    };
 
     // Deployments (created_at / started_at are chrono's to_rfc3339()).
     let deploys = sqlx::query_as::<_, DeployRow>(
@@ -247,10 +261,10 @@ pub async fn app_events(
         "SELECT e.ts, e.kind, e.detail FROM metric_events e
          JOIN metric_targets t ON t.id = e.target
          WHERE t.kind = 'app' AND t.owner_id = ? AND e.ts < ?
-         ORDER BY e.ts DESC LIMIT ?",
+         ORDER BY e.ts DESC, e.kind DESC LIMIT ?",
     )
     .bind(&app.id)
-    .bind(before.timestamp())
+    .bind(before_secs)
     .bind(limit)
     .fetch_all(db)
     .await?;
@@ -338,7 +352,7 @@ pub async fn app_events(
              WHERE app_id = ? AND fired_at < ? ORDER BY fired_at DESC LIMIT ?",
         )
         .bind(&app.id)
-        .bind(before.timestamp())
+        .bind(before_secs)
         .bind(limit)
         .fetch_all(db)
         .await?;
@@ -372,7 +386,7 @@ pub async fn app_events(
              ORDER BY i.started_at DESC LIMIT ?",
         )
         .bind(&app.id)
-        .bind(before.timestamp())
+        .bind(before_secs)
         .bind(limit)
         .fetch_all(db)
         .await?;
@@ -404,10 +418,22 @@ pub async fn app_events(
 
     all.retain(|(at, _)| *at < before);
     all.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
-    let more = some_source_full || i64::try_from(all.len()).unwrap_or(0) > limit;
-    all.truncate(usize::try_from(limit).unwrap_or(50));
+    let limit = usize::try_from(limit).unwrap_or(50);
+    let more = some_source_full || all.len() > limit;
+    // The cursor is exclusive, so a page must never end in the middle of
+    // events that share one instant: the rest of them would be skipped on
+    // the next page. Cut before the tie instead (unless the whole page is
+    // that one instant, the only way to make progress).
+    if all.len() > limit {
+        let boundary = all[limit].0;
+        all.truncate(limit);
+        let keep = all.iter().take_while(|(at, _)| *at != boundary).count();
+        if keep > 0 {
+            all.truncate(keep);
+        }
+    }
     let next_before = if more {
-        all.last().map(|(at, _)| fmt_time(*at))
+        all.last().map(|(at, _)| cursor(*at))
     } else {
         None
     };
@@ -446,7 +472,7 @@ pub async fn list_app_events(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit_log::{AuditActor, write_audit_log};
+    use crate::audit_log::{AuditActor, AuditEntry, record_at};
 
     async fn seed(db: &SqlitePool) -> App {
         let now = "2026-09-01T00:00:00Z";
@@ -510,13 +536,15 @@ mod tests {
         .execute(db)
         .await
         .unwrap_or_else(|e| panic!("cert: {e}"));
-        write_audit_log(
+        // A fixed time, not now: every seeded event has a known order, and
+        // record_at panics where write_audit_log would only log a failure.
+        record_at(
             db,
-            Some("a1"),
-            Some("web"),
-            "resources_update",
             &AuditActor::user("u1", "admin@example.com", None),
-            Some("memory=512MiB"),
+            AuditEntry::new("resources_update")
+                .resource("app", "a1", "web")
+                .maybe_detail(Some("memory=512MiB")),
+            "2026-09-23T09:00:00.000Z",
         )
         .await;
         let fired = parse_time("2026-09-19T08:00:00Z").map_or(0, |t| t.timestamp());
@@ -622,6 +650,63 @@ mod tests {
         assert_eq!(
             second.events.first().map(|e| e.kind),
             Some(AppEventKind::Oom)
+        );
+    }
+
+    #[tokio::test]
+    async fn pages_never_split_events_of_one_instant() {
+        let state = AppState::for_tests().await;
+        let app = seed(&state.db).await;
+        // A second-precision event in the very second the OOM kill happened,
+        // and a deploy that failed a quarter second into it.
+        let oom_ts = parse_time("2026-09-21T12:00:00Z").map_or(0, |t| t.timestamp());
+        sqlx::query("INSERT INTO metric_events (target, ts, kind) VALUES (7, ?, 'restart')")
+            .bind(oom_ts)
+            .execute(&state.db)
+            .await
+            .unwrap_or_else(|e| panic!("event: {e}"));
+        sqlx::query(
+            "INSERT INTO deployments (id, app_id, status, started_at, finished_at, created_at)
+             VALUES ('d4', 'a1', 'failed', '2026-09-21T11:59:00+00:00',
+                     '2026-09-21T12:00:00.250+00:00', '2026-09-21T11:59:00+00:00')",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap_or_else(|e| panic!("deploy: {e}"));
+
+        // Walk every page of two and collect what was seen.
+        let mut seen = Vec::new();
+        let mut before = Utc::now() + chrono::Duration::minutes(1);
+        for _ in 0..20 {
+            let page = app_events(&state.db, &app, true, true, before, 2)
+                .await
+                .unwrap_or_else(|e| panic!("events: {e}"));
+            assert!(!page.events.is_empty() || page.next_before.is_none());
+            seen.extend(page.events.iter().map(|e| (e.at.clone(), e.kind)));
+            match page.next_before.as_deref().and_then(parse_time) {
+                Some(next) => before = next,
+                None => break,
+            }
+        }
+        let all = app_events(
+            &state.db,
+            &app,
+            true,
+            true,
+            Utc::now() + chrono::Duration::minutes(1),
+            50,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("events: {e}"));
+        let expected: Vec<_> = all.events.iter().map(|e| (e.at.clone(), e.kind)).collect();
+        assert_eq!(seen, expected);
+        assert_eq!(
+            expected
+                .iter()
+                .filter(|(at, _)| at == "2026-09-21T12:00:00.000Z")
+                .count(),
+            2,
+            "the OOM kill and the restart share one instant"
         );
     }
 

@@ -54,6 +54,7 @@ Click **Create rule**. On the rule's page, **Send test** sends a test to every c
 | Deploy failed | The latest deploy failed; resolves on a successful deploy | immediately |
 | Disk usage | The disk holding Tond's data is this full | 90 % for 5 min, critical |
 | Disk full forecast | At the last 24 hours' growth rate, the disk fills within this many hours | 48 h |
+| Automatic disk cleanup | Tond pruned images and build cache because the disk crossed the cleanup threshold; the value is the disk use afterwards. Resolves an hour later | immediately |
 | Certificate expiry | A TLS certificate expires within this many days | 14 days |
 | Backup failed | The latest snapshot or its upload failed | immediately, critical |
 | Cron job failed | A cron job's latest run failed after its retries | immediately |

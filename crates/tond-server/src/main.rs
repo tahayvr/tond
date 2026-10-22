@@ -88,6 +88,7 @@ mod db_docker_tests;
 mod db_exec;
 mod db_upgrade;
 mod deploy;
+mod disk_pressure;
 mod dns_providers;
 mod docker;
 mod domains;
@@ -118,6 +119,7 @@ mod snapshot_remote;
 mod state;
 mod static_files;
 mod storage;
+mod template_apps;
 mod updates;
 mod upload;
 mod uptime;
@@ -215,6 +217,11 @@ async fn run() -> Result<()> {
                 "session_max_age_days" => {
                     if let Ok(v) = row.value.parse() {
                         s.session_max_age_days = v;
+                    }
+                }
+                "auto_prune_disk_percent" => {
+                    if let Ok(v) = row.value.parse() {
+                        s.auto_prune_disk_percent = v;
                     }
                 }
                 _ => {}

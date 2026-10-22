@@ -45,6 +45,28 @@ const SHOTS = [
 	{ page: 'backups', name: 'snapshots', path: '/snapshots' },
 	{ page: 'backups', name: 'restore-from-storage', path: '/snapshots?tab=storage' },
 	{ page: 'templates', name: 'templates', path: '/templates' },
+	{
+		page: 'templates',
+		name: 'update-available',
+		path: '/apps/app_links',
+		run: async (p) => {
+			await p.getByText(/Update available/).waitFor();
+			await p.locator('section[aria-label=Template]').scrollIntoViewIfNeeded();
+		},
+		clip: 'section[aria-label=Template]',
+		pad: 16
+	},
+	{
+		page: 'deploys',
+		name: 'rollback-parks',
+		path: '/apps/app_compose?tab=deployments',
+		run: async (p) => {
+			await p.getByRole('button', { name: /roll back to this/i }).first().click();
+			await p.waitForTimeout(700);
+		},
+		clip: '[role=dialog]',
+		pad: 24
+	},
 	{ page: 'upgrading', name: 'available', path: '/system?tab=updates' },
 	{
 		page: 'upgrading',

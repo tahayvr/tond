@@ -20,6 +20,7 @@
 //   7d  → 5m,  25 min buckets (~400)
 //   30d → 1h,  2 h buckets (360)
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use sqlx::{AssertSqlSafe, SqlitePool};
@@ -98,13 +99,31 @@ impl EventKind {
     }
 }
 
+/// Bumped whenever metric_targets may have changed (a target created or a
+/// memory limit written), so readers can cache what they derive from it.
+static TARGETS_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub fn targets_generation() -> u64 {
+    TARGETS_GENERATION.load(Ordering::Relaxed)
+}
+
+fn bump_targets_generation() {
+    TARGETS_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Id of `owner`'s target row, creating it on first use.
 pub async fn ensure_target(db: &SqlitePool, owner: &Owner) -> sqlx::Result<i64> {
-    sqlx::query("INSERT INTO metric_targets (kind, owner_id) VALUES (?, ?) ON CONFLICT DO NOTHING")
-        .bind(owner.kind.as_str())
-        .bind(&owner.id)
-        .execute(db)
-        .await?;
+    let created = sqlx::query(
+        "INSERT INTO metric_targets (kind, owner_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
+    )
+    .bind(owner.kind.as_str())
+    .bind(&owner.id)
+    .execute(db)
+    .await?
+    .rows_affected();
+    if created > 0 {
+        bump_targets_generation();
+    }
     sqlx::query_scalar("SELECT id FROM metric_targets WHERE kind = ? AND owner_id = ?")
         .bind(owner.kind.as_str())
         .bind(&owner.id)
@@ -130,36 +149,61 @@ pub struct TickRow {
     pub mem_limit: Option<i64>,
 }
 
-/// Write one tick's samples in a single transaction.
+/// Write one tick's samples: one INSERT for every row and one UPDATE for the
+/// memory limits that changed, in a single transaction.
 pub async fn insert_tick(db: &SqlitePool, ts: i64, rows: &[TickRow]) -> sqlx::Result<()> {
+    use std::fmt::Write as _;
     if rows.is_empty() {
         return Ok(());
     }
-    let mut tx = crate::db::begin_write(db).await?;
-    for row in rows {
+    let mut samples = String::with_capacity(2 + rows.len() * 64);
+    let mut limits = String::from("[");
+    samples.push('[');
+    for (i, row) in rows.iter().enumerate() {
         let s = row.sample;
-        sqlx::query(
-            "INSERT OR REPLACE INTO metrics_raw (target, ts, cpu, mem, rx, tx, pids)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(row.target)
-        .bind(ts)
-        .bind(s.cpu)
-        .bind(s.mem)
-        .bind(s.rx)
-        .bind(s.tx)
-        .bind(s.pids)
-        .execute(&mut *tx)
-        .await?;
+        if i > 0 {
+            samples.push(',');
+        }
+        let _ = write!(
+            samples,
+            "[{},{},{},{},{},{}]",
+            row.target, s.cpu, s.mem, s.rx, s.tx, s.pids
+        );
         if let Some(limit) = row.mem_limit {
-            sqlx::query("UPDATE metric_targets SET mem_limit = ? WHERE id = ?")
-                .bind(limit)
-                .bind(row.target)
-                .execute(&mut *tx)
-                .await?;
+            if limits.len() > 1 {
+                limits.push(',');
+            }
+            let _ = write!(limits, "[{},{limit}]", row.target);
         }
     }
-    tx.commit().await
+    samples.push(']');
+    limits.push(']');
+
+    let limits_changed = limits.len() > 2;
+    let mut tx = crate::db::begin_write(db).await?;
+    sqlx::query(
+        "INSERT OR REPLACE INTO metrics_raw (target, ts, cpu, mem, rx, tx, pids)
+         SELECT value->>0, ?, value->>1, value->>2, value->>3, value->>4, value->>5
+         FROM json_each(?)",
+    )
+    .bind(ts)
+    .bind(samples)
+    .execute(&mut *tx)
+    .await?;
+    if limits_changed {
+        sqlx::query(
+            "UPDATE metric_targets SET mem_limit = l.value->>1
+             FROM json_each(?) AS l WHERE metric_targets.id = l.value->>0",
+        )
+        .bind(limits)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    if limits_changed {
+        bump_targets_generation();
+    }
+    Ok(())
 }
 
 /// Record a restart / crash / OOM event (duplicates in the same second collapse).
@@ -401,17 +445,17 @@ pub async fn query_series(
             .bind(from)
             .fetch_all(db)
             .await?;
-    let mut series = MetricSeries::default();
-    for (t, cpu, cpu_max, mem, mem_max, rx, tx, pids) in rows {
-        series.t.push(t);
-        series.cpu.push(centi_to_percent(cpu));
-        series.cpu_max.push(centi_to_percent(cpu_max as f64));
-        series.mem.push(mem);
-        series.mem_max.push(mem_max);
-        series.rx.push(rx);
-        series.tx.push(tx);
-        series.pids.push(pids);
-    }
+    // Each column is allocated once at its final size (up to 480 points).
+    let series = MetricSeries {
+        t: rows.iter().map(|r| r.0).collect(),
+        cpu: rows.iter().map(|r| centi_to_percent(r.1)).collect(),
+        cpu_max: rows.iter().map(|r| centi_to_percent(r.2 as f64)).collect(),
+        mem: rows.iter().map(|r| r.3).collect(),
+        mem_max: rows.iter().map(|r| r.4).collect(),
+        rx: rows.iter().map(|r| r.5).collect(),
+        tx: rows.iter().map(|r| r.6).collect(),
+        pids: rows.iter().map(|r| r.7).collect(),
+    };
     Ok((from, series))
 }
 
@@ -525,6 +569,54 @@ mod tests {
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         assert_ne!(a, other);
+    }
+
+    #[tokio::test]
+    async fn a_tick_of_many_targets_writes_every_row_and_changed_limit() {
+        let db = db().await;
+        let mut rows = Vec::new();
+        for i in 0..60 {
+            let target = ensure_target(&db, &Owner::new(TargetKind::App, format!("a{i}")))
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            rows.push(TickRow {
+                target,
+                sample: Sample {
+                    cpu: i,
+                    mem: i * 1000,
+                    rx: i64::MAX,
+                    tx: 0,
+                    pids: 3,
+                },
+                mem_limit: (i % 3 == 0).then_some(4096 + i),
+            });
+        }
+        insert_tick(&db, 1_700_000_000, &rows)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let stored: Vec<(i64, i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
+            "SELECT r.target, r.cpu, r.mem, r.rx, r.pids, r.ts, t.mem_limit
+             FROM metrics_raw r JOIN metric_targets t ON t.id = r.target ORDER BY r.target",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(stored.len(), 60);
+        for (row, want) in stored.iter().zip(&rows) {
+            let limit = want.mem_limit.unwrap_or(0);
+            assert_eq!(
+                *row,
+                (
+                    want.target,
+                    want.sample.cpu,
+                    want.sample.mem,
+                    i64::MAX,
+                    3,
+                    1_700_000_000,
+                    limit
+                )
+            );
+        }
     }
 
     #[tokio::test]

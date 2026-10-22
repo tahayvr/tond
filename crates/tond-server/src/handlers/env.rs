@@ -113,7 +113,10 @@ fn env_response(app: &App) -> Result<AppEnvResponse, AppError> {
     })
 }
 
-async fn fetch_app_in_tx(tx: &mut sqlx::SqliteConnection, app_id: &str) -> Result<App, AppError> {
+pub(super) async fn fetch_app_in_tx(
+    tx: &mut sqlx::SqliteConnection,
+    app_id: &str,
+) -> Result<App, AppError> {
     let app = sqlx::query_as::<_, App>("SELECT * FROM apps WHERE id = ?")
         .bind(app_id)
         .fetch_optional(&mut *tx)

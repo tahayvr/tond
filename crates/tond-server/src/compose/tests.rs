@@ -279,14 +279,16 @@ async fn db_with_app() -> sqlx::SqlitePool {
 }
 
 #[tokio::test]
-async fn syncing_keeps_user_choices_and_drops_services_that_left_the_file() {
+async fn syncing_keeps_user_choices_and_parks_services_that_left_the_file() {
     let db = db_with_app().await;
     let specs = service_specs(TWO_SERVICES).unwrap_or_else(|e| panic!("{e}"));
-    sync_specs(&db, "a1", &specs)
+    sync_specs(&db, "a1", &specs, Gone::Delete)
         .await
         .unwrap_or_else(|e| panic!("{e}"));
     sqlx::query(
-        "UPDATE compose_services SET published_port = 80, host_port = 8100 WHERE name = 'web'",
+        "UPDATE compose_services SET published_port = 80, host_port = 8100 WHERE name = 'web';
+         UPDATE compose_services SET published_port = 6379, host_port = 8101 WHERE name = 'cache';
+         UPDATE apps SET status = 'running' WHERE id = 'a1'",
     )
     .execute(&db)
     .await
@@ -300,27 +302,64 @@ async fn syncing_keeps_user_choices_and_drops_services_that_left_the_file() {
     .await
     .unwrap_or_else(|e| panic!("{e}"));
 
-    // The cache leaves the file; web changes image.
-    let next = service_specs(
-        "services:\n  web:\n    image: nginx:2\n    ports: ['80']\n  api:\n    build: .\n",
-    )
-    .unwrap_or_else(|e| panic!("{e}"));
-    sync_specs(&db, "a1", &next)
+    let routed = || async {
+        sqlx::query_as::<_, (String, String, String, String, i64, i64, i64)>(
+            tond_common::route_queries::COMPOSE_SERVICE_ROUTES,
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"))
+        .into_iter()
+        .map(|r| r.0)
+        .collect::<Vec<_>>()
+    };
+    assert_eq!(routed().await, ["shop.example.com", "cache.example.com"]);
+
+    // The cache leaves the file (a rollback to an older one); web changes image.
+    const NEXT: &str =
+        "services:\n  web:\n    image: nginx:2\n    ports: ['80']\n  api:\n    build: .\n";
+    let leaving = services_leaving(&db, "a1", NEXT)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        leaving,
+        [("cache".to_string(), vec!["cache.example.com".to_string()])]
+    );
+    let next = service_specs(NEXT).unwrap_or_else(|e| panic!("{e}"));
+    sync_specs(&db, "a1", &next, Gone::Park)
         .await
         .unwrap_or_else(|e| panic!("{e}"));
     let rows = rows(&db, "a1").await.unwrap_or_else(|e| panic!("{e}"));
     let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
-    assert_eq!(names, ["web", "api"]);
+    assert_eq!(names, ["web", "api", "cache"]);
     assert_eq!(rows[0].image.as_deref(), Some("nginx:2"));
     assert_eq!(rows[0].published_port, Some(80), "user choice kept");
     assert_eq!(rows[0].host_port, Some(8100));
+    let cache = &rows[2];
+    assert_eq!(cache.parked, 1);
+    assert_eq!(cache.status, "parked");
+    assert_eq!(cache.published_port, Some(6379), "kept for when it returns");
+    assert_eq!(cache.host_port, None, "unrouted");
     let domains = domains_by_service(&db, "a1")
         .await
         .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(domains.get("web").map(Vec::len), Some(1));
+    assert_eq!(
+        domains.get("cache").map(Vec::len),
+        Some(1),
+        "a parked service keeps its domains"
+    );
+    assert_eq!(
+        routed().await,
+        ["shop.example.com"],
+        "but they aren't routed"
+    );
     assert!(
-        !domains.contains_key("cache"),
-        "domains of a removed service go too"
+        services_leaving(&db, "a1", NEXT)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .is_empty(),
+        "already parked"
     );
     let primary: Option<String> = sqlx::query_scalar("SELECT domain FROM apps WHERE id = 'a1'")
         .fetch_one(&db)
@@ -355,6 +394,119 @@ async fn syncing_keeps_user_choices_and_drops_services_that_left_the_file() {
     assert_eq!(rows[0].health.as_deref(), Some("healthy"));
     assert_eq!(rows[1].status, "missing");
     assert_eq!(rows[1].container_id, None);
+    assert_eq!(
+        rows[2].status, "parked",
+        "Docker's view leaves parked rows alone"
+    );
+
+    // The cache comes back (rolling forward): unparked with its choices.
+    sync_specs(
+        &db,
+        "a1",
+        &service_specs(TWO_SERVICES).unwrap_or_else(|e| panic!("{e}")),
+        Gone::Park,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{e}"));
+    let rows = super::rows(&db, "a1")
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let cache = rows
+        .iter()
+        .find(|r| r.name == "cache")
+        .unwrap_or_else(|| panic!("cache row"));
+    assert_eq!(cache.parked, 0);
+    assert_eq!(cache.status, "pending");
+    assert_eq!(cache.published_port, Some(6379));
+    // Routed again once the next deploy allocates its host port.
+    sqlx::query("UPDATE compose_services SET host_port = 8101 WHERE name = 'cache'")
+        .execute(&db)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(routed().await, ["shop.example.com", "cache.example.com"]);
+}
+
+#[tokio::test]
+async fn a_parked_service_can_be_forgotten_with_its_domains() {
+    let db = db_with_app().await;
+    sync_specs(
+        &db,
+        "a1",
+        &service_specs(TWO_SERVICES).unwrap_or_else(|e| panic!("{e}")),
+        Gone::Park,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{e}"));
+    sqlx::query(
+        "INSERT INTO app_domains (domain, app_id, service, port, kind) VALUES
+         ('cache.example.com', 'a1', 'cache', 6379, 'primary')",
+    )
+    .execute(&db)
+    .await
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        !forget_parked(&db, "a1", "cache")
+            .await
+            .unwrap_or_else(|e| panic!("{e}")),
+        "a service in the file isn't forgotten"
+    );
+    sync_specs(
+        &db,
+        "a1",
+        &service_specs("services:\n  web:\n    image: nginx\n").unwrap_or_else(|e| panic!("{e}")),
+        Gone::Park,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        forget_parked(&db, "a1", "cache")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+    );
+    let names: Vec<String> = rows(&db, "a1")
+        .await
+        .unwrap_or_else(|e| panic!("{e}"))
+        .into_iter()
+        .map(|r| r.name)
+        .collect();
+    assert_eq!(names, ["web", "api"], "api is parked, cache is gone");
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app_domains WHERE app_id = 'a1'")
+        .fetch_one(&db)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(left, 0);
+
+    // A changed file (not a rollback) removes running services outright, but
+    // a parked one stays parked: after a rollback of a pasted file the stored
+    // file lacks it too, and the next ordinary deploy must not drop it.
+    sync_specs(
+        &db,
+        "a1",
+        &service_specs("services:\n  other:\n    image: x\n").unwrap_or_else(|e| panic!("{e}")),
+        Gone::Delete,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{e}"));
+    let names: Vec<(String, i64)> = rows(&db, "a1")
+        .await
+        .unwrap_or_else(|e| panic!("{e}"))
+        .into_iter()
+        .map(|r| (r.name, r.parked))
+        .collect();
+    assert_eq!(names, [("other".to_string(), 0), ("api".to_string(), 1)]);
+}
+
+#[test]
+fn replicas_come_from_deploy_or_scale() {
+    let specs = service_specs(
+        "services:\n  a:\n    image: x\n    deploy:\n      replicas: 3\n  b:\n    image: x\n    scale: 2\n  c:\n    image: x\n",
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let replicas: Vec<u32> = specs.iter().map(|s| s.replicas).collect();
+    assert_eq!(replicas, [3, 2, 1]);
+    assert!(replicas_publish_error("a", 3).is_some_and(|m| m.contains("3 replicas")));
+    assert_eq!(replicas_publish_error("c", 1), None);
+    assert_eq!(replicas_publish_error("z", 0), None);
 }
 
 #[tokio::test]
@@ -370,6 +522,7 @@ async fn route_version_moves_with_service_domains_and_host_ports() {
         &db,
         "a1",
         &service_specs("services:\n  web:\n    image: x\n").unwrap_or_default(),
+        Gone::Delete,
     )
     .await
     .unwrap_or_else(|e| panic!("{e}"));

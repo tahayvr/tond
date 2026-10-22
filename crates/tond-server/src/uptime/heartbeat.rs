@@ -20,6 +20,7 @@
 // rendered without it. The schedule runs in the uptime loop (uptime/mod.rs)
 // on the same minute grid as the uptime checks, so it adds no wakeups.
 
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -236,17 +237,23 @@ pub async fn healthy(state: &AppState) -> Result<(), String> {
         .map_err(|e| format!("the database is not answering: {e}"))
 }
 
-/// Send one ping (no health check).
-pub async fn send(url: &str, method: &str) -> Outcome {
-    let client = match reqwest::Client::builder()
+/// One HTTP client for every ping (connection pool and TLS configuration
+/// are reused; a ping every minute keeps the connection warm).
+static CLIENT: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(|| {
+    reqwest::Client::builder()
         .timeout(PING_TIMEOUT)
         .user_agent(concat!("Tond-Heartbeat/", env!("CARGO_PKG_VERSION")))
         .build()
-    {
+        .map_err(|e| e.without_url().to_string())
+});
+
+/// Send one ping (no health check).
+pub async fn send(url: &str, method: &str) -> Outcome {
+    let client = match &*CLIENT {
         Ok(c) => c,
-        Err(e) => {
+        Err(error) => {
             return Outcome::Failed {
-                error: e.without_url().to_string(),
+                error: error.clone(),
             };
         }
     };

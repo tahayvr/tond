@@ -992,6 +992,8 @@ export interface ComposeServiceSpec {
 	/** Container ports under ports: and expose: */
 	ports: number[];
 	has_healthcheck: boolean;
+	/** Replicas the file asks for (deploy.replicas or scale; 1 when unset) */
+	replicas?: number;
 }
 
 /** GET /apps/{id}/services: one compose service and what Docker reports now. */
@@ -1003,8 +1005,14 @@ export interface ComposeService extends ComposeServiceSpec {
 	/** The published port changed since the last deploy */
 	redeploy_required: boolean;
 	domains: string[];
-	/** "pending" | "running" | "restarting" | "paused" | "created" | "exited" | "dead" | "missing" */
+	/** "pending" | "running" | "restarting" | "paused" | "created" | "exited" | "dead" | "missing" | "parked" */
 	status: string;
+	/**
+	 * Not in the current compose file (a rollback to an older file): it doesn't
+	 * run and its domains aren't routed, but they are kept and come back when a
+	 * later deploy declares the service again.
+	 */
+	parked?: boolean;
 	/** "healthy" | "unhealthy" | "starting"; null without a healthcheck */
 	health: string | null;
 	exit_code: number | null;
@@ -1038,6 +1046,73 @@ export async function updateService(
 	return request<ServiceUpdateResult>(`/apps/${appId}/services/${encodeURIComponent(service)}`, {
 		method: 'PUT',
 		body: JSON.stringify(data)
+	});
+}
+
+// ── Apps deployed from a template ──
+
+/** An env value made from the app's address that no longer matches its primary domain. */
+export interface TemplateDomainEnvChange {
+	key: string;
+	current: string;
+	proposed: string;
+}
+
+/** GET /apps/{id}/template */
+export interface TemplateAppStatus {
+	template_id: string;
+	template_name: string | null;
+	/** The template version the app runs */
+	version: string | null;
+	/** The catalog's version (null when the catalog no longer has the template) */
+	latest_version: string | null;
+	update_available: boolean;
+	upgrade_notes: string | null;
+	/** Why a one-click upgrade isn't possible (e.g. the compose file was edited); null when it is */
+	upgrade_blocked: string | null;
+	/** Values to update after a primary-domain change */
+	domain_env: TemplateDomainEnvChange[];
+	/** Domain-derived keys edited by hand (never changed by Tond) */
+	domain_env_edited: string[];
+}
+
+export interface TemplateUpgradeResult {
+	from_version: string | null;
+	to_version: string;
+	snapshot_id: string | null;
+	deployment_id: string;
+	added_env: string[];
+	credentials: TemplateCredential[];
+	upgrade_notes: string | null;
+}
+
+export async function getAppTemplate(appId: string): Promise<TemplateAppStatus> {
+	return request<TemplateAppStatus>(`/apps/${appId}/template`);
+}
+
+/** Update the env values made from the old domain; `redeploy` also starts a deploy. */
+export async function syncTemplateDomainEnv(
+	appId: string,
+	data: { redeploy: boolean }
+): Promise<{ updated: TemplateDomainEnvChange[]; deployment_id: string | null }> {
+	return request(`/apps/${appId}/template/domain-env`, {
+		method: 'POST',
+		body: JSON.stringify(data)
+	});
+}
+
+/** Snapshot, replace the compose file with the catalog's newer version, keep env, deploy. */
+export async function upgradeAppTemplate(appId: string): Promise<TemplateUpgradeResult> {
+	return request<TemplateUpgradeResult>(`/apps/${appId}/template/upgrade`, { method: 'POST' });
+}
+
+/** Remove a parked service (one a rollback took out of the compose file) and its domains. */
+export async function removeParkedService(
+	appId: string,
+	service: string
+): Promise<ComposeService[]> {
+	return request<ComposeService[]>(`/apps/${appId}/services/${encodeURIComponent(service)}`, {
+		method: 'DELETE'
 	});
 }
 
@@ -1414,6 +1489,11 @@ export interface ServerSettings {
 	session_idle_timeout_hours?: number;
 	/** Sessions end this many days after sign-in (1–365, default 30) */
 	session_max_age_days?: number;
+	/**
+	 * Prune unused images (beyond the kept releases), then the build cache, when
+	 * the disk is at least this full (50–99 %, default 85; 0 = off)
+	 */
+	auto_prune_disk_percent?: number;
 }
 
 export interface LastDeployment {
@@ -1708,6 +1788,18 @@ export interface Deployment {
 	rollback_unavailable_reason: string | null;
 	/** Compose apps: per-service images and progress */
 	services?: DeploymentService[];
+	/**
+	 * Compose apps: services running now that this deployment's file lacks.
+	 * Rolling back parks them: they stop and their domains stop being routed
+	 * until a later deploy brings them back (the domains are kept).
+	 */
+	rollback_parks?: RollbackPark[];
+}
+
+/** A compose service a rollback would park, with the domains that would stop routing. */
+export interface RollbackPark {
+	service: string;
+	domains: string[];
 }
 
 /** One service of a compose deployment. */
@@ -3103,6 +3195,7 @@ export type AlertKind =
 	| 'deploy_failed'
 	| 'disk_usage'
 	| 'disk_forecast'
+	| 'disk_auto_prune'
 	| 'cert_expiry'
 	| 'backup_failed'
 	| 'cron_failed';
@@ -3905,6 +3998,15 @@ export interface UpdateDatabaseCredentialsResponse {
 	database: ManagedDatabaseDetail;
 	/** Fields changed inside the running database and saved, e.g. ["db_password"] */
 	changed: ('db_password' | 'root_password')[];
+	/** Apps whose own environment variables still hold the old password */
+	apps_to_update?: AppUsingOldPassword[];
+}
+
+export interface AppUsingOldPassword {
+	id: string;
+	name: string;
+	/** Environment variable keys whose value contains the old password */
+	keys: string[];
 }
 
 /**

@@ -305,6 +305,8 @@ pub struct Collector {
     next_df: Instant,
     /// Per compose service `(cpu, mem)` of the last sample pass.
     service_samples: ServiceSamples,
+    /// What the alert evaluation on this tick keeps between ticks.
+    alert_cache: alerts::evaluate::EvalCache,
 }
 
 /// Reload the owner tables at least this often even without a change
@@ -335,6 +337,7 @@ impl Collector {
             host_history: host_history::HostHistory::default(),
             next_df: Instant::now() + FIRST_DF_AFTER,
             service_samples: HashMap::new(),
+            alert_cache: alerts::evaluate::EvalCache::default(),
         }
     }
 
@@ -672,6 +675,8 @@ impl Collector {
         if let Err(e) = self.host_history.record(&state.db, &snapshot).await {
             tracing::warn!("metrics: cannot store host history: {}", e);
         }
+        // Over the disk threshold: prune unused images and build cache.
+        crate::disk_pressure::check(state, &snapshot).await;
         if at >= self.next_df {
             self.next_df = at + docker_host::DF_EVERY;
             let docker = state.docker.clone();
@@ -772,7 +777,7 @@ impl Collector {
         self.requests.tick(&state.db, now).await;
 
         // Alert rules are evaluated on this tick (no loop of their own).
-        alerts::on_metrics_tick(state, now).await;
+        alerts::on_metrics_tick(state, now, &mut self.alert_cache).await;
     }
 
     async fn roll_up(&mut self, db: &SqlitePool, now: i64) -> sqlx::Result<()> {

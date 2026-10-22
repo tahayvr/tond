@@ -132,6 +132,7 @@ Server-wide settings are rows in the `settings` table of `tond.db`. Change them 
 | `upload_max_bytes` | 1 GiB | Settings (upload limit) | Largest unpacked source archive for uploads (`tond apps push`). Accepted range: 1 MiB to 64 GiB. |
 | `session_idle_timeout_hours` | `12` | Settings → Dashboard sessions | A dashboard session ends after this many hours without a request. Range 1 to 720. |
 | `session_max_age_days` | `30` | Settings → Dashboard sessions | A dashboard session ends this many days after sign-in, however active. Range 1 to 365. |
+| `auto_prune_disk_percent` | `85` | Settings → Disk cleanup | When the disk is at least this full, Tond removes unused images (keeping every app's kept releases) and then the build cache. Never volumes. Range 50 to 99, or `0` for off. See [Disk full](/operations/troubleshooting#disk-full). |
 | `host_terminal` | off | `sudo tond settings host-terminal on` / `off` | Enables the browser shell on the host. Can only be changed on the server itself, never from the dashboard or with a token. See [Host terminal](/guides/host-terminal). |
 | `alert_quiet_hours` | disabled, 22:00 to 07:00 UTC, critical alerts bypass | Alerts page | Global window in which notifications wait. See [Alerts and heartbeat](/guides/alerts). |
 
