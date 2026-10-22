@@ -116,7 +116,7 @@ To replace the key:
 
 At startup, when `TOND_PREVIOUS_SECRET_KEY` is set, Tond re-encrypts every stored secret that only the previous key can read, in one transaction. This is safe to repeat. The log says how many values it re-encrypted, and warns about any value neither key can read.
 
-While the previous key is set, Tond can still read snapshot archives made with it. Snapshots taken before the rotation, both remote archives and the database copies inside them, remain sealed with the old key. Keep the old key safe for as long as you keep those snapshots.
+While the previous key is set, Tond can still read snapshot archives made with it. Local snapshot copies are re-encrypted with the new key at startup (in the background). Remote archives and exports are not, and the database copy inside every snapshot taken before the rotation keeps its secrets sealed with the old key. Keep the old key safe for as long as you keep those snapshots. See [Snapshots and backups](/concepts/backups#key-rotation).
 
 ## Related
 

@@ -16,8 +16,16 @@ const api = vi.hoisted(() => ({
 	rollbackAppToSnapshot: vi.fn(),
 	listStorageProviders: vi.fn(),
 	getBackupConfig: vi.fn(),
-	updateBackupConfig: vi.fn()
+	updateBackupConfig: vi.fn(),
+	listApps: vi.fn(),
+	listDatabases: vi.fn(),
+	listRemoteSnapshots: vi.fn(),
+	importRemoteSnapshot: vi.fn(),
+	restoreDatabase: vi.fn(),
+	restoreDatabaseToNew: vi.fn()
 }));
+
+vi.mock('$app/state', async () => ({ page: (await import('../mocks/page-state.svelte')).page }));
 
 vi.mock('$lib/ui-context.svelte', () => ({
 	setUiContext,
@@ -25,7 +33,8 @@ vi.mock('$lib/ui-context.svelte', () => ({
 	snapshotsContext
 }));
 
-vi.mock('$lib/api', () => ({
+vi.mock('$lib/api', async (importOriginal) => ({
+	...(await importOriginal<typeof import('$lib/api')>()),
 	...api
 }));
 
@@ -34,6 +43,7 @@ vi.mock('$lib/auth.svelte', () => ({ can: () => true }));
 
 import SnapshotsPage from '../../routes/snapshots/+page.svelte';
 import { confirmDialog, renderConfirmHost } from '../confirm';
+import { setPageUrl } from '../mocks/page-state.svelte';
 
 const fullSnapshot: Snapshot = {
 	id: 'snap_1',
@@ -106,7 +116,7 @@ describe('snapshots page', () => {
 		api.restoreSnapshot.mockResolvedValue({ message: 'Restore queued.' });
 		api.rollbackAppToSnapshot.mockResolvedValue({ message: 'Rollback started.' });
 		api.listStorageProviders.mockResolvedValue([
-			{ id: 'provider_1', name: 'S3 Bucket', kind: 's3' }
+			{ id: 'provider_1', name: 'S3 Bucket', kind: 's3', config: { bucket: 'tond-backups' } }
 		]);
 		api.getBackupConfig.mockResolvedValue({
 			enabled: true,
@@ -118,6 +128,25 @@ describe('snapshots page', () => {
 			storage_provider_id: 'provider_1'
 		});
 		api.updateBackupConfig.mockResolvedValue(undefined);
+	});
+
+	it('shows Restore from storage as a URL tab', async () => {
+		api.listApps.mockResolvedValue([]);
+		api.listDatabases.mockResolvedValue([]);
+		api.listRemoteSnapshots.mockResolvedValue([]);
+		setPageUrl('http://localhost/snapshots?tab=storage');
+		renderPage();
+
+		const tab = screen.getByRole('link', { name: 'Restore from storage' });
+		expect(tab).toHaveAttribute('aria-current', 'page');
+		expect(screen.getByRole('link', { name: 'On this server' })).toHaveAttribute(
+			'href',
+			'/snapshots'
+		);
+		expect(screen.queryByRole('button', { name: /create snapshot/i })).not.toBeInTheDocument();
+		expect(await screen.findByText(/No Tond snapshots in tond-backups/)).toBeInTheDocument();
+		expect(api.listRemoteSnapshots).toHaveBeenCalledWith('provider_1');
+		setPageUrl('http://localhost/snapshots');
 	});
 
 	it('renders snapshots from route data without initial loading state', () => {

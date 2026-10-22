@@ -10,7 +10,7 @@ Tond records security-relevant events and every state change, for example:
 - **Users and tokens:** `user_invite`, `user_role_change`, `user_delete`, `token_create`, `token_revoke`.
 - **Apps:** `create`, `deploy`, `rollback`, `stop`, `start`, `restart`, `delete`, `domain_update`, `volume_add`, `volume_remove`, `health_update`, `source_update`.
 - **Secrets:** `env_reveal`, `env_update`, `db_credentials_reveal`, `webhook_secret_reveal`, `webhook_secret_rotate`.
-- **Data:** `snapshot_create`, `snapshot_restore_full`, `snapshot_restore_app`, `snapshot_restore_database`, `db_backup`, database changes.
+- **Data:** `snapshot_create`, `snapshot_restore_full`, `snapshot_restore_finished`, `snapshot_restore_app`, `snapshot_restore_database`, `snapshot_import`, `snapshot_export`, `backup_catch_up`, `db_backup`, database changes.
 - **Server:** `settings_update`, `backup_config_update`, `retention_update`, integrations, alert rules, `terminal_opened` and `terminal_closed`, updates and rollbacks of Tond itself.
 
 Each entry holds:

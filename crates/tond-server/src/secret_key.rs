@@ -84,10 +84,21 @@ pub enum Purpose {
     /// idempotency_keys.response (a stored response can hold a new token or
     /// database password). A cache: key rotation drops it instead.
     IdempotentResponse,
+    /// Snapshot archives (remote copies, exports): the key-derivation info
+    /// of snapshot_archive's streaming format, not a column
+    SnapshotArchive,
+    /// Each file of a local snapshot directory (streaming format). Key
+    /// rotation re-encrypts them (`snapshot_files::rotate_local_snapshots`).
+    LocalSnapshotFile,
+    /// The sealed part of a remote snapshot's manifest (names of what it
+    /// holds); not rotated, like the remote archive it describes
+    SnapshotManifest,
 }
 
 impl Purpose {
-    fn aad(self) -> &'static [u8] {
+    /// The GCM associated data (or, for the streaming snapshot formats, the
+    /// HKDF info) that binds a ciphertext to its purpose.
+    pub fn aad(self) -> &'static [u8] {
         match self {
             Purpose::RegistryPassword => b"tond:registry_credentials.password_enc",
             Purpose::GitlabToken => b"tond:gitlab_tokens.token_enc",
@@ -111,6 +122,9 @@ impl Purpose {
             Purpose::AuditWebhookSecret => b"tond:audit_shipping.webhook_secret",
             Purpose::DnsProviderToken => b"tond:dns_providers.token_enc",
             Purpose::IdempotentResponse => b"tond:idempotency_keys.response",
+            Purpose::SnapshotArchive => b"tond snapshot archive v1",
+            Purpose::LocalSnapshotFile => b"tond:local snapshot file v1",
+            Purpose::SnapshotManifest => b"tond:snapshot manifest v1",
         }
     }
 }

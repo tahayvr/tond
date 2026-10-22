@@ -206,6 +206,10 @@ const ACTION_LABELS: Record<string, string> = {
 	snapshot_restore_full: 'restored the whole server',
 	snapshot_restore_app: 'restored an app from a snapshot',
 	snapshot_restore_database: 'restored a database from a snapshot',
+	snapshot_restore_finished: 'finished restoring the whole server',
+	snapshot_import: 'imported a snapshot',
+	snapshot_export: 'exported a snapshot',
+	backup_catch_up: 'ran a missed scheduled backup',
 	audit_pruned: 'pruned old activity (retention)'
 };
 

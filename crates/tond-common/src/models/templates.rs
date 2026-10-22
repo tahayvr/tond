@@ -87,6 +87,11 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 
+use super::compose::{
+    BACKUP_DUMP_LABEL, BACKUP_RESTORE_LABEL, check_backup_hook, compose_label,
+    database_engine_of_image,
+};
+
 /// Memory a template may need and still carry the "fits on 2 GB" badge: a
 /// 2 GB VPS keeps roughly 1.6 GB after the OS, Docker and Tond, so an app up
 /// to 1 GB leaves room for its peaks and a small neighbour.
@@ -1074,6 +1079,33 @@ pub fn validate(
             }
         }
 
+        // Backup hooks: a database's files copied while it runs aren't
+        // consistent, so a database that keeps data in a volume must declare
+        // a dump (BACKUP_DUMP_LABEL).
+        let labels = get("labels");
+        let dump = labels.and_then(|l| compose_label(l, BACKUP_DUMP_LABEL));
+        let restore = labels.and_then(|l| compose_label(l, BACKUP_RESTORE_LABEL));
+        for (label, value) in [(BACKUP_DUMP_LABEL, &dump), (BACKUP_RESTORE_LABEL, &restore)] {
+            if let Some(value) = value {
+                check_backup_hook(label, value)
+                    .map_err(|e| invalid(id, format!("service {name}: {e}")))?;
+            }
+        }
+        if restore.is_some() && dump.is_none() {
+            return fail(format!(
+                "service {name}: {BACKUP_RESTORE_LABEL} needs a {BACKUP_DUMP_LABEL} to restore from"
+            ));
+        }
+        if let Some(engine) = database_engine_of_image(&image)
+            && get("volumes").is_some()
+            && dump.is_none()
+        {
+            return fail(format!(
+                "service {name}: {engine} data copied while it runs isn't consistent; add a \
+                 '{BACKUP_DUMP_LABEL}' label (and '{BACKUP_RESTORE_LABEL}' to load it back)"
+            ));
+        }
+
         if let Some(vols) = get("volumes") {
             let Some(vols) = vols.as_sequence() else {
                 return fail(format!("service {name}: 'volumes' must be a list"));
@@ -1849,6 +1881,34 @@ description = "Create the administrator account"
             &format!("{COMPOSE}volumes:\n  data: {{}}\n"),
             "named volumes",
         );
+    }
+
+    #[test]
+    fn databases_with_volumes_need_a_backup_dump_hook() {
+        let manifest = format!(
+            "{MANIFEST}\n[[volumes]]\nservice = \"db\"\npath = \"./pg\"\ndescription = \"Database\"\n"
+        );
+        let db = "  db:\n    image: postgres:17-alpine\n    restart: unless-stopped\n    mem_limit: 256m\n    volumes:\n      - ./pg:/var/lib/postgresql/data\n";
+        let without = format!("{COMPOSE}{db}");
+        assert_err(&manifest, &without, "add a 'tond.backup.dump' label");
+
+        let hooked = format!(
+            "{without}    labels:\n      tond.backup.dump: pg_dumpall -U \"$$POSTGRES_USER\" --clean --if-exists\n      tond.backup.restore: psql -U \"$$POSTGRES_USER\" -d postgres -q\n"
+        );
+        let t = Template::parse("demo", &manifest, &hooked).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(t.services.len(), 2);
+
+        // A restore needs a dump; hook commands are single lines.
+        let restore_only =
+            format!("{without}    labels:\n      tond.backup.restore: psql -U postgres\n");
+        assert_err(&manifest, &restore_only, "needs a tond.backup.dump");
+        let multiline =
+            format!("{without}    labels:\n      tond.backup.dump: \"pg_dumpall\\nrm -rf /\"\n");
+        assert_err(&manifest, &multiline, "single-line");
+
+        // A cache without a volume has nothing in backups: no hook needed.
+        let cache = "  cache:\n    image: valkey/valkey:8-alpine\n    restart: unless-stopped\n    mem_limit: 64m\n";
+        assert!(Template::parse("demo", MANIFEST, &format!("{COMPOSE}{cache}")).is_ok());
     }
 
     #[test]

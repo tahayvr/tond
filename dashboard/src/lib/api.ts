@@ -342,7 +342,8 @@ export const ERROR_CODES = {
 	rateLimited: 'RATE_LIMITED',
 	scopeDenied: 'SCOPE_DENIED',
 	notFound: 'NOT_FOUND',
-	appNotFound: 'APP_NOT_FOUND'
+	appNotFound: 'APP_NOT_FOUND',
+	snapshotKeyMismatch: 'SNAPSHOT_KEY_MISMATCH'
 } as const;
 
 // Endpoints that answer 401 for a wrong password or code. A 401 from these is
@@ -4845,4 +4846,46 @@ export async function updateBackupConfig(config: Partial<BackupConfig>): Promise
 		body: JSON.stringify(config)
 	});
 }
+// ── Restore from storage ──────────────────────────────────────────────────────
+// Snapshots found by reading a storage provider's bucket (their manifests), so
+// a fresh server can see and restore what another server uploaded.
+
+/** A snapshot in remote storage, read from its manifest. */
+export interface RemoteSnapshot {
+	id: string;
+	provider_id: string;
+	created_at: string;
+	tond_version: string;
+	/** Size of the encrypted archive */
+	archive_bytes: number;
+	/** This server's TOND_SECRET_KEY opens it (otherwise name, scope and contents are unknown) */
+	readable: boolean;
+	name: string | null;
+	trigger: string | null;
+	/** "full" | "database:<name>" (null when unreadable) */
+	scope: string | null;
+	apps: string[];
+	databases: string[];
+	/** Already in this server's snapshot list */
+	imported: boolean;
+}
+
+/** List the snapshots in a storage provider (default: the configured backup provider). */
+export async function listRemoteSnapshots(providerId?: string): Promise<RemoteSnapshot[]> {
+	const qs = providerId ? `?provider_id=${encodeURIComponent(providerId)}` : '';
+	return request<RemoteSnapshot[]>(`/snapshots/remote${qs}`);
+}
+
+/**
+ * Add a remote snapshot to this server's snapshot list (returns the existing
+ * row when it is already there). Fails with SNAPSHOT_KEY_MISMATCH when this
+ * server's TOND_SECRET_KEY can't read it.
+ */
+export async function importRemoteSnapshot(id: string, providerId?: string): Promise<Snapshot> {
+	return request<Snapshot>(`/snapshots/remote/${encodeURIComponent(id)}/import`, {
+		method: 'POST',
+		body: JSON.stringify(providerId ? { provider_id: providerId } : {})
+	});
+}
+
 // Download: window.open(`/api/v1/snapshots/${id}/download`) — no fetch wrapper needed

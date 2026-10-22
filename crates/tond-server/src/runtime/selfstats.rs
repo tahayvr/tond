@@ -28,6 +28,7 @@ static STARTED: LazyLock<Instant> = LazyLock::new(Instant::now);
 /// Remember the process start (call early in main).
 pub fn mark_start() {
     LazyLock::force(&STARTED);
+    super::process_started_at();
 }
 
 /// Previous CPU sample and the last computed percentage.

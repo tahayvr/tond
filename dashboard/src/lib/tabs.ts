@@ -168,6 +168,12 @@ export const SYSTEM_TABS: readonly TabDef<SystemTab>[] = [
 	{ id: 'updates', label: 'Updates' }
 ];
 
+export type SnapshotsTab = 'snapshots' | 'storage';
+export const SNAPSHOTS_TABS: readonly TabDef<SnapshotsTab>[] = [
+	{ id: 'snapshots', label: 'On this server' },
+	{ id: 'storage', label: 'Restore from storage', scope: 'snapshots:restore' }
+];
+
 export type CronTab = 'overview' | 'runs' | 'metrics' | 'settings';
 export const CRON_TABS: readonly TabDef<CronTab>[] = [
 	{ id: 'overview', label: 'Overview' },
