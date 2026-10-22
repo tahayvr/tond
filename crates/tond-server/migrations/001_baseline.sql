@@ -6,8 +6,10 @@
 -- host history, uptime checks and heartbeat, certificate issuer, audit
 -- shipping; and Phase 3 (v1): compose services, app templates, several
 -- domains per app with DNS providers, idempotency keys, managed database
--- essentials, Gitea tokens and the update check. Add new migrations as
--- 002_..., 003_... from here on.
+-- essentials, Gitea tokens and the update check; and the launch track:
+-- backup schedule catch-up, per-app egress policy, template admin seeding
+-- and upgrade tracking, parked compose services and replicas. Add new
+-- migrations as 002_..., 003_... from here on.
 
 CREATE TABLE apps(
   id TEXT PRIMARY KEY NOT NULL,
@@ -58,7 +60,55 @@ CREATE TABLE apps(
   -- template's upgrade notes. NULL for apps created any other way.
   template_id TEXT,
   template_version TEXT,
-  gitea_token_id TEXT REFERENCES gitea_tokens(id) ON DELETE SET NULL
+  gitea_token_id TEXT REFERENCES gitea_tokens(id) ON DELETE SET NULL,
+  -- Per-app outbound network policy (crates/tond-server/src/egress.rs),
+  -- enforced by tond-server in the iptables chain TOND-EGRESS (hooked into
+  -- DOCKER-USER).
+  --   egress_policy          'open' (default) | 'restricted' | 'none'
+  --   egress_allowlist       JSON array of "<host-or-cidr>[:<port>[,<port>…]]"
+  --                          (used by 'restricted', and by previews set to it)
+  --   preview_egress_policy  the same three values for the app's previews,
+  --                          which run pull-request code: 'none' by default
+  egress_policy TEXT NOT NULL DEFAULT 'open'
+    CHECK (egress_policy IN ('open', 'restricted', 'none')),
+  egress_allowlist TEXT NOT NULL DEFAULT '[]',
+  preview_egress_policy TEXT NOT NULL DEFAULT 'none'
+    CHECK (preview_egress_policy IN ('open', 'restricted', 'none')),
+  -- How a template app's admin account comes to exist (see
+  -- crates/tond-server/src/template_setup.rs):
+  --   'pending'    post_deploy commands will create it on the next successful
+  --                start; tond-proxy withholds a compose app's routes meanwhile
+  --   'upgrade'    run the outstanding steps on the next deploy without
+  --                withholding the app's routes (only 'pending' does that)
+  --   'done'       they did
+  --   'failed'     they gave up (admin_setup_error says why): the app page warns
+  --   'open'       the first visitor creates it: the app page warns
+  --   'dismissed'  the warning was dismissed
+  -- NULL for apps that didn't come from such a template.
+  admin_setup TEXT,
+  admin_setup_error TEXT,
+  -- The template post_deploy steps an app has already run, as a JSON array of
+  -- fingerprints (deploy/template_setup.rs: SHA-256 of the step, hashed like
+  -- template_apps::compose_sha256). A template upgrade runs only the steps its
+  -- new version adds, so an admin account that exists is never seeded twice.
+  template_hooks_done TEXT NOT NULL DEFAULT '[]',
+  -- Apps deployed from a template remember what they need to follow the
+  -- catalog and their own domain (handlers/templates.rs, template_apps.rs):
+  --   template_compose_sha256  SHA-256 (hex) of the compose file as Tond last
+  --                            wrote it from the template; a different hash
+  --                            means the user edited it, and one-click
+  --                            upgrades are refused
+  --   template_releases        JSON object {sha256: template version} of every
+  --                            template compose file the app has run, so a
+  --                            rollback to an older one restores its version
+  --   template_domain_env      JSON {"host": "<host the values were made for>",
+  --                            "keys": {"<ENV KEY>": "<text with {app_url} or
+  --                            {app_host}>"}}: env values derived from the
+  --                            app's address, offered for update when the
+  --                            primary domain changes
+  template_compose_sha256 TEXT,
+  template_releases TEXT,
+  template_domain_env TEXT
 );
 
 CREATE TABLE deploy_logs(
@@ -268,6 +318,17 @@ CREATE TABLE compose_services(
   -- its image id (sha256:...)
   image_digest TEXT,
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  -- 1 when the service left the compose file (a rollback to an older file,
+  -- or an edit): it is parked instead of deleted. The row keeps the user's
+  -- published port and app_domains keeps its domains, but host_port is
+  -- cleared so tond-proxy stops routing it (route_compose_services_update
+  -- fires). The service comes back with its domains when a later file
+  -- declares it again.
+  parked INTEGER NOT NULL DEFAULT 0,
+  -- Replicas the file asks for (deploy.replicas / scale; 1 when unset). A
+  -- service Tond publishes for routing must run one replica: every replica
+  -- would bind the same loopback host port.
+  replicas INTEGER NOT NULL DEFAULT 1,
   PRIMARY KEY(app_id, name)
 ) WITHOUT ROWID;
 
@@ -559,6 +620,19 @@ CREATE TABLE backup_config(
   storage_provider_id TEXT REFERENCES storage_providers(id) ON DELETE SET NULL
 );
 
+-- When each backup schedule last ran, so a backup that came due while the
+-- server was down runs once at the next start (a catch-up) instead of being
+-- skipped (backup.rs: backup_scheduler).
+--   job: "full" | "database:<name>"
+--   schedule: the cron expression last_slot belongs to (a changed schedule
+--             starts over from now instead of catching up)
+--   last_slot: the latest slot that ran or was caught up (RFC 3339, UTC)
+CREATE TABLE backup_schedule_state(
+  job TEXT PRIMARY KEY NOT NULL,
+  schedule TEXT NOT NULL,
+  last_slot TEXT NOT NULL
+);
+
 CREATE TABLE project_previews(
   id TEXT PRIMARY KEY NOT NULL,
   project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -737,6 +811,14 @@ WHEN OLD.name IS NOT NEW.name
   OR OLD.host_port IS NOT NEW.host_port
   OR OLD.readiness IS NOT NEW.readiness
   OR (OLD.status = 'running') IS NOT (NEW.status = 'running')
+BEGIN
+  UPDATE route_state SET version = version + 1 WHERE id = 1;
+END;
+-- tond-proxy withholds a compose app's routes while its admin_setup is
+-- 'pending' (tond_common::route_queries::COMPOSE_SERVICE_ROUTES), so a
+-- change into or out of 'pending' is a routing change.
+CREATE TRIGGER route_apps_admin_setup AFTER UPDATE OF admin_setup ON apps
+WHEN (OLD.admin_setup IS 'pending') IS NOT (NEW.admin_setup IS 'pending')
 BEGIN
   UPDATE route_state SET version = version + 1 WHERE id = 1;
 END;
