@@ -91,6 +91,22 @@ baseline, so install 0.2.0 fresh.
 - **Breaking**: snapshots are streamed as encrypted, authenticated archives.
   Pre-deploy snapshots can be turned off, and retention never deletes the
   newest snapshot.
+- Move a whole server: `tond export` writes a full snapshot as one encrypted
+  archive (a file, or a storage provider with `--remote`) and `tond import`
+  restores it on a fresh install, then starts or redeploys every app and
+  database. Still-valid TLS certificates come along.
+- Restore from storage: remote snapshots carry a manifest, so any server with
+  the same `TOND_SECRET_KEY` can list a bucket (Snapshots → Restore from
+  storage, `tond snapshot remote`) and restore everything, one app or one
+  database. Another key is refused with `SNAPSHOT_KEY_MISMATCH`.
+- **Breaking**: local snapshot copies are encrypted at rest (hard-link
+  deduplication kept, re-encrypted on key rotation). Snapshots taken before
+  can't be read; delete them.
+- A scheduled backup missed while the server was down runs once at the next
+  start, noted as a catch-up.
+- Compose services (and templates) can declare `tond.backup.dump` and
+  `tond.backup.restore` labels for consistent database backups; bundled
+  Postgres and MySQL templates use them.
 
 ### Observability
 

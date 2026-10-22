@@ -177,12 +177,10 @@ impl Header {
     /// Read and parse a header, returning it with its raw bytes (the AAD).
     fn read<R: Read>(input: &mut R, magic: &[u8; 8]) -> Result<(Self, Vec<u8>)> {
         let mut fixed = [0u8; FIXED_HEADER_LEN];
-        input
-            .read_exact(&mut fixed)
-            .context(
-                "not an encrypted Tond snapshot file (too short): snapshots taken before local \
+        input.read_exact(&mut fixed).context(
+            "not an encrypted Tond snapshot file (too short): snapshots taken before local \
                  copies were encrypted can't be read; delete them",
-            )?;
+        )?;
         if &fixed[..8] != magic {
             if &fixed[..8] == ARCHIVE_MAGIC || &fixed[..8] == LOCAL_MAGIC {
                 bail!("this Tond snapshot file is of another kind (archive vs. local copy)");
@@ -366,13 +364,11 @@ pub fn encrypt_to_file<R: Read>(
         .mode(0o600)
         .open(dest)
         .with_context(|| format!("failed to create {}", dest.display()))?;
-    let mut writer = EncryptWriter::new(BufWriter::with_capacity(CHUNK_SIZE, file), secret, kind, "")?;
+    let mut writer =
+        EncryptWriter::new(BufWriter::with_capacity(CHUNK_SIZE, file), secret, kind, "")?;
     let n = io::copy(&mut input, &mut writer)
         .with_context(|| format!("failed to encrypt into {}", dest.display()))?;
-    writer
-        .finish()?
-        .into_inner()
-        .map_err(|e| e.into_error())?;
+    writer.finish()?.into_inner().map_err(|e| e.into_error())?;
     Ok(n)
 }
 
@@ -805,8 +801,15 @@ mod tests {
             .unwrap_or_else(|e| panic!("verify: {e:#}"));
         let out = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
         let dest = out.path().join("restored");
-        extract_archive(Cursor::new(&archive), &[SECRET], ARCHIVE, Some("s1"), &dest, Target::Plain)
-            .unwrap_or_else(|e| panic!("extract: {e:#}"));
+        extract_archive(
+            Cursor::new(&archive),
+            &[SECRET],
+            ARCHIVE,
+            Some("s1"),
+            &dest,
+            Target::Plain,
+        )
+        .unwrap_or_else(|e| panic!("extract: {e:#}"));
         assert_eq!(
             std::fs::read(dest.join("volumes/web/data.bin")).ok(),
             std::fs::read(src.path().join("volumes/web/data.bin")).ok()
@@ -818,8 +821,8 @@ mod tests {
     fn exact_multiple_of_the_chunk_size_round_trips() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
         let mut sink = Vec::new();
-        let mut w =
-            EncryptWriter::new(&mut sink, SECRET, ARCHIVE, "s").unwrap_or_else(|e| panic!("writer: {e:#}"));
+        let mut w = EncryptWriter::new(&mut sink, SECRET, ARCHIVE, "s")
+            .unwrap_or_else(|e| panic!("writer: {e:#}"));
         w.write_all(&vec![7u8; CHUNK_SIZE * 2])
             .unwrap_or_else(|e| panic!("write: {e}"));
         w.finish().unwrap_or_else(|e| panic!("finish: {e}"));
@@ -853,7 +856,13 @@ mod tests {
         assert!(verify_archive(Cursor::new(&archive[..cut]), &[SECRET], ARCHIVE, None).is_err());
         // …or cut inside a record.
         assert!(
-            verify_archive(Cursor::new(&archive[..archive.len() - 5]), &[SECRET], ARCHIVE, None).is_err()
+            verify_archive(
+                Cursor::new(&archive[..archive.len() - 5]),
+                &[SECRET],
+                ARCHIVE,
+                None
+            )
+            .is_err()
         );
 
         assert!(verify_archive(Cursor::new(&archive), &["other-key"], ARCHIVE, None).is_err());
@@ -946,7 +955,14 @@ mod tests {
             let archive = seal_tar(&tar_bytes);
             let out = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
             let dest = out.path().join("restore");
-            let result = extract_archive(Cursor::new(&archive), &[SECRET], ARCHIVE, None, &dest, Target::Plain);
+            let result = extract_archive(
+                Cursor::new(&archive),
+                &[SECRET],
+                ARCHIVE,
+                None,
+                &dest,
+                Target::Plain,
+            );
             assert!(result.is_err(), "{what} must be refused");
             assert!(
                 !out.path().join("escape.txt").exists(),
@@ -963,8 +979,15 @@ mod tests {
         let archive = archive_of(src.path(), "s1");
         let out = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
         let dest = out.path().join("restored");
-        extract_archive(Cursor::new(&archive), &[SECRET], ARCHIVE, None, &dest, Target::Plain)
-            .unwrap_or_else(|e| panic!("extract: {e:#}"));
+        extract_archive(
+            Cursor::new(&archive),
+            &[SECRET],
+            ARCHIVE,
+            None,
+            &dest,
+            Target::Plain,
+        )
+        .unwrap_or_else(|e| panic!("extract: {e:#}"));
         assert!(
             std::fs::symlink_metadata(dest.join("volumes/web/leak")).is_err(),
             "symlinks are not snapshot data and must not be archived"
@@ -993,7 +1016,14 @@ mod tests {
     #[test]
     fn local_file_size_is_a_function_of_the_plaintext_size() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
-        for size in [0, 1, CHUNK_SIZE - 1, CHUNK_SIZE, CHUNK_SIZE + 1, CHUNK_SIZE * 3] {
+        for size in [
+            0,
+            1,
+            CHUNK_SIZE - 1,
+            CHUNK_SIZE,
+            CHUNK_SIZE + 1,
+            CHUNK_SIZE * 3,
+        ] {
             let out = dir.path().join(format!("f{size}"));
             let n = encrypt_to_file(Cursor::new(vec![9u8; size]), &out, SECRET, LOCAL)
                 .unwrap_or_else(|e| panic!("encrypt: {e:#}"));
@@ -1029,14 +1059,22 @@ mod tests {
             magic: LOCAL_MAGIC,
             info: b"another purpose",
         };
-        assert!(open(&[SECRET], other_purpose).is_err(), "bound to its purpose");
+        assert!(
+            open(&[SECRET], other_purpose).is_err(),
+            "bound to its purpose"
+        );
         let rotated = open(&["old", SECRET], LOCAL).unwrap_or_else(|e| panic!("open: {e:#}"));
         assert_eq!(rotated.key_index(), 1);
 
-        let err = DecryptReader::open(Cursor::new(b"plain text file, not encrypted at all".to_vec()), &[SECRET], LOCAL, None)
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
+        let err = DecryptReader::open(
+            Cursor::new(b"plain text file, not encrypted at all".to_vec()),
+            &[SECRET],
+            LOCAL,
+            None,
+        )
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
         assert!(err.contains("before local copies were encrypted"), "{err}");
     }
 
@@ -1056,8 +1094,15 @@ mod tests {
         // Plain extraction gives back the original plaintext…
         let out = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
         let plain = out.path().join("plain");
-        extract_archive(Cursor::new(&archive), &[SECRET], ARCHIVE, Some("s1"), &plain, Target::Plain)
-            .unwrap_or_else(|e| panic!("extract: {e:#}"));
+        extract_archive(
+            Cursor::new(&archive),
+            &[SECRET],
+            ARCHIVE,
+            Some("s1"),
+            &plain,
+            Target::Plain,
+        )
+        .unwrap_or_else(|e| panic!("extract: {e:#}"));
         assert_eq!(
             std::fs::read(plain.join("volumes/web/data.bin")).ok(),
             std::fs::read(src.path().join("volumes/web/data.bin")).ok()
@@ -1069,8 +1114,15 @@ mod tests {
             kind: LOCAL,
             secret: SECRET,
         };
-        extract_archive(Cursor::new(&archive), &[SECRET], ARCHIVE, Some("s1"), &enc, target)
-            .unwrap_or_else(|e| panic!("extract: {e:#}"));
+        extract_archive(
+            Cursor::new(&archive),
+            &[SECRET],
+            ARCHIVE,
+            Some("s1"),
+            &enc,
+            target,
+        )
+        .unwrap_or_else(|e| panic!("extract: {e:#}"));
         let raw = std::fs::read(enc.join("manifest.json")).unwrap_or_default();
         assert!(raw.starts_with(LOCAL_MAGIC));
         let mut text = String::new();

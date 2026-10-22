@@ -219,7 +219,8 @@ pub fn read_encrypted(path: &Path) -> Result<Vec<u8>> {
 pub fn decrypt_file(src: &Path, dest: &Path) -> Result<u64> {
     let meta = std::fs::metadata(src)?;
     let mut reader = open(src)?;
-    let mut out = File::create(dest).with_context(|| format!("failed to create {}", dest.display()))?;
+    let mut out =
+        File::create(dest).with_context(|| format!("failed to create {}", dest.display()))?;
     let n = std::io::copy(&mut reader, &mut out)
         .with_context(|| format!("failed to restore {}", dest.display()))?;
     drop(out);
@@ -330,7 +331,11 @@ pub struct RotationReport {
 /// readable (each one is replaced atomically) and the next start resumes.
 /// Files hard-linked between snapshots are re-encrypted once and linked
 /// again, so deduplication survives.
-pub fn rotate_local_snapshots(root: &Path, current: &str, previous: &str) -> Result<RotationReport> {
+pub fn rotate_local_snapshots(
+    root: &Path,
+    current: &str,
+    previous: &str,
+) -> Result<RotationReport> {
     let mut report = RotationReport::default();
     if current == previous || !root.is_dir() {
         return Ok(report);

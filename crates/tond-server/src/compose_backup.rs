@@ -378,7 +378,7 @@ mod tests {
             .create_container(
                 Some(CreateContainerOptionsBuilder::default().name(&name).build()),
                 ContainerCreateBody {
-                    image: Some("alpine:3.20".to_string()),
+                    image: Some("alpine:3".to_string()),
                     cmd: Some(vec!["sleep".to_string(), "300".to_string()]),
                     ..Default::default()
                 },

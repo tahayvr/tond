@@ -173,7 +173,7 @@ The PostgreSQL services of the bundled templates use:
 
 Write `$$` so compose leaves the `$` alone and the shell in the container expands the variable from the service's own environment: passwords never appear in the compose file or the label. The dump uses `--clean`, so loading it replaces what the restored volume holds. MySQL services dump with `mysqldump --single-transaction` and load with `mysql`, authenticating as root through `MYSQL_PWD`. A dump command can also write into the service's own volume instead of standard output, for example `redis-cli SAVE`, which writes a consistent `dump.rdb` just before the copy. A cache without a volume needs no hook: nothing of it is in a snapshot.
 
-Each label is one line of at most 2048 characters, and a restore needs a dump. The same labels work in any compose app you deploy, not only templates. See [Snapshots and backups](/concepts/backups) for when the hooks run.
+Each label is one line of at most 2048 characters, and a restore needs a dump. The same labels work in any compose app you deploy, not only templates. See [Snapshots and backups](/concepts/backups#consistent-backups-of-compose-databases) for when the hooks run.
 
 The compose file also goes through the same [compose policy](/guides/sources#what-the-compose-policy-rejects) as any compose app you paste.
 

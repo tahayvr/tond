@@ -65,8 +65,8 @@ pub fn write_marker(
     pre_restore: Option<&Snapshot>,
     _manifest: &serde_json::Value,
 ) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let marker = Marker {
         snapshot: SnapshotResponse::from(snapshot.clone()),
         pre_restore: pre_restore.cloned().map(SnapshotResponse::from),
@@ -150,10 +150,12 @@ async fn fix_snapshot_rows(state: &AppState, marker: &Marker) -> Result<()> {
 /// database can't satisfy (a storage provider or deployment it doesn't have).
 pub(crate) async fn upsert_snapshot(state: &AppState, s: &SnapshotResponse) -> Result<()> {
     let provider: Option<String> = match &s.storage_provider_id {
-        Some(id) => sqlx::query_scalar("SELECT id FROM storage_providers WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&state.db)
-            .await?,
+        Some(id) => {
+            sqlx::query_scalar("SELECT id FROM storage_providers WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&state.db)
+                .await?
+        }
         None => None,
     };
     sqlx::query(
@@ -319,10 +321,12 @@ async fn start_or_redeploy(state: &AppState, app: &App) -> Result<Resumed> {
         for cid in &containers {
             docker::start_container(&state.docker, cid).await?;
         }
-        sqlx::query("UPDATE apps SET status = 'running', updated_at = datetime('now') WHERE id = ?")
-            .bind(&app.id)
-            .execute(&state.db)
-            .await?;
+        sqlx::query(
+            "UPDATE apps SET status = 'running', updated_at = datetime('now') WHERE id = ?",
+        )
+        .bind(&app.id)
+        .execute(&state.db)
+        .await?;
         return Ok(Resumed::Started);
     }
     let queued = deploy::start(
@@ -343,10 +347,11 @@ async fn load_dumps_after_deploy(
 ) -> Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3 * 3600);
     loop {
-        let status: Option<String> = sqlx::query_scalar("SELECT status FROM deployments WHERE id = ?")
-            .bind(deployment_id)
-            .fetch_optional(&state.db)
-            .await?;
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM deployments WHERE id = ?")
+                .bind(deployment_id)
+                .fetch_optional(&state.db)
+                .await?;
         match status.as_deref() {
             Some("succeeded") => break,
             Some("queued" | "running") if tokio::time::Instant::now() < deadline => {
@@ -423,7 +428,11 @@ mod tests {
         for (id, local, remote) in [
             ("restored", Some("/old/server/restored"), None),
             ("old-local-only", Some("/old/server/x"), None),
-            ("old-remote", Some("/old/server/y"), Some("snapshots/y.tondsnap")),
+            (
+                "old-remote",
+                Some("/old/server/y"),
+                Some("snapshots/y.tondsnap"),
+            ),
         ] {
             sqlx::query(
                 "INSERT INTO snapshots (id, name, status, local_path, remote_key) VALUES (?, ?, 'running', ?, ?)",
@@ -455,7 +464,11 @@ mod tests {
             rows,
             vec![
                 ("old-remote".into(), "running".into(), None),
-                ("restored".into(), "completed".into(), Some(here_path.clone())),
+                (
+                    "restored".into(),
+                    "completed".into(),
+                    Some(here_path.clone())
+                ),
                 ("safety-net".into(), "completed".into(), Some(here_path)),
             ],
             "local-only rows of the old server are gone, remote ones lose the local path"

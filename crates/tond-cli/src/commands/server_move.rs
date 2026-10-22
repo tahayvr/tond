@@ -106,9 +106,11 @@ pub async fn handle_export(client: &TondClient, out: &Output, args: ExportArgs) 
     if let Some(path) = &output
         && path.exists()
     {
-        return Err(CliError::usage(format!("{} already exists", path.display()))
-            .with_hint("Choose another --output, or remove the file first.")
-            .into());
+        return Err(
+            CliError::usage(format!("{} already exists", path.display()))
+                .with_hint("Choose another --output, or remove the file first.")
+                .into(),
+        );
     }
 
     let snapshot = match &args.snapshot {
@@ -180,20 +182,35 @@ async fn wait_for_upload(client: &TondClient, id: &str) -> Result<tond_common::S
             .await?
             .into_iter()
             .find(|s| s.id == id)
-            .ok_or_else(|| CliError::coded(code::NOT_FOUND, exit::NOT_FOUND, format!("snapshot {id} disappeared")))?;
+            .ok_or_else(|| {
+                CliError::coded(
+                    code::NOT_FOUND,
+                    exit::NOT_FOUND,
+                    format!("snapshot {id} disappeared"),
+                )
+            })?;
         match snap.remote_status.as_deref() {
             Some("uploaded") => return Ok(snap),
             Some("failed") => {
-                return Err(CliError::coded(code::INTERNAL, exit::GENERIC, format!(
-                    "The upload failed: {}",
-                    snap.remote_error.as_deref().unwrap_or("unknown error")
-                ))
+                return Err(CliError::coded(
+                    code::INTERNAL,
+                    exit::GENERIC,
+                    format!(
+                        "The upload failed: {}",
+                        snap.remote_error.as_deref().unwrap_or("unknown error")
+                    ),
+                )
                 .into());
             }
             _ => tokio::time::sleep(Duration::from_secs(2)).await,
         }
     }
-    Err(CliError::coded(code::INTERNAL, exit::GENERIC, "The upload did not finish in time").into())
+    Err(CliError::coded(
+        code::INTERNAL,
+        exit::GENERIC,
+        "The upload did not finish in time",
+    )
+    .into())
 }
 
 pub async fn handle_import(client: &TondClient, out: &Output, args: ImportArgs) -> Result<()> {
@@ -216,12 +233,22 @@ pub async fn handle_import(client: &TondClient, out: &Output, args: ImportArgs) 
         outln!(out, "Uploading {} to the server…", file.display());
         client.upload_snapshot_archive(file).await?
     } else {
-        outln!(out, "Importing snapshot {} from remote storage…", args.source);
+        outln!(
+            out,
+            "Importing snapshot {} from remote storage…",
+            args.source
+        );
         client
             .import_remote_snapshot(&args.source, args.provider.as_deref())
             .await?
     };
-    outln!(out, "Snapshot {} ({}, {}) is in the list.", snap.name, snap.id, snap.scope);
+    outln!(
+        out,
+        "Snapshot {} ({}, {}) is in the list.",
+        snap.name,
+        snap.id,
+        snap.scope
+    );
 
     if args.no_restore {
         out.done("import", "snapshot", &snap.id, serde_json::to_value(&snap)?)?;
@@ -234,7 +261,10 @@ pub async fn handle_import(client: &TondClient, out: &Output, args: ImportArgs) 
         ))
         .into());
     }
-    outln!(out, "Restoring (the snapshot is downloaded and verified first)…");
+    outln!(
+        out,
+        "Restoring (the snapshot is downloaded and verified first)…"
+    );
     let data = client.restore_snapshot_full(&snap.id).await?;
     out.done("import", "snapshot", &snap.id, data.clone())?;
     if let Some(pre) = data.get("pre_restore_snapshot_id").and_then(Value::as_str) {

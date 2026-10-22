@@ -57,9 +57,7 @@ pub fn manifest_key(id: &str) -> String {
 /// Snapshot ids name directories and object keys: letters, digits and
 /// dashes only (Tond makes UUIDs).
 pub fn valid_snapshot_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
-        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 /// The manifest stored next to an archive.
@@ -129,10 +127,7 @@ pub fn build_manifest(
         databases: strings(local, "databases_included"),
         total_bytes: local.get("total_bytes").and_then(|v| v.as_i64()),
     };
-    let sealed = secret_key::encrypt(
-        Purpose::SnapshotManifest,
-        &serde_json::to_string(&details)?,
-    )?;
+    let sealed = secret_key::encrypt(Purpose::SnapshotManifest, &serde_json::to_string(&details)?)?;
     Ok(RemoteManifest {
         format: MANIFEST_FORMAT.to_string(),
         id: id.to_string(),
@@ -192,7 +187,9 @@ pub async fn provider(state: &AppState, id: Option<String>) -> Result<StoragePro
                         "provider_id",
                         "No storage provider given and none is set in the backup settings.",
                     )
-                    .with_hint("Add the storage provider (same bucket and keys) first, then pick it."),
+                    .with_hint(
+                        "Add the storage provider (same bucket and keys) first, then pick it.",
+                    ),
                 )
             })?,
     };
@@ -250,7 +247,11 @@ pub async fn list_remote(
     let provider = provider(state, provider_id).await?;
     let objects = storage::list(&provider, SNAPSHOTS_PREFIX)
         .await
-        .map_err(|e| AppError(TondError::Unavailable(format!("Listing the bucket failed: {e:#}"))))?;
+        .map_err(|e| {
+            AppError(TondError::Unavailable(format!(
+                "Listing the bucket failed: {e:#}"
+            )))
+        })?;
     let ids: Vec<String> = objects
         .iter()
         .filter_map(|o| {
@@ -299,7 +300,10 @@ pub async fn import_remote(
     id: &str,
 ) -> Result<Snapshot, AppError> {
     if !valid_snapshot_id(id) {
-        return Err(AppError(TondError::invalid_field("id", "Not a snapshot id.")));
+        return Err(AppError(TondError::invalid_field(
+            "id",
+            "Not a snapshot id.",
+        )));
     }
     if let Ok(existing) = backup::fetch_snapshot(state, id).await {
         return Ok(existing);
@@ -336,9 +340,9 @@ pub async fn import_remote(
     .bind(format!("Imported from storage provider {}", provider.name))
     .execute(&state.db)
     .await?;
-    Ok(backup::fetch_snapshot(state, id)
+    backup::fetch_snapshot(state, id)
         .await
-        .map_err(|e| AppError(TondError::Internal(format!("{e:#}"))))?)
+        .map_err(|e| AppError(TondError::Internal(format!("{e:#}"))))
 }
 
 /// `created_at` as SQLite's `datetime('now')` writes it (how the rest of the
@@ -390,7 +394,11 @@ pub async fn import_archive_file(state: &AppState, archive: &Path) -> Result<Sna
     tokio::task::spawn_blocking(move || backup::extract_archive_file(&src, &out, &sid))
         .await
         .map_err(|e| AppError(TondError::Internal(format!("import task failed: {e}"))))?
-        .map_err(|e| AppError(TondError::Internal(format!("Extracting the archive failed: {e:#}"))))?;
+        .map_err(|e| {
+            AppError(TondError::Internal(format!(
+                "Extracting the archive failed: {e:#}"
+            )))
+        })?;
     let local = backup::read_manifest(&dest)
         .await
         .map_err(|e| AppError(TondError::InvalidInput(format!("{e:#}"))))?;
@@ -411,9 +419,9 @@ pub async fn import_archive_file(state: &AppState, archive: &Path) -> Result<Sna
     .bind(dest.to_string_lossy().as_ref())
     .execute(&state.db)
     .await?;
-    Ok(backup::fetch_snapshot(state, &id)
+    backup::fetch_snapshot(state, &id)
         .await
-        .map_err(|e| AppError(TondError::Internal(format!("{e:#}"))))?)
+        .map_err(|e| AppError(TondError::Internal(format!("{e:#}"))))
 }
 
 #[cfg(test)]
@@ -447,7 +455,10 @@ mod tests {
         let manifest = build_manifest(&local(), id, &archive_key(id), &summary())
             .unwrap_or_else(|e| panic!("manifest: {e:#}"));
         let json = serde_json::to_string(&manifest).unwrap_or_default();
-        assert!(!json.contains("shop-db") && !json.contains("Nightly"), "names are sealed: {json}");
+        assert!(
+            !json.contains("shop-db") && !json.contains("Nightly"),
+            "names are sealed: {json}"
+        );
         assert_eq!(manifest.archive_bytes, 1234);
 
         let details = open_details(&manifest).unwrap_or_else(|| panic!("opens with the key"));
@@ -483,6 +494,9 @@ mod tests {
         for bad in ["", "../etc", "a/b", "a.b", &"x".repeat(65)] {
             assert!(!valid_snapshot_id(bad), "{bad}");
         }
-        assert_eq!(sqlite_time("2026-10-01T03:00:00+02:00"), "2026-10-01 01:00:00");
+        assert_eq!(
+            sqlite_time("2026-10-01T03:00:00+02:00"),
+            "2026-10-01 01:00:00"
+        );
     }
 }

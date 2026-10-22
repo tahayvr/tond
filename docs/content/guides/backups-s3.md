@@ -105,8 +105,16 @@ sudo mkdir -p /opt/tond/data
 sudo install -m 600 -o root -g root tond.env /opt/tond/data/tond.env
 ```
 
-> [!WARNING]
-> Tond restores remote copies only for snapshots recorded in its own database. A fresh installation starts with an empty snapshot list, and this version has no command to import snapshots from a bucket. Until it does, a remote copy can only be restored by the installation that made it: for example when **Keep local copy** is off, or the local snapshot directory was lost. It does not yet cover the loss of the whole server. Keep that in mind when you plan for disaster recovery.
+Then install Tond, add the same storage provider (same bucket, prefix and keys), and find the snapshots in the bucket. Each upload has a small manifest next to it, so the new server lists them without the old server's database:
+
+```sh
+tond snapshot remote --provider <provider-id>
+tond import <snapshot-id> --provider <provider-id>
+```
+
+In the dashboard, open **Snapshots** → **Restore from storage**, pick the provider and click **Restore…** on a snapshot. You can restore everything, one app, or one database (in place, or into a new database). A snapshot made with another `TOND_SECRET_KEY` is listed as **Made with a different key** and can't be restored until the server has that key.
+
+The full procedure, including moving a server without remote storage, is in [Move to a new server](/guides/server-move).
 
 ## Next steps
 

@@ -24,18 +24,30 @@
 //     Long-running background task. Re-reads config each iteration.
 //
 // Local snapshots are directories under <data>/backups/snapshots/<id>
-// (hard-linked against the previous one). Only regular files and
+// whose files are each encrypted at rest (snapshot_files.rs) and hard-linked
+// against the previous snapshot when unchanged. Only regular files and
 // directories are copied: symlinks in app volumes are skipped, so a container
 // can't make a snapshot read host files. The SQLite database is captured
-// with `VACUUM INTO` (a consistent copy while tond-server keeps running).
+// with `VACUUM INTO` (a consistent copy while tond-server keeps running) and
+// encrypted at once; database dumps likewise. Compose services that declare
+// a `tond.backup.dump` hook (compose_backup.rs) dump into the snapshot before
+// their volumes are copied; app restores feed the dump to their
+// `tond.backup.restore` hook. Full snapshots also hold the TLS certificates.
+//
+// Scheduled backups remember their last slot (backup_schedule_state): one
+// that came due while the server was down runs once at the next start, as a
+// catch-up. A full restore leaves a marker so the next start puts the
+// snapshot list right and starts or redeploys everything (restore_resume.rs).
 //
 // Remote copies are streamed end to end with constant memory: the snapshot
 // directory is tarred, gzipped and encrypted (`snapshot_archive`, key derived
 // from TOND_SECRET_KEY) on a blocking thread and handed to an S3 multipart
-// upload one `storage::PART_SIZE` part at a time. Restoring downloads the
-// archive to a file, checks its SHA-256 against the one recorded at upload,
-// authenticates every record, and only then extracts it — so a server
-// restoring from remote storage needs the same TOND_SECRET_KEY.
+// upload one `storage::PART_SIZE` part at a time, with a manifest next to it
+// so another server can list and import it (snapshot_remote.rs). Restoring
+// downloads the archive to a file, checks its SHA-256 against the one
+// recorded at upload, authenticates every record, and only then extracts it
+// (re-encrypted for local storage) — so a server restoring from remote
+// storage needs the same TOND_SECRET_KEY.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -342,7 +354,9 @@ async fn build_snapshot(
             .await
             .map(|m| m.len())
             .unwrap_or(0);
-        seal(dest).await.context("failed to encrypt the SQLite copy")?;
+        seal(dest)
+            .await
+            .context("failed to encrypt the SQLite copy")?;
         delta_bytes += size as i64;
         total_bytes += size as i64;
         tracing::debug!("SQLite snapshot: {} bytes", size);
@@ -817,7 +831,8 @@ pub(crate) async fn restore_compose_dumps(
             continue;
         }
         let result = async {
-            let plain = snapshot_files::plain_subset_async(root.clone(), vec![file.clone()]).await?;
+            let plain =
+                snapshot_files::plain_subset_async(root.clone(), vec![file.clone()]).await?;
             compose_backup::run_restore(&state.docker, hook, &plain.path().join(&file)).await
         }
         .await;
@@ -1415,10 +1430,18 @@ pub(crate) fn valid_certificate_dirs(
 /// files 0600: certificates and keys belong to tond-proxy alone.
 fn hand_over(path: &Path, owner: &std::fs::Metadata) {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    for entry in walkdir::WalkDir::new(path).follow_links(false).into_iter().flatten() {
+    for entry in walkdir::WalkDir::new(path)
+        .follow_links(false)
+        .into_iter()
+        .flatten()
+    {
         let p = entry.path();
         let _ = std::os::unix::fs::lchown(p, Some(owner.uid()), Some(owner.gid()));
-        let mode = if entry.file_type().is_dir() { 0o700 } else { 0o600 };
+        let mode = if entry.file_type().is_dir() {
+            0o700
+        } else {
+            0o600
+        };
         let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode));
     }
 }
@@ -1726,8 +1749,6 @@ pub fn schedules_changed() {
     crate::runtime::changes::notify(crate::runtime::changes::Table::BackupConfig);
 }
 
-
-
 /// The next run of one cron expression (for the API).
 pub fn next_run(expr: &str) -> Option<chrono::DateTime<Utc>> {
     crate::cron::parse_schedule(expr)
@@ -1865,7 +1886,8 @@ async fn schedule_states(
     let live: Vec<String> = jobs.iter().map(|(j, _)| job_key(j)).collect();
     let mut out = std::collections::HashMap::new();
     for (job, schedule, last_slot) in rows {
-        let parsed = chrono::DateTime::parse_from_rfc3339(&last_slot).map(|t| t.with_timezone(&Utc));
+        let parsed =
+            chrono::DateTime::parse_from_rfc3339(&last_slot).map(|t| t.with_timezone(&Utc));
         match parsed {
             Ok(last) if live.contains(&job) => {
                 out.insert(job, (schedule, last));
@@ -2043,8 +2065,6 @@ async fn emit(tx: &Option<ProgressTx>, step: &str, message: &str, done: bool) {
             .await;
     }
 }
-
-
 
 // ── Remote upload key ─────────────────────────────────────────────────────────
 
@@ -2964,9 +2984,18 @@ mod tests {
         let now = at("2026-03-01T10:30:00Z");
         let jobs = vec![
             (ScheduledJob::Full, "0 3 * * *".to_string()),
-            (ScheduledJob::Database("shop".into()), "0 11 * * *".to_string()),
-            (ScheduledJob::Database("cache".into()), "*/15 * * * *".to_string()),
-            (ScheduledJob::Database("broken".into()), "not a cron".to_string()),
+            (
+                ScheduledJob::Database("shop".into()),
+                "0 11 * * *".to_string(),
+            ),
+            (
+                ScheduledJob::Database("cache".into()),
+                "*/15 * * * *".to_string(),
+            ),
+            (
+                ScheduledJob::Database("broken".into()),
+                "not a cron".to_string(),
+            ),
         ];
         // First sight: nothing runs, every job starts from now.
         let plan = plan_due(&jobs, &HashMap::new(), now, now);
@@ -3000,7 +3029,10 @@ mod tests {
     fn backups_missed_while_down_run_once_as_a_catch_up() {
         let jobs = vec![
             (ScheduledJob::Full, "0 3 * * *".to_string()),
-            (ScheduledJob::Database("shop".into()), "0 * * * *".to_string()),
+            (
+                ScheduledJob::Database("shop".into()),
+                "0 * * * *".to_string(),
+            ),
         ];
         // Last ran at 03:00 on the 1st; the server was down until the 4th 09:20.
         let last = at("2026-03-01T03:00:00Z");
@@ -3010,7 +3042,11 @@ mod tests {
             .collect();
         let started = at("2026-03-04T09:20:00Z");
         let plan = plan_due(&jobs, &states, started, started);
-        assert_eq!(plan.due.len(), 2, "one run per job, not one per missed slot");
+        assert_eq!(
+            plan.due.len(),
+            2,
+            "one run per job, not one per missed slot"
+        );
         assert_eq!(plan.due[0].job, ScheduledJob::Full);
         assert_eq!(plan.due[0].slot, at("2026-03-04T03:00:00Z"));
         assert!(plan.due[0].catch_up);
@@ -3022,7 +3058,10 @@ mod tests {
         let mut changed = states.clone();
         changed.insert("full".into(), ("0 4 * * *".into(), last));
         let plan = plan_due(&jobs, &changed, started, started);
-        assert_eq!(plan.init, vec![("full".to_string(), "0 3 * * *".to_string())]);
+        assert_eq!(
+            plan.init,
+            vec![("full".to_string(), "0 3 * * *".to_string())]
+        );
         assert!(plan.due.iter().all(|d| d.job != ScheduledJob::Full));
     }
 
@@ -3239,6 +3278,22 @@ mod tests {
                         b"<CompleteMultipartUploadResult/>".to_vec(),
                     )
                 }
+                "PUT" => {
+                    store
+                        .objects
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(key, body.to_vec());
+                    (StatusCode::OK, headers, Vec::new())
+                }
+                "DELETE" if !q.contains_key("uploadId") => {
+                    store
+                        .objects
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&key);
+                    (StatusCode::NO_CONTENT, headers, Vec::new())
+                }
                 "DELETE" if q.contains_key("uploadId") => {
                     *store.aborted.lock().unwrap_or_else(|e| e.into_inner()) = true;
                     (StatusCode::NO_CONTENT, headers, Vec::new())
@@ -3256,9 +3311,34 @@ mod tests {
             }
         }
 
+        /// ListObjectsV2 on one line, like AWS answers.
+        async fn list(
+            State(store): State<Store>,
+            Query(q): Query<HashMap<String, String>>,
+        ) -> impl IntoResponse {
+            let prefix = q.get("prefix").cloned().unwrap_or_default();
+            let objects = store.objects.lock().unwrap_or_else(|e| e.into_inner());
+            let mut keys: Vec<&String> =
+                objects.keys().filter(|k| k.starts_with(&prefix)).collect();
+            keys.sort();
+            let contents: String = keys
+                .iter()
+                .map(|k| {
+                    format!(
+                        "<Contents><Key>{k}</Key><Size>{}</Size></Contents>",
+                        objects[*k].len()
+                    )
+                })
+                .collect();
+            format!(
+                "<ListBucketResult><IsTruncated>false</IsTruncated>{contents}</ListBucketResult>"
+            )
+        }
+
         /// Serve the fake bucket; returns its base URL.
         pub async fn serve(store: Store) -> String {
             let app = Router::new()
+                .route("/{bucket}", axum::routing::get(list))
                 .route("/{bucket}/{*key}", any(handle))
                 .layer(axum::extract::DefaultBodyLimit::disable())
                 .with_state(store);
@@ -3392,6 +3472,212 @@ mod tests {
         fs::write(&download, &stored).unwrap_or_else(|e| panic!("{e}"));
         assert!(unpack_verified(&download, &target, "snap-2").is_err());
         assert!(!target.exists());
+    }
+
+    /// A server that never took the snapshot finds it in the bucket, sees
+    /// what it holds, imports it and restores from it; a snapshot made with
+    /// another TOND_SECRET_KEY is shown as such and refused with a clear
+    /// error before anything is downloaded.
+    #[tokio::test]
+    async fn a_fresh_server_lists_imports_and_fetches_remote_snapshots() {
+        let temp = temp_dir();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe {
+            std::env::set_var("TOND_DATA_DIR", temp.path().join("data"));
+        }
+        let store = fake_s3::Store::default();
+        let endpoint = fake_s3::serve(store.clone()).await;
+        let provider = fake_provider(&endpoint);
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO storage_providers (id, name, kind, config) VALUES (?, ?, 's3', ?)",
+        )
+        .bind(&provider.id)
+        .bind(&provider.name)
+        .bind(&provider.config)
+        .execute(&state.db)
+        .await
+        .unwrap_or_else(|e| panic!("provider: {e}"));
+
+        // The old server's snapshot: a local copy, archived and uploaded.
+        let id = "0b7c1f2e-0000-4000-8000-000000000001";
+        let plain = temp.path().join("plain");
+        fs::create_dir_all(plain.join("volumes/web")).unwrap_or_else(|e| panic!("{e}"));
+        fs::write(plain.join("volumes/web/index.html"), b"hello").unwrap_or_else(|e| panic!("{e}"));
+        let local = temp.path().join("old-server-snapshot");
+        snapshot_files::encrypt_tree(&plain, &local, None).unwrap_or_else(|e| panic!("{e:#}"));
+        let manifest = json!({
+            "id": id, "name": "Nightly", "trigger": "scheduled", "scope": "full",
+            "created_at": "2026-10-01T03:00:00+00:00", "tond_version": "0.2.0",
+            "apps_included": ["web"], "databases_included": [], "total_bytes": 5,
+        });
+        snapshot_files::write_encrypted(
+            &local.join(MANIFEST_FILE),
+            &serde_json::to_vec(&manifest).unwrap_or_default(),
+        )
+        .unwrap_or_else(|e| panic!("{e:#}"));
+        let (summary, archive) = archive_snapshot_dir(&local, Vec::new(), id)
+            .unwrap_or_else(|e| panic!("archive: {e:#}"));
+        let remote = snapshot_remote::remote_manifest(
+            &local,
+            id,
+            &snapshot_remote::archive_key(id),
+            &summary,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("manifest: {e:#}"));
+        // Another server's snapshot, sealed with its own key.
+        let foreign_id = "0b7c1f2e-0000-4000-8000-000000000002";
+        let mut foreign = remote.clone();
+        foreign.id = foreign_id.to_string();
+        foreign.archive_key = snapshot_remote::archive_key(foreign_id);
+        foreign.sealed = secret_key::encrypt_with(
+            &secret_key::Key::derive("the-other-servers-key"),
+            secret_key::Purpose::SnapshotManifest,
+            "{}",
+        )
+        .unwrap_or_default();
+        {
+            let mut objects = store.objects.lock().unwrap_or_else(|e| e.into_inner());
+            objects.insert(
+                format!("tond/{}", snapshot_remote::archive_key(id)),
+                archive,
+            );
+            objects.insert(
+                format!("tond/{}", snapshot_remote::manifest_key(id)),
+                serde_json::to_vec(&remote).unwrap_or_default(),
+            );
+            objects.insert(
+                format!("tond/{}", snapshot_remote::manifest_key(foreign_id)),
+                serde_json::to_vec(&foreign).unwrap_or_default(),
+            );
+            objects.insert("tond/snapshots/stray.txt".to_string(), b"x".to_vec());
+        }
+
+        let listed = snapshot_remote::list_remote(&state, Some(provider.id.clone()))
+            .await
+            .unwrap_or_else(|e| panic!("list: {}", e.0));
+        assert_eq!(listed.len(), 2, "{listed:?}");
+        let mine = listed
+            .iter()
+            .find(|s| s.id == id)
+            .unwrap_or_else(|| panic!("listed"));
+        assert!(mine.readable && !mine.imported);
+        assert_eq!(mine.apps, vec!["web".to_string()]);
+        assert_eq!(mine.scope.as_deref(), Some("full"));
+        let other = listed
+            .iter()
+            .find(|s| s.id == foreign_id)
+            .unwrap_or_else(|| panic!("listed"));
+        assert!(!other.readable && other.name.is_none());
+
+        let refused = snapshot_remote::import_remote(&state, Some(provider.id.clone()), foreign_id)
+            .await
+            .err()
+            .map(|e| e.0.code())
+            .unwrap_or_default();
+        assert_eq!(refused, tond_common::code::SNAPSHOT_KEY_MISMATCH);
+
+        let row = snapshot_remote::import_remote(&state, Some(provider.id.clone()), id)
+            .await
+            .unwrap_or_else(|e| panic!("import: {}", e.0));
+        assert_eq!(
+            (row.scope.as_str(), row.status.as_str()),
+            ("full", "completed")
+        );
+        assert!(row.local_path.is_none() && row.remote_key.is_some());
+        let again = snapshot_remote::list_remote(&state, Some(provider.id.clone()))
+            .await
+            .unwrap_or_else(|e| panic!("list: {}", e.0));
+        assert!(again.iter().any(|s| s.id == id && s.imported));
+
+        // A restore fetches it: downloaded, checked, encrypted at rest again.
+        let dir = ensure_local(&state, &row)
+            .await
+            .unwrap_or_else(|e| panic!("fetch: {e:#}"));
+        assert_eq!(dir, snapshot_dir(id));
+        assert_eq!(
+            snapshot_files::read_encrypted(&dir.join("volumes/web/index.html")).ok(),
+            Some(b"hello".to_vec())
+        );
+        assert_eq!(
+            read_manifest(&dir).await.ok().map(|m| m["name"].clone()),
+            Some(json!("Nightly"))
+        );
+    }
+
+    /// An exported archive imports into a local snapshot (and twice is once);
+    /// another server's archive is refused as a key mismatch.
+    #[tokio::test]
+    async fn exported_archives_import_as_local_snapshots() {
+        let temp = temp_dir();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe {
+            std::env::set_var("TOND_DATA_DIR", temp.path().join("data"));
+        }
+        let state = test_state().await;
+        let id = "0b7c1f2e-0000-4000-8000-000000000003";
+        let local = temp.path().join("snap");
+        fs::create_dir_all(&local).unwrap_or_else(|e| panic!("{e}"));
+        snapshot_files::write_encrypted(
+            &local.join(MANIFEST_FILE),
+            &serde_json::to_vec(&json!({
+                "id": id, "name": "Export", "trigger": "manual", "scope": "full",
+                "created_at": "2026-10-01T03:00:00+00:00", "total_bytes": 0,
+            }))
+            .unwrap_or_default(),
+        )
+        .unwrap_or_else(|e| panic!("{e:#}"));
+        let file = temp.path().join("export.tondsnap");
+        let out = fs::File::create(&file).unwrap_or_else(|e| panic!("{e}"));
+        archive_snapshot_dir(&local, out, id).unwrap_or_else(|e| panic!("{e:#}"));
+
+        let row = snapshot_remote::import_archive_file(&state, &file)
+            .await
+            .unwrap_or_else(|e| panic!("import: {}", e.0));
+        assert_eq!((row.id.as_str(), row.name.as_str()), (id, "Export"));
+        assert_eq!(
+            row.local_path.as_deref().map(PathBuf::from),
+            Some(snapshot_dir(id))
+        );
+        let twice = snapshot_remote::import_archive_file(&state, &file)
+            .await
+            .unwrap_or_else(|e| panic!("again: {}", e.0));
+        assert_eq!(twice.id, id);
+
+        let foreign = temp.path().join("foreign.tondsnap");
+        let out = fs::File::create(&foreign).unwrap_or_else(|e| panic!("{e}"));
+        snapshot_archive::write_archive(
+            &temp.path().join("data"),
+            out,
+            "the-other-servers-key",
+            snapshot_files::archive_kind(),
+            "0b7c1f2e-0000-4000-8000-000000000004",
+            snapshot_archive::Source::Plain,
+        )
+        .unwrap_or_else(|e| panic!("{e:#}"));
+        let refused = snapshot_remote::import_archive_file(&state, &foreign)
+            .await
+            .err()
+            .map(|e| e.0.code())
+            .unwrap_or_default();
+        assert_eq!(refused, tond_common::code::SNAPSHOT_KEY_MISMATCH);
+    }
+
+    #[test]
+    fn only_certificates_valid_for_another_day_come_back() {
+        let manifest = json!({ "certificates": [
+            { "dir": "example.com", "expires_at": "2026-12-01T00:00:00Z" },
+            { "dir": "_wildcard.apps.example.com", "expires_at": "2026-12-01 00:00:00" },
+            { "dir": "soon.example.com", "expires_at": "2026-10-01T12:00:00Z" },
+            { "dir": "../escape", "expires_at": "2027-01-01T00:00:00Z" },
+            { "dir": "broken.example.com", "expires_at": "not a date" },
+        ]});
+        assert_eq!(
+            valid_certificate_dirs(&manifest, at("2026-10-01T00:00:00Z")),
+            vec!["example.com", "_wildcard.apps.example.com"]
+        );
+        assert!(valid_certificate_dirs(&json!({}), at("2026-10-01T00:00:00Z")).is_empty());
     }
 
     /// Verify, then extract an archive file into a local snapshot directory.

@@ -557,7 +557,9 @@ fn parse_list_objects_response(xml: &str) -> anyhow::Result<Vec<RemoteObject>> {
         };
         objects.push(RemoteObject {
             key: xml_unescape(&key),
-            size: first("Size").and_then(|s| s.trim().parse().ok()).unwrap_or(0),
+            size: first("Size")
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0),
             last_modified: first("LastModified").unwrap_or_default(),
         });
     }

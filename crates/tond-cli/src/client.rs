@@ -49,11 +49,10 @@ use tond_common::{
     CronJobResponse, CronJobRun, DatabaseCredentialsResponse, DeployKeyResponse,
     DeploymentResponse, IntegrationResponse, ManagedDatabaseDetail, ManagedDatabaseResponse,
     PasswordLinkResponse, PreviewDeploymentResponse, ProjectPreviewResponse, ProjectResponse,
-    RemoteSnapshotResponse,
-    ServerSettings, SnapshotResponse, StorageProviderResponse, TemplateCatalogResponse,
-    TemplateDeployRequest, TemplateDeployResponse, TokenResponse, UpdateAppDomainRequest,
-    UpdateCronJobRequest, UpdateSettingsRequest, UserResponse, WebhookConfigResponse,
-    WebhookSecretResponse, WwwPairRequest, code,
+    RemoteSnapshotResponse, ServerSettings, SnapshotResponse, StorageProviderResponse,
+    TemplateCatalogResponse, TemplateDeployRequest, TemplateDeployResponse, TokenResponse,
+    UpdateAppDomainRequest, UpdateCronJobRequest, UpdateSettingsRequest, UserResponse,
+    WebhookConfigResponse, WebhookSecretResponse, WwwPairRequest, code,
 };
 
 use crate::error::CliError;
@@ -1410,7 +1409,11 @@ impl TondClient {
         }
         let body = resp.text().await.unwrap_or_default();
         parse_envelope::<Value>(status, &body)?;
-        Err(CliError::status_only(status.as_u16(), format!("The server answered HTTP {status}")).into())
+        Err(CliError::status_only(
+            status.as_u16(),
+            format!("The server answered HTTP {status}"),
+        )
+        .into())
     }
 
     /// GET /api/v1/snapshots/{id}/archive into `dest` (written next to it
@@ -1433,9 +1436,8 @@ impl TondClient {
         let mut stream = resp.bytes_stream();
         let written: Result<()> = async {
             while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|e| {
-                    CliError::unreachable(format!("The download broke off: {e}"))
-                })?;
+                let chunk = chunk
+                    .map_err(|e| CliError::unreachable(format!("The download broke off: {e}")))?;
                 hasher.update(&chunk);
                 bytes += chunk.len() as u64;
                 file.write_all(&chunk).await?;

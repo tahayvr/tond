@@ -12,6 +12,12 @@
 //   POST   /api/v1/snapshots/{id}/restore-database  — Database-scope restore (no restart)
 //   GET    /api/v1/databases/{id}/backups           — snapshots that hold one database
 //   POST   /api/v1/databases/{id}/backups           — back up one database now
+//   GET    /api/v1/snapshots/remote                 — snapshots in a storage bucket
+//   POST   /api/v1/snapshots/remote/{id}/import     — list a bucket's snapshot here
+//   POST   /api/v1/snapshots/import                 — import an exported archive
+//   GET    /api/v1/snapshots/{id}/archive           — export: the encrypted archive
+//   GET    /api/v1/snapshots/{id}/manifest          — what a snapshot holds
+//   POST   /api/v1/snapshots/{id}/upload            — upload to a storage provider now
 //
 // Remote copies of snapshots are encrypted with a key derived from
 // TOND_SECRET_KEY: restoring them on another server needs the same key.
@@ -36,8 +42,8 @@ use crate::audit_log::{AuditEntry, record};
 use crate::{
     auth::{Authz, RateLimit, scope},
     backup::{self, SnapshotTrigger},
-    snapshot_remote,
     error::AppError,
+    snapshot_remote,
     state::AppState,
 };
 
@@ -580,7 +586,10 @@ pub async fn import_remote_snapshot(
             .detail("from=storage"),
     )
     .await;
-    Ok((StatusCode::OK, Json(ApiResponse::ok(SnapshotResponse::from(snap)))))
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(SnapshotResponse::from(snap))),
+    ))
 }
 
 /// POST /api/v1/snapshots/{id}/upload — upload a snapshot's encrypted
@@ -599,10 +608,12 @@ pub async fn upload_snapshot(
     let dir = backup::ensure_local(&state, &snap)
         .await
         .map_err(|e| AppError(TondError::Internal(format!("{e:#}"))))?;
-    sqlx::query("UPDATE snapshots SET remote_status = 'uploading', remote_error = NULL WHERE id = ?")
-        .bind(&id)
-        .execute(&state.db)
-        .await?;
+    sqlx::query(
+        "UPDATE snapshots SET remote_status = 'uploading', remote_error = NULL WHERE id = ?",
+    )
+    .bind(&id)
+    .execute(&state.db)
+    .await?;
     let worker = state.clone();
     let (sid, sp) = (id.clone(), provider.id.clone());
     crate::runtime::shutdown::spawn_tracked(async move {
