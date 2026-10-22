@@ -105,6 +105,15 @@ export function buildPaletteEntries(
 		'new:alert': 'settings:write'
 	};
 	entries.push(...creators.filter((e) => can(creatorScopes[e.id])));
+	if (can('snapshots:restore')) {
+		entries.push({
+			id: 'act:restore-storage',
+			group: 'Actions',
+			label: 'Restore from storage',
+			keywords: ['snapshot', 'backup', 's3', 'import', 'migrate', 'move server'],
+			href: '/snapshots?tab=storage'
+		});
+	}
 
 	entries.push(
 		{
