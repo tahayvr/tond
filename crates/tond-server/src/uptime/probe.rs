@@ -23,8 +23,8 @@
 //                                issuing root, which no browser trusts)
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use rustls::pki_types::{CertificateDer, ServerName};
@@ -189,7 +189,44 @@ struct Ctx {
     cert_expires_at: Option<i64>,
 }
 
-/// Probes share one TLS configuration per round.
+/// The TLS client configuration every round reuses, built once (the root
+/// store copies ~150 anchors).
+static TLS: LazyLock<tokio_rustls::TlsConnector> = LazyLock::new(|| tls_connector(Vec::new()));
+
+/// Mozilla roots + `extra` + TOND_UPTIME_CA_FILE.
+fn tls_connector(extra: Vec<CertificateDer<'static>>) -> tokio_rustls::TlsConnector {
+    tond_common::install_crypto_provider();
+    let mut roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    for cert in extra {
+        let _ = roots.add(cert);
+    }
+    if let Ok(path) = std::env::var("TOND_UPTIME_CA_FILE")
+        && !path.is_empty()
+    {
+        use rustls::pki_types::pem::PemObject;
+        match CertificateDer::pem_file_iter(&path) {
+            Ok(certs) => {
+                for cert in certs.flatten() {
+                    let _ = roots.add(cert);
+                }
+            }
+            Err(e) => tracing::debug!("uptime: cannot read TOND_UPTIME_CA_FILE {path}: {e}"),
+        }
+    }
+    let mut config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    // Every probe does a full handshake: a resumed session carries no
+    // certificate, so its expiry could not be read or a replaced (or
+    // expired) certificate re-verified.
+    config.resumption = rustls::client::Resumption::disabled();
+    tokio_rustls::TlsConnector::from(Arc::new(config))
+}
+
+/// One round of probes: the shared TLS configuration and this server's
+/// addresses as of the round.
 pub struct Prober {
     tls: tokio_rustls::TlsConnector,
     resolve_override: Option<IpAddr>,
@@ -199,45 +236,26 @@ pub struct Prober {
 }
 
 impl Prober {
-    /// Build the TLS configuration (Mozilla roots + TOND_UPTIME_CA_FILE) and
-    /// read this server's addresses.
+    /// Reuse the shared TLS configuration and read this server's addresses.
     pub fn new() -> Self {
-        Self::with_extra_roots(Vec::new())
+        Self::with_tls(TLS.clone())
     }
 
-    fn with_extra_roots(extra: Vec<CertificateDer<'static>>) -> Self {
-        tond_common::install_crypto_provider();
-        let mut roots = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        for cert in extra {
-            let _ = roots.add(cert);
-        }
-        if let Ok(path) = std::env::var("TOND_UPTIME_CA_FILE")
-            && !path.is_empty()
-        {
-            use rustls::pki_types::pem::PemObject;
-            match CertificateDer::pem_file_iter(&path) {
-                Ok(certs) => {
-                    for cert in certs.flatten() {
-                        let _ = roots.add(cert);
-                    }
-                }
-                Err(e) => tracing::debug!("uptime: cannot read TOND_UPTIME_CA_FILE {path}: {e}"),
-            }
-        }
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+    fn with_tls(tls: tokio_rustls::TlsConnector) -> Self {
         let resolve_override = std::env::var("TOND_UPTIME_RESOLVE")
             .ok()
             .and_then(|v| v.trim().parse().ok());
         Self {
-            tls: tokio_rustls::TlsConnector::from(Arc::new(config)),
+            tls,
             resolve_override,
             server_ips: tond_common::dns::server_addresses(),
             port: 443,
         }
+    }
+
+    #[cfg(test)]
+    fn with_extra_roots(extra: Vec<CertificateDer<'static>>) -> Self {
+        Self::with_tls(tls_connector(extra))
     }
 
     /// Probe once, within `spec.timeout`.

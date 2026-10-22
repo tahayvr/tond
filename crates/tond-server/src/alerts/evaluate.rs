@@ -10,9 +10,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use sqlx::{Sqlite, SqlitePool, Transaction};
+use tokio::sync::watch;
 use tond_common::{
     ALERT_SNOOZE_UNTIL_RESOLVED, AlertComparison, AlertKindInfo, AlertRule, AlertScope,
     ChannelQuietHours, QuietHours, alert_kind,
@@ -24,6 +26,7 @@ use super::quiet;
 use super::sources::{self, Forecast, RequestWindow};
 use crate::metrics;
 use crate::notifications::NoticeEvent;
+use crate::runtime::changes::{self, Table};
 
 /// One target's reading for a rule.
 #[derive(Debug, Clone, PartialEq)]
@@ -139,8 +142,75 @@ struct Ctx<'a> {
     source: &'a Source,
     apps: Option<Vec<AppRow>>,
     mem_limits: Option<HashMap<String, i64>>,
+    certs: Option<Vec<(String, String)>>,
     requests: HashMap<i64, Option<HashMap<String, RequestWindow>>>,
     global_quiet: Option<QuietHours>,
+}
+
+/// Reload cached inputs at least this often, even without a change
+/// notification (writes behind tond-server's back, e.g. sqlite3 by hand).
+const CACHE_MAX_AGE: Duration = Duration::from_secs(600);
+
+/// What the metrics tick's evaluations keep between ticks: the enabled
+/// rules, the apps and the certificates (dropped when alert_rules, apps or
+/// certificates change, see runtime::changes) and the apps' memory limits
+/// (dropped when the collector writes new targets or limits). An idle
+/// server with rules then runs only the queries whose answers move: the
+/// alert states and request windows.
+pub struct EvalCache {
+    changes: Vec<watch::Receiver<u64>>,
+    loaded_at: Option<Instant>,
+    rules: Option<Vec<AlertRule>>,
+    apps: Option<Vec<AppRow>>,
+    certs: Option<Vec<(String, String)>>,
+    mem_limits: Option<(u64, HashMap<String, i64>)>,
+}
+
+impl Default for EvalCache {
+    fn default() -> Self {
+        Self {
+            changes: [Table::AlertRules, Table::Apps, Table::Certificates]
+                .into_iter()
+                .map(changes::subscribe)
+                .collect(),
+            loaded_at: None,
+            rules: None,
+            apps: None,
+            certs: None,
+            mem_limits: None,
+        }
+    }
+}
+
+impl EvalCache {
+    /// Drop what may be stale.
+    async fn refresh(&mut self) {
+        let changed = self
+            .changes
+            .iter()
+            .any(|rx| rx.has_changed().unwrap_or(true));
+        for rx in &mut self.changes {
+            rx.mark_unchanged();
+        }
+        if changed || self.loaded_at.is_none_or(|t| t.elapsed() > CACHE_MAX_AGE) {
+            if changed {
+                // The commit hook fires just before the commit is visible.
+                tokio::time::sleep(changes::SETTLE).await;
+            }
+            self.loaded_at = Some(Instant::now());
+            self.rules = None;
+            self.apps = None;
+            self.certs = None;
+            self.mem_limits = None;
+        }
+        if self
+            .mem_limits
+            .as_ref()
+            .is_some_and(|(generation, _)| *generation != metrics::store::targets_generation())
+        {
+            self.mem_limits = None;
+        }
+    }
 }
 
 impl Ctx<'_> {
@@ -172,6 +242,20 @@ impl Ctx<'_> {
             self.mem_limits = Some(rows.into_iter().collect());
         }
         Ok(self.mem_limits.get_or_insert_with(HashMap::new))
+    }
+
+    /// `(domain, expires_at)` of every served certificate.
+    async fn certs(&mut self) -> Result<&Vec<(String, String)>> {
+        if self.certs.is_none() {
+            let rows = sqlx::query_as(
+                "SELECT domain, expires_at FROM certificates
+                 WHERE cert_type IN ('acme', 'custom') AND status IN ('active', 'expired')",
+            )
+            .fetch_all(self.db)
+            .await?;
+            self.certs = Some(rows);
+        }
+        Ok(self.certs.get_or_insert_with(Vec::new))
     }
 
     async fn requests(&mut self, window: i64) -> Result<Option<HashMap<String, RequestWindow>>> {
@@ -355,12 +439,7 @@ async fn observe(
             });
         }
         AlertScope::Certificate => {
-            let certs: Vec<(String, String)> = sqlx::query_as(
-                "SELECT domain, expires_at FROM certificates
-                 WHERE cert_type IN ('acme', 'custom') AND status IN ('active', 'expired')",
-            )
-            .fetch_all(ctx.db)
-            .await?;
+            let certs = ctx.certs().await?.clone();
             for (domain, expires_at) in certs {
                 let Some(expires) = parse_ts(&expires_at) else {
                     continue;
@@ -442,6 +521,7 @@ pub fn backup_observation(scope: &str, failed: bool) -> Observation {
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct StateRow {
+    rule_id: String,
     target: String,
     target_label: String,
     state: String,
@@ -469,10 +549,30 @@ impl StateRow {
 
 /// Evaluate every enabled rule once.
 pub async fn evaluate(db: &SqlitePool, now: i64, source: &Source) -> Result<Report> {
+    evaluate_with(db, now, source, None).await
+}
+
+/// `evaluate`, reusing (and refilling) `cache` across calls.
+pub async fn evaluate_with(
+    db: &SqlitePool,
+    now: i64,
+    source: &Source,
+    mut cache: Option<&mut EvalCache>,
+) -> Result<Report> {
     let _guard = EVAL_LOCK.lock().await;
-    let rules = sqlx::query_as::<_, AlertRule>("SELECT * FROM alert_rules WHERE enabled = 1")
-        .fetch_all(db)
-        .await?;
+    let mem_generation = metrics::store::targets_generation();
+    if let Some(c) = cache.as_deref_mut() {
+        c.refresh().await;
+    }
+    let cached_rules = cache.as_deref_mut().and_then(|c| c.rules.take());
+    let rules = match cached_rules {
+        Some(rules) => rules,
+        None => {
+            sqlx::query_as::<_, AlertRule>("SELECT * FROM alert_rules WHERE enabled = 1")
+                .fetch_all(db)
+                .await?
+        }
+    };
     let mut report = Report {
         rules: rules.len(),
         ..Report::default()
@@ -481,19 +581,41 @@ pub async fn evaluate(db: &SqlitePool, now: i64, source: &Source) -> Result<Repo
         db,
         now,
         source,
-        apps: None,
-        mem_limits: None,
+        apps: cache.as_deref_mut().and_then(|c| c.apps.take()),
+        mem_limits: cache
+            .as_deref_mut()
+            .and_then(|c| c.mem_limits.take())
+            .map(|(_, m)| m),
+        certs: cache.as_deref_mut().and_then(|c| c.certs.take()),
         requests: HashMap::new(),
         global_quiet: None,
     };
+    let report_result = evaluate_rules(&mut ctx, &rules, &mut report).await;
+    if let Some(c) = cache {
+        c.rules = Some(rules);
+        c.apps = ctx.apps.take();
+        c.certs = ctx.certs.take();
+        c.mem_limits = ctx.mem_limits.take().map(|m| (mem_generation, m));
+    }
+    report_result.map(|()| report)
+}
+
+async fn evaluate_rules(ctx: &mut Ctx<'_>, rules: &[AlertRule], report: &mut Report) -> Result<()> {
+    let db = ctx.db;
+    let mut states = if rules.is_empty() {
+        HashMap::new()
+    } else {
+        load_states(db).await?
+    };
     let mut first_error = None;
-    for rule in &rules {
+    for rule in rules {
         let Some(info) = alert_kind(&rule.kind) else {
             continue;
         };
+        let rule_states = states.remove(&rule.id).unwrap_or_default();
         let result = async {
-            let obs = observe(&mut ctx, rule, info).await?;
-            apply(&mut ctx, rule, obs, &mut report).await
+            let obs = observe(ctx, rule, info).await?;
+            apply(ctx, rule, obs, rule_states, report).await
         }
         .await;
         if let Err(e) = result {
@@ -503,27 +625,37 @@ pub async fn evaluate(db: &SqlitePool, now: i64, source: &Source) -> Result<Repo
     }
     match first_error {
         Some(e) if report.rules == 1 => Err(e),
-        _ => Ok(report),
+        _ => Ok(()),
     }
 }
 
-/// Advance the states of one rule from its observations.
+/// Every stored state, grouped by rule: one query per evaluation, however
+/// many rules there are.
+async fn load_states(db: &SqlitePool) -> Result<HashMap<String, Vec<StateRow>>> {
+    let rows: Vec<StateRow> = sqlx::query_as(
+        "SELECT s.rule_id, s.target, s.target_label, s.state, s.since, s.value, s.episode_id,
+                s.snoozed_until, h.fired_at, h.acknowledged_at, h.last_notified_at
+         FROM alert_states s LEFT JOIN alert_history h ON h.id = s.episode_id",
+    )
+    .fetch_all(db)
+    .await?;
+    let mut by_rule: HashMap<String, Vec<StateRow>> = HashMap::new();
+    for row in rows {
+        by_rule.entry(row.rule_id.clone()).or_default().push(row);
+    }
+    Ok(by_rule)
+}
+
+/// Advance the states of one rule (`states`: its stored rows) from its
+/// observations.
 async fn apply(
     ctx: &mut Ctx<'_>,
     rule: &AlertRule,
     observations: Vec<Observation>,
+    states: Vec<StateRow>,
     report: &mut Report,
 ) -> Result<()> {
     let now = ctx.now;
-    let states: Vec<StateRow> = sqlx::query_as(
-        "SELECT s.target, s.target_label, s.state, s.since, s.value, s.episode_id,
-                s.snoozed_until, h.fired_at, h.acknowledged_at, h.last_notified_at
-         FROM alert_states s LEFT JOIN alert_history h ON h.id = s.episode_id
-         WHERE s.rule_id = ?",
-    )
-    .bind(&rule.id)
-    .fetch_all(ctx.db)
-    .await?;
     let mut by_target: HashMap<String, StateRow> =
         states.into_iter().map(|s| (s.target.clone(), s)).collect();
 

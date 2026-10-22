@@ -522,6 +522,33 @@ struct FrameTags {
     service: Option<String>,
 }
 
+/// `{"type":"container","ts":…,"line":…}` plus the follower's tags,
+/// serialised straight from borrowed fields (no intermediate JSON map per
+/// line: a busy container streams thousands of lines a second).
+struct ContainerFrame<'a> {
+    ts: Option<&'a str>,
+    line: &'a str,
+    tags: &'a FrameTags,
+}
+
+impl serde::Serialize for ContainerFrame<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("type", "container")?;
+        map.serialize_entry("ts", &self.ts)?;
+        map.serialize_entry("line", self.line)?;
+        if let Some((id_field, name_field, id, name)) = &self.tags.tag {
+            map.serialize_entry(*id_field, id)?;
+            map.serialize_entry(*name_field, name)?;
+        }
+        if let Some(service) = &self.tags.service {
+            map.serialize_entry("service", service)?;
+        }
+        map.end()
+    }
+}
+
 /// Follow one container's logs until the stream ends or the receiver is gone.
 async fn follow_container(
     tx: mpsc::Sender<String>,
@@ -545,18 +572,19 @@ async fn follow_container(
     while let Some(result) = stream.next().await {
         match result {
             Ok(output) => {
-                let raw = output.to_string();
+                // Borrowed unless the line is not valid UTF-8.
+                let raw = String::from_utf8_lossy(output.as_ref());
                 let (ts, line) = split_docker_ts(&raw);
                 let line = scrub.line(line).await;
-                let mut frame = json!({ "type": "container", "ts": ts, "line": line });
-                if let Some((id_field, name_field, id, name)) = &tags.tag {
-                    frame[*id_field] = json!(id);
-                    frame[*name_field] = json!(name);
-                }
-                if let Some(service) = &tags.service {
-                    frame["service"] = json!(service);
-                }
-                if tx.send(frame.to_string()).await.is_err() {
+                let frame = ContainerFrame {
+                    ts,
+                    line: &line,
+                    tags: &tags,
+                };
+                let Ok(text) = serde_json::to_string(&frame) else {
+                    continue;
+                };
+                if tx.send(text).await.is_err() {
                     return;
                 }
             }
@@ -1111,6 +1139,38 @@ async fn poll_cron_runs(
 mod tests {
     use super::*;
     use crate::log_bus::DeployLogEvent;
+
+    #[test]
+    fn container_frames_carry_the_line_and_the_follower_tags() {
+        let frame = |ts, tags: &FrameTags| {
+            let text = serde_json::to_string(&ContainerFrame {
+                ts,
+                line: "hello \"world\"",
+                tags,
+            })
+            .unwrap_or_default();
+            serde_json::from_str::<serde_json::Value>(&text).unwrap_or_default()
+        };
+        let plain = FrameTags {
+            tag: None,
+            service: None,
+        };
+        assert_eq!(
+            frame(None, &plain),
+            json!({ "type": "container", "ts": null, "line": "hello \"world\"" })
+        );
+        let tagged = FrameTags {
+            tag: Some(("app_id", "app_name", "a1".into(), "web".into())),
+            service: Some("db".into()),
+        };
+        assert_eq!(
+            frame(Some("2026-01-01T00:00:00Z"), &tagged),
+            json!({
+                "type": "container", "ts": "2026-01-01T00:00:00Z", "line": "hello \"world\"",
+                "app_id": "a1", "app_name": "web", "service": "db",
+            })
+        );
+    }
 
     fn target(key: &str, cid: &str) -> FollowTarget {
         FollowTarget {
