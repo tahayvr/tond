@@ -83,7 +83,15 @@ error() { echo -e "${RED}[update]${NC} $*" >&2; }
 step_banner() { echo -e "\n${CYAN}▶${NC} ${BOLD}$*${NC}"; }
 
 # ── Release signatures (keep in sync: install.sh, update.sh, web/install.sh,
-# web/update.sh; crates/tond-cli/src/signature.rs has the same policy) ──
+# web/update.sh — byte for byte, a test compares them; crates/tond-common/src/release.rs
+# and crates/tond-cli/src/signature.rs have the same rules) ──
+#
+# Where releases come from: TOND_RELEASE_BASE, else the first line of
+# <install dir>/RELEASE_BASE (install.sh writes it when run with a
+# non-default base), else the public GitHub releases. A release's files are at
+# <base>/download/<tag>/tond-linux-<arch>.tar.gz (+ .sha256, .minisig), and
+# <base>/latest names the latest release (GitHub redirects it to
+# .../releases/tag/<tag>; a plain file server serves a file holding the tag).
 #
 # Releases are signed with minisign (release/SIGNING.md). A signature that is
 # present must verify; a missing one is refused unless the release predates
@@ -92,6 +100,63 @@ step_banner() { echo -e "\n${CYAN}▶${NC} ${BOLD}$*${NC}"; }
 # minisign's default "ED" signatures are).
 TOND_RELEASE_PUBKEY="RWRyw6SNQq+I90HcxHS9ho+7FUE9drT12DfUN0W1vyS7nU3W6PZ0XeXL"
 TOND_UNSIGNED_RELEASES="v0.1.0"
+TOND_DEFAULT_RELEASE_BASE="https://github.com/tahayvr/tond/releases"
+
+# release_base — the release base URL, without a trailing slash.
+release_base() {
+    _rb="${TOND_RELEASE_BASE:-}"
+    if [ -z "$_rb" ] && [ -r "${TOND_INSTALL_DIR:-/opt/tond}/RELEASE_BASE" ]; then
+        _rb="$(head -n 1 "${TOND_INSTALL_DIR:-/opt/tond}/RELEASE_BASE" | tr -d '[:space:]')"
+    fi
+    _rb="${_rb:-$TOND_DEFAULT_RELEASE_BASE}"
+    printf '%s\n' "${_rb%/}"
+}
+
+# release_asset_url TAG FILE — where FILE of release TAG is downloaded from.
+release_asset_url() {
+    printf '%s/download/%s/%s\n' "$(release_base)" "$1" "$2"
+}
+
+# valid_release_tag TAG — v<digit>..., only [A-Za-z0-9.+-] (it goes into a URL).
+valid_release_tag() {
+    case "$1" in v[0-9]*) ;; *) return 1 ;; esac
+    case "$1" in *[!A-Za-z0-9.+-]*) return 1 ;; esac
+    return 0
+}
+
+# release_fetch URL DEST — download URL to DEST with curl or wget.
+release_fetch() {
+    if command -v curl > /dev/null 2>&1; then
+        curl -fsSL -o "$2" "$1"
+    else
+        wget -qO "$2" "$1"
+    fi
+}
+
+# release_sha256 FILE — the file's SHA-256, lowercase hex.
+release_sha256() {
+    if command -v sha256sum > /dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
+# latest_release_tag — the tag of the latest release (e.g. v0.2.0).
+latest_release_tag() {
+    _lr_url="$(release_base)/latest"
+    _lr_body=$(mktemp) || return 1
+    if command -v curl > /dev/null 2>&1; then
+        _lr_final=$(curl -fsSL -o "$_lr_body" -w '%{url_effective}' "$_lr_url") || _lr_final=""
+    else
+        _lr_final=$(wget -S -O "$_lr_body" "$_lr_url" 2>&1 | sed -n 's/^ *[Ll]ocation: *//p' | tail -n 1 | tr -d '\r')
+    fi
+    _lr_tag=$(printf '%s\n' "$_lr_final" | sed -n 's#.*/releases/tag/\([^/?#]*\).*#\1#p')
+    valid_release_tag "$_lr_tag" || _lr_tag=$(head -n 1 "$_lr_body" | tr -d '[:space:]')
+    rm -f "$_lr_body"
+    valid_release_tag "$_lr_tag" || return 1
+    printf '%s\n' "$_lr_tag"
+}
 
 # verify_minisig FILE SIGFILE PUBKEY_B64 — succeeds when SIGFILE is a valid
 # prehashed minisign signature of FILE by PUBKEY_B64.
@@ -153,14 +218,30 @@ check_release_signature() {
     return 1
 }
 
-# latest_release_tag — the tag of the latest GitHub release (e.g. v0.2.0).
-latest_release_tag() {
-    _lr_api="https://api.github.com/repos/tahayvr/tond/releases/latest"
-    if command -v curl > /dev/null 2>&1; then
-        curl -fsSL "$_lr_api"
-    else
-        wget -qO- "$_lr_api"
-    fi | sed -n 's/.*"tag_name": *"\(v[^"]*\)".*/\1/p' | head -n 1
+# fetch_verified_release TAG BUNDLE DIR — download BUNDLE.tar.gz of release TAG
+# (e.g. v0.2.0 tond-linux-x86_64) to DIR/tond.tar.gz and verify its checksum
+# and signature. Prints why and fails when it can't be used.
+fetch_verified_release() {
+    valid_release_tag "$1" || { echo "Not a release tag: $1" >&2; return 1; }
+    _fv_url="$(release_asset_url "$1" "$2.tar.gz")"
+    echo "Downloading $2 $1 from $_fv_url"
+    release_fetch "$_fv_url" "$3/tond.tar.gz" \
+        || { echo "Could not download $_fv_url." >&2; return 1; }
+    release_fetch "$_fv_url.sha256" "$3/tond.tar.gz.sha256" \
+        || { echo "Could not download the checksum $_fv_url.sha256." >&2; return 1; }
+    _fv_expected="$(awk '{print $1}' "$3/tond.tar.gz.sha256" | head -n 1)"
+    case "$_fv_expected" in
+        *[!0-9a-f]*|"") _fv_expected="malformed" ;;
+    esac
+    if [ "${#_fv_expected}" -ne 64 ] || [ "$_fv_expected" != "$(release_sha256 "$3/tond.tar.gz")" ]; then
+        echo "The checksum of $2 $1 doesn't match: the download may be corrupted or tampered with; nothing was installed." >&2
+        return 1
+    fi
+    echo "Checksum verified."
+    # A missing signature (download failure included) is handled by the policy.
+    release_fetch "$_fv_url.minisig" "$3/tond.tar.gz.minisig" 2>/dev/null \
+        || rm -f "$3/tond.tar.gz.minisig"
+    check_release_signature "$1" "$3/tond.tar.gz" "$3/tond.tar.gz.minisig"
 }
 # ── end release signatures ──
 
@@ -307,6 +388,8 @@ Options:
   --force                  Reinstall even when that version is already installed
   --dry-run                Show what would happen without changing anything
   --allow-unsupported-os   Run on a Linux distribution outside the support matrix
+  --release-base URL       Download releases from URL (default: TOND_RELEASE_BASE,
+                           ${INSTALL_DIR}/RELEASE_BASE, else GitHub releases)
   --help, -h               Show this help
 
 The dashboard (System → Updates) and \`tond update\` take a full snapshot first
@@ -350,6 +433,9 @@ parse_args() {
                 [[ $# -ge 2 ]] || usage_error "--snapshot-id needs a value"
                 SNAPSHOT_ID="$2"; shift 2 ;;
             --allow-unsupported-os) ALLOW_UNSUPPORTED_OS=true; shift ;;
+            --release-base)
+                [[ $# -ge 2 && -n "$2" ]] || usage_error "--release-base needs a URL"
+                export TOND_RELEASE_BASE="$2"; shift 2 ;;
             --help|-h) show_help; exit 0 ;;
             *) usage_error "Unknown option: $1" ;;
         esac
@@ -722,32 +808,16 @@ trap cleanup EXIT
 
 # download_release VERSION — sets BUNDLE_DIR to the verified, extracted bundle.
 download_release() {
-    local version="$1" arch name url
-    arch="$(host_arch)"
-    name="tond-linux-${arch}"
-    url="https://github.com/tahayvr/tond/releases/download/v${version}/${name}.tar.gz"
+    local version="$1" name
+    name="tond-linux-$(host_arch)"
     if [[ "$DRY_RUN" == true ]]; then
-        info "[dry run] Would download ${url} and verify its checksum and signature"
+        info "[dry run] Would download $(release_asset_url "v${version}" "${name}.tar.gz") and verify its checksum and signature"
         BUNDLE_DIR="(download)"
         return 0
     fi
     DOWNLOAD_TMP="$(mktemp -d)"
-    info "Downloading ${url}"
-    curl -fsSL -o "${DOWNLOAD_TMP}/tond.tar.gz" "$url" \
-        || fail_unchanged "Could not download Tond ${version} (${url})."
-    curl -fsSL -o "${DOWNLOAD_TMP}/tond.tar.gz.sha256" "${url}.sha256" \
-        || fail_unchanged "Could not download the checksum of Tond ${version}."
-    local expected actual
-    expected="$(awk '{print $1}' "${DOWNLOAD_TMP}/tond.tar.gz.sha256")"
-    actual="$(sha256sum "${DOWNLOAD_TMP}/tond.tar.gz" | awk '{print $1}')"
-    if [[ ! "$expected" =~ ^[0-9a-f]{64}$ || "$expected" != "$actual" ]]; then
-        fail_unchanged "The download's checksum doesn't match: it may be corrupted or tampered with."
-    fi
-    info "Checksum verified"
-    curl -fsSL -o "${DOWNLOAD_TMP}/tond.tar.gz.minisig" "${url}.minisig" 2>/dev/null \
-        || rm -f "${DOWNLOAD_TMP}/tond.tar.gz.minisig"
-    check_release_signature "v${version}" "${DOWNLOAD_TMP}/tond.tar.gz" "${DOWNLOAD_TMP}/tond.tar.gz.minisig" \
-        || fail_unchanged "Refusing to install an unverified release."
+    fetch_verified_release "v${version}" "$name" "$DOWNLOAD_TMP" \
+        || fail_unchanged "Could not download and verify Tond ${version} (see above)."
     tar -xzf "${DOWNLOAD_TMP}/tond.tar.gz" -C "$DOWNLOAD_TMP" \
         || fail_unchanged "Could not extract the release."
     BUNDLE_DIR="${DOWNLOAD_TMP}/${name}"
@@ -952,7 +1022,7 @@ run_update() {
         if [[ -z "$TO_VERSION" ]]; then
             local tag
             tag="$(latest_release_tag || true)"
-            [[ -n "$tag" ]] || fail_unchanged "Could not look up the latest release on GitHub."
+            [[ -n "$tag" ]] || fail_unchanged "Could not look up the latest release at $(release_base)/latest."
             TO_VERSION="${tag#v}"
         fi
         if [[ "$FROM_VERSION" == "$TO_VERSION" && "$FORCE" == false ]]; then

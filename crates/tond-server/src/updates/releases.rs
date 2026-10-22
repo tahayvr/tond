@@ -6,8 +6,11 @@
 // now" (throttled). The request carries nothing about the server beyond the
 // User-Agent `tond/<version>`; admins can turn the check off.
 //
-// TOND_UPDATE_RELEASES_URL overrides the API URL (the end-to-end test points it
-// at a local file).
+// The list comes from the release base (tond_common::release: TOND_RELEASE_BASE,
+// <install dir>/RELEASE_BASE, else github.com/tahayvr/tond/releases): GitHub's
+// releases API for a GitHub base, `<base>/releases.json` (same format) for a
+// mirror. TOND_UPDATE_RELEASES_URL overrides the URL outright (the end-to-end
+// test points it at a local file).
 
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -16,9 +19,11 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
+use tond_common::release;
+
+use super::run::Paths;
 use super::version::{self, Version};
 
-const RELEASES_URL: &str = "https://api.github.com/repos/tahayvr/tond/releases?per_page=30";
 /// Automatic checks: at most this often.
 pub const CHECK_INTERVAL_SECS: i64 = 24 * 3600;
 /// "Check now": at most this often.
@@ -129,11 +134,21 @@ pub fn check_due(enabled: bool, checked_at: Option<i64>, now: i64) -> bool {
     enabled && checked_at.is_none_or(|t| now - t >= CHECK_INTERVAL_SECS || t > now)
 }
 
+/// The release base of this install (the parent of bin/ is the install dir).
+pub fn release_base() -> String {
+    let install_dir = Paths::from_env()
+        .bin_dir
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("/opt/tond"));
+    release::release_base(&install_dir)
+}
+
 async fn fetch() -> Result<Vec<Release>> {
     let url = std::env::var("TOND_UPDATE_RELEASES_URL")
         .ok()
         .filter(|u| !u.is_empty())
-        .unwrap_or_else(|| RELEASES_URL.to_string());
+        .unwrap_or_else(|| release::releases_api_url(&release_base()));
     let body = if let Some(path) = url.strip_prefix("file://") {
         tokio::fs::read_to_string(path)
             .await

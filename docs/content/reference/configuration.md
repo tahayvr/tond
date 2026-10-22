@@ -67,6 +67,7 @@ The proxy reads the dashboard, apps and preview domains, and the zones of config
 | `TOND_SOCKET_PATH` | `--socket` | `/opt/tond/data/tond.sock` | Local socket used when no server URL is set. |
 | `TOND_IDEMPOTENCY_KEY` | `--idempotency-key` | a new UUID per request | Idempotency key sent with mutating requests: a repeated command with the same key returns the first result instead of acting twice. See [Error codes](/reference/error-codes#retries-and-idempotency). |
 | `TOND_ALLOW_UNSIGNED` | none | unset | `1` lets `tond update --direct` install a release that has no signature. A signature that fails to verify is always refused. |
+| `TOND_RELEASE_BASE` | none | `/opt/tond/RELEASE_BASE`, else `https://github.com/tahayvr/tond/releases` | Where `tond update --direct` downloads releases from (see [Release downloads](#release-downloads)). |
 
 See [CLI](/reference/cli) for every command and flag.
 
@@ -180,11 +181,13 @@ curl -fsSL https://tond.io/install | sudo bash -s -- [flags]
 | `--apps-domain <domain>` | Domain apps are served under (`<app>.<domain>`). Must be on a different site from the dashboard and preview domains, with a wildcard DNS record. Default: `<server-ip>.nip.io`, or `.sslip.io` when the dashboard is on nip.io. Pass `""` for none. |
 | `--preview-domain <domain>` | Domain previews are served under (`<id>-<app>.<domain>`). Must be a separate domain you own, with a wildcard DNS record `*.<domain>`. Previews stay disabled until one is set. |
 | `--allow-unsupported-os` | Install on a Linux distribution outside the support matrix. The installer prints a warning and continues. See [Supported systems](/support-matrix). |
+| `--version <version>` | Release to download when the installer runs on its own (download mode). Default: the latest release. Also `TOND_VERSION`. |
+| `--release-base <url>` | Where releases are downloaded from. Also `TOND_RELEASE_BASE`. See [Release downloads](#release-downloads). |
 | `--help`, `-h` | Print usage and exit. |
 
 An unknown flag stops the installer with an error. Without a flag, interactive runs ask for each domain.
 
-The installer also reads two variables from its environment: `TOND_ALLOW_UNSIGNED=1` lets it install a downloaded release that has no signature file (a signature that does not verify is always fatal), and `TOND_ALLOW_UNSUPPORTED_OS=1` is the same as `--allow-unsupported-os`.
+The installer also reads these variables from its environment: `TOND_ALLOW_UNSIGNED=1` lets it install a downloaded release that has no signature file (a signature that does not verify is always fatal), `TOND_ALLOW_UNSUPPORTED_OS=1` is the same as `--allow-unsupported-os`, and `TOND_VERSION` and `TOND_RELEASE_BASE` are the same as `--version` and `--release-base`. The one-line installer passes them on, for example `curl -fsSL https://tond.io/install | sudo TOND_VERSION=0.2.0 bash`.
 
 ## update.sh flags
 
@@ -203,6 +206,7 @@ sudo /opt/tond/bin/update.sh [flags]
 | `--force` | Reinstall even when that version is already installed. |
 | `--dry-run` | Say what would happen without changing anything. |
 | `--allow-unsupported-os` | Run on a distribution outside the [support matrix](/support-matrix). Not needed when the install was made with this flag. |
+| `--release-base <url>` | Download releases from this base. Also `TOND_RELEASE_BASE`. See [Release downloads](#release-downloads). |
 | `--help`, `-h` | Print usage and exit. |
 
 It reads these variables:
@@ -212,7 +216,17 @@ It reads these variables:
 | `TOND_PORT` | `3001` | Port tond-server listens on, for the health check. |
 | `TOND_UPDATE_HEALTH_TIMEOUT` | `90` | Seconds the new tond-server gets to become healthy before the update is rolled back. |
 | `TOND_ALLOW_UNSIGNED` | unset | `1` accepts a downloaded release without a signature file. |
+| `TOND_RELEASE_BASE` | `/opt/tond/RELEASE_BASE`, else GitHub releases | Where releases are downloaded from. |
 
 ### The update check
 
-The daily check for new releases is on by default. Turn it off under System → Updates (or `PUT /api/v1/system/update/settings` with `{"check_enabled": false}`). tond-server reads `TOND_UPDATE_RELEASES_URL` to look somewhere other than GitHub's releases API; a `file://` path works too (the end-to-end test uses one).
+The daily check for new releases is on by default. Turn it off under System → Updates (or `PUT /api/v1/system/update/settings` with `{"check_enabled": false}`). The check reads the release list from the [release base](#release-downloads): GitHub's releases API for a GitHub base, or `<base>/releases.json` (the same format) for any other base. `TOND_UPDATE_RELEASES_URL` overrides that URL; a `file://` path works too (the end-to-end test uses one).
+
+### Release downloads
+
+Releases are downloaded from `https://github.com/tahayvr/tond/releases` by default. Every downloader (the installer, `update.sh`, `tond update` and the one-line scripts) uses the same layout:
+
+- `<base>/download/v<version>/tond-linux-<arch>.tar.gz`, with `.sha256` and `.minisig` next to it
+- `<base>/latest` for the latest release. GitHub redirects it to `…/releases/tag/v<version>`; a plain file server can serve a file whose first line is the tag.
+
+Set `TOND_RELEASE_BASE` (or `--release-base`) to use a mirror. The installer records a non-default base in `/opt/tond/RELEASE_BASE`, so later updates and the update check use it too. Delete that file to go back to GitHub. A mirror can't weaken verification: every download is still checked against its checksum and the minisign signature from the release key built into Tond.
