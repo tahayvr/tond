@@ -421,17 +421,17 @@ pub async fn query_series(
             .bind(from)
             .fetch_all(db)
             .await?;
-    let mut series = MetricSeries::default();
-    for (t, cpu, cpu_max, mem, mem_max, rx, tx, pids) in rows {
-        series.t.push(t);
-        series.cpu.push(centi_to_percent(cpu));
-        series.cpu_max.push(centi_to_percent(cpu_max as f64));
-        series.mem.push(mem);
-        series.mem_max.push(mem_max);
-        series.rx.push(rx);
-        series.tx.push(tx);
-        series.pids.push(pids);
-    }
+    // Each column is allocated once at its final size (up to 480 points).
+    let series = MetricSeries {
+        t: rows.iter().map(|r| r.0).collect(),
+        cpu: rows.iter().map(|r| centi_to_percent(r.1)).collect(),
+        cpu_max: rows.iter().map(|r| centi_to_percent(r.2 as f64)).collect(),
+        mem: rows.iter().map(|r| r.3).collect(),
+        mem_max: rows.iter().map(|r| r.4).collect(),
+        rx: rows.iter().map(|r| r.5).collect(),
+        tx: rows.iter().map(|r| r.6).collect(),
+        pids: rows.iter().map(|r| r.7).collect(),
+    };
     Ok((from, series))
 }
 

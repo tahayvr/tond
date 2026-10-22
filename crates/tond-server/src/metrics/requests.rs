@@ -643,8 +643,24 @@ pub async fn query(
         }
         total.add(&c);
     }
-    let mut s = RequestSeries::default();
     let rate = |v: u64| round2(v as f64 / step as f64);
+    // Each column is allocated once at its final size (up to 480 points).
+    let n = per_bucket.len();
+    let mut s = RequestSeries {
+        t: Vec::with_capacity(n),
+        rps: Vec::with_capacity(n),
+        rps_1xx: Vec::with_capacity(n),
+        rps_2xx: Vec::with_capacity(n),
+        rps_3xx: Vec::with_capacity(n),
+        rps_4xx: Vec::with_capacity(n),
+        rps_5xx: Vec::with_capacity(n),
+        err_pct: Vec::with_capacity(n),
+        p50: Vec::with_capacity(n),
+        p95: Vec::with_capacity(n),
+        p99: Vec::with_capacity(n),
+        bytes_in: Vec::with_capacity(n),
+        bytes_out: Vec::with_capacity(n),
+    };
     for (i, c) in per_bucket.iter().enumerate() {
         s.t.push(from + i as i64 * step);
         s.rps.push(rate(c.requests));
