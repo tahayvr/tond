@@ -585,6 +585,8 @@ async fn run_with_source(
         set_services_status(state, &app_id, deployment_id, &names, "failed").await;
         return Err(e);
     }
+    // The services have addresses now: load the app's egress policy for them.
+    crate::egress::reconcile_now(state).await;
 
     // ── Health ──
     progress::start(state, &app_id, DeployPhase::Health).await;
@@ -607,6 +609,10 @@ async fn run_with_source(
         let _ = compose::refresh(state, &app_id, &app_name).await;
         return Err(e);
     }
+
+    // Template apps: create the admin account (or replace a default login)
+    // while the app is up but not yet routed, so nobody can claim it first.
+    super::template_setup::run_pending(state, app, &project, trigger).await;
 
     // ── Release ──
     progress::start(state, &app_id, DeployPhase::Release).await;

@@ -3,7 +3,19 @@
 // Length-based, as NIST SP 800-63B recommends: at least 12 characters, at
 // most 256, no composition rules ("one uppercase, one symbol…"), and a check
 // against a compiled-in list of common / breached passwords. The list is
-// bundled at build time (common_passwords.txt); no network call is made.
+// bundled at build time (common_passwords.txt, ~10k entries; sources and
+// licence in common_passwords.NOTICE); no network call is made.
+//
+// The list is kept lowercase and byte-sorted, and looked up by binary search
+// directly over the embedded text: no set is built, nothing is allocated,
+// and the ~80 KB sit in the binary's read-only data, paged in only when a
+// password is checked. Idle RSS is unaffected however long the list grows.
+//
+// Normalisation (cheap and conventional, matching how the list is stored):
+// the password is lowercased, and checked both whole and with leading and
+// trailing digits, punctuation and spaces stripped, so "Password123!" hits
+// "password". No leetspeak folding: the list already carries the common
+// variants ("p@ssw0rd"), and folding would refuse many unique passwords.
 //
 // A password is refused when, lowercased, it
 //   * is on the list,
@@ -12,9 +24,6 @@
 //   * repeats one short chunk ("aaaaaaaaaaaa", "abcabcabcabc"), or
 //   * is a straight run of characters ("123456789012", "abcdefghijkl").
 
-use std::collections::HashSet;
-use std::sync::OnceLock;
-
 /// Minimum length in characters.
 pub const MIN_PASSWORD_CHARS: usize = 12;
 /// Maximum length in characters (argon2 cost stays bounded).
@@ -22,15 +31,33 @@ pub const MAX_PASSWORD_CHARS: usize = 256;
 
 static LIST_SOURCE: &str = include_str!("common_passwords.txt");
 
-fn common_passwords() -> &'static HashSet<&'static str> {
-    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
-    SET.get_or_init(|| {
-        LIST_SOURCE
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .collect()
-    })
+/// Whether `needle` is a whole line of the sorted, newline-separated `list`.
+/// Binary search over byte offsets: pick the middle byte, back up to the start
+/// of its line, compare, and halve. No allocation.
+fn sorted_lines_contain(list: &str, needle: &str) -> bool {
+    let bytes = list.as_bytes();
+    let (mut lo, mut hi) = (0usize, bytes.len());
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let start = bytes[lo..mid]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(lo, |i| lo + i + 1);
+        let end = bytes[start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(bytes.len(), |i| start + i);
+        match list[start..end].cmp(needle) {
+            std::cmp::Ordering::Equal => return true,
+            std::cmp::Ordering::Less => lo = end + 1,
+            std::cmp::Ordering::Greater => hi = start,
+        }
+    }
+    false
+}
+
+fn is_common(candidate: &str) -> bool {
+    sorted_lines_contain(LIST_SOURCE, candidate)
 }
 
 /// Why a password was refused. `Display` is a friendly, actionable message.
@@ -69,12 +96,11 @@ pub fn check_password(password: &str) -> Result<(), PasswordProblem> {
         return Err(PasswordProblem::TooLong);
     }
     let lower = password.to_lowercase();
-    let list = common_passwords();
     let core = lower.trim_matches(|c: char| {
         c.is_ascii_digit() || c.is_ascii_punctuation() || c.is_whitespace()
     });
-    if list.contains(lower.as_str())
-        || (!core.is_empty() && list.contains(core))
+    if is_common(&lower)
+        || (!core.is_empty() && is_common(core))
         || is_repetition(&lower)
         || is_straight_run(&lower)
     {
@@ -175,9 +201,50 @@ mod tests {
     }
 
     #[test]
-    fn the_bundled_list_is_loaded() {
-        assert!(common_passwords().len() > 300);
-        assert!(common_passwords().contains("password"));
-        assert!(!common_passwords().iter().any(|l| l.starts_with('#')));
+    fn the_bundled_list_is_sorted_unique_and_lowercase() {
+        // Binary search depends on this; see common_passwords.NOTICE.
+        let lines: Vec<&str> = LIST_SOURCE.lines().collect();
+        assert!(lines.len() > 10_000, "{} entries", lines.len());
+        for pair in lines.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "not sorted/unique (LC_ALL=C sort -u): {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        for line in &lines {
+            assert!(!line.is_empty(), "blank line");
+            assert_eq!(line.trim(), *line, "whitespace around {line:?}");
+            assert_eq!(line.to_lowercase(), *line, "{line:?} isn't lowercase");
+            assert!(!line.contains('\r'), "CRLF line ending");
+        }
+    }
+
+    #[test]
+    fn every_listed_entry_is_found_and_others_are_not() {
+        for line in LIST_SOURCE.lines() {
+            assert!(is_common(line), "{line:?} not found by binary search");
+        }
+        for absent in ["", "zzzzzzzzzzzzzzzzzz", "000", "purple otter lamp drift"] {
+            assert!(!is_common(absent), "{absent:?}");
+        }
+        assert!(sorted_lines_contain("a\nb\nc", "c"));
+        assert!(sorted_lines_contain("a\nb\nc\n", "a"));
+        assert!(!sorted_lines_contain("a\nb\nc\n", "bb"));
+        assert!(!sorted_lines_contain("", "a"));
+    }
+
+    #[test]
+    fn the_list_costs_no_heap_and_stays_small() {
+        // The list lives in read-only data and is searched in place (no set is
+        // built at startup); keep the binary from bloating if a much bigger
+        // list is dropped in.
+        assert!(
+            LIST_SOURCE.len() < 2 * 1024 * 1024,
+            "{} bytes",
+            LIST_SOURCE.len()
+        );
+        assert!(is_common("password") && is_common("p@ssw0rd") && is_common("dragon"));
     }
 }

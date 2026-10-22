@@ -24,14 +24,14 @@ Tond trusts exactly two things without further checks: root on the host, and req
 
 - `tond-proxy` is the only service that faces the internet. It parses untrusted TLS and HTTP, so it runs as the unprivileged `tond-proxy` user with only the capability to bind ports 80 and 443, a strict systemd sandbox, and read-only access to the database. It cannot reach Docker. See [Isolation](/security/isolation).
 - `tond-server` listens on `127.0.0.1:3001` only.
-- App and database ports are published on `127.0.0.1`, because Docker's port rules bypass the firewall. Only a managed database whose public access you enabled binds to all interfaces.
+- App and database ports are published on `127.0.0.1`, because Docker's port rules bypass the firewall. Only a managed database whose public access you enabled binds to all interfaces. Its [allowlist](/concepts/databases#allowed-addresses) is enforced in the kernel, and while a [major-version upgrade](/concepts/databases#major-version-upgrades) copies its data the port is closed to every address, so nothing writes to it that the copy would miss. The port reopens when the upgrade finishes or fails, and after a restart in the middle of one.
 - The installer enables UFW with only SSH, 80 and 443 open.
 
 ### Brute force
 
 - Every API request over TCP is rate limited per client (IPv6 grouped by `/64`).
 - Failed sign-ins and 2FA attempts back off per client and per account, doubling up to 15 minutes. The per-account limit is higher than the per-client limit, so one attacker cannot lock the owner out quickly, and the CLI on the socket is never affected.
-- Passwords need at least 12 characters, and known breached passwords are refused. 2FA with TOTP is available for every account.
+- Passwords need at least 12 characters, and the 10,000 most common passwords (plus Tond's own list) are refused, case-insensitively and with surrounding digits and symbols stripped, so `Password123!` counts as `password`. 2FA with TOTP is available for every account.
 
 ### Session theft
 
@@ -64,12 +64,22 @@ Apps, cron jobs and compose files may run code you did not write. Tond limits wh
 - Users never choose host paths for volumes. Tond maps named volumes into its own directory and refuses symlink escapes.
 - Compose files are checked before they are stored or deployed. Host-level options (`privileged`, the Docker socket, host namespaces, extra capabilities, host paths) are refused, and published ports are rewritten to `127.0.0.1`. `docker compose` runs with a cleared environment, so `${TOND_SECRET_KEY}` cannot leak into a container.
 - Secret values are scrubbed from deploy and container logs.
+- An app's outbound connections can be limited to an allowlist, or cut off, in the server firewall. Previews have no internet by default.
 
 See [Isolation](/security/isolation) for the details.
 
 ### Pull-request previews
 
-Previews run code from pull requests, possibly from strangers. They are served only on a separate registrable domain (`<id>-<app>.<preview_domain>`), checked against the Public Suffix List, so a preview page is cross-site to the dashboard and cannot use its cookies. `tond-proxy` never serves the dashboard or API on the preview domain. Without a preview domain, previews are refused. Previews never join the project's network, so they cannot reach production databases. See [Previews](/concepts/previews).
+Previews run code from pull requests, possibly from strangers. They are served only on a separate registrable domain (`<id>-<app>.<preview_domain>`), checked against the Public Suffix List, so a preview page is cross-site to the dashboard and cannot use its cookies. `tond-proxy` never serves the dashboard or API on the preview domain. Without a preview domain, previews are refused. Previews never join the project's network, so they cannot reach production databases, and by default they can't connect to the internet either (DNS aside), so pull-request code can't send out what it reads or abuse the server's address. See [Previews](/concepts/previews) and [Outbound connections](/security/isolation#outbound-connections).
+
+### Unclaimed admin accounts in one-click apps
+
+Many self-hosted apps give the admin account to whoever opens them first (an install page, or "the first account becomes the admin"), or ship a fixed default login. Once such an app is on a public domain, a scanner can reach it before you do. Templates close this where the app allows it:
+
+- **Pre-seeded**: Forgejo, Gitea, Mattermost, Actual Budget, Audiobookshelf, Umami and Mealie. Tond creates the admin (or replaces the default password) with a generated password while the app is running but before `tond-proxy` routes its domain, so nobody can reach it first. The password is shown once after the deploy and kept, encrypted, in the app's environment.
+- **Warned**: Ghost, Uptime Kuma, Memos, Wiki.js, Docmost and Twenty have no documented way to create the admin from outside. Their app page warns "Open the app now and create the admin account; anyone who reaches it first can" until you dismiss it.
+
+If pre-seeding fails, the deploy still finishes and the app page shows the same warning with the reason. See [Templates](/guides/templates#admin-accounts).
 
 ### The host terminal
 

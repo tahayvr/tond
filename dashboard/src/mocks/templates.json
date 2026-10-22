@@ -43,13 +43,25 @@
         "owner": null
       }
     ],
-    "inputs": [],
-    "setup_notes": "Open the app right away and set the server password; anyone who opens it first could set it otherwise. Then create or import a budget.",
+    "inputs": [
+      {
+        "key": "SERVER_PASSWORD",
+        "label": "Server password",
+        "description": null,
+        "kind": "password",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": true
+      }
+    ],
+    "setup_notes": "Sign in with the server password shown after deploy (also kept as SERVER_PASSWORD on the Environment tab), then create or import a budget.",
     "upgrade_notes": "Actual releases monthly (YY.M). Change the image tag and redeploy; snapshot the app first.",
     "post_deploy_checks": [
-      "Set the server password",
+      "Sign in with the server password",
       "Create or import a budget"
     ],
+    "admin_setup": "seeded",
     "compose": "services:\n  actual:\n    image: actualbudget/actual-server:26.9.0-alpine\n    restart: unless-stopped\n    mem_limit: 256m\n    ports: [\"5006\"]\n    volumes:\n      - ./data:/data\n"
   },
   {
@@ -103,6 +115,7 @@
       "Create the admin account",
       "Build a first app against a data source"
     ],
+    "admin_setup": "none",
     "compose": "services:\n  appsmith:\n    image: appsmith/appsmith-ce:v2.4.2\n    restart: unless-stopped\n    mem_limit: 3g\n    ports: [\"80\"]\n    environment:\n      APPSMITH_DISABLE_TELEMETRY: \"true\"\n    volumes:\n      - ./stacks:/appsmith-stacks\n    # Timings only: the image's own HEALTHCHECK test is kept, but its 15s interval\n    # would keep the deploy waiting.\n    healthcheck:\n      interval: 10s\n      timeout: 15s\n      start_period: 180s\n      start_interval: 3s\n"
   },
   {
@@ -167,13 +180,25 @@
         "owner": null
       }
     ],
-    "inputs": [],
-    "setup_notes": "Open the app right away and create the root user (the first visitor sets it). Then add a library pointing at /audiobooks or /podcasts.",
+    "inputs": [
+      {
+        "key": "ROOT_PASSWORD",
+        "label": "Root user password",
+        "description": null,
+        "kind": "password",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": true
+      }
+    ],
+    "setup_notes": "Sign in as root with the password shown after deploy (also kept as ROOT_PASSWORD on the Environment tab). Then add a library pointing at /audiobooks or /podcasts.",
     "upgrade_notes": "Change the image to a newer 2.x tag and redeploy; the database is migrated on start. Snapshot the app first.",
     "post_deploy_checks": [
-      "Create the root user",
+      "Sign in as root",
       "Add a library for /audiobooks"
     ],
+    "admin_setup": "seeded",
     "compose": "services:\n  audiobookshelf:\n    image: ghcr.io/advplyr/audiobookshelf:2.36.1\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"80\"]\n    environment:\n      TZ: UTC\n    volumes:\n      - ./config:/config\n      - ./metadata:/metadata\n      - ./audiobooks:/audiobooks\n      - ./podcasts:/podcasts\n"
   },
   {
@@ -250,6 +275,7 @@
       "Sign in with the password",
       "Open a terminal and clone a repository"
     ],
+    "admin_setup": "none",
     "compose": "services:\n  code-server:\n    image: codercom/code-server:4.139.1\n    restart: unless-stopped\n    mem_limit: 1g\n    ports: [\"8080\"]\n    environment:\n      PASSWORD: ${PASSWORD}\n    command: [\"--bind-addr\", \"0.0.0.0:8080\", \"--disable-telemetry\", \"/home/coder/project\"]\n    volumes:\n      - ./project:/home/coder/project\n      - ./config:/home/coder/.config\n      - ./local:/home/coder/.local\n"
   },
   {
@@ -341,6 +367,7 @@
       "Sign in to the data studio",
       "Create a collection and fetch it from the API"
     ],
+    "admin_setup": "none",
     "compose": "services:\n  directus:\n    image: directus/directus:11.17.4\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"8055\"]\n    environment:\n      PUBLIC_URL: ${PUBLIC_URL}\n      SECRET: ${SECRET}\n      ADMIN_EMAIL: ${ADMIN_EMAIL}\n      ADMIN_PASSWORD: ${ADMIN_PASSWORD}\n      DB_CLIENT: sqlite3\n      DB_FILENAME: /directus/database/data.db\n      TELEMETRY: \"false\"\n    volumes:\n      - ./database:/directus/database\n      - ./uploads:/directus/uploads\n"
   },
   {
@@ -428,12 +455,13 @@
         "credential": false
       }
     ],
-    "setup_notes": "Open the app right away and create your workspace and admin account. Add SMTP settings as environment variables to send invitations by email.",
+    "setup_notes": "Open the app right away and create your workspace and admin account: anyone who reaches it first can. Add SMTP settings as environment variables to send invitations by email.",
     "upgrade_notes": "Docmost is pre-1.0. Read the release notes, snapshot the app, then change the image tag and redeploy; migrations run on start.",
     "post_deploy_checks": [
       "Create the workspace and admin account",
       "Create a space and a page"
     ],
+    "admin_setup": "first_visitor",
     "compose": "services:\n  docmost:\n    image: docmost/docmost:0.95.0\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"3000\"]\n    environment:\n      APP_URL: ${APP_URL}\n      APP_SECRET: ${APP_SECRET}\n      DATABASE_URL: postgresql://docmost:${DB_PASSWORD}@db:5432/docmost?schema=public\n      REDIS_URL: redis://redis:6379\n    volumes:\n      - ./storage:/app/data/storage\n    depends_on:\n      db:\n        condition: service_healthy\n      redis:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    labels:\n      tond.backup.dump: pg_dump -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" --clean --if-exists\n      tond.backup.restore: psql -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" -q -v ON_ERROR_STOP=1\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: docmost\n      POSTGRES_USER: docmost\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U docmost -d docmost\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n\n  redis:\n    image: valkey/valkey:8-alpine\n    restart: unless-stopped\n    mem_limit: 128m\n    healthcheck:\n      test: [\"CMD\", \"valkey-cli\", \"ping\"]\n      interval: 5s\n      timeout: 3s\n      retries: 10\n"
   },
   {
@@ -478,6 +506,7 @@
     "post_deploy_checks": [
       "Open the app and draw something"
     ],
+    "admin_setup": "none",
     "compose": "services:\n  excalidraw:\n    image: excalidraw/excalidraw:sha-4bfc5bb\n    restart: unless-stopped\n    mem_limit: 64m\n    ports: [\"80\"]\n    # Timings only: the image's own HEALTHCHECK test is kept, but its 30s default interval\n    # would keep the deploy waiting.\n    healthcheck:\n      interval: 10s\n      timeout: 5s\n      start_period: 10s\n      start_interval: 1s\n"
   },
   {
@@ -525,14 +554,56 @@
         "owner": null
       }
     ],
-    "inputs": [],
-    "setup_notes": "Open the app right away: the install page is open to the first visitor. Keep the prefilled settings, create the administrator account at the bottom of the page and press Install.",
+    "inputs": [
+      {
+        "key": "ADMIN_USERNAME",
+        "label": "Administrator name",
+        "description": "Forgejo reserves some names, such as admin.",
+        "kind": "text",
+        "required": false,
+        "generated": false,
+        "default": "forgeadmin",
+        "credential": false
+      },
+      {
+        "key": "ADMIN_EMAIL",
+        "label": "Administrator email",
+        "description": null,
+        "kind": "email",
+        "required": true,
+        "generated": false,
+        "default": null,
+        "credential": false
+      },
+      {
+        "key": "ADMIN_PASSWORD",
+        "label": "Administrator password",
+        "description": null,
+        "kind": "password",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": true
+      },
+      {
+        "key": "SECRET_KEY",
+        "label": "Secret key",
+        "description": "Encrypts secrets in the database. Keep it if you move the data.",
+        "kind": "text",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": false
+      }
+    ],
+    "setup_notes": "Sign in with the administrator name and the password shown after deploy (also kept as ADMIN_PASSWORD on the Environment tab). There is no install page and public sign-up is off: add users under Site Administration.",
     "upgrade_notes": "The image follows Forgejo 15.x. For a new major, change the tag, snapshot the app first and read the release notes; the database is migrated on start.",
     "post_deploy_checks": [
-      "Finish the install page and create the administrator",
+      "Sign in as the administrator",
       "Push a test repository over HTTPS"
     ],
-    "compose": "services:\n  forgejo:\n    image: codeberg.org/forgejo/forgejo:15\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"3000\"]\n    environment:\n      USER_UID: \"1000\"\n      USER_GID: \"1000\"\n      FORGEJO__database__DB_TYPE: sqlite3\n      FORGEJO__server__ROOT_URL: ${ROOT_URL}\n      FORGEJO__server__DOMAIN: ${DOMAIN}\n      FORGEJO__server__HTTP_PORT: \"3000\"\n      FORGEJO__server__DISABLE_SSH: \"true\"\n      FORGEJO__server__START_SSH_SERVER: \"false\"\n      FORGEJO__service__DISABLE_REGISTRATION: \"true\"\n    volumes:\n      - ./data:/data\n"
+    "admin_setup": "seeded",
+    "compose": "services:\n  forgejo:\n    image: codeberg.org/forgejo/forgejo:15\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"3000\"]\n    environment:\n      USER_UID: \"1000\"\n      USER_GID: \"1000\"\n      FORGEJO__database__DB_TYPE: sqlite3\n      FORGEJO__server__ROOT_URL: ${ROOT_URL}\n      FORGEJO__server__DOMAIN: ${DOMAIN}\n      FORGEJO__server__HTTP_PORT: \"3000\"\n      FORGEJO__server__DISABLE_SSH: \"true\"\n      FORGEJO__server__START_SSH_SERVER: \"false\"\n      FORGEJO__service__DISABLE_REGISTRATION: \"true\"\n      # No install page: Tond creates the administrator before the app is\n      # reachable (post_deploy in template.toml).\n      FORGEJO__security__INSTALL_LOCK: \"true\"\n      FORGEJO__security__SECRET_KEY: ${SECRET_KEY}\n    volumes:\n      - ./data:/data\n"
   },
   {
     "id": "freshrss",
@@ -622,6 +693,7 @@
       "Sign in as admin",
       "Subscribe to a feed"
     ],
+    "admin_setup": "none",
     "compose": "services:\n  freshrss:\n    image: freshrss/freshrss:1.30.0\n    restart: unless-stopped\n    mem_limit: 256m\n    ports: [\"80\"]\n    environment:\n      TZ: UTC\n      CRON_MIN: \"3,23,43\"\n      TRUSTED_PROXY: 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16\n      FRESHRSS_INSTALL: >-\n        --api-enabled\n        --base-url ${BASE_URL}\n        --db-type sqlite\n        --default-user admin\n        --language en\n      FRESHRSS_USER: >-\n        --api-password ${API_PASSWORD}\n        --email ${ADMIN_EMAIL}\n        --language en\n        --password ${ADMIN_PASSWORD}\n        --user admin\n    volumes:\n      - ./data:/var/www/FreshRSS/data\n      - ./extensions:/var/www/FreshRSS/extensions\n"
   },
   {
@@ -703,12 +775,13 @@
         "credential": false
       }
     ],
-    "setup_notes": "Open /ghost on the app's address right away to create the owner account. To send newsletters and sign-in emails, add mail settings (mail__transport and friends) as environment variables on the app's Environment tab.",
+    "setup_notes": "Open /ghost on the app's address right away to create the owner account: anyone who reaches it first can. To send newsletters and sign-in emails, add mail settings (mail__transport and friends) as environment variables on the app's Environment tab.",
     "upgrade_notes": "The image follows Ghost 6.x: redeploying pulls the tag as stored. To move to a new major, change the tag, take a snapshot first and follow Ghost's upgrade guide.",
     "post_deploy_checks": [
       "Create the owner account at /ghost",
       "Configure mail so members can sign in"
     ],
+    "admin_setup": "first_visitor",
     "compose": "services:\n  ghost:\n    image: ghost:6-alpine\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"2368\"]\n    environment:\n      url: ${GHOST_URL}\n      NODE_ENV: production\n      database__client: mysql\n      database__connection__host: db\n      database__connection__user: ghost\n      database__connection__password: ${DB_PASSWORD}\n      database__connection__database: ghost\n    volumes:\n      - ./content:/var/lib/ghost/content\n    depends_on:\n      db:\n        condition: service_healthy\n\n  db:\n    image: mysql:8.4\n    labels:\n      tond.backup.dump: MYSQL_PWD=\"$$MYSQL_ROOT_PASSWORD\" mysqldump -uroot --databases \"$$MYSQL_DATABASE\" --single-transaction --routines --events\n      tond.backup.restore: MYSQL_PWD=\"$$MYSQL_ROOT_PASSWORD\" mysql -uroot\n    restart: unless-stopped\n    mem_limit: 512m\n    command: [\"--innodb-buffer-pool-size=64M\", \"--performance-schema=OFF\", \"--skip-log-bin\"]\n    environment:\n      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}\n      MYSQL_DATABASE: ghost\n      MYSQL_USER: ghost\n      MYSQL_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./mysql:/var/lib/mysql\n    healthcheck:\n      test: [\"CMD-SHELL\", \"mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent\"]\n      interval: 5s\n      timeout: 5s\n      retries: 30\n      start_period: 10s\n      start_interval: 1s\n"
   },
   {
@@ -756,14 +829,56 @@
         "owner": null
       }
     ],
-    "inputs": [],
-    "setup_notes": "Open the app right away: the install page is open to the first visitor. Keep the prefilled settings, create the administrator account at the bottom of the page and press Install.",
+    "inputs": [
+      {
+        "key": "ADMIN_USERNAME",
+        "label": "Administrator name",
+        "description": "Gitea reserves some names, such as admin.",
+        "kind": "text",
+        "required": false,
+        "generated": false,
+        "default": "gitadmin",
+        "credential": false
+      },
+      {
+        "key": "ADMIN_EMAIL",
+        "label": "Administrator email",
+        "description": null,
+        "kind": "email",
+        "required": true,
+        "generated": false,
+        "default": null,
+        "credential": false
+      },
+      {
+        "key": "ADMIN_PASSWORD",
+        "label": "Administrator password",
+        "description": null,
+        "kind": "password",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": true
+      },
+      {
+        "key": "SECRET_KEY",
+        "label": "Secret key",
+        "description": "Encrypts secrets in the database. Keep it if you move the data.",
+        "kind": "text",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": false
+      }
+    ],
+    "setup_notes": "Sign in with the administrator name and the password shown after deploy (also kept as ADMIN_PASSWORD on the Environment tab). There is no install page and public sign-up is off: add users under Site Administration.",
     "upgrade_notes": "The image follows Gitea 1.27.x. For a newer minor version change the tag, take a snapshot and redeploy; the database is migrated on start.",
     "post_deploy_checks": [
-      "Finish the install page and create the administrator",
+      "Sign in as the administrator",
       "Push a test repository over HTTPS"
     ],
-    "compose": "services:\n  gitea:\n    image: gitea/gitea:1.27\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"3000\"]\n    environment:\n      USER_UID: \"1000\"\n      USER_GID: \"1000\"\n      GITEA__database__DB_TYPE: sqlite3\n      GITEA__server__ROOT_URL: ${ROOT_URL}\n      GITEA__server__DOMAIN: ${DOMAIN}\n      GITEA__server__HTTP_PORT: \"3000\"\n      GITEA__server__DISABLE_SSH: \"true\"\n      GITEA__server__START_SSH_SERVER: \"false\"\n      GITEA__service__DISABLE_REGISTRATION: \"true\"\n    volumes:\n      - ./data:/data\n"
+    "admin_setup": "seeded",
+    "compose": "services:\n  gitea:\n    image: gitea/gitea:1.27\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"3000\"]\n    environment:\n      USER_UID: \"1000\"\n      USER_GID: \"1000\"\n      GITEA__database__DB_TYPE: sqlite3\n      GITEA__server__ROOT_URL: ${ROOT_URL}\n      GITEA__server__DOMAIN: ${DOMAIN}\n      GITEA__server__HTTP_PORT: \"3000\"\n      GITEA__server__DISABLE_SSH: \"true\"\n      GITEA__server__START_SSH_SERVER: \"false\"\n      GITEA__service__DISABLE_REGISTRATION: \"true\"\n      # No install page: Tond creates the administrator before the app is\n      # reachable (post_deploy in template.toml).\n      GITEA__security__INSTALL_LOCK: \"true\"\n      GITEA__security__SECRET_KEY: ${SECRET_KEY}\n    volumes:\n      - ./data:/data\n"
   },
   {
     "id": "gotify",
@@ -827,6 +942,7 @@
       "Sign in as admin",
       "Create an application and send a test message"
     ],
+    "admin_setup": "none",
     "compose": "services:\n  gotify:\n    image: gotify/server:2.9.1\n    restart: unless-stopped\n    mem_limit: 128m\n    ports: [\"80\"]\n    environment:\n      GOTIFY_DEFAULTUSER_NAME: admin\n      GOTIFY_DEFAULTUSER_PASS: ${ADMIN_PASSWORD}\n      GOTIFY_REGISTRATION: \"false\"\n      TZ: UTC\n    volumes:\n      - ./data:/app/data\n    # Timings only: the image's own HEALTHCHECK test is kept, but its 30s interval\n    # would keep the deploy waiting.\n    healthcheck:\n      interval: 10s\n      timeout: 5s\n      start_period: 10s\n      start_interval: 1s\n"
   },
   {
@@ -892,6 +1008,7 @@
       "Sign in as admin",
       "Add a data source"
     ],
+    "admin_setup": "none",
     "compose": "services:\n  grafana:\n    image: grafana/grafana-oss:12.4.3\n    restart: unless-stopped\n    mem_limit: 384m\n    ports: [\"3000\"]\n    environment:\n      GF_SERVER_ROOT_URL: ${GF_SERVER_ROOT_URL}\n      GF_SECURITY_ADMIN_USER: admin\n      GF_SECURITY_ADMIN_PASSWORD: ${ADMIN_PASSWORD}\n      GF_USERS_ALLOW_SIGN_UP: \"false\"\n      GF_ANALYTICS_REPORTING_ENABLED: \"false\"\n      GF_ANALYTICS_CHECK_FOR_UPDATES: \"false\"\n    volumes:\n      - ./data:/var/lib/grafana\n"
   },
   {
@@ -969,6 +1086,7 @@
       "Sign in to Grafana",
       "Open Explore and query the 'up' metric"
     ],
+    "admin_setup": "none",
     "compose": "services:\n  grafana:\n    image: grafana/grafana-oss:12.4.3\n    restart: unless-stopped\n    mem_limit: 384m\n    ports: [\"3000\"]\n    environment:\n      GF_SERVER_ROOT_URL: ${GF_SERVER_ROOT_URL}\n      GF_SECURITY_ADMIN_USER: admin\n      GF_SECURITY_ADMIN_PASSWORD: ${ADMIN_PASSWORD}\n      GF_USERS_ALLOW_SIGN_UP: \"false\"\n      GF_ANALYTICS_REPORTING_ENABLED: \"false\"\n      GF_ANALYTICS_CHECK_FOR_UPDATES: \"false\"\n    volumes:\n      - ./grafana:/var/lib/grafana\n    configs:\n      - source: grafana_datasource\n        target: /etc/grafana/provisioning/datasources/prometheus.yml\n    depends_on:\n      - prometheus\n\n  prometheus:\n    image: prom/prometheus:v3.14.0\n    restart: unless-stopped\n    mem_limit: 512m\n    command:\n      - --config.file=/etc/prometheus/prometheus.yml\n      - --storage.tsdb.path=/prometheus\n      - --storage.tsdb.retention.time=15d\n    volumes:\n      - ./prometheus:/prometheus\n    configs:\n      - source: prometheus_config\n        target: /etc/prometheus/prometheus.yml\n\nconfigs:\n  grafana_datasource:\n    content: |\n      apiVersion: 1\n      datasources:\n        - name: Prometheus\n          type: prometheus\n          access: proxy\n          url: http://prometheus:9090\n          isDefault: true\n  prometheus_config:\n    content: |\n      global:\n        scrape_interval: 30s\n        evaluation_interval: 30s\n      scrape_configs:\n        - job_name: prometheus\n          static_configs:\n            - targets: [\"localhost:9090\"]\n        - job_name: grafana\n          static_configs:\n            - targets: [\"grafana:3000\"]\n"
   },
   {
@@ -1052,6 +1170,7 @@
       "Create the admin account",
       "Connect the mobile app and back up a photo"
     ],
+    "admin_setup": "none",
     "compose": "services:\n  immich-server:\n    image: ghcr.io/immich-app/immich-server:v2.7.0\n    restart: unless-stopped\n    mem_limit: 2g\n    ports: [\"2283\"]\n    environment:\n      DB_HOSTNAME: database\n      DB_USERNAME: immich\n      DB_PASSWORD: ${DB_PASSWORD}\n      DB_DATABASE_NAME: immich\n      REDIS_HOSTNAME: redis\n      IMMICH_MACHINE_LEARNING_ENABLED: \"false\"\n    volumes:\n      - ./library:/data\n    depends_on:\n      redis:\n        condition: service_healthy\n      database:\n        condition: service_healthy\n    # Timings only: the image's own HEALTHCHECK test is kept, but its 30s default interval\n    # would keep the deploy waiting.\n    healthcheck:\n      interval: 10s\n      timeout: 5s\n      start_period: 60s\n      start_interval: 2s\n\n  redis:\n    image: valkey/valkey:8-alpine\n    restart: unless-stopped\n    mem_limit: 128m\n    healthcheck:\n      test: [\"CMD\", \"valkey-cli\", \"ping\"]\n      interval: 5s\n      timeout: 3s\n      retries: 10\n\n  database:\n    image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0\n    labels:\n      tond.backup.dump: pg_dump -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" --clean --if-exists\n      tond.backup.restore: psql -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" -q -v ON_ERROR_STOP=1\n    restart: unless-stopped\n    mem_limit: 512m\n    shm_size: 128mb\n    environment:\n      POSTGRES_USER: immich\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n      POSTGRES_DB: immich\n      POSTGRES_INITDB_ARGS: --data-checksums\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U immich -d immich\"]\n      interval: 5s\n      timeout: 5s\n      retries: 20\n"
   },
   {
@@ -1097,6 +1216,7 @@
     "post_deploy_checks": [
       "Open the app and try a tool"
     ],
+    "admin_setup": "none",
     "compose": "services:\n  it-tools:\n    image: corentinth/it-tools:2024.10.22-7ca5933\n    restart: unless-stopped\n    mem_limit: 64m\n    ports: [\"80\"]\n"
   },
   {
@@ -1161,6 +1281,7 @@
       "Sign in as admin",
       "Save a bookmark"
     ],
+    "admin_setup": "none",
     "compose": "services:\n  linkding:\n    image: sissbruecker/linkding:1.47.0\n    restart: unless-stopped\n    mem_limit: 256m\n    ports: [\"9090\"]\n    environment:\n      LD_SUPERUSER_NAME: admin\n      LD_SUPERUSER_PASSWORD: ${ADMIN_PASSWORD}\n      LD_CSRF_TRUSTED_ORIGINS: ${TRUSTED_ORIGIN}\n    volumes:\n      - ./data:/etc/linkding/data\n    # Timings only: the image's own HEALTHCHECK test is kept, but its 30s interval\n    # would keep the deploy waiting.\n    healthcheck:\n      interval: 10s\n      timeout: 5s\n      start_period: 30s\n      start_interval: 2s\n"
   },
   {
@@ -1257,6 +1378,7 @@
       "Sign in and set the root URL",
       "Configure SMTP and send a test campaign"
     ],
+    "admin_setup": "none",
     "compose": "services:\n  listmonk:\n    image: listmonk/listmonk:v6.2.0\n    restart: unless-stopped\n    mem_limit: 256m\n    ports: [\"9000\"]\n    command: [sh, -c, \"./listmonk --install --idempotent --yes --config '' && ./listmonk --upgrade --yes --config '' && ./listmonk --config ''\"]\n    environment:\n      LISTMONK_app__address: 0.0.0.0:9000\n      LISTMONK_db__host: db\n      LISTMONK_db__port: \"5432\"\n      LISTMONK_db__user: listmonk\n      LISTMONK_db__password: ${DB_PASSWORD}\n      LISTMONK_db__database: listmonk\n      LISTMONK_db__ssl_mode: disable\n      LISTMONK_ADMIN_USER: admin\n      LISTMONK_ADMIN_PASSWORD: ${ADMIN_PASSWORD}\n      TZ: ${TZ}\n    volumes:\n      - ./uploads:/listmonk/uploads\n    depends_on:\n      db:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    labels:\n      tond.backup.dump: pg_dump -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" --clean --if-exists\n      tond.backup.restore: psql -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" -q -v ON_ERROR_STOP=1\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: listmonk\n      POSTGRES_USER: listmonk\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U listmonk -d listmonk\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n"
   },
   {
@@ -1336,15 +1458,46 @@
         "generated": true,
         "default": null,
         "credential": false
+      },
+      {
+        "key": "ADMIN_USERNAME",
+        "label": "System admin username",
+        "description": null,
+        "kind": "text",
+        "required": false,
+        "generated": false,
+        "default": "sysadmin",
+        "credential": false
+      },
+      {
+        "key": "ADMIN_EMAIL",
+        "label": "System admin email",
+        "description": null,
+        "kind": "email",
+        "required": true,
+        "generated": false,
+        "default": null,
+        "credential": false
+      },
+      {
+        "key": "ADMIN_PASSWORD",
+        "label": "System admin password",
+        "description": null,
+        "kind": "password",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": true
       }
     ],
-    "setup_notes": "Open the app right away: the first account created becomes the system admin. Then create a team and invite people.",
+    "setup_notes": "Sign in as the system admin with the password shown after deploy (also kept as ADMIN_PASSWORD on the Environment tab), create a team and invite people: sign-up needs an invitation.",
     "upgrade_notes": "Change the image to a newer tag and redeploy; the database is migrated on start. Stay on Extended Support Releases for fewer upgrades, and snapshot first.",
     "post_deploy_checks": [
-      "Create the admin account",
+      "Sign in as the system admin",
       "Configure SMTP in the System Console for invites and notifications"
     ],
-    "compose": "services:\n  mattermost:\n    image: mattermost/mattermost-team-edition:11.11\n    restart: unless-stopped\n    mem_limit: 1g\n    ports: [\"8065\"]\n    environment:\n      TZ: UTC\n      MM_SQLSETTINGS_DRIVERNAME: postgres\n      MM_SQLSETTINGS_DATASOURCE: postgres://mattermost:${DB_PASSWORD}@db:5432/mattermost?sslmode=disable&connect_timeout=10\n      MM_CONFIG: postgres://mattermost:${DB_PASSWORD}@db:5432/mattermost?sslmode=disable&connect_timeout=10\n      MM_SERVICESETTINGS_SITEURL: ${MM_SERVICESETTINGS_SITEURL}\n      MM_BLEVESETTINGS_INDEXDIR: /mattermost/data/bleve-indexes\n    volumes:\n      - ./data:/mattermost/data\n      - ./plugins:/mattermost/plugins\n      - ./client-plugins:/mattermost/client/plugins\n    depends_on:\n      db:\n        condition: service_healthy\n    # Timings only: the image's own HEALTHCHECK test is kept, but its 30s interval\n    # would keep the deploy waiting.\n    healthcheck:\n      interval: 10s\n      timeout: 10s\n      start_period: 60s\n      start_interval: 2s\n\n  db:\n    image: postgres:17-alpine\n    labels:\n      tond.backup.dump: pg_dump -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" --clean --if-exists\n      tond.backup.restore: psql -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" -q -v ON_ERROR_STOP=1\n    restart: unless-stopped\n    mem_limit: 384m\n    environment:\n      POSTGRES_DB: mattermost\n      POSTGRES_USER: mattermost\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U mattermost -d mattermost\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n"
+    "admin_setup": "seeded",
+    "compose": "services:\n  mattermost:\n    image: mattermost/mattermost-team-edition:11.11\n    restart: unless-stopped\n    mem_limit: 1g\n    ports: [\"8065\"]\n    environment:\n      TZ: UTC\n      MM_SQLSETTINGS_DRIVERNAME: postgres\n      MM_SQLSETTINGS_DATASOURCE: postgres://mattermost:${DB_PASSWORD}@db:5432/mattermost?sslmode=disable&connect_timeout=10\n      MM_CONFIG: postgres://mattermost:${DB_PASSWORD}@db:5432/mattermost?sslmode=disable&connect_timeout=10\n      MM_SERVICESETTINGS_SITEURL: ${MM_SERVICESETTINGS_SITEURL}\n      MM_BLEVESETTINGS_INDEXDIR: /mattermost/data/bleve-indexes\n      # mmctl --local creates the system admin before the app is routed\n      # (post_deploy in template.toml). The socket exists only inside the\n      # container (/var/tmp/mattermost_local.socket).\n      MM_SERVICESETTINGS_ENABLELOCALMODE: \"true\"\n    volumes:\n      - ./data:/mattermost/data\n      - ./plugins:/mattermost/plugins\n      - ./client-plugins:/mattermost/client/plugins\n    depends_on:\n      db:\n        condition: service_healthy\n    # Timings only: the image's own HEALTHCHECK test is kept, but its 30s interval\n    # would keep the deploy waiting.\n    healthcheck:\n      interval: 10s\n      timeout: 10s\n      start_period: 60s\n      start_interval: 2s\n\n  db:\n    image: postgres:17-alpine\n    labels:\n      tond.backup.dump: pg_dump -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" --clean --if-exists\n      tond.backup.restore: psql -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" -q -v ON_ERROR_STOP=1\n    restart: unless-stopped\n    mem_limit: 384m\n    environment:\n      POSTGRES_DB: mattermost\n      POSTGRES_USER: mattermost\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U mattermost -d mattermost\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n"
   },
   {
     "id": "mealie",
@@ -1400,14 +1553,25 @@
         "generated": false,
         "default": "UTC",
         "credential": false
+      },
+      {
+        "key": "ADMIN_PASSWORD",
+        "label": "Admin password",
+        "description": null,
+        "kind": "password",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": true
       }
     ],
-    "setup_notes": "Sign in with changeme@example.com and password MyPassword, then change the email and password immediately under your profile.",
+    "setup_notes": "Sign in as changeme@example.com with the password shown after deploy (also kept as ADMIN_PASSWORD on the Environment tab): Tond replaces Mealie's default password before the app goes live. Change the email to yours under your profile.",
     "upgrade_notes": "Change the image to a newer tag and redeploy; migrations run on start. Snapshot the app first.",
     "post_deploy_checks": [
-      "Sign in and change the default credentials",
+      "Sign in and change the email to yours",
       "Import a recipe from a URL"
     ],
+    "admin_setup": "seeded",
     "compose": "services:\n  mealie:\n    image: ghcr.io/mealie-recipes/mealie:v3.28.0\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"9000\"]\n    environment:\n      BASE_URL: ${BASE_URL}\n      TZ: ${TZ}\n      ALLOW_SIGNUP: \"false\"\n      MAX_WORKERS: \"1\"\n      WEB_CONCURRENCY: \"1\"\n    volumes:\n      - ./data:/app/data\n    # Timings only: the image's own HEALTHCHECK test is kept, but its 30s default interval\n    # would keep the deploy waiting.\n    healthcheck:\n      interval: 10s\n      timeout: 5s\n      start_period: 60s\n      start_interval: 2s\n"
   },
   {
@@ -1455,12 +1619,13 @@
       }
     ],
     "inputs": [],
-    "setup_notes": "Open the app right away: the first account you create becomes the admin. Then turn off sign-ups in Settings if you use it alone.",
+    "setup_notes": "Open the app right away: the first account created becomes the admin, so anyone who reaches it first can. Then turn off sign-ups in Settings if you use it alone.",
     "upgrade_notes": "Memos is pre-1.0 and minor versions can change the database. Snapshot the app, then change the image tag and redeploy.",
     "post_deploy_checks": [
       "Create the admin account",
       "Disable public sign-ups"
     ],
+    "admin_setup": "first_visitor",
     "compose": "services:\n  memos:\n    image: neosmemo/memos:0.31.0\n    restart: unless-stopped\n    mem_limit: 128m\n    ports: [\"5230\"]\n    volumes:\n      - ./data:/var/opt/memos\n"
   },
   {
@@ -1532,6 +1697,7 @@
       "Complete the setup wizard",
       "Connect a database and build a question"
     ],
+    "admin_setup": "none",
     "compose": "services:\n  metabase:\n    image: metabase/metabase:v0.58.34\n    restart: unless-stopped\n    mem_limit: 1280m\n    ports: [\"3000\"]\n    environment:\n      MB_DB_TYPE: postgres\n      MB_DB_HOST: db\n      MB_DB_PORT: \"5432\"\n      MB_DB_DBNAME: metabase\n      MB_DB_USER: metabase\n      MB_DB_PASS: ${DB_PASSWORD}\n      MB_SITE_URL: ${MB_SITE_URL}\n      MB_ANON_TRACKING_ENABLED: \"false\"\n      JAVA_OPTS: -Xmx768m -XX:+UseSerialGC\n    depends_on:\n      db:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    labels:\n      tond.backup.dump: pg_dump -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" --clean --if-exists\n      tond.backup.restore: psql -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" -q -v ON_ERROR_STOP=1\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: metabase\n      POSTGRES_USER: metabase\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U metabase -d metabase\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n"
   },
   {
@@ -1612,6 +1778,7 @@
       "Sign in as admin",
       "Import an OPML file or add a feed"
     ],
+    "admin_setup": "none",
     "compose": "services:\n  miniflux:\n    image: miniflux/miniflux:2.3.3\n    restart: unless-stopped\n    mem_limit: 128m\n    ports: [\"8080\"]\n    environment:\n      DATABASE_URL: postgres://miniflux:${DB_PASSWORD}@db/miniflux?sslmode=disable\n      RUN_MIGRATIONS: \"1\"\n      CREATE_ADMIN: \"1\"\n      ADMIN_USERNAME: admin\n      ADMIN_PASSWORD: ${ADMIN_PASSWORD}\n      BASE_URL: ${BASE_URL}\n      LISTEN_ADDR: 0.0.0.0:8080\n    depends_on:\n      db:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    labels:\n      tond.backup.dump: pg_dump -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" --clean --if-exists\n      tond.backup.restore: psql -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" -q -v ON_ERROR_STOP=1\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: miniflux\n      POSTGRES_USER: miniflux\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U miniflux -d miniflux\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n"
   },
   {
@@ -1687,6 +1854,7 @@
       "Create the owner account",
       "Build a test workflow with a webhook trigger"
     ],
+    "admin_setup": "none",
     "compose": "services:\n  n8n:\n    image: n8nio/n8n:2.41.3\n    restart: unless-stopped\n    mem_limit: 1g\n    ports: [\"5678\"]\n    environment:\n      N8N_HOST: ${N8N_HOST}\n      N8N_PROTOCOL: https\n      N8N_PORT: \"5678\"\n      WEBHOOK_URL: ${WEBHOOK_URL}\n      N8N_PROXY_HOPS: \"1\"\n      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}\n      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE}\n      TZ: ${GENERIC_TIMEZONE}\n      N8N_DIAGNOSTICS_ENABLED: \"false\"\n      N8N_PERSONALIZATION_ENABLED: \"false\"\n      EXECUTIONS_DATA_PRUNE: \"true\"\n      EXECUTIONS_DATA_MAX_AGE: \"336\"\n      DB_SQLITE_POOL_SIZE: \"2\"\n    volumes:\n      - ./data:/home/node/.n8n\n"
   },
   {
@@ -1775,6 +1943,7 @@
       "Sign in as admin",
       "Check Administration → Overview for warnings"
     ],
+    "admin_setup": "none",
     "compose": "services:\n  nextcloud:\n    image: nextcloud:34-apache\n    restart: unless-stopped\n    mem_limit: 768m\n    ports: [\"80\"]\n    environment:\n      POSTGRES_HOST: db\n      POSTGRES_DB: nextcloud\n      POSTGRES_USER: nextcloud\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n      NEXTCLOUD_ADMIN_USER: admin\n      NEXTCLOUD_ADMIN_PASSWORD: ${ADMIN_PASSWORD}\n      NEXTCLOUD_TRUSTED_DOMAINS: ${NEXTCLOUD_TRUSTED_DOMAINS}\n      OVERWRITEPROTOCOL: https\n      OVERWRITECLIURL: ${OVERWRITE_CLI_URL}\n      TRUSTED_PROXIES: 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16\n      PHP_MEMORY_LIMIT: 512M\n      PHP_UPLOAD_LIMIT: 2G\n    volumes:\n      - ./html:/var/www/html\n    depends_on:\n      db:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    labels:\n      tond.backup.dump: pg_dump -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" --clean --if-exists\n      tond.backup.restore: psql -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" -q -v ON_ERROR_STOP=1\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: nextcloud\n      POSTGRES_USER: nextcloud\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U nextcloud -d nextcloud\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n"
   },
   {
@@ -1828,6 +1997,7 @@
       "Create an admin user from the app terminal",
       "Send a test message with curl"
     ],
+    "admin_setup": "none",
     "compose": "services:\n  ntfy:\n    image: binwiederhier/ntfy:v2.28.0\n    restart: unless-stopped\n    mem_limit: 128m\n    command: serve\n    ports: [\"80\"]\n    environment:\n      NTFY_BASE_URL: ${NTFY_BASE_URL}\n      NTFY_LISTEN_HTTP: \":80\"\n      NTFY_BEHIND_PROXY: \"true\"\n      NTFY_CACHE_FILE: /var/lib/ntfy/cache.db\n      NTFY_AUTH_FILE: /var/lib/ntfy/auth.db\n      NTFY_AUTH_DEFAULT_ACCESS: deny-all\n      NTFY_ENABLE_LOGIN: \"true\"\n      NTFY_ATTACHMENT_CACHE_DIR: /var/lib/ntfy/attachments\n    volumes:\n      - ./data:/var/lib/ntfy\n"
   },
   {
@@ -1931,6 +2101,7 @@
       "Sign in as admin",
       "Upload a PDF and search for a word in it"
     ],
+    "admin_setup": "none",
     "compose": "services:\n  paperless:\n    image: ghcr.io/paperless-ngx/paperless-ngx:2.20.15\n    restart: unless-stopped\n    mem_limit: 1g\n    ports: [\"8000\"]\n    environment:\n      PAPERLESS_REDIS: redis://redis:6379\n      PAPERLESS_URL: ${PAPERLESS_URL}\n      PAPERLESS_SECRET_KEY: ${PAPERLESS_SECRET_KEY}\n      PAPERLESS_ADMIN_USER: admin\n      PAPERLESS_ADMIN_PASSWORD: ${ADMIN_PASSWORD}\n      PAPERLESS_OCR_LANGUAGE: ${PAPERLESS_OCR_LANGUAGE}\n      PAPERLESS_TASK_WORKERS: \"1\"\n      PAPERLESS_THREADS_PER_WORKER: \"1\"\n      PAPERLESS_WEBSERVER_WORKERS: \"1\"\n    volumes:\n      - ./data:/usr/src/paperless/data\n      - ./media:/usr/src/paperless/media\n      - ./consume:/usr/src/paperless/consume\n    depends_on:\n      redis:\n        condition: service_healthy\n    # Timings only: the image's own HEALTHCHECK test is kept, but its 30s interval\n    # would keep the deploy waiting.\n    healthcheck:\n      interval: 10s\n      timeout: 10s\n      start_period: 120s\n      start_interval: 2s\n      retries: 5\n\n  redis:\n    image: valkey/valkey:8-alpine\n    restart: unless-stopped\n    mem_limit: 128m\n    healthcheck:\n      test: [\"CMD\", \"valkey-cli\", \"ping\"]\n      interval: 5s\n      timeout: 3s\n      retries: 10\n"
   },
   {
@@ -2029,6 +2200,7 @@
       "Register the owner account right away",
       "Add a site and check a page view arrives"
     ],
+    "admin_setup": "none",
     "compose": "services:\n  plausible:\n    image: ghcr.io/plausible/community-edition:v3.2.1\n    restart: unless-stopped\n    mem_limit: 768m\n    command: sh -c \"/entrypoint.sh db createdb && /entrypoint.sh db migrate && /entrypoint.sh run\"\n    ports: [\"8000\"]\n    environment:\n      BASE_URL: ${BASE_URL}\n      SECRET_KEY_BASE: ${SECRET_KEY_BASE}\n      HTTP_PORT: \"8000\"\n      DATABASE_URL: postgres://plausible:${DB_PASSWORD}@db:5432/plausible\n      CLICKHOUSE_DATABASE_URL: http://events:8123/plausible_events\n      DISABLE_REGISTRATION: invite_only\n    volumes:\n      - ./plausible:/var/lib/plausible\n    depends_on:\n      db:\n        condition: service_healthy\n      events:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    labels:\n      tond.backup.dump: pg_dump -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" --clean --if-exists\n      tond.backup.restore: psql -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" -q -v ON_ERROR_STOP=1\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: plausible\n      POSTGRES_USER: plausible\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U plausible -d plausible\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n\n  events:\n    image: clickhouse/clickhouse-server:24.12-alpine\n    restart: unless-stopped\n    mem_limit: 1g\n    environment:\n      CLICKHOUSE_SKIP_USER_SETUP: \"1\"\n    volumes:\n      - ./clickhouse:/var/lib/clickhouse\n    configs:\n      - source: clickhouse_logs\n        target: /etc/clickhouse-server/config.d/logs.xml\n      - source: clickhouse_ipv4\n        target: /etc/clickhouse-server/config.d/ipv4-only.xml\n      - source: clickhouse_low_resources\n        target: /etc/clickhouse-server/users.d/low-resources.xml\n    ulimits:\n      nofile:\n        soft: 262144\n        hard: 262144\n    healthcheck:\n      test: [\"CMD-SHELL\", \"wget --no-verbose --tries=1 -O - http://127.0.0.1:8123/ping || exit 1\"]\n      interval: 5s\n      timeout: 5s\n      retries: 20\n      start_period: 5s\n      start_interval: 1s\n\nconfigs:\n  clickhouse_logs:\n    content: |\n      <clickhouse>\n        <logger><level>warning</level><console>true</console></logger>\n        <query_log replace=\"1\"><database>system</database><table>query_log</table><flush_interval_milliseconds>7500</flush_interval_milliseconds><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></query_log>\n        <query_thread_log remove=\"remove\"/>\n        <metric_log remove=\"remove\"/>\n        <asynchronous_metric_log remove=\"remove\"/>\n        <trace_log remove=\"remove\"/>\n        <text_log remove=\"remove\"/>\n        <session_log remove=\"remove\"/>\n        <part_log remove=\"remove\"/>\n      </clickhouse>\n  clickhouse_ipv4:\n    content: |\n      <clickhouse>\n        <listen_host>0.0.0.0</listen_host>\n      </clickhouse>\n  clickhouse_low_resources:\n    content: |\n      <clickhouse>\n        <profiles>\n          <default>\n            <max_threads>1</max_threads>\n            <max_block_size>8192</max_block_size>\n            <max_download_threads>1</max_download_threads>\n            <input_format_parallel_parsing>0</input_format_parallel_parsing>\n            <output_format_parallel_formatting>0</output_format_parallel_formatting>\n          </default>\n        </profiles>\n      </clickhouse>\n"
   },
   {
@@ -2105,6 +2277,7 @@
       "Sign in to the dashboard at /_/",
       "Create your first collection"
     ],
+    "admin_setup": "none",
     "compose": "services:\n  pocketbase:\n    image: ghcr.io/muchobien/pocketbase:0.40.4\n    restart: unless-stopped\n    mem_limit: 256m\n    ports: [\"8090\"]\n    environment:\n      PB_SUPERUSER_EMAIL: ${SUPERUSER_EMAIL}\n      PB_SUPERUSER_PASSWORD: ${SUPERUSER_PASSWORD}\n    # Create (or update) the superuser, then serve.\n    entrypoint: [\"/bin/sh\", \"-c\"]\n    command:\n      - >-\n        /usr/local/bin/pocketbase superuser upsert \"$$PB_SUPERUSER_EMAIL\" \"$$PB_SUPERUSER_PASSWORD\" --dir=/pb_data\n        && exec /usr/local/bin/pocketbase serve --http=0.0.0.0:8090 --dir=/pb_data\n    volumes:\n      - ./pb_data:/pb_data\n"
   },
   {
@@ -2170,6 +2343,7 @@
       "Sign in and change the password",
       "Merge two PDFs"
     ],
+    "admin_setup": "none",
     "compose": "services:\n  stirling-pdf:\n    image: stirlingtools/stirling-pdf:2.14.3\n    restart: unless-stopped\n    mem_limit: 2g\n    ports: [\"8080\"]\n    environment:\n      SECURITY_ENABLELOGIN: \"true\"\n      SECURITY_INITIALLOGIN_USERNAME: admin\n      SECURITY_INITIALLOGIN_PASSWORD: ${ADMIN_PASSWORD}\n      SYSTEM_ENABLEANALYTICS: \"false\"\n      LANGS: en_GB\n    volumes:\n      - ./configs:/configs\n    # Timings only: the image's own HEALTHCHECK test is kept, but its 30s interval\n    # would keep the deploy waiting.\n    healthcheck:\n      interval: 15s\n      timeout: 15s\n      start_period: 120s\n      start_interval: 2s\n      retries: 5\n"
   },
   {
@@ -2262,12 +2436,13 @@
         "credential": false
       }
     ],
-    "setup_notes": "The first start runs migrations and takes a few minutes. Then open the app and sign up: the first account creates the workspace.",
+    "setup_notes": "The first start runs migrations and takes a few minutes. Then open the app right away and sign up: the first account creates the workspace, so anyone who reaches it first can.",
     "upgrade_notes": "Upgrade one minor version at a time and read Twenty's upgrade guide: some releases need a manual upgrade command. Snapshot the app first.",
     "post_deploy_checks": [
       "Create the workspace",
       "Import contacts from CSV"
     ],
+    "admin_setup": "first_visitor",
     "compose": "services:\n  server:\n    image: twentycrm/twenty:v2.42.6\n    restart: unless-stopped\n    mem_limit: 1g\n    ports: [\"3000\"]\n    environment:\n      NODE_PORT: \"3000\"\n      SERVER_URL: ${SERVER_URL}\n      APP_SECRET: ${APP_SECRET}\n      PG_DATABASE_URL: postgres://twenty:${DB_PASSWORD}@db:5432/twenty\n      REDIS_URL: redis://redis:6379\n      STORAGE_TYPE: local\n    volumes:\n      - ./storage:/app/packages/twenty-server/.local-storage\n    depends_on:\n      db:\n        condition: service_healthy\n      redis:\n        condition: service_healthy\n\n  worker:\n    image: twentycrm/twenty:v2.42.6\n    restart: unless-stopped\n    mem_limit: 768m\n    command: [\"yarn\", \"worker:prod\"]\n    environment:\n      SERVER_URL: ${SERVER_URL}\n      APP_SECRET: ${APP_SECRET}\n      PG_DATABASE_URL: postgres://twenty:${DB_PASSWORD}@db:5432/twenty\n      REDIS_URL: redis://redis:6379\n      STORAGE_TYPE: local\n      DISABLE_DB_MIGRATIONS: \"true\"\n      DISABLE_CRON_JOBS_REGISTRATION: \"true\"\n    depends_on:\n      - server\n\n  db:\n    image: postgres:16-alpine\n    labels:\n      tond.backup.dump: pg_dump -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" --clean --if-exists\n      tond.backup.restore: psql -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" -q -v ON_ERROR_STOP=1\n    restart: unless-stopped\n    mem_limit: 384m\n    environment:\n      POSTGRES_DB: twenty\n      POSTGRES_USER: twenty\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U twenty -d twenty\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n\n  redis:\n    image: valkey/valkey:8-alpine\n    restart: unless-stopped\n    mem_limit: 128m\n    command: [\"valkey-server\", \"--maxmemory-policy\", \"noeviction\"]\n    healthcheck:\n      test: [\"CMD\", \"valkey-cli\", \"ping\"]\n      interval: 5s\n      timeout: 3s\n      retries: 10\n"
   },
   {
@@ -2340,14 +2515,25 @@
         "generated": true,
         "default": null,
         "credential": false
+      },
+      {
+        "key": "ADMIN_PASSWORD",
+        "label": "Admin password",
+        "description": null,
+        "kind": "password",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": true
       }
     ],
-    "setup_notes": "Sign in with username admin and password umami, then change the password right away under Settings → Profile. Add a website to get its tracking script.",
+    "setup_notes": "Sign in as admin with the password shown after deploy (also kept as ADMIN_PASSWORD on the Environment tab): Tond replaces Umami's default password before the app goes live. Add a website to get its tracking script.",
     "upgrade_notes": "Change the image tag to a newer 3.x release and redeploy; database migrations run on start. Read the release notes before a major version.",
     "post_deploy_checks": [
-      "Sign in and change the default admin password",
+      "Sign in as admin",
       "Add your first website and install the tracking script"
     ],
+    "admin_setup": "seeded",
     "compose": "services:\n  umami:\n    image: ghcr.io/umami-software/umami:3.4.0\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"3000\"]\n    environment:\n      DATABASE_URL: postgresql://umami:${DB_PASSWORD}@db:5432/umami\n      APP_SECRET: ${APP_SECRET}\n      DISABLE_TELEMETRY: \"1\"\n    depends_on:\n      db:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    labels:\n      tond.backup.dump: pg_dump -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" --clean --if-exists\n      tond.backup.restore: psql -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" -q -v ON_ERROR_STOP=1\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: umami\n      POSTGRES_USER: umami\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U umami -d umami\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n"
   },
   {
@@ -2395,12 +2581,13 @@
       }
     ],
     "inputs": [],
-    "setup_notes": "Open the app right away: the first visitor creates the admin account. Choose the embedded SQLite database when asked.",
+    "setup_notes": "Open the app right away: the first visitor creates the admin account, so anyone who reaches it first can. Choose the embedded SQLite database when asked.",
     "upgrade_notes": "Change the image to a newer 2.x tag and redeploy. Take a snapshot first; the database is migrated on start.",
     "post_deploy_checks": [
       "Create the admin account",
       "Add a monitor and a notification channel"
     ],
+    "admin_setup": "first_visitor",
     "compose": "services:\n  uptime-kuma:\n    image: louislam/uptime-kuma:2.5.5\n    restart: unless-stopped\n    mem_limit: 384m\n    ports: [\"3001\"]\n    # Ping monitors need raw sockets, which Tond drops by default.\n    cap_add: [NET_RAW]\n    volumes:\n      - ./data:/app/data\n    # Timings only: the image's own HEALTHCHECK test is kept, but its 60s interval\n    # would keep the deploy waiting.\n    healthcheck:\n      interval: 20s\n      timeout: 10s\n      start_period: 60s\n      start_interval: 2s\n      retries: 5\n"
   },
   {
@@ -2466,6 +2653,7 @@
       "Disable new signups in /admin",
       "Set up backups of this app"
     ],
+    "admin_setup": "none",
     "compose": "services:\n  vaultwarden:\n    image: vaultwarden/server:1.37.3-alpine\n    restart: unless-stopped\n    mem_limit: 256m\n    ports: [\"80\"]\n    environment:\n      DOMAIN: ${DOMAIN}\n      ADMIN_TOKEN: ${ADMIN_TOKEN}\n      SIGNUPS_ALLOWED: \"true\"\n      WEBSOCKET_ENABLED: \"true\"\n    volumes:\n      - ./data:/data\n    # Timings only: the image's own HEALTHCHECK test is kept, but its 60s interval\n    # would keep the deploy waiting.\n    healthcheck:\n      interval: 10s\n      timeout: 5s\n      start_period: 10s\n      start_interval: 1s\n"
   },
   {
@@ -2530,12 +2718,13 @@
         "credential": false
       }
     ],
-    "setup_notes": "Open the app right away: the setup page creates the administrator account and asks for the site URL (use this app's address).",
+    "setup_notes": "Open the app right away: the setup page creates the administrator account for whoever reaches it first and asks for the site URL (use this app's address).",
     "upgrade_notes": "Change the image to a newer 2.5.x tag and redeploy. Wiki.js 3 is a different product line with its own migration.",
     "post_deploy_checks": [
       "Finish the setup page",
       "Create the home page"
     ],
+    "admin_setup": "first_visitor",
     "compose": "services:\n  wiki:\n    image: ghcr.io/requarks/wiki:2.5.315\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"3000\"]\n    environment:\n      DB_TYPE: postgres\n      DB_HOST: db\n      DB_PORT: \"5432\"\n      DB_USER: wikijs\n      DB_PASS: ${DB_PASSWORD}\n      DB_NAME: wiki\n    depends_on:\n      db:\n        condition: service_healthy\n\n  db:\n    image: postgres:17-alpine\n    labels:\n      tond.backup.dump: pg_dump -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" --clean --if-exists\n      tond.backup.restore: psql -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" -q -v ON_ERROR_STOP=1\n    restart: unless-stopped\n    mem_limit: 256m\n    environment:\n      POSTGRES_DB: wiki\n      POSTGRES_USER: wikijs\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - ./postgres:/var/lib/postgresql/data\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -h 127.0.0.1 -U wikijs -d wiki\"]\n      interval: 5s\n      timeout: 5s\n      retries: 10\n"
   }
 ]

@@ -25,6 +25,12 @@
 // them back at startup, whenever a database changes, and re-checks them
 // hourly while any exist (Docker or a firewall reload may drop the jump).
 //
+// While a public database runs a major upgrade (`upgrade.status` is
+// `running`, db_upgrade.rs) its port gets the DROP rule alone, allowlist or
+// not: nothing reaches it while the dump runs. The rule follows the stored
+// state, so it lifts when the upgrade waits for confirmation or fails, and
+// after a crash once `recover_interrupted` marks it failed.
+//
 // Where iptables or the DOCKER-USER chain is missing (nftables-only hosts,
 // rootless Docker, a dev machine) an allowlist can't be enforced: saving one
 // is refused with an explanation, and a database that has one says so.
@@ -140,12 +146,22 @@ pub fn ruleset(rules: &BTreeMap<i64, Vec<String>>) -> String {
     out
 }
 
-/// The rules the databases call for: every public database with an
-/// allowlist, by host port.
+/// Whether a database's public port is closed for a running major upgrade.
+pub fn is_sealed(db: &ManagedDatabase) -> bool {
+    db.upgrade_state().is_some_and(|u| u.status == "running")
+}
+
+/// The rules the databases call for, by host port: every public database
+/// with an allowlist, and every public database in the middle of a major
+/// upgrade with no allowed address at all (the port is closed while the
+/// dump runs, so nothing is written that the copy would miss).
 pub fn desired_rules(dbs: &[ManagedDatabase]) -> BTreeMap<i64, Vec<String>> {
     dbs.iter()
         .filter(|d| d.public_access)
         .filter_map(|d| {
+            if is_sealed(d) {
+                return d.host_port.map(|p| (p, Vec::new()));
+            }
             let allowed = d.allowlist_entries();
             (!allowed.is_empty())
                 .then_some(d.host_port)
@@ -188,6 +204,10 @@ pub fn access_warning(db: &ManagedDatabase, fw: &FirewallStatus) -> Option<Strin
     if !db.public_access {
         return None;
     }
+    if is_sealed(db) && fw.applied_ports.contains(&db.host_port.unwrap_or(-1)) {
+        // Closed to everyone until the upgrade finishes.
+        return None;
+    }
     let allowlist = db.allowlist_entries();
     if allowlist.is_empty() {
         return Some(
@@ -224,21 +244,26 @@ pub fn set_test_firewall(available: bool) {
 
 /// Refuse to store an allowlist this server can't enforce.
 pub async fn require_firewall() -> Result<(), String> {
+    firewall_usable().await.map_err(|e| {
+        format!(
+            "This server can't enforce an allowlist ({e}). Keep the database private and \
+             connect through an SSH tunnel instead."
+        )
+    })
+}
+
+/// Whether iptables with a DOCKER-USER chain can be used here; the reason
+/// when it can't. Shared by every feature that writes rules there.
+pub async fn firewall_usable() -> Result<(), String> {
     #[cfg(test)]
     if TEST_FIREWALL.load(std::sync::atomic::Ordering::Relaxed) {
         return Ok(());
     }
-    match probe_firewall().await {
-        Ok(()) => Ok(()),
-        Err(e) => Err(format!(
-            "This server can't enforce an allowlist ({e:#}). Keep the database private and \
-             connect through an SSH tunnel instead."
-        )),
-    }
+    probe_firewall().await.map_err(|e| format!("{e:#}"))
 }
 
 /// Whether iptables and Docker's DOCKER-USER chain are usable.
-async fn probe_firewall() -> Result<()> {
+pub async fn probe_firewall() -> Result<()> {
     let out = crate::process::command("iptables")
         .args(["-w", "5", "-n", "-L", "DOCKER-USER"])
         .output()
@@ -254,6 +279,13 @@ async fn probe_firewall() -> Result<()> {
 
 /// Load `rules` into the kernel (and make sure DOCKER-USER jumps to them).
 async fn apply(rules: &BTreeMap<i64, Vec<String>>) -> Result<()> {
+    load_chain(CHAIN, &ruleset(rules)).await
+}
+
+/// Replace one of Tond's chains with `restore_input` (an iptables-restore
+/// `*filter` table that declares the chain, which flushes it atomically) and
+/// make sure DOCKER-USER jumps to it. Shared by TOND-DB and TOND-EGRESS.
+pub async fn load_chain(chain: &str, restore_input: &str) -> Result<()> {
     use tokio::io::AsyncWriteExt;
 
     probe_firewall().await?;
@@ -265,7 +297,7 @@ async fn apply(rules: &BTreeMap<i64, Vec<String>>) -> Result<()> {
         .spawn()
         .context("iptables-restore isn't installed")?;
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(ruleset(rules).as_bytes()).await?;
+        stdin.write_all(restore_input.as_bytes()).await?;
     }
     let out = child.wait_with_output().await?;
     anyhow::ensure!(
@@ -273,19 +305,19 @@ async fn apply(rules: &BTreeMap<i64, Vec<String>>) -> Result<()> {
         "iptables-restore failed: {}",
         String::from_utf8_lossy(&out.stderr).trim()
     );
-    // The jump, first in DOCKER-USER (an empty TOND-DB chain is harmless).
+    // The jump, first in DOCKER-USER (an empty chain is harmless).
     let jumps = crate::process::command("iptables")
-        .args(["-w", "5", "-C", "DOCKER-USER", "-j", CHAIN])
+        .args(["-w", "5", "-C", "DOCKER-USER", "-j", chain])
         .status()
         .await?;
     if !jumps.success() {
         let inserted = crate::process::command("iptables")
-            .args(["-w", "5", "-I", "DOCKER-USER", "1", "-j", CHAIN])
+            .args(["-w", "5", "-I", "DOCKER-USER", "1", "-j", chain])
             .output()
             .await?;
         anyhow::ensure!(
             inserted.status.success(),
-            "couldn't hook {CHAIN} into DOCKER-USER: {}",
+            "couldn't hook {chain} into DOCKER-USER: {}",
             String::from_utf8_lossy(&inserted.stderr).trim()
         );
     }
@@ -344,6 +376,24 @@ pub async fn reconcile_now(state: &AppState) {
     if let Err(e) = reconcile(state, false).await {
         tracing::warn!("db-access: couldn't load the database allowlists: {e:#}");
     }
+}
+
+/// Close a public database's published port for a major upgrade (its
+/// `upgrade` state must already say `running`) and confirm the DROP rule is
+/// loaded. The seal is derived from that state, so it lifts by itself once
+/// the upgrade is confirmed-pending or failed, including the `failed` that
+/// `recover_interrupted` records after a crash; the kernel keeps the rule
+/// while tond-server is down, so the port stays closed in between.
+pub async fn seal_for_upgrade(state: &AppState, db: &ManagedDatabase) -> Result<()> {
+    let Some(port) = db.host_port.filter(|_| db.public_access) else {
+        return Ok(());
+    };
+    reconcile(state, false).await?;
+    anyhow::ensure!(
+        firewall_status().applied_ports.contains(&port),
+        "couldn't close public port {port} in the server firewall"
+    );
+    Ok(())
 }
 
 /// The "db-access" loop: keeps the allowlist rules loaded and TLS
@@ -596,6 +646,57 @@ mod tests {
         assert_eq!(
             ruleset(&BTreeMap::new()),
             "*filter\n:TOND-DB - [0:0]\nCOMMIT\n"
+        );
+    }
+
+    fn upgrading(mut db: ManagedDatabase, status: &str) -> ManagedDatabase {
+        db.upgrade = Some(format!(
+            r#"{{"status":"{status}","from_image":"","to_image":"","from_version":"16","to_version":"17","step":"","backup_id":null,"started_at":"","finished_at":null,"error":null,"rollback_dir":null}}"#
+        ));
+        assert_eq!(
+            db.upgrade_state().map(|u| u.status),
+            Some(status.to_string())
+        );
+        db
+    }
+
+    #[test]
+    fn a_running_upgrade_closes_the_public_port_to_everyone() {
+        let mut private = upgrading(public_db("private", 5403, &[]), "running");
+        private.public_access = false;
+        let dbs = vec![
+            upgrading(public_db("open", 5400, &[]), "running"),
+            upgrading(public_db("listed", 5401, &["203.0.113.7"]), "running"),
+            upgrading(public_db("waiting", 5402, &[]), "awaiting_confirmation"),
+            upgrading(public_db("failed", 5404, &["203.0.113.7"]), "failed"),
+            private,
+        ];
+        let rules = desired_rules(&dbs);
+        assert_eq!(
+            rules,
+            BTreeMap::from([
+                (5400, vec![]),
+                (5401, vec![]),
+                (5404, vec!["203.0.113.7".to_string()]),
+            ]),
+            "running upgrades drop every source (even allowlisted ones); finished, failed \
+             and private databases are back to their normal rules"
+        );
+        let text = ruleset(&rules);
+        let m = "-p tcp -m conntrack --ctstate DNAT --ctdir ORIGINAL --ctorigdstport";
+        assert!(text.contains(&format!("-A TOND-DB {m} 5400 -j DROP\n")));
+        assert!(text.contains(&format!("-A TOND-DB {m} 5401 -j DROP\n")));
+        assert!(!text.contains("5401 -s"), "{text}");
+
+        let fw = FirewallStatus {
+            available: true,
+            applied_ports: vec![5400],
+            error: None,
+        };
+        assert_eq!(
+            access_warning(&dbs[0], &fw),
+            None,
+            "closed, so no 'open to everyone'"
         );
     }
 

@@ -111,6 +111,7 @@ api_routes! {
     POST "/api/v1/apps/{id}/stop" => handlers::stop_app;
     POST "/api/v1/apps/{id}/start" => handlers::start_app;
     POST "/api/v1/apps/{id}/restart" => handlers::restart_app;
+    POST "/api/v1/apps/{id}/admin-setup/dismiss" => handlers::templates::dismiss_admin_setup;
     // Docker Compose apps: services, per-service domains and ports, the file
     GET "/api/v1/apps/{id}/services" => handlers::compose::list_services;
     PUT "/api/v1/apps/{id}/services/{service}" => handlers::compose::update_service;
@@ -138,6 +139,8 @@ api_routes! {
     PUT "/api/v1/apps/{id}/health" => handlers::update_health;
     PUT "/api/v1/apps/{id}/port" => handlers::update_port;
     PUT "/api/v1/apps/{id}/readiness" => handlers::update_readiness;
+    GET "/api/v1/apps/{id}/egress" => handlers::egress::get_egress;
+    PUT "/api/v1/apps/{id}/egress" => handlers::egress::update_egress;
     POST "/api/v1/compose/validate" => handlers::validate_compose;
     POST "/api/v1/apps/{id}/volumes" => handlers::add_volume;
     DELETE "/api/v1/apps/{id}/volumes" => handlers::remove_volume;

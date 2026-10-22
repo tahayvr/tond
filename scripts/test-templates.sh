@@ -16,7 +16,9 @@
 # followed). Then every container with a healthcheck (the image's or the
 # compose file's) must report healthy within HEALTH_GRACE seconds (default
 # 30): Tond waits for Docker's healthchecks too, so a slow one ("starting"
-# for a minute) would hold up a real deploy. Needs docker (with compose
+# for a minute) would hold up a real deploy. Finally the template's
+# [[post_deploy]] commands (pre-seeding the admin account) must succeed, as
+# Tond runs them before routing the app. Needs docker (with compose
 # v2.23+) and python3 ≥ 3.11.
 #
 # Exit status: 0 when every template tested came up healthy.
@@ -145,6 +147,48 @@ prefetch() {
 	done
 }
 
+# Run a template's [[post_deploy]] commands with `docker compose exec`, the
+# listed inputs passed as env vars (by name, so values stay off the command
+# line), each retried every 3s for its timeout_secs (default 120).
+run_post_deploy() {
+	local src="$1" dir="$2"
+	shift 2
+	python3 - "$src" "$dir" "$@" <<'PY'
+import os, subprocess, sys, time, tomllib
+
+src, out, dc = sys.argv[1], sys.argv[2], sys.argv[3:]
+with open(os.path.join(src, "template.toml"), "rb") as f:
+    hooks = tomllib.load(f).get("post_deploy", [])
+env = {}
+with open(os.path.join(out, ".env")) as f:
+    for line in f:
+        key, _, value = line.rstrip("\n").partition("=")
+        env[key] = value.strip("'")
+for hook in hooks:
+    cmd = dc + ["exec", "-T"]
+    if hook.get("user"):
+        cmd += ["-u", hook["user"]]
+    for key in hook.get("env", []):
+        cmd += ["-e", key]
+    cmd += [hook["service"]] + hook["command"]
+    deadline = time.time() + hook.get("timeout_secs", 120)
+    while True:
+        r = subprocess.run(cmd, env={**os.environ, **{k: env[k] for k in hook.get("env", [])}},
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            print(f"  post_deploy: {hook['description']}: done")
+            break
+        if time.time() + 3 >= deadline:
+            output = (r.stdout + r.stderr).strip()
+            for k in hook.get("env", []):
+                if len(env[k]) >= 4:
+                    output = output.replace(env[k], "********")
+            print(f"  post_deploy: {hook['description']}: failed (exit {r.returncode}): {output[-600:]}", file=sys.stderr)
+            sys.exit(1)
+        time.sleep(3)
+PY
+}
+
 cleanup_dir() {
 	local dir="$1"
 	rm -rf "$dir" 2>/dev/null ||
@@ -216,6 +260,11 @@ for id in "${IDS[@]}"; do
 		done
 		[ -z "$unhealthy" ] || ok=2
 	fi
+	# The template's post_deploy commands (pre-seeding the admin), as Tond
+	# runs them before routing the app: retried until they succeed.
+	if [ "$ok" = 1 ] && ! run_post_deploy "$src" "$dir" "${dc[@]}"; then
+		ok=3
+	fi
 	elapsed=$(($(date +%s) - started))
 	mem="$(docker stats --no-stream --format '{{.MemUsage}}' $("${dc[@]}" ps -q) 2>/dev/null |
 		python3 -c "
@@ -231,6 +280,9 @@ print(f'{t:.0f} MiB')")"
 	if [ "$ok" = 1 ]; then
 		echo "✓ $id: healthy after ${elapsed}s, using $mem"
 		PASSED+=("$id ($mem)")
+	elif [ "$ok" = 3 ]; then
+		echo "✗ $id: healthy, but a post_deploy command failed (see above)" >&2
+		FAILED+=("$id")
 	elif [ "$ok" = 2 ]; then
 		echo "✗ $id: answered, but healthchecks not healthy ${HEALTH_GRACE}s later:$unhealthy (give it a healthcheck with a short interval and start_interval)" >&2
 		FAILED+=("$id")

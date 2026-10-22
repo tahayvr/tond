@@ -62,6 +62,7 @@
 	} from '$lib/tabs';
 	import LinkTabs from '$lib/components/nav/link-tabs.svelte';
 	import PageHeader from '$lib/components/nav/page-header.svelte';
+	import AdminSetupWarning from '$lib/components/templates/admin-setup-warning.svelte';
 	import StatusBadge from '$lib/components/feedback/status-badge.svelte';
 	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import SuccessAlert from '$lib/components/feedback/success-alert.svelte';
@@ -84,6 +85,7 @@
 	import AppDomain from '$lib/components/tabs/app-page/app-domain.svelte';
 	import AppDatabases from '$lib/components/tabs/app-page/app-databases.svelte';
 	import AppHealth from '$lib/components/tabs/app-page/app-health.svelte';
+	import AppNetwork from '$lib/components/tabs/app-page/app-network.svelte';
 	import AppPort from '$lib/components/tabs/app-page/app-port.svelte';
 	import AppReadiness from '$lib/components/tabs/app-page/app-readiness.svelte';
 	import AppVolumes from '$lib/components/tabs/app-page/app-volumes.svelte';
@@ -999,6 +1001,12 @@
 
 		<InlineError message={error} ondismiss={() => (error = '')} />
 
+		<AdminSetupWarning
+			app={current}
+			canDismiss={canEditApp}
+			ondismissed={(updated) => (app = updated)}
+		/>
+
 		<LinkTabs
 			label="App sections"
 			tabs={appTabs}
@@ -1131,6 +1139,16 @@
 						appName={app.name}
 						sourceType={app.source_type}
 						projectId={app.project_id}
+					/>
+				{/if}
+
+				<!-- Network: outbound connections (egress policy) -->
+				{#if viewAllowed && activeTab === 'network'}
+					<AppNetwork
+						appId={app.id}
+						appName={app.name}
+						sourceType={app.source_type}
+						canEdit={can('settings:write')}
 					/>
 				{/if}
 

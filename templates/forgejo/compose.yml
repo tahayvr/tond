@@ -14,5 +14,9 @@ services:
       FORGEJO__server__DISABLE_SSH: "true"
       FORGEJO__server__START_SSH_SERVER: "false"
       FORGEJO__service__DISABLE_REGISTRATION: "true"
+      # No install page: Tond creates the administrator before the app is
+      # reachable (post_deploy in template.toml).
+      FORGEJO__security__INSTALL_LOCK: "true"
+      FORGEJO__security__SECRET_KEY: ${SECRET_KEY}
     volumes:
       - ./data:/data

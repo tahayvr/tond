@@ -130,7 +130,7 @@ The **Version** section of the database's **Settings** tab offers the newer vers
 
 Engines can't simply start on an older version's data files, so Tond moves the data through a logical dump into a fresh data directory:
 
-1. The database moves to a private network, so apps lose their connection and nothing is written after the dump.
+1. The database moves to a private network, so apps lose their connection and nothing is written after the dump. A [public](#public-access) database's port is closed to every address too, allowlisted or not, until the upgrade waits for you or fails. This uses the same server firewall as the allowlist, so on a server without it a public database can't be upgraded: make it private for the upgrade, then public again.
 2. Tond takes a backup of the database (shown as **Before an upgrade**). If it fails, nothing else happens.
 3. A temporary container of the new version starts on an empty data directory with the same credentials, and the dump is loaded into it.
 4. Tond switches over: the old data directory is kept under `<data>/db-upgrades/<name>/previous`, the new one takes its place, and the database is recreated on the new image with the same name, port, networks and credentials. If it doesn't pass a health check, the old data and version come back.

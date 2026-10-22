@@ -13,7 +13,7 @@ Admins manage everyone else on the **Users** page:
 - **Reset a password** by creating a new one-time link. On the server: `sudo tond users reset-link <email>`.
 - **Delete** a user. You can't delete yourself or the last admin. Deleting a user deletes their API tokens.
 
-Passwords must be 12 to 256 characters. There are no composition rules, but Tond refuses common and breached passwords (from a list built into the binary), a listed word padded with digits or symbols, repeated chunks and straight runs such as `123456789012`. Change your own password on your **Profile**.
+Passwords must be 12 to 256 characters. There are no composition rules, but Tond refuses common and breached passwords (the 10,000 most common passwords from SecLists plus its own list, built into the binary and compared case-insensitively), a listed word padded with digits or symbols, repeated chunks and straight runs such as `123456789012`. Change your own password on your **Profile**.
 
 ## Roles
 

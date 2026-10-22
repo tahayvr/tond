@@ -30,6 +30,9 @@
 //   setup_notes             shown after deploy (first login, what to do next)
 //   upgrade_notes           how to move to a newer version safely
 //   post_deploy_checks      short manual checklist
+//   first_visitor_admin     true when the app lets whoever opens it first create
+//                           the admin (or claim the install page) and Tond can't
+//                           pre-seed one: the app page warns until dismissed
 //
 //   [public]                the service that gets the app's domain
 //     service, port         compose service and the container port it serves HTTP on
@@ -46,6 +49,21 @@
 //     required              default true
 //     credential            show the final value once after deploy (first login)
 //
+//   [[post_deploy]]         commands that pre-seed the admin (or replace a fixed
+//                           default login) on the first deploy: run with
+//                           `docker exec` in a service container once every
+//                           service is ready and BEFORE the app is routed, so
+//                           nobody can reach the app first. Retried until they
+//                           succeed or time out; a failure doesn't fail the
+//                           deploy, it turns into the first-visitor warning.
+//     service               compose service to run in
+//     user                  optional exec user (a name or "uid:gid")
+//     command               argv (use ["sh", "-c", "..."] for a script; read inputs
+//                           as "$KEY", never inline secrets)
+//     env                   input keys passed to the command as env vars
+//     description           what it does ("Create the administrator account")
+//     timeout_secs          retry budget (default 120, at most 600)
+//
 //   [[volumes]]             every bind mount in the compose file, declared
 //     service, path         compose service and bind source ("./data")
 //     description           what is stored there
@@ -57,7 +75,7 @@
 // service has `restart` and `mem_limit`, only the public service publishes a
 // port and only as "<port>" (Tond picks the loopback host port), data lives in
 // declared `./…` binds (named volumes aren't in backups), every ${VAR} is an
-// input and every input is used. A service `healthcheck:` sets `interval` (at
+// input and every input is used (by compose.yml or a post_deploy `env`). A service `healthcheck:` sets `interval` (at
 // most 30s) and, with a `start_period`, a `start_interval` of at most 5s, so a
 // deploy is ready in seconds. A service whose image ships a slow HEALTHCHECK
 // (Docker's default interval is 30s) overrides its timings the same way; the
@@ -137,11 +155,68 @@ pub struct TemplateManifest {
     pub upgrade_notes: Option<String>,
     #[serde(default)]
     pub post_deploy_checks: Vec<String>,
+    /// The first visitor creates the admin and no pre-seeding is possible.
+    #[serde(default)]
+    pub first_visitor_admin: bool,
     pub public: TemplatePublic,
     #[serde(default)]
     pub inputs: Vec<TemplateInput>,
     #[serde(default)]
     pub volumes: Vec<TemplateVolume>,
+    #[serde(default)]
+    pub post_deploy: Vec<TemplatePostDeploy>,
+}
+
+/// Default retry budget of a post-deploy command.
+pub const POST_DEPLOY_DEFAULT_TIMEOUT_SECS: u32 = 120;
+/// Longest retry budget a post-deploy command may ask for.
+pub const POST_DEPLOY_MAX_TIMEOUT_SECS: u32 = 600;
+
+/// A command run once in a service container after the first successful
+/// start, before the app is routed (see the module docs).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TemplatePostDeploy {
+    pub service: String,
+    pub user: Option<String>,
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<String>,
+    pub description: String,
+    pub timeout_secs: Option<u32>,
+}
+
+impl TemplatePostDeploy {
+    pub fn timeout_secs(&self) -> u32 {
+        self.timeout_secs
+            .unwrap_or(POST_DEPLOY_DEFAULT_TIMEOUT_SECS)
+    }
+}
+
+/// How a template's admin account comes to exist.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum TemplateAdminSetup {
+    /// No admin account to claim (or it is set from an input at start).
+    #[default]
+    None,
+    /// Tond creates it (or replaces the default login) before routing the app.
+    Seeded,
+    /// Whoever opens the app first creates it: open it right after deploy.
+    FirstVisitor,
+}
+
+impl TemplateManifest {
+    pub fn admin_setup(&self) -> TemplateAdminSetup {
+        if !self.post_deploy.is_empty() {
+            TemplateAdminSetup::Seeded
+        } else if self.first_visitor_admin {
+            TemplateAdminSetup::FirstVisitor
+        } else {
+            TemplateAdminSetup::None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1098,6 +1173,51 @@ pub fn validate(
         ));
     }
 
+    // Post-deploy commands.
+    if m.first_visitor_admin && !m.post_deploy.is_empty() {
+        return fail(
+            "first_visitor_admin means the admin can't be pre-seeded; drop it when post_deploy seeds one"
+                .into(),
+        );
+    }
+    let mut hook_env: BTreeSet<&str> = BTreeSet::new();
+    for (i, hook) in m.post_deploy.iter().enumerate() {
+        let n = i + 1;
+        if !out.iter().any(|s| s.name == hook.service) {
+            return fail(format!(
+                "post_deploy {n}: service \"{}\" is not a service in compose.yml",
+                hook.service
+            ));
+        }
+        if hook.description.trim().is_empty() {
+            return fail(format!("post_deploy {n}: description must not be empty"));
+        }
+        if hook.command.first().is_none_or(|c| c.trim().is_empty()) {
+            return fail(format!("post_deploy {n}: command must not be empty"));
+        }
+        if let Some(user) = &hook.user
+            && (user.is_empty()
+                || !user
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':')))
+        {
+            return fail(format!(
+                "post_deploy {n}: user must be a user name or uid[:gid]"
+            ));
+        }
+        if hook.timeout_secs() == 0 || hook.timeout_secs() > POST_DEPLOY_MAX_TIMEOUT_SECS {
+            return fail(format!(
+                "post_deploy {n}: timeout_secs must be 1–{POST_DEPLOY_MAX_TIMEOUT_SECS}"
+            ));
+        }
+        for key in &hook.env {
+            if !keys.contains(key.as_str()) {
+                return fail(format!("post_deploy {n}: env {key} isn't an input"));
+            }
+            hook_env.insert(key.as_str());
+        }
+    }
+
     // Variables: every ${VAR} is an input, every input is used.
     let vars = compose_variables(compose).map_err(|e| invalid(id, e))?;
     if let Some(var) = vars.iter().find(|v| !keys.contains(v.as_str())) {
@@ -1105,8 +1225,13 @@ pub fn validate(
             "compose.yml uses ${{{var}}}, which isn't an input (write a literal $ as $$)"
         ));
     }
-    if let Some(key) = keys.iter().find(|k| !vars.contains(**k)) {
-        return fail(format!("input {key} isn't used in compose.yml"));
+    if let Some(key) = keys
+        .iter()
+        .find(|k| !vars.contains(**k) && !hook_env.contains(**k))
+    {
+        return fail(format!(
+            "input {key} isn't used in compose.yml or by a post_deploy command"
+        ));
     }
 
     out.sort_by_key(|s| (!s.public, s.name.clone()));
@@ -1159,12 +1284,17 @@ pub struct TemplateResponse {
     pub setup_notes: Option<String>,
     pub upgrade_notes: Option<String>,
     pub post_deploy_checks: Vec<String>,
+    /// How the admin account comes to exist: pre-seeded by Tond, created by
+    /// the first visitor, or nothing to claim.
+    #[serde(default)]
+    pub admin_setup: TemplateAdminSetup,
     pub compose: String,
 }
 
 impl From<Template> for TemplateResponse {
     fn from(t: Template) -> Self {
         let fits_2gb = t.fits_2gb();
+        let admin_setup = t.manifest.admin_setup();
         let m = t.manifest;
         Self {
             inputs: m
@@ -1202,6 +1332,7 @@ impl From<Template> for TemplateResponse {
             setup_notes: m.setup_notes,
             upgrade_notes: m.upgrade_notes,
             post_deploy_checks: m.post_deploy_checks,
+            admin_setup,
             compose: t.compose,
         }
     }
@@ -1558,6 +1689,135 @@ services:
                 .iter()
                 .any(|i| i.key == "ADMIN_EMAIL" && i.required)
         );
+        assert_eq!(resp.admin_setup, TemplateAdminSetup::None);
+    }
+
+    const HOOK: &str = r#"
+[[post_deploy]]
+service = "web"
+user = "1000:1000"
+command = ["sh", "-c", "demo admin create --password \"$SEED_PASSWORD\""]
+env = ["SEED_PASSWORD"]
+description = "Create the administrator account"
+"#;
+
+    fn with_hook(hook: &str) -> String {
+        format!(
+            "{MANIFEST}\n[[inputs]]\nkey = \"SEED_PASSWORD\"\nlabel = \"Admin password\"\ngenerate = \"password\"\ncredential = true\n{hook}"
+        )
+    }
+
+    #[test]
+    fn post_deploy_commands_are_parsed_and_their_env_counts_as_use() {
+        let t =
+            Template::parse("demo", &with_hook(HOOK), COMPOSE).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(t.manifest.post_deploy.len(), 1);
+        let hook = &t.manifest.post_deploy[0];
+        assert_eq!(hook.user.as_deref(), Some("1000:1000"));
+        assert_eq!(hook.env, ["SEED_PASSWORD"]);
+        assert_eq!(hook.timeout_secs(), POST_DEPLOY_DEFAULT_TIMEOUT_SECS);
+        assert_eq!(t.manifest.admin_setup(), TemplateAdminSetup::Seeded);
+        assert_eq!(
+            TemplateResponse::from(t).admin_setup,
+            TemplateAdminSetup::Seeded
+        );
+        // Without the hook the input would be unused.
+        assert_err(&with_hook(""), COMPOSE, "SEED_PASSWORD isn't used");
+    }
+
+    #[test]
+    fn post_deploy_commands_are_validated() {
+        assert_err(
+            &with_hook(&HOOK.replace("service = \"web\"", "service = \"db\"")),
+            COMPOSE,
+            "post_deploy 1: service \"db\"",
+        );
+        assert_err(
+            &with_hook(&HOOK.replace(
+                "env = [\"SEED_PASSWORD\"]",
+                "env = [\"SEED_PASSWORD\", \"NOPE\"]",
+            )),
+            COMPOSE,
+            "env NOPE isn't an input",
+        );
+        assert_err(
+            &with_hook(&HOOK.replace("user = \"1000:1000\"", "user = \"root; rm\"")),
+            COMPOSE,
+            "user must be",
+        );
+        assert_err(
+            &with_hook(&format!("{HOOK}timeout_secs = 9000\n")),
+            COMPOSE,
+            "timeout_secs",
+        );
+        assert_err(
+            &with_hook(&HOOK.replace(
+                "command = [\"sh\", \"-c\", \"demo admin create --password \\\"$SEED_PASSWORD\\\"\"]",
+                "command = []",
+            )),
+            COMPOSE,
+            "command must not be empty",
+        );
+        assert_err(
+            &with_hook(&HOOK.replace(
+                "description = \"Create the administrator account\"",
+                "description = \" \"",
+            )),
+            COMPOSE,
+            "description must not be empty",
+        );
+        let both =
+            with_hook(HOOK).replace("ram_mb = 200", "ram_mb = 200\nfirst_visitor_admin = true");
+        assert_err(&both, COMPOSE, "first_visitor_admin");
+    }
+
+    #[test]
+    fn first_visitor_flag_sets_the_admin_setup() {
+        let m = MANIFEST.replace("ram_mb = 200", "ram_mb = 200\nfirst_visitor_admin = true");
+        let t = Template::parse("demo", &m, COMPOSE).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(t.manifest.admin_setup(), TemplateAdminSetup::FirstVisitor);
+    }
+
+    /// Apps that hand the admin account to whoever opens them first, or ship
+    /// a fixed default login: each template either pre-seeds the admin with
+    /// a post_deploy command or carries the first-visitor warning.
+    #[test]
+    fn templates_with_a_claimable_admin_seed_it_or_warn() {
+        let all = builtin_templates().unwrap_or_else(|e| panic!("{e}"));
+        let expect = |id: &str, setup: TemplateAdminSetup| {
+            let t = all
+                .iter()
+                .find(|t| t.manifest.id == id)
+                .unwrap_or_else(|| panic!("{id} should be in the catalog"));
+            assert_eq!(t.manifest.admin_setup(), setup, "{id}");
+            if setup == TemplateAdminSetup::Seeded {
+                assert!(
+                    t.manifest.inputs.iter().any(|i| i.credential),
+                    "{id}: a seeded admin's password is shown once (credential = true)"
+                );
+            }
+        };
+        for id in [
+            "forgejo",
+            "gitea",
+            "mattermost",
+            "actual",
+            "audiobookshelf",
+            "umami",
+            "mealie",
+        ] {
+            expect(id, TemplateAdminSetup::Seeded);
+        }
+        for id in [
+            "ghost",
+            "uptime-kuma",
+            "memos",
+            "wikijs",
+            "docmost",
+            "twenty",
+        ] {
+            expect(id, TemplateAdminSetup::FirstVisitor);
+        }
     }
 
     #[test]

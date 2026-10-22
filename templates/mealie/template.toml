@@ -10,9 +10,9 @@ website = "https://mealie.io"
 docs = "https://docs.mealie.io/documentation/getting-started/installation/installation-checklist/"
 repository = "https://github.com/mealie-recipes/mealie"
 ram_mb = 300
-setup_notes = "Sign in with changeme@example.com and password MyPassword, then change the email and password immediately under your profile."
+setup_notes = "Sign in as changeme@example.com with the password shown after deploy (also kept as ADMIN_PASSWORD on the Environment tab): Tond replaces Mealie's default password before the app goes live. Change the email to yours under your profile."
 upgrade_notes = "Change the image to a newer tag and redeploy; migrations run on start. Snapshot the app first."
-post_deploy_checks = ["Sign in and change the default credentials", "Import a recipe from a URL"]
+post_deploy_checks = ["Sign in and change the email to yours", "Import a recipe from a URL"]
 
 [public]
 service = "mealie"
@@ -30,7 +30,23 @@ label = "Time zone"
 description = "For meal plans, e.g. Europe/Berlin."
 default = "UTC"
 
+[[inputs]]
+key = "ADMIN_PASSWORD"
+label = "Admin password"
+kind = "password"
+generate = "password"
+credential = true
+
 [[volumes]]
 service = "mealie"
 path = "./data"
 description = "Recipes, images and the SQLite database"
+
+# Mealie creates changeme@example.com / MyPassword on first start. Tond changes
+# the password through Mealie's API before the app is routed (a retry that
+# finds it changed checks that the new password signs in).
+[[post_deploy]]
+service = "mealie"
+description = "Replace the default admin password"
+env = ["ADMIN_PASSWORD"]
+command = ["python3", "-c", "import json, os, urllib.error, urllib.parse, urllib.request\nbase = 'http://127.0.0.1:9000/api'\nuser, old, new = 'changeme@example.com', 'MyPassword', os.environ['ADMIN_PASSWORD']\ndef token(pw):\n    data = urllib.parse.urlencode({'username': user, 'password': pw}).encode()\n    try:\n        return json.load(urllib.request.urlopen(base + '/auth/token', data))['access_token']\n    except urllib.error.HTTPError:\n        return None\nif token(new) is None:\n    t = token(old)\n    if t is None:\n        raise SystemExit('the default login no longer works')\n    body = json.dumps({'currentPassword': old, 'newPassword': new}).encode()\n    req = urllib.request.Request(base + '/users/password', data=body, method='PUT', headers={'Authorization': 'Bearer ' + t, 'Content-Type': 'application/json'})\n    urllib.request.urlopen(req)\n    if token(new) is None:\n        raise SystemExit('the new password does not sign in')\n"]

@@ -140,8 +140,48 @@ pub struct App {
     /// The template's version at deploy time
     #[sqlx(default)]
     pub template_version: Option<String>,
+    /// How the app's admin account comes to exist (template apps):
+    /// "pending" | "done" | "failed" | "open" | "dismissed" (see
+    /// [`AdminSetup`])
+    #[sqlx(default)]
+    pub admin_setup: Option<String>,
+    /// Why seeding the admin failed (admin_setup = "failed")
+    #[sqlx(default)]
+    pub admin_setup_error: Option<String>,
+    /// Outbound network policy: "open" | "restricted" | "none"
+    #[sqlx(default)]
+    #[serde(default)]
+    pub egress_policy: String,
+    /// JSON array of allowed destinations ("api.example.com:443",
+    /// "203.0.113.0/24") for "restricted"
+    #[sqlx(default)]
+    #[serde(default)]
+    pub egress_allowlist: String,
+    /// Outbound network policy of the app's previews (default "none")
+    #[sqlx(default)]
+    #[serde(default)]
+    pub preview_egress_policy: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// [`App::admin_setup`] values.
+pub struct AdminSetup;
+
+impl AdminSetup {
+    pub const PENDING: &'static str = "pending";
+    pub const DONE: &'static str = "done";
+    pub const FAILED: &'static str = "failed";
+    pub const OPEN: &'static str = "open";
+    pub const DISMISSED: &'static str = "dismissed";
+    /// A template upgrade added post_deploy steps for an app whose admin
+    /// Tond seeded: run them on the next deploy, keeping the app routed.
+    pub const UPGRADE: &'static str = "upgrade";
+
+    /// Whether the app page warns that the admin account is unclaimed.
+    pub fn warns(value: Option<&str>) -> bool {
+        matches!(value, Some(Self::OPEN | Self::FAILED))
+    }
 }
 
 /// Default for [`App::ready_after_secs`].
@@ -251,6 +291,11 @@ impl App {
             ready_after_secs: DEFAULT_READY_AFTER_SECS,
             template_id: None,
             template_version: None,
+            admin_setup: None,
+            admin_setup_error: None,
+            egress_policy: "open".to_string(),
+            egress_allowlist: "[]".to_string(),
+            preview_egress_policy: "none".to_string(),
             created_at: now.clone(),
             updated_at: now,
         }
@@ -344,6 +389,14 @@ pub struct AppResponse {
     /// The template's version at deploy time
     #[serde(default)]
     pub template_version: Option<String>,
+    /// How the app's admin account comes to exist: "pending" (Tond creates
+    /// it on the first successful deploy), "done", "failed" (see
+    /// `admin_setup_error`), "open" (the first visitor creates it) or
+    /// "dismissed". The dashboard warns while it is "open" or "failed".
+    #[serde(default)]
+    pub admin_setup: Option<String>,
+    #[serde(default)]
+    pub admin_setup_error: Option<String>,
     pub source_type: String,
     pub source_url: Option<String>,
     /// Branch deployed from `source_url` (git and git-sourced compose apps)
@@ -459,6 +512,8 @@ impl From<App> for AppResponse {
             ready_after_secs: app.ready_after_secs,
             template_id: app.template_id,
             template_version: app.template_version,
+            admin_setup: app.admin_setup,
+            admin_setup_error: app.admin_setup_error,
             created_at: app.created_at,
             updated_at: app.updated_at,
             domain_warning: None,
@@ -617,6 +672,59 @@ pub struct UpdateAppResourcesRequest {
     pub memory_limit: Option<i64>,
     /// CPU limit as nano_cpus (None = no limit / unlimited)
     pub cpu_limit: Option<i64>,
+}
+
+// ── Egress (outbound network policy) ──
+
+/// PUT /api/v1/apps/{id}/egress — the app's outbound network policy
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UpdateEgressRequest {
+    /// "open" (any destination), "restricted" (only the allowlist) or "none"
+    /// (no internet). DNS and the app's own Docker networks (linked
+    /// databases, project members) always work.
+    pub policy: String,
+    /// Allowed destinations, used by "restricted" (and by previews set to
+    /// "restricted"): an IPv4 address, a CIDR range or a hostname, each with
+    /// optional ports — "api.stripe.com:443", "203.0.113.0/24",
+    /// "198.51.100.7:5432,6432", "0.0.0.0/0:443". Omitted = unchanged.
+    #[serde(default)]
+    pub allowlist: Option<Vec<String>>,
+    /// Policy of the app's previews (pull-request code): "none" (default),
+    /// "restricted" (the app's allowlist) or "open". Omitted = unchanged.
+    #[serde(default)]
+    pub preview_policy: Option<String>,
+}
+
+/// The addresses a hostname in an egress allowlist resolved to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct EgressHostResponse {
+    pub host: String,
+    /// IPv4 addresses allowed for it right now (empty: not resolved)
+    pub addresses: Vec<String>,
+}
+
+/// GET/PUT /api/v1/apps/{id}/egress
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AppEgressResponse {
+    /// "open" | "restricted" | "none"
+    pub policy: String,
+    pub allowlist: Vec<String>,
+    /// Policy of the app's previews: "open" | "restricted" | "none"
+    pub preview_policy: String,
+    /// Whether this server can enforce a policy (iptables with Docker's
+    /// DOCKER-USER chain)
+    pub firewall_available: bool,
+    /// Why the app's policy isn't (fully) in force, if it isn't
+    #[serde(default)]
+    pub warning: Option<String>,
+    /// Why the previews' policy isn't in force, if it isn't
+    #[serde(default)]
+    pub preview_warning: Option<String>,
+    /// Hostnames in the allowlist and what they currently resolve to
+    pub hosts: Vec<EgressHostResponse>,
 }
 
 // ── Phase 4: Git Integration & Automation ──

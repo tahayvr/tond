@@ -20,6 +20,8 @@ const MAX_OUTPUT: usize = 64 * 1024;
 pub struct Cmd {
     pub argv: Vec<String>,
     pub env: Vec<String>,
+    /// Exec user (a name or "uid:gid"); None = the image's user.
+    pub user: Option<String>,
 }
 
 impl Cmd {
@@ -27,6 +29,7 @@ impl Cmd {
         Self {
             argv: argv.iter().map(|s| s.to_string()).collect(),
             env: Vec::new(),
+            user: None,
         }
     }
 
@@ -64,13 +67,14 @@ pub async fn run(
             CreateExecOptions {
                 cmd: Some(cmd.argv.clone()),
                 env: Some(cmd.env.clone()),
+                user: cmd.user.clone(),
                 attach_stdout: Some(true),
                 attach_stderr: Some(true),
                 ..Default::default()
             },
         )
         .await
-        .context("the database container isn't running")?;
+        .context("the container isn't running")?;
 
     let collect = async {
         let mut output = String::new();

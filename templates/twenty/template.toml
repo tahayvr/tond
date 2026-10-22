@@ -10,9 +10,11 @@ website = "https://twenty.com"
 docs = "https://twenty.com/developers/section/self-hosting/docker-compose"
 repository = "https://github.com/twentyhq/twenty"
 ram_mb = 1500
-setup_notes = "The first start runs migrations and takes a few minutes. Then open the app and sign up: the first account creates the workspace."
+setup_notes = "The first start runs migrations and takes a few minutes. Then open the app right away and sign up: the first account creates the workspace, so anyone who reaches it first can."
 upgrade_notes = "Upgrade one minor version at a time and read Twenty's upgrade guide: some releases need a manual upgrade command. Snapshot the app first."
 post_deploy_checks = ["Create the workspace", "Import contacts from CSV"]
+
+first_visitor_admin = true
 
 [public]
 service = "server"

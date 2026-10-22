@@ -10,9 +10,9 @@ website = "https://about.gitea.com"
 docs = "https://docs.gitea.com/installation/install-with-docker"
 repository = "https://github.com/go-gitea/gitea"
 ram_mb = 220
-setup_notes = "Open the app right away: the install page is open to the first visitor. Keep the prefilled settings, create the administrator account at the bottom of the page and press Install."
+setup_notes = "Sign in with the administrator name and the password shown after deploy (also kept as ADMIN_PASSWORD on the Environment tab). There is no install page and public sign-up is off: add users under Site Administration."
 upgrade_notes = "The image follows Gitea 1.27.x. For a newer minor version change the tag, take a snapshot and redeploy; the database is migrated on start."
-post_deploy_checks = ["Finish the install page and create the administrator", "Push a test repository over HTTPS"]
+post_deploy_checks = ["Sign in as the administrator", "Push a test repository over HTTPS"]
 
 [public]
 service = "gitea"
@@ -29,7 +29,40 @@ key = "DOMAIN"
 label = "Domain"
 value = "{app_host}"
 
+[[inputs]]
+key = "ADMIN_USERNAME"
+label = "Administrator name"
+description = "Gitea reserves some names, such as admin."
+default = "gitadmin"
+
+[[inputs]]
+key = "ADMIN_EMAIL"
+label = "Administrator email"
+kind = "email"
+
+[[inputs]]
+key = "ADMIN_PASSWORD"
+label = "Administrator password"
+kind = "password"
+generate = "password"
+credential = true
+
+[[inputs]]
+key = "SECRET_KEY"
+label = "Secret key"
+description = "Encrypts secrets in the database. Keep it if you move the data."
+generate = "hex"
+
 [[volumes]]
 service = "gitea"
 path = "./data"
 description = "Repositories, attachments, packages and the SQLite database"
+
+# The install page is locked (INSTALL_LOCK), so nobody can claim the server;
+# the administrator is created with Gitea's CLI before the app is routed.
+[[post_deploy]]
+service = "gitea"
+user = "git"
+description = "Create the administrator account"
+env = ["ADMIN_USERNAME", "ADMIN_EMAIL", "ADMIN_PASSWORD"]
+command = ["sh", "-c", "gitea admin user list --admin | awk 'NR > 1 { print $2 }' | grep -qx \"$ADMIN_USERNAME\" || gitea admin user create --admin --username \"$ADMIN_USERNAME\" --email \"$ADMIN_EMAIL\" --password \"$ADMIN_PASSWORD\" --must-change-password=false"]

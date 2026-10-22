@@ -53,6 +53,7 @@ pub mod deploy_stats;
 pub mod deployments;
 pub mod dns_providers;
 pub mod domains;
+pub mod egress;
 pub mod env;
 pub mod git;
 pub mod gitea_tokens;

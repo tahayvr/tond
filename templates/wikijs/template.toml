@@ -10,9 +10,11 @@ website = "https://js.wiki"
 docs = "https://docs.requarks.io/install/docker"
 repository = "https://github.com/requarks/wiki"
 ram_mb = 350
-setup_notes = "Open the app right away: the setup page creates the administrator account and asks for the site URL (use this app's address)."
+setup_notes = "Open the app right away: the setup page creates the administrator account for whoever reaches it first and asks for the site URL (use this app's address)."
 upgrade_notes = "Change the image to a newer 2.5.x tag and redeploy. Wiki.js 3 is a different product line with its own migration."
 post_deploy_checks = ["Finish the setup page", "Create the home page"]
+
+first_visitor_admin = true
 
 [public]
 service = "wiki"

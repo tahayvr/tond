@@ -1103,6 +1103,62 @@
         ],
         "type": "object"
       },
+      "AppEgressResponse": {
+        "description": "GET/PUT /api/v1/apps/{id}/egress",
+        "properties": {
+          "allowlist": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "firewall_available": {
+            "description": "Whether this server can enforce a policy (iptables with Docker's\nDOCKER-USER chain)",
+            "type": "boolean"
+          },
+          "hosts": {
+            "description": "Hostnames in the allowlist and what they currently resolve to",
+            "items": {
+              "$ref": "#/components/schemas/EgressHostResponse"
+            },
+            "type": "array"
+          },
+          "policy": {
+            "description": "\"open\" | \"restricted\" | \"none\"",
+            "type": "string"
+          },
+          "preview_policy": {
+            "description": "Policy of the app's previews: \"open\" | \"restricted\" | \"none\"",
+            "type": "string"
+          },
+          "preview_warning": {
+            "default": null,
+            "description": "Why the previews' policy isn't in force, if it isn't",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "warning": {
+            "default": null,
+            "description": "Why the app's policy isn't (fully) in force, if it isn't",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "policy",
+          "allowlist",
+          "preview_policy",
+          "firewall_available",
+          "warning",
+          "preview_warning",
+          "hosts"
+        ],
+        "type": "object"
+      },
       "AppEnvResponse": {
         "description": "GET /api/v1/apps/{id}/env",
         "properties": {
@@ -1272,6 +1328,21 @@
       },
       "AppResponse": {
         "properties": {
+          "admin_setup": {
+            "default": null,
+            "description": "How the app's admin account comes to exist: \"pending\" (Tond creates\nit on the first successful deploy), \"done\", \"failed\" (see\n`admin_setup_error`), \"open\" (the first visitor creates it) or\n\"dismissed\". The dashboard warns while it is \"open\" or \"failed\".",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "admin_setup_error": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "auto_deploy": {
             "description": "Whether auto-deploy on webhook push is enabled",
             "type": "boolean"
@@ -1511,6 +1582,8 @@
           "domain",
           "template_id",
           "template_version",
+          "admin_setup",
+          "admin_setup_error",
           "source_type",
           "source_url",
           "branch",
@@ -5786,6 +5859,26 @@
           "dns_matches_server",
           "https_ready",
           "certificate_status"
+        ],
+        "type": "object"
+      },
+      "EgressHostResponse": {
+        "description": "The addresses a hostname in an egress allowlist resolved to.",
+        "properties": {
+          "addresses": {
+            "description": "IPv4 addresses allowed for it right now (empty: not resolved)",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "host": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "host",
+          "addresses"
         ],
         "type": "object"
       },
@@ -10677,6 +10770,26 @@
         ],
         "type": "object"
       },
+      "TemplateAdminSetup": {
+        "description": "How a template's admin account comes to exist.",
+        "oneOf": [
+          {
+            "const": "none",
+            "description": "No admin account to claim (or it is set from an input at start).",
+            "type": "string"
+          },
+          {
+            "const": "seeded",
+            "description": "Tond creates it (or replaces the default login) before routing the app.",
+            "type": "string"
+          },
+          {
+            "const": "first_visitor",
+            "description": "Whoever opens the app first creates it: open it right after deploy.",
+            "type": "string"
+          }
+        ]
+      },
       "TemplateAppStatus": {
         "description": "`GET /api/v1/apps/{id}/template`: where an app deployed from a template\nstands against the catalog.",
         "properties": {
@@ -11053,6 +11166,11 @@
               "null"
             ]
           },
+          "admin_setup": {
+            "$ref": "#/components/schemas/TemplateAdminSetup",
+            "default": "none",
+            "description": "How the admin account comes to exist: pre-seeded by Tond, created by\nthe first visitor, or nothing to claim."
+          },
           "architectures": {
             "default": [
               "amd64",
@@ -11183,6 +11301,7 @@
           "setup_notes",
           "upgrade_notes",
           "post_deploy_checks",
+          "admin_setup",
           "compose"
         ],
         "type": "object"
@@ -12297,6 +12416,38 @@
         },
         "required": [
           "drain_timeout"
+        ],
+        "type": "object"
+      },
+      "UpdateEgressRequest": {
+        "description": "PUT /api/v1/apps/{id}/egress — the app's outbound network policy",
+        "properties": {
+          "allowlist": {
+            "default": null,
+            "description": "Allowed destinations, used by \"restricted\" (and by previews set to\n\"restricted\"): an IPv4 address, a CIDR range or a hostname, each with\noptional ports — \"api.stripe.com:443\", \"203.0.113.0/24\",\n\"198.51.100.7:5432,6432\", \"0.0.0.0/0:443\". Omitted = unchanged.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "policy": {
+            "description": "\"open\" (any destination), \"restricted\" (only the allowlist) or \"none\"\n(no internet). DNS and the app's own Docker networks (linked\ndatabases, project members) always work.",
+            "type": "string"
+          },
+          "preview_policy": {
+            "default": null,
+            "description": "Policy of the app's previews (pull-request code): \"none\" (default),\n\"restricted\" (the app's allowlist) or \"open\". Omitted = unchanged.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "policy"
         ],
         "type": "object"
       },
@@ -15265,6 +15416,94 @@
         ]
       }
     },
+    "/api/v1/apps/{id}/admin-setup/dismiss": {
+      "post": {
+        "description": "Template apps whose first visitor creates the admin account (`admin_setup` \"open\"), or whose admin couldn't be pre-seeded (\"failed\"), carry a warning until it is dismissed; the app then has `admin_setup` \"dismissed\". Other values are left unchanged.",
+        "operationId": "dismiss_admin_setup",
+        "parameters": [
+          {
+            "description": "App id or name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/AppResponse"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Dismiss the unclaimed-admin warning of a template app",
+        "tags": [
+          "Apps"
+        ],
+        "x-tond-scopes": [
+          "apps:write"
+        ]
+      }
+    },
     "/api/v1/apps/{id}/auto-deploy": {
       "put": {
         "operationId": "update_auto_deploy",
@@ -16854,6 +17093,181 @@
         ],
         "x-tond-scopes": [
           "apps:write"
+        ]
+      }
+    },
+    "/api/v1/apps/{id}/egress": {
+      "get": {
+        "description": "`policy` is open, restricted (only `allowlist`) or none; `preview_policy` applies to the app's previews (none by default). DNS and the app's own Docker networks always work. `hosts` lists what allowlisted hostnames resolve to (re-resolved every 5 minutes).",
+        "operationId": "get_egress",
+        "parameters": [
+          {
+            "description": "App id or name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/AppEgressResponse"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "An app's outbound network policy and whether it is enforced",
+        "tags": [
+          "Apps"
+        ],
+        "x-tond-scopes": [
+          "apps:read"
+        ]
+      },
+      "put": {
+        "description": "Enforced by tond-server in the iptables chain TOND-EGRESS; a non-open `policy` is refused on servers without iptables and Docker's DOCKER-USER chain. Applies to running containers at once.",
+        "operationId": "update_egress",
+        "parameters": [
+          {
+            "description": "App id or name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateEgressRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/AppEgressResponse"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Change an app's outbound network policy",
+        "tags": [
+          "Apps"
+        ],
+        "x-tond-scopes": [
+          "apps:write",
+          "settings:write"
         ]
       }
     },

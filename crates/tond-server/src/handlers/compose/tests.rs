@@ -221,6 +221,36 @@ async fn service_domains_set_through_the_api_are_what_the_proxy_routes() {
             ("redis.example.com".to_string(), "cache".to_string(), 8301),
         ]
     );
+
+    // A template app whose admin account Tond is still creating isn't routed,
+    // and leaving 'pending' is a routing change the proxy is told about.
+    let version = || async {
+        sqlx::query_scalar::<_, i64>("SELECT version FROM route_state WHERE id = 1")
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+    };
+    let set_admin_setup = |value: &'static str| {
+        let db = state.db.clone();
+        async move {
+            sqlx::query("UPDATE apps SET admin_setup = ? WHERE name = 'shop'")
+                .bind(value)
+                .execute(&db)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+    };
+    let before = version().await;
+    set_admin_setup("pending").await;
+    assert!(routes().await.is_empty(), "pending admin setup: not routed");
+    assert!(version().await > before);
+    let before = version().await;
+    set_admin_setup("done").await;
+    assert_eq!(routes().await.len(), 2);
+    assert!(version().await > before);
+    let before = version().await;
+    set_admin_setup("dismissed").await;
+    assert_eq!(version().await, before, "only 'pending' changes routing");
 }
 
 #[tokio::test]

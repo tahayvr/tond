@@ -921,6 +921,15 @@ if [[ -n "$PREVIEW" ]]; then
     wait_for 60 "route for ${PREVIEW_HOST}" \
         bash -c "curl -sk --resolve '${PREVIEW_HOST}:443:${IP}' 'https://${PREVIEW_HOST}/' | grep -q Hostname:"
     pass "preview served at https://${PREVIEW_HOST}"
+    # Previews have no internet by default: TOND-EGRESS rejects everything
+    # from the preview network's subnet but DNS, its own network and replies
+    # (the route above still answers).
+    PREVIEW_SLUG=${PREVIEW_HOST%%-e2e-whoami.*}
+    PREVIEW_SUBNET=$(docker network inspect -f '{{(index .IPAM.Config 0).Subnet}}' "tond-net-preview-${PREVIEW_SLUG}")
+    iptables -S TOND-EGRESS | grep -- "tond-egress:preview:${PREVIEW_SLUG} " | grep -- "-s ${PREVIEW_SUBNET}" \
+        | grep -q -- "-j REJECT" || fail "a preview must get no internet by default: $(iptables -S TOND-EGRESS)"
+    iptables -S DOCKER-USER | grep -q -- "-j TOND-EGRESS" || fail "DOCKER-USER must jump to TOND-EGRESS"
+    pass "the preview's network has no internet (TOND-EGRESS rejects ${PREVIEW_SUBNET})"
 
     for host in "$PREVIEW" "dash.${PREVIEW}" "unknown.${PREVIEW}"; do
         status=$(proxied_status "$host" /api/v1/apps)
@@ -1113,12 +1122,21 @@ pass "postgres row restored into e2e-pg-copy (owned by its own user); pg_trgm en
 step "Database major-version upgrade and public access allowlist"
 [[ "$(api_req POST /api/v1/databases/e2e-pg-copy/upgrade '{"version":"15"}')" == 400 ]] \
     || fail "a downgrade must be refused: $(cat "$API_BODY")"
+# Public with no allowlist: the upgrade must close the published port while
+# the dump runs (a bare DROP in TOND-DB), then open it again.
+[[ "$(api_req PATCH /api/v1/databases/e2e-pg-copy '{"public_access":true,"allowlist":[]}')" == 200 ]] \
+    || fail "making e2e-pg-copy public must succeed: $(cat "$API_BODY")"
+PGU_PORT=$(jq -r '.data.host_port' "$API_BODY")
 [[ "$(api_req POST /api/v1/databases/e2e-pg-copy/upgrade '{"version":"17"}')" == 202 ]] \
     || fail "starting an upgrade must succeed: $(cat "$API_BODY")"
+wait_for 120 "public port ${PGU_PORT} closed during the upgrade" \
+    bash -c "iptables -S TOND-DB | grep -- '--ctorigdstport ${PGU_PORT} ' | grep -v -- ' -s ' | grep -q -- '-j DROP'"
 wait_for 600 "the e2e-pg-copy upgrade waiting for confirmation" \
     bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/databases/e2e-pg-copy | jq -e '.data.upgrade.status == \"awaiting_confirmation\" or .data.upgrade.status == \"failed\"'"
 UPGRADE=$(api /api/v1/databases/e2e-pg-copy | jq -c '.data.upgrade')
 [[ "$(jq -r '.status' <<<"$UPGRADE")" == awaiting_confirmation ]] || fail "the upgrade failed: ${UPGRADE}"
+wait_for 30 "public port ${PGU_PORT} open again after the upgrade" \
+    bash -c "! iptables -S TOND-DB | grep -q -- '--ctorigdstport ${PGU_PORT} '"
 [[ "$(docker exec tond-db-e2e-pg-copy psql -At -U "$PGC_USER" -d "$PGC_USER" -c 'SHOW server_version_num' | cut -c1-2)" == 17 ]] \
     || fail "e2e-pg-copy must run PostgreSQL 17 after the upgrade"
 [[ "$(docker exec tond-db-e2e-pg-copy psql -At -U "$PGC_USER" -d "$PGC_USER" -c 'SELECT v FROM e2e WHERE id = 1')" == restored-ok ]] \
@@ -1126,7 +1144,7 @@ UPGRADE=$(api /api/v1/databases/e2e-pg-copy | jq -c '.data.upgrade')
 [[ -d "$(jq -r '.rollback_dir' <<<"$UPGRADE")" ]] || fail "the old data directory must be kept until confirmed"
 [[ "$(api_req POST /api/v1/databases/e2e-pg-copy/upgrade/confirm '{}')" == 200 ]] || fail "confirming must succeed: $(cat "$API_BODY")"
 [[ ! -d "$(jq -r '.rollback_dir' <<<"$UPGRADE")" ]] || fail "confirming must delete the old data directory"
-pass "e2e-pg-copy upgraded 16 → 17 with its data (downgrade refused, old data kept until confirmed)"
+pass "e2e-pg-copy upgraded 16 → 17 with its data (public port closed during the dump, downgrade refused, old data kept until confirmed)"
 
 # The allowlist lands in the DOCKER-USER chain (TOND-DB) and goes away again.
 [[ "$(api_req PATCH /api/v1/databases/e2e-pg-copy '{"public_access":true,"allowlist":["192.0.2.10","198.51.100.0/24"]}')" == 200 ]] \
@@ -1378,6 +1396,40 @@ code=$(api_req POST /api/v1/apps '{"name":"e2e-compose","source_type":"compose",
 [[ "$code" == 400 ]] && grep -q "external" "$API_BODY" \
     || fail "a compose file joining another network must be rejected, got ${code}: $(cat "$API_BODY")"
 pass "compose files cannot join another app's or database's network"
+
+# Egress policy: a probe sharing e2e-whoami's network namespace connects with
+# the app's own address. 192.0.2.0/24 (TEST-NET-1) is never routed, so an
+# allowed connection times out, and a rejected one is refused at once.
+egress_try() {
+    timeout 30 docker run --rm --init --network container:tond-e2e-whoami "$PROBE_IMAGE" \
+        wget -q -T 4 -O /dev/null "http://$1/" 2>&1 || true
+}
+WHOAMI_SUBNET=$(docker network inspect -f '{{(index .IPAM.Config 0).Subnet}}' "$WHOAMI_NET")
+[[ "$(egress_try 192.0.2.1)" != *refused* ]] || fail "an open app's connections must not be refused"
+read -r code body < <(api_send PUT /api/v1/apps/e2e-whoami/egress '{"policy":"restricted","allowlist":["192.0.2.1:80"]}')
+[[ "$code" == 200 ]] && jq -e '.data.policy == "restricted" and .data.warning == null and .data.firewall_available' <<<"$body" > /dev/null \
+    || fail "restricting e2e-whoami's egress must succeed and be enforced (got ${code}: ${body})"
+iptables -S TOND-EGRESS | grep -- "tond-egress:app:e2e-whoami " | grep -- "-s ${WHOAMI_IP}/32" | grep -- "-d 192.0.2.1/32" \
+    | grep -q -- "--dports 80 " || fail "the allowlist must be in TOND-EGRESS: $(iptables -S TOND-EGRESS)"
+iptables -S TOND-EGRESS | grep -- "tond-egress:app:e2e-whoami " | grep -q -- "-d ${WHOAMI_SUBNET} .*-j RETURN" \
+    || fail "the app's own network must stay reachable: $(iptables -S TOND-EGRESS)"
+iptables -S TOND-EGRESS | grep -- "tond-egress:app:e2e-whoami " | grep -q -- "--dport 53 .*-j RETURN" \
+    || fail "DNS must stay allowed: $(iptables -S TOND-EGRESS)"
+[[ "$(egress_try 192.0.2.2)" == *refused* ]] || fail "a destination outside the allowlist must be refused"
+[[ "$(egress_try 192.0.2.1)" != *refused* ]] || fail "an allowlisted destination must not be refused"
+http_ok "$WHOAMI_NET" "$WHOAMI_IP" || fail "a restricted app must still answer on its own network"
+wait_for 30 "https://${WHOAMI_DOMAIN} still routed while restricted" \
+    bash -c "curl -sk --resolve '${WHOAMI_DOMAIN}:443:${IP}' 'https://${WHOAMI_DOMAIN}/' | grep -q Hostname:"
+pass "restricted egress: allowlisted destination open, others refused, own network, DNS and routing intact"
+read -r code body < <(api_send PUT /api/v1/apps/e2e-whoami/egress '{"policy":"none"}')
+[[ "$code" == 200 ]] || fail "setting egress to none must succeed (got ${code}: ${body})"
+[[ "$(egress_try 192.0.2.1)" == *refused* ]] || fail "with egress none, every outside destination must be refused"
+read -r code body < <(api_send PUT /api/v1/apps/e2e-whoami/egress '{"policy":"open","allowlist":[]}')
+[[ "$code" == 200 ]] || fail "opening egress again must succeed (got ${code}: ${body})"
+! iptables -S TOND-EGRESS | grep -q -- "tond-egress:app:e2e-whoami " || fail "an open app must have no egress rules"
+read -r code body < <(api_send PUT /api/v1/apps/e2e-whoami/egress '{"policy":"restricted","allowlist":["*.example.com"]}')
+[[ "$code" == 400 ]] || fail "a wildcard in the egress allowlist must be refused (got ${code}: ${body})"
+pass "egress none refuses everything outside; open removes the rules; wildcards are refused"
 
 step "Upload safety (archives are extracted in Rust, with limits)"
 UPLOAD_TMP=$(mktemp -d)
@@ -1773,6 +1825,40 @@ code=$(api_req POST /api/v1/templates/vaultwarden/deploy '{"name":"e2e-vault","i
     || fail "a refused template deploy must not leave an app behind"
 rm -rf "${DATA_DIR}/volumes/e2e-vault"
 pass "same name → 409; leftover data → 400 and nothing is created"
+
+# Admin accounts: templates whose app hands the admin to its first visitor are
+# pre-seeded before the domain is routed, or carry a dismissible warning.
+jq -e '[.data.templates[] | select(.admin_setup == "seeded") | .id] as $s
+       | [.data.templates[] | select(.admin_setup == "first_visitor") | .id] as $f
+       | (["actual", "audiobookshelf", "gitea", "mattermost", "mealie", "umami"] - $s) == []
+         and (["docmost", "ghost", "memos", "twenty", "uptime-kuma", "wikijs"] - $f) == []' <<< "$CATALOG" > /dev/null \
+    || fail "the catalog should mark which templates pre-seed the admin and which warn: $(jq -c '[.data.templates[] | {id, admin_setup}]' <<< "$CATALOG")"
+code=$(api_req POST /api/v1/templates/actual/deploy '{"name":"e2e-actual","inputs":{},"allow_low_memory":true}')
+[[ "$code" == 202 ]] || fail "deploying the actual template should be accepted, got ${code}: $(cat "$API_BODY")"
+ACTUAL_PW=$(jq -r '.data.credentials[] | select(.key == "SERVER_PASSWORD") | .value' "$API_BODY")
+[[ ${#ACTUAL_PW} -eq 24 ]] || fail "the deploy should return the generated server password once"
+wait_for_app_running e2e-actual 300
+[[ "$(app_field e2e-actual admin_setup)" == done ]] \
+    || fail "the server password should be set by the post_deploy step: admin_setup=$(app_field e2e-actual admin_setup) $(app_field e2e-actual admin_setup_error)"
+ACTUAL_PORT=$(api /api/v1/apps/e2e-actual/services | jq -r '.data[] | select(.name == "actual") | .host_port')
+curl -sf -X POST -H 'content-type: application/json' -d "$(jq -n --arg p "$ACTUAL_PW" '{password: $p}')" \
+    "http://127.0.0.1:${ACTUAL_PORT}/account/login" | jq -e '.status == "ok" and (.data.token | length > 0)' > /dev/null \
+    || fail "the seeded server password should sign in to Actual"
+api /api/v1/apps/e2e-actual/logs | jq -e '.data.deploy_logs | any(.message | contains("Set the server password: done"))' > /dev/null \
+    || fail "the deploy log should record the post_deploy step"
+api /api/v1/apps/e2e-actual/logs | jq -e --arg p "$ACTUAL_PW" '[.data.deploy_logs[].message | select(contains($p))] | length == 0' > /dev/null \
+    || fail "the seeded password must not appear in the deploy log"
+pass "actual: the server password is set before routing (admin_setup done), signs in, stays out of the log"
+code=$(api_req POST /api/v1/apps/e2e-actual/admin-setup/dismiss '{}')
+[[ "$code" == 200 ]] && jq -e '.data.admin_setup == "done"' "$API_BODY" > /dev/null \
+    || fail "dismissing must leave a seeded admin alone, got ${code}: $(cat "$API_BODY")"
+sqlite3 "${DATA_DIR}/tond.db" "UPDATE apps SET admin_setup = 'open' WHERE name = 'e2e-actual'"
+code=$(api_req POST /api/v1/apps/e2e-actual/admin-setup/dismiss '{}')
+[[ "$code" == 200 ]] && jq -e '.data.admin_setup == "dismissed"' "$API_BODY" > /dev/null \
+    || fail "dismissing a first-visitor warning should mark it dismissed, got ${code}: $(cat "$API_BODY")"
+pass "POST /admin-setup/dismiss clears only a warning"
+tond apps delete e2e-actual -y > /dev/null
+rm -rf "${DATA_DIR}/volumes/e2e-actual"
 
 
 step "Docker Compose app (per-service routing, status, logs, rollback, cleanup)"

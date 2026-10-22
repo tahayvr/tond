@@ -40,6 +40,8 @@ export interface CronVolumeInput {
 	container_path: string;
 }
 
+export type AdminSetupStatus = 'pending' | 'done' | 'failed' | 'open' | 'dismissed';
+
 export interface App {
 	id: string;
 	name: string;
@@ -53,6 +55,13 @@ export interface App {
 	template_id?: string | null;
 	/** The template's version at deploy time. */
 	template_version?: string | null;
+	/**
+	 * How a template app's admin account comes to exist: 'pending' (Tond creates it
+	 * on the first deploy), 'done', 'failed' (see admin_setup_error), 'open' (the
+	 * first visitor creates it) or 'dismissed'. The app page warns on open/failed.
+	 */
+	admin_setup?: AdminSetupStatus | null;
+	admin_setup_error?: string | null;
 	source_type: string;
 	source_url: string | null;
 	/** Branch deployed from source_url (repository-based apps) */
@@ -184,8 +193,15 @@ export interface Template {
 	setup_notes: string | null;
 	upgrade_notes: string | null;
 	post_deploy_checks: string[];
+	/**
+	 * How the admin account comes to exist: pre-seeded by Tond before the app is
+	 * routed, created by whoever opens the app first, or nothing to claim.
+	 */
+	admin_setup?: TemplateAdminSetup;
 	compose: string;
 }
+
+export type TemplateAdminSetup = 'none' | 'seeded' | 'first_visitor';
 
 export interface TemplateHostMemory {
 	total_mb: number;
@@ -604,6 +620,11 @@ export async function restartApp(id: string): Promise<void> {
 	await request(`/apps/${id}/restart`, { method: 'POST' });
 }
 
+/** Hide the "create the admin account now" warning of a template app. */
+export async function dismissAdminSetup(id: string): Promise<App> {
+	return request<App>(`/apps/${id}/admin-setup/dismiss`, { method: 'POST' });
+}
+
 export async function getAppLogs(
 	id: string
 ): Promise<{ deploy_logs: DeployLog[]; container_logs: { ts: string | null; line: string }[] }> {
@@ -954,6 +975,47 @@ export async function updateContainerPort(id: string, container_port: number): P
 	return request<App>(`/apps/${id}/port`, {
 		method: 'PUT',
 		body: JSON.stringify({ container_port })
+	});
+}
+
+/** What an app's containers may connect to. */
+export type EgressPolicy = 'open' | 'restricted' | 'none';
+
+export interface EgressHost {
+	host: string;
+	/** IPv4 addresses allowed for it right now (empty: not resolved) */
+	addresses: string[];
+}
+
+/** GET/PUT /apps/{id}/egress */
+export interface AppEgress {
+	policy: EgressPolicy;
+	allowlist: string[];
+	/** Policy of the app's previews (pull-request code); "none" by default */
+	preview_policy: EgressPolicy;
+	/** iptables with Docker's DOCKER-USER chain is usable on the server */
+	firewall_available: boolean;
+	warning?: string | null;
+	preview_warning?: string | null;
+	hosts: EgressHost[];
+}
+
+export interface UpdateEgressRequest {
+	policy: EgressPolicy;
+	allowlist?: string[];
+	preview_policy?: EgressPolicy;
+}
+
+/** An app's outbound network policy and whether the server enforces it. */
+export async function getAppEgress(id: string): Promise<AppEgress> {
+	return request<AppEgress>(`/apps/${id}/egress`);
+}
+
+/** Change an app's outbound network policy (admins; applies at once). */
+export async function updateAppEgress(id: string, body: UpdateEgressRequest): Promise<AppEgress> {
+	return request<AppEgress>(`/apps/${id}/egress`, {
+		method: 'PUT',
+		body: JSON.stringify(body)
 	});
 }
 
