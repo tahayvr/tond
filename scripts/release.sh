@@ -41,4 +41,4 @@ echo "  git tag -a ${TAG} -m \"Tond ${VERSION}\" ${commit}"
 echo "  git push origin ${TAG}"
 echo
 echo "Then approve the 'release' environment in the Actions run (it holds the"
-echo "signing key), and afterwards: scripts/release-smoke.sh --version ${VERSION} ..."
+echo "signing key), and afterwards: scripts/release-smoke.sh --host root@<fresh server> --from ${VERSION}"
