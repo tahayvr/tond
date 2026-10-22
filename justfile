@@ -59,8 +59,8 @@ build-server:
     @echo "--- Building tond-server ---"
     cargo zigbuild -p tond-server --target {{ target }} --profile {{ profile }}
 
-# Run all checks: formatting, linting, and type checking for Rust and dashboard; the docs build (with its link check)
-check: check-dashboard docs-build
+# Run all checks: formatting, linting, and type checking for Rust and dashboard; the whole tond.io site build (docs + landing page, link checks, site tests)
+check: check-dashboard site-build
     cargo fmt
     cargo check --quiet
     cargo clippy --all-targets --all-features -- -D warnings
@@ -106,16 +106,31 @@ docs-build:
     pnpm install --frozen-lockfile --silent
     pnpm build
 
+# Landing page (tond.io/) live preview at http://localhost:4322 (links into /docs need `just site-build`)
+[working-directory('docs')]
+site:
+    pnpm install --frozen-lockfile --silent
+    pnpm dev:landing
+
+# Build all of tond.io into docs/dist-site (landing page + docs at /docs + /install, /update, 404.html, sitemap); .github/workflows/site.yml deploys the same, check its links and test it
+[working-directory('docs')]
+site-build: docs-build
+    pnpm build:site
+
+# Serve the built site (docs/dist-site) at http://localhost:4400, like GitHub Pages: run `just site-build` first
+site-preview:
+    python3 -m http.server 4400 --bind 127.0.0.1 --directory docs/dist-site
+
 # Regenerate the docs pages that come from the CLI (CLI reference, exit codes); tests fail when they're stale
 docs-gen:
     cargo run -q -p tond-cli -- docs cli > docs/content/reference/cli.md
     cargo run -q -p tond-cli -- help exit-codes --json > docs/src/data/exit-codes.json
 
-# Retake the dashboard screenshots in the docs (light + dark), from the mock dashboard; needs Chrome
+# Retake the dashboard screenshots in the docs and on the landing page (light + dark), from the mock dashboard; needs Chrome. FILTER e.g. `upgrading`, `landing`
 [working-directory('docs')]
-docs-screenshots:
+docs-screenshots FILTER="":
     pnpm install --frozen-lockfile --silent
-    pnpm screenshots
+    pnpm screenshots {{ FILTER }}
 
 # Run dev server for Dashboard
 [working-directory('dashboard')]

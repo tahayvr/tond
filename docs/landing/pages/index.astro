@@ -1,0 +1,220 @@
+---
+// tond.io/: what Tond is, how to install it, what it does. Every number and
+// claim here is stated in the docs (linked next to it); keep it that way.
+import Base from '../layouts/Base.astro';
+import Shot from '../components/Shot.astro';
+import Icon from '../../src/components/Icon.astro';
+import { INSTALL, RELEASES, REPO } from '../links';
+
+const features = [
+	{
+		icon: 'git-branch-line',
+		title: 'Git push deploys',
+		text: 'Connect GitHub, GitLab or Gitea and deploy on push, or ship a Dockerfile, an image or a tarball from your laptop or CI. No Dockerfile? Tond works out how to build it. New releases start next to the old one and take traffic only once healthy; rollback is one click.',
+		href: '/docs/guides/deploy-from-git'
+	},
+	{
+		icon: 'git-pull-request-line',
+		title: 'Previews on their own domain',
+		text: 'Every pull request gets a preview at <id>-<app>.<preview domain>, a separate registrable domain from your dashboard, so untrusted code never shares cookies with it.',
+		href: '/docs/concepts/previews'
+	},
+	{
+		icon: 'stack-line',
+		title: 'Compose apps',
+		text: 'Paste a compose file or read one from the repository. Each service can get its own domain; host-level options such as privileged mode and the Docker socket are refused.',
+		href: '/docs/concepts/apps'
+	},
+	{
+		icon: 'layout-grid-line',
+		title: '35 one-click templates',
+		text: 'Plausible, Vaultwarden, Miniflux and more, built into the release. Each carries a memory estimate, and the ones that need 1 GB or less are marked “Fits on 2 GB”.',
+		href: '/docs/guides/templates'
+	},
+	{
+		icon: 'database-2-line',
+		title: 'Managed databases, backed up',
+		text: 'PostgreSQL, MySQL, MariaDB, Redis, KeyDB and MongoDB next to your apps on private networks. Snapshots of apps, databases and Tond itself are deduplicated and can go, encrypted, to S3-compatible storage.',
+		href: '/docs/concepts/databases'
+	},
+	{
+		icon: 'lock-line',
+		title: 'HTTPS everywhere',
+		text: 'Let’s Encrypt certificates for every app and the dashboard, obtained and renewed automatically. Add a DNS provider for wildcard certificates, or upload your own.',
+		href: '/docs/concepts/domains'
+	},
+	{
+		icon: 'pulse-line',
+		title: 'Metrics, uptime and alerts',
+		text: 'Requests, errors, latency and bandwidth per app, uptime checks, and alerts to Slack, Discord, Telegram, email, ntfy, Pushover, Gotify or a webhook, plus a heartbeat for when the whole server is down.',
+		href: '/docs/concepts/observability'
+	},
+	{
+		icon: 'shield-check-line',
+		title: 'Signed releases, one-click updates',
+		text: 'Releases are signed with minisign and verified before anything runs. Updates take a snapshot first and roll back automatically if the new version doesn’t come up; rolling back by hand is one click too.',
+		href: '/docs/guides/upgrading'
+	},
+	{
+		icon: 'robot-2-line',
+		title: 'Built for scripts and agents',
+		text: 'An HTTP API with an OpenAPI spec and a tond CLI with --json output, documented exit codes and idempotency keys. API tokens carry only the scopes you give them, and the docs come as Markdown and llms.txt.',
+		href: '/docs/reference/cli'
+	}
+];
+
+const budgets = [
+	{ value: '≤ 15 MB', label: 'tond-server memory at idle' },
+	{ value: '≤ 12 MB', label: 'tond-proxy memory at idle' },
+	{ value: '≤ 0.2 %', label: 'of one core at idle, both together' },
+	{ value: '2 GB', label: 'of RAM is enough to run it' }
+];
+
+const gallery = [
+	{ name: 'deployments', alt: 'An app’s deployments, each with its commit, duration and status', caption: 'Every deploy, with its commit, build log and a rollback button.' },
+	{ name: 'templates', alt: 'The template catalog, grouped by category', caption: '35 templates, each with a memory estimate.' },
+	{ name: 'databases', alt: 'Managed databases with their engine, version and status', caption: 'Databases next to your apps, on private networks.' },
+	{ name: 'app', alt: 'An app’s overview: recent events and uptime', caption: 'Events, problems and uptime at a glance.' }
+];
+
+const title = 'Tond: apps and databases on one cheap VPS';
+const description =
+	'Tond is a fast, lightweight, self-hosted PaaS for a single cheap VPS (x86_64 or ARM64): git push deploys, previews, compose apps, templates, managed databases with backups, automatic HTTPS, metrics and alerts.';
+---
+
+<Base {title} {description} path="/">
+	<section class="hero" aria-labelledby="hero-title">
+		<div class="wrap hero-grid">
+			<div class="hero-copy">
+				<p class="eyebrow">Self-hosted PaaS · x86_64 and ARM64</p>
+				<h1 id="hero-title">Apps and databases on one cheap VPS.</h1>
+				<p class="lede">
+					Tond is a fast, lightweight platform you install on a single server. Push your code and it
+					builds, starts, puts it on HTTPS, watches it and backs it up, with a dashboard, a CLI and an
+					HTTP API.
+				</p>
+				<div class="install" data-copy-root>
+					<span class="install-prompt" aria-hidden="true">$</span>
+					<code class="install-cmd" data-copy-text>{INSTALL}</code>
+					<button class="copy" type="button" data-copy aria-label="Copy the install command">
+						<Icon name="file-copy-line" class="copy-icon" />
+						<Icon name="check-line" class="copied-icon" />
+						<span class="copy-label" data-copy-label aria-hidden="true">Copy</span>
+					</button>
+					<span class="sr-only" role="status" data-copy-status></span>
+				</div>
+				<p class="install-note">
+					Debian 12 or 13, Ubuntu 24.04 or 26.04 LTS, on x86_64 or ARM64, with 2 GB of RAM. See{' '}
+					<a href="/docs/support-matrix">supported systems</a>.
+				</p>
+				<div class="cta">
+					<a class="button primary" href="/docs/quickstart">
+						Quickstart <Icon name="arrow-right-line" />
+					</a>
+					<a class="button" href={REPO}><Icon name="github-line" /> GitHub</a>
+					<a class="button" href={RELEASES}><Icon name="download-line" /> Releases</a>
+				</div>
+			</div>
+			<figure class="hero-shot">
+				<Shot
+					name="metrics"
+					alt="The Tond dashboard showing an app’s requests per second, error rate, latency and bandwidth"
+				/>
+			</figure>
+		</div>
+	</section>
+
+	<section class="budgets" aria-labelledby="budgets-title">
+		<div class="wrap">
+			<h2 id="budgets-title" class="section-title">Small enough to leave the server to your apps</h2>
+			<ul class="budget-list">
+				{
+					budgets.map((b) => (
+						<li>
+							<span class="budget-value">{b.value}</span>
+							<span class="budget-label">{b.label}</span>
+						</li>
+					))
+				}
+			</ul>
+			<p class="muted">
+				Idle budgets that Tond’s resource test checks against a fresh install; background work sleeps
+				until it has something to do. Budgets, not guarantees for every workload:{' '}
+				<a href="/docs/operations/footprint">resource footprint</a>.
+			</p>
+		</div>
+	</section>
+
+	<section class="features" aria-labelledby="features-title">
+		<div class="wrap">
+			<h2 id="features-title" class="section-title">Everything one server needs</h2>
+			<ul class="feature-grid">
+				{
+					features.map((f) => (
+						<li class="feature">
+							<Icon name={f.icon} class="feature-icon" />
+							<h3>{f.title}</h3>
+							<p>{f.text}</p>
+							<a class="more" href={f.href} aria-label={`${f.title}: read the docs`}>
+								Docs <Icon name="arrow-right-line" />
+							</a>
+						</li>
+					))
+				}
+			</ul>
+		</div>
+	</section>
+
+	<section class="gallery" aria-labelledby="gallery-title">
+		<div class="wrap">
+			<h2 id="gallery-title" class="section-title">The dashboard</h2>
+			<div class="gallery-grid">
+				{
+					gallery.map((g) => (
+						<figure>
+							<Shot name={g.name} alt={g.alt} />
+							<figcaption>{g.caption}</figcaption>
+						</figure>
+					))
+				}
+			</div>
+		</div>
+	</section>
+
+	<section class="agents" aria-labelledby="agents-title">
+		<div class="wrap agents-grid">
+			<div>
+				<h2 id="agents-title" class="section-title">Scriptable from day one</h2>
+				<p>
+					The <code>tond</code> CLI talks to the server over a root-only socket, or to any Tond over
+					HTTPS with a scoped token. Every command takes <code>--json</code>, exits with a documented
+					code, and repeats safely with an idempotency key.
+				</p>
+				<p>
+					<a href="/docs/reference/cli">CLI reference</a>{' · '}
+					<a href="/docs/reference/api">HTTP API</a>{' · '}
+					<a href="/docs/llms.txt">llms.txt</a>
+				</p>
+			</div>
+			<pre class="terminal" aria-label="Example tond CLI session"><code><span class="t-prompt">$</span> tond templates show vaultwarden
+<span class="t-prompt">$</span> tond apps deploy api-service
+<span class="t-prompt">$</span> tond apps list --json
+<span class="t-prompt">$</span> sudo tond update --rollback</code></pre>
+		</div>
+	</section>
+
+	<section class="closing" aria-labelledby="closing-title">
+		<div class="wrap closing-inner">
+			<h2 id="closing-title">Five minutes from a fresh server to a deployed app.</h2>
+			<p class="muted">
+				The quickstart takes you from install to an app with its own domain and certificate.
+			</p>
+			<div class="cta">
+				<a class="button primary" href="/docs/quickstart">
+					Read the quickstart <Icon name="arrow-right-line" />
+				</a>
+				<a class="button" href="/docs/">Browse the docs</a>
+			</div>
+		</div>
+	</section>
+</Base>

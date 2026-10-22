@@ -1,6 +1,8 @@
 # Dependencies and build output
 node_modules/
 dist/
+dist-landing/
+dist-site/
 .astro/
 
 # Generated before every build by scripts/generate.mjs

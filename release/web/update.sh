@@ -1,5 +1,6 @@
 #!/bin/sh
 # tond.io/update - Quick updater for Tond
+# Served byte-for-byte at https://tond.io/update (docs/scripts/assemble-site.mjs).
 # This script downloads the update.sh bundled in the latest release and runs it.
 # Using the release artefact (rather than main branch) ensures the update logic
 # matches the version being installed.

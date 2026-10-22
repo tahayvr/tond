@@ -8,6 +8,8 @@ set -euo pipefail
 # --allow-unsupported-os.
 #
 # Quick install: curl -fsSL https://tond.io/install | sudo bash
+# (tond.io/install serves release/web/install.sh, which verifies the latest
+# release bundle and runs the install.sh inside it, i.e. this script.)
 #
 # This script can run in two modes:
 #   1. Bundled mode: Binaries and dashboard are in the same directory as this script
