@@ -1097,12 +1097,21 @@ pass "postgres row restored into e2e-pg-copy (owned by its own user); pg_trgm en
 step "Database major-version upgrade and public access allowlist"
 [[ "$(api_req POST /api/v1/databases/e2e-pg-copy/upgrade '{"version":"15"}')" == 400 ]] \
     || fail "a downgrade must be refused: $(cat "$API_BODY")"
+# Public with no allowlist: the upgrade must close the published port while
+# the dump runs (a bare DROP in TOND-DB), then open it again.
+[[ "$(api_req PATCH /api/v1/databases/e2e-pg-copy '{"public_access":true,"allowlist":[]}')" == 200 ]] \
+    || fail "making e2e-pg-copy public must succeed: $(cat "$API_BODY")"
+PGU_PORT=$(jq -r '.data.host_port' "$API_BODY")
 [[ "$(api_req POST /api/v1/databases/e2e-pg-copy/upgrade '{"version":"17"}')" == 202 ]] \
     || fail "starting an upgrade must succeed: $(cat "$API_BODY")"
+wait_for 120 "public port ${PGU_PORT} closed during the upgrade" \
+    bash -c "iptables -S TOND-DB | grep -- '--ctorigdstport ${PGU_PORT} ' | grep -v -- ' -s ' | grep -q -- '-j DROP'"
 wait_for 600 "the e2e-pg-copy upgrade waiting for confirmation" \
     bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/databases/e2e-pg-copy | jq -e '.data.upgrade.status == \"awaiting_confirmation\" or .data.upgrade.status == \"failed\"'"
 UPGRADE=$(api /api/v1/databases/e2e-pg-copy | jq -c '.data.upgrade')
 [[ "$(jq -r '.status' <<<"$UPGRADE")" == awaiting_confirmation ]] || fail "the upgrade failed: ${UPGRADE}"
+wait_for 30 "public port ${PGU_PORT} open again after the upgrade" \
+    bash -c "! iptables -S TOND-DB | grep -q -- '--ctorigdstport ${PGU_PORT} '"
 [[ "$(docker exec tond-db-e2e-pg-copy psql -At -U "$PGC_USER" -d "$PGC_USER" -c 'SHOW server_version_num' | cut -c1-2)" == 17 ]] \
     || fail "e2e-pg-copy must run PostgreSQL 17 after the upgrade"
 [[ "$(docker exec tond-db-e2e-pg-copy psql -At -U "$PGC_USER" -d "$PGC_USER" -c 'SELECT v FROM e2e WHERE id = 1')" == restored-ok ]] \
@@ -1110,7 +1119,7 @@ UPGRADE=$(api /api/v1/databases/e2e-pg-copy | jq -c '.data.upgrade')
 [[ -d "$(jq -r '.rollback_dir' <<<"$UPGRADE")" ]] || fail "the old data directory must be kept until confirmed"
 [[ "$(api_req POST /api/v1/databases/e2e-pg-copy/upgrade/confirm '{}')" == 200 ]] || fail "confirming must succeed: $(cat "$API_BODY")"
 [[ ! -d "$(jq -r '.rollback_dir' <<<"$UPGRADE")" ]] || fail "confirming must delete the old data directory"
-pass "e2e-pg-copy upgraded 16 → 17 with its data (downgrade refused, old data kept until confirmed)"
+pass "e2e-pg-copy upgraded 16 → 17 with its data (public port closed during the dump, downgrade refused, old data kept until confirmed)"
 
 # The allowlist lands in the DOCKER-USER chain (TOND-DB) and goes away again.
 [[ "$(api_req PATCH /api/v1/databases/e2e-pg-copy '{"public_access":true,"allowlist":["192.0.2.10","198.51.100.0/24"]}')" == 200 ]] \

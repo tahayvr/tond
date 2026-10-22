@@ -6,7 +6,11 @@
 // never touches the old one until the user says so:
 //
 //   1. Apps lose access: the container moves to a private network
-//      (tond-upgrade-<name>), so nothing is written after the dump.
+//      (tond-upgrade-<name>), so nothing is written after the dump. A public
+//      database's published port is closed too (db_access: a DROP-all rule
+//      in TOND-DB while `upgrade.status` is `running`), and opens again when
+//      the upgrade waits for confirmation or fails; a public database on a
+//      server without the iptables DOCKER-USER chain can't be upgraded.
 //   2. Backup: a normal database backup (trigger `pre_upgrade`). If it
 //      fails, nothing else happens.
 //   3. A temporary container of the new version starts on an empty data
@@ -39,7 +43,7 @@ use tond_common::{DbUpgradeState, ManagedDatabase, check_upgrade, image_for};
 use crate::backup::{self, SnapshotTrigger};
 use crate::handlers::databases as dbh;
 use crate::state::AppState;
-use crate::{db_exec, docker, networks, secrets};
+use crate::{db_access, db_exec, docker, networks, secrets};
 
 /// How long a database gets to become ready after a start.
 const READY_TIMEOUT: Duration = Duration::from_secs(300);
@@ -122,6 +126,15 @@ pub async fn start(
     to: &str,
 ) -> Result<DbUpgradeState, String> {
     preflight(&db, to)?;
+    if db.public_access {
+        crate::db_access::firewall_usable().await.map_err(|e| {
+            format!(
+                "This database is public, and the server firewall can't close its port while \
+                 the upgrade copies the data ({e}). Make the database private for the upgrade, \
+                 then public again."
+            )
+        })?;
+    }
     let from = db.effective_version();
     let upgrade = DbUpgradeState {
         status: "running".to_string(),
@@ -164,6 +177,8 @@ pub async fn start(
             progress.finished_at = Some(Utc::now().to_rfc3339());
             let _ = save_state(&worker, &id, Some(&progress)).await;
         }
+        // Reopen the public port (the seal follows `upgrade.status`).
+        db_access::reconcile_now(&worker).await;
     });
     Ok(upgrade)
 }
@@ -186,7 +201,14 @@ async fn run(state: &AppState, id: &str, progress: &mut DbUpgradeState) -> Resul
     let staging = root.join("new");
     let net = upgrade_network(&db.name);
 
-    // 1. Nothing new gets written: apps lose their network path to it.
+    // 1. Nothing new gets written: the public port closes and apps lose
+    // their network path to it.
+    if db.public_access {
+        step(state, id, progress, "Closing the public port").await;
+        db_access::seal_for_upgrade(state, &db)
+            .await
+            .context("nothing was changed; the public port couldn't be closed for the upgrade")?;
+    }
     step(state, id, progress, "Disconnecting apps").await;
     docker::ensure_network(&state.docker, &net, false).await?;
     let isolate = async {
@@ -493,6 +515,9 @@ pub async fn recover_interrupted(state: &AppState) {
         upgrade.finished_at = Some(Utc::now().to_rfc3339());
         let _ = save_state(state, &db.id, Some(&upgrade)).await;
     }
+    // The public ports closed for these upgrades open again (the DROP rules
+    // survived the restart in the kernel; they follow `upgrade.status`).
+    db_access::reconcile_now(state).await;
 }
 
 #[cfg(test)]

@@ -57,6 +57,16 @@ baseline, so install 0.2.0 fresh.
 - The host terminal is off by default and uses step-up auth with single-use
   tickets. Secrets are scrubbed from container logs. Git tokens stay out of
   URLs, logs and images.
+- Passwords are checked against the 10,000 most common passwords (SecLists),
+  as well as Tond's own list, lowercased and with surrounding digits and
+  symbols stripped.
+- A public database's port is closed to every address while a major-version
+  upgrade copies its data, and reopens afterwards, including after a crash.
+- Templates that would let the first visitor claim the admin account now
+  create the admin with generated credentials (Gitea, Mattermost, Actual,
+  Audiobookshelf; Umami's and Mealie's default logins are replaced). Templates
+  where that isn't possible show a warning on the app's page until it is
+  dismissed.
 
 ### Deploys and apps
 
