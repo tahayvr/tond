@@ -114,6 +114,7 @@ api_routes! {
     // Docker Compose apps: services, per-service domains and ports, the file
     GET "/api/v1/apps/{id}/services" => handlers::compose::list_services;
     PUT "/api/v1/apps/{id}/services/{service}" => handlers::compose::update_service;
+    DELETE "/api/v1/apps/{id}/services/{service}" => handlers::compose::forget_service;
     GET "/api/v1/apps/{id}/services/{service}/logs" => handlers::compose::service_logs;
     POST "/api/v1/apps/{id}/services/{service}/{action}" => handlers::compose::service_action;
     PUT "/api/v1/apps/{id}/compose" => handlers::compose::update_compose;

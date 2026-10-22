@@ -391,6 +391,7 @@ fn check_service(name: &str, svc: &mut Mapping, default_memory: i64, ctx: &mut C
     if let Some(v) = svc.get_mut("ports") {
         rewrite_ports(name, v, ctx);
     }
+    check_replicas_ports(name, svc, ctx);
 
     if ctx.errors.is_empty() {
         apply_hardening(svc, &added_caps, default_memory);
@@ -661,6 +662,50 @@ fn rewrite_ports(service: &str, ports: &mut Value, ctx: &mut Ctx) {
             )),
         }
     }
+}
+
+/// More than one replica can't share a fixed host port: the second replica
+/// fails with "port is already allocated" half-way through `up`. Refused up
+/// front; an ephemeral port ("80") or a range sized for the replicas is fine.
+fn check_replicas_ports(service: &str, svc: &Mapping, ctx: &mut Ctx) {
+    let replicas = crate::compose::replicas(svc, &std::collections::BTreeMap::new()).unwrap_or(1);
+    if replicas <= 1 {
+        return;
+    }
+    let Some(Value::Sequence(items)) = svc.get("ports").map(untag) else {
+        return;
+    };
+    for item in items {
+        if let Some(host) = fixed_host_port(untag(item)) {
+            ctx.err(format!(
+                "service \"{service}\": runs {replicas} replicas but publishes the fixed host port {host} — every replica would need that same port. Publish only the container port (e.g. \"80\") so each replica gets its own, or run one replica (Tond routes domains to one container per service)"
+            ));
+            return;
+        }
+    }
+}
+
+/// The single fixed host port of a `ports:` entry, if it has one
+/// ("127.0.0.1:8080:80" → 8080; "127.0.0.1::80", ranges and `{target: 80}` → None).
+fn fixed_host_port(item: &Value) -> Option<String> {
+    let host = match item {
+        Value::Mapping(m) => m.get("published").and_then(scalar_str)?,
+        _ => {
+            let spec = scalar_str(item)?;
+            let spec = spec.split('/').next().unwrap_or_default().to_string();
+            let rest = match spec.strip_prefix('[') {
+                Some(s) => s.split_once("]:").map(|(_, r)| r.to_string())?,
+                None => spec.clone(),
+            };
+            let parts: Vec<&str> = rest.split(':').collect();
+            match parts.as_slice() {
+                [_, host, _] | [host, _] => (*host).to_string(),
+                _ => return None,
+            }
+        }
+    };
+    let host = host.trim();
+    (!host.is_empty() && !host.contains('-')).then(|| host.to_string())
 }
 
 /// Add Tond's container policy to a service (docs in docker.rs).
@@ -1206,6 +1251,30 @@ mod tests {
             errors("services:\n  a:\n    build: https://github.com/org/repo.git#main\n").is_empty()
         );
         assert!(errors("services:\n  a:\n    build:\n      context: .\n      dockerfile_inline: |\n        FROM alpine\n").is_empty());
+    }
+
+    #[test]
+    fn replicas_refuse_a_fixed_host_port() {
+        let errs = errors(
+            "services:\n  web:\n    image: x\n    deploy:\n      replicas: 3\n    ports: [\"8080:80\"]\n",
+        );
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("runs 3 replicas"), "{errs:?}");
+        assert!(errs[0].contains("8080"), "{errs:?}");
+        // scale: and the long syntax too.
+        assert!(!errors(
+            "services:\n  web:\n    image: x\n    scale: 2\n    ports:\n      - target: 80\n        published: 9000\n",
+        )
+        .is_empty());
+        // An ephemeral host port, a range or one replica is fine.
+        for ok in [
+            "services:\n  web:\n    image: x\n    deploy:\n      replicas: 3\n    ports: [\"80\"]\n",
+            "services:\n  web:\n    image: x\n    scale: 2\n    ports: [\"8000-8001:80\"]\n",
+            "services:\n  web:\n    image: x\n    deploy:\n      replicas: 1\n    ports: [\"8080:80\"]\n",
+            "services:\n  web:\n    image: x\n    deploy:\n      replicas: 2\n    ports:\n      - target: 80\n",
+        ] {
+            assert!(errors(ok).is_empty(), "{ok}: {:?}", errors(ok));
+        }
     }
 
     #[test]

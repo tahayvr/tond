@@ -2529,6 +2529,11 @@
           "name": {
             "type": "string"
           },
+          "parked": {
+            "default": false,
+            "description": "The service is no longer in the compose file (for example after a\nrollback to an older file): it does not run and its domains are not\nrouted, but they are kept and come back when the file declares the\nservice again.",
+            "type": "boolean"
+          },
           "ports": {
             "default": [],
             "description": "Container ports declared in the file",
@@ -2556,6 +2561,13 @@
             "description": "The published port changed since the last deploy: redeploy to apply",
             "type": "boolean"
           },
+          "replicas": {
+            "default": 1,
+            "description": "Replicas the file asks for (1 when unset)",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
           "running_image": {
             "default": null,
             "description": "Pinned local image the container runs (`tond-<app>/<service>:<image id prefix>`)",
@@ -2565,7 +2577,7 @@
             ]
           },
           "status": {
-            "description": "\"pending\" | \"running\" | \"restarting\" | \"paused\" | \"created\" | \"exited\"\n| \"dead\" | \"missing\"",
+            "description": "\"pending\" | \"running\" | \"restarting\" | \"paused\" | \"created\" | \"exited\"\n| \"dead\" | \"missing\" | \"parked\"",
             "type": "string"
           }
         },
@@ -2580,6 +2592,8 @@
           "redeploy_required",
           "domains",
           "status",
+          "replicas",
+          "parked",
           "health",
           "exit_code",
           "container_id",
@@ -4787,6 +4801,13 @@
               "null"
             ]
           },
+          "rollback_parks": {
+            "description": "Compose apps: services running now that this deployment's compose file\nlacks. Rolling back to it parks them: they stop, and their domains stop\nbeing routed until a later deploy brings the service back (the domains\nare kept). Only listed while a rollback to this deployment is available.",
+            "items": {
+              "$ref": "#/components/schemas/RollbackPark"
+            },
+            "type": "array"
+          },
           "rollback_unavailable_reason": {
             "default": null,
             "description": "Why rollback is unavailable (for a tooltip); `None` when available",
@@ -5008,6 +5029,13 @@
               "string",
               "null"
             ]
+          },
+          "rollback_parks": {
+            "description": "Compose apps: services running now that this deployment's compose file\nlacks. Rolling back to it parks them: they stop, and their domains stop\nbeing routed until a later deploy brings the service back (the domains\nare kept). Only listed while a rollback to this deployment is available.",
+            "items": {
+              "$ref": "#/components/schemas/RollbackPark"
+            },
+            "type": "array"
           },
           "rollback_unavailable_reason": {
             "default": null,
@@ -9374,6 +9402,26 @@
           "backup_created_at",
           "available_until",
           "restores_database"
+        ],
+        "type": "object"
+      },
+      "RollbackPark": {
+        "description": "A compose service a rollback would park, with the domains that would stop\nbeing routed.",
+        "properties": {
+          "domains": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "service": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "service",
+          "domains"
         ],
         "type": "object"
       },
@@ -18954,6 +19002,103 @@
       }
     },
     "/api/v1/apps/{id}/services/{service}": {
+      "delete": {
+        "description": "Only for a service a rollback parked (`parked: true`, no longer in the compose file). Its domains, and redirects to them, are deleted; the remaining services are returned.",
+        "operationId": "forget_service",
+        "parameters": [
+          {
+            "description": "App id or name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "service",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "items": {
+                        "$ref": "#/components/schemas/ComposeServiceResponse"
+                      },
+                      "type": "array"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Remove a parked service and its domains",
+        "tags": [
+          "Apps"
+        ],
+        "x-tond-scopes": [
+          "apps:write"
+        ]
+      },
       "put": {
         "description": "Domains route at once when the service already publishes that port; a new published port is bound on the next deploy (`redeploy_required`).",
         "operationId": "update_service",

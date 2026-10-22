@@ -10,7 +10,9 @@
 //
 //   1. The file is validated and hardened by compose_policy (unchanged).
 //   2. `service_specs` reads the services from it; `sync_specs` upserts the
-//      rows (user choices survive) and removes services that left the file.
+//      rows (user choices survive) and removes services that left the file —
+//      except on a rollback, which parks them (kept with their domains,
+//      unrouted, until a later file declares them again).
 //   3. Each service's image is produced by Tond, not by `docker compose`:
 //      built with `docker build --cgroup-parent` (so compose builds share the
 //      build memory cap) or pulled, then tagged
@@ -256,10 +258,36 @@ pub fn service_specs_env(
             builds: svc.contains_key("build"),
             ports: declared_ports(svc),
             has_healthcheck: has_healthcheck(svc),
+            replicas: replicas(svc, env).unwrap_or(1),
             name,
         });
     }
     Ok(specs)
+}
+
+/// Replicas a service asks for: `deploy.replicas`, else `scale`. None when
+/// neither is set or the value isn't a whole number once variables resolve.
+pub fn replicas(svc: &Mapping, env: &BTreeMap<String, String>) -> Option<u32> {
+    let raw = svc
+        .get("deploy")
+        .and_then(|d| untag(d).get("replicas"))
+        .or_else(|| svc.get("scale"))
+        .and_then(scalar)?;
+    interpolate_env(&raw, env).trim().parse().ok()
+}
+
+/// The error for a service Tond would publish (a domain routes to it) that
+/// runs more than one replica: every replica would bind the same loopback
+/// host port. None for one replica (or zero: the service doesn't run).
+pub fn replicas_publish_error(service: &str, replicas: u32) -> Option<String> {
+    (replicas > 1).then(|| {
+        format!(
+            "Service '{service}' runs {replicas} replicas, but Tond routes a domain to one \
+             container: every replica would bind the same host port. Set 'replicas: 1' (or \
+             remove 'scale') on a service with a domain, or remove its domains and reach it \
+             from the other services by name."
+        )
+    })
 }
 
 /// Services `docker compose up` leaves alone: those in a profile (Tond
@@ -725,6 +753,8 @@ pub struct ServiceRow {
     pub exit_code: Option<i64>,
     pub running_image: Option<String>,
     pub image_digest: Option<String>,
+    pub parked: i64,
+    pub replicas: i64,
 }
 
 impl ServiceRow {
@@ -741,38 +771,76 @@ pub async fn rows(db: &sqlx::SqlitePool, app_id: &str) -> sqlx::Result<Vec<Servi
         .await
 }
 
-/// Upsert the services of the file and delete the ones that left it (with
-/// their domains). User choices (published port) are kept.
+/// What happens to services that left the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gone {
+    /// The user's file changed: delete them with their domains. Services a
+    /// rollback parked stay parked.
+    Delete,
+    /// A rollback to an older file: park them. A parked service keeps the
+    /// user's choices (published port, and its domains in app_domains) but
+    /// loses its host port, so tond-proxy stops routing it; it is unparked,
+    /// domains and all, when a later file declares it again.
+    Park,
+}
+
+/// Upsert the services of the file (user choices survive) and delete or
+/// park the ones that left it.
 pub async fn sync_specs(
     db: &sqlx::SqlitePool,
     app_id: &str,
     specs: &[ComposeServiceSpec],
+    gone_mode: Gone,
 ) -> sqlx::Result<()> {
     let mut tx = crate::db::begin_write(db).await?;
-    let existing: Vec<String> =
-        sqlx::query_scalar("SELECT name FROM compose_services WHERE app_id = ?")
+    let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+    let existing: Vec<(String, i64)> =
+        sqlx::query_as("SELECT name, parked FROM compose_services WHERE app_id = ?")
             .bind(app_id)
             .fetch_all(&mut *tx)
             .await?;
-    for gone in existing
+    let gone = existing
         .iter()
-        .filter(|n| !specs.iter().any(|s| &s.name == *n))
-    {
-        crate::app_domains::remove_service(&mut tx, app_id, gone).await?;
-        sqlx::query("DELETE FROM compose_services WHERE app_id = ? AND name = ?")
-            .bind(app_id)
-            .bind(gone)
-            .execute(&mut *tx)
-            .await?;
+        .filter(|(n, _)| !names.contains(&n.as_str()));
+    for (gone, parked) in gone {
+        // Already parked: stays parked until a file declares it again or the
+        // user removes it (a rollback of a pasted file also replaces the
+        // stored file, so the next ordinary deploy lacks the service too).
+        if *parked != 0 {
+            continue;
+        }
+        if gone_mode == Gone::Delete {
+            crate::app_domains::remove_service(&mut tx, app_id, gone).await?;
+            sqlx::query("DELETE FROM compose_services WHERE app_id = ? AND name = ?")
+                .bind(app_id)
+                .bind(gone)
+                .execute(&mut *tx)
+                .await?;
+            continue;
+        }
+        sqlx::query(
+            "UPDATE compose_services SET parked = 1, host_port = NULL, routed_port = NULL,
+               container_id = NULL, status = 'parked', health = NULL, exit_code = NULL,
+               updated_at = datetime('now')
+             WHERE app_id = ? AND name = ?",
+        )
+        .bind(app_id)
+        .bind(gone)
+        .execute(&mut *tx)
+        .await?;
     }
     for (position, spec) in specs.iter().enumerate() {
         let ports = serde_json::to_string(&spec.ports).unwrap_or_else(|_| "[]".into());
         sqlx::query(
-            "INSERT INTO compose_services (app_id, name, position, image, builds, ports, has_healthcheck)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO compose_services (app_id, name, position, image, builds, ports,
+                                           has_healthcheck, replicas)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(app_id, name) DO UPDATE SET position = excluded.position,
                image = excluded.image, builds = excluded.builds, ports = excluded.ports,
-               has_healthcheck = excluded.has_healthcheck, updated_at = datetime('now')",
+               has_healthcheck = excluded.has_healthcheck, replicas = excluded.replicas,
+               status = CASE WHEN parked = 1 THEN 'pending' ELSE status END,
+               parked = 0,
+               updated_at = datetime('now')",
         )
         .bind(app_id)
         .bind(&spec.name)
@@ -781,10 +849,63 @@ pub async fn sync_specs(
         .bind(spec.builds as i64)
         .bind(ports)
         .bind(spec.has_healthcheck as i64)
+        .bind(i64::from(spec.replicas))
         .execute(&mut *tx)
         .await?;
     }
     tx.commit().await
+}
+
+/// Services a compose file would park: running in the app now, absent from
+/// `content`, each with the domains that would stop being routed. Used to
+/// warn before a rollback.
+pub async fn services_leaving(
+    db: &sqlx::SqlitePool,
+    app_id: &str,
+    content: &str,
+) -> Result<Vec<(String, Vec<String>)>> {
+    let names: Vec<String> = service_specs(content)
+        .map_err(anyhow::Error::msg)?
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    let mut domains = domains_by_service(db, app_id).await?;
+    Ok(rows(db, app_id)
+        .await?
+        .into_iter()
+        .filter(|r| r.parked == 0 && !names.contains(&r.name))
+        .map(|r| {
+            let d = domains.remove(&r.name).unwrap_or_default();
+            (r.name, d)
+        })
+        .collect())
+}
+
+/// Forget a parked service: delete its row and its domains (and redirects to
+/// them). False (nothing done) unless the service exists and is parked.
+pub async fn forget_parked(
+    db: &sqlx::SqlitePool,
+    app_id: &str,
+    service: &str,
+) -> sqlx::Result<bool> {
+    let mut tx = crate::db::begin_write(db).await?;
+    let parked: Option<i64> =
+        sqlx::query_scalar("SELECT parked FROM compose_services WHERE app_id = ? AND name = ?")
+            .bind(app_id)
+            .bind(service)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if parked != Some(1) {
+        return Ok(false);
+    }
+    crate::app_domains::remove_service(&mut tx, app_id, service).await?;
+    sqlx::query("DELETE FROM compose_services WHERE app_id = ? AND name = ?")
+        .bind(app_id)
+        .bind(service)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// Write what Docker reports into the rows. Services without a container are
@@ -795,7 +916,7 @@ pub async fn store_states(
     states: &[ServiceState],
 ) -> sqlx::Result<()> {
     let names: Vec<String> =
-        sqlx::query_scalar("SELECT name FROM compose_services WHERE app_id = ?")
+        sqlx::query_scalar("SELECT name FROM compose_services WHERE app_id = ? AND parked = 0")
             .bind(app_id)
             .fetch_all(db)
             .await?;

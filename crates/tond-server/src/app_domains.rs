@@ -810,7 +810,7 @@ mod tests {
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         let rows = list(&db, "a1").await.unwrap_or_else(|e| panic!("{e}"));
-        let view: Vec<(&str, &str, Option<&str>, Option<i64>)> = rows
+        let mut view: Vec<(&str, &str, Option<&str>, Option<i64>)> = rows
             .iter()
             .map(|r| {
                 (
@@ -821,6 +821,9 @@ mod tests {
                 )
             })
             .collect();
+        // Aliases list oldest first (created_at has whole seconds): the two
+        // calls may straddle a second, so compare the aliases by name.
+        view[1..].sort_by_key(|r| r.0);
         assert_eq!(
             view,
             [

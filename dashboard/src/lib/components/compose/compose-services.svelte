@@ -4,6 +4,7 @@
 	// per service. `compact` is the Overview summary (no actions).
 	import {
 		listServices,
+		removeParkedService,
 		serviceAction,
 		type App,
 		type ComposeService,
@@ -116,6 +117,24 @@
 		});
 	}
 
+	async function handleRemoveParked(svc: ComposeService) {
+		await confirmAction({
+			title: `Remove ${svc.name}?`,
+			description:
+				"The service isn't in the compose file any more. Removing it also removes its domains, so a later deploy that brings it back starts without them.",
+			details: [
+				`The ${svc.name} service entry and its published port`,
+				...svc.domains.map((d) => `The domain ${d}`)
+			],
+			confirmLabel: 'Remove service',
+			pendingLabel: 'Removing…',
+			destructive: true,
+			onconfirm: async () => {
+				services = await removeParkedService(app.id, svc.name);
+			}
+		});
+	}
+
 	function openRouting(svc: ComposeService) {
 		routing = svc;
 		routingOpen = true;
@@ -219,6 +238,9 @@
 											<HeartIcon class="size-3" aria-hidden="true" /> healthcheck
 										</span>
 									{/if}
+									{#if (svc.replicas ?? 1) > 1}
+										<span class="text-[11px] text-muted-foreground">{svc.replicas} replicas</span>
+									{/if}
 								</div>
 								<p class="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
 									{#if svc.builds}
@@ -236,7 +258,12 @@
 								</p>
 							</div>
 							<div class="flex flex-wrap items-center gap-2">
-								{#if canReadLogs}
+								{#if svc.parked && canEdit}
+									<Button variant="outline" size="sm" onclick={() => handleRemoveParked(svc)}>
+										Remove
+									</Button>
+								{/if}
+								{#if canReadLogs && !svc.parked}
 									<Button variant="outline" size="sm" onclick={() => (logsFor = svc.name)}>
 										<TerminalIcon class="size-4" /> Logs
 									</Button>
@@ -269,6 +296,19 @@
 								{/if}
 							</div>
 						</div>
+
+						{#if svc.parked}
+							<p
+								class="mt-3 flex items-start gap-2 rounded-sm border border-dashed px-3 py-2 text-xs text-muted-foreground"
+							>
+								<InfoIcon class="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+								<span>
+									Not in the compose file this app runs now (rolled back to an older one). Its
+									domains are kept but not routed, and come back when a deploy brings the service
+									back.
+								</span>
+							</p>
+						{/if}
 
 						<dl class="mt-3 grid grid-cols-2 gap-x-4 gap-y-2 text-xs sm:grid-cols-4">
 							<div class="min-w-0">
@@ -321,7 +361,7 @@
 									<span class="text-muted-foreground">No domain</span>
 								{/if}
 							</div>
-							{#if canEdit}
+							{#if canEdit && !svc.parked}
 								<Button variant="ghost" size="sm" onclick={() => openRouting(svc)}>
 									<SettingsIcon class="size-4" /> Domains &amp; port
 								</Button>

@@ -192,6 +192,9 @@ pub fn entries() -> Vec<Doc> {
         e("PUT /api/v1/apps/{id}/services/{service}", "Publish a service's container port and route domains to it")
             .object("`{service, port_changed, redeploy_required, warnings}`")
             .about("Domains route at once when the service already publishes that port; a new published port is bound on the next deploy (`redeploy_required`)."),
+        e("DELETE /api/v1/apps/{id}/services/{service}", "Remove a parked service and its domains")
+            .returns::<Vec<ComposeServiceResponse>>()
+            .about("Only for a service a rollback parked (`parked: true`, no longer in the compose file). Its domains, and redirects to them, are deleted; the remaining services are returned."),
         e("GET /api/v1/apps/{id}/services/{service}/logs", "Recent log lines of one service (secrets masked)")
             .object("`{service, lines}`; `?tail=` (default 200, at most 2000)"),
         e("POST /api/v1/apps/{id}/services/{service}/{action}", "Restart, stop or start one service")

@@ -125,7 +125,15 @@ tond apps service shop worker logs
 
 Stop, start and restart on the app itself act on every service. The app's combined log tags each line with its service, for example `[cache]`. The in-browser terminal opens in the web service.
 
-A service that leaves the compose file leaves the list and takes its domains with it. Services in a `profiles:` group, or scaled to zero replicas, aren't started.
+A service you remove from the compose file leaves the list and takes its domains with it. A [rollback](/concepts/deploys#rolling-back-a-docker-compose-app) to an older file that lacks a service parks it instead: see [Parked services](#parked-services). Services in a `profiles:` group, or scaled to zero replicas, aren't started.
+
+### Parked services
+
+When you roll back to a deployment whose compose file doesn't have a service that runs now, Tond parks that service rather than deleting it. The rollback dialog lists the services it would park and their domains before you confirm, and the deploy log notes each one.
+
+A parked service shows **Parked** on the **Services** tab. It doesn't run, and its domains stay attached to it but aren't routed, so they answer like an unknown host until the service is back. Tond keeps the published port you chose, too. When a later deploy declares the service again, for example a rollback to the newer deployment or a deploy of a file that has it, the service comes back with its domains and port.
+
+Ordinary deploys and file edits leave parked services parked. If you don't want the service back, choose **Remove** on its card: that deletes the service entry and its domains (`DELETE /api/v1/apps/{id}/services/{service}`).
 
 ### Service domains
 
@@ -134,7 +142,7 @@ Each compose service can have its own domains. In **Domains & port**, choose the
 - Domains you add to a service that already publishes that port are routed at once, and get a certificate like any app domain.
 - A new or changed published port is bound on the next deploy. The service shows **(after deploy)** until then, and the tab offers **Deploy now**.
 
-Tond binds the published port on `127.0.0.1` only, on a host port it allocates and keeps across deploys. On the first deploy, the web service gets the automatic `<app>.<apps domain>` hostname if the app has no domain yet. See [Domains and certificates](/concepts/domains#compose-service-domains) for the rules service domains share with other app domains.
+Tond binds the published port on `127.0.0.1` only, on a host port it allocates and keeps across deploys. A service with a domain runs one container: Tond refuses to publish a service that sets `deploy.replicas` or `scale` above 1, because every replica would need the same host port. Keep replicated services internal and reach them by service name from the others. On the first deploy, the web service gets the automatic `<app>.<apps domain>` hostname if the app has no domain yet. See [Domains and certificates](/concepts/domains#compose-service-domains) for the rules service domains share with other app domains.
 
 With the API, use `PUT /api/v1/apps/{id}/services/{service}` with `published_port` and `domains`.
 
@@ -170,6 +178,7 @@ The dashboard checks the file as you type and lists every problem at once. The s
 - bind mounts outside the app's volume directory, or of the whole directory
 - named volumes that are `external`, have a fixed `name` or use a driver other than `local`
 - published ports bound to an explicit IP such as `0.0.0.0:80:80`
+- a fixed host port such as `"8080:80"` on a service with more than one replica (`deploy.replicas` or `scale`): each replica would need that port. Publish only the container port (`"80"`) so Docker picks one per replica
 - external, fixed-name or non-bridge networks
 - `secrets` and `configs` that read host files, and build contexts or build options that read from the host
 - `${…}` variable substitution in security-relevant fields such as volumes and ports

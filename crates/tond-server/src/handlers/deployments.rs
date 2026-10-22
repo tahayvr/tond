@@ -41,6 +41,7 @@ use tond_common::*;
 use crate::{
     audit_log::write_audit_log,
     auth::{Authz, MaybePrincipal, Principal, RateLimit, principal::AuthFailure, scope},
+    compose,
     deploy::{self, images},
     error::AppError,
     handlers,
@@ -181,10 +182,29 @@ pub async fn list_deployments(
     .fetch_all(&state.db)
     .await?;
 
-    Ok((
-        StatusCode::OK,
-        Json(ApiResponse::ok(deployment_responses(&app, deployments))),
-    ))
+    // Compose apps: what rolling back to each deployment would park.
+    let mut parks = std::collections::HashMap::new();
+    if app.source_type == "compose" {
+        for d in &deployments {
+            if let Some(content) = d.compose_source.as_deref() {
+                let leaving = compose::services_leaving(&state.db, &app.id, content)
+                    .await
+                    .unwrap_or_default();
+                parks.insert(d.id.clone(), leaving);
+            }
+        }
+    }
+    let mut responses = deployment_responses(&app, deployments);
+    for resp in responses.iter_mut().filter(|r| r.rollback_available) {
+        if let Some(leaving) = parks.remove(&resp.id) {
+            resp.rollback_parks = leaving
+                .into_iter()
+                .map(|(service, domains)| RollbackPark { service, domains })
+                .collect();
+        }
+    }
+
+    Ok((StatusCode::OK, Json(ApiResponse::ok(responses))))
 }
 
 // ── Rollback App ──

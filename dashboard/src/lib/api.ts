@@ -991,6 +991,8 @@ export interface ComposeServiceSpec {
 	/** Container ports under ports: and expose: */
 	ports: number[];
 	has_healthcheck: boolean;
+	/** Replicas the file asks for (deploy.replicas or scale; 1 when unset) */
+	replicas?: number;
 }
 
 /** GET /apps/{id}/services: one compose service and what Docker reports now. */
@@ -1002,8 +1004,14 @@ export interface ComposeService extends ComposeServiceSpec {
 	/** The published port changed since the last deploy */
 	redeploy_required: boolean;
 	domains: string[];
-	/** "pending" | "running" | "restarting" | "paused" | "created" | "exited" | "dead" | "missing" */
+	/** "pending" | "running" | "restarting" | "paused" | "created" | "exited" | "dead" | "missing" | "parked" */
 	status: string;
+	/**
+	 * Not in the current compose file (a rollback to an older file): it doesn't
+	 * run and its domains aren't routed, but they are kept and come back when a
+	 * later deploy declares the service again.
+	 */
+	parked?: boolean;
 	/** "healthy" | "unhealthy" | "starting"; null without a healthcheck */
 	health: string | null;
 	exit_code: number | null;
@@ -1037,6 +1045,16 @@ export async function updateService(
 	return request<ServiceUpdateResult>(`/apps/${appId}/services/${encodeURIComponent(service)}`, {
 		method: 'PUT',
 		body: JSON.stringify(data)
+	});
+}
+
+/** Remove a parked service (one a rollback took out of the compose file) and its domains. */
+export async function removeParkedService(
+	appId: string,
+	service: string
+): Promise<ComposeService[]> {
+	return request<ComposeService[]>(`/apps/${appId}/services/${encodeURIComponent(service)}`, {
+		method: 'DELETE'
 	});
 }
 
@@ -1707,6 +1725,18 @@ export interface Deployment {
 	rollback_unavailable_reason: string | null;
 	/** Compose apps: per-service images and progress */
 	services?: DeploymentService[];
+	/**
+	 * Compose apps: services running now that this deployment's file lacks.
+	 * Rolling back parks them: they stop and their domains stop being routed
+	 * until a later deploy brings them back (the domains are kept).
+	 */
+	rollback_parks?: RollbackPark[];
+}
+
+/** A compose service a rollback would park, with the domains that would stop routing. */
+export interface RollbackPark {
+	service: string;
+	domains: string[];
 }
 
 /** One service of a compose deployment. */

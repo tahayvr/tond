@@ -349,7 +349,34 @@ async fn run_with_source(
         interpolation.iter().cloned().collect();
     let specs =
         compose::service_specs_env(&source.content, &app_env).map_err(anyhow::Error::msg)?;
-    compose::sync_specs(&state.db, &app_id, &specs).await?;
+    // A rollback parks services its file lacks (their domains come back with
+    // them); a deploy of a changed file removes them.
+    let gone = if source.reuse.is_some() {
+        for (service, domains) in
+            compose::services_leaving(&state.db, &app_id, &source.content).await?
+        {
+            let routes = if domains.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; {} stop being routed until it returns (they are kept)",
+                    domains.join(", ")
+                )
+            };
+            log_deploy(
+                state,
+                &app_id,
+                "warn",
+                trigger,
+                &format!("[{service}] Not in this deployment's compose file: parked{routes}"),
+            )
+            .await?;
+        }
+        compose::Gone::Park
+    } else {
+        compose::Gone::Delete
+    };
+    compose::sync_specs(&state.db, &app_id, &specs, gone).await?;
     // Services in a profile (or scaled to zero) are not started: nothing to
     // build, pull or wait for.
     let inactive = compose::inactive_services(&source.content);
@@ -358,6 +385,7 @@ async fn run_with_source(
         .filter(|s| !inactive.contains(&s.name))
         .collect();
     ensure_web_service(state, app, &specs).await?;
+    check_replicas_unpublished(state, &app_id, &specs).await?;
 
     let builds = compose::build_specs(&hardened.yaml, &source.base_dir, &app_env);
     let credentials = match &app.registry_credential_id {
@@ -670,6 +698,30 @@ async fn run_with_source(
     Ok(())
 }
 
+/// Refuse a deploy where a service Tond publishes (a domain routes to it)
+/// runs more than one replica: every replica would bind the same loopback
+/// host port, so compose would fail half-way with "port is already
+/// allocated". (Replicas behind one domain need load balancing in the proxy.)
+async fn check_replicas_unpublished(
+    state: &AppState,
+    app_id: &str,
+    specs: &[ComposeServiceSpec],
+) -> Result<()> {
+    let published: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM compose_services
+         WHERE app_id = ? AND published_port IS NOT NULL AND parked = 0",
+    )
+    .bind(app_id)
+    .fetch_all(&state.db)
+    .await?;
+    for spec in specs.iter().filter(|s| published.contains(&s.name)) {
+        if let Some(msg) = compose::replicas_publish_error(&spec.name, spec.replicas) {
+            anyhow::bail!(msg);
+        }
+    }
+    Ok(())
+}
+
 /// Make sure a web service is published when none is: the app's first
 /// deploy picks one (the file's service declaring the app's port, else the
 /// first service declaring a port) and moves a domain set at creation onto it.
@@ -679,7 +731,8 @@ async fn ensure_web_service(
     specs: &[ComposeServiceSpec],
 ) -> Result<()> {
     let published: Option<String> = sqlx::query_scalar(
-        "SELECT name FROM compose_services WHERE app_id = ? AND published_port IS NOT NULL LIMIT 1",
+        "SELECT name FROM compose_services
+         WHERE app_id = ? AND published_port IS NOT NULL AND parked = 0 LIMIT 1",
     )
     .bind(&app.id)
     .fetch_optional(&state.db)
@@ -783,7 +836,7 @@ async fn allocate_host_ports(
 ) -> Result<HashMap<String, (u16, u16)>> {
     let rows: Vec<(String, i64, Option<i64>)> = sqlx::query_as(
         "SELECT name, published_port, host_port FROM compose_services
-         WHERE app_id = ? AND published_port IS NOT NULL ORDER BY position",
+         WHERE app_id = ? AND published_port IS NOT NULL AND parked = 0 ORDER BY position",
     )
     .bind(app_id)
     .fetch_all(&state.db)
@@ -1265,6 +1318,7 @@ mod tests {
             builds: false,
             ports: vec![],
             has_healthcheck: healthcheck,
+            replicas: 1,
         }
     }
 

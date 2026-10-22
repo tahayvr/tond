@@ -160,6 +160,8 @@ A compose rollback restores a whole release: the compose file that deployment ra
 
 A compose deployment can be restored if it succeeded, its compose file was recorded and every service image is still on the server. Pruning keeps every image that a kept release uses.
 
+If the restored file lacks a service that runs now, the rollback parks that service instead of deleting it: the service stops and its domains stop being routed, but Tond keeps them and routes them again when a later deploy brings the service back. The rollback dialog lists what it would park before you confirm. See [Parked services](/guides/sources#parked-services).
+
 > [!NOTE]
 > A rollback restores code, not data. To undo a change to an app's volume data, restore a snapshot (see below).
 

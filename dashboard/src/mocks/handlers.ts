@@ -3072,6 +3072,22 @@ export const handlers = [
 		});
 	}),
 
+	http.delete('/api/v1/apps/:id/services/:service', async ({ params }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id);
+		if (!app) return err('App not found', 404);
+		const list = composeServices[app.id] ?? [];
+		const svc = list.find((s) => s.name === params.service);
+		if (!svc) return err(`Not found: service '${params.service}' in app '${app.name}'`, 404);
+		if (!svc.parked) {
+			return err(
+				`Invalid input: Service '${svc.name}' is in the compose file: remove it from the file and deploy instead`
+			);
+		}
+		composeServices[app.id] = list.filter((s) => s.name !== svc.name);
+		return ok(composeServices[app.id]);
+	}),
+
 	http.post('/api/v1/apps/:id/services/:service/:action', async ({ params }) => {
 		await delay(LATENCY * 2);
 		const app = apps.find((a) => a.id === params.id);
