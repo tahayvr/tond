@@ -166,12 +166,12 @@ pub fn format_line(
         push_escaped(&mut line, q);
     }
     let ms = req.duration.as_secs_f64() * 1000.0;
-    let status = if req.status == 0 {
-        "-".to_string()
+    if req.status == 0 {
+        line.push_str(" -");
     } else {
-        req.status.to_string()
-    };
-    let _ = write!(line, " {status} {ms:.1}ms {}", req.bytes_out);
+        let _ = write!(line, " {}", req.status);
+    }
+    let _ = write!(line, " {ms:.1}ms {}", req.bytes_out);
     match req.client {
         Some(ip) => {
             let _ = write!(line, " {ip}");
