@@ -67,13 +67,13 @@ Some inputs are credentials you need for the first login. Tond shows them once, 
 
 Many apps give the admin account to whoever opens them first, or ship a fixed default login. Once the app is on a public domain, anyone could get there before you. Tond handles this in one of two ways.
 
-**Pre-seeded.** Tond creates the admin account, or replaces the default password, during the first deploy. It runs the template's setup command inside the app's container after every service is ready and before `tond-proxy` routes the domain, so nobody can reach the app first. The password is generated unless you type one, shown once after the deploy, and kept as an encrypted environment variable on the app.
+**Pre-seeded.** Tond creates the admin account, or replaces the default password, during the first deploy. It runs the template's setup command inside one of the app's containers after every service is ready and before `tond-proxy` routes the domain, so nobody can reach the app first. The password is generated unless you type one, shown once after the deploy, and kept as an encrypted environment variable on the app.
 
 | Template       | What Tond does                                                                                                             | Sign in as                       |
 | -------------- | -------------------------------------------------------------------------------------------------------------------------- | -------------------------------- |
 | Forgejo        | Locks the install page (`INSTALL_LOCK`) and creates the administrator with `forgejo admin user create`. Sign-up stays off. | the administrator name you chose |
 | Gitea          | Locks the install page (`INSTALL_LOCK`) and creates the administrator with `gitea admin user create`. Sign-up stays off.    | the administrator name you chose |
-| Mattermost     | Creates the system admin with `mmctl --local user create --system-admin`. Joining needs an invitation.                     | the username you chose           |
+| Mattermost     | Creates the system admin through Mattermost's API (the first account becomes the admin). Joining needs an invitation.     | the username you chose           |
 | Actual Budget  | Sets the server password through the server's bootstrap endpoint.                                                          | the server password              |
 | Audiobookshelf | Creates the `root` user through the server's `/init` endpoint.                                                            | `root`                           |
 | Umami          | Replaces the default `admin` / `umami` password in the database.                                                          | `admin`                          |

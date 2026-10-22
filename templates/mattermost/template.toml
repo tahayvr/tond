@@ -70,11 +70,22 @@ service = "db"
 path = "./postgres"
 description = "PostgreSQL data: messages, users, channels and settings"
 
-# Mattermost makes the first account a system admin. mmctl creates it over the
-# local-mode socket (inside the container only) before the app is routed.
+# Mattermost makes the first account a system admin. Its image has no shell, and
+# mmctl takes the password only as an argument (visible in the host's process
+# list), so the account is created through the REST API from the db container
+# (busybox sh and wget) before the app is routed. The JSON goes in on stdin,
+# built by the shell's printf: no value lands on a command line. A retried step
+# whose account exists already passes on its login and changes nothing.
 [[post_deploy]]
-service = "mattermost"
+service = "db"
 description = "Create the system admin account"
 env = ["ADMIN_USERNAME", "ADMIN_EMAIL", "ADMIN_PASSWORD"]
-command = ["sh", "-c", "mmctl --local user create --system-admin --username \"$ADMIN_USERNAME\" --email \"$ADMIN_EMAIL\" --password \"$ADMIN_PASSWORD\" || mmctl --local --json user search \"$ADMIN_USERNAME\" | grep -q \"\\\"username\\\": \\\"$ADMIN_USERNAME\\\"\""]
+command = ["sh", "-c", '''
+set -e
+esc() { printf '%s' "$1" | sed 's/[\\"]/\\&/g'; }
+u=$(esc "$ADMIN_USERNAME"); e=$(esc "$ADMIN_EMAIL"); p=$(esc "$ADMIN_PASSWORD")
+post() { wget -q -O /dev/null -T 30 --header 'Content-Type: application/json' --post-file /dev/stdin "http://mattermost:8065/api/v4/$1"; }
+if printf '{"login_id":"%s","password":"%s"}' "$u" "$p" | post users/login 2>/dev/null; then exit 0; fi
+printf '{"username":"%s","email":"%s","password":"%s"}' "$u" "$e" "$p" | post users
+''']
 timeout_secs = 180

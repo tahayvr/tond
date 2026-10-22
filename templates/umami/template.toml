@@ -42,11 +42,27 @@ service = "db"
 path = "./postgres"
 description = "PostgreSQL data: websites, users and all analytics events"
 
-# Umami creates admin / umami on first start. Tond replaces the password (a
-# bcrypt hash, which Umami verifies) in the database before the app is routed;
-# it fails, and is retried, until Umami's migrations have created the user.
+# Umami's first migration (01_init, run before the server starts) inserts
+# admin / umami. Tond replaces the password (a bcrypt hash, which Umami
+# verifies) in the database before the app is routed. The step fails, and is
+# retried, until the admin row exists and takes the new password; RAISE runs
+# only in the \else branch (a constant 1 / 0 would be folded, and fail, at
+# plan time).
 [[post_deploy]]
 service = "db"
 description = "Replace the default admin password"
 env = ["ADMIN_PASSWORD"]
-command = ["sh", "-c", "psql -v ON_ERROR_STOP=1 -q -U umami -d umami -v pw=\"$ADMIN_PASSWORD\" <<'SQL'\nCREATE EXTENSION IF NOT EXISTS pgcrypto;\nUPDATE \"user\" SET password = crypt(:'pw', gen_salt('bf', 10)) WHERE username = 'admin';\nSELECT CASE WHEN EXISTS (SELECT 1 FROM \"user\" WHERE username = 'admin' AND password = crypt(:'pw', password)) THEN 1 ELSE 1 / 0 END;\nSQL\n"]
+command = ["sh", "-c", '''
+psql -v ON_ERROR_STOP=1 -q -U umami -d umami <<'SQL'
+\getenv pw ADMIN_PASSWORD
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+UPDATE "user" SET password = crypt(:'pw', gen_salt('bf', 10)) WHERE username = 'admin';
+SELECT EXISTS (SELECT 1 FROM "user" WHERE username = 'admin' AND password = crypt(:'pw', password)) AS seeded \gset
+\if :seeded
+\else
+DO $$ BEGIN RAISE EXCEPTION 'Umami has not created its admin user yet'; END $$;
+\endif
+SQL
+''']
+timeout_secs = 180
