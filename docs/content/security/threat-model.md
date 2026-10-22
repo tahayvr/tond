@@ -71,6 +71,15 @@ See [Isolation](/security/isolation) for the details.
 
 Previews run code from pull requests, possibly from strangers. They are served only on a separate registrable domain (`<id>-<app>.<preview_domain>`), checked against the Public Suffix List, so a preview page is cross-site to the dashboard and cannot use its cookies. `tond-proxy` never serves the dashboard or API on the preview domain. Without a preview domain, previews are refused. Previews never join the project's network, so they cannot reach production databases. See [Previews](/concepts/previews).
 
+### Unclaimed admin accounts in one-click apps
+
+Many self-hosted apps give the admin account to whoever opens them first (an install page, or "the first account becomes the admin"), or ship a fixed default login. Once such an app is on a public domain, a scanner can reach it before you do. Templates close this where the app allows it:
+
+- **Pre-seeded**: Gitea, Mattermost, Actual Budget, Audiobookshelf, Umami and Mealie. Tond creates the admin (or replaces the default password) with a generated password while the app is running but before `tond-proxy` routes its domain, so nobody can reach it first. The password is shown once after the deploy and kept, encrypted, in the app's environment.
+- **Warned**: Ghost, Uptime Kuma, Memos, Wiki.js, Docmost and Twenty have no documented way to create the admin from outside. Their app page warns "Open the app now and create the admin account; anyone who reaches it first can" until you dismiss it.
+
+If pre-seeding fails, the deploy still finishes and the app page shows the same warning with the reason. See [Templates](/guides/templates#admin-accounts).
+
 ### The host terminal
 
 The browser shell on the host is off by default and can only be switched on from the server itself (`sudo tond settings host-terminal on`), never from the dashboard or with a token. When on, it is admin-only, every session requires the password (and 2FA code) again, and it runs as an unprivileged user that is not in the `docker` or `sudo` groups. See [Host terminal](/guides/host-terminal).

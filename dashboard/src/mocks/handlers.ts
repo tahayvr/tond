@@ -120,6 +120,7 @@ import { observeHandlers } from './observe';
 import { updateHandlers } from './updates';
 import {
 	MOCK_COMPOSE_APP,
+	MOCK_TEMPLATE_APP,
 	MOCK_COMPOSE_DEPLOYMENTS,
 	MOCK_COMPOSE_SERVICES,
 	mockComposeSpecs,
@@ -564,7 +565,7 @@ function mockNextRuns(schedule: string, count: number): string[] | null {
 const MOCK_STEP_UP_PASSWORD = 'ValidPass123!';
 // ticket → target, consumed by the terminal WebSocket mock
 const terminalTickets = new Map<string, { kind: string; id: string }>();
-let apps: App[] = structuredClone([...MOCK_APPS, MOCK_COMPOSE_APP]);
+let apps: App[] = structuredClone([...MOCK_APPS, MOCK_COMPOSE_APP, MOCK_TEMPLATE_APP]);
 /** Services of compose apps (app id → services). */
 const composeServices: Record<string, ComposeService[]> = structuredClone(MOCK_COMPOSE_SERVICES);
 let projects: Project[] = structuredClone(MOCK_PROJECTS);
@@ -2032,6 +2033,12 @@ export const handlers = [
 			readiness: template.public.health_path ? 'http' : 'tcp',
 			template_id: template.id,
 			template_version: template.version,
+			admin_setup:
+				template.admin_setup === 'seeded'
+					? 'done'
+					: template.admin_setup === 'first_visitor'
+						? 'open'
+						: null,
 			created_at: now,
 			updated_at: now
 		};
@@ -2406,6 +2413,22 @@ export const handlers = [
 		if (idx === -1) return err('App not found', 404);
 		apps[idx] = { ...apps[idx], status: 'running', updated_at: new Date().toISOString() };
 		return ok(null);
+	}),
+
+	http.post('/api/v1/apps/:id/admin-setup/dismiss', async ({ params }) => {
+		await delay(LATENCY);
+		const idx = apps.findIndex((a) => a.id === params.id || a.name === params.id);
+		if (idx === -1) return err('App not found', 404);
+		const current = apps[idx];
+		if (current.admin_setup === 'open' || current.admin_setup === 'failed') {
+			apps[idx] = {
+				...current,
+				admin_setup: 'dismissed',
+				admin_setup_error: null,
+				updated_at: new Date().toISOString()
+			};
+		}
+		return ok(apps[idx]);
 	}),
 
 	http.post('/api/v1/apps/:id/restart', async ({ params }) => {

@@ -1785,6 +1785,40 @@ code=$(api_req POST /api/v1/templates/vaultwarden/deploy '{"name":"e2e-vault","i
 rm -rf "${DATA_DIR}/volumes/e2e-vault"
 pass "same name → 409; leftover data → 400 and nothing is created"
 
+# Admin accounts: templates whose app hands the admin to its first visitor are
+# pre-seeded before the domain is routed, or carry a dismissible warning.
+jq -e '[.data.templates[] | select(.admin_setup == "seeded") | .id] as $s
+       | [.data.templates[] | select(.admin_setup == "first_visitor") | .id] as $f
+       | (["actual", "audiobookshelf", "gitea", "mattermost", "mealie", "umami"] - $s) == []
+         and (["docmost", "ghost", "memos", "twenty", "uptime-kuma", "wikijs"] - $f) == []' <<< "$CATALOG" > /dev/null \
+    || fail "the catalog should mark which templates pre-seed the admin and which warn: $(jq -c '[.data.templates[] | {id, admin_setup}]' <<< "$CATALOG")"
+code=$(api_req POST /api/v1/templates/actual/deploy '{"name":"e2e-actual","inputs":{},"allow_low_memory":true}')
+[[ "$code" == 202 ]] || fail "deploying the actual template should be accepted, got ${code}: $(cat "$API_BODY")"
+ACTUAL_PW=$(jq -r '.data.credentials[] | select(.key == "SERVER_PASSWORD") | .value' "$API_BODY")
+[[ ${#ACTUAL_PW} -eq 24 ]] || fail "the deploy should return the generated server password once"
+wait_for_app_running e2e-actual 300
+[[ "$(app_field e2e-actual admin_setup)" == done ]] \
+    || fail "the server password should be set by the post_deploy step: admin_setup=$(app_field e2e-actual admin_setup) $(app_field e2e-actual admin_setup_error)"
+ACTUAL_PORT=$(api /api/v1/apps/e2e-actual/services | jq -r '.data[] | select(.name == "actual") | .host_port')
+curl -sf -X POST -H 'content-type: application/json' -d "$(jq -n --arg p "$ACTUAL_PW" '{password: $p}')" \
+    "http://127.0.0.1:${ACTUAL_PORT}/account/login" | jq -e '.status == "ok" and (.data.token | length > 0)' > /dev/null \
+    || fail "the seeded server password should sign in to Actual"
+api /api/v1/apps/e2e-actual/logs | jq -e '.data.deploy_logs | any(.message | contains("Set the server password: done"))' > /dev/null \
+    || fail "the deploy log should record the post_deploy step"
+api /api/v1/apps/e2e-actual/logs | jq -e --arg p "$ACTUAL_PW" '[.data.deploy_logs[].message | select(contains($p))] | length == 0' > /dev/null \
+    || fail "the seeded password must not appear in the deploy log"
+pass "actual: the server password is set before routing (admin_setup done), signs in, stays out of the log"
+code=$(api_req POST /api/v1/apps/e2e-actual/admin-setup/dismiss '{}')
+[[ "$code" == 200 ]] && jq -e '.data.admin_setup == "done"' "$API_BODY" > /dev/null \
+    || fail "dismissing must leave a seeded admin alone, got ${code}: $(cat "$API_BODY")"
+sqlite3 "${DATA_DIR}/tond.db" "UPDATE apps SET admin_setup = 'open' WHERE name = 'e2e-actual'"
+code=$(api_req POST /api/v1/apps/e2e-actual/admin-setup/dismiss '{}')
+[[ "$code" == 200 ]] && jq -e '.data.admin_setup == "dismissed"' "$API_BODY" > /dev/null \
+    || fail "dismissing a first-visitor warning should mark it dismissed, got ${code}: $(cat "$API_BODY")"
+pass "POST /admin-setup/dismiss clears only a warning"
+tond apps delete e2e-actual -y > /dev/null
+rm -rf "${DATA_DIR}/volumes/e2e-actual"
+
 
 step "Docker Compose app (per-service routing, status, logs, rollback, cleanup)"
 # A two-service compose app: whoami gets a domain, redis stays internal with

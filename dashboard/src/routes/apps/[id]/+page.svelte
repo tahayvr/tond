@@ -62,6 +62,7 @@
 	} from '$lib/tabs';
 	import LinkTabs from '$lib/components/nav/link-tabs.svelte';
 	import PageHeader from '$lib/components/nav/page-header.svelte';
+	import AdminSetupWarning from '$lib/components/templates/admin-setup-warning.svelte';
 	import StatusBadge from '$lib/components/feedback/status-badge.svelte';
 	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import SuccessAlert from '$lib/components/feedback/success-alert.svelte';
@@ -998,6 +999,12 @@
 		</PageHeader>
 
 		<InlineError message={error} ondismiss={() => (error = '')} />
+
+		<AdminSetupWarning
+			app={current}
+			canDismiss={canEditApp}
+			ondismissed={(updated) => (app = updated)}
+		/>
 
 		<LinkTabs
 			label="App sections"
