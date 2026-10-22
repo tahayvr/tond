@@ -442,6 +442,7 @@ pub fn backup_observation(scope: &str, failed: bool) -> Observation {
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct StateRow {
+    rule_id: String,
     target: String,
     target_label: String,
     state: String,
@@ -486,14 +487,20 @@ pub async fn evaluate(db: &SqlitePool, now: i64, source: &Source) -> Result<Repo
         requests: HashMap::new(),
         global_quiet: None,
     };
+    let mut states = if rules.is_empty() {
+        HashMap::new()
+    } else {
+        load_states(db).await?
+    };
     let mut first_error = None;
     for rule in &rules {
         let Some(info) = alert_kind(&rule.kind) else {
             continue;
         };
+        let rule_states = states.remove(&rule.id).unwrap_or_default();
         let result = async {
             let obs = observe(&mut ctx, rule, info).await?;
-            apply(&mut ctx, rule, obs, &mut report).await
+            apply(&mut ctx, rule, obs, rule_states, &mut report).await
         }
         .await;
         if let Err(e) = result {
@@ -507,23 +514,33 @@ pub async fn evaluate(db: &SqlitePool, now: i64, source: &Source) -> Result<Repo
     }
 }
 
-/// Advance the states of one rule from its observations.
+/// Every stored state, grouped by rule: one query per evaluation, however
+/// many rules there are.
+async fn load_states(db: &SqlitePool) -> Result<HashMap<String, Vec<StateRow>>> {
+    let rows: Vec<StateRow> = sqlx::query_as(
+        "SELECT s.rule_id, s.target, s.target_label, s.state, s.since, s.value, s.episode_id,
+                s.snoozed_until, h.fired_at, h.acknowledged_at, h.last_notified_at
+         FROM alert_states s LEFT JOIN alert_history h ON h.id = s.episode_id",
+    )
+    .fetch_all(db)
+    .await?;
+    let mut by_rule: HashMap<String, Vec<StateRow>> = HashMap::new();
+    for row in rows {
+        by_rule.entry(row.rule_id.clone()).or_default().push(row);
+    }
+    Ok(by_rule)
+}
+
+/// Advance the states of one rule (`states`: its stored rows) from its
+/// observations.
 async fn apply(
     ctx: &mut Ctx<'_>,
     rule: &AlertRule,
     observations: Vec<Observation>,
+    states: Vec<StateRow>,
     report: &mut Report,
 ) -> Result<()> {
     let now = ctx.now;
-    let states: Vec<StateRow> = sqlx::query_as(
-        "SELECT s.target, s.target_label, s.state, s.since, s.value, s.episode_id,
-                s.snoozed_until, h.fired_at, h.acknowledged_at, h.last_notified_at
-         FROM alert_states s LEFT JOIN alert_history h ON h.id = s.episode_id
-         WHERE s.rule_id = ?",
-    )
-    .bind(&rule.id)
-    .fetch_all(ctx.db)
-    .await?;
     let mut by_target: HashMap<String, StateRow> =
         states.into_iter().map(|s| (s.target.clone(), s)).collect();
 
