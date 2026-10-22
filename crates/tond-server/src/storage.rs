@@ -165,16 +165,59 @@ pub async fn download_to_file(
     Ok((bytes, hex::encode(hasher.finalize())))
 }
 
-/// List objects under the given `prefix` in the configured bucket.
+/// List objects under the given `prefix` in the configured bucket, every
+/// page of it. Keys are returned relative to the provider's prefix (the
+/// form the other calls take).
 pub async fn list(provider: &StorageProvider, prefix: &str) -> anyhow::Result<Vec<RemoteObject>> {
     let cfg = parse_config(provider)?;
-    let (endpoint, host) = endpoint_and_host(&cfg);
+    let mut objects = Vec::new();
+    let mut token: Option<String> = None;
+    // A bound on pages, so a misbehaving endpoint can't loop forever.
+    for _ in 0..1000 {
+        let page = list_page(&cfg, prefix, token.as_deref()).await?;
+        objects.extend(page.objects.into_iter().map(|mut o| {
+            if let Some(p) = &cfg.prefix
+                && let Some(rest) = o.key.strip_prefix(p.as_str())
+            {
+                o.key = rest.to_string();
+            }
+            o
+        }));
+        match page.next {
+            Some(next) => token = Some(next),
+            None => break,
+        }
+    }
+    Ok(objects)
+}
 
-    let effective_prefix = full_key(&cfg, prefix);
-    let query = format!(
-        "list-type=2&prefix={}",
-        urlencoding::encode(&effective_prefix)
-    );
+/// One page of a ListObjectsV2 listing.
+struct ListPage {
+    objects: Vec<RemoteObject>,
+    /// NextContinuationToken when the listing is truncated
+    next: Option<String>,
+}
+
+async fn list_page(
+    cfg: &S3ConfigDecrypted,
+    prefix: &str,
+    token: Option<&str>,
+) -> anyhow::Result<ListPage> {
+    let (endpoint, host) = endpoint_and_host(cfg);
+
+    let effective_prefix = full_key(cfg, prefix);
+    // Canonical query: parameters sorted by name.
+    let query = match token {
+        Some(t) => format!(
+            "continuation-token={}&list-type=2&prefix={}",
+            urlencoding::encode(t),
+            urlencoding::encode(&effective_prefix)
+        ),
+        None => format!(
+            "list-type=2&prefix={}",
+            urlencoding::encode(&effective_prefix)
+        ),
+    };
     let url = format!("{}/{}?{}", endpoint, cfg.bucket, query);
 
     let now = Utc::now();
@@ -210,7 +253,53 @@ pub async fn list(provider: &StorageProvider, prefix: &str) -> anyhow::Result<Ve
         .await?;
 
     let xml = expect_success(resp, "S3 list").await?;
-    parse_list_objects_response(&xml)
+    let objects = parse_list_objects_response(&xml)?;
+    let truncated = xml_elements(&xml, "IsTruncated")
+        .first()
+        .is_some_and(|v| v.trim() == "true");
+    let next = xml_elements(&xml, "NextContinuationToken")
+        .into_iter()
+        .next()
+        .filter(|t| truncated && !t.is_empty());
+    Ok(ListPage { objects, next })
+}
+
+/// Store a small object (`body` in one PUT).
+pub async fn put_object(
+    provider: &StorageProvider,
+    key: &str,
+    body: Vec<u8>,
+) -> anyhow::Result<()> {
+    let cfg = parse_config(provider)?;
+    let resp = signed(&Client::new(), &cfg, Method::PUT, key, "", body).await?;
+    expect_success(resp, "S3 upload").await?;
+    Ok(())
+}
+
+/// Fetch a small object, refusing anything over `max_bytes`.
+pub async fn get_object(
+    provider: &StorageProvider,
+    key: &str,
+    max_bytes: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let cfg = parse_config(provider)?;
+    let resp = signed(&Client::new(), &cfg, Method::GET, key, "", Vec::new()).await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body_text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("S3 download of {key} failed ({status}): {body_text}");
+    }
+    let mut out = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        anyhow::ensure!(
+            out.len() + chunk.len() <= max_bytes,
+            "{key} is larger than {max_bytes} bytes"
+        );
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
 }
 
 /// Delete the object at `key` from remote storage.
@@ -457,42 +546,48 @@ fn sigv4_sign(
 }
 
 /// Minimal XML parser for S3 ListObjectsV2 response.
-/// Extracts `<Key>`, `<Size>`, and `<LastModified>` from `<Contents>` elements.
+/// Extracts `<Key>`, `<Size>`, and `<LastModified>` from `<Contents>` elements,
+/// whether the response is pretty-printed or on one line (AWS sends one).
 fn parse_list_objects_response(xml: &str) -> anyhow::Result<Vec<RemoteObject>> {
     let mut objects = Vec::new();
-    let mut current_key = String::new();
-    let mut current_size = 0u64;
-    let mut current_last_modified = String::new();
-    let mut in_contents = false;
-
-    for line in xml.lines() {
-        let trimmed = line.trim();
-        if trimmed.contains("<Contents>") {
-            in_contents = true;
-            current_key.clear();
-            current_size = 0;
-            current_last_modified.clear();
-        } else if trimmed.contains("</Contents>") {
-            if in_contents && !current_key.is_empty() {
-                objects.push(RemoteObject {
-                    key: current_key.clone(),
-                    size: current_size,
-                    last_modified: current_last_modified.clone(),
-                });
-            }
-            in_contents = false;
-        } else if in_contents {
-            if let Some(key) = extract_xml_value(trimmed, "Key") {
-                current_key = key;
-            } else if let Some(size) = extract_xml_value(trimmed, "Size") {
-                current_size = size.parse().unwrap_or(0);
-            } else if let Some(lm) = extract_xml_value(trimmed, "LastModified") {
-                current_last_modified = lm;
-            }
-        }
+    for contents in xml_elements(xml, "Contents") {
+        let first = |tag: &str| xml_elements(&contents, tag).into_iter().next();
+        let Some(key) = first("Key").filter(|k| !k.is_empty()) else {
+            continue;
+        };
+        objects.push(RemoteObject {
+            key: xml_unescape(&key),
+            size: first("Size")
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0),
+            last_modified: first("LastModified").unwrap_or_default(),
+        });
     }
-
     Ok(objects)
+}
+
+/// The inner text of every `<tag>…</tag>` in `xml` (no nesting of the same tag).
+fn xml_elements(xml: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find(&open) {
+        let after = &rest[start + open.len()..];
+        let Some(end) = after.find(&close) else { break };
+        out.push(after[..end].to_string());
+        rest = &after[end + close.len()..];
+    }
+    out
+}
+
+/// Undo XML's predefined entities.
+fn xml_unescape(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 /// Extract the text content of a simple XML element from a trimmed line.
@@ -718,6 +813,25 @@ mod tests {
         assert_eq!(
             objects[1].last_modified, "2026-01-02T00:00:00.000Z",
             "second object last_modified should be parsed correctly"
+        );
+    }
+
+    #[test]
+    fn parses_single_line_listings_and_continuation_tokens() {
+        let xml = "<?xml version=\"1.0\"?><ListBucketResult><IsTruncated>true</IsTruncated>\
+                   <Contents><Key>snapshots/a&amp;b.manifest.json</Key><Size>10</Size></Contents>\
+                   <Contents><Key>snapshots/c.tondsnap</Key><Size>20</Size></Contents>\
+                   <NextContinuationToken>tok/123</NextContinuationToken></ListBucketResult>";
+        let objects = parse_list_objects_response(xml).unwrap_or_default();
+        let keys: Vec<&str> = objects.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["snapshots/a&b.manifest.json", "snapshots/c.tondsnap"]
+        );
+        assert_eq!(objects[1].size, 20);
+        assert_eq!(
+            xml_elements(xml, "NextContinuationToken"),
+            vec!["tok/123".to_string()]
         );
     }
 

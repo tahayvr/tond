@@ -14,3 +14,11 @@ pub mod http_metrics;
 pub mod loops;
 pub mod selfstats;
 pub mod shutdown;
+
+static STARTED_AT: std::sync::LazyLock<chrono::DateTime<chrono::Utc>> =
+    std::sync::LazyLock::new(chrono::Utc::now);
+
+/// When this process started (wall clock; fixed by `selfstats::mark_start`).
+pub fn process_started_at() -> chrono::DateTime<chrono::Utc> {
+    *STARTED_AT
+}

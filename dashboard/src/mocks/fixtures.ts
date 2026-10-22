@@ -49,6 +49,7 @@ import type {
 	ServerSettings,
 	Snapshot,
 	StorageProvider,
+	RemoteSnapshot,
 	SystemMetrics,
 	SystemSelf,
 	User,
@@ -3179,6 +3180,53 @@ export const MOCK_SNAPSHOTS: Snapshot[] = [
 		remote_status: null,
 		remote_error: null,
 		archive_bytes: null
+	}
+];
+
+// ── Remote snapshots (Restore from storage) ────────────────────────────────
+
+export const MOCK_REMOTE_SNAPSHOTS: RemoteSnapshot[] = [
+	{
+		id: 'snap_remote_full',
+		provider_id: 'sp_r2_1',
+		created_at: '2026-10-20T03:00:12.000Z',
+		tond_version: '1.0.0',
+		archive_bytes: 412_318_720,
+		readable: true,
+		name: 'Scheduled 2026-10-20 03:00',
+		trigger: 'scheduled',
+		scope: 'full',
+		apps: ['api-service', 'web-frontend', 'old-blog'],
+		databases: ['app-postgres', 'analytics-pg'],
+		imported: false
+	},
+	{
+		id: 'snap_remote_db',
+		provider_id: 'sp_r2_1',
+		created_at: '2026-10-19T22:15:40.000Z',
+		tond_version: '1.0.0',
+		archive_bytes: 18_874_368,
+		readable: true,
+		name: 'app-postgres 2026-10-19 22:15',
+		trigger: 'manual',
+		scope: 'database:app-postgres',
+		apps: [],
+		databases: ['app-postgres'],
+		imported: true
+	},
+	{
+		id: 'snap_remote_other_key',
+		provider_id: 'sp_r2_1',
+		created_at: '2026-09-02T03:00:05.000Z',
+		tond_version: '0.9.4',
+		archive_bytes: 301_989_888,
+		readable: false,
+		name: null,
+		trigger: null,
+		scope: null,
+		apps: [],
+		databases: [],
+		imported: false
 	}
 ];
 

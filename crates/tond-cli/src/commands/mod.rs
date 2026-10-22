@@ -8,6 +8,7 @@ pub mod docs;
 pub mod integrations;
 pub mod projects;
 pub mod scanner;
+pub mod server_move;
 pub mod settings;
 pub mod setup;
 pub mod snapshots;

@@ -2137,6 +2137,44 @@ tond snapshot create --name e2e-smoke > /dev/null
 wait_for 120 "e2e-smoke snapshot completed" \
     bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/snapshots | jq -e '.data[] | select(.name == \"e2e-smoke\" and .status == \"completed\")'"
 pass "full snapshot completed"
+SMOKE_ID=$(api /api/v1/snapshots | jq -r '[.data[] | select(.name == "e2e-smoke")][0].id')
+[[ "$(head -c 8 "${DATA_DIR}/backups/snapshots/${SMOKE_ID}/tond.db")" == TONDLOC1 ]] \
+    || fail "local snapshot files must be encrypted at rest (tond.db)"
+[[ "$(head -c 8 "${DATA_DIR}/backups/snapshots/${SMOKE_ID}/manifest.json")" == TONDLOC1 ]] \
+    || fail "local snapshot files must be encrypted at rest (manifest.json)"
+pass "local snapshot copies are encrypted at rest"
+
+# Server move, file round trip (no restore): export, check, import.
+tond export --snapshot "$SMOKE_ID" --output /root/e2e-export.tondsnap > /dev/null
+[[ "$(head -c 8 /root/e2e-export.tondsnap)" == TONDSNP1 ]] || fail "an export must be an encrypted snapshot archive"
+jq -e --arg sha "$(sha256sum /root/e2e-export.tondsnap | cut -d' ' -f1)" --arg id "$SMOKE_ID" \
+    '.sha256 == $sha and .id == $id and .scope == "full"' /root/e2e-export.tondsnap.manifest.json > /dev/null \
+    || fail "the export manifest must name the snapshot and the archive's sha256: $(cat /root/e2e-export.tondsnap.manifest.json)"
+tond --json import /root/e2e-export.tondsnap --no-restore | jq -e --arg id "$SMOKE_ID" '.id == $id' > /dev/null \
+    || fail "importing an export must find its snapshot"
+# Cut after the first record (the first one authenticates, the end is missing).
+head -c 100000 /root/e2e-export.tondsnap > /root/e2e-truncated.tondsnap
+[[ "$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "$SOCK" -X POST --data-binary @/root/e2e-truncated.tondsnap \
+    -H 'Content-Type: application/octet-stream' http://localhost/api/v1/snapshots/import)" == 400 ]] \
+    || fail "a truncated archive must be refused"
+rm -f /root/e2e-export.tondsnap /root/e2e-export.tondsnap.manifest.json /root/e2e-truncated.tondsnap
+pass "tond export / tond import round trip; a truncated archive is refused"
+
+step "Missed backup catch-up"
+[[ "$(api_req PUT /api/v1/databases/e2e-redis/backup-schedule '{"schedule":"0 0 1 1 *","retention":2}')" == 200 ]] \
+    || fail "scheduling e2e-redis backups must succeed: $(cat "$API_BODY")"
+systemctl stop tond-server
+# Pretend the last run was years ago: the server was "down" through a slot.
+python3 -c "import sqlite3; c = sqlite3.connect('${DATA_DIR}/tond.db'); c.execute(\"INSERT OR REPLACE INTO backup_schedule_state (job, schedule, last_slot) VALUES ('database:e2e-redis', '0 0 1 1 *', '2020-01-01T00:00:00+00:00')\"); c.commit()"
+systemctl start tond-server
+wait_for 60 "API health after the restart" curl -sf http://127.0.0.1:3001/health
+wait_for 120 "one catch-up backup of e2e-redis" \
+    bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/databases/e2e-redis/backups | jq -e '[.data[] | select(.trigger == \"scheduled\" and (.notes // \"\" | startswith(\"Catch-up\")))] | length == 1'"
+journalctl -u tond-server --since "-3min" --no-pager -o cat | grep -q "Catch-up: the backup due at" \
+    || fail "the catch-up must be logged"
+[[ "$(api_req PUT /api/v1/databases/e2e-redis/backup-schedule '{"schedule":null}')" == 200 ]] \
+    || fail "turning the schedule off must succeed"
+pass "a backup missed while down runs once at start, noted and logged as a catch-up"
 
 step "Restart survival"
 systemctl restart tond-server tond-proxy

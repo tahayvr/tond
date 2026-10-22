@@ -51,6 +51,7 @@ import {
 	MOCK_STORAGE_PROVIDERS,
 	MOCK_SNAPSHOTS,
 	MOCK_BACKUP_CONFIG,
+	MOCK_REMOTE_SNAPSHOTS,
 	MOCK_APP_ENV_VARS,
 	MOCK_PREVIEW_ENV_VARS,
 	MOCK_CERTIFICATES,
@@ -100,6 +101,7 @@ import type {
 	RegistryCredential,
 	Snapshot,
 	StorageProvider,
+	RemoteSnapshot,
 	EnvVarEntry,
 	DatabaseCredentials,
 	DatabaseBackupStatus,
@@ -919,6 +921,8 @@ let integrations: Integration[] = structuredClone(MOCK_INTEGRATIONS);
 let storageProviders: StorageProvider[] = structuredClone(MOCK_STORAGE_PROVIDERS);
 let snapshots: Snapshot[] = structuredClone(MOCK_SNAPSHOTS);
 let backupConfig: BackupConfig = structuredClone(MOCK_BACKUP_CONFIG);
+// Only the first provider's bucket holds snapshots in the mock.
+let remoteSnapshots: RemoteSnapshot[] = structuredClone(MOCK_REMOTE_SNAPSHOTS);
 // app_id → env vars / preview overrides (plaintext; only masked values leave the mock)
 const appEnvVars: Record<string, Record<string, string>> = structuredClone(MOCK_APP_ENV_VARS);
 const previewEnvVars: Record<string, Record<string, string>> = structuredClone(
@@ -5705,6 +5709,79 @@ export const handlers = [
 			message: `Database '${body.db_name}' restored. The data it held just before is saved as a backup.`,
 			pre_restore_snapshot_id: safetyNet.id
 		});
+	}),
+
+	// ── Restore from storage ─────────────────────────────────────────────────
+
+	http.get('/api/v1/snapshots/remote', async ({ request }) => {
+		await delay(LATENCY * 2);
+		const id =
+			new URL(request.url).searchParams.get('provider_id') ?? backupConfig.storage_provider_id;
+		if (!id) {
+			return err(
+				'No storage provider given and none is selected in Backup settings. Pass provider_id.',
+				400
+			);
+		}
+		if (!storageProviders.some((p) => p.id === id)) {
+			return err('Storage provider not found', 404);
+		}
+		return ok(
+			remoteSnapshots
+				.filter((s) => s.provider_id === id)
+				.map((s) => ({ ...s, imported: s.imported || snapshots.some((l) => l.id === s.id) }))
+		);
+	}),
+
+	http.post('/api/v1/snapshots/remote/:id/import', async ({ params, request }) => {
+		await delay(LATENCY * 3);
+		const body = (await request.json().catch(() => ({}))) as { provider_id?: string };
+		const providerId = body.provider_id ?? backupConfig.storage_provider_id;
+		const remote = remoteSnapshots.find((s) => s.id === params.id && s.provider_id === providerId);
+		if (!remote) return err('Snapshot not found in remote storage', 404);
+		if (!remote.readable) {
+			return HttpResponse.json(
+				errorBody(
+					"This snapshot was encrypted with a different TOND_SECRET_KEY, so this server can't read it.",
+					409,
+					'SNAPSHOT_KEY_MISMATCH',
+					{
+						hint: 'Set TOND_SECRET_KEY in /opt/tond/data/tond.env to the key of the server that made it, restart tond-server and try again.'
+					}
+				),
+				{ status: 409 }
+			);
+		}
+		const existing = snapshots.find((s) => s.id === remote.id);
+		if (existing) return ok(existing);
+		const snap: Snapshot = {
+			id: remote.id,
+			name: remote.name ?? remote.id,
+			status: 'completed',
+			trigger: remote.trigger ?? 'manual',
+			scope: remote.scope ?? 'full',
+			trigger_app: null,
+			deployment_id: null,
+			parent_snapshot_id: null,
+			created_at: remote.created_at,
+			completed_at: remote.created_at,
+			delta_bytes: null,
+			total_bytes: null,
+			local_path: null,
+			remote_key: `snapshots/${remote.id}.tondsnap`,
+			storage_provider_id: remote.provider_id,
+			checksum_sha256: 'f'.repeat(64),
+			error_message: null,
+			notes: null,
+			remote_status: 'uploaded',
+			remote_error: null,
+			archive_bytes: remote.archive_bytes
+		};
+		snapshots = [snap, ...snapshots].sort((a, b) => b.created_at.localeCompare(a.created_at));
+		remoteSnapshots = remoteSnapshots.map((s) =>
+			s.id === remote.id ? { ...s, imported: true } : s
+		);
+		return ok(snap);
 	}),
 
 	http.get('/api/v1/snapshots/config', async () => {

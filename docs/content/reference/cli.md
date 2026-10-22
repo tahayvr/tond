@@ -1298,6 +1298,7 @@ tond snapshot <COMMAND>
 | --- | --- |
 | `tond snapshot create` | Create a manual full snapshot |
 | `tond snapshot list` | List snapshots |
+| `tond snapshot remote` | List the snapshots in a storage provider's bucket (also ones this server never took: restore them with `tond import <id>`) |
 | `tond snapshot restore` | Restore a full snapshot (asks first; the server restarts) |
 | `tond snapshot rollback` | Roll back a single app or database to a snapshot state (no server restart; asks first) |
 | `tond snapshot delete` | Delete a snapshot (asks first) |
@@ -1326,6 +1327,18 @@ tond snapshot list [OPTIONS]
 | Option | Description |
 | --- | --- |
 | `--app <APP>` | Filter to snapshots for a specific app name. |
+
+### tond snapshot remote
+
+List the snapshots in a storage provider's bucket (also ones this server never took: restore them with `tond import <id>`)
+
+```text
+tond snapshot remote [OPTIONS]
+```
+
+| Option | Description |
+| --- | --- |
+| `--provider <PROVIDER>` | Storage provider to list (default: the one in the backup settings). |
 
 ### tond snapshot restore
 
@@ -1414,6 +1427,40 @@ tond snapshot config set [OPTIONS]
 | `--pre-deploy-retain <PRE_DEPLOY_RETAIN>` | Number of pre-deploy snapshots to retain per app. |
 | `--keep-local <KEEP_LOCAL>` | Keep a local copy of snapshots (true/false). One of `true`, `false`. |
 | `--provider <PROVIDER>` | Storage provider ID to upload snapshots to (use "none" to clear). |
+
+## tond export
+
+Export the whole server as one encrypted archive (a file and/or remote storage)
+
+```text
+tond export [OPTIONS]
+```
+
+| Option | Description |
+| --- | --- |
+| `-o, --output <OUTPUT>` | File to write the encrypted archive to (default: tond-export-<date>.tondsnap, unless only --remote is given). |
+| `--remote` | Upload the archive (and its manifest) to a storage provider instead of, or as well as (with --output), writing a file. |
+| `--provider <PROVIDER>` | Storage provider for --remote (default: the one in the backup settings). |
+| `--snapshot <SNAPSHOT>` | Export this existing snapshot instead of taking a new full snapshot. |
+| `--name <NAME>` | Name of the new snapshot. |
+
+## tond import
+
+Restore an exported archive or a remote snapshot onto this server (asks first)
+
+```text
+tond import [OPTIONS] <SOURCE>
+```
+
+| Argument | Description |
+| --- | --- |
+| `<SOURCE>` | An exported archive file, or the id of a snapshot in a storage provider. |
+
+| Option | Description |
+| --- | --- |
+| `--provider <PROVIDER>` | Storage provider holding the snapshot (default: the one in the backup settings). |
+| `--no-restore` | Only add the snapshot to the server's list; don't restore it. |
+| `-y, --yes` | Don't ask for confirmation (required when stdin is not a terminal). |
 
 ## tond token
 

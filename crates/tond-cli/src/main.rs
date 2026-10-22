@@ -245,6 +245,12 @@ enum Commands {
         action: SnapshotAction,
     },
 
+    /// Export the whole server as one encrypted archive (a file and/or remote storage)
+    Export(commands::server_move::ExportArgs),
+
+    /// Restore an exported archive or a remote snapshot onto this server (asks first)
+    Import(commands::server_move::ImportArgs),
+
     /// Manage API tokens (scoped, expiring credentials for automation)
     #[command(visible_alias = "tokens")]
     Token {
@@ -465,6 +471,8 @@ async fn run(cli: Cli, out: &Output) -> Result<()> {
             commands::storage_providers::handle(&client()?, out, action).await
         }
         Commands::Snapshot { action } => commands::snapshots::handle(&client()?, out, action).await,
+        Commands::Export(args) => commands::server_move::handle_export(&client()?, out, args).await,
+        Commands::Import(args) => commands::server_move::handle_import(&client()?, out, args).await,
         Commands::Token { action } => commands::tokens::handle(&client()?, out, action).await,
         Commands::Audit { action } => commands::audit::handle(&client()?, out, action).await,
         Commands::Users { action } => commands::users::handle(&client()?, out, action).await,

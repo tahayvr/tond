@@ -38,6 +38,9 @@ services:
 
   database:
     image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0
+    labels:
+      tond.backup.dump: pg_dump -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" --clean --if-exists
+      tond.backup.restore: psql -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -q -v ON_ERROR_STOP=1
     restart: unless-stopped
     mem_limit: 512m
     shm_size: 128mb

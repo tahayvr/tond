@@ -191,6 +191,27 @@ Before running `docker compose`, Tond rewrites its own copy of the file (the sto
 
 Bind mounts and named volumes are both included in [snapshots](/concepts/backups). Deleting a compose app removes its containers, its named volumes and its images.
 
+### Backing up a database service
+
+Volumes are copied while the services run, which is fine for uploads but not for a database's files. Give a database service a `tond.backup.dump` label: a command Tond runs inside the service before each snapshot copies the volumes, whose output is saved in the snapshot. An optional `tond.backup.restore` label loads that dump back after a restore, reading it on standard input:
+
+```yaml
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_DB: app
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - ./postgres:/var/lib/postgresql/data
+    labels:
+      tond.backup.dump: pg_dump -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" --clean --if-exists
+      tond.backup.restore: psql -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -q -v ON_ERROR_STOP=1
+```
+
+`$$` keeps compose from substituting the variable, so the shell in the container reads it from the service's environment. Each label is one line, and a restore needs a dump. See [Templates](/guides/templates#backup-hooks) for MySQL and Redis examples and [Snapshots and backups](/concepts/backups) for when the hooks run.
+
 ### Limits
 
 - Compose apps have no previews, and can't be deployed from an upload (`tond apps push`).

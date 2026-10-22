@@ -482,5 +482,18 @@ pub fn entries() -> Vec<Doc> {
         e("POST /api/v1/snapshots/{id}/restore-new-database", "Restore one database of a snapshot into a new database")
             .created()
             .object("`{message, database}`; the original database is not touched."),
+        e("GET /api/v1/snapshots/remote", "List the snapshots in a storage provider's bucket")
+            .returns::<Vec<RemoteSnapshotResponse>>(),
+        e("POST /api/v1/snapshots/remote/{id}/import", "Add a snapshot from a storage provider to this server's list")
+            .returns::<SnapshotResponse>(),
+        e("POST /api/v1/snapshots/import", "Import an exported snapshot archive")
+            .created()
+            .returns::<SnapshotResponse>(),
+        e("GET /api/v1/snapshots/{id}/archive", "Download a snapshot as one encrypted archive")
+            .raw("application/octet-stream", "The encrypted snapshot archive, streamed; only a server with the same TOND_SECRET_KEY can read it."),
+        e("GET /api/v1/snapshots/{id}/manifest", "What a snapshot holds").object("The snapshot's manifest: scope, apps, databases, sizes and Tond version."),
+        e("POST /api/v1/snapshots/{id}/upload", "Upload a snapshot to a storage provider now")
+            .accepted()
+            .returns::<SnapshotResponse>(),
     ]
 }

@@ -77,6 +77,7 @@ mod audit_ship;
 mod auth;
 mod backup;
 mod compose;
+mod compose_backup;
 mod compose_policy;
 mod cron;
 mod db;
@@ -106,12 +107,15 @@ mod openapi;
 mod process;
 mod proxy_link;
 mod reconcile;
+mod restore_resume;
 mod routes;
 mod runtime;
 mod secret_key;
 mod secrets;
 mod security_headers;
 mod snapshot_archive;
+mod snapshot_files;
+mod snapshot_remote;
 mod state;
 mod static_files;
 mod storage;
@@ -182,6 +186,11 @@ async fn run() -> Result<()> {
 
     // Uploads interrupted by a restart leave their extraction dirs behind.
     upload::clear_upload_dirs(&volumes::data_dir());
+    // ...and restores their plaintext working directories.
+    snapshot_files::clean_work_dirs();
+    // Local snapshot copies follow a key rotation too (in the background:
+    // reads every file once while TOND_PREVIOUS_SECRET_KEY is set).
+    runtime::shutdown::spawn_tracked(snapshot_files::rotate_at_startup());
 
     // Load persisted settings from DB into the in-memory cache
     {
@@ -241,6 +250,10 @@ async fn run() -> Result<()> {
         });
     }
 
+    // A full restore that just finished: put back the snapshot rows the
+    // restored database doesn't know (before reconcile would mark them).
+    let finished_restore = restore_resume::before_reconcile(&state).await;
+
     // Finish what a previous process left behind (and resume queued deploys)
     // before anything new starts.
     reconcile::at_startup(&state).await;
@@ -264,6 +277,14 @@ async fn run() -> Result<()> {
 
     // Control connection to tond-proxy: route nudges, cutover acks, cert results.
     tokio::spawn(proxy_link::run(state.clone()));
+
+    // ...then start (or redeploy) the restored apps and databases.
+    if let Some(marker) = finished_restore {
+        let state = state.clone();
+        runtime::shutdown::spawn_tracked(async move {
+            restore_resume::finish(&state, marker).await;
+        });
+    }
 
     // API routes: the table in routes.rs, a JSON 404 for any other /api
     // path, and structured errors for axum's own plain-text rejections.

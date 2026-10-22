@@ -5873,6 +5873,7 @@
           "APP_ALREADY_EXISTS",
           "DEPLOY_IN_PROGRESS",
           "INSUFFICIENT_MEMORY",
+          "SNAPSHOT_KEY_MISMATCH",
           "IDEMPOTENCY_KEY_REUSED",
           "IDEMPOTENCY_KEY_IN_USE",
           "BUILD_FAILED",
@@ -6026,6 +6027,12 @@
           {
             "code": "INSUFFICIENT_MEMORY",
             "description": "The server has less free memory than the template needs.",
+            "exit_code": 5,
+            "status": 409
+          },
+          {
+            "code": "SNAPSHOT_KEY_MISMATCH",
+            "description": "The snapshot was encrypted with a different TOND_SECRET_KEY than this server's.",
             "exit_code": 5,
             "status": 409
           },
@@ -8806,6 +8813,99 @@
           "default_branch",
           "branches",
           "truncated"
+        ],
+        "type": "object"
+      },
+      "RemoteProviderRequest": {
+        "description": "POST /api/v1/snapshots/remote/{id}/import and /snapshots/{id}/upload",
+        "properties": {
+          "provider_id": {
+            "default": null,
+            "description": "Storage provider to use; default: the one in the backup settings",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "RemoteSnapshotResponse": {
+        "description": "One snapshot found in a storage provider's bucket (from its manifest),\nfor restoring on this server — possibly a fresh one.",
+        "properties": {
+          "apps": {
+            "description": "Apps it holds volumes of (empty when not readable)",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "archive_bytes": {
+            "description": "Size of the encrypted archive",
+            "format": "int64",
+            "type": "integer"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "databases": {
+            "description": "Managed databases it holds (empty when not readable)",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "id": {
+            "type": "string"
+          },
+          "imported": {
+            "description": "Already in this server's snapshot list",
+            "type": "boolean"
+          },
+          "name": {
+            "description": "Null when not readable",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider_id": {
+            "type": "string"
+          },
+          "readable": {
+            "description": "This server's TOND_SECRET_KEY (or the previous one) opens it",
+            "type": "boolean"
+          },
+          "scope": {
+            "description": "\"full\" | \"database:<name>\"; null when not readable",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tond_version": {
+            "type": "string"
+          },
+          "trigger": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "provider_id",
+          "created_at",
+          "tond_version",
+          "archive_bytes",
+          "readable",
+          "name",
+          "trigger",
+          "scope",
+          "apps",
+          "databases",
+          "imported"
         ],
         "type": "object"
       },
@@ -30306,6 +30406,268 @@
         ]
       }
     },
+    "/api/v1/snapshots/import": {
+      "post": {
+        "operationId": "import_snapshot_archive",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/SnapshotResponse"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Created."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Import an exported snapshot archive",
+        "tags": [
+          "Snapshots"
+        ],
+        "x-tond-scopes": [
+          "snapshots:restore"
+        ]
+      }
+    },
+    "/api/v1/snapshots/remote": {
+      "get": {
+        "operationId": "list_remote_snapshots",
+        "parameters": [
+          {
+            "description": "Storage provider to list; default: the one in the backup settings",
+            "in": "query",
+            "name": "provider_id",
+            "required": false,
+            "schema": {
+              "description": "Storage provider to list; default: the one in the backup settings",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "items": {
+                        "$ref": "#/components/schemas/RemoteSnapshotResponse"
+                      },
+                      "type": "array"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "List the snapshots in a storage provider's bucket",
+        "tags": [
+          "Snapshots"
+        ],
+        "x-tond-scopes": [
+          "snapshots:read"
+        ]
+      }
+    },
+    "/api/v1/snapshots/remote/{id}/import": {
+      "post": {
+        "operationId": "import_remote_snapshot",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RemoteProviderRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/SnapshotResponse"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Add a snapshot from a storage provider to this server's list",
+        "tags": [
+          "Snapshots"
+        ],
+        "x-tond-scopes": [
+          "snapshots:restore"
+        ]
+      }
+    },
     "/api/v1/snapshots/{id}": {
       "delete": {
         "operationId": "delete_snapshot",
@@ -30392,6 +30754,66 @@
         ]
       }
     },
+    "/api/v1/snapshots/{id}/archive": {
+      "get": {
+        "operationId": "export_snapshot_archive",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The encrypted snapshot archive, streamed; only a server with the same TOND_SECRET_KEY can read it."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Download a snapshot as one encrypted archive",
+        "tags": [
+          "Snapshots"
+        ],
+        "x-tond-scopes": [
+          "snapshots:restore"
+        ]
+      }
+    },
     "/api/v1/snapshots/{id}/logs/stream": {
       "get": {
         "operationId": "stream_snapshot_logs",
@@ -30437,6 +30859,82 @@
           }
         ],
         "summary": "Live snapshot progress",
+        "tags": [
+          "Snapshots"
+        ],
+        "x-tond-scopes": [
+          "snapshots:read"
+        ]
+      }
+    },
+    "/api/v1/snapshots/{id}/manifest": {
+      "get": {
+        "operationId": "get_snapshot_manifest",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "description": "The snapshot's manifest: scope, apps, databases, sizes and Tond version."
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ],
+        "summary": "What a snapshot holds",
         "tags": [
           "Snapshots"
         ],
@@ -30816,6 +31314,102 @@
         ],
         "x-tond-scopes": [
           "snapshots:restore"
+        ]
+      }
+    },
+    "/api/v1/snapshots/{id}/upload": {
+      "post": {
+        "operationId": "upload_snapshot",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RemoteProviderRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/SnapshotResponse"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Accepted: the work continues in the background."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Upload a snapshot to a storage provider now",
+        "tags": [
+          "Snapshots"
+        ],
+        "x-tond-scopes": [
+          "snapshots:create"
         ]
       }
     },

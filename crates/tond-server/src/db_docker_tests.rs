@@ -320,3 +320,147 @@ async fn docker_redis_restores_into_a_new_database_and_upgrades() {
 
     cleanup(&state, &names).await;
 }
+
+/// A compose app whose postgres service declares `tond.backup.dump` and
+/// `tond.backup.restore`: the snapshot holds a consistent dump, and an app
+/// restore loads it back after restoring the volumes.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn docker_compose_backup_hooks_dump_and_restore_a_postgres_service() {
+    let _guard = LOCK.lock().await;
+    let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e}"));
+    let state = docker_state(dir.path()).await;
+    let app = "thooks";
+    let compose = dir.path().join("compose.yml");
+    std::fs::write(
+        &compose,
+        r#"services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: app
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app -h 127.0.0.1"]
+      interval: 1s
+      retries: 60
+    labels:
+      tond.backup.dump: 'pg_dump -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" --clean --if-exists'
+      tond.backup.restore: 'psql -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -q -v ON_ERROR_STOP=1'
+volumes:
+  pgdata: {}
+"#,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let compose_cmd = |args: &[&str]| {
+        let mut cmd = crate::process::command("docker");
+        cmd.args(["compose", "-p", app, "-f"])
+            .arg(&compose)
+            .args(args);
+        cmd
+    };
+    let _ = compose_cmd(&["down", "-v"]).output().await; // a previous run's leftovers
+    let up = compose_cmd(&["up", "-d", "--wait"])
+        .output()
+        .await
+        .unwrap_or_else(|e| panic!("compose up: {e}"));
+    assert!(
+        up.status.success(),
+        "{}",
+        String::from_utf8_lossy(&up.stderr)
+    );
+    sqlx::query(
+        "INSERT INTO apps (id, name, source_type, container_port, status, created_at, updated_at)
+         VALUES ('a-hooks', ?, 'compose', 80, 'running', datetime('now'), datetime('now'))",
+    )
+    .bind(app)
+    .execute(&state.db)
+    .await
+    .unwrap_or_else(|e| panic!("{e}"));
+    sqlx::query(
+        "INSERT INTO deployments (id, app_id, status, started_at, created_at)
+         VALUES ('d-hooks', 'a-hooks', 'running', datetime('now'), datetime('now'))",
+    )
+    .execute(&state.db)
+    .await
+    .unwrap_or_else(|e| panic!("{e}"));
+
+    let hooks = crate::compose_backup::discover_hooks(&state.docker, app)
+        .await
+        .unwrap_or_else(|e| panic!("hooks: {e:#}"));
+    assert_eq!(hooks.len(), 1);
+    let sql = |q: &str| {
+        let cmd = db_exec::Cmd::new(&["psql", "-X", "-A", "-t", "-U", "app", "-d", "app", "-c", q]);
+        let docker = state.docker.clone();
+        let cid = hooks[0].container_id.clone();
+        async move {
+            // The container id changes on recreate; the compose service name doesn't.
+            db_exec::run(&docker, &cid, &cmd, Duration::from_secs(60), &[])
+                .await
+                .unwrap_or_else(|e| panic!("psql {cmd:?}: {e:#}"))
+                .trim()
+                .to_string()
+        }
+    };
+    sql("CREATE TABLE notes (body text); INSERT INTO notes VALUES ('before');").await;
+
+    let snap = backup::create_snapshot(
+        &state,
+        SnapshotTrigger::PreDeploy {
+            app_name: app.to_string(),
+            deployment_id: "d-hooks".to_string(),
+        },
+        None,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("snapshot: {e:#}"));
+    let local: String = sqlx::query_scalar("SELECT local_path FROM snapshots WHERE id = ?")
+        .bind(&snap)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let dump = std::path::Path::new(&local).join("compose-dumps/thooks/db.dump");
+    assert!(dump.is_file(), "the dump is in the snapshot");
+    assert!(
+        !std::fs::read(&dump)
+            .unwrap_or_default()
+            .windows(6)
+            .any(|w| w == b"before"),
+        "and encrypted at rest"
+    );
+
+    sql("DELETE FROM notes; INSERT INTO notes VALUES ('after');").await;
+    backup::restore_app(&state, &snap, app)
+        .await
+        .unwrap_or_else(|e| panic!("restore: {e:#}"));
+    let hooks = crate::compose_backup::discover_hooks(&state.docker, app)
+        .await
+        .unwrap_or_else(|e| panic!("hooks: {e:#}"));
+    let cmd = db_exec::Cmd::new(&[
+        "psql",
+        "-X",
+        "-A",
+        "-t",
+        "-U",
+        "app",
+        "-d",
+        "app",
+        "-c",
+        "SELECT body FROM notes",
+    ]);
+    let rows = db_exec::run(
+        &state.docker,
+        &hooks[0].container_id,
+        &cmd,
+        Duration::from_secs(60),
+        &[],
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{e:#}"));
+    assert_eq!(rows.trim(), "before");
+
+    let _ = compose_cmd(&["down", "-v"]).output().await;
+}

@@ -138,6 +138,11 @@ export const sections = [
 				description: 'Ship encrypted snapshots to S3-compatible storage.'
 			},
 			{
+				text: 'Move to a new server',
+				link: '/guides/server-move',
+				description: 'Export a whole server and restore it on another, or rebuild from a bucket.'
+			},
+			{
 				text: 'Upgrading Tond',
 				link: '/guides/upgrading',
 				description: 'Update from the dashboard or the CLI, and roll back.'
