@@ -11,9 +11,8 @@ services:
       MM_CONFIG: postgres://mattermost:${DB_PASSWORD}@db:5432/mattermost?sslmode=disable&connect_timeout=10
       MM_SERVICESETTINGS_SITEURL: ${MM_SERVICESETTINGS_SITEURL}
       MM_BLEVESETTINGS_INDEXDIR: /mattermost/data/bleve-indexes
-      # mmctl --local creates the system admin before the app is routed
-      # (post_deploy in template.toml). The socket exists only inside the
-      # container (/var/tmp/mattermost_local.socket).
+      # The image's healthcheck runs `mmctl --local`. The socket exists only
+      # inside the container (/var/tmp/mattermost_local.socket).
       MM_SERVICESETTINGS_ENABLELOCALMODE: "true"
     volumes:
       - ./data:/mattermost/data

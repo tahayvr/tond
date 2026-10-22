@@ -58,8 +58,12 @@
 //                           deploy, it turns into the first-visitor warning.
 //     service               compose service to run in
 //     user                  optional exec user (a name or "uid:gid")
-//     command               argv (use ["sh", "-c", "..."] for a script; read inputs
-//                           as "$KEY", never inline secrets)
+//     command               argv, run as is without a shell (use ["sh", "-c", "..."]
+//                           for a script; read inputs as "$KEY", never inline
+//                           secrets; a value passed as an argument shows in the
+//                           host's process list while the step runs). An image
+//                           without a shell can run the step from a sibling
+//                           service's container.
 //     env                   input keys passed to the command as env vars
 //     description           what it does ("Create the administrator account")
 //     timeout_secs          retry budget (default 120, at most 600)
@@ -2031,6 +2035,34 @@ description = "Create the administrator account"
                     "{}: service {} uses {} whose built-in healthcheck is slow; add a healthcheck with a short interval and start_interval",
                     t.manifest.id,
                     svc.name,
+                    svc.image
+                );
+            }
+        }
+    }
+
+    /// Images without a shell (checked by exporting the image's filesystem):
+    /// a post_deploy step in one runs the image's binaries as argv, or runs
+    /// in a sibling service's container instead.
+    const IMAGES_WITHOUT_A_SHELL: &[&str] = &["mattermost/mattermost-team-edition"];
+
+    #[test]
+    fn post_deploy_scripts_never_run_in_an_image_without_a_shell() {
+        for t in builtin_templates().unwrap_or_else(|e| panic!("{e}")) {
+            for hook in &t.manifest.post_deploy {
+                let Some(svc) = t.services.iter().find(|s| s.name == hook.service) else {
+                    continue;
+                };
+                let repo = svc.image.split([':', '@']).next().unwrap_or_default();
+                let shell = matches!(
+                    hook.command.first().map(String::as_str),
+                    Some("sh" | "bash" | "/bin/sh" | "/bin/bash")
+                );
+                assert!(
+                    !(shell && IMAGES_WITHOUT_A_SHELL.contains(&repo)),
+                    "{}: post_deploy \"{}\" runs a shell in {}, whose image has none",
+                    t.manifest.id,
+                    hook.description,
                     svc.image
                 );
             }
