@@ -51,6 +51,7 @@ export type AppSettingsSection =
 	| 'compose'
 	| 'domain'
 	| 'databases'
+	| 'network'
 	| 'health'
 	| 'volumes'
 	| 'resources'
@@ -75,6 +76,7 @@ export const APP_SETTINGS_SECTIONS: readonly TabDef<AppSettingsSection>[] = [
 	{ id: 'compose', label: 'Compose file' },
 	{ id: 'domain', label: 'Domain' },
 	{ id: 'databases', label: 'Databases', scope: 'db:read' },
+	{ id: 'network', label: 'Network' },
 	{ id: 'health', label: 'Health' },
 	{ id: 'volumes', label: 'Volumes' },
 	{ id: 'resources', label: 'Resources' },

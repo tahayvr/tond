@@ -977,6 +977,47 @@ export async function updateContainerPort(id: string, container_port: number): P
 	});
 }
 
+/** What an app's containers may connect to. */
+export type EgressPolicy = 'open' | 'restricted' | 'none';
+
+export interface EgressHost {
+	host: string;
+	/** IPv4 addresses allowed for it right now (empty: not resolved) */
+	addresses: string[];
+}
+
+/** GET/PUT /apps/{id}/egress */
+export interface AppEgress {
+	policy: EgressPolicy;
+	allowlist: string[];
+	/** Policy of the app's previews (pull-request code); "none" by default */
+	preview_policy: EgressPolicy;
+	/** iptables with Docker's DOCKER-USER chain is usable on the server */
+	firewall_available: boolean;
+	warning?: string | null;
+	preview_warning?: string | null;
+	hosts: EgressHost[];
+}
+
+export interface UpdateEgressRequest {
+	policy: EgressPolicy;
+	allowlist?: string[];
+	preview_policy?: EgressPolicy;
+}
+
+/** An app's outbound network policy and whether the server enforces it. */
+export async function getAppEgress(id: string): Promise<AppEgress> {
+	return request<AppEgress>(`/apps/${id}/egress`);
+}
+
+/** Change an app's outbound network policy (admins; applies at once). */
+export async function updateAppEgress(id: string, body: UpdateEgressRequest): Promise<AppEgress> {
+	return request<AppEgress>(`/apps/${id}/egress`, {
+		method: 'PUT',
+		body: JSON.stringify(body)
+	});
+}
+
 export async function updateDrainTimeout(id: string, drain_timeout: number): Promise<void> {
 	await request(`/apps/${id}/drain-timeout`, {
 		method: 'PUT',

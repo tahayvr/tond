@@ -85,6 +85,7 @@
 	import AppDomain from '$lib/components/tabs/app-page/app-domain.svelte';
 	import AppDatabases from '$lib/components/tabs/app-page/app-databases.svelte';
 	import AppHealth from '$lib/components/tabs/app-page/app-health.svelte';
+	import AppNetwork from '$lib/components/tabs/app-page/app-network.svelte';
 	import AppPort from '$lib/components/tabs/app-page/app-port.svelte';
 	import AppReadiness from '$lib/components/tabs/app-page/app-readiness.svelte';
 	import AppVolumes from '$lib/components/tabs/app-page/app-volumes.svelte';
@@ -1138,6 +1139,16 @@
 						appName={app.name}
 						sourceType={app.source_type}
 						projectId={app.project_id}
+					/>
+				{/if}
+
+				<!-- Network: outbound connections (egress policy) -->
+				{#if viewAllowed && activeTab === 'network'}
+					<AppNetwork
+						appId={app.id}
+						appName={app.name}
+						sourceType={app.source_type}
+						canEdit={can('settings:write')}
 					/>
 				{/if}
 

@@ -126,7 +126,7 @@ import {
 	mockComposeSpecs,
 	mockReleaseServices
 } from './compose-fixtures';
-import type { ComposeService, DeploymentService } from '$lib/api';
+import type { AppEgress, ComposeService, DeploymentService, UpdateEgressRequest } from '$lib/api';
 import { errorBody, okBody } from './envelope';
 import { MOCK_OPENAPI } from './openapi';
 
@@ -564,6 +564,23 @@ function mockNextRuns(schedule: string, count: number): string[] | null {
 
 const MOCK_STEP_UP_PASSWORD = 'ValidPass123!';
 // ticket → target, consumed by the terminal WebSocket mock
+/** Egress policies set through PUT /apps/:id/egress (apps start open). */
+const egressByApp = new Map<string, AppEgress>();
+
+function egressFor(appId: string): AppEgress {
+	return (
+		egressByApp.get(appId) ?? {
+			policy: 'open',
+			allowlist: [],
+			preview_policy: 'none',
+			firewall_available: true,
+			warning: null,
+			preview_warning: null,
+			hosts: []
+		}
+	);
+}
+
 const terminalTickets = new Map<string, { kind: string; id: string }>();
 let apps: App[] = structuredClone([...MOCK_APPS, MOCK_COMPOSE_APP, MOCK_TEMPLATE_APP]);
 /** Services of compose apps (app id → services). */
@@ -2318,6 +2335,49 @@ export const handlers = [
 			updated_at: new Date().toISOString()
 		};
 		return ok(apps[idx]);
+	}),
+
+	http.get('/api/v1/apps/:id/egress', async ({ params }) => {
+		await delay(LATENCY);
+		if (!apps.some((a) => a.id === params.id)) return err('App not found', 404);
+		return ok(egressFor(String(params.id)));
+	}),
+
+	http.put('/api/v1/apps/:id/egress', async ({ params, request }) => {
+		await delay(LATENCY);
+		if (!apps.some((a) => a.id === params.id)) return err('App not found', 404);
+		const body = (await request.json()) as UpdateEgressRequest;
+		const policies = ['open', 'restricted', 'none'];
+		if (!policies.includes(body.policy)) {
+			return fieldErr(`'${body.policy}' isn't a policy; use open, restricted or none`, 'policy');
+		}
+		const current = egressFor(String(params.id));
+		const allowlist = (body.allowlist ?? current.allowlist).map((e) => e.trim().toLowerCase());
+		const bad = allowlist.find((e) => e.startsWith('*.') || e.includes(' '));
+		if (bad) {
+			return fieldErr(`'${bad}' isn't an IPv4 address, a CIDR range or a hostname`, 'allowlist');
+		}
+		const preview_policy = body.preview_policy ?? current.preview_policy;
+		if (
+			allowlist.filter(Boolean).length === 0 &&
+			(body.policy === 'restricted' || preview_policy === 'restricted')
+		) {
+			return fieldErr(
+				'A restricted policy needs at least one destination. Add the hosts or addresses the app calls, or choose "none" to block the internet entirely.',
+				'allowlist'
+			);
+		}
+		const list = allowlist.filter(Boolean);
+		egressByApp.set(String(params.id), {
+			...current,
+			policy: body.policy,
+			allowlist: list,
+			preview_policy,
+			hosts: list
+				.filter((e) => /[a-z]/.test(e.split(':')[0]))
+				.map((e) => ({ host: e.split(':')[0], addresses: ['192.0.2.10'] }))
+		});
+		return ok(egressFor(String(params.id)));
 	}),
 
 	http.put('/api/v1/apps/:id/port', async ({ params, request }) => {
