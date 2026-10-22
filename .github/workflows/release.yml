@@ -1,8 +1,15 @@
 name: Release Tond
 
-# `just release` pushes a v* tag, which builds, packages, signs and publishes
-# both architectures. Can also be run manually (builds, signs and uploads the
-# bundles as workflow artifacts; only tag runs create a GitHub Release).
+# Pushing a v* tag (the commands `just release <version>` prints) builds,
+# packages, signs and publishes both architectures. Can also be run manually
+# (builds, signs and uploads the bundles as workflow artifacts; only tag runs
+# create a GitHub Release). See release/RELEASING.md.
+#
+# Assets (per arch: x86_64, aarch64), as install.sh, update.sh, the tond.io
+# scripts and `tond update --direct` download them (tond_common::release has a
+# test that keeps this list and the clients in step):
+#   tond-linux-<arch>.tar.gz, .tar.gz.sha256, .tar.gz.minisig, .tar.gz.sha256.minisig
+#   minisign.pub
 on:
   push:
     tags:
@@ -29,6 +36,12 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      # The tag, Cargo.toml, dashboard/package.json and CHANGELOG.md must agree
+      # (VERSION in the bundle is the tag without the v).
+      - name: Check version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: scripts/check-version.sh "$GITHUB_REF_NAME"
 
       # Native build on a runner of the target architecture; writes
       # dist/tond-linux-<arch>.tar.gz and its .sha256.
@@ -62,7 +75,9 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          sparse-checkout: release/minisign.pub
+          sparse-checkout: |
+            release/minisign.pub
+            release/sign.sh
           sparse-checkout-cone-mode: false
 
       - name: Download bundles
@@ -71,16 +86,13 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Verify checksums
-        working-directory: dist
-        run: sha256sum -c tond-linux-x86_64.tar.gz.sha256 tond-linux-aarch64.tar.gz.sha256
-
       - name: Install minisign
         run: sudo apt-get update -qq && sudo apt-get install -y -qq minisign
 
       # MINISIGN_SECRET_KEY is the content of a passwordless minisign secret
       # key (minisign -G -W); release/minisign.pub is its public key. See
-      # release/SIGNING.md.
+      # release/SIGNING.md. sign.sh verifies the checksums first and every
+      # signature with the committed public key afterwards.
       - name: Sign tarballs and checksums
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
@@ -90,23 +102,11 @@ jobs:
             echo "::error::MINISIGN_SECRET_KEY is not set (release environment). See release/SIGNING.md."
             exit 1
           fi
-          if ! grep -qv '^untrusted comment:' <(grep -v '^$' release/minisign.pub); then
-            echo "::error::release/minisign.pub has no key yet. See release/SIGNING.md."
-            exit 1
-          fi
           key="$(mktemp)"
           trap 'rm -f "$key"' EXIT
           printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
-          for file in dist/*.tar.gz dist/*.tar.gz.sha256; do
-            minisign -S -s "$key" -m "$file" -t "$TRUSTED_COMMENT $(basename "$file")"
-          done
-
-      # Clients verify with the committed public key, so check that exact key.
-      - name: Verify signatures with the committed public key
-        run: |
-          for file in dist/*.tar.gz dist/*.tar.gz.sha256; do
-            minisign -V -p release/minisign.pub -m "$file"
-          done
+          release/sign.sh --key "$key" --pubkey release/minisign.pub \
+            --comment "$TRUSTED_COMMENT" --dist dist
 
       - name: Attest build provenance (SLSA)
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
@@ -128,12 +128,9 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write # Required to create releases
-      pull-requests: read # Required by git-cliff when resolving GitHub PR metadata
     steps:
       - name: Checkout Repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          fetch-depth: 0 # Full history needed for changelog
 
       - name: Download signed bundles
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -145,16 +142,19 @@ jobs:
         working-directory: dist
         run: sha256sum -c tond-linux-x86_64.tar.gz.sha256 tond-linux-aarch64.tar.gz.sha256
 
-      - name: Generate changelog
-        uses: orhun/git-cliff-action@a9a95522b26fe6403f7bb24031f21fb573d0f5ff # v4
-        id: git-cliff
-        with:
-          config: cliff.toml
-          args: -vv --latest --strip header
-        env:
-          OUTPUT: CHANGELOG.md
-          GITHUB_REPO: ${{ github.repository }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # The release notes are the tag's section of the hand-written
+      # CHANGELOG.md (written by `just release-prep`, edited before tagging).
+      - name: Release notes from CHANGELOG.md
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            $0 ~ "^## " { if (found) exit; if ($2 == v) { found = 1; next } }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if [[ ! -s release-notes.md ]]; then
+            echo "::error::CHANGELOG.md has no '## ${version}' section"
+            exit 1
+          fi
 
       - name: Create Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
@@ -169,6 +169,8 @@ jobs:
             dist/tond-linux-aarch64.tar.gz.minisig
             dist/tond-linux-aarch64.tar.gz.sha256.minisig
             release/minisign.pub
-          body: ${{ steps.git-cliff.outputs.content }}
+          body_path: release-notes.md
           draft: false
-          prerelease: false
+          # v1.2.3-rc.1 and the like: a pre-release, which "latest" (and so
+          # install.sh, update.sh and the update check) skips.
+          prerelease: ${{ contains(github.ref_name, '-') }}

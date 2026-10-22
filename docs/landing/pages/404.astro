@@ -1,0 +1,22 @@
+---
+// GitHub Pages serves this for every path that doesn't exist, docs included,
+// so its links are site-absolute.
+import Base from '../layouts/Base.astro';
+import Icon from '../../src/components/Icon.astro';
+---
+
+<Base title="Page not found · Tond" description="This page doesn't exist on tond.io.">
+	<section class="not-found" aria-labelledby="nf-title">
+		<div class="wrap">
+			<p class="eyebrow">404</p>
+			<h1 id="nf-title">This page doesn’t exist.</h1>
+			<p class="lede">
+				It may have moved. The docs have a search (press <kbd>/</kbd> on any docs page).
+			</p>
+			<div class="cta">
+				<a class="button primary" href="/docs/">Docs <Icon name="arrow-right-line" /></a>
+				<a class="button" href="/">Home</a>
+			</div>
+		</div>
+	</section>
+</Base>

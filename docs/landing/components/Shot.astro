@@ -1,0 +1,27 @@
+---
+// A dashboard screenshot in both themes (scripts/screenshots.mjs, `site: 'landing'`),
+// each shown only in its theme. Hidden lazy images are never fetched, so a
+// reader downloads one version.
+import { join } from 'node:path';
+import sharp from 'sharp';
+
+interface Props {
+	name: string;
+	alt: string;
+	class?: string;
+}
+
+const { name, alt, class: className } = Astro.props;
+// Astro builds from docs/ (import.meta.url points into the build output).
+const file = join(process.cwd(), 'landing/public/img/dashboard', `${name}.light.webp`);
+const meta = await sharp(file).metadata();
+// Captured at 2x: shown at half the pixel size.
+const width = Math.round((meta.width ?? 2400) / 2);
+const height = Math.round((meta.height ?? 1520) / 2);
+const src = (theme: string) => `/img/dashboard/${name}.${theme}.webp`;
+---
+
+<div class:list={['shot', className]}>
+	<img class="only-light" src={src('light')} {alt} {width} {height} loading="lazy" decoding="async" />
+	<img class="only-dark" src={src('dark')} {alt} {width} {height} loading="lazy" decoding="async" />
+</div>
