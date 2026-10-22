@@ -2,7 +2,6 @@
 # Requires:
 # cargo-zigbuild for cross-compilation (https://github.com/messense/cargo-zigbuild)
 # pnpm for dashboard build and dev server (https://pnpm.io/installation)
-# cargo-edit for version bumping (https://github.com/killercup/cargo-edit)
 # cargo-nextest for test runs (https://nexte.st/book/installation.html)
 
 server := "tond-dev"
@@ -21,11 +20,9 @@ release_dir := "target/" + target + "/" + profile
 
 alias c := check
 alias b := build-rust
-alias v := version
 alias d := dev
 alias ds := dev-setup
 alias t := test
-alias cl := changelog
 alias clu := changelog-unreleased
 
 # List available recipes
@@ -59,8 +56,8 @@ build-server:
     @echo "--- Building tond-server ---"
     cargo zigbuild -p tond-server --target {{ target }} --profile {{ profile }}
 
-# Run all checks: formatting, linting, and type checking for Rust and dashboard; the docs build (with its link check)
-check: check-dashboard docs-build
+# Run all checks: formatting, linting, and type checking for Rust and dashboard; the whole tond.io site build (docs + landing page, link checks, site tests)
+check: check-dashboard site-build
     cargo fmt
     cargo check --quiet
     cargo clippy --all-targets --all-features -- -D warnings
@@ -106,16 +103,31 @@ docs-build:
     pnpm install --frozen-lockfile --silent
     pnpm build
 
+# Landing page (tond.io/) live preview at http://localhost:4322 (links into /docs need `just site-build`)
+[working-directory('docs')]
+site:
+    pnpm install --frozen-lockfile --silent
+    pnpm dev:landing
+
+# Build all of tond.io into docs/dist-site (landing page + docs at /docs + /install, /update, 404.html, sitemap); .github/workflows/site.yml deploys the same, check its links and test it
+[working-directory('docs')]
+site-build: docs-build
+    pnpm build:site
+
+# Serve the built site (docs/dist-site) at http://localhost:4400, like GitHub Pages: run `just site-build` first
+site-preview:
+    python3 -m http.server 4400 --bind 127.0.0.1 --directory docs/dist-site
+
 # Regenerate the docs pages that come from the CLI (CLI reference, exit codes); tests fail when they're stale
 docs-gen:
     cargo run -q -p tond-cli -- docs cli > docs/content/reference/cli.md
     cargo run -q -p tond-cli -- help exit-codes --json > docs/src/data/exit-codes.json
 
-# Retake the dashboard screenshots in the docs (light + dark), from the mock dashboard; needs Chrome
+# Retake the dashboard screenshots in the docs and on the landing page (light + dark), from the mock dashboard; needs Chrome. FILTER e.g. `upgrading`, `landing`
 [working-directory('docs')]
-docs-screenshots:
+docs-screenshots FILTER="":
     pnpm install --frozen-lockfile --silent
-    pnpm screenshots
+    pnpm screenshots {{ FILTER }}
 
 # Run dev server for Dashboard
 [working-directory('dashboard')]
@@ -131,43 +143,22 @@ dev-setup:
 tunnel:
     ssh -L 3001:localhost:3001 $VPS
 
-# Bump version (major, minor, patch)
-[arg("VER", pattern='major|minor|patch')]
-version VER: (version-dashboard VER)
-    cargo set-version --bump {{ VER }}
+# Prepare release <version>: bump Cargo, dashboard and docs versions, start its CHANGELOG.md section, run all checks and tests (commits nothing)
+release-prep VERSION:
+    scripts/release-prep.sh {{ VERSION }}
+    just check
+    just test
+    @echo "Review CHANGELOG.md, commit (chore(release): v{{ VERSION }}), then: just release {{ VERSION }}"
 
-# Bump dashboard package version (major, minor, patch)
-[arg("VER", pattern='major|minor|patch')]
-[working-directory('dashboard')]
-version-dashboard VER:
-    pnpm version {{ VER }}
+# Print the exact git tag/push commands that publish release <version> (runs nothing; pushing the tag starts release.yml)
+release VERSION:
+    scripts/release.sh {{ VERSION }}
 
-# Tag and push to trigger the CI release workflow (builds, packages, and publishes to GitHub Releases)
-release:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    version=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
-    tag="v$version"
-    echo "Generating CHANGELOG.md for $tag..."
-    git-cliff -c cliff.toml --tag "$tag" --offline -o CHANGELOG.md
-    if ! git diff --quiet -- CHANGELOG.md; then
-        git add CHANGELOG.md
-        git commit -m "docs: update changelog for $tag"
-        git push origin main
-    fi
-    echo "Tagging $tag and pushing to trigger CI release..."
-    git tag "$tag"
-    git push origin "$tag"
+# Release signing round trip with a throwaway key and a local file server (--fake: stand-in bundles; default: dist/ from package-all)
+release-signing-test *args:
+    release/tests/signing-test.sh {{ args }}
 
-# Regenerate the full local changelog from tags without GitHub API calls
-changelog:
-    git-cliff -c cliff.toml --offline -o CHANGELOG.md
-
-# Generate CHANGELOG.md for a specific upcoming tag without creating the tag
-changelog-tag TAG:
-    git-cliff -c cliff.toml --tag {{ TAG }} --offline -o CHANGELOG.md
-
-# Preview the unreleased section without modifying CHANGELOG.md
+# Draft changelog entries from the conventional commits since the last tag (prints; CHANGELOG.md is hand-edited)
 changelog-unreleased:
     git-cliff -c cliff.toml --unreleased --strip header --offline
 
@@ -225,7 +216,7 @@ package-all:
     just profile={{ profile }} arch=x86_64 package
     just profile={{ profile }} arch=aarch64 package
 
-# End-to-end smoke test on a throwaway Hetzner server (needs hcloud auth). Args go to e2e/hcloud.sh, e.g. --keep
+# End-to-end test on a throwaway Hetzner server (needs hcloud auth). Args go to e2e/hcloud.sh, e.g. --keep, --test both, --dns-zone <zone>
 e2e-hcloud *args: package
     e2e/hcloud.sh --arch {{ linux_arch }} {{ args }}
 

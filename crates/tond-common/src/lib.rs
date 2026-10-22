@@ -9,6 +9,7 @@
 //   dns     — compare a domain's DNS with this server's addresses
 //   logging — TOND_LOG_FORMAT (text | json) for tond-server and tond-proxy
 //   models  — all domain structs, DTOs, and request/response types
+//   release — release download base, asset names and URLs (CLI, server, scripts)
 //   route_queries — SQL tond-proxy routes on (shared with tond-server's tests)
 //   traffic — per-route request counters (tond-proxy -> tond-server)
 //
@@ -23,6 +24,7 @@ pub mod logging;
 pub mod models;
 pub mod procstat;
 pub mod proxy_control;
+pub mod release;
 pub mod route_queries;
 pub mod traffic;
 

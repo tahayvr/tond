@@ -47,11 +47,22 @@ minisign -G -W -p release/minisign.pub -s tond-release.key   # -W: no password
 2. Store the content of `tond-release.key` as the `MINISIGN_SECRET_KEY` secret
    of the `release` environment (Settings → Environments; add required
    reviewers there), then delete the local file or keep it offline.
-3. Publish the updated web installers to tond.io.
+3. Push to `main`: the Site workflow (`.github/workflows/site.yml`) republishes
+   the web installers at tond.io/install and tond.io/update.
 
-The release workflow refuses to publish when the secret is missing, when
-`release/minisign.pub` has no key, or when a signature does not verify with
-the committed key.
+The release workflow signs with `release/sign.sh`. It refuses to publish when
+the secret is missing, when `release/minisign.pub` has no key, or when a
+signature does not verify with the committed key.
+
+## Testing the signing locally
+
+`just release-signing-test --fake` runs the whole round trip with stand-in
+bundles; `just package-all && just release-signing-test` uses real bundles of
+both architectures. The test generates a throwaway key in a temp directory
+(never the real one), signs with `release/sign.sh`, serves the release layout
+from a local file server, and verifies the downloads with the release block of
+every script (`TOND_RELEASE_BASE` points them at the server). It also checks
+that tampered, foreign-key and unsigned downloads are refused.
 
 Rotating the key: generate a new pair, update all copies, and release. Clients
 older than the rotation verify with the old key, so sign one transition

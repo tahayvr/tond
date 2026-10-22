@@ -22,10 +22,17 @@ set -euo pipefail
 #   --acme          pebble (default): local Pebble CA, works offline / in CI
 #                   letsencrypt-staging: real ACME against Let's Encrypt staging
 #                     (needs public DNS for the domains, e.g. <ip>.sslip.io)
+#                   letsencrypt: Let's Encrypt production (publicly trusted
+#                     certificates; mind its rate limits)
 #                   none: skip certificate issuance checks
 #   --ip            IP the domains resolve to (default: 127.0.0.1)
 #   --test          smoke (default): e2e/smoke.sh; budget: e2e/budget.sh (idle
-#                   resource budgets; run it on a fresh install)
+#                   resource budgets; run it on a fresh install); both: the
+#                   budget on the fresh install first, then the smoke test
+#   --results       directory for results: budget.json, journals, update.log
+#                   (written even when the test fails)
+#   --env-file      file of KEY=VALUE lines exported to the tests (secrets such
+#                   as E2E_CLOUDFLARE_TOKEN; kept out of command lines)
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BUNDLE=""
@@ -35,6 +42,8 @@ APPS_DOMAIN=""
 ACME="pebble"
 IP="127.0.0.1"
 TEST="smoke"
+RESULTS=""
+ENV_FILE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -45,7 +54,9 @@ while [[ $# -gt 0 ]]; do
         --acme) ACME="$2"; shift 2 ;;
         --ip) IP="$2"; shift 2 ;;
         --test) TEST="$2"; shift 2 ;;
-        -h|--help) sed -n '4,28p' "$0"; exit 0 ;;
+        --results) RESULTS="$2"; shift 2 ;;
+        --env-file) ENV_FILE="$2"; shift 2 ;;
+        -h|--help) sed -n '4,36p' "$0"; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -53,6 +64,37 @@ done
 [[ $EUID -eq 0 ]] || { echo "run.sh must run as root" >&2; exit 1; }
 [[ -f "${BUNDLE}/install.sh" ]] || { echo "--bundle must point at a release/package.sh bundle" >&2; exit 1; }
 [[ -n "$BASE_DOMAIN" ]] || { echo "--base-domain is required" >&2; exit 1; }
+
+if [[ -n "$ENV_FILE" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    set +a
+fi
+
+# Results survive a failed run: collected on exit.
+collect_results() {
+    local code=$?
+    if [[ -n "$RESULTS" ]]; then
+        mkdir -p "$RESULTS"
+        for unit in tond-server tond-proxy tond-update docker; do
+            journalctl -u "$unit" --no-pager -o short-iso > "${RESULTS}/journal-${unit}.log" 2>&1 || true
+        done
+        cp /opt/tond/data/update/update.log "${RESULTS}/update.log" 2> /dev/null || true
+        cp /opt/tond/data/update/status.json "${RESULTS}/update-status.json" 2> /dev/null || true
+        cp /opt/tond/VERSION "${RESULTS}/VERSION" 2> /dev/null || true
+        {
+            echo "exit=${code}"
+            echo "test=${TEST} acme=${ACME} arch=$(uname -m)"
+            echo "kernel=$(uname -r)"
+            grep PRETTY_NAME /etc/os-release || true
+            docker version --format 'docker={{.Server.Version}}' 2> /dev/null || true
+            free -m || true
+        } > "${RESULTS}/summary.txt"
+    fi
+    exit "$code"
+}
+trap collect_results EXIT
 
 CA_FILE=""
 mkdir -p /opt/tond-e2e
@@ -75,6 +117,11 @@ case "$ACME" in
         fi
         "${HERE}/pebble/pebble.sh" /opt/tond-e2e/pebble-root.pem
         CA_FILE=/opt/tond-e2e/pebble-root.pem
+        ;;
+    letsencrypt)
+        rm -f /etc/systemd/system/tond-proxy.service.d/e2e-acme.conf
+        systemctl daemon-reload
+        CA_FILE=/etc/ssl/certs/ca-certificates.crt
         ;;
     letsencrypt-staging)
         mkdir -p /etc/systemd/system/tond-proxy.service.d
@@ -120,16 +167,33 @@ if [[ "$ACME" == pebble ]]; then
     "${HERE}/pebble/pebble.sh" --refresh-root "$CA_FILE"
 fi
 
+run_smoke() {
+    E2E_BASE_DOMAIN="$BASE_DOMAIN" \
+    E2E_PREVIEW_DOMAIN="$PREVIEW_DOMAIN" \
+    E2E_APPS_DOMAIN="$APPS_DOMAIN" \
+    E2E_TARGET_IP="$IP" \
+    E2E_CA_FILE="$CA_FILE" \
+    E2E_BUNDLE="$(cd "$BUNDLE" && pwd)" \
+        "${HERE}/smoke.sh"
+}
+run_budget() {
+    local json=()
+    [[ -n "$RESULTS" ]] && mkdir -p "$RESULTS" && json=(--json "${RESULTS}/budget.json")
+    # shellcheck disable=SC2086
+    "${HERE}/budget.sh" ${BUDGET_ARGS:-} "${json[@]}"
+}
+
 case "$TEST" in
-    smoke)
-        E2E_BASE_DOMAIN="$BASE_DOMAIN" \
-        E2E_PREVIEW_DOMAIN="$PREVIEW_DOMAIN" \
-        E2E_APPS_DOMAIN="$APPS_DOMAIN" \
-        E2E_TARGET_IP="$IP" \
-        E2E_CA_FILE="$CA_FILE" \
-        E2E_BUNDLE="$(cd "$BUNDLE" && pwd)" \
-            "${HERE}/smoke.sh"
+    smoke) run_smoke ;;
+    budget) run_budget ;;
+    # The budget needs a fresh install; it removes its dummy apps afterwards,
+    # so the smoke test runs on the same server next. Both run even when the
+    # budget fails; the exit status reports either failure.
+    both)
+        budget_rc=0
+        run_budget || budget_rc=$?
+        run_smoke
+        [[ "$budget_rc" == 0 ]] || { echo "The resource budget failed (exit ${budget_rc}); the smoke test passed." >&2; exit "$budget_rc"; }
         ;;
-    budget) "${HERE}/budget.sh" ${BUDGET_ARGS:-} ;;
-    *) echo "Unknown --test: $TEST (expected smoke or budget)" >&2; exit 1 ;;
+    *) echo "Unknown --test: $TEST (expected smoke, budget or both)" >&2; exit 1 ;;
 esac
