@@ -278,7 +278,33 @@ fn check_namespace_mode(svc: &Mapping, service: &str, field: &str, what: &str, c
 
 // ── services ─────────────────────────────────────────────────────────────────
 
+/// Backup hook labels (`tond.backup.dump` / `tond.backup.restore`, see
+/// compose_backup.rs): single-line commands, and a restore needs a dump.
+/// They run inside the service's own container, so they grant nothing the
+/// file doesn't already.
+fn check_backup_labels(name: &str, svc: &Mapping, ctx: &mut Ctx) {
+    use tond_common::{BACKUP_DUMP_LABEL, BACKUP_RESTORE_LABEL, check_backup_hook, compose_label};
+    let Some(labels) = svc.get("labels").map(untag) else {
+        return;
+    };
+    let dump = compose_label(labels, BACKUP_DUMP_LABEL);
+    let restore = compose_label(labels, BACKUP_RESTORE_LABEL);
+    for (label, value) in [(BACKUP_DUMP_LABEL, &dump), (BACKUP_RESTORE_LABEL, &restore)] {
+        if let Some(value) = value
+            && let Err(e) = check_backup_hook(label, value)
+        {
+            ctx.err(format!("service \"{name}\": {e}"));
+        }
+    }
+    if restore.is_some() && dump.is_none() {
+        ctx.err(format!(
+            "service \"{name}\": label {BACKUP_RESTORE_LABEL} needs a {BACKUP_DUMP_LABEL} label to restore from"
+        ));
+    }
+}
+
 fn check_service(name: &str, svc: &mut Mapping, default_memory: i64, ctx: &mut Ctx) {
+    check_backup_labels(name, svc, ctx);
     // privileged: anything but an explicit false/absent is refused (a string
     // like "${PRIV:-true}" would become true after substitution).
     if let Some(v) = svc.get("privileged")
@@ -919,6 +945,34 @@ mod tests {
         assert!(
             errs.iter().any(|e| e.contains(needle)),
             "expected an error containing {needle:?} for:\n{yaml}\ngot: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn backup_hook_labels_are_accepted_and_checked() {
+        let doc = hardened(
+            "services:\n  db:\n    image: postgres:17\n    labels:\n      tond.backup.dump: pg_dumpall -U \"$$POSTGRES_USER\" --clean --if-exists\n      tond.backup.restore: psql -U \"$$POSTGRES_USER\" -d postgres -q\n",
+        );
+        assert!(
+            doc["services"]["db"]["labels"]["tond.backup.dump"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("pg_dumpall")),
+            "the labels reach docker compose unchanged"
+        );
+        hardened(
+            "services:\n  db:\n    image: redis:7\n    labels: [\"tond.backup.dump=redis-cli SAVE\"]\n",
+        );
+        assert_rejected(
+            "services:\n  db:\n    image: postgres:17\n    labels:\n      tond.backup.dump: \"\"\n",
+            "must not be empty",
+        );
+        assert_rejected(
+            "services:\n  db:\n    image: postgres:17\n    labels:\n      tond.backup.dump: \"a\\nb\"\n",
+            "single-line",
+        );
+        assert_rejected(
+            "services:\n  db:\n    image: postgres:17\n    labels:\n      tond.backup.restore: psql\n",
+            "needs a tond.backup.dump",
         );
     }
 

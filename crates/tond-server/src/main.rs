@@ -77,6 +77,9 @@ mod audit_ship;
 mod auth;
 mod backup;
 mod compose;
+// Not called yet: the snapshot engine (backup.rs) wires the hooks in.
+#[allow(dead_code)]
+mod compose_backup;
 mod compose_policy;
 mod cron;
 mod db;

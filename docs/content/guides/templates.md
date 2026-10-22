@@ -143,13 +143,37 @@ description = "Notes and uploads"
 owner = "1000:1000"             # optional: for images that don't run as root
 ```
 
-Templates are declarative: no scripts or hooks run. Tond validates every template against these rules, and its tests check each shipped one:
+Templates are declarative: nothing runs at deploy time apart from the images themselves. Tond validates every template against these rules, and its tests check each shipped one:
 
 - every image is pinned to a version tag or digest, never `latest` or another moving tag, and nothing is built;
 - every service sets `restart` and `mem_limit`;
 - only the public service publishes a port, and only as `"<port>"`, so Tond picks the loopback host port;
 - data lives in `./…` bind mounts declared under `[[volumes]]`, so snapshots include it;
+- a service running a database image (PostgreSQL and its variants, MySQL, MariaDB, MongoDB, Redis and Valkey) that keeps data in a volume declares a [backup hook](#backup-hooks);
 - every `${VAR}` in the compose file is an input, and every input is used.
+
+### Backup hooks
+
+A database's files copied while it runs aren't consistent: a snapshot can catch them halfway through a write. So every bundled template's database service declares how to dump its data, with two compose labels:
+
+| Label | Runs | Required |
+| --- | --- | --- |
+| `tond.backup.dump` | With `sh -c` inside the service before a snapshot copies the app's volumes. Its standard output is saved in the snapshot as the service's dump. | Yes, for a database image with a volume |
+| `tond.backup.restore` | With `sh -c` inside the service after a restore, with the dump on standard input. | No |
+
+The PostgreSQL services of the bundled templates use:
+
+```yaml
+  db:
+    image: postgres:17-alpine
+    labels:
+      tond.backup.dump: pg_dump -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" --clean --if-exists
+      tond.backup.restore: psql -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -q -v ON_ERROR_STOP=1
+```
+
+Write `$$` so compose leaves the `$` alone and the shell in the container expands the variable from the service's own environment: passwords never appear in the compose file or the label. The dump uses `--clean`, so loading it replaces what the restored volume holds. MySQL services dump with `mysqldump --single-transaction` and load with `mysql`, authenticating as root through `MYSQL_PWD`. A dump command can also write into the service's own volume instead of standard output, for example `redis-cli SAVE`, which writes a consistent `dump.rdb` just before the copy. A cache without a volume needs no hook: nothing of it is in a snapshot.
+
+Each label is one line of at most 2048 characters, and a restore needs a dump. The same labels work in any compose app you deploy, not only templates. See [Snapshots and backups](/concepts/backups) for when the hooks run.
 
 The compose file also goes through the same [compose policy](/guides/sources#what-the-compose-policy-rejects) as any compose app you paste.
 

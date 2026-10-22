@@ -22,6 +22,9 @@ services:
 
   db:
     image: postgres:17-alpine
+    labels:
+      tond.backup.dump: pg_dump -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" --clean --if-exists
+      tond.backup.restore: psql -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -q -v ON_ERROR_STOP=1
     restart: unless-stopped
     mem_limit: 256m
     environment:
