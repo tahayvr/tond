@@ -90,6 +90,7 @@ mod deploy;
 mod dns_providers;
 mod docker;
 mod domains;
+mod egress;
 mod error;
 mod forge;
 mod handlers;
@@ -252,6 +253,7 @@ async fn run() -> Result<()> {
     tokio::spawn(audit_ship::run(state.clone()));
     tokio::spawn(backup::backup_scheduler(state.clone()));
     tokio::spawn(db_access::run_access_loop(state.clone()));
+    tokio::spawn(egress::run_loop(state.clone()));
     tokio::spawn(run_preview_cleanup_loop(state.clone()));
     tokio::spawn(uptime::run(state.clone()));
 

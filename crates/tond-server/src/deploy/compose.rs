@@ -557,6 +557,8 @@ async fn run_with_source(
         set_services_status(state, &app_id, deployment_id, &names, "failed").await;
         return Err(e);
     }
+    // The services have addresses now: load the app's egress policy for them.
+    crate::egress::reconcile_now(state).await;
 
     // ── Health ──
     progress::start(state, &app_id, DeployPhase::Health).await;

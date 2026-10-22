@@ -148,6 +148,19 @@ pub struct App {
     /// Why seeding the admin failed (admin_setup = "failed")
     #[sqlx(default)]
     pub admin_setup_error: Option<String>,
+    /// Outbound network policy: "open" | "restricted" | "none"
+    #[sqlx(default)]
+    #[serde(default)]
+    pub egress_policy: String,
+    /// JSON array of allowed destinations ("api.example.com:443",
+    /// "203.0.113.0/24") for "restricted"
+    #[sqlx(default)]
+    #[serde(default)]
+    pub egress_allowlist: String,
+    /// Outbound network policy of the app's previews (default "none")
+    #[sqlx(default)]
+    #[serde(default)]
+    pub preview_egress_policy: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -277,6 +290,9 @@ impl App {
             template_version: None,
             admin_setup: None,
             admin_setup_error: None,
+            egress_policy: "open".to_string(),
+            egress_allowlist: "[]".to_string(),
+            preview_egress_policy: "none".to_string(),
             created_at: now.clone(),
             updated_at: now,
         }
@@ -653,6 +669,59 @@ pub struct UpdateAppResourcesRequest {
     pub memory_limit: Option<i64>,
     /// CPU limit as nano_cpus (None = no limit / unlimited)
     pub cpu_limit: Option<i64>,
+}
+
+// ── Egress (outbound network policy) ──
+
+/// PUT /api/v1/apps/{id}/egress — the app's outbound network policy
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UpdateEgressRequest {
+    /// "open" (any destination), "restricted" (only the allowlist) or "none"
+    /// (no internet). DNS and the app's own Docker networks (linked
+    /// databases, project members) always work.
+    pub policy: String,
+    /// Allowed destinations, used by "restricted" (and by previews set to
+    /// "restricted"): an IPv4 address, a CIDR range or a hostname, each with
+    /// optional ports — "api.stripe.com:443", "203.0.113.0/24",
+    /// "198.51.100.7:5432,6432", "0.0.0.0/0:443". Omitted = unchanged.
+    #[serde(default)]
+    pub allowlist: Option<Vec<String>>,
+    /// Policy of the app's previews (pull-request code): "none" (default),
+    /// "restricted" (the app's allowlist) or "open". Omitted = unchanged.
+    #[serde(default)]
+    pub preview_policy: Option<String>,
+}
+
+/// The addresses a hostname in an egress allowlist resolved to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct EgressHostResponse {
+    pub host: String,
+    /// IPv4 addresses allowed for it right now (empty: not resolved)
+    pub addresses: Vec<String>,
+}
+
+/// GET/PUT /api/v1/apps/{id}/egress
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AppEgressResponse {
+    /// "open" | "restricted" | "none"
+    pub policy: String,
+    pub allowlist: Vec<String>,
+    /// Policy of the app's previews: "open" | "restricted" | "none"
+    pub preview_policy: String,
+    /// Whether this server can enforce a policy (iptables with Docker's
+    /// DOCKER-USER chain)
+    pub firewall_available: bool,
+    /// Why the app's policy isn't (fully) in force, if it isn't
+    #[serde(default)]
+    pub warning: Option<String>,
+    /// Why the previews' policy isn't in force, if it isn't
+    #[serde(default)]
+    pub preview_warning: Option<String>,
+    /// Hostnames in the allowlist and what they currently resolve to
+    pub hosts: Vec<EgressHostResponse>,
 }
 
 // ── Phase 4: Git Integration & Automation ──

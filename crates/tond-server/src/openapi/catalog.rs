@@ -183,6 +183,13 @@ pub fn entries() -> Vec<Doc> {
         e("PUT /api/v1/apps/{id}/health", "Configure health checks").message(),
         e("PUT /api/v1/apps/{id}/port", "Change the container port").returns::<AppResponse>(),
         e("PUT /api/v1/apps/{id}/readiness", "Configure readiness (when a deploy counts as up)").returns::<AppResponse>(),
+        e("GET /api/v1/apps/{id}/egress", "An app's outbound network policy and whether it is enforced")
+            .returns::<AppEgressResponse>()
+            .about("`policy` is open, restricted (only `allowlist`) or none; `preview_policy` applies to the app's previews (none by default). DNS and the app's own Docker networks always work. `hosts` lists what allowlisted hostnames resolve to (re-resolved every 5 minutes)."),
+        e("PUT /api/v1/apps/{id}/egress", "Change an app's outbound network policy")
+            .returns::<AppEgressResponse>()
+            .about("Enforced by tond-server in the iptables chain TOND-EGRESS; a non-open `policy` is refused on servers without iptables and Docker's DOCKER-USER chain. Applies to running containers at once.")
+            .scopes(&["settings:write"]),
         e("POST /api/v1/compose/validate", "Validate a Docker Compose file against Tond's policy")
             .object("`{valid, errors, services}`: one line per problem, and the services the file declares (`ComposeServiceSpec`)."),
         // ── Docker Compose apps ──

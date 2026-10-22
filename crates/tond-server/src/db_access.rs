@@ -263,7 +263,7 @@ pub async fn firewall_usable() -> Result<(), String> {
 }
 
 /// Whether iptables and Docker's DOCKER-USER chain are usable.
-async fn probe_firewall() -> Result<()> {
+pub async fn probe_firewall() -> Result<()> {
     let out = crate::process::command("iptables")
         .args(["-w", "5", "-n", "-L", "DOCKER-USER"])
         .output()
@@ -279,6 +279,13 @@ async fn probe_firewall() -> Result<()> {
 
 /// Load `rules` into the kernel (and make sure DOCKER-USER jumps to them).
 async fn apply(rules: &BTreeMap<i64, Vec<String>>) -> Result<()> {
+    load_chain(CHAIN, &ruleset(rules)).await
+}
+
+/// Replace one of Tond's chains with `restore_input` (an iptables-restore
+/// `*filter` table that declares the chain, which flushes it atomically) and
+/// make sure DOCKER-USER jumps to it. Shared by TOND-DB and TOND-EGRESS.
+pub async fn load_chain(chain: &str, restore_input: &str) -> Result<()> {
     use tokio::io::AsyncWriteExt;
 
     probe_firewall().await?;
@@ -290,7 +297,7 @@ async fn apply(rules: &BTreeMap<i64, Vec<String>>) -> Result<()> {
         .spawn()
         .context("iptables-restore isn't installed")?;
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(ruleset(rules).as_bytes()).await?;
+        stdin.write_all(restore_input.as_bytes()).await?;
     }
     let out = child.wait_with_output().await?;
     anyhow::ensure!(
@@ -298,19 +305,19 @@ async fn apply(rules: &BTreeMap<i64, Vec<String>>) -> Result<()> {
         "iptables-restore failed: {}",
         String::from_utf8_lossy(&out.stderr).trim()
     );
-    // The jump, first in DOCKER-USER (an empty TOND-DB chain is harmless).
+    // The jump, first in DOCKER-USER (an empty chain is harmless).
     let jumps = crate::process::command("iptables")
-        .args(["-w", "5", "-C", "DOCKER-USER", "-j", CHAIN])
+        .args(["-w", "5", "-C", "DOCKER-USER", "-j", chain])
         .status()
         .await?;
     if !jumps.success() {
         let inserted = crate::process::command("iptables")
-            .args(["-w", "5", "-I", "DOCKER-USER", "1", "-j", CHAIN])
+            .args(["-w", "5", "-I", "DOCKER-USER", "1", "-j", chain])
             .output()
             .await?;
         anyhow::ensure!(
             inserted.status.success(),
-            "couldn't hook {CHAIN} into DOCKER-USER: {}",
+            "couldn't hook {chain} into DOCKER-USER: {}",
             String::from_utf8_lossy(&inserted.stderr).trim()
         );
     }
@@ -646,7 +653,10 @@ mod tests {
         db.upgrade = Some(format!(
             r#"{{"status":"{status}","from_image":"","to_image":"","from_version":"16","to_version":"17","step":"","backup_id":null,"started_at":"","finished_at":null,"error":null,"rollback_dir":null}}"#
         ));
-        assert_eq!(db.upgrade_state().map(|u| u.status), Some(status.to_string()));
+        assert_eq!(
+            db.upgrade_state().map(|u| u.status),
+            Some(status.to_string())
+        );
         db
     }
 
@@ -683,7 +693,11 @@ mod tests {
             applied_ports: vec![5400],
             error: None,
         };
-        assert_eq!(access_warning(&dbs[0], &fw), None, "closed, so no 'open to everyone'");
+        assert_eq!(
+            access_warning(&dbs[0], &fw),
+            None,
+            "closed, so no 'open to everyone'"
+        );
     }
 
     #[test]

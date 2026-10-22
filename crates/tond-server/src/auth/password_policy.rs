@@ -240,7 +240,11 @@ mod tests {
         // The list lives in read-only data and is searched in place (no set is
         // built at startup); keep the binary from bloating if a much bigger
         // list is dropped in.
-        assert!(LIST_SOURCE.len() < 2 * 1024 * 1024, "{} bytes", LIST_SOURCE.len());
+        assert!(
+            LIST_SOURCE.len() < 2 * 1024 * 1024,
+            "{} bytes",
+            LIST_SOURCE.len()
+        );
         assert!(is_common("password") && is_common("p@ssw0rd") && is_common("dragon"));
     }
 }

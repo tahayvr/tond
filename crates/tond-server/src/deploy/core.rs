@@ -736,6 +736,8 @@ async fn pipeline(
         .context("Docker could not start the new container")?
     };
     drop(port_guard);
+    // The container has an address now: load the app's egress policy for it.
+    crate::egress::reconcile_now(state).await;
 
     // ── Health ──
     //
@@ -1265,6 +1267,11 @@ pub async fn deploy_preview(
     let network = networks::ensure_preview(&state.docker, &slug)
         .await
         .context("could not create the preview's Docker network")?;
+    // Its egress policy is keyed on that network, so it is loaded before the
+    // pull-request code starts.
+    crate::egress::prepare_preview(state, app, &slug)
+        .await
+        .context("could not apply the preview's egress policy")?;
 
     let container_id = docker::run_container_named(
         &state.docker,

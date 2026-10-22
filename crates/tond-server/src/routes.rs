@@ -138,6 +138,8 @@ api_routes! {
     PUT "/api/v1/apps/{id}/health" => handlers::update_health;
     PUT "/api/v1/apps/{id}/port" => handlers::update_port;
     PUT "/api/v1/apps/{id}/readiness" => handlers::update_readiness;
+    GET "/api/v1/apps/{id}/egress" => handlers::egress::get_egress;
+    PUT "/api/v1/apps/{id}/egress" => handlers::egress::update_egress;
     POST "/api/v1/compose/validate" => handlers::validate_compose;
     POST "/api/v1/apps/{id}/volumes" => handlers::add_volume;
     DELETE "/api/v1/apps/{id}/volumes" => handlers::remove_volume;

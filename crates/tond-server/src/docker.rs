@@ -569,6 +569,20 @@ pub async fn remove_compose_project(docker: &Docker, project_name: &str) {
     }
 }
 
+/// IDs of the running containers of a compose project (empty on error).
+pub async fn compose_containers(docker: &Docker, project_name: &str) -> Vec<String> {
+    let filters = compose_project_filter(project_name);
+    docker
+        .list_containers(Some(
+            ListContainersOptionsBuilder::default()
+                .filters(&filters)
+                .build(),
+        ))
+        .await
+        .map(|cs| cs.into_iter().filter_map(|c| c.id).collect())
+        .unwrap_or_default()
+}
+
 /// Named volumes of a compose project (`<project>_<volume>`, labelled by
 /// compose) with their mount points: `(volume name, mountpoint)`.
 pub async fn compose_volumes(
