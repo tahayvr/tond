@@ -5037,7 +5037,7 @@ checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
 name = "tond-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -5065,7 +5065,7 @@ dependencies = [
 
 [[package]]
 name = "tond-common"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5089,7 +5089,7 @@ dependencies = [
 
 [[package]]
 name = "tond-proxy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5115,7 +5115,7 @@ dependencies = [
 
 [[package]]
 name = "tond-scanner"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tempfile",
  "thiserror 2.0.21",
@@ -5124,7 +5124,7 @@ dependencies = [
 
 [[package]]
 name = "tond-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "anyhow",

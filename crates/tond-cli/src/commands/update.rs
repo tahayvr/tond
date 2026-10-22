@@ -22,11 +22,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
+use tond_common::release;
 
 use crate::client::TondClient;
 use crate::output::{Output, note, outln};
 use crate::signature::{self, Verdict};
 
+const INSTALL_DIR: &str = "/opt/tond";
 const FALLBACK_SCRIPT: &str = "/opt/tond/bin/update.sh";
 /// How long to follow a run before giving up (a snapshot of a big server
 /// plus a slow download can take a while).
@@ -281,43 +283,43 @@ impl From<anyhow::Error> for DownloadError {
 
 /// Release bundle name for this build's architecture, e.g. `tond-linux-aarch64`.
 fn bundle_name() -> String {
-    format!("tond-linux-{}", std::env::consts::ARCH)
+    release::bundle_name(std::env::consts::ARCH)
 }
 
-/// Tarball URL of a release tag (e.g. `v0.2.0`).
-fn tarball_url(tag: &str) -> String {
-    let bundle = bundle_name();
-    format!("https://github.com/tahayvr/tond/releases/download/{tag}/{bundle}.tar.gz")
+/// Where releases come from: TOND_RELEASE_BASE, /opt/tond/RELEASE_BASE, or
+/// the public GitHub releases (tond_common::release).
+fn release_base() -> String {
+    release::release_base(Path::new(INSTALL_DIR))
 }
 
-/// The tag GitHub's `releases/latest` redirects to, from the final URL.
-fn tag_from_latest_url(url: &str) -> Option<String> {
-    let tag = url.trim().rsplit_once("/releases/tag/")?.1;
-    let tag = tag.split(['?', '#', '/']).next()?;
-    (tag.starts_with('v') && tag.len() > 1).then(|| tag.to_string())
+/// Tarball URL of a release tag (e.g. `v0.2.0`) under `base`.
+fn tarball_url(base: &str, tag: &str) -> String {
+    release::asset_url(base, tag, &format!("{}.tar.gz", bundle_name()))
 }
 
-/// Resolve the release tag to install: `v<version>`, or the latest release.
-fn resolve_tag(version: Option<&str>) -> Result<String> {
+/// Resolve the release tag to install: `v<version>`, or the latest release
+/// (`<base>/latest`: GitHub's redirect, or a file naming the tag).
+fn resolve_tag(base: &str, version: Option<&str>) -> Result<String> {
     if let Some(v) = version {
-        return Ok(format!("v{v}"));
+        let tag = format!("v{v}");
+        if !release::is_valid_tag(&tag) {
+            bail!("'{v}' isn't a release version (expected something like 0.2.0)");
+        }
+        return Ok(tag);
     }
+    let latest = release::latest_url(base);
     let output = process::Command::new("curl")
-        .args([
-            "-fsSLI",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{url_effective}",
-            "https://github.com/tahayvr/tond/releases/latest",
-        ])
+        .args(["-fsSL", "-w", "\n%{url_effective}"])
+        .arg(&latest)
         .output()
         .context("Failed to run curl — is it installed?")?;
     if !output.status.success() {
-        bail!("could not look up the latest release");
+        bail!("could not look up the latest release ({latest})");
     }
-    tag_from_latest_url(&String::from_utf8_lossy(&output.stdout))
-        .context("could not work out the latest release tag")
+    let text = String::from_utf8_lossy(&output.stdout);
+    let (body, final_url) = text.rsplit_once('\n').unwrap_or(("", &text));
+    release::tag_from_latest(final_url, body)
+        .with_context(|| format!("could not work out the latest release tag from {latest}"))
 }
 
 /// Download `url` to `dest`. `Ok(false)` when the server says 404.
@@ -464,8 +466,9 @@ fn download_bundle(
     dir: &Path,
     version: Option<&str>,
 ) -> Result<PathBuf, DownloadError> {
-    let tag = resolve_tag(version)?;
-    let url = tarball_url(&tag);
+    let base = release_base();
+    let tag = resolve_tag(&base, version)?;
+    let url = tarball_url(&base, &tag);
     let bundle = bundle_name();
 
     let tarball_path = dir.join("tond.tar.gz");
@@ -594,27 +597,21 @@ mod tests {
     fn tarball_url_names_the_bundle_for_this_architecture() {
         let arch = std::env::consts::ARCH;
         assert_eq!(
-            tarball_url("v0.2.0"),
+            tarball_url(release::DEFAULT_RELEASE_BASE, "v0.2.0"),
             format!(
                 "https://github.com/tahayvr/tond/releases/download/v0.2.0/tond-linux-{arch}.tar.gz"
             )
         );
+        assert_eq!(
+            tarball_url("http://127.0.0.1:8000/", "v0.2.0"),
+            format!("http://127.0.0.1:8000/download/v0.2.0/tond-linux-{arch}.tar.gz")
+        );
     }
 
     #[test]
-    fn tag_from_latest_url_reads_the_redirect_target() {
-        assert_eq!(
-            tag_from_latest_url("https://github.com/tahayvr/tond/releases/tag/v0.2.0\n").as_deref(),
-            Some("v0.2.0")
-        );
-        assert_eq!(
-            tag_from_latest_url("https://github.com/tahayvr/tond/releases"),
-            None
-        );
-        assert_eq!(
-            tag_from_latest_url("https://github.com/x/releases/tag/"),
-            None
-        );
+    fn a_pinned_version_must_be_a_version() {
+        assert_eq!(resolve_tag("x", Some("0.2.0")).unwrap(), "v0.2.0");
+        assert!(resolve_tag("x", Some("../evil")).is_err());
     }
 
     #[test]

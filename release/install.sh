@@ -13,7 +13,8 @@ set -euo pipefail
 #
 # This script can run in two modes:
 #   1. Bundled mode: Binaries and dashboard are in the same directory as this script
-#   2. Download mode: Script downloads latest release from GitHub
+#   2. Download mode: Script downloads the release (latest, or TOND_VERSION) from
+#      GitHub releases (or TOND_RELEASE_BASE) and verifies it first
 
 INSTALL_DIR="/opt/tond"
 BIN_DIR="${INSTALL_DIR}/bin"
@@ -37,6 +38,9 @@ DASHBOARD_DOMAIN=""
 PREVIEW_DOMAIN=""
 APPS_DOMAIN=""
 APPS_DOMAIN_SET=false
+# Download mode: the release to install (default: the latest). TOND_VERSION or
+# --version; TOND_RELEASE_BASE or --release-base says where releases come from.
+RELEASE_VERSION="${TOND_VERSION:-}"
 # Unprivileged user tond-proxy runs as (see tond-proxy.service); its group
 # shares tond.db with tond-server.
 TERMINAL_USER="tond"
@@ -176,7 +180,15 @@ spinner() {
 }
 
 # ── Release signatures (keep in sync: install.sh, update.sh, web/install.sh,
-# web/update.sh; crates/tond-cli/src/signature.rs has the same policy) ──
+# web/update.sh — byte for byte, a test compares them; crates/tond-common/src/release.rs
+# and crates/tond-cli/src/signature.rs have the same rules) ──
+#
+# Where releases come from: TOND_RELEASE_BASE, else the first line of
+# <install dir>/RELEASE_BASE (install.sh writes it when run with a
+# non-default base), else the public GitHub releases. A release's files are at
+# <base>/download/<tag>/tond-linux-<arch>.tar.gz (+ .sha256, .minisig), and
+# <base>/latest names the latest release (GitHub redirects it to
+# .../releases/tag/<tag>; a plain file server serves a file holding the tag).
 #
 # Releases are signed with minisign (release/SIGNING.md). A signature that is
 # present must verify; a missing one is refused unless the release predates
@@ -185,6 +197,63 @@ spinner() {
 # minisign's default "ED" signatures are).
 TOND_RELEASE_PUBKEY="RWRyw6SNQq+I90HcxHS9ho+7FUE9drT12DfUN0W1vyS7nU3W6PZ0XeXL"
 TOND_UNSIGNED_RELEASES="v0.1.0"
+TOND_DEFAULT_RELEASE_BASE="https://github.com/tahayvr/tond/releases"
+
+# release_base — the release base URL, without a trailing slash.
+release_base() {
+    _rb="${TOND_RELEASE_BASE:-}"
+    if [ -z "$_rb" ] && [ -r "${TOND_INSTALL_DIR:-/opt/tond}/RELEASE_BASE" ]; then
+        _rb="$(head -n 1 "${TOND_INSTALL_DIR:-/opt/tond}/RELEASE_BASE" | tr -d '[:space:]')"
+    fi
+    _rb="${_rb:-$TOND_DEFAULT_RELEASE_BASE}"
+    printf '%s\n' "${_rb%/}"
+}
+
+# release_asset_url TAG FILE — where FILE of release TAG is downloaded from.
+release_asset_url() {
+    printf '%s/download/%s/%s\n' "$(release_base)" "$1" "$2"
+}
+
+# valid_release_tag TAG — v<digit>..., only [A-Za-z0-9.+-] (it goes into a URL).
+valid_release_tag() {
+    case "$1" in v[0-9]*) ;; *) return 1 ;; esac
+    case "$1" in *[!A-Za-z0-9.+-]*) return 1 ;; esac
+    return 0
+}
+
+# release_fetch URL DEST — download URL to DEST with curl or wget.
+release_fetch() {
+    if command -v curl > /dev/null 2>&1; then
+        curl -fsSL -o "$2" "$1"
+    else
+        wget -qO "$2" "$1"
+    fi
+}
+
+# release_sha256 FILE — the file's SHA-256, lowercase hex.
+release_sha256() {
+    if command -v sha256sum > /dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
+# latest_release_tag — the tag of the latest release (e.g. v0.2.0).
+latest_release_tag() {
+    _lr_url="$(release_base)/latest"
+    _lr_body=$(mktemp) || return 1
+    if command -v curl > /dev/null 2>&1; then
+        _lr_final=$(curl -fsSL -o "$_lr_body" -w '%{url_effective}' "$_lr_url") || _lr_final=""
+    else
+        _lr_final=$(wget -S -O "$_lr_body" "$_lr_url" 2>&1 | sed -n 's/^ *[Ll]ocation: *//p' | tail -n 1 | tr -d '\r')
+    fi
+    _lr_tag=$(printf '%s\n' "$_lr_final" | sed -n 's#.*/releases/tag/\([^/?#]*\).*#\1#p')
+    valid_release_tag "$_lr_tag" || _lr_tag=$(head -n 1 "$_lr_body" | tr -d '[:space:]')
+    rm -f "$_lr_body"
+    valid_release_tag "$_lr_tag" || return 1
+    printf '%s\n' "$_lr_tag"
+}
 
 # verify_minisig FILE SIGFILE PUBKEY_B64 — succeeds when SIGFILE is a valid
 # prehashed minisign signature of FILE by PUBKEY_B64.
@@ -246,14 +315,30 @@ check_release_signature() {
     return 1
 }
 
-# latest_release_tag — the tag of the latest GitHub release (e.g. v0.2.0).
-latest_release_tag() {
-    _lr_api="https://api.github.com/repos/tahayvr/tond/releases/latest"
-    if command -v curl > /dev/null 2>&1; then
-        curl -fsSL "$_lr_api"
-    else
-        wget -qO- "$_lr_api"
-    fi | sed -n 's/.*"tag_name": *"\(v[^"]*\)".*/\1/p' | head -n 1
+# fetch_verified_release TAG BUNDLE DIR — download BUNDLE.tar.gz of release TAG
+# (e.g. v0.2.0 tond-linux-x86_64) to DIR/tond.tar.gz and verify its checksum
+# and signature. Prints why and fails when it can't be used.
+fetch_verified_release() {
+    valid_release_tag "$1" || { echo "Not a release tag: $1" >&2; return 1; }
+    _fv_url="$(release_asset_url "$1" "$2.tar.gz")"
+    echo "Downloading $2 $1 from $_fv_url"
+    release_fetch "$_fv_url" "$3/tond.tar.gz" \
+        || { echo "Could not download $_fv_url." >&2; return 1; }
+    release_fetch "$_fv_url.sha256" "$3/tond.tar.gz.sha256" \
+        || { echo "Could not download the checksum $_fv_url.sha256." >&2; return 1; }
+    _fv_expected="$(awk '{print $1}' "$3/tond.tar.gz.sha256" | head -n 1)"
+    case "$_fv_expected" in
+        *[!0-9a-f]*|"") _fv_expected="malformed" ;;
+    esac
+    if [ "${#_fv_expected}" -ne 64 ] || [ "$_fv_expected" != "$(release_sha256 "$3/tond.tar.gz")" ]; then
+        echo "The checksum of $2 $1 doesn't match: the download may be corrupted or tampered with; nothing was installed." >&2
+        return 1
+    fi
+    echo "Checksum verified."
+    # A missing signature (download failure included) is handled by the policy.
+    release_fetch "$_fv_url.minisig" "$3/tond.tar.gz.minisig" 2>/dev/null \
+        || rm -f "$3/tond.tar.gz.minisig"
+    check_release_signature "$1" "$3/tond.tar.gz" "$3/tond.tar.gz.minisig"
 }
 # ── end release signatures ──
 
@@ -379,7 +464,8 @@ is_bundled() {
     [[ -f "${SCRIPT_DIR}/tond-server" && -f "${SCRIPT_DIR}/tond-proxy" && -f "${SCRIPT_DIR}/tond" && -d "${SCRIPT_DIR}/dashboard" ]]
 }
 
-# Download latest release from GitHub
+# Download the release (TOND_VERSION / --version, else the latest) from the
+# release base, verify it, and unpack it next to this script.
 download_release() {
     step "Downloading Tond release"
 
@@ -387,53 +473,23 @@ download_release() {
     arch="$(host_arch)"
     [[ -n "$arch" ]] || fatal "Unsupported architecture: $(uname -m). Tond supports x86_64 (amd64) and aarch64 (arm64)."
 
-    local tmp_dir=$(mktemp -d)
-    local tag
-    tag="$(latest_release_tag || true)"
-    [[ -n "$tag" ]] || fatal "Could not look up the latest Tond release"
-    local release_url="https://github.com/tahayvr/tond/releases/download/${tag}/tond-linux-${arch}.tar.gz"
-    local checksum_url="${release_url}.sha256"
-
-    info "Downloading tond-linux-${arch} ${tag} from GitHub..."
-    curl -fsSL -o "${tmp_dir}/tond.tar.gz" "$release_url" || fatal "Failed to download release"
-
-    info "Verifying checksum..."
-    curl -fsSL -o "${tmp_dir}/tond.tar.gz.sha256" "$checksum_url" || fatal "Failed to download checksum"
-    # The .sha256 file contains "HASH  filename" — rewrite the filename to match our local path
-    local expected_hash
-    expected_hash=$(awk '{print $1}' "${tmp_dir}/tond.tar.gz.sha256")
-    local actual_hash
-    actual_hash=$(sha256sum "${tmp_dir}/tond.tar.gz" | awk '{print $1}')
-    if [[ ! "$expected_hash" =~ ^[0-9a-f]{64}$ || "$expected_hash" != "$actual_hash" ]]; then
-        fatal "Checksum verification failed! Download may be corrupted or tampered with."
+    local tmp_dir tag
+    tmp_dir=$(mktemp -d)
+    if [[ -n "$RELEASE_VERSION" ]]; then
+        tag="v${RELEASE_VERSION#v}"
+    else
+        tag="$(latest_release_tag || true)"
+        [[ -n "$tag" ]] || fatal "Could not look up the latest Tond release at $(release_base)/latest"
     fi
-    info "✓ Checksum verified"
 
-    info "Verifying signature..."
-    curl -fsSL -o "${tmp_dir}/tond.tar.gz.minisig" "${release_url}.minisig" 2>/dev/null \
-        || rm -f "${tmp_dir}/tond.tar.gz.minisig"
-    check_release_signature "$tag" "${tmp_dir}/tond.tar.gz" "${tmp_dir}/tond.tar.gz.minisig" \
+    fetch_verified_release "$tag" "tond-linux-${arch}" "$tmp_dir" \
         || fatal "Refusing to install an unverified release"
 
     info "Extracting..."
     tar -xzf "${tmp_dir}/tond.tar.gz" -C "$tmp_dir" || fatal "Failed to extract archive"
 
-    # Find the extracted directory
-    local extracted_dir=""
-    if [[ -d "${tmp_dir}/tond-linux-${arch}" ]]; then
-        extracted_dir="${tmp_dir}/tond-linux-${arch}"
-    elif [[ -d "${tmp_dir}/tond" ]]; then
-        extracted_dir="${tmp_dir}/tond"
-    elif [[ -f "${tmp_dir}/install.sh" ]]; then
-        extracted_dir="$tmp_dir"
-    else
-        # Try to find install.sh
-        extracted_dir=$(dirname "$(find "$tmp_dir" -name "install.sh" -type f 2>/dev/null | head -1)")
-    fi
-
-    if [[ -z "$extracted_dir" || ! -f "${extracted_dir}/install.sh" ]]; then
-        fatal "Could not find extracted files"
-    fi
+    local extracted_dir="${tmp_dir}/tond-linux-${arch}"
+    [[ -f "${extracted_dir}/install.sh" ]] || fatal "The release has no tond-linux-${arch}/install.sh"
 
     # Copy files to script directory
     cp -r "${extracted_dir}/"* "$SCRIPT_DIR/" 2>/dev/null || true
@@ -442,6 +498,22 @@ download_release() {
     rm -rf "$tmp_dir"
 
     info "Download complete"
+}
+
+# Updates download from the same place as this install: record a
+# non-default release base in ${INSTALL_DIR}/RELEASE_BASE (read by update.sh,
+# `tond update` and tond-server's release check).
+record_release_base() {
+    local base
+    [[ -n "${TOND_RELEASE_BASE:-}" ]] || return 0
+    base="$(release_base)"
+    if [[ "$base" == "$TOND_DEFAULT_RELEASE_BASE" ]]; then
+        rm -f "${INSTALL_DIR}/RELEASE_BASE"
+    else
+        echo "$base" > "${INSTALL_DIR}/RELEASE_BASE"
+        chmod 0644 "${INSTALL_DIR}/RELEASE_BASE"
+        info "Releases come from ${base} (recorded in ${INSTALL_DIR}/RELEASE_BASE)"
+    fi
 }
 
 # Get server's public IP
@@ -1422,8 +1494,18 @@ main() {
                 ALLOW_UNSUPPORTED_OS=true
                 shift
                 ;;
+            --version)
+                [[ $# -ge 2 && -n "$2" ]] || fatal "Missing value for --version"
+                RELEASE_VERSION="$2"
+                shift 2
+                ;;
+            --release-base)
+                [[ $# -ge 2 && -n "$2" ]] || fatal "Missing value for --release-base"
+                export TOND_RELEASE_BASE="$2"
+                shift 2
+                ;;
             --help|-h)
-                echo "Usage: install.sh [--non-interactive|-y] [--dashboard-domain <domain>] [--apps-domain <domain>] [--preview-domain <domain>] [--allow-unsupported-os]"
+                echo "Usage: install.sh [--non-interactive|-y] [--dashboard-domain <domain>] [--apps-domain <domain>] [--preview-domain <domain>] [--allow-unsupported-os] [--version <version>] [--release-base <url>]"
                 echo ""
                 echo "  --non-interactive, -y   Skip all prompts and apply safe defaults"
                 echo "                          (enables UFW and prints browser-first next steps)"
@@ -1442,6 +1524,11 @@ main() {
                 echo "  --allow-unsupported-os  Install on a Linux distribution outside the support matrix"
                 echo "                          (${TOND_SUPPORTED_SYSTEMS_TEXT})."
                 echo "                          Not supported: things may break. Also TOND_ALLOW_UNSUPPORTED_OS=1."
+                echo "  --version               Release to download when this script runs on its own"
+                echo "                          (default: the latest). Also TOND_VERSION."
+                echo "  --release-base          Where releases are downloaded from (default:"
+                echo "                          ${TOND_DEFAULT_RELEASE_BASE}). Also TOND_RELEASE_BASE."
+                echo "                          Updates keep using it."
                 echo ""
                 echo "Docs: https://tond.io/docs/quickstart"
                 exit 0
@@ -1498,6 +1585,7 @@ main() {
     ensure_proxy_user
     ensure_terminal_user
     create_directories
+    record_release_base
     ensure_secret_key
     install_binaries
     install_dashboard

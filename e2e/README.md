@@ -50,7 +50,7 @@ What the smoke test covers:
 | --- | --- | --- | --- |
 | Local OrbStack VM | `just vm-e2e` / `just arch=arm64 vm-e2e` | Pebble | while developing (the default) |
 | GitHub Actions runners | `ci.yml` → `e2e` job (x86_64 + aarch64 matrix) | Pebble (local test CA) | manual only (Actions tab), to save minutes |
-| Throwaway Hetzner server | `just e2e-hcloud` / `e2e-hetzner.yml` (arch input) | Let's Encrypt staging, real DNS via `<ip>.sslip.io` (previews on `<ip>.nip.io`) | manual, before releases |
+| Throwaway Hetzner servers | `just e2e-hcloud` (x86_64 + ARM64) | Let's Encrypt staging or production, real DNS via `<ip>.sslip.io` (previews on `<ip>.nip.io`), DNS-01 through Cloudflare | manual, before releases ([runbook](HOSTED.md)) |
 
 All three install the bundle built by `release/package.sh` (`just package`, or
 `just arch=arm64 package` for `dist/tond-linux-aarch64`), the same packaging the
@@ -81,15 +81,21 @@ Cross-compiling for aarch64 needs the Rust target once:
 
 ## Throwaway Hetzner server
 
-Needs the `hcloud` CLI with an active context (or `HCLOUD_TOKEN`).
+Needs the `hcloud` CLI with an active context (or `HCLOUD_TOKEN`) and `jq`. The full
+runbook for the hosted run (secrets, cost, cleanup) is
+[e2e/HOSTED.md](HOSTED.md).
 
 ```bash
-just e2e-hcloud                 # cx23 in nbg1, deleted afterwards (~€0.01 per run)
+just e2e-hcloud                 # cx23 in nbg1, smoke test, deleted afterwards
 just arch=arm64 e2e-hcloud      # ARM64: cax11
+just e2e-hcloud --test both     # resource budgets on the fresh install, then the smoke test
+just e2e-hcloud --acme letsencrypt                    # Let's Encrypt production
+CLOUDFLARE_API_TOKEN=… just e2e-hcloud --dns-zone tond-e2e.dev   # real DNS-01 wildcard via Cloudflare
+just e2e-hcloud --artifacts /tmp/e2e   # keep run.log, budget.json, journals
 just e2e-hcloud --keep          # keep the server for debugging (prints SSH + delete commands)
 just e2e-hcloud --acme pebble   # same flow as CI, on Hetzner
 just e2e-hcloud-gc              # delete leftovers from killed runs (older than 3 h)
 ```
 
-For the manual `e2e-hetzner.yml` workflow, add a read/write Hetzner Cloud API token as the
-`HCLOUD_TOKEN` repository secret.
+`e2e/lib.sh` holds the helpers shared by `smoke.sh` and `scripts/release-smoke.sh`
+(output, API requests over the socket, `wait_for`, app and self-update waits).
