@@ -24209,7 +24209,7 @@
                 "schema": {
                   "properties": {
                     "data": {
-                      "description": "`{database, changed}`"
+                      "description": "`{database, changed, apps_to_update}`: `apps_to_update` lists `{id, name, keys}` of apps whose own environment still holds the old password"
                     },
                     "message": {
                       "description": "Informational note, when there is one.",
@@ -24263,7 +24263,7 @@
             "sessionCookie": []
           }
         ],
-        "summary": "Change a database's credentials",
+        "summary": "Change a database's password in place",
         "tags": [
           "Databases"
         ],

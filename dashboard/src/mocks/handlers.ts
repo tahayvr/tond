@@ -4617,9 +4617,13 @@ export const handlers = [
 		const nextRoot = body.root_password?.trim();
 		if (nextRoot && nextRoot !== secrets.root_password) changed.push('root_password');
 		if (changed.length === 0) return err('Nothing to change: enter a new password.');
-		if (current.db_type === 'redis' || current.db_type === 'keydb') {
+		if (
+			(current.db_type === 'redis' || current.db_type === 'keydb') &&
+			nextPw &&
+			/[\s"'\\#]/.test(nextPw)
+		) {
 			return err(
-				"Invalid input: Redis and KeyDB passwords can't be changed in place yet. The stored password was not changed."
+				"Invalid input: Redis password may not contain spaces, quotes, backslashes or '#'"
 			);
 		}
 		if (current.status !== 'running') {
@@ -4637,7 +4641,11 @@ export const handlers = [
 			updated_at: new Date().toISOString()
 		};
 		databases[idx] = updated;
-		return ok({ database: dbDetail(updated), changed });
+		const appsToUpdate = apps
+			.filter((a) => a.project_id && a.project_id === current.project_id)
+			.slice(0, 2)
+			.map((a) => ({ id: a.id, name: a.name, keys: ['DATABASE_URL'] }));
+		return ok({ database: dbDetail(updated), changed, apps_to_update: appsToUpdate });
 	}),
 
 	http.post('/api/v1/databases/:id/stop', async ({ params }) => {

@@ -19,6 +19,7 @@
 		redeployDatabase,
 		revealDatabaseCredentials,
 		listProjects,
+		type AppUsingOldPassword,
 		type DatabaseCredentials,
 		type ManagedDatabaseDetail,
 		type Project
@@ -36,7 +37,14 @@
 	import LinkTabs from '$lib/components/nav/link-tabs.svelte';
 	import ConfirmDialog from '$lib/components/dialogs/confirm-dialog.svelte';
 	import { confirmAction } from '$lib/confirm.svelte';
-	import { allowedTabs, DATABASE_TABS, tabFromUrl, tabHref, type DatabaseTab } from '$lib/tabs';
+	import {
+		allowedTabs,
+		appTabHref,
+		DATABASE_TABS,
+		tabFromUrl,
+		tabHref,
+		type DatabaseTab
+	} from '$lib/tabs';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
@@ -120,6 +128,7 @@
 	let savingCred = $state(false);
 	let credError = $state('');
 	let credDialogOpen = $state(false);
+	let credApps = $state<AppUsingOldPassword[]>([]);
 	let credSuccess = $state('');
 	let isRedisLike = $derived(db?.db_type === 'redis' || db?.db_type === 'keydb');
 	let dbRunning = $derived(db?.status === 'running');
@@ -417,7 +426,10 @@
 			creds = null;
 			revealedKeys.clear();
 			if (db) setUiContext(dbContext(db));
-			credSuccess = `${credLabel(field)} changed inside the database and saved. Update any app that still connects with the old password, then redeploy it.`;
+			credApps = res.apps_to_update ?? [];
+			credSuccess = credApps.length
+				? `${credLabel(field)} changed inside the database and saved. These apps still have the old password in their environment: update it there, then redeploy them.`
+				: `${credLabel(field)} changed inside the database and saved. No app's environment holds the old password; update any other client that connects with it.`;
 			credDialogOpen = false;
 			editingCredField = null;
 			credDraft = '';
@@ -1123,11 +1135,29 @@
 								class="flex items-start justify-between gap-3 rounded-lg bg-success/10 px-4 py-3 text-sm text-success"
 								role="status"
 							>
-								<p>{credSuccess}</p>
+								<div class="space-y-1">
+									<p>{credSuccess}</p>
+									{#if credApps.length}
+										<ul class="list-disc pl-5" aria-label="Apps to update">
+											{#each credApps as a (a.id)}
+												<li>
+													<a
+														class="font-medium underline underline-offset-2"
+														href={appTabHref(a.id, 'settings', 'environment')}>{a.name}</a
+													>
+													<span class="font-mono text-xs">({a.keys.join(', ')})</span>
+												</li>
+											{/each}
+										</ul>
+									{/if}
+								</div>
 								<button
 									type="button"
 									class="text-xs underline-offset-2 hover:underline"
-									onclick={() => (credSuccess = '')}
+									onclick={() => {
+										credSuccess = '';
+										credApps = [];
+									}}
 								>
 									Dismiss
 								</button>
@@ -1144,21 +1174,21 @@
 									Your role can't reveal them.
 								{/if}
 							</p>
-							{#if isRedisLike}
-								Redis and KeyDB passwords can't be changed in place yet.
-							{:else}
-								<p>
-									<span class="font-semibold text-foreground">Changing a password</span> updates it inside
-									the running database right away, then saves it here. Apps that use the old password
-									must be updated and redeployed.
-								</p>
-								<p class="mt-1">
-									The database name and username can't be changed after creation.
-									{#if !dbRunning}
-										<span class="text-warn">Start the database to change a password.</span>
-									{/if}
-								</p>
-							{/if}
+							<p>
+								<span class="font-semibold text-foreground">Changing a password</span> updates it
+								inside the running database right away, then saves it here. Apps that use the old
+								password must be updated and redeployed; Tond lists the ones whose environment still
+								holds the old password.
+								{#if isRedisLike}
+									Redis passwords can't contain spaces, quotes, backslashes or '#'.
+								{/if}
+							</p>
+							<p class="mt-1">
+								The database name and username can't be changed after creation.
+								{#if !dbRunning}
+									<span class="text-warn">Start the database to change a password.</span>
+								{/if}
+							</p>
 						</div>
 
 						<!-- Credentials table -->
@@ -1230,7 +1260,7 @@
 															{/if}
 														</Button>
 													{/if}
-													{#if isPasswordField(v.credField) && !isRedisLike}
+													{#if isPasswordField(v.credField)}
 														{@const field = v.credField}
 														<Button
 															variant="ghost"

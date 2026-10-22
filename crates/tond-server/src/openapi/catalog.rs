@@ -435,7 +435,7 @@ pub fn entries() -> Vec<Doc> {
         e("POST /api/v1/databases/{id}/upgrade/rollback", "Roll an upgrade back to the old version and data").message(),
         e("POST /api/v1/databases/{id}/upgrade/dismiss", "Clear a failed upgrade's state").null(),
         e("POST /api/v1/databases/{id}/backups", "Back up a database now").created().returns::<SnapshotResponse>(),
-        e("PATCH /api/v1/databases/{id}/credentials", "Change a database's credentials").object("`{database, changed}`"),
+        e("PATCH /api/v1/databases/{id}/credentials", "Change a database's password in place").object("`{database, changed, apps_to_update}`: `apps_to_update` lists `{id, name, keys}` of apps whose own environment still holds the old password"),
         e("GET /api/v1/databases/{id}/credentials", "Reveal a database's credentials").returns::<DatabaseCredentialsResponse>(),
         e("GET /api/v1/databases/{id}/access", "Which apps can reach a database").returns::<DatabaseAccessResponse>(),
         e("PUT /api/v1/databases/{id}/links/{app}", "Let an app reach a database").returns::<DatabaseAccessResponse>(),

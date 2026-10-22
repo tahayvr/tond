@@ -3934,6 +3934,15 @@ export interface UpdateDatabaseCredentialsResponse {
 	database: ManagedDatabaseDetail;
 	/** Fields changed inside the running database and saved, e.g. ["db_password"] */
 	changed: ('db_password' | 'root_password')[];
+	/** Apps whose own environment variables still hold the old password */
+	apps_to_update?: AppUsingOldPassword[];
+}
+
+export interface AppUsingOldPassword {
+	id: string;
+	name: string;
+	/** Environment variable keys whose value contains the old password */
+	keys: string[];
 }
 
 /**

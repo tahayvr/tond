@@ -166,25 +166,10 @@ fn is_redis_like(db_type: &str) -> bool {
     matches!(db_type, "redis" | "keydb")
 }
 
-/// ACL usernames/passwords go into a whitespace-separated config line, so they
-/// must be plain tokens.
-fn validate_redis_credential(what: &str, value: &str) -> Result<(), String> {
-    if value.is_empty() {
-        return Err(format!("Redis {what} cannot be empty"));
-    }
-    if value
-        .chars()
-        .any(|c| c.is_whitespace() || c.is_control() || c == '"' || c == '\\' || c == '#')
-    {
-        return Err(format!(
-            "Redis {what} may not contain spaces, quotes, backslashes or '#'"
-        ));
-    }
-    Ok(())
-}
+use crate::db_credentials::validate_redis_credential;
 
 /// The generated ACL config for a Redis-like database.
-fn redis_config(db_user: &str, db_password: &str) -> Result<String, String> {
+pub(crate) fn redis_config(db_user: &str, db_password: &str) -> Result<String, String> {
     validate_redis_credential("username", db_user)?;
     validate_redis_credential("password", db_password)?;
     Ok(format!(
@@ -1160,6 +1145,35 @@ fn refuse_rename(
     }
 }
 
+/// Apps whose own environment variables (not counting the project's) still
+/// contain one of `secrets`, with the keys that do: `{id, name, keys}`.
+pub(crate) async fn apps_using_secrets(
+    pool: &sqlx::SqlitePool,
+    secrets: &[&str],
+) -> Result<Vec<serde_json::Value>, AppError> {
+    if secrets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let apps = sqlx::query_as::<_, App>("SELECT * FROM apps ORDER BY name")
+        .fetch_all(pool)
+        .await?;
+    let mut out = Vec::new();
+    for app in apps {
+        let Ok(env) = secrets::app_env(&app) else {
+            continue;
+        };
+        let keys: Vec<&String> = env
+            .iter()
+            .filter(|(_, v)| secrets.iter().any(|s| v.contains(s)))
+            .map(|(k, _)| k)
+            .collect();
+        if !keys.is_empty() {
+            out.push(serde_json::json!({ "id": app.id, "name": app.name, "keys": keys }));
+        }
+    }
+    Ok(out)
+}
+
 /// Change the application and/or root password inside the running database,
 /// then persist it.
 ///
@@ -1246,6 +1260,34 @@ pub async fn update_database_credentials(
             ))));
         }
 
+        // Redis/KeyDB read the password from Tond's generated ACL config on
+        // start: rewrite it so a restart keeps the new password. If that
+        // fails, put the old password back so the two never disagree.
+        if is_redis_like(&current.db_type) {
+            let written =
+                match redis_config(current.db_user.as_deref().unwrap_or_default(), password) {
+                    Ok(config) => tokio::fs::write(
+                        redis_config_path(&volume_path_for(&current), &current.name),
+                        config,
+                    )
+                    .await
+                    .map_err(|e| e.to_string()),
+                    Err(e) => Err(e),
+                };
+            if let Err(e) = written {
+                let old = current.db_password.clone().unwrap_or_default();
+                let mut revert_db = current.clone();
+                revert_db.db_password = Some(password.clone());
+                if let Ok(revert) = password_change_step(&revert_db, *field, &old) {
+                    let _ = run_step(&state.docker, &container_id, &revert, &secrets).await;
+                }
+                return Err(AppError(TondError::Internal(format!(
+                    "Couldn't save the Redis config of '{}': {e}. Nothing was changed.",
+                    db.name
+                ))));
+            }
+        }
+
         match field {
             CredentialField::AppPassword => {
                 // A MySQL/MariaDB row without a root password mirrors the app
@@ -1290,6 +1332,15 @@ pub async fn update_database_credentials(
     )
     .await;
 
+    // Apps keep their own copy of the password in their environment (pasted
+    // connection strings, template env): name the ones still on the old one.
+    let old_secrets: Vec<&str> = [db.db_password.as_deref(), db.root_password.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter(|s| s.len() >= 6)
+        .collect();
+    let apps_to_update = apps_using_secrets(&state.db, &old_secrets).await?;
+
     let updated_db = fetch_db(&state.db, &db.id).await?;
     let detail = build_detail(updated_db, public_host(&state).await.as_deref());
     Ok((
@@ -1297,6 +1348,7 @@ pub async fn update_database_credentials(
         Json(ApiResponse::ok(serde_json::json!({
             "database": detail,
             "changed": applied,
+            "apps_to_update": apps_to_update,
         }))),
     ))
 }
@@ -2045,21 +2097,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_database_credentials_refuses_engines_that_cannot_change_in_place() {
+    async fn redis_password_changes_check_the_acl_rules_then_need_the_running_server() {
         let state = test_state().await;
         let mut db = standalone_db();
         db.db_type = "redis".to_string();
         db.db_name = None;
         seed_database_row(&state, &db).await;
 
+        let err = call_update_credentials(&state, &db.id, password_only("has space"))
+            .await
+            .expect_err("an ACL password is one token");
+        assert!(err.contains("may not contain"), "unexpected message: {err}");
+
+        // A valid password goes on to the in-place change (ACL SETUSER in the
+        // container), which needs the server running.
         let err = call_update_credentials(&state, &db.id, password_only("new-secret"))
             .await
-            .expect_err("redis passwords can't be changed in place");
-
-        assert!(err.contains("Redis"), "unexpected message: {err}");
+            .expect_err("no container here");
+        assert!(
+            err.contains("Nothing was changed"),
+            "unexpected message: {err}"
+        );
         assert_eq!(
             stored_password(&state, &db.id).await.as_deref(),
             Some("secret")
+        );
+    }
+
+    #[tokio::test]
+    async fn apps_still_holding_the_old_password_are_named() {
+        let state = test_state().await;
+        for (id, env) in [
+            (
+                "a1",
+                r#"{"DATABASE_URL":"postgres://u:old-secret@db:5432/x","PORT":"80"}"#,
+            ),
+            ("a2", r#"{"OTHER":"nothing here"}"#),
+        ] {
+            let mut env_map = std::collections::BTreeMap::new();
+            for (k, v) in serde_json::from_str::<std::collections::BTreeMap<String, String>>(env)
+                .unwrap_or_default()
+            {
+                env_map.insert(k, v);
+            }
+            let sealed = secrets::seal_app_env(&env_map).unwrap_or_else(|e| panic!("{e}"));
+            sqlx::query(
+                "INSERT INTO apps (id, name, env_vars, created_at, updated_at) VALUES (?, ?, ?, 'now', 'now')",
+            )
+            .bind(id)
+            .bind(format!("app-{id}"))
+            .bind(sealed)
+            .execute(&state.db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let found = apps_using_secrets(&state.db, &["old-secret"])
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.0));
+        assert_eq!(
+            found,
+            [serde_json::json!({"id": "a1", "name": "app-a1", "keys": ["DATABASE_URL"]})]
+        );
+        assert!(
+            apps_using_secrets(&state.db, &[])
+                .await
+                .unwrap_or_else(|e| panic!("{}", e.0))
+                .is_empty()
         );
     }
 }

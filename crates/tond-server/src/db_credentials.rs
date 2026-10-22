@@ -4,7 +4,7 @@
 // empty data directory. Once data exists, changing the env and redeploying does
 // nothing, so the password Tond stores and the real one drift apart. Instead we
 // run the engine's own password change (ALTER ROLE / ALTER USER /
-// changeUserPassword) inside the running container with `docker exec`,
+// changeUserPassword / ACL SETUSER) inside the running container with `docker exec`,
 // authenticated with the current credentials, and only persist the new value
 // once that succeeded.
 //
@@ -60,6 +60,32 @@ const MONGO_SCRIPT: &str = "const admin = db.getSiblingDB('admin'); \
 admin.auth(process.env.TOND_DB_USER, process.env.TOND_CURRENT_PASSWORD); \
 admin.changeUserPassword(process.env.TOND_DB_USER, process.env.TOND_NEW_PASSWORD);";
 
+// Redis/KeyDB: the user's ACL entry gets the new password (resetpass drops
+// the old one). The command is piped to the CLI on stdin (printf is a shell
+// builtin, so neither password shows up in a process list) and the client
+// authenticates with REDISCLI_AUTH. redis-cli exits 0 on an error reply, so
+// the reply must be exactly "OK". Tond rewrites the generated ACL config
+// afterwards so a restart keeps the new password.
+const REDIS_SCRIPT: &str = r#"if command -v redis-cli >/dev/null 2>&1; then c=redis-cli; else c=keydb-cli; fi; out=$(printf 'ACL SETUSER %s resetpass >%s
+' "$TOND_DB_USER" "$TOND_NEW_PASSWORD" | "$c" --user "$TOND_DB_USER" 2>&1); [ "$out" = "OK" ] || { printf '%s
+' "$out"; exit 1; }"#;
+
+/// ACL usernames/passwords go into a whitespace-separated config line (and an
+/// inline Redis command), so they must be plain tokens.
+pub fn validate_redis_credential(what: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("Redis {what} cannot be empty"));
+    }
+    if value.chars().any(|c| {
+        c.is_whitespace() || c.is_control() || c == '"' || c == '\\' || c == '#' || c == '\''
+    }) {
+        return Err(format!(
+            "Redis {what} may not contain spaces, quotes, backslashes or '#'"
+        ));
+    }
+    Ok(())
+}
+
 fn hex(value: &str) -> String {
     hex::encode(value.as_bytes())
 }
@@ -96,7 +122,10 @@ pub fn password_change_step(
             cmd: vec!["sh".into(), "-c".into(), POSTGRES_SCRIPT.into()],
             env: vec![
                 format!("TOND_DB_USER={user}"),
-                format!("TOND_DB_NAME={}", db.db_name.clone().unwrap_or_else(|| user.clone())),
+                format!(
+                    "TOND_DB_NAME={}",
+                    db.db_name.clone().unwrap_or_else(|| user.clone())
+                ),
                 format!("TOND_NEW_PASSWORD={new_password}"),
                 format!("PGPASSWORD={current}"),
             ],
@@ -129,10 +158,17 @@ pub fn password_change_step(
                 format!("TOND_NEW_PASSWORD={new_password}"),
             ],
         }),
-        ("redis" | "keydb", _) => Err(
-            "Redis and KeyDB passwords can't be changed in place yet. The stored password was not changed."
-                .to_string(),
-        ),
+        ("redis" | "keydb", CredentialField::AppPassword) => {
+            validate_redis_credential("password", new_password)?;
+            Ok(ExecStep {
+                cmd: vec!["sh".into(), "-c".into(), REDIS_SCRIPT.into()],
+                env: vec![
+                    format!("TOND_DB_USER={user}"),
+                    format!("TOND_NEW_PASSWORD={new_password}"),
+                    format!("REDISCLI_AUTH={current}"),
+                ],
+            })
+        }
         (engine, CredentialField::RootPassword) => Err(format!(
             "{engine} databases don't have a separate root password."
         )),
@@ -313,9 +349,32 @@ mod tests {
     }
 
     #[test]
+    fn redis_sets_the_acl_password_through_env_and_stdin() {
+        for engine in ["redis", "keydb"] {
+            let step =
+                password_change_step(&db(engine), CredentialField::AppPassword, "N3w-pass_42")
+                    .unwrap_or_else(|e| panic!("{engine} should be supported: {e}"));
+            assert_eq!(step.cmd, ["sh", "-c", REDIS_SCRIPT]);
+            assert!(
+                !step
+                    .cmd
+                    .iter()
+                    .any(|a| a.contains("N3w-pass_42") || a.contains("old-pass"))
+            );
+            assert_eq!(env_value(&step, "TOND_NEW_PASSWORD"), Some("N3w-pass_42"));
+            assert_eq!(env_value(&step, "REDISCLI_AUTH"), Some("old-pass"));
+            assert_eq!(env_value(&step, "TOND_DB_USER"), Some("tond_shop"));
+        }
+        // The ACL line is whitespace-separated: such passwords are refused.
+        let err = password_change_step(&db("redis"), CredentialField::AppPassword, NASTY)
+            .err()
+            .unwrap_or_else(|| panic!("spaces and quotes can't go into an ACL line"));
+        assert!(err.contains("may not contain"), "{err}");
+    }
+
+    #[test]
     fn unsupported_changes_are_refused_with_a_reason() {
-        assert!(password_change_step(&db("redis"), CredentialField::AppPassword, "x").is_err());
-        assert!(password_change_step(&db("keydb"), CredentialField::AppPassword, "x").is_err());
+        assert!(password_change_step(&db("redis"), CredentialField::RootPassword, "x").is_err());
         assert!(password_change_step(&db("postgres"), CredentialField::RootPassword, "x").is_err());
     }
 
