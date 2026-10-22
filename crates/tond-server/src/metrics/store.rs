@@ -20,6 +20,7 @@
 //   7d  → 5m,  25 min buckets (~400)
 //   30d → 1h,  2 h buckets (360)
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use sqlx::{AssertSqlSafe, SqlitePool};
@@ -98,13 +99,31 @@ impl EventKind {
     }
 }
 
+/// Bumped whenever metric_targets may have changed (a target created or a
+/// memory limit written), so readers can cache what they derive from it.
+static TARGETS_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub fn targets_generation() -> u64 {
+    TARGETS_GENERATION.load(Ordering::Relaxed)
+}
+
+fn bump_targets_generation() {
+    TARGETS_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Id of `owner`'s target row, creating it on first use.
 pub async fn ensure_target(db: &SqlitePool, owner: &Owner) -> sqlx::Result<i64> {
-    sqlx::query("INSERT INTO metric_targets (kind, owner_id) VALUES (?, ?) ON CONFLICT DO NOTHING")
-        .bind(owner.kind.as_str())
-        .bind(&owner.id)
-        .execute(db)
-        .await?;
+    let created = sqlx::query(
+        "INSERT INTO metric_targets (kind, owner_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
+    )
+    .bind(owner.kind.as_str())
+    .bind(&owner.id)
+    .execute(db)
+    .await?
+    .rows_affected();
+    if created > 0 {
+        bump_targets_generation();
+    }
     sqlx::query_scalar("SELECT id FROM metric_targets WHERE kind = ? AND owner_id = ?")
         .bind(owner.kind.as_str())
         .bind(&owner.id)
@@ -160,6 +179,7 @@ pub async fn insert_tick(db: &SqlitePool, ts: i64, rows: &[TickRow]) -> sqlx::Re
     samples.push(']');
     limits.push(']');
 
+    let limits_changed = limits.len() > 2;
     let mut tx = crate::db::begin_write(db).await?;
     sqlx::query(
         "INSERT OR REPLACE INTO metrics_raw (target, ts, cpu, mem, rx, tx, pids)
@@ -170,7 +190,7 @@ pub async fn insert_tick(db: &SqlitePool, ts: i64, rows: &[TickRow]) -> sqlx::Re
     .bind(samples)
     .execute(&mut *tx)
     .await?;
-    if limits.len() > 2 {
+    if limits_changed {
         sqlx::query(
             "UPDATE metric_targets SET mem_limit = l.value->>1
              FROM json_each(?) AS l WHERE metric_targets.id = l.value->>0",
@@ -179,7 +199,11 @@ pub async fn insert_tick(db: &SqlitePool, ts: i64, rows: &[TickRow]) -> sqlx::Re
         .execute(&mut *tx)
         .await?;
     }
-    tx.commit().await
+    tx.commit().await?;
+    if limits_changed {
+        bump_targets_generation();
+    }
+    Ok(())
 }
 
 /// Record a restart / crash / OOM event (duplicates in the same second collapse).
