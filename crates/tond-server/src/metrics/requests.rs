@@ -298,37 +298,60 @@ async fn latest_hour(db: &SqlitePool) -> sqlx::Result<Option<i64>> {
         .await
 }
 
-const INSERT_COLUMNS: &str = "(target, ts, requests, s1xx, s2xx, s3xx, s4xx, s5xx, s502, s504,
+/// Columns of requests_1m / requests_1h, in the order `rows_json` writes them.
+const INSERT_SELECT: &str = "(target, ts, requests, s1xx, s2xx, s3xx, s4xx, s5xx, s502, s504,
      bytes_in, bytes_out, latency, upstream)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+     SELECT value->>0, value->>1, value->>2, value->>3, value->>4, value->>5, value->>6,
+            value->>7, value->>8, value->>9, value->>10, value->>11,
+            unhex(value->>12), unhex(value->>13)
+     FROM json_each(?)";
 
 fn clamp_i64(v: u64) -> i64 {
     i64::try_from(v).unwrap_or(i64::MAX)
 }
 
-async fn insert_row(
+/// `(target, ts, counters)` rows as the JSON array `insert_rows` binds:
+/// numbers, then both histograms hex-encoded.
+fn rows_json<'a>(rows: impl ExactSizeIterator<Item = (i64, i64, &'a TrafficCounters)>) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(2 + rows.len() * 160);
+    out.push('[');
+    for (i, (target, ts, c)) in rows.enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let _ = write!(out, "[{target},{ts},{}", clamp_i64(c.requests));
+        for v in c
+            .status
+            .iter()
+            .chain([&c.s502, &c.s504, &c.bytes_in, &c.bytes_out])
+        {
+            let _ = write!(out, ",{}", clamp_i64(*v));
+        }
+        for hist in [&c.latency, &c.upstream] {
+            out.push_str(",\"");
+            out.push_str(&hex::encode(encode_histogram(hist)));
+            out.push('"');
+        }
+        out.push(']');
+    }
+    out.push(']');
+    out
+}
+
+/// Insert (or replace) `(target, ts, counters)` rows with one statement.
+async fn insert_rows<'a>(
     conn: &mut sqlx::SqliteConnection,
     table: &str,
-    target: i64,
-    ts: i64,
-    c: &TrafficCounters,
+    rows: impl ExactSizeIterator<Item = (i64, i64, &'a TrafficCounters)>,
 ) -> sqlx::Result<()> {
-    let sql = format!("INSERT OR REPLACE INTO {table} {INSERT_COLUMNS}");
+    if rows.len() == 0 {
+        return Ok(());
+    }
+    let json = rows_json(rows);
+    let sql = format!("INSERT OR REPLACE INTO {table} {INSERT_SELECT}");
     sqlx::query(AssertSqlSafe(sql.as_str()))
-        .bind(target)
-        .bind(ts)
-        .bind(clamp_i64(c.requests))
-        .bind(clamp_i64(c.status[0]))
-        .bind(clamp_i64(c.status[1]))
-        .bind(clamp_i64(c.status[2]))
-        .bind(clamp_i64(c.status[3]))
-        .bind(clamp_i64(c.status[4]))
-        .bind(clamp_i64(c.s502))
-        .bind(clamp_i64(c.s504))
-        .bind(clamp_i64(c.bytes_in))
-        .bind(clamp_i64(c.bytes_out))
-        .bind(encode_histogram(&c.latency))
-        .bind(encode_histogram(&c.upstream))
+        .bind(json)
         .execute(&mut *conn)
         .await?;
     Ok(())
@@ -386,9 +409,12 @@ pub async fn write_minute(
     rollup: Option<(i64, i64)>,
 ) -> sqlx::Result<()> {
     let mut tx = crate::db::begin_write(db).await?;
-    for (target, counters) in rows {
-        insert_row(&mut tx, "requests_1m", *target, minute, counters).await?;
-    }
+    insert_rows(
+        &mut tx,
+        "requests_1m",
+        rows.iter().map(|(target, c)| (*target, minute, c)),
+    )
+    .await?;
     if let Some((from, to)) = rollup {
         let sql = format!(
             "SELECT {SELECT_COLUMNS} FROM requests_1m
@@ -406,9 +432,12 @@ pub async fn write_minute(
                 .or_default()
                 .add(&row.counters());
         }
-        for ((target, hour), counters) in hours {
-            insert_row(&mut tx, "requests_1h", target, hour, &counters).await?;
-        }
+        insert_rows(
+            &mut tx,
+            "requests_1h",
+            hours.iter().map(|((target, hour), c)| (*target, *hour, c)),
+        )
+        .await?;
     }
     tx.commit().await
 }
@@ -768,11 +797,16 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{e}"));
         }
         let mut conn = db.acquire().await.unwrap_or_else(|e| panic!("{e}"));
-        for ts in [now - 10 * 86_400, now - 3600] {
-            insert_row(&mut conn, "requests_1h", a, ts, &counters(1, 0, 0))
-                .await
-                .unwrap_or_else(|e| panic!("{e}"));
-        }
+        let c = counters(1, 0, 0);
+        insert_rows(
+            &mut conn,
+            "requests_1h",
+            [now - 10 * 86_400, now - 3600]
+                .into_iter()
+                .map(|ts| (a, ts, &c)),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
         drop(conn);
         let deleted = prune(&db, now, 7 * 86_400)
             .await
@@ -818,6 +852,41 @@ mod tests {
         assert!(current(&route, 2000).is_none(), "stale");
         publish_live(&[], &[], 1060, 30);
         assert!(current(&route, 1060).is_none(), "route gone");
+    }
+
+    #[tokio::test]
+    async fn a_minute_of_many_routes_is_one_statement_that_round_trips() {
+        let db = db().await;
+        let mut rows = Vec::new();
+        for i in 0..120 {
+            let target = ensure_target(&db, &app(&format!("r{i}")))
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            let mut c = counters(10 + i as u64, i as u64 % 3, (i % 20) as usize);
+            c.s502 = 1;
+            c.s504 = u64::MAX; // clamped, not wrapped
+            if i % 2 == 0 {
+                c.upstream = Default::default(); // an empty histogram
+            }
+            rows.push((target, c));
+        }
+        write_minute(&db, 1_800_000_000, &rows, None)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let sql = format!("SELECT {SELECT_COLUMNS} FROM requests_1m ORDER BY target");
+        let stored: Vec<Row> = sqlx::query_as(AssertSqlSafe(sql))
+            .fetch_all(&db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(stored.len(), rows.len());
+        for (row, (target, c)) in stored.iter().zip(&rows) {
+            assert_eq!(row.target, *target);
+            assert_eq!(row.ts, 1_800_000_000);
+            assert_eq!(row.s504, i64::MAX);
+            let mut expected = c.clone();
+            expected.s504 = i64::MAX as u64;
+            assert_eq!(row.counters(), expected);
+        }
     }
 
     #[tokio::test]

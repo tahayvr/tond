@@ -130,34 +130,54 @@ pub struct TickRow {
     pub mem_limit: Option<i64>,
 }
 
-/// Write one tick's samples in a single transaction.
+/// Write one tick's samples: one INSERT for every row and one UPDATE for the
+/// memory limits that changed, in a single transaction.
 pub async fn insert_tick(db: &SqlitePool, ts: i64, rows: &[TickRow]) -> sqlx::Result<()> {
+    use std::fmt::Write as _;
     if rows.is_empty() {
         return Ok(());
     }
-    let mut tx = crate::db::begin_write(db).await?;
-    for row in rows {
+    let mut samples = String::with_capacity(2 + rows.len() * 64);
+    let mut limits = String::from("[");
+    samples.push('[');
+    for (i, row) in rows.iter().enumerate() {
         let s = row.sample;
+        if i > 0 {
+            samples.push(',');
+        }
+        let _ = write!(
+            samples,
+            "[{},{},{},{},{},{}]",
+            row.target, s.cpu, s.mem, s.rx, s.tx, s.pids
+        );
+        if let Some(limit) = row.mem_limit {
+            if limits.len() > 1 {
+                limits.push(',');
+            }
+            let _ = write!(limits, "[{},{limit}]", row.target);
+        }
+    }
+    samples.push(']');
+    limits.push(']');
+
+    let mut tx = crate::db::begin_write(db).await?;
+    sqlx::query(
+        "INSERT OR REPLACE INTO metrics_raw (target, ts, cpu, mem, rx, tx, pids)
+         SELECT value->>0, ?, value->>1, value->>2, value->>3, value->>4, value->>5
+         FROM json_each(?)",
+    )
+    .bind(ts)
+    .bind(samples)
+    .execute(&mut *tx)
+    .await?;
+    if limits.len() > 2 {
         sqlx::query(
-            "INSERT OR REPLACE INTO metrics_raw (target, ts, cpu, mem, rx, tx, pids)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "UPDATE metric_targets SET mem_limit = l.value->>1
+             FROM json_each(?) AS l WHERE metric_targets.id = l.value->>0",
         )
-        .bind(row.target)
-        .bind(ts)
-        .bind(s.cpu)
-        .bind(s.mem)
-        .bind(s.rx)
-        .bind(s.tx)
-        .bind(s.pids)
+        .bind(limits)
         .execute(&mut *tx)
         .await?;
-        if let Some(limit) = row.mem_limit {
-            sqlx::query("UPDATE metric_targets SET mem_limit = ? WHERE id = ?")
-                .bind(limit)
-                .bind(row.target)
-                .execute(&mut *tx)
-                .await?;
-        }
     }
     tx.commit().await
 }
@@ -525,6 +545,54 @@ mod tests {
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         assert_ne!(a, other);
+    }
+
+    #[tokio::test]
+    async fn a_tick_of_many_targets_writes_every_row_and_changed_limit() {
+        let db = db().await;
+        let mut rows = Vec::new();
+        for i in 0..60 {
+            let target = ensure_target(&db, &Owner::new(TargetKind::App, format!("a{i}")))
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            rows.push(TickRow {
+                target,
+                sample: Sample {
+                    cpu: i,
+                    mem: i * 1000,
+                    rx: i64::MAX,
+                    tx: 0,
+                    pids: 3,
+                },
+                mem_limit: (i % 3 == 0).then_some(4096 + i),
+            });
+        }
+        insert_tick(&db, 1_700_000_000, &rows)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let stored: Vec<(i64, i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
+            "SELECT r.target, r.cpu, r.mem, r.rx, r.pids, r.ts, t.mem_limit
+             FROM metrics_raw r JOIN metric_targets t ON t.id = r.target ORDER BY r.target",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(stored.len(), 60);
+        for (row, want) in stored.iter().zip(&rows) {
+            let limit = want.mem_limit.unwrap_or(0);
+            assert_eq!(
+                *row,
+                (
+                    want.target,
+                    want.sample.cpu,
+                    want.sample.mem,
+                    i64::MAX,
+                    3,
+                    1_700_000_000,
+                    limit
+                )
+            );
+        }
     }
 
     #[tokio::test]
