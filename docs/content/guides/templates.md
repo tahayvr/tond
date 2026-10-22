@@ -97,7 +97,11 @@ The app is an ordinary Docker Compose app from here on. Change its environment v
 
 ### Upgrade to a newer template version
 
-When a Tond release ships a newer version of the template, the app's **Overview** shows **Update available** with the old and new version and the new version's upgrade notes. Read them, then choose **Upgrade to …**. Tond:
+When a Tond release ships a newer version of the template, the app's **Overview** shows **Update available** with the old and new version and the new version's upgrade notes. Read them, then choose **Upgrade to …**.
+
+![An app's overview with Update available, its upgrade notes and a reminder that a setting still uses the old address](/img/templates/update-available.light.webp)
+
+Tond:
 
 1. takes a snapshot of the app's data first, and changes nothing if the snapshot fails;
 2. replaces the compose file with the new version's;

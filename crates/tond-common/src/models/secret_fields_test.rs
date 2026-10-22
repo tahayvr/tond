@@ -79,6 +79,11 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "a template's generated first-login credentials, shown once to the deployer",
     ),
     (
+        "TemplateUpgradeResponse",
+        "credentials",
+        "credentials a newer template version adds, generated and shown once to the upgrader",
+    ),
+    (
         "ManagedDatabaseResponse",
         "custom_external_url",
         "masked with mask_url_password",

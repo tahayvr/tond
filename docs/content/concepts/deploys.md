@@ -162,6 +162,8 @@ A compose deployment can be restored if it succeeded, its compose file was recor
 
 If the restored file lacks a service that runs now, the rollback parks that service instead of deleting it: the service stops and its domains stop being routed, but Tond keeps them and routes them again when a later deploy brings the service back. The rollback dialog lists what it would park before you confirm. See [Parked services](/guides/sources#parked-services).
 
+![The rollback dialog listing a service the older compose file lacks, with its domain](/img/deploys/rollback-parks.light.webp)
+
 > [!NOTE]
 > A rollback restores code, not data. To undo a change to an app's volume data, restore a snapshot (see below).
 
