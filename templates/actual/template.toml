@@ -10,16 +10,32 @@ website = "https://actualbudget.org"
 docs = "https://actualbudget.org/docs/install/docker"
 repository = "https://github.com/actualbudget/actual"
 ram_mb = 120
-setup_notes = "Open the app right away and set the server password; anyone who opens it first could set it otherwise. Then create or import a budget."
+setup_notes = "Sign in with the server password shown after deploy (also kept as SERVER_PASSWORD on the Environment tab), then create or import a budget."
 upgrade_notes = "Actual releases monthly (YY.M). Change the image tag and redeploy; snapshot the app first."
-post_deploy_checks = ["Set the server password", "Create or import a budget"]
+post_deploy_checks = ["Sign in with the server password", "Create or import a budget"]
 
 [public]
 service = "actual"
 port = 5006
 health_path = "/health"
 
+[[inputs]]
+key = "SERVER_PASSWORD"
+label = "Server password"
+kind = "password"
+generate = "password"
+credential = true
+
 [[volumes]]
 service = "actual"
 path = "./data"
 description = "Budget files and the server's account database"
+
+# Whoever opens a fresh server first sets its password. Tond sets it through
+# the server's bootstrap endpoint before the app is routed (a retry that finds
+# it set checks that this password signs in).
+[[post_deploy]]
+service = "actual"
+description = "Set the server password"
+env = ["SERVER_PASSWORD"]
+command = ["node", "-e", "const u='http://127.0.0.1:5006/account/',p=process.env.SERVER_PASSWORD,post=(path)=>fetch(u+path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({password:p})}).then(r=>r.json());post('bootstrap').then(b=>b.status==='ok'?b:post('login')).then(r=>{if(r.status!=='ok'||(r.data&&r.data.token===null))throw new Error(JSON.stringify(r));}).catch(e=>{console.error(String(e));process.exit(1);});"]

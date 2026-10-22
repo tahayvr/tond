@@ -11,9 +11,9 @@ docs = "https://docs.mattermost.com/deployment-guide/server/deploy-containers.ht
 repository = "https://github.com/mattermost/mattermost"
 architectures = ["amd64"]
 ram_mb = 800
-setup_notes = "Open the app right away: the first account created becomes the system admin. Then create a team and invite people."
+setup_notes = "Sign in as the system admin with the password shown after deploy (also kept as ADMIN_PASSWORD on the Environment tab), create a team and invite people: sign-up needs an invitation."
 upgrade_notes = "Change the image to a newer tag and redeploy; the database is migrated on start. Stay on Extended Support Releases for fewer upgrades, and snapshot first."
-post_deploy_checks = ["Create the admin account", "Configure SMTP in the System Console for invites and notifications"]
+post_deploy_checks = ["Sign in as the system admin", "Configure SMTP in the System Console for invites and notifications"]
 
 [public]
 service = "mattermost"
@@ -29,6 +29,23 @@ value = "{app_url}"
 key = "DB_PASSWORD"
 label = "Database password"
 generate = "password"
+
+[[inputs]]
+key = "ADMIN_USERNAME"
+label = "System admin username"
+default = "sysadmin"
+
+[[inputs]]
+key = "ADMIN_EMAIL"
+label = "System admin email"
+kind = "email"
+
+[[inputs]]
+key = "ADMIN_PASSWORD"
+label = "System admin password"
+kind = "password"
+generate = "password"
+credential = true
 
 [[volumes]]
 service = "mattermost"
@@ -52,3 +69,12 @@ owner = "2000:2000"
 service = "db"
 path = "./postgres"
 description = "PostgreSQL data: messages, users, channels and settings"
+
+# Mattermost makes the first account a system admin. mmctl creates it over the
+# local-mode socket (inside the container only) before the app is routed.
+[[post_deploy]]
+service = "mattermost"
+description = "Create the system admin account"
+env = ["ADMIN_USERNAME", "ADMIN_EMAIL", "ADMIN_PASSWORD"]
+command = ["sh", "-c", "mmctl --local user create --system-admin --username \"$ADMIN_USERNAME\" --email \"$ADMIN_EMAIL\" --password \"$ADMIN_PASSWORD\" || mmctl --local --json user search \"$ADMIN_USERNAME\" | grep -q \"\\\"username\\\": \\\"$ADMIN_USERNAME\\\"\""]
+timeout_secs = 180

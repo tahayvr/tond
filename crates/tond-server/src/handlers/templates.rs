@@ -2,6 +2,9 @@
 //
 //   GET  /api/templates              the catalog (tond_common::builtin_templates)
 //   POST /api/templates/{id}/deploy  create the app and start its first deploy
+//   POST /api/apps/{id}/admin-setup/dismiss
+//                                    hide the "create the admin account now"
+//                                    warning of a template app
 //
 // A template deploy is one server-side step so every client gets the same
 // behaviour: inputs are checked and generated, the app is created as an inline
@@ -20,10 +23,10 @@ use axum::{
     response::IntoResponse,
 };
 use tond_common::{
-    ApiResponse, App, CreateAppRequest, Scope, Template, TemplateCatalogResponse, TemplateContext,
-    TemplateCredential, TemplateDeployRequest, TemplateDeployResponse, TemplateHostMemory,
-    TemplateResponse, TondError, architecture_label, builtin_template, builtin_templates,
-    host_architecture, resolve_inputs,
+    AdminSetup, ApiResponse, App, AppResponse, CreateAppRequest, Scope, Template,
+    TemplateAdminSetup, TemplateCatalogResponse, TemplateContext, TemplateCredential,
+    TemplateDeployRequest, TemplateDeployResponse, TemplateHostMemory, TemplateResponse, TondError,
+    architecture_label, builtin_template, builtin_templates, host_architecture, resolve_inputs,
 };
 
 use crate::{
@@ -301,12 +304,22 @@ async fn deploy_from_template(
         return Err(e);
     }
 
-    sqlx::query("UPDATE apps SET template_id = ?, template_version = ? WHERE id = ?")
-        .bind(&template.manifest.id)
-        .bind(&template.manifest.version)
-        .bind(&app.id)
-        .execute(&state.db)
-        .await?;
+    // A seeded admin is created on the first deploy before the app is
+    // routed ('pending'); a first-visitor admin makes the app page warn.
+    let admin_setup = match template.manifest.admin_setup() {
+        TemplateAdminSetup::Seeded => Some(AdminSetup::PENDING),
+        TemplateAdminSetup::FirstVisitor => Some(AdminSetup::OPEN),
+        TemplateAdminSetup::None => None,
+    };
+    sqlx::query(
+        "UPDATE apps SET template_id = ?, template_version = ?, admin_setup = ? WHERE id = ?",
+    )
+    .bind(&template.manifest.id)
+    .bind(&template.manifest.version)
+    .bind(admin_setup)
+    .bind(&app.id)
+    .execute(&state.db)
+    .await?;
 
     let app_id = app.id.clone();
     let app_domain = app.domain.clone();
@@ -354,6 +367,45 @@ async fn deploy_from_template(
         setup_notes: template.manifest.setup_notes.clone(),
     };
     Ok(response)
+}
+
+/// POST /api/v1/apps/{id}/admin-setup/dismiss — the user has created (or
+/// secured) the admin account: stop warning about it. Only a warning
+/// ('open' or 'failed') can be dismissed; anything else is left as is.
+pub async fn dismiss_admin_setup(
+    _rate: RateLimit,
+    auth: Authz<scope::AppsWrite>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let app = super::fetch_app(&state.db, &id).await?;
+    let dismissed = sqlx::query(
+        "UPDATE apps SET admin_setup = ?, admin_setup_error = NULL, updated_at = datetime('now')
+         WHERE id = ? AND admin_setup IN (?, ?)",
+    )
+    .bind(AdminSetup::DISMISSED)
+    .bind(&app.id)
+    .bind(AdminSetup::OPEN)
+    .bind(AdminSetup::FAILED)
+    .execute(&state.db)
+    .await?
+    .rows_affected();
+    if dismissed > 0 {
+        write_audit_log(
+            &state.db,
+            Some(&app.id),
+            Some(&app.name),
+            "app.admin_setup_dismiss",
+            &auth.audit_actor(),
+            None,
+        )
+        .await;
+    }
+    let app = super::fetch_app(&state.db, &app.id).await?;
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(AppResponse::from(app))),
+    ))
 }
 
 #[cfg(test)]
@@ -634,11 +686,14 @@ mod tests {
                     compose_policy::format_errors(&errors)
                 );
             }
-            // Every input reaches compose (no reserved names are dropped).
+            // Every input the file uses reaches compose (no reserved names
+            // are dropped); the others are read by post_deploy commands.
+            let used = tond_common::compose_variables(&t.compose).unwrap_or_else(|e| panic!("{e}"));
             let env: BTreeMap<String, String> = t
                 .manifest
                 .inputs
                 .iter()
+                .filter(|i| used.contains(&i.key))
                 .map(|i| (i.key.clone(), "x".to_string()))
                 .collect();
             assert_eq!(
@@ -712,6 +767,98 @@ mod tests {
             .unwrap_or_else(|| panic!("a taken domain is refused"));
         assert_eq!(err.0.status_code(), 400);
         assert_eq!(app_count(&state).await, 1);
+    }
+
+    async fn admin_setup_of(state: &AppState, name: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT admin_setup FROM apps WHERE name = ?")
+            .bind(name)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    async fn dismiss(state: &AppState, name: &str) -> serde_json::Value {
+        let id: String = sqlx::query_scalar("SELECT id FROM apps WHERE name = ?")
+            .bind(name)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let response = dismiss_admin_setup(
+            RateLimit,
+            Authz::unchecked(Principal::test_user(Role::Admin)),
+            State(state.clone()),
+            Path(id),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{}", e.0))
+        .into_response();
+        response_json(response).await
+    }
+
+    #[tokio::test]
+    async fn template_deploys_record_how_the_admin_account_is_created() {
+        let state = test_state().await;
+        let dir = tmp();
+        // Umami's default login is replaced before the app is routed.
+        let body = deploy(&state, dir.path(), "umami", deploy_request("stats", &[]))
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.0));
+        assert!(
+            body["data"]["credentials"]
+                .as_array()
+                .is_some_and(|c| c.iter().any(|c| c["key"] == "ADMIN_PASSWORD")),
+            "the seeded admin password is shown once"
+        );
+        assert_eq!(
+            admin_setup_of(&state, "stats").await.as_deref(),
+            Some("pending")
+        );
+        // Memos hands the admin account to its first visitor: the page warns.
+        deploy(&state, dir.path(), "memos", deploy_request("notes", &[]))
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.0));
+        assert_eq!(
+            admin_setup_of(&state, "notes").await.as_deref(),
+            Some("open")
+        );
+        // Nothing to claim: nothing recorded.
+        deploy(&state, dir.path(), "it-tools", deploy_request("tools", &[]))
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.0));
+        assert_eq!(admin_setup_of(&state, "tools").await, None);
+    }
+
+    #[tokio::test]
+    async fn dismissing_clears_only_a_warning() {
+        let state = test_state().await;
+        let dir = tmp();
+        deploy(&state, dir.path(), "memos", deploy_request("notes", &[]))
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.0));
+        let body = dismiss(&state, "notes").await;
+        assert_eq!(body["data"]["admin_setup"], "dismissed");
+        assert_eq!(
+            admin_setup_of(&state, "notes").await.as_deref(),
+            Some("dismissed")
+        );
+
+        // A failed seed warns too, with its error, until dismissed.
+        sqlx::query(
+            "UPDATE apps SET admin_setup = 'failed', admin_setup_error = 'boom' WHERE name = 'notes'",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+        let body = dismiss(&state, "notes").await;
+        assert_eq!(body["data"]["admin_setup"], "dismissed");
+        assert!(body["data"]["admin_setup_error"].is_null());
+
+        // A pending seed isn't a warning: dismissing leaves it alone.
+        deploy(&state, dir.path(), "umami", deploy_request("stats", &[]))
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.0));
+        let body = dismiss(&state, "stats").await;
+        assert_eq!(body["data"]["admin_setup"], "pending");
     }
 
     #[test]

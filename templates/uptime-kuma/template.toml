@@ -10,9 +10,11 @@ website = "https://uptime.kuma.pet"
 docs = "https://github.com/louislam/uptime-kuma/wiki"
 repository = "https://github.com/louislam/uptime-kuma"
 ram_mb = 230
-setup_notes = "Open the app right away: the first visitor creates the admin account. Choose the embedded SQLite database when asked."
+setup_notes = "Open the app right away: the first visitor creates the admin account, so anyone who reaches it first can. Choose the embedded SQLite database when asked."
 upgrade_notes = "Change the image to a newer 2.x tag and redeploy. Take a snapshot first; the database is migrated on start."
 post_deploy_checks = ["Create the admin account", "Add a monitor and a notification channel"]
+
+first_visitor_admin = true
 
 [public]
 service = "uptime-kuma"

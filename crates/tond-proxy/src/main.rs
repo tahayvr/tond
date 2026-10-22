@@ -1568,7 +1568,8 @@ mod tests {
                 host_port INTEGER,
                 readiness TEXT NOT NULL DEFAULT 'http',
                 access_log INTEGER NOT NULL DEFAULT 0,
-                access_log_query INTEGER NOT NULL DEFAULT 0
+                access_log_query INTEGER NOT NULL DEFAULT 0,
+                admin_setup TEXT
             )",
         )
         .execute(&pool)
@@ -2769,7 +2770,7 @@ mod tests {
             "CREATE TABLE route_state (id INTEGER PRIMARY KEY, version INTEGER NOT NULL)",
             "INSERT INTO route_state VALUES (1, 1)",
             "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-            "CREATE TABLE apps (id TEXT PRIMARY KEY, name TEXT, domain TEXT, status TEXT, source_type TEXT NOT NULL DEFAULT 'git', host_port INTEGER, readiness TEXT NOT NULL DEFAULT 'http', access_log INTEGER NOT NULL DEFAULT 0, access_log_query INTEGER NOT NULL DEFAULT 0)",
+            "CREATE TABLE apps (id TEXT PRIMARY KEY, name TEXT, domain TEXT, status TEXT, source_type TEXT NOT NULL DEFAULT 'git', host_port INTEGER, readiness TEXT NOT NULL DEFAULT 'http', access_log INTEGER NOT NULL DEFAULT 0, access_log_query INTEGER NOT NULL DEFAULT 0, admin_setup TEXT)",
             "CREATE TABLE preview_deployments (id TEXT PRIMARY KEY, subdomain TEXT, host_port INTEGER, status TEXT, expires_at TEXT)",
             "CREATE TABLE compose_services (app_id TEXT NOT NULL, name TEXT NOT NULL, host_port INTEGER, PRIMARY KEY(app_id, name))",
             "INSERT INTO apps (id, name, domain, status, host_port) VALUES ('a', 'web', 'web.example.com', 'running', 4100)",

@@ -14,5 +14,9 @@ services:
       GITEA__server__DISABLE_SSH: "true"
       GITEA__server__START_SSH_SERVER: "false"
       GITEA__service__DISABLE_REGISTRATION: "true"
+      # No install page: Tond creates the administrator before the app is
+      # reachable (post_deploy in template.toml).
+      GITEA__security__INSTALL_LOCK: "true"
+      GITEA__security__SECRET_KEY: ${SECRET_KEY}
     volumes:
       - ./data:/data

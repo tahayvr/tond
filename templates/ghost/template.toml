@@ -10,9 +10,11 @@ website = "https://ghost.org"
 docs = "https://ghost.org/docs/config/"
 repository = "https://github.com/TryGhost/Ghost"
 ram_mb = 700
-setup_notes = "Open /ghost on the app's address right away to create the owner account. To send newsletters and sign-in emails, add mail settings (mail__transport and friends) as environment variables on the app's Environment tab."
+setup_notes = "Open /ghost on the app's address right away to create the owner account: anyone who reaches it first can. To send newsletters and sign-in emails, add mail settings (mail__transport and friends) as environment variables on the app's Environment tab."
 upgrade_notes = "The image follows Ghost 6.x: redeploying pulls the tag as stored. To move to a new major, change the tag, take a snapshot first and follow Ghost's upgrade guide."
 post_deploy_checks = ["Create the owner account at /ghost", "Configure mail so members can sign in"]
+
+first_visitor_admin = true
 
 [public]
 service = "ghost"

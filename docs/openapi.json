@@ -1272,6 +1272,21 @@
       },
       "AppResponse": {
         "properties": {
+          "admin_setup": {
+            "default": null,
+            "description": "How the app's admin account comes to exist: \"pending\" (Tond creates\nit on the first successful deploy), \"done\", \"failed\" (see\n`admin_setup_error`), \"open\" (the first visitor creates it) or\n\"dismissed\". The dashboard warns while it is \"open\" or \"failed\".",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "admin_setup_error": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "auto_deploy": {
             "description": "Whether auto-deploy on webhook push is enabled",
             "type": "boolean"
@@ -1511,6 +1526,8 @@
           "domain",
           "template_id",
           "template_version",
+          "admin_setup",
+          "admin_setup_error",
           "source_type",
           "source_url",
           "branch",
@@ -10522,6 +10539,26 @@
         ],
         "type": "object"
       },
+      "TemplateAdminSetup": {
+        "description": "How a template's admin account comes to exist.",
+        "oneOf": [
+          {
+            "const": "none",
+            "description": "No admin account to claim (or it is set from an input at start).",
+            "type": "string"
+          },
+          {
+            "const": "seeded",
+            "description": "Tond creates it (or replaces the default login) before routing the app.",
+            "type": "string"
+          },
+          {
+            "const": "first_visitor",
+            "description": "Whoever opens the app first creates it: open it right after deploy.",
+            "type": "string"
+          }
+        ]
+      },
       "TemplateCatalogResponse": {
         "description": "GET /api/templates",
         "properties": {
@@ -10770,6 +10807,11 @@
               "null"
             ]
           },
+          "admin_setup": {
+            "$ref": "#/components/schemas/TemplateAdminSetup",
+            "default": "none",
+            "description": "How the admin account comes to exist: pre-seeded by Tond, created by\nthe first visitor, or nothing to claim."
+          },
           "architectures": {
             "default": [
               "amd64",
@@ -10900,6 +10942,7 @@
           "setup_notes",
           "upgrade_notes",
           "post_deploy_checks",
+          "admin_setup",
           "compose"
         ],
         "type": "object"
@@ -14917,6 +14960,94 @@
         ],
         "x-tond-scopes": [
           "logs:read"
+        ]
+      }
+    },
+    "/api/v1/apps/{id}/admin-setup/dismiss": {
+      "post": {
+        "description": "Template apps whose first visitor creates the admin account (`admin_setup` \"open\"), or whose admin couldn't be pre-seeded (\"failed\"), carry a warning until it is dismissed; the app then has `admin_setup` \"dismissed\". Other values are left unchanged.",
+        "operationId": "dismiss_admin_setup",
+        "parameters": [
+          {
+            "description": "App id or name.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/AppResponse"
+                    },
+                    "message": {
+                      "description": "Informational note, when there is one.",
+                      "type": "string"
+                    },
+                    "success": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "success",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "csrfHeader": [],
+            "sessionCookie": []
+          }
+        ],
+        "summary": "Dismiss the unclaimed-admin warning of a template app",
+        "tags": [
+          "Apps"
+        ],
+        "x-tond-scopes": [
+          "apps:write"
         ]
       }
     },

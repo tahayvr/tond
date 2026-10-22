@@ -580,6 +580,10 @@ async fn run_with_source(
         return Err(e);
     }
 
+    // Template apps: create the admin account (or replace a default login)
+    // while the app is up but not yet routed, so nobody can claim it first.
+    super::template_setup::run_pending(state, app, &project, trigger).await;
+
     // ── Release ──
     progress::start(state, &app_id, DeployPhase::Release).await;
     let release = images::deployment_tag(&app_name, deployment_id);
