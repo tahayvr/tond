@@ -282,6 +282,17 @@ pub fn entries() -> Vec<Doc> {
             .returns::<TemplateDeployResponse>()
             .scopes(&["apps:deploy", "settings:write"])
             .about("Inputs left empty are generated or defaulted; `credentials` (first-login passwords) are returned only in this response. 409 INSUFFICIENT_MEMORY when the template needs more memory than is free, unless `allow_low_memory` is true."),
+        e("GET /api/v1/apps/{id}/template", "An app's template: update available, upgrade notes, stale domain values")
+            .returns::<TemplateAppStatus>()
+            .about("For apps deployed from a template. `domain_env` lists env values made from the app's address (`{app_url}`, `{app_host}`) that no longer match its primary domain; hand-edited ones are in `domain_env_edited` and never changed."),
+        e("POST /api/v1/apps/{id}/template/domain-env", "Update the env values made from the app's old domain")
+            .returns::<TemplateDomainEnvResponse>()
+            .about("Applies `domain_env` from GET …/template. `redeploy: true` (needs `apps:deploy`) also starts a deploy so the containers get the new values."),
+        e("POST /api/v1/apps/{id}/template/upgrade", "Move an app to the catalog's newer template version")
+            .accepted()
+            .returns::<TemplateUpgradeResponse>()
+            .scopes(&["apps:write", "apps:deploy", "settings:write"])
+            .about("Takes a snapshot of the app's data first (nothing changes if it fails), replaces the compose file with the new version's, keeps every env value and generated secret (inputs the new version adds are generated or defaulted; new credentials are returned once) and deploys. 409 when the compose file was edited since it was deployed, or the app is already current. Roll back with the normal deployment rollback."),
         // ── Registry credentials ──
         e("GET /api/v1/registry-credentials", "List container registry credentials").returns::<Vec<RegistryCredentialResponse>>(),
         e("POST /api/v1/registry-credentials", "Add a registry credential").created().returns::<RegistryCredentialResponse>(),

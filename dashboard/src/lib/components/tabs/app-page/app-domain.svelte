@@ -35,6 +35,7 @@
 		type DomainCheck
 	} from '$lib/api';
 	import { confirmAction } from '$lib/confirm.svelte';
+	import { offerTemplateDomainUpdate } from '$lib/template-app';
 	import {
 		KIND_LABELS,
 		domainSummary,
@@ -170,7 +171,13 @@
 
 	/** Every change returns the full list; keep the selection and tell the parent. */
 	async function applied(list: AppDomain[], select?: string) {
+		const oldPrimary = primary?.domain ?? null;
 		domains = list;
+		const newPrimary = list.find((d) => d.kind === 'primary')?.domain ?? null;
+		if (app.template_id && newPrimary && newPrimary !== oldPrimary) {
+			// Values the template made from the old address: offer to update them.
+			void offerTemplateDomainUpdate(app.id, app.name);
+		}
 		if (select) selected = select;
 		certKey += 1;
 		await Promise.all([refreshCerts(), onChanged?.()]);

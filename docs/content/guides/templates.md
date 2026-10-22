@@ -93,7 +93,24 @@ The CLI sends one request to the server, prints the address and the one-time cre
 - Follow the setup notes and post-deploy checks. Many apps make the first account you register the owner, so register it right away.
 - The app's **Overview** says which template and version it was deployed from, with a link to the template's upgrade notes.
 
-The app is an ordinary Docker Compose app from here on. Change its environment variables, compose file and service domains like any other (see [Docker Compose apps](/guides/sources#docker-compose-apps)). To upgrade, follow the template's upgrade notes: usually you change an image tag in the compose file and deploy again. Snapshot the app first; its data lives in the app's volume directory, so [snapshots](/concepts/backups) include it.
+The app is an ordinary Docker Compose app from here on. Change its environment variables, compose file and service domains like any other (see [Docker Compose apps](/guides/sources#docker-compose-apps)).
+
+### Upgrade to a newer template version
+
+When a Tond release ships a newer version of the template, the app's **Overview** shows **Update available** with the old and new version and the new version's upgrade notes. Read them, then choose **Upgrade to …**. Tond:
+
+1. takes a snapshot of the app's data first, and changes nothing if the snapshot fails;
+2. replaces the compose file with the new version's;
+3. keeps every environment variable and generated password; settings the new version adds are generated or take their default, and new first-login credentials are shown once;
+4. starts a deploy.
+
+If the new version misbehaves, roll back to the previous deployment on the **Deployments** tab: that restores the previous compose file and images (and the app shows the older template version again). Restore the snapshot too if the new version already changed the data.
+
+Tond records the compose file it deployed from the template. If you edited the file since, the one-click upgrade is refused, because it would throw your edits away: apply the new version by hand with the upgrade notes, usually by changing an image tag and deploying, after taking a snapshot. Upgrading needs the admin scopes for compose files (`settings:write`) and `apps:deploy`. The API is `GET /api/v1/apps/{id}/template` (status) and `POST /api/v1/apps/{id}/template/upgrade`.
+
+### Change the domain later
+
+Some templates store the app's address in an environment variable, for example a site URL or a trusted origin. Tond remembers which ones. When you change the app's primary domain, it offers to update those values to the new address and redeploy, so links, logins and redirects follow. It only updates values that are still what the template set; a value you edited by hand is left alone. If you skip the offer, the **Overview** keeps a reminder with **Update and redeploy…**. The API is `POST /api/v1/apps/{id}/template/domain-env` with `{"redeploy": true}`.
 
 ## The template format
 

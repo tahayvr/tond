@@ -1048,6 +1048,63 @@ export async function updateService(
 	});
 }
 
+// ── Apps deployed from a template ──
+
+/** An env value made from the app's address that no longer matches its primary domain. */
+export interface TemplateDomainEnvChange {
+	key: string;
+	current: string;
+	proposed: string;
+}
+
+/** GET /apps/{id}/template */
+export interface TemplateAppStatus {
+	template_id: string;
+	template_name: string | null;
+	/** The template version the app runs */
+	version: string | null;
+	/** The catalog's version (null when the catalog no longer has the template) */
+	latest_version: string | null;
+	update_available: boolean;
+	upgrade_notes: string | null;
+	/** Why a one-click upgrade isn't possible (e.g. the compose file was edited); null when it is */
+	upgrade_blocked: string | null;
+	/** Values to update after a primary-domain change */
+	domain_env: TemplateDomainEnvChange[];
+	/** Domain-derived keys edited by hand (never changed by Tond) */
+	domain_env_edited: string[];
+}
+
+export interface TemplateUpgradeResult {
+	from_version: string | null;
+	to_version: string;
+	snapshot_id: string | null;
+	deployment_id: string;
+	added_env: string[];
+	credentials: TemplateCredential[];
+	upgrade_notes: string | null;
+}
+
+export async function getAppTemplate(appId: string): Promise<TemplateAppStatus> {
+	return request<TemplateAppStatus>(`/apps/${appId}/template`);
+}
+
+/** Update the env values made from the old domain; `redeploy` also starts a deploy. */
+export async function syncTemplateDomainEnv(
+	appId: string,
+	data: { redeploy: boolean }
+): Promise<{ updated: TemplateDomainEnvChange[]; deployment_id: string | null }> {
+	return request(`/apps/${appId}/template/domain-env`, {
+		method: 'POST',
+		body: JSON.stringify(data)
+	});
+}
+
+/** Snapshot, replace the compose file with the catalog's newer version, keep env, deploy. */
+export async function upgradeAppTemplate(appId: string): Promise<TemplateUpgradeResult> {
+	return request<TemplateUpgradeResult>(`/apps/${appId}/template/upgrade`, { method: 'POST' });
+}
+
 /** Remove a parked service (one a rollback took out of the compose file) and its domains. */
 export async function removeParkedService(
 	appId: string,

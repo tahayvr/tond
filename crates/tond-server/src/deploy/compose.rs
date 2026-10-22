@@ -649,6 +649,8 @@ async fn run_with_source(
             .execute(&mut *tx)
             .await?;
         app.compose_content = Some(source.content.clone());
+        // A template app back on an older template file is on that version.
+        crate::template_apps::follow_restored_compose(&mut tx, &app_id, &source.content).await?;
     }
     // The app's own domain/host_port are not routed for compose apps: routes
     // are the service domains (app_domains + compose_services.host_port).

@@ -19,6 +19,7 @@
 	} from '$lib/compose';
 	import { useAction } from '$lib/action.svelte';
 	import { confirmAction } from '$lib/confirm.svelte';
+	import { offerTemplateDomainUpdate } from '$lib/template-app';
 	import { pollWhileVisible } from '$lib/polling';
 	import { appTabHref } from '$lib/tabs';
 	import { safeUrl } from '$lib/utils';
@@ -381,6 +382,7 @@
 			if (services && updated) {
 				services = services.map((s) => (s.name === updated.name ? updated : s));
 			}
+			if (app.template_id) void offerTemplateDomainUpdate(app.id, app.name);
 		}}
 	/>
 	<ServiceLogsSheet appId={app.id} service={logsFor} onclose={() => (logsFor = null)} />

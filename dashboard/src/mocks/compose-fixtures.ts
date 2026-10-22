@@ -77,6 +77,31 @@ export const MOCK_COMPOSE_APP: App = {
 	updated_at: '2025-03-09T10:00:00.000Z'
 };
 
+/**
+ * An app deployed from the linkding template, one version behind the catalog,
+ * whose primary domain moved after the deploy (its TRUSTED_ORIGIN still names
+ * the old address).
+ */
+export const MOCK_TEMPLATE_APP: App = {
+	...MOCK_COMPOSE_APP,
+	id: 'app_links',
+	name: 'links',
+	domain: 'links.example.com',
+	container_port: 9090,
+	health_check_path: '/health',
+	compose_content: 'services:\n  linkding:\n    image: sissbruecker/linkding:1.46.0\n',
+	template_id: 'linkding',
+	template_version: '1.46'
+};
+
+/** What the template derived from the app's address, per app (mock state seed). */
+export const MOCK_TEMPLATE_DOMAIN_ENV: Record<
+	string,
+	{ host: string; keys: Record<string, string> }
+> = {
+	app_links: { host: 'links.apps.example.com', keys: { TRUSTED_ORIGIN: '{app_url}' } }
+};
+
 const MiB = 1_048_576;
 
 export const MOCK_COMPOSE_SERVICES: Record<string, ComposeService[]> = {

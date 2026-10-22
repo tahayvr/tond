@@ -120,6 +120,8 @@ import { observeHandlers } from './observe';
 import { updateHandlers } from './updates';
 import {
 	MOCK_COMPOSE_APP,
+	MOCK_TEMPLATE_APP,
+	MOCK_TEMPLATE_DOMAIN_ENV,
 	MOCK_COMPOSE_DEPLOYMENTS,
 	MOCK_COMPOSE_SERVICES,
 	mockComposeSpecs,
@@ -564,7 +566,47 @@ function mockNextRuns(schedule: string, count: number): string[] | null {
 const MOCK_STEP_UP_PASSWORD = 'ValidPass123!';
 // ticket → target, consumed by the terminal WebSocket mock
 const terminalTickets = new Map<string, { kind: string; id: string }>();
-let apps: App[] = structuredClone([...MOCK_APPS, MOCK_COMPOSE_APP]);
+let apps: App[] = structuredClone([...MOCK_APPS, MOCK_COMPOSE_APP, MOCK_TEMPLATE_APP]);
+const templateDomainEnv = structuredClone(MOCK_TEMPLATE_DOMAIN_ENV);
+
+/** Mock of the server's template_version_newer: dotted numbers compare numerically. */
+function versionNewer(candidate: string, current: string): boolean {
+	const a = candidate.replace(/^v/i, '').split(/[.\-+]/);
+	const b = current.replace(/^v/i, '').split(/[.\-+]/);
+	for (let i = 0; i < Math.min(a.length, b.length); i++) {
+		const [x, y] = [Number(a[i]), Number(b[i])];
+		const cmp = Number.isNaN(x) || Number.isNaN(y) ? a[i].localeCompare(b[i]) : x - y;
+		if (cmp !== 0) return cmp > 0;
+	}
+	return a.length > b.length;
+}
+
+function templateStatus(app: App) {
+	const template = templates.find((t) => t.id === app.template_id);
+	const recorded = templateDomainEnv[app.id];
+	const url = (host: string) => `https://${host}`;
+	const domainEnv =
+		recorded && app.domain && app.domain !== recorded.host
+			? Object.entries(recorded.keys).map(([key, t]) => ({
+					key,
+					current: t.replace('{app_url}', url(recorded.host)).replace('{app_host}', recorded.host),
+					proposed: t.replace('{app_url}', url(app.domain!)).replace('{app_host}', app.domain!)
+				}))
+			: [];
+	const updateAvailable =
+		!!template && !!app.template_version && versionNewer(template.version, app.template_version);
+	return {
+		template_id: app.template_id!,
+		template_name: template?.name ?? null,
+		version: app.template_version ?? null,
+		latest_version: template?.version ?? null,
+		update_available: updateAvailable,
+		upgrade_notes: template?.upgrade_notes ?? null,
+		upgrade_blocked: null,
+		domain_env: domainEnv,
+		domain_env_edited: []
+	};
+}
 /** Services of compose apps (app id → services). */
 const composeServices: Record<string, ComposeService[]> = structuredClone(MOCK_COMPOSE_SERVICES);
 let projects: Project[] = structuredClone(MOCK_PROJECTS);
@@ -3070,6 +3112,63 @@ export const handlers = [
 			redeploy_required: updated.redeploy_required,
 			warnings: []
 		});
+	}),
+
+	// ── Apps deployed from a template ──
+	http.get('/api/v1/apps/:id/template', async ({ params }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id || a.name === params.id);
+		if (!app) return err('App not found', 404);
+		if (!app.template_id)
+			return err(`Invalid input: '${app.name}' wasn't deployed from a template`);
+		return ok(templateStatus(app));
+	}),
+
+	http.post('/api/v1/apps/:id/template/domain-env', async ({ params, request }) => {
+		await delay(LATENCY);
+		const app = apps.find((a) => a.id === params.id);
+		if (!app?.template_id) return err('App not found', 404);
+		const body = (await request.json()) as { redeploy?: boolean };
+		const updated = templateStatus(app).domain_env;
+		if (templateDomainEnv[app.id] && app.domain) templateDomainEnv[app.id].host = app.domain;
+		const d =
+			body.redeploy && updated.length
+				? startMockDeploy(app, { trigger_source: 'manual', trigger_detail: MOCK_USER.email })
+				: null;
+		return ok({ updated, deployment_id: d?.id ?? null });
+	}),
+
+	http.post('/api/v1/apps/:id/template/upgrade', async ({ params }) => {
+		await delay(LATENCY * 4); // the snapshot
+		const idx = apps.findIndex((a) => a.id === params.id);
+		if (idx < 0 || !apps[idx].template_id) return err('App not found', 404);
+		const status = templateStatus(apps[idx]);
+		if (!status.update_available || !status.latest_version) {
+			return err(`Conflict: ${apps[idx].name} is already on the catalog's version`, 409);
+		}
+		const from = apps[idx].template_version ?? null;
+		const template = templates.find((t) => t.id === apps[idx].template_id)!;
+		apps[idx] = {
+			...apps[idx],
+			template_version: status.latest_version,
+			compose_content: template.compose
+		};
+		const d = startMockDeploy(apps[idx], {
+			trigger_source: 'manual',
+			trigger_detail: MOCK_USER.email
+		});
+		return HttpResponse.json(
+			okBody({
+				from_version: from,
+				to_version: status.latest_version,
+				snapshot_id: `snap_${Date.now()}`,
+				deployment_id: d.id,
+				added_env: [],
+				credentials: [],
+				upgrade_notes: status.upgrade_notes
+			}),
+			{ status: 202 }
+		);
 	}),
 
 	http.delete('/api/v1/apps/:id/services/:service', async ({ params }) => {

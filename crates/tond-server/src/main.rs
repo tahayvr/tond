@@ -115,6 +115,7 @@ mod snapshot_archive;
 mod state;
 mod static_files;
 mod storage;
+mod template_apps;
 mod updates;
 mod upload;
 mod uptime;
