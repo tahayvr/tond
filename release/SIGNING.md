@@ -47,7 +47,8 @@ minisign -G -W -p release/minisign.pub -s tond-release.key   # -W: no password
 2. Store the content of `tond-release.key` as the `MINISIGN_SECRET_KEY` secret
    of the `release` environment (Settings → Environments; add required
    reviewers there), then delete the local file or keep it offline.
-3. Publish the updated web installers to tond.io.
+3. Push to `main`: the Site workflow (`.github/workflows/site.yml`) republishes
+   the web installers at tond.io/install and tond.io/update.
 
 The release workflow refuses to publish when the secret is missing, when
 `release/minisign.pub` has no key, or when a signature does not verify with

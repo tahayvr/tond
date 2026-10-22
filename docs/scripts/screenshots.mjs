@@ -1,19 +1,22 @@
 #!/usr/bin/env node
-// Dashboard screenshots for the docs, light and dark: `just docs-screenshots`.
+// Dashboard screenshots for the docs and the tond.io landing page, light and
+// dark: `just docs-screenshots`.
 //
 // Starts the dashboard's dev server with the mock API (VITE_MOCK_API=true,
 // VITE_DEV_AUTH_BYPASS=true) on a free port, drives headless Chrome with
 // playwright-core through the SHOTS below, and writes 2x WebP files to
 // public/img/<page>/<name>.<light|dark>.webp. Pages reference the light one
 // (`![…](/img/quickstart/home.light.webp)`); remark-themed-images shows the
-// one matching the reader's theme. Rerun it whenever the UI changes.
+// one matching the reader's theme. Shots with `site: 'landing'` go to
+// landing/public/img/ instead, for the landing page at tond.io/. Rerun it
+// whenever the UI changes.
 //
 // Needs Google Chrome (or set CHROME_PATH to a Chromium binary) and the
 // dashboard's node_modules (`pnpm install` in dashboard/).
 //
-// Usage: node scripts/screenshots.mjs [name-filter]   e.g. `upgrading`
+// Usage: node scripts/screenshots.mjs [name-filter]   e.g. `upgrading`, `landing`
 import { spawn } from 'node:child_process';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import sharp from 'sharp';
@@ -21,11 +24,13 @@ import { chromium } from 'playwright-core';
 
 const DASHBOARD = fileURLToPath(new URL('../../dashboard/', import.meta.url));
 const OUT = fileURLToPath(new URL('../public/img/', import.meta.url));
+const LANDING_OUT = fileURLToPath(new URL('../landing/public/img/', import.meta.url));
 const VIEWPORT = { width: 1200, height: 760 };
 const QUALITY = 78;
 
 /**
- * page: the docs page the shot belongs to (a directory under public/img)
+ * page: the docs page the shot belongs to (a directory under public/img), or
+ *   for site: 'landing', the directory under landing/public/img
  * path: dashboard URL; scenario: `tond:mock-update` value for the updates mock
  * run(page): interactions before the shot; clip: CSS selector to crop to
  */
@@ -81,7 +86,13 @@ const SHOTS = [
 		run: async (p) => p.getByTestId('rollback-card').scrollIntoViewIfNeeded(),
 		clip: '[data-testid=rollback-card]',
 		pad: 16
-	}
+	},
+	// The landing page (tond.io/): a hero and a few feature shots.
+	{ site: 'landing', page: 'dashboard', name: 'app', path: '/apps/app_running' },
+	{ site: 'landing', page: 'dashboard', name: 'deployments', path: '/apps/app_running?tab=deployments' },
+	{ site: 'landing', page: 'dashboard', name: 'metrics', path: '/apps/app_running?tab=metrics' },
+	{ site: 'landing', page: 'dashboard', name: 'templates', path: '/templates' },
+	{ site: 'landing', page: 'dashboard', name: 'databases', path: '/databases' }
 ];
 
 function freePort() {
@@ -161,15 +172,58 @@ async function capture(browser, base, shot, theme) {
 	}
 	const png = await page.screenshot({ clip, animations: 'disabled' });
 	await context.close();
-	mkdirSync(`${OUT}${shot.page}`, { recursive: true });
-	const file = `${OUT}${shot.page}/${shot.name}.${theme}.webp`;
+	const out = shot.site === 'landing' ? LANDING_OUT : OUT;
+	mkdirSync(`${out}${shot.page}`, { recursive: true });
+	const file = `${out}${shot.page}/${shot.name}.${theme}.webp`;
 	await sharp(png).webp({ quality: QUALITY }).toFile(file);
 	return file;
 }
 
+/**
+ * The Open Graph image (landing/public/og.png, 1200x630): the wordmark, the
+ * tagline and the landing page's dark hero shot. Rendered from inline HTML
+ * with the bundled font, so it needs no server.
+ */
+async function ogImage(browser) {
+	const dataUrl = (file, type) => `data:${type};base64,${readFileSync(file).toString('base64')}`;
+	const font = dataUrl(
+		fileURLToPath(
+			import.meta.resolve(
+				'@fontsource-variable/jetbrains-mono/files/jetbrains-mono-latin-wght-normal.woff2'
+			)
+		),
+		'font/woff2'
+	);
+	const shot = dataUrl(`${LANDING_OUT}dashboard/metrics.dark.webp`, 'image/webp');
+	const logo = readFileSync(new URL('../src/components/Logo.astro', import.meta.url), 'utf8')
+		.match(/<svg[\s\S]*<\/svg>/)[0]
+		.replace(/class=\{className\}/, 'class="logo"');
+	const html = `<!doctype html><html><head><style>
+		@font-face { font-family: JBM; src: url(${font}) format('woff2'); font-weight: 100 800; }
+		html, body { margin: 0; width: 1200px; height: 630px; overflow: hidden; }
+		body { background: #0a0a0a; color: #fafafa; font-family: JBM, monospace; position: relative; }
+		.logo { position: absolute; left: 72px; top: 72px; height: 44px; width: auto; color: #fafafa; }
+		h1 { position: absolute; left: 72px; top: 150px; width: 520px; margin: 0; font-size: 50px; line-height: 1.12; letter-spacing: -0.03em; font-weight: 700; }
+		p { position: absolute; left: 72px; bottom: 72px; width: 500px; margin: 0; font-size: 22px; line-height: 1.5; color: #b4b4b4; }
+		img { position: absolute; left: 640px; top: 72px; width: 900px; border: 1px solid #333; border-radius: 10px; }
+	</style></head><body>${logo}<h1>Apps and databases on one cheap VPS.</h1>
+	<p>Self-hosted PaaS for x86_64 and ARM64. tond.io</p><img src="${shot}" alt=""></body></html>`;
+	const context = await browser.newContext({ viewport: { width: 1200, height: 630 } });
+	const page = await context.newPage();
+	await page.setContent(html, { waitUntil: 'load' });
+	await page.evaluate(() => document.fonts.ready);
+	const png = await page.screenshot();
+	await context.close();
+	await sharp(png)
+		.png({ compressionLevel: 9, palette: true, quality: 90 })
+		.toFile(fileURLToPath(new URL('../landing/public/og.png', import.meta.url)));
+}
+
 async function main() {
 	const filter = process.argv[2];
-	const shots = SHOTS.filter((s) => !filter || `${s.page}/${s.name}`.includes(filter));
+	const shots = SHOTS.filter(
+		(s) => !filter || `${s.site ?? 'docs'}/${s.page}/${s.name}`.includes(filter)
+	);
 	const port = Number(process.env.TOND_SCREENSHOT_PORT) || (await freePort());
 	const { child, url } = await startDashboard(port);
 	const browser = await chromium.launch(
@@ -179,8 +233,12 @@ async function main() {
 		for (const shot of shots) {
 			for (const theme of ['light', 'dark']) {
 				const file = await capture(browser, url, shot, theme);
-				console.log(`  ${file.slice(OUT.length)}`);
+				console.log(`  ${file.slice(file.indexOf('/img/') + 1)}`);
 			}
+		}
+		if (!filter || 'landing/og'.includes(filter)) {
+			await ogImage(browser);
+			console.log('  og.png');
 		}
 	} finally {
 		await browser.close();

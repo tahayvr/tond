@@ -1,6 +1,9 @@
 #!/bin/sh
 # tond.io/install - Quick installer for Tond
-# This script downloads and installs the latest Tond release from tond.io/install
+# Served byte-for-byte at https://tond.io/install (docs/scripts/assemble-site.mjs).
+# It downloads the latest release from GitHub, verifies its checksum and
+# signature, and runs that release's own install.sh with your arguments
+# (`curl -fsSL https://tond.io/install | sudo bash -s -- <flags>`).
 
 set -e
 
