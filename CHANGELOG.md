@@ -104,6 +104,10 @@ baseline, so install 0.2.0 fresh.
   deployments, runs, audit entries, metrics and sessions.
 - Tond measures itself: process stats, background-loop health, and idle
   resource budgets checked in the end-to-end test.
+- Lower idle load with many apps and alert rules: metrics are written one
+  statement per flush, retention runs one query per rule instead of per app,
+  alert evaluation re-reads rules, apps and certificates only when they change,
+  and uptime probes reuse one TLS setup.
 
 ### Routing
 

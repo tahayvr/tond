@@ -41,7 +41,7 @@
 // newest seq/hash must match the remote copy. Remote entries missing locally,
 // or a different hash for the same seq, mean the local log was rewritten.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -258,6 +258,18 @@ async fn write_frames<S: AsyncWrite + Unpin>(stream: &mut S, frames: &[Vec<u8>])
     Ok(())
 }
 
+/// TLS configuration for syslog over TLS, built once: loading the system
+/// trust store reads and parses every certificate file.
+static SYSLOG_TLS: LazyLock<Result<Arc<rustls::ClientConfig>, String>> = LazyLock::new(|| {
+    use rustls_platform_verifier::ConfigVerifierExt;
+    rustls::ClientConfig::with_platform_verifier()
+        .map(Arc::new)
+        .map_err(|e| e.to_string())
+});
+
+/// One HTTP client (connection pool, TLS configuration) for webhook targets.
+static WEBHOOK_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
+
 pub async fn deliver_syslog(target: &SyslogTarget, frames: &[Vec<u8>]) -> Result<()> {
     let addr = (target.host.as_str(), target.port);
     let tcp = tokio::time::timeout(TIMEOUT, tokio::net::TcpStream::connect(addr))
@@ -266,12 +278,12 @@ pub async fn deliver_syslog(target: &SyslogTarget, frames: &[Vec<u8>]) -> Result
         .with_context(|| format!("could not connect to {}:{}", target.host, target.port))?;
     let send = async {
         if target.tls {
-            use rustls_platform_verifier::ConfigVerifierExt;
-            let config = rustls::ClientConfig::with_platform_verifier()
-                .context("could not load the system trust store")?;
+            let config = SYSLOG_TLS
+                .as_ref()
+                .map_err(|e| anyhow::anyhow!("could not load the system trust store: {e}"))?;
             let name = rustls::pki_types::ServerName::try_from(target.host.clone())
                 .context("invalid TLS server name")?;
-            let mut tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+            let mut tls = tokio_rustls::TlsConnector::from(config.clone())
                 .connect(name, tcp)
                 .await
                 .context("TLS handshake failed")?;
@@ -288,7 +300,7 @@ pub async fn deliver_syslog(target: &SyslogTarget, frames: &[Vec<u8>]) -> Result
 
 pub async fn deliver_webhook(target: &WebhookTarget, body: String) -> Result<()> {
     let timestamp = Utc::now().timestamp();
-    let response = reqwest::Client::new()
+    let response = WEBHOOK_CLIENT
         .post(&target.url)
         .timeout(TIMEOUT)
         .header(reqwest::header::CONTENT_TYPE, "application/json")

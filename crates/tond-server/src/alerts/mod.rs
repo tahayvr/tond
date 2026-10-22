@@ -68,11 +68,13 @@ fn now_unix() -> i64 {
 }
 
 /// Called by the metrics collector at the end of every tick.
-pub async fn on_metrics_tick(state: &AppState, now: i64) {
+/// `cache` (owned by the collector) keeps the rules, apps and certificates
+/// between ticks until they change.
+pub async fn on_metrics_tick(state: &AppState, now: i64, cache: &mut evaluate::EvalCache) {
     if ENABLED_RULES.load(Ordering::Relaxed) == 0 {
         return;
     }
-    match evaluate::evaluate(&state.db, now, &Source::Live).await {
+    match evaluate::evaluate_with(&state.db, now, &Source::Live, Some(cache)).await {
         Ok(report) if report.queued > 0 => kick(),
         Ok(_) => {}
         Err(e) => tracing::warn!("alert evaluation failed: {e:#}"),
