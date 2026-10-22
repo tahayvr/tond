@@ -3,12 +3,19 @@
 // file must exist and a #fragment must name an element id on that page.
 // Runs after `astro build` as part of `pnpm build`; external links are not
 // fetched (the build stays offline).
+//
+// Usage: node scripts/check-links.mjs [dir] [base]
+//   defaults: dist/ and /docs (the docs build); the whole tond.io site is
+//   checked with `dist-site /` by scripts/assemble-site.mjs.
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
-import { join, relative } from 'node:path';
+import { join, relative, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const DIST = fileURLToPath(new URL('../dist/', import.meta.url));
-const BASE = '/docs';
+const DIST = process.argv[2]
+	? `${resolvePath(process.argv[2])}/`
+	: fileURLToPath(new URL('../dist/', import.meta.url));
+// No trailing slash; '' for a site served at the root.
+const BASE = (process.argv[3] ?? '/docs').replace(/\/$/, '');
 
 function* htmlFiles(dir) {
 	for (const name of readdirSync(dir)) {
@@ -48,7 +55,7 @@ for (const file of htmlFiles(DIST)) {
 		}
 		if (!url.startsWith('/') || url.startsWith('//')) continue;
 		checked++;
-		if (!url.startsWith(`${BASE}/`) && url !== BASE) {
+		if (BASE && !url.startsWith(`${BASE}/`) && url !== BASE) {
 			problems.push(`${page}: ${attr}="${url}" is outside ${BASE}/ (missing base prefix?)`);
 			continue;
 		}

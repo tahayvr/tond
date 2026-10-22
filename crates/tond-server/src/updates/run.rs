@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use tond_common::release::RELEASE_BASE_ENV;
 
 /// Name of the transient unit. One at a time: systemd refuses a second unit
 /// with the same name while the first is active.
@@ -460,8 +461,17 @@ pub fn systemd_run_args(paths: &Paths, cmd: &[String]) -> Vec<String> {
         "--property=TimeoutStopSec=15min".to_string(),
         "--setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
         "--setenv=NO_COLOR=1".to_string(),
-        "--".to_string(),
     ];
+    // A release base set in tond-server's environment (a unit drop-in) also
+    // applies to the update it starts; without one, `tond update --direct`
+    // reads <install dir>/RELEASE_BASE or uses the default.
+    if let Some(base) = std::env::var(RELEASE_BASE_ENV)
+        .ok()
+        .filter(|b| !b.trim().is_empty())
+    {
+        args.push(format!("--setenv={RELEASE_BASE_ENV}={}", base.trim()));
+    }
+    args.push("--".to_string());
     args.extend(cmd.iter().cloned());
     args
 }

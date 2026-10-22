@@ -211,8 +211,14 @@ One system for all of these — never hand-roll a pill, banner or `confirm()`:
 - Generated, never edited by hand: `content/reference/cli.md` and `src/data/exit-codes.json`
   (`just docs-gen` after changing the CLI; tests fail when stale), the API pages and the
   error/exit-code pages (built from `docs/openapi.json` and `docs/templates/`).
-- `just docs` previews, `just docs-build` builds (part of `just check`). Link docs from the
+- `just docs` previews, `just docs-build` builds. Link docs from the
   product as `https://tond.io/docs/...` (`docsUrl()` in the dashboard's `$lib/docs.ts`).
+- The rest of tond.io (the landing page at `/`, `docs/landing/`, a second Astro config) and
+  the merged output are described in `docs/SITE.md`: `just site` previews the landing page,
+  `just site-build` builds everything into `docs/dist-site` (part of `just check`), with
+  `/install` and `/update` served byte-for-byte from `release/web/`. Claims on the landing
+  page must be stated in the docs. `.github/workflows/site.yml` deploys it to GitHub Pages
+  on pushes to `main` that touch `docs/**` or `release/web/`.
 
 ---
 

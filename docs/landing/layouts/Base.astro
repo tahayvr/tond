@@ -1,0 +1,105 @@
+---
+// The landing page shell (tond.io/ and 404.html): head tags, top bar, footer.
+// No tracking, no web fonts or scripts from other servers: the font is
+// bundled (fontsource) and the only script is landing/scripts/landing.ts.
+import '@fontsource-variable/jetbrains-mono/index.css';
+import '../styles/landing.css';
+import Icon from '../../src/components/Icon.astro';
+import Logo from '../../src/components/Logo.astro';
+
+interface Props {
+	title: string;
+	description: string;
+	/** Canonical path; omitted for pages that shouldn't be indexed (404). */
+	path?: string;
+}
+
+const { title, description, path } = Astro.props;
+const canonical = path ? new URL(path, Astro.site).toString() : undefined;
+const ogImage = new URL('/og.png', Astro.site).toString();
+import { REPO } from '../links';
+---
+
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>{title}</title>
+		<meta name="description" content={description} />
+		{canonical ? <link rel="canonical" href={canonical} /> : <meta name="robots" content="noindex" />}
+		<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+		<link rel="alternate" type="text/plain" title="llms.txt" href="/llms.txt" />
+		<meta name="color-scheme" content="light dark" />
+		<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
+		<meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)" />
+		<meta property="og:site_name" content="Tond" />
+		<meta property="og:title" content={title} />
+		<meta property="og:description" content={description} />
+		<meta property="og:type" content="website" />
+		{canonical && <meta property="og:url" content={canonical} />}
+		<meta property="og:image" content={ogImage} />
+		<meta property="og:image:width" content="1200" />
+		<meta property="og:image:height" content="630" />
+		<meta property="og:image:alt" content="Tond: apps and databases on one cheap VPS" />
+		<meta name="twitter:card" content="summary_large_image" />
+		<!-- Theme before first paint: saved choice (shared with the docs), else the system setting. -->
+		<script is:inline>
+			(() => {
+				let theme = null;
+				try {
+					theme = localStorage.getItem('tond-docs-theme');
+				} catch {}
+				const dark = theme ? theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+				document.documentElement.classList.toggle('dark', dark);
+			})();
+		</script>
+	</head>
+	<body>
+		<a class="skip-link" href="#content">Skip to content</a>
+		<header class="bar">
+			<div class="bar-inner">
+				<a class="brand" href="/" aria-label="Tond home">
+					<Logo class="brand-logo" />
+				</a>
+				<nav class="bar-nav" aria-label="Site">
+					<a href="/docs/">Docs</a>
+					<a href={`${REPO}/releases`}>Releases</a>
+					<a class="icon-button" href={REPO} aria-label="Tond on GitHub">
+						<Icon name="github-line" />
+					</a>
+					<button class="icon-button" type="button" data-theme-toggle aria-label="Switch to dark theme">
+						<Icon name="moon-line" class="theme-icon-dark" />
+						<Icon name="sun-line" class="theme-icon-light" />
+					</button>
+				</nav>
+			</div>
+		</header>
+
+		<main id="content">
+			<slot />
+		</main>
+
+		<footer class="foot">
+			<div class="foot-inner">
+				<p>
+					<Logo class="foot-logo" />
+				</p>
+				<nav class="foot-links" aria-label="Footer">
+					<a href="/docs/">Docs</a>
+					<a href="/docs/quickstart">Quickstart</a>
+					<a href={REPO}>GitHub</a>
+					<a href={`${REPO}/releases`}>Releases</a>
+					<a href="/docs/security/reporting">Security</a>
+					<a href="/llms.txt">llms.txt</a>
+				</nav>
+				<p class="foot-note">
+					Open source under the Apache License 2.0. This site sets no cookies and loads nothing from
+					other servers.
+				</p>
+			</div>
+		</footer>
+
+		<script src="../scripts/landing.ts"></script>
+	</body>
+</html>
