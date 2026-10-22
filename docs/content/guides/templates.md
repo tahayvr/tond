@@ -49,7 +49,7 @@ When you deploy a template, Tond:
 3. creates a Docker Compose app from the template's compose file, with the inputs stored as encrypted environment variables;
 4. creates the directories that hold the template's data inside the app's volume directory;
 5. gives the template's public service the app's port and domain, or the automatic `<app>.<apps domain>` hostname if you set no domain;
-6. queues the first deploy.
+6. queues the first deploy. For templates that pre-seed the admin account, that deploy creates it before the domain is routed (see [Admin accounts](#admin-accounts)).
 
 If a step fails after the app was created, Tond removes the app again, so you can fix the problem and retry with the same name. Tond also refuses a name whose volume directory still holds data from an earlier app of that name, because that data wouldn't match the new passwords.
 
@@ -62,6 +62,29 @@ A template's inputs are the environment variables its compose file uses as `${KE
 - **Fixed**: computed by Tond and never asked, for example the app's public URL (`https://<domain>`), its hostname or its name.
 
 Some inputs are credentials you need for the first login. Tond shows them once, right after the deploy. Save them in your password manager.
+
+### Admin accounts
+
+Many apps give the admin account to whoever opens them first, or ship a fixed default login. Once the app is on a public domain, anyone could get there before you. Tond handles this in one of two ways.
+
+**Pre-seeded.** Tond creates the admin account, or replaces the default password, during the first deploy. It runs the template's setup command inside the app's container after every service is ready and before `tond-proxy` routes the domain, so nobody can reach the app first. The password is generated unless you type one, shown once after the deploy, and kept as an encrypted environment variable on the app.
+
+| Template       | What Tond does                                                                                                             | Sign in as                       |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------- | -------------------------------- |
+| Gitea          | Locks the install page (`INSTALL_LOCK`) and creates the administrator with `gitea admin user create`. Sign-up stays off.    | the administrator name you chose |
+| Mattermost     | Creates the system admin with `mmctl --local user create --system-admin`. Joining needs an invitation.                     | the username you chose           |
+| Actual Budget  | Sets the server password through the server's bootstrap endpoint.                                                          | the server password              |
+| Audiobookshelf | Creates the `root` user through the server's `/init` endpoint.                                                            | `root`                           |
+| Umami          | Replaces the default `admin` / `umami` password in the database.                                                          | `admin`                          |
+| Mealie         | Replaces the default `MyPassword` password through Mealie's API.                                                          | `changeme@example.com`           |
+
+The deploy log shows each step. If a step still fails after its retries (about two minutes), the deploy finishes anyway and the app page shows the warning below with the reason. Then open the app right away and secure the admin account yourself.
+
+**Warned.** Ghost, Uptime Kuma, Memos, Wiki.js, Docmost and Twenty have no documented way to create the admin from outside, so the first visitor still creates it. Their setup notes say so, and the app page shows a warning until you dismiss it:
+
+> Open the app now and create the admin account; anyone who reaches it first can.
+
+Open the app straight after the deploy, create the account, then click **I've created it, dismiss**. Dismissing needs the `apps:write` permission and only hides the warning. From the API, it is `POST /api/v1/apps/{id}/admin-setup/dismiss`. The app's `admin_setup` field says where it stands: `pending`, `done`, `failed`, `open` or `dismissed`.
 
 ## Deploy a template in the dashboard
 
@@ -90,7 +113,7 @@ The CLI sends one request to the server, prints the address and the one-time cre
 ## After the deploy
 
 - Point the domain's DNS at the server, or use the automatic hostname under your apps domain. See [Domains and certificates](/concepts/domains).
-- Follow the setup notes and post-deploy checks. Many apps make the first account you register the owner, so register it right away.
+- Follow the setup notes and post-deploy checks. If the app page warns that the admin account is unclaimed, open the app and create it right away (see [Admin accounts](#admin-accounts)).
 - The app's **Overview** says which template and version it was deployed from, with a link to the template's upgrade notes.
 
 The app is an ordinary Docker Compose app from here on. Change its environment variables, compose file and service domains like any other (see [Docker Compose apps](/guides/sources#docker-compose-apps)). To upgrade, follow the template's upgrade notes: usually you change an image tag in the compose file and deploy again. Snapshot the app first; its data lives in the app's volume directory, so [snapshots](/concepts/backups) include it.
@@ -141,15 +164,27 @@ service = "web"
 path = "./data"                 # a bind mount in compose.yml
 description = "Notes and uploads"
 owner = "1000:1000"             # optional: for images that don't run as root
+
+# Optional: create the admin before the app is routed (once, on the first deploy)
+[[post_deploy]]
+service = "web"
+user = "1000:1000"              # optional exec user
+description = "Create the administrator account"
+env = ["ADMIN_EMAIL", "ADMIN_PASSWORD"]   # inputs passed as environment variables
+command = ["sh", "-c", "example-cli admin create --email \"$ADMIN_EMAIL\" --password \"$ADMIN_PASSWORD\""]
+timeout_secs = 120              # retried every 3 seconds until it succeeds (at most 600)
 ```
 
-Templates are declarative: no scripts or hooks run. Tond validates every template against these rules, and its tests check each shipped one:
+A `[[post_deploy]]` command runs with `docker exec` in the named service's container. It gets the inputs listed in `env` as environment variables, never on its command line, and its output is logged with those values hidden. Make it safe to run twice: a retry may follow an attempt that worked but didn't report it. A template whose app hands the admin account to its first visitor and can't be pre-seeded sets `first_visitor_admin = true` instead, which puts the warning on the app page.
+
+Apart from these commands, templates are declarative. Tond validates every template against these rules, and its tests check each shipped one:
 
 - every image is pinned to a version tag or digest, never `latest` or another moving tag, and nothing is built;
 - every service sets `restart` and `mem_limit`;
 - only the public service publishes a port, and only as `"<port>"`, so Tond picks the loopback host port;
 - data lives in `./…` bind mounts declared under `[[volumes]]`, so snapshots include it;
-- every `${VAR}` in the compose file is an input, and every input is used.
+- every `${VAR}` in the compose file is an input, and every input is used by the compose file or a `[[post_deploy]]` command;
+- a `[[post_deploy]]` command names a compose service, a non-empty command and only inputs in `env`.
 
 The compose file also goes through the same [compose policy](/guides/sources#what-the-compose-policy-rejects) as any compose app you paste.
 

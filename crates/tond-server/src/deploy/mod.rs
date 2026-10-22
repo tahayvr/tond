@@ -10,6 +10,8 @@
 //                 global build semaphore; deploy::start() queues through it
 //   failure.rs  — classify a failed deployment into a likely cause + fix hint
 //   images.rs   — per-deployment image tags and pruning
+//   template_setup.rs — a template's post_deploy steps (pre-seed the admin)
+//                 before the first release routes the app
 //
 // Public surface:
 //   deploy::start(state, app, DeployRequest) -> queue::Enqueued (id, place in line)
@@ -24,6 +26,7 @@ pub mod git;
 pub mod images;
 pub mod progress;
 pub mod queue;
+mod template_setup;
 
 pub use build::{compose_project_name, compose_work_dir_for, validate_base_dir};
 pub use compose::{compose_path_in_repo, deployment_services};

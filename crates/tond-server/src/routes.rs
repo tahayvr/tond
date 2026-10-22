@@ -111,6 +111,7 @@ api_routes! {
     POST "/api/v1/apps/{id}/stop" => handlers::stop_app;
     POST "/api/v1/apps/{id}/start" => handlers::start_app;
     POST "/api/v1/apps/{id}/restart" => handlers::restart_app;
+    POST "/api/v1/apps/{id}/admin-setup/dismiss" => handlers::templates::dismiss_admin_setup;
     // Docker Compose apps: services, per-service domains and ports, the file
     GET "/api/v1/apps/{id}/services" => handlers::compose::list_services;
     PUT "/api/v1/apps/{id}/services/{service}" => handlers::compose::update_service;

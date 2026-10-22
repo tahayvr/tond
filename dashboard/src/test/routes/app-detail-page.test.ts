@@ -16,6 +16,7 @@ const api = vi.hoisted(() => ({
 	stopApp: vi.fn(),
 	startApp: vi.fn(),
 	restartApp: vi.fn(),
+	dismissAdminSetup: vi.fn(),
 	deleteApp: vi.fn(),
 	updateDomain: vi.fn(),
 	updateHealth: vi.fn(),
@@ -346,6 +347,28 @@ describe('apps/[id] page', () => {
 
 		expect(api.deleteApp).toHaveBeenCalledWith('app_1');
 		expect(goto).toHaveBeenCalledWith('/apps', { invalidateAll: true });
+	});
+
+	it('warns until the first-visitor admin account is claimed, then dismisses', async () => {
+		const template = { ...app, template_id: 'memos', admin_setup: 'open' as const };
+		api.dismissAdminSetup.mockResolvedValue({ ...template, admin_setup: 'dismissed' });
+		const user = userEvent.setup();
+		renderPage(template);
+
+		expect(
+			screen.getByText(
+				'Open the app now and create the admin account; anyone who reaches it first can.'
+			)
+		).toBeInTheDocument();
+		await user.click(screen.getByRole('button', { name: "I've created it, dismiss" }));
+		expect(api.dismissAdminSetup).toHaveBeenCalledWith('app_1');
+		expect(await screen.findByRole('button', { name: /^deploy$/i })).toBeInTheDocument();
+		expect(screen.queryByTestId('admin-setup-warning')).not.toBeInTheDocument();
+	});
+
+	it('shows no admin warning for apps whose admin was seeded', () => {
+		renderPage({ ...app, template_id: 'umami', admin_setup: 'done' });
+		expect(screen.queryByTestId('admin-setup-warning')).not.toBeInTheDocument();
 	});
 
 	it('restarts only after confirmation', async () => {

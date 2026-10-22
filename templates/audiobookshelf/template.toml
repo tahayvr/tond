@@ -10,14 +10,21 @@ website = "https://www.audiobookshelf.org"
 docs = "https://www.audiobookshelf.org/docs"
 repository = "https://github.com/advplyr/audiobookshelf"
 ram_mb = 200
-setup_notes = "Open the app right away and create the root user (the first visitor sets it). Then add a library pointing at /audiobooks or /podcasts."
+setup_notes = "Sign in as root with the password shown after deploy (also kept as ROOT_PASSWORD on the Environment tab). Then add a library pointing at /audiobooks or /podcasts."
 upgrade_notes = "Change the image to a newer 2.x tag and redeploy; the database is migrated on start. Snapshot the app first."
-post_deploy_checks = ["Create the root user", "Add a library for /audiobooks"]
+post_deploy_checks = ["Sign in as root", "Add a library for /audiobooks"]
 
 [public]
 service = "audiobookshelf"
 port = 80
 health_path = "/healthcheck"
+
+[[inputs]]
+key = "ROOT_PASSWORD"
+label = "Root user password"
+kind = "password"
+generate = "password"
+credential = true
 
 [[volumes]]
 service = "audiobookshelf"
@@ -38,3 +45,12 @@ description = "Your audiobooks (/audiobooks)"
 service = "audiobookshelf"
 path = "./podcasts"
 description = "Downloaded podcast episodes (/podcasts)"
+
+# A fresh server lets the first visitor create the root user. Tond creates it
+# through the server's /init endpoint before the app is routed (a retry that
+# finds it created checks that this password signs in).
+[[post_deploy]]
+service = "audiobookshelf"
+description = "Create the root user"
+env = ["ROOT_PASSWORD"]
+command = ["node", "-e", "const u='http://127.0.0.1:80',p=process.env.ROOT_PASSWORD,j={'content-type':'application/json'};fetch(u+'/status').then(r=>r.json()).then(s=>s.isInit?fetch(u+'/login',{method:'POST',headers:j,body:JSON.stringify({username:'root',password:p})}):fetch(u+'/init',{method:'POST',headers:j,body:JSON.stringify({newRoot:{username:'root',password:p}})})).then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);}).catch(e=>{console.error(String(e));process.exit(1);});"]

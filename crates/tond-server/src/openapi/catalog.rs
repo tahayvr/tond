@@ -205,6 +205,9 @@ pub fn entries() -> Vec<Doc> {
         e("DELETE /api/v1/apps/{id}/volumes", "Remove a volume (applies on the next deploy)")
             .object("`{message, volumes}`")
             .scopes(&["settings:write"]),
+        e("POST /api/v1/apps/{id}/admin-setup/dismiss", "Dismiss the unclaimed-admin warning of a template app")
+            .returns::<AppResponse>()
+            .about("Template apps whose first visitor creates the admin account (`admin_setup` \"open\"), or whose admin couldn't be pre-seeded (\"failed\"), carry a warning until it is dismissed; the app then has `admin_setup` \"dismissed\". Other values are left unchanged."),
         e("PUT /api/v1/apps/{id}/drain-timeout", "Set the graceful-deploy drain timeout").object("`{message, drain_timeout}`"),
         e("PATCH /api/v1/apps/{id}/resources", "Change memory and CPU limits").returns::<AppResponse>(),
         e("POST /api/v1/apps/{id}/upload", "Deploy an uploaded source archive")

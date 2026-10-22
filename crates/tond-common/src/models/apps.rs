@@ -140,8 +140,32 @@ pub struct App {
     /// The template's version at deploy time
     #[sqlx(default)]
     pub template_version: Option<String>,
+    /// How the app's admin account comes to exist (template apps):
+    /// "pending" | "done" | "failed" | "open" | "dismissed" (see
+    /// [`AdminSetup`])
+    #[sqlx(default)]
+    pub admin_setup: Option<String>,
+    /// Why seeding the admin failed (admin_setup = "failed")
+    #[sqlx(default)]
+    pub admin_setup_error: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// [`App::admin_setup`] values.
+pub struct AdminSetup;
+
+impl AdminSetup {
+    pub const PENDING: &'static str = "pending";
+    pub const DONE: &'static str = "done";
+    pub const FAILED: &'static str = "failed";
+    pub const OPEN: &'static str = "open";
+    pub const DISMISSED: &'static str = "dismissed";
+
+    /// Whether the app page warns that the admin account is unclaimed.
+    pub fn warns(value: Option<&str>) -> bool {
+        matches!(value, Some(Self::OPEN | Self::FAILED))
+    }
 }
 
 /// Default for [`App::ready_after_secs`].
@@ -251,6 +275,8 @@ impl App {
             ready_after_secs: DEFAULT_READY_AFTER_SECS,
             template_id: None,
             template_version: None,
+            admin_setup: None,
+            admin_setup_error: None,
             created_at: now.clone(),
             updated_at: now,
         }
@@ -344,6 +370,14 @@ pub struct AppResponse {
     /// The template's version at deploy time
     #[serde(default)]
     pub template_version: Option<String>,
+    /// How the app's admin account comes to exist: "pending" (Tond creates
+    /// it on the first successful deploy), "done", "failed" (see
+    /// `admin_setup_error`), "open" (the first visitor creates it) or
+    /// "dismissed". The dashboard warns while it is "open" or "failed".
+    #[serde(default)]
+    pub admin_setup: Option<String>,
+    #[serde(default)]
+    pub admin_setup_error: Option<String>,
     pub source_type: String,
     pub source_url: Option<String>,
     /// Branch deployed from `source_url` (git and git-sourced compose apps)
@@ -459,6 +493,8 @@ impl From<App> for AppResponse {
             ready_after_secs: app.ready_after_secs,
             template_id: app.template_id,
             template_version: app.template_version,
+            admin_setup: app.admin_setup,
+            admin_setup_error: app.admin_setup_error,
             created_at: app.created_at,
             updated_at: app.updated_at,
             domain_warning: None,

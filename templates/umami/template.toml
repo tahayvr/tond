@@ -10,9 +10,9 @@ website = "https://umami.is"
 docs = "https://umami.is/docs"
 repository = "https://github.com/umami-software/umami"
 ram_mb = 300
-setup_notes = "Sign in with username admin and password umami, then change the password right away under Settings → Profile. Add a website to get its tracking script."
+setup_notes = "Sign in as admin with the password shown after deploy (also kept as ADMIN_PASSWORD on the Environment tab): Tond replaces Umami's default password before the app goes live. Add a website to get its tracking script."
 upgrade_notes = "Change the image tag to a newer 3.x release and redeploy; database migrations run on start. Read the release notes before a major version."
-post_deploy_checks = ["Sign in and change the default admin password", "Add your first website and install the tracking script"]
+post_deploy_checks = ["Sign in as admin", "Add your first website and install the tracking script"]
 
 [public]
 service = "umami"
@@ -30,7 +30,23 @@ key = "DB_PASSWORD"
 label = "Database password"
 generate = "password"
 
+[[inputs]]
+key = "ADMIN_PASSWORD"
+label = "Admin password"
+kind = "password"
+generate = "password"
+credential = true
+
 [[volumes]]
 service = "db"
 path = "./postgres"
 description = "PostgreSQL data: websites, users and all analytics events"
+
+# Umami creates admin / umami on first start. Tond replaces the password (a
+# bcrypt hash, which Umami verifies) in the database before the app is routed;
+# it fails, and is retried, until Umami's migrations have created the user.
+[[post_deploy]]
+service = "db"
+description = "Replace the default admin password"
+env = ["ADMIN_PASSWORD"]
+command = ["sh", "-c", "psql -v ON_ERROR_STOP=1 -q -U umami -d umami -v pw=\"$ADMIN_PASSWORD\" <<'SQL'\nCREATE EXTENSION IF NOT EXISTS pgcrypto;\nUPDATE \"user\" SET password = crypt(:'pw', gen_salt('bf', 10)) WHERE username = 'admin';\nSELECT CASE WHEN EXISTS (SELECT 1 FROM \"user\" WHERE username = 'admin' AND password = crypt(:'pw', password)) THEN 1 ELSE 1 / 0 END;\nSQL\n"]

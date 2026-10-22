@@ -77,6 +77,34 @@ export const MOCK_COMPOSE_APP: App = {
 	updated_at: '2025-03-09T10:00:00.000Z'
 };
 
+/**
+ * A template app whose first visitor creates the admin account (Memos): its
+ * page shows the "create the admin account now" warning.
+ */
+export const MOCK_TEMPLATE_APP: App = {
+	...MOCK_COMPOSE_APP,
+	id: 'app_template',
+	name: 'notes',
+	domain: 'notes.example.com',
+	container_port: 5230,
+	health_check_path: '/healthz',
+	compose_content: `services:
+  memos:
+    image: neosmemo/memos:0.31.0
+    restart: unless-stopped
+    mem_limit: 128m
+    ports: ["5230"]
+    volumes:
+      - ./data:/var/opt/memos
+`,
+	template_id: 'memos',
+	template_version: '0.31',
+	admin_setup: 'open',
+	admin_setup_error: null,
+	created_at: '2025-03-10T10:00:00.000Z',
+	updated_at: '2025-03-10T10:00:00.000Z'
+};
+
 const MiB = 1_048_576;
 
 export const MOCK_COMPOSE_SERVICES: Record<string, ComposeService[]> = {

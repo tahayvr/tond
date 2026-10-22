@@ -2135,6 +2135,7 @@ pub(crate) async fn load_dump_into(
                 db_exec::Cmd {
                     argv,
                     env: Vec::new(),
+                    user: None,
                 },
             )
         }
