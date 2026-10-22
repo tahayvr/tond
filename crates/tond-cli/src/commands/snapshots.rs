@@ -25,6 +25,14 @@ pub enum SnapshotAction {
         app: Option<String>,
     },
 
+    /// List the snapshots in a storage provider's bucket (also ones this
+    /// server never took: restore them with `tond import <id>`)
+    Remote {
+        /// Storage provider to list (default: the one in the backup settings)
+        #[arg(long)]
+        provider: Option<String>,
+    },
+
     /// Restore a full snapshot (asks first; the server restarts)
     Restore {
         /// Snapshot ID to restore from
@@ -152,6 +160,43 @@ pub async fn handle(client: &TondClient, out: &Output, action: SnapshotAction) -
                         s.scope,
                         s.status,
                         s.created_at,
+                    );
+                }
+            }
+        }
+
+        SnapshotAction::Remote { provider } => {
+            let list = client.list_remote_snapshots(provider.as_deref()).await?;
+            out.json(&list)?;
+            if list.is_empty() {
+                outln!(out, "No snapshots in this bucket.");
+            } else {
+                outln!(
+                    out,
+                    "{:<38} {:<20} {:<22} {:>10}  NAME",
+                    "ID",
+                    "SCOPE",
+                    "CREATED AT",
+                    "SIZE"
+                );
+                for s in &list {
+                    let name = if s.readable {
+                        format!(
+                            "{}{}",
+                            s.name.as_deref().unwrap_or(""),
+                            if s.imported { " (in list)" } else { "" }
+                        )
+                    } else {
+                        "(made with a different TOND_SECRET_KEY)".to_string()
+                    };
+                    outln!(
+                        out,
+                        "{:<38} {:<20} {:<22} {:>8.1}MB  {}",
+                        s.id,
+                        s.scope.as_deref().unwrap_or("?"),
+                        s.created_at,
+                        s.archive_bytes as f64 / 1_048_576.0,
+                        name
                     );
                 }
             }

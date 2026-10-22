@@ -48,7 +48,10 @@ use uuid::Uuid;
 
 use crate::handlers::storage_providers::decrypt_provider_secret;
 use crate::state::AppState;
-use crate::{db, db_exec, docker, secret_key, secrets, snapshot_archive, storage};
+use crate::{
+    compose_backup, db, db_exec, docker, secret_key, secrets, snapshot_archive, snapshot_files,
+    snapshot_remote, storage,
+};
 use tond_common::{BackupConfig, ManagedDatabase, Snapshot};
 
 // ── Progress event ────────────────────────────────────────────────────────────
@@ -198,20 +201,12 @@ fn db_path() -> String {
     std::env::var("TOND_DB_PATH").unwrap_or_else(|_| "/opt/tond/data/tond.db".to_string())
 }
 
-fn snapshots_dir() -> PathBuf {
+pub(crate) fn snapshots_dir() -> PathBuf {
     PathBuf::from(data_dir()).join("backups").join("snapshots")
 }
 
-fn snapshot_dir(id: &str) -> PathBuf {
+pub(crate) fn snapshot_dir(id: &str) -> PathBuf {
     snapshots_dir().join(id)
-}
-
-/// Keys that may decrypt a snapshot archive: the current TOND_SECRET_KEY and,
-/// during a key rotation, the previous one.
-fn archive_secrets() -> Vec<String> {
-    let mut secrets = vec![secret_key::current_secret()];
-    secrets.extend(secret_key::previous_secret());
-    secrets
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -222,6 +217,16 @@ pub async fn create_snapshot(
     state: &AppState,
     trigger: SnapshotTrigger,
     progress_tx: Option<ProgressTx>,
+) -> Result<String> {
+    create_snapshot_noted(state, trigger, progress_tx, None).await
+}
+
+/// `create_snapshot` with a note on the snapshot (e.g. a catch-up).
+pub async fn create_snapshot_noted(
+    state: &AppState,
+    trigger: SnapshotTrigger,
+    progress_tx: Option<ProgressTx>,
+    notes: Option<String>,
 ) -> Result<String> {
     let id = Uuid::new_v4().to_string();
     let scope = trigger.scope();
@@ -235,8 +240,8 @@ pub async fn create_snapshot(
     .await?;
 
     sqlx::query(
-        "INSERT INTO snapshots (id, name, status, trigger, scope, trigger_app, deployment_id, parent_snapshot_id)
-         VALUES (?, ?, 'running', ?, ?, ?, ?, ?)",
+        "INSERT INTO snapshots (id, name, status, trigger, scope, trigger_app, deployment_id, parent_snapshot_id, notes)
+         VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(trigger.name())
@@ -245,6 +250,7 @@ pub async fn create_snapshot(
     .bind(trigger.trigger_app())
     .bind(trigger.deployment_id())
     .bind(&parent_id)
+    .bind(&notes)
     .execute(&state.db)
     .await?;
 
@@ -336,6 +342,7 @@ async fn build_snapshot(
             .await
             .map(|m| m.len())
             .unwrap_or(0);
+        seal(dest).await.context("failed to encrypt the SQLite copy")?;
         delta_bytes += size as i64;
         total_bytes += size as i64;
         tracing::debug!("SQLite snapshot: {} bytes", size);
@@ -391,7 +398,11 @@ async fn build_snapshot(
         Vec::new()
     };
     let mut compose_volumes_included: Vec<String> = Vec::new();
+    let mut compose_dumps: Vec<serde_json::Value> = Vec::new();
     for app_name in &compose_apps {
+        // Services that declare a dump hook (`tond.backup.dump`) dump first,
+        // so the snapshot holds a consistent copy next to the live files.
+        compose_dumps.extend(dump_compose_services(state, &staging, app_name, progress_tx).await);
         let project = crate::deploy::compose_project_name(app_name);
         let volumes = match docker::compose_volumes(&state.docker, &project).await {
             Ok(v) => v,
@@ -421,7 +432,10 @@ async fn build_snapshot(
             total_bytes += t;
             compose_volumes_included.push(volume);
         }
-        if !apps_included.contains(app_name) && compose_volume_root(&staging, app_name).exists() {
+        if !apps_included.contains(app_name)
+            && (compose_volume_root(&staging, app_name).exists()
+                || compose_dump_root(&staging, app_name).exists())
+        {
             apps_included.push(app_name.clone());
         }
     }
@@ -460,12 +474,24 @@ async fn build_snapshot(
                     let db = secrets::open_database(db)?;
                     // What restoring into a new database needs to know, even
                     // after this database is gone.
-                    tokio::fs::write(
+                    write_sealed(
                         dest_db.join(DB_META_FILE),
                         serde_json::to_vec_pretty(&DatabaseMeta::of(&db))?,
                     )
                     .await?;
-                    if let Err(e) = dump_database(&state.docker, &db, &dest_db).await {
+                    let dumped = async {
+                        dump_database(&state.docker, &db, &dest_db).await?;
+                        // The engine wrote a plain dump: encrypt it at once.
+                        for file in DUMP_FILES {
+                            let path = dest_db.join(file);
+                            if path.exists() {
+                                seal(path).await?;
+                            }
+                        }
+                        anyhow::Ok(())
+                    }
+                    .await;
+                    if let Err(e) = dumped {
                         // A copy of a running engine's files isn't consistent:
                         // a backup of just this database needs the dump.
                         if db_scope.is_some() && db.status == "running" {
@@ -507,10 +533,58 @@ async fn build_snapshot(
         }
     }
 
+    // ── Step: TLS certificates (full scope only) ─────────────────────────────
+    // So a server move keeps serving HTTPS at once; a restore puts back only
+    // the ones still valid (see `restore_certificates`).
+    let mut certificates: Vec<serde_json::Value> = Vec::new();
+    if is_full {
+        let certs_src = PathBuf::from(data_dir()).join("certs");
+        if certs_src.is_dir() {
+            let prev_certs = prev_dir.as_ref().map(|p| p.join("certs"));
+            let (d, t) = copy_tree(certs_src, staging.join("certs"), prev_certs).await?;
+            delta_bytes += d;
+            total_bytes += t;
+        }
+        let account = PathBuf::from(data_dir()).join("acme_account.json");
+        if account.is_file() {
+            let dest = staging.join("acme_account.json");
+            tokio::task::spawn_blocking(move || snapshot_files::encrypt_file(&account, &dest))
+                .await
+                .context("snapshot copy task failed")??;
+        }
+        let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT domain, cert_type, expires_at, cert_path FROM certificates
+             WHERE status = 'active'",
+        )
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+        certificates = rows
+            .into_iter()
+            .filter_map(|(domain, cert_type, expires_at, cert_path)| {
+                // The directory under certs/ that holds this certificate.
+                let dir = Path::new(&cert_path)
+                    .parent()?
+                    .file_name()?
+                    .to_string_lossy()
+                    .into_owned();
+                Some(json!({
+                    "domain": domain, "cert_type": cert_type,
+                    "expires_at": expires_at, "dir": dir,
+                }))
+            })
+            .collect();
+    }
+
     // ── Write manifest.json ───────────────────────────────────────────────────
+    let name: String = sqlx::query_scalar("SELECT name FROM snapshots WHERE id = ?")
+        .bind(id)
+        .fetch_one(&state.db)
+        .await?;
     let manifest = json!({
         "tond_version": env!("CARGO_PKG_VERSION"),
         "id": id,
+        "name": name,
         "created_at": Utc::now().to_rfc3339(),
         "trigger": trigger_str,
         "trigger_app": trigger_app,
@@ -520,11 +594,13 @@ async fn build_snapshot(
         "total_bytes": total_bytes,
         "apps_included": apps_included,
         "compose_volumes_included": compose_volumes_included,
+        "compose_dumps": compose_dumps,
         "databases_included": databases_included,
+        "certificates": certificates,
     });
-    tokio::fs::write(
-        staging.join("manifest.json"),
-        serde_json::to_string_pretty(&manifest)?,
+    write_sealed(
+        staging.join(MANIFEST_FILE),
+        serde_json::to_vec_pretty(&manifest)?,
     )
     .await?;
 
@@ -655,8 +731,106 @@ async fn restore_compose_volumes(state: &AppState, snapshot: &Path, app_name: &s
                 tokio::fs::remove_file(&path).await?;
             }
         }
-        copy_dir_recursive(&root.join(&volume), &dest).await?;
+        snapshot_files::decrypt_tree_async(root.join(&volume), dest).await?;
     }
+    Ok(())
+}
+
+/// `<snapshot>/compose-dumps/<app>`: the dumps of an app's services that
+/// declare a `tond.backup.dump` hook, one `<service>.dump` each.
+fn compose_dump_root(snapshot: &Path, app_name: &str) -> PathBuf {
+    snapshot.join("compose-dumps").join(app_name)
+}
+
+/// Run the dump hook of every service of `app_name` that declares one,
+/// storing each dump (encrypted) in the snapshot. A failed dump is logged
+/// and recorded; the volume copy that follows still happens. Returns one
+/// manifest entry per service.
+async fn dump_compose_services(
+    state: &AppState,
+    staging: &Path,
+    app_name: &str,
+    progress_tx: &Option<ProgressTx>,
+) -> Vec<serde_json::Value> {
+    let hooks = match compose_backup::discover_hooks(&state.docker, app_name).await {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!("Could not read the backup hooks of {app_name}: {e:#}");
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for hook in hooks {
+        emit(
+            progress_tx,
+            "dump",
+            &format!("Dumping {app_name}/{}…", hook.service),
+            false,
+        )
+        .await;
+        let root = compose_dump_root(staging, app_name);
+        let dest = root.join(format!("{}.dump", hook.service));
+        let result = async {
+            tokio::fs::create_dir_all(&root).await?;
+            let bytes = compose_backup::run_dump(&state.docker, &hook, &dest).await?;
+            seal(dest.clone()).await?;
+            anyhow::Ok(bytes)
+        }
+        .await;
+        match result {
+            Ok(bytes) => out.push(json!({
+                "app": app_name, "service": hook.service, "ok": true, "bytes": bytes,
+            })),
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&dest).await;
+                tracing::warn!(
+                    "The backup dump of {app_name}/{} failed (its volumes are still copied): {e:#}",
+                    hook.service
+                );
+                out.push(json!({
+                    "app": app_name, "service": hook.service, "ok": false,
+                    "error": format!("{e:#}"),
+                }));
+            }
+        }
+    }
+    out
+}
+
+/// Feed each service of `app_name` that declares a `tond.backup.restore`
+/// hook its dump from the snapshot (after its volumes were restored and its
+/// containers started). Fails with every service whose restore failed.
+pub(crate) async fn restore_compose_dumps(
+    state: &AppState,
+    snapshot: &Path,
+    app_name: &str,
+) -> Result<()> {
+    let root = compose_dump_root(snapshot, app_name);
+    if !root.is_dir() {
+        return Ok(());
+    }
+    let hooks = compose_backup::discover_hooks(&state.docker, app_name).await?;
+    let mut failures = Vec::new();
+    for hook in hooks.iter().filter(|h| h.restore.is_some()) {
+        let file = format!("{}.dump", hook.service);
+        if !root.join(&file).is_file() {
+            continue;
+        }
+        let result = async {
+            let plain = snapshot_files::plain_subset_async(root.clone(), vec![file.clone()]).await?;
+            compose_backup::run_restore(&state.docker, hook, &plain.path().join(&file)).await
+        }
+        .await;
+        match result {
+            Ok(()) => tracing::info!("Loaded the backup dump of {app_name}/{}", hook.service),
+            Err(e) => failures.push(format!("{}: {e:#}", hook.service)),
+        }
+    }
+    anyhow::ensure!(
+        failures.is_empty(),
+        "the volumes were restored, but loading the dump failed for {}",
+        failures.join("; ")
+    );
     Ok(())
 }
 
@@ -677,20 +851,62 @@ async fn list_subdirs(base: &Path) -> Vec<String> {
     names
 }
 
-/// `copy_dir_with_hardlinks` on a blocking thread.
+/// Copy `src` into the snapshot at `dest`, encrypted and hard-linked
+/// against `prev` (`snapshot_files::encrypt_tree`), on a blocking thread.
 async fn copy_tree(src: PathBuf, dest: PathBuf, prev: Option<PathBuf>) -> Result<(i64, i64)> {
     tokio::task::spawn_blocking(move || {
         std::fs::create_dir_all(&dest)?;
-        copy_dir_with_hardlinks(&src, &dest, prev.as_deref())
+        snapshot_files::encrypt_tree(&src, &dest, prev.as_deref())
     })
     .await
     .context("snapshot copy task failed")?
 }
 
+/// Encrypt a plain file just written into a snapshot (in place).
+async fn seal(path: PathBuf) -> Result<()> {
+    tokio::task::spawn_blocking(move || snapshot_files::seal_in_place(&path))
+        .await
+        .context("snapshot copy task failed")?
+}
+
+/// Write `bytes` into a snapshot as an encrypted file.
+async fn write_sealed(path: PathBuf, bytes: Vec<u8>) -> Result<()> {
+    tokio::task::spawn_blocking(move || snapshot_files::write_encrypted(&path, &bytes))
+        .await
+        .context("snapshot copy task failed")?
+}
+
+/// A snapshot's manifest file.
+pub(crate) const MANIFEST_FILE: &str = "manifest.json";
+
+/// Files a database dump may leave in `databases/<name>/`.
+const DUMP_FILES: [&str; 3] = ["dump.archive", "dump.sql", "dump.rdb"];
+
+/// The dump and metadata of database `db_name` in the local snapshot
+/// `snapshot`, decrypted into a temporary directory (removed when dropped).
+pub(crate) async fn plain_database_files(
+    snapshot: &Path,
+    db_name: &str,
+) -> Result<snapshot_files::PlainDir> {
+    snapshot_files::plain_subset_async(
+        snapshot.join("databases").join(db_name),
+        database_plain_files(),
+    )
+    .await
+}
+
+/// What restoring a database reads from `databases/<name>/` as plain files.
+fn database_plain_files() -> Vec<String> {
+    let mut files: Vec<String> = DUMP_FILES.iter().map(|f| f.to_string()).collect();
+    files.push(DB_META_FILE.to_string());
+    files.push("volume/dump.rdb".to_string());
+    files
+}
+
 // ── Remote upload ─────────────────────────────────────────────────────────────
 
 /// Upload an encrypted archive of the snapshot and record the outcome.
-async fn upload_snapshot(
+pub(crate) async fn upload_snapshot(
     state: &AppState,
     id: &str,
     staging: &Path,
@@ -757,10 +973,9 @@ async fn upload_archive(
     let (tx, rx) = mpsc::channel::<storage::Part>(1);
     let src = staging.to_path_buf();
     let snapshot_id = id.to_string();
-    let secret = secret_key::current_secret();
     let writer = tokio::task::spawn_blocking(move || {
         let sink = PartWriter::new(tx, storage::PART_SIZE);
-        let (summary, sink) = snapshot_archive::write_archive(&src, sink, &secret, &snapshot_id)?;
+        let (summary, sink) = archive_snapshot_dir(&src, sink, &snapshot_id)?;
         sink.finish()?;
         Ok::<_, anyhow::Error>(summary)
     });
@@ -768,7 +983,39 @@ async fn upload_archive(
     let uploaded = storage::upload_stream(&provider, &key, rx).await;
     let summary = writer.await.context("archive task failed")??;
     uploaded?;
+    // The manifest next to the archive lets another server list and import
+    // this snapshot without this server's database.
+    let manifest = snapshot_remote::remote_manifest(staging, id, &key, &summary).await?;
+    storage::put_object(
+        &provider,
+        &snapshot_remote::manifest_key(id),
+        serde_json::to_vec_pretty(&manifest)?,
+    )
+    .await
+    .context("the archive uploaded but its manifest didn't")?;
     Ok((key, summary))
+}
+
+/// Stream the local (encrypted) snapshot directory `src` into `out` as one
+/// snapshot archive bound to `snapshot_id`. Blocking.
+pub(crate) fn archive_snapshot_dir<W: Write>(
+    src: &Path,
+    out: W,
+    snapshot_id: &str,
+) -> Result<(snapshot_archive::ArchiveSummary, W)> {
+    let secrets = snapshot_files::secrets();
+    let keys: Vec<&str> = secrets.iter().map(String::as_str).collect();
+    snapshot_archive::write_archive(
+        src,
+        out,
+        &secret_key::current_secret(),
+        snapshot_files::archive_kind(),
+        snapshot_id,
+        snapshot_archive::Source::Encrypted {
+            kind: snapshot_files::local_kind(),
+            secrets: &keys,
+        },
+    )
 }
 
 /// A `Write` sink that cuts the stream into `part_size` parts and sends them
@@ -856,9 +1103,12 @@ async fn fetch_remote_snapshot(state: &AppState, snap: &Snapshot) -> Result<Path
         let archive = download.clone();
         let dest = staging.clone();
         let id = snap.id.clone();
-        tokio::task::spawn_blocking(move || unpack_verified(&archive, &dest, &id))
-            .await
-            .context("restore task failed")?
+        tokio::task::spawn_blocking(move || {
+            verify_archive_file(&archive, Some(&id))?;
+            extract_archive_file(&archive, &dest, &id)
+        })
+        .await
+        .context("restore task failed")?
     }
     .await;
     let _ = tokio::fs::remove_file(&download).await;
@@ -872,20 +1122,39 @@ async fn fetch_remote_snapshot(state: &AppState, snap: &Snapshot) -> Result<Path
     Ok(staging)
 }
 
-/// Verify the whole archive, then extract it next to `dest` and move it into
-/// place, so a failed extraction never leaves a half-restored directory.
-fn unpack_verified(archive: &Path, dest: &Path, snapshot_id: &str) -> Result<()> {
-    let secrets = archive_secrets();
+/// Authenticate every record of the archive file (blocking). Returns the
+/// snapshot id it holds; `expected_id`, when given, must match it.
+pub(crate) fn verify_archive_file(archive: &Path, expected_id: Option<&str>) -> Result<String> {
+    let secrets = snapshot_files::secrets();
     let keys: Vec<&str> = secrets.iter().map(String::as_str).collect();
-    snapshot_archive::verify_archive(std::fs::File::open(archive)?, &keys, Some(snapshot_id))?;
+    snapshot_archive::verify_archive(
+        std::fs::File::open(archive)?,
+        &keys,
+        snapshot_files::archive_kind(),
+        expected_id,
+    )
+}
 
+/// Extract a verified archive into the local snapshot directory `dest`
+/// (each file encrypted again for local storage), next to it first and then
+/// moved into place, so a failed extraction never leaves a half-restored
+/// directory. Blocking.
+pub(crate) fn extract_archive_file(archive: &Path, dest: &Path, snapshot_id: &str) -> Result<()> {
+    let secrets = snapshot_files::secrets();
+    let keys: Vec<&str> = secrets.iter().map(String::as_str).collect();
+    let secret = secret_key::current_secret();
     let partial = dest.with_extension("partial");
     let _ = std::fs::remove_dir_all(&partial);
     if let Err(e) = snapshot_archive::extract_archive(
         std::fs::File::open(archive)?,
         &keys,
+        snapshot_files::archive_kind(),
         Some(snapshot_id),
         &partial,
+        snapshot_archive::Target::Encrypted {
+            kind: snapshot_files::local_kind(),
+            secret: &secret,
+        },
     ) {
         let _ = std::fs::remove_dir_all(&partial);
         return Err(e);
@@ -900,6 +1169,10 @@ fn unpack_verified(archive: &Path, dest: &Path, snapshot_id: &str) -> Result<()>
 // ── Full restore (with pre-restore safety net) ────────────────────────────────
 
 /// Launch a full restore in a background task. Returns the pre_restore snapshot ID.
+///
+/// The snapshot is fetched (a remote copy downloaded) and verified before
+/// anything else happens, so a snapshot this server can't read — another
+/// TOND_SECRET_KEY, a corrupted archive — fails here with nothing changed.
 pub async fn restore_full(state: &AppState, snapshot_id: String) -> Result<String> {
     // Verify snapshot is completed
     let snap: Option<Snapshot> = sqlx::query_as::<_, Snapshot>(
@@ -915,6 +1188,9 @@ pub async fn restore_full(state: &AppState, snapshot_id: String) -> Result<Strin
         "This snapshot only holds {}; restore it from its app or database page",
         snap.scope
     );
+    let staging = ensure_local(state, &snap).await?;
+    let manifest = read_manifest(&staging).await?;
+    let snap = fetch_snapshot(state, &snapshot_id).await?;
 
     // Auto-create a pre-restore safety net
     let pre_restore_id = create_snapshot(
@@ -925,27 +1201,49 @@ pub async fn restore_full(state: &AppState, snapshot_id: String) -> Result<Strin
         None,
     )
     .await?;
+    let pre_restore = fetch_snapshot(state, &pre_restore_id).await.ok();
 
     let state_clone = state.clone();
     tokio::spawn(async move {
-        if let Err(e) = do_full_restore(&state_clone, &snap).await {
-            tracing::error!("Full restore failed: {:#}", e);
-        } else {
-            tracing::info!(
-                "Full restore of {} completed — exiting for systemd restart",
-                snapshot_id
-            );
-            std::process::exit(0);
+        match do_full_restore(&state_clone, &snap, &staging, &manifest).await {
+            Err(e) => tracing::error!("Full restore failed: {:#}", e),
+            Ok(()) => {
+                // What the restored database doesn't know: the snapshot it
+                // came from, the safety net, and that apps and databases
+                // must be started (or redeployed) at the next start.
+                if let Err(e) =
+                    crate::restore_resume::write_marker(&snap, pre_restore.as_ref(), &manifest)
+                {
+                    tracing::error!("Could not record the restore for the next start: {e:#}");
+                }
+                tracing::info!(
+                    "Full restore of {} completed — exiting for systemd restart",
+                    snapshot_id
+                );
+                std::process::exit(0);
+            }
         }
     });
 
     Ok(pre_restore_id)
 }
 
-async fn do_full_restore(state: &AppState, snap: &Snapshot) -> Result<()> {
-    // Fetch (and verify) the archive first: nothing is stopped or replaced
-    // until the snapshot is known to be complete and authentic.
-    let staging = ensure_local(state, snap).await?;
+/// The snapshot's manifest (`manifest.json`, encrypted like every file).
+pub(crate) async fn read_manifest(snapshot: &Path) -> Result<serde_json::Value> {
+    let path = snapshot.join(MANIFEST_FILE);
+    let bytes = tokio::task::spawn_blocking(move || snapshot_files::read_encrypted(&path))
+        .await
+        .context("restore task failed")??;
+    serde_json::from_slice(&bytes).context("the snapshot's manifest is unreadable")
+}
+
+async fn do_full_restore(
+    state: &AppState,
+    snap: &Snapshot,
+    staging: &Path,
+    manifest: &serde_json::Value,
+) -> Result<()> {
+    tracing::info!("Full restore of {}: replacing all data", snap.id);
 
     // Stop all app containers
     let apps = sqlx::query_as::<_, tond_common::App>("SELECT * FROM apps")
@@ -971,40 +1269,46 @@ async fn do_full_restore(state: &AppState, snap: &Snapshot) -> Result<()> {
         }
     }
 
-    // Replace SQLite
+    // Replace SQLite: decrypted next to the live file, then renamed over it.
+    // The live WAL is checkpointed and removed first, so none of its frames
+    // can be replayed onto the restored database at the next start.
     let db_dest = PathBuf::from(db_path());
     let db_src = staging.join("tond.db");
     if db_src.exists() {
         if let Some(parent) = db_dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        tokio::fs::copy(&db_src, &db_dest).await?;
-        // fs::copy also copies the snapshot's mode; restore tond-proxy's access.
+        let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&state.db)
+            .await;
+        let tmp = db_dest.with_extension("db.restoring");
+        let (src, out) = (db_src.clone(), tmp.clone());
+        tokio::task::spawn_blocking(move || snapshot_files::decrypt_file(&src, &out))
+            .await
+            .context("restore task failed")??;
+        tokio::fs::rename(&tmp, &db_dest).await?;
+        for suffix in ["-wal", "-shm"] {
+            let _ = tokio::fs::remove_file(format!("{}{suffix}", db_dest.display())).await;
+        }
+        // Restore tond-proxy's read access (and the snapshot's mode with it).
         db::share_with_proxy(&db_dest);
     }
 
     // Replace app volumes
     let vol_base = PathBuf::from(data_dir()).join("volumes");
-    let staging_vol = staging.join("volumes");
-    if staging_vol.exists()
-        && let Ok(mut entries) = tokio::fs::read_dir(&staging_vol).await
-    {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let app_name = entry.file_name();
-            let src = staging_vol.join(&app_name);
-            let dest = vol_base.join(&app_name);
-            if dest.exists() {
-                tokio::fs::remove_dir_all(&dest).await?;
-            }
-            copy_dir_recursive(&src, &dest).await?;
+    for app_name in list_subdirs(&staging.join("volumes")).await {
+        let dest = vol_base.join(&app_name);
+        if dest.exists() {
+            tokio::fs::remove_dir_all(&dest).await?;
         }
+        snapshot_files::decrypt_tree_async(staging.join("volumes").join(&app_name), dest).await?;
     }
 
     // Replace the named volumes of compose apps
     let staging_named = staging.join("compose-volumes");
     if staging_named.exists() {
         for app_name in list_subdirs(&staging_named).await {
-            if let Err(e) = restore_compose_volumes(state, &staging, &app_name).await {
+            if let Err(e) = restore_compose_volumes(state, staging, &app_name).await {
                 tracing::warn!("Could not restore the volumes of {app_name}: {e:#}");
             }
         }
@@ -1012,23 +1316,14 @@ async fn do_full_restore(state: &AppState, snap: &Snapshot) -> Result<()> {
 
     // Replace database volumes
     let db_vol_base = PathBuf::from(data_dir()).join("databases");
-    let staging_dbs = staging.join("databases");
-    if staging_dbs.exists()
-        && let Ok(mut entries) = tokio::fs::read_dir(&staging_dbs).await
-    {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let db_name = entry.file_name();
-            let staging_db = staging_dbs.join(&db_name);
+    for db_name in list_subdirs(&staging.join("databases")).await {
+        let raw = staging.join("databases").join(&db_name).join("volume");
+        if raw.exists() {
             let dest_vol = db_vol_base.join(&db_name);
-
-            // Restore raw volume
-            let raw = staging_db.join("volume");
-            if raw.exists() {
-                if dest_vol.exists() {
-                    tokio::fs::remove_dir_all(&dest_vol).await?;
-                }
-                copy_dir_recursive(&raw, &dest_vol).await?;
+            if dest_vol.exists() {
+                tokio::fs::remove_dir_all(&dest_vol).await?;
             }
+            snapshot_files::decrypt_tree_async(raw, dest_vol).await?;
         }
     }
 
@@ -1039,10 +1334,93 @@ async fn do_full_restore(state: &AppState, snap: &Snapshot) -> Result<()> {
         if keys_dest.exists() {
             tokio::fs::remove_dir_all(&keys_dest).await?;
         }
-        copy_dir_recursive(&keys_src, &keys_dest).await?;
+        snapshot_files::decrypt_tree_async(keys_src, keys_dest).await?;
+    }
+
+    // TLS certificates that are still valid
+    if let Err(e) = restore_certificates(staging, manifest).await {
+        tracing::warn!("Could not restore the TLS certificates: {e:#}");
     }
 
     Ok(())
+}
+
+/// Put back the snapshot's TLS certificates that are valid for at least
+/// another day (the proxy orders the others again), owned by whoever owns
+/// `<data>/certs` on this server (tond-proxy, whose uid may differ from the
+/// server the snapshot came from). The ACME account comes back too when this
+/// server has none yet.
+async fn restore_certificates(staging: &Path, manifest: &serde_json::Value) -> Result<()> {
+    let src_root = staging.join("certs");
+    let dest_root = PathBuf::from(data_dir()).join("certs");
+    let valid_dirs = valid_certificate_dirs(manifest, Utc::now());
+    if !src_root.is_dir() || valid_dirs.is_empty() {
+        return Ok(());
+    }
+    tokio::fs::create_dir_all(&dest_root).await?;
+    let owner = tokio::fs::metadata(&dest_root).await?;
+    for dir in list_subdirs(&src_root).await {
+        if !valid_dirs.contains(&dir) {
+            continue;
+        }
+        let dest = dest_root.join(&dir);
+        if dest.exists() {
+            tokio::fs::remove_dir_all(&dest).await?;
+        }
+        snapshot_files::decrypt_tree_async(src_root.join(&dir), dest.clone()).await?;
+        hand_over(&dest, &owner);
+    }
+    let account_src = staging.join("acme_account.json");
+    let account_dest = PathBuf::from(data_dir()).join("acme_account.json");
+    if account_src.is_file() && !account_dest.exists() {
+        let out = account_dest.clone();
+        tokio::task::spawn_blocking(move || snapshot_files::decrypt_file(&account_src, &out))
+            .await
+            .context("restore task failed")??;
+        hand_over(&account_dest, &owner);
+    }
+    Ok(())
+}
+
+/// The certs/ directories of the manifest's certificates that stay valid
+/// for at least a day after `now`.
+pub(crate) fn valid_certificate_dirs(
+    manifest: &serde_json::Value,
+    now: chrono::DateTime<Utc>,
+) -> Vec<String> {
+    let horizon = now + chrono::Duration::days(1);
+    manifest
+        .get("certificates")
+        .and_then(|c| c.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|cert| {
+            let dir = cert.get("dir")?.as_str()?;
+            let expires = cert.get("expires_at")?.as_str()?;
+            let expires = chrono::DateTime::parse_from_rfc3339(expires)
+                .map(|t| t.with_timezone(&Utc))
+                .or_else(|_| {
+                    chrono::NaiveDateTime::parse_from_str(expires, "%Y-%m-%d %H:%M:%S")
+                        .map(|t| t.and_utc())
+                })
+                .ok()?;
+            // Never a path: one directory name directly under certs/.
+            let plain_name = !dir.is_empty() && !dir.contains('/') && !dir.starts_with('.');
+            (expires > horizon && plain_name).then(|| dir.to_string())
+        })
+        .collect()
+}
+
+/// Give `path` (recursively) the owner of `owner`, directories 0700 and
+/// files 0600: certificates and keys belong to tond-proxy alone.
+fn hand_over(path: &Path, owner: &std::fs::Metadata) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    for entry in walkdir::WalkDir::new(path).follow_links(false).into_iter().flatten() {
+        let p = entry.path();
+        let _ = std::os::unix::fs::lchown(p, Some(owner.uid()), Some(owner.gid()));
+        let mode = if entry.file_type().is_dir() { 0o700 } else { 0o600 };
+        let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode));
+    }
 }
 
 // ── App-scope restore ─────────────────────────────────────────────────────────
@@ -1052,8 +1430,9 @@ pub async fn restore_app(state: &AppState, snapshot_id: &str, app_name: &str) ->
     let local_path = ensure_local(state, &snap).await?;
     let vol_src = local_path.join("volumes").join(app_name);
     let named_src = compose_volume_root(&local_path, app_name);
+    let dumps_src = compose_dump_root(&local_path, app_name);
 
-    if !vol_src.exists() && !named_src.exists() {
+    if !vol_src.exists() && !named_src.exists() && !dumps_src.exists() {
         anyhow::bail!("Snapshot does not contain volumes for app '{}'", app_name);
     }
 
@@ -1080,7 +1459,7 @@ pub async fn restore_app(state: &AppState, snapshot_id: &str, app_name: &str) ->
         if vol_dest.exists() {
             tokio::fs::remove_dir_all(&vol_dest).await?;
         }
-        copy_dir_recursive(&vol_src, &vol_dest).await?;
+        snapshot_files::decrypt_tree_async(vol_src, vol_dest).await?;
     }
     // ...and a compose app's named volumes
     if app.source_type == "compose" {
@@ -1090,6 +1469,11 @@ pub async fn restore_app(state: &AppState, snapshot_id: &str, app_name: &str) ->
     // Start the containers again
     for cid in &containers {
         let _ = docker::start_container(&state.docker, cid).await;
+    }
+
+    // Load each service's dump (services with a `tond.backup.restore` hook)
+    if app.source_type == "compose" {
+        restore_compose_dumps(state, &local_path, app_name).await?;
     }
 
     Ok(())
@@ -1148,7 +1532,7 @@ pub async fn restore_database(
         if dest_vol.exists() {
             tokio::fs::remove_dir_all(&dest_vol).await?;
         }
-        copy_dir_recursive(&raw_src, &dest_vol).await?;
+        snapshot_files::decrypt_tree_async(raw_src, dest_vol).await?;
     }
 
     // Start container
@@ -1163,6 +1547,9 @@ pub async fn restore_database(
         .any(|f| db_staging.join(f).exists());
     if has_dump && let Some(ref cid) = db_row.container_id {
         let imported = async {
+            let plain =
+                snapshot_files::plain_subset_async(db_staging.clone(), database_plain_files())
+                    .await?;
             db_exec::wait_ready(
                 &state.docker,
                 cid,
@@ -1170,7 +1557,7 @@ pub async fn restore_database(
                 std::time::Duration::from_secs(180),
             )
             .await?;
-            import_database_dump(&state.docker, &db_row, &db_staging).await
+            import_database_dump(&state.docker, &db_row, plain.path()).await
         }
         .await;
         if let Err(e) = imported {
@@ -1240,11 +1627,14 @@ pub async fn restore_to_new_database(
     );
 
     let local_path = ensure_local(state, &snap).await?;
-    let dump_dir = local_path.join("databases").join(source);
+    let encrypted_dir = local_path.join("databases").join(source);
     anyhow::ensure!(
-        dump_dir.exists(),
+        encrypted_dir.exists(),
         "This snapshot doesn't include the database '{source}'"
     );
+    // The dump and metadata as plain files, removed when this returns.
+    let plain = snapshot_files::plain_subset_async(encrypted_dir, database_plain_files()).await?;
+    let dump_dir = plain.path().to_path_buf();
 
     // Engine, version and variant: from the snapshot, or (older snapshots)
     // from the source database if it still exists.
@@ -1336,32 +1726,7 @@ pub fn schedules_changed() {
     crate::runtime::changes::notify(crate::runtime::changes::Table::BackupConfig);
 }
 
-/// The next run of every schedule after `now`: the full snapshot (when
-/// enabled) and each database with a schedule. Invalid schedules are skipped.
-pub(crate) fn plan_schedules(
-    cfg: &BackupConfig,
-    databases: &[(String, String)],
-    now: chrono::DateTime<Utc>,
-) -> Vec<(chrono::DateTime<Utc>, ScheduledJob)> {
-    let next = |expr: &str| {
-        crate::cron::parse_schedule(expr)
-            .ok()
-            .and_then(|s| s.after(&now).next())
-    };
-    let mut out = Vec::new();
-    if cfg.enabled != 0
-        && let Some(t) = next(&cfg.full_schedule_cron)
-    {
-        out.push((t, ScheduledJob::Full));
-    }
-    for (name, expr) in databases {
-        if let Some(t) = next(expr) {
-            out.push((t, ScheduledJob::Database(name.clone())));
-        }
-    }
-    out.sort_by_key(|(t, _)| *t);
-    out
-}
+
 
 /// The next run of one cron expression (for the API).
 pub fn next_run(expr: &str) -> Option<chrono::DateTime<Utc>> {
@@ -1370,11 +1735,180 @@ pub fn next_run(expr: &str) -> Option<chrono::DateTime<Utc>> {
         .and_then(|s| s.after(&Utc::now()).next())
 }
 
+/// The key of a job in `backup_schedule_state`.
+fn job_key(job: &ScheduledJob) -> String {
+    match job {
+        ScheduledJob::Full => "full".to_string(),
+        ScheduledJob::Database(name) => format!("database:{name}"),
+    }
+}
+
+/// A scheduled backup to run now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DueJob {
+    pub job: ScheduledJob,
+    /// The latest slot it runs for (recorded as `last_slot`)
+    pub slot: chrono::DateTime<Utc>,
+    /// The slot came due before this process started (the server was down)
+    pub catch_up: bool,
+    /// How many slots passed since the last run (one backup covers them all)
+    pub missed: usize,
+}
+
+/// What the scheduler does next.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct SchedulePlan {
+    /// Jobs to run now, in order
+    pub due: Vec<DueJob>,
+    /// Jobs seen for the first time (or with a changed schedule): their
+    /// state starts at `now`, so they never catch up on slots before that
+    pub init: Vec<(String, String)>,
+    /// When the next slot comes due
+    pub next: Option<chrono::DateTime<Utc>>,
+}
+
+/// Decide what runs: a job whose first slot after its `last_slot` has
+/// passed is due — once, however many slots passed. `states` maps job keys
+/// to (schedule, last_slot); `started_at` is when this process started, to
+/// tell a catch-up (a slot missed while the server was down) from a slot
+/// that just came due.
+pub(crate) fn plan_due(
+    jobs: &[(ScheduledJob, String)],
+    states: &std::collections::HashMap<String, (String, chrono::DateTime<Utc>)>,
+    now: chrono::DateTime<Utc>,
+    started_at: chrono::DateTime<Utc>,
+) -> SchedulePlan {
+    let mut plan = SchedulePlan::default();
+    for (job, expr) in jobs {
+        let Ok(schedule) = crate::cron::parse_schedule(expr) else {
+            continue;
+        };
+        let key = job_key(job);
+        let after_now = schedule.after(&now).next();
+        let last = match states.get(&key) {
+            Some((stored, last)) if stored == expr => *last,
+            _ => {
+                plan.init.push((key, expr.clone()));
+                plan.next = min_time(plan.next, after_now);
+                continue;
+            }
+        };
+        let Some(first) = schedule.after(&last).next() else {
+            continue;
+        };
+        if first > now {
+            plan.next = min_time(plan.next, Some(first));
+            continue;
+        }
+        // The latest slot that has passed (bounded: a minutely schedule
+        // missed for a year is still few enough).
+        let mut slot = first;
+        let mut missed = 1;
+        for t in schedule.after(&first).take(600_000) {
+            if t > now {
+                break;
+            }
+            slot = t;
+            missed += 1;
+        }
+        plan.due.push(DueJob {
+            job: job.clone(),
+            slot,
+            catch_up: first < started_at,
+            missed,
+        });
+        plan.next = min_time(plan.next, after_now);
+    }
+    plan
+}
+
+fn min_time(
+    a: Option<chrono::DateTime<Utc>>,
+    b: Option<chrono::DateTime<Utc>>,
+) -> Option<chrono::DateTime<Utc>> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// The schedules in force: the full snapshot (when enabled) and each
+/// database with a schedule.
+async fn scheduled_jobs(state: &AppState) -> Result<Vec<(ScheduledJob, String)>> {
+    let cfg = get_backup_config(state).await?;
+    let dbs: Vec<(String, String)> = sqlx::query_as(
+        "SELECT name, backup_schedule FROM databases WHERE backup_schedule IS NOT NULL",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    let mut jobs = Vec::new();
+    if cfg.enabled != 0 {
+        jobs.push((ScheduledJob::Full, cfg.full_schedule_cron));
+    }
+    jobs.extend(
+        dbs.into_iter()
+            .map(|(name, expr)| (ScheduledJob::Database(name), expr)),
+    );
+    Ok(jobs)
+}
+
+/// Read the schedule state, forgetting jobs that are no longer scheduled
+/// (so turning a schedule back on starts over instead of catching up).
+async fn schedule_states(
+    state: &AppState,
+    jobs: &[(ScheduledJob, String)],
+) -> Result<std::collections::HashMap<String, (String, chrono::DateTime<Utc>)>> {
+    let rows: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT job, schedule, last_slot FROM backup_schedule_state")
+            .fetch_all(&state.db)
+            .await?;
+    let live: Vec<String> = jobs.iter().map(|(j, _)| job_key(j)).collect();
+    let mut out = std::collections::HashMap::new();
+    for (job, schedule, last_slot) in rows {
+        let parsed = chrono::DateTime::parse_from_rfc3339(&last_slot).map(|t| t.with_timezone(&Utc));
+        match parsed {
+            Ok(last) if live.contains(&job) => {
+                out.insert(job, (schedule, last));
+            }
+            _ => {
+                sqlx::query("DELETE FROM backup_schedule_state WHERE job = ?")
+                    .bind(&job)
+                    .execute(&state.db)
+                    .await?;
+            }
+        }
+    }
+    Ok(out)
+}
+
+async fn set_last_slot(
+    state: &AppState,
+    job: &str,
+    schedule: &str,
+    slot: chrono::DateTime<Utc>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO backup_schedule_state (job, schedule, last_slot) VALUES (?, ?, ?)
+         ON CONFLICT(job) DO UPDATE SET schedule = excluded.schedule, last_slot = excluded.last_slot",
+    )
+    .bind(job)
+    .bind(schedule)
+    .bind(slot.to_rfc3339())
+    .execute(&state.db)
+    .await?;
+    Ok(())
+}
+
 /// Sleeps until the next scheduled backup — the full snapshot or any
 /// database's own schedule, whichever is first. A change to backup_config or
 /// to a database schedule (`schedules_changed`) wakes it to re-plan. With
 /// nothing scheduled it waits for a change. Jobs due together run one after
 /// another (they may dump the same database).
+///
+/// Each job's last slot is kept in `backup_schedule_state`, so a backup that
+/// came due while the server was down runs once when it starts again — not
+/// once per missed slot — logged, audited (`backup_catch_up`) and noted on
+/// the snapshot as a catch-up.
 pub async fn backup_scheduler(state: AppState) {
     use crate::runtime::changes::{Table, Watch};
     use crate::runtime::loops::{self, Wake};
@@ -1382,16 +1916,28 @@ pub async fn backup_scheduler(state: AppState) {
     const IDLE: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
     let lp = loops::register("backup-scheduler");
     let mut watch = Watch::new(&[Table::BackupConfig]);
+    let started_at = crate::runtime::process_started_at();
 
     loop {
         let planned = async {
-            let cfg = get_backup_config(&state).await?;
-            let dbs: Vec<(String, String)> = sqlx::query_as(
-                "SELECT name, backup_schedule FROM databases WHERE backup_schedule IS NOT NULL",
-            )
-            .fetch_all(&state.db)
-            .await?;
-            anyhow::Ok(plan_schedules(&cfg, &dbs, Utc::now()))
+            let jobs = scheduled_jobs(&state).await?;
+            let states = schedule_states(&state, &jobs).await?;
+            let now = Utc::now();
+            let plan = plan_due(&jobs, &states, now, started_at);
+            for (key, expr) in &plan.init {
+                set_last_slot(&state, key, expr, now).await?;
+            }
+            // Claim the due slots before running, so a re-plan (or a
+            // restart mid-backup) never runs them twice.
+            for due in &plan.due {
+                let expr = jobs
+                    .iter()
+                    .find(|(j, _)| *j == due.job)
+                    .map(|(_, e)| e.clone())
+                    .unwrap_or_default();
+                set_last_slot(&state, &job_key(&due.job), &expr, due.slot).await?;
+            }
+            anyhow::Ok(plan)
         }
         .await;
         let plan = match planned {
@@ -1403,11 +1949,25 @@ pub async fn backup_scheduler(state: AppState) {
                 continue;
             }
         };
-        let Some(&(next, _)) = plan.first() else {
+
+        if !plan.due.is_empty() {
+            if crate::runtime::shutdown::is_shutting_down() {
+                return;
+            }
+            drop(lp.run());
+            let state_clone = state.clone();
+            crate::runtime::shutdown::spawn_tracked(async move {
+                for due in plan.due {
+                    run_scheduled(&state_clone, due).await;
+                }
+            });
+            continue;
+        }
+
+        let Some(next) = plan.next else {
             lp.wait(Some(IDLE), &mut watch).await;
             continue;
         };
-
         let wait = (next - Utc::now())
             .to_std()
             .unwrap_or(std::time::Duration::from_secs(1));
@@ -1418,29 +1978,41 @@ pub async fn backup_scheduler(state: AppState) {
         if crate::runtime::shutdown::is_shutting_down() {
             return;
         }
-        drop(lp.run());
-
-        let now = Utc::now();
-        let due: Vec<ScheduledJob> = plan
-            .into_iter()
-            .filter(|(t, _)| *t <= now)
-            .map(|(_, job)| job)
-            .collect();
-        let state_clone = state.clone();
-        crate::runtime::shutdown::spawn_tracked(async move {
-            for job in due {
-                let trigger = match job {
-                    ScheduledJob::Full => SnapshotTrigger::Scheduled,
-                    ScheduledJob::Database(db_name) => {
-                        SnapshotTrigger::ScheduledDatabase { db_name }
-                    }
-                };
-                // A failure marks the snapshot failed, which the alert
-                // engine's "backup failed" rule picks up.
-                let _ = create_snapshot(&state_clone, trigger, None).await;
-            }
-        });
     }
+}
+
+/// Run one due scheduled backup. A failure marks the snapshot failed, which
+/// the alert engine's "backup failed" rule picks up.
+async fn run_scheduled(state: &AppState, due: DueJob) {
+    let trigger = match &due.job {
+        ScheduledJob::Full => SnapshotTrigger::Scheduled,
+        ScheduledJob::Database(db_name) => SnapshotTrigger::ScheduledDatabase {
+            db_name: db_name.clone(),
+        },
+    };
+    let notes = due.catch_up.then(|| {
+        format!(
+            "Catch-up: the backup due at {} was missed while Tond was down{}",
+            due.slot.format("%Y-%m-%d %H:%M UTC"),
+            if due.missed > 1 {
+                format!(" ({} slots missed, one backup taken)", due.missed)
+            } else {
+                String::new()
+            }
+        )
+    });
+    if let Some(note) = &notes {
+        tracing::info!("Scheduled backup {}: {note}", job_key(&due.job));
+        crate::audit_log::record(
+            &state.db,
+            &crate::audit_log::AuditActor::system("backup-scheduler"),
+            crate::audit_log::AuditEntry::new("backup_catch_up")
+                .kind("backup")
+                .detail(format!("job={} {note}", job_key(&due.job))),
+        )
+        .await;
+    }
+    let _ = create_snapshot_noted(state, trigger, None, notes).await;
 }
 
 // ── Dump lock ─────────────────────────────────────────────────────────────────
@@ -1472,120 +2044,12 @@ async fn emit(tx: &Option<ProgressTx>, step: &str, message: &str, done: bool) {
     }
 }
 
-// ── Hard-link deduplication copy ─────────────────────────────────────────────
 
-/// Walk `src` and copy into `dest`, hard-linking from `prev` when mtime+size match.
-/// Only regular files and directories are copied: symlinks (which a container
-/// could point at host files), sockets and devices are skipped.
-/// Returns (delta_bytes, total_bytes).
-fn copy_dir_with_hardlinks(src: &Path, dest: &Path, prev: Option<&Path>) -> Result<(i64, i64)> {
-    let mut delta: i64 = 0;
-    let mut total: i64 = 0;
-
-    for entry in walkdir::WalkDir::new(src).follow_links(false) {
-        let entry = entry?;
-        let rel = entry.path().strip_prefix(src)?;
-        let dest_path = dest.join(rel);
-
-        if entry.file_type().is_dir() {
-            std::fs::create_dir_all(&dest_path)?;
-            if let Ok(meta) = entry.metadata() {
-                keep_owner(&meta, &dest_path);
-            }
-            continue;
-        }
-        if !entry.file_type().is_file() {
-            continue;
-        }
-
-        let src_meta = entry.metadata()?;
-        let size = src_meta.len() as i64;
-        total += size;
-
-        // Try hard-link from previous snapshot if mtime+size match
-        let hard_linked = if let Some(prev_dir) = prev {
-            let prev_path = prev_dir.join(rel);
-            match std::fs::symlink_metadata(&prev_path) {
-                Ok(prev_meta) if prev_meta.is_file() => {
-                    let mtime_match = src_meta.modified().ok() == prev_meta.modified().ok();
-                    let size_match = src_meta.len() == prev_meta.len();
-                    if mtime_match && size_match {
-                        if let Some(parent) = dest_path.parent() {
-                            std::fs::create_dir_all(parent)?;
-                        }
-                        std::fs::hard_link(&prev_path, &dest_path).is_ok()
-                    } else {
-                        false
-                    }
-                }
-                _ => false,
-            }
-        } else {
-            false
-        };
-
-        if !hard_linked {
-            if let Some(parent) = dest_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::copy(entry.path(), &dest_path)?;
-            keep_owner(&src_meta, &dest_path);
-            // Keep the mtime so the next snapshot can hard-link this file.
-            if let Ok(mtime) = src_meta.modified() {
-                let _ = std::fs::File::options()
-                    .write(true)
-                    .open(&dest_path)
-                    .and_then(|f| f.set_modified(mtime));
-            }
-            delta += size;
-        }
-    }
-
-    Ok((delta, total))
-}
-
-/// Give `path` the owner and group of `meta` (best-effort: only root can).
-/// Volume data often belongs to a service user (postgres, redis) that must
-/// still own it after a snapshot and restore.
-fn keep_owner(meta: &std::fs::Metadata, path: &Path) {
-    use std::os::unix::fs::MetadataExt;
-    let _ = std::os::unix::fs::lchown(path, Some(meta.uid()), Some(meta.gid()));
-}
-
-/// Simple recursive directory copy (no deduplication). Only regular files
-/// and directories are copied; owners are kept.
-async fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
-    tokio::fs::create_dir_all(dest).await?;
-    if let Ok(meta) = tokio::fs::metadata(src).await {
-        keep_owner(&meta, dest);
-    }
-    let mut stack = vec![(src.to_path_buf(), dest.to_path_buf())];
-    while let Some((s, d)) = stack.pop() {
-        let mut entries = tokio::fs::read_dir(&s).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let ft = entry.file_type().await?;
-            let dest_entry = d.join(entry.file_name());
-            if ft.is_dir() {
-                tokio::fs::create_dir_all(&dest_entry).await?;
-                if let Ok(meta) = entry.metadata().await {
-                    keep_owner(&meta, &dest_entry);
-                }
-                stack.push((entry.path(), dest_entry));
-            } else if ft.is_file() {
-                tokio::fs::copy(entry.path(), &dest_entry).await?;
-                if let Ok(meta) = entry.metadata().await {
-                    keep_owner(&meta, &dest_entry);
-                }
-            }
-        }
-    }
-    Ok(())
-}
 
 // ── Remote upload key ─────────────────────────────────────────────────────────
 
 fn upload_key_for_snapshot(id: &str) -> String {
-    format!("snapshots/{}.tondsnap", id)
+    snapshot_remote::archive_key(id)
 }
 
 // ── Config helper ─────────────────────────────────────────────────────────────
@@ -1696,12 +2160,15 @@ pub async fn delete_snapshot_files_and_row(state: &AppState, snap: &Snapshot) {
         .fetch_optional(&state.db)
         .await
         && let Ok(provider) = decrypt_provider_secret(provider)
-        && let Err(e) = storage::delete(&provider, key).await
     {
-        tracing::warn!(
-            "Couldn't delete the remote copy of snapshot {}: {e:#}",
-            snap.id
-        );
+        // The manifest first: an archive without one is no longer listed.
+        let _ = storage::delete(&provider, &snapshot_remote::manifest_key(&snap.id)).await;
+        if let Err(e) = storage::delete(&provider, key).await {
+            tracing::warn!(
+                "Couldn't delete the remote copy of snapshot {}: {e:#}",
+                snap.id
+            );
+        }
     }
     let _ = sqlx::query("DELETE FROM snapshots WHERE id = ?")
         .bind(&snap.id)
@@ -1711,7 +2178,7 @@ pub async fn delete_snapshot_files_and_row(state: &AppState, snap: &Snapshot) {
 
 // ── Fetch + ensure local helpers ──────────────────────────────────────────────
 
-async fn fetch_snapshot(state: &AppState, id: &str) -> Result<Snapshot> {
+pub(crate) async fn fetch_snapshot(state: &AppState, id: &str) -> Result<Snapshot> {
     sqlx::query_as::<_, Snapshot>("SELECT * FROM snapshots WHERE id = ? AND status = 'completed'")
         .bind(id)
         .fetch_optional(&state.db)
@@ -1721,7 +2188,7 @@ async fn fetch_snapshot(state: &AppState, id: &str) -> Result<Snapshot> {
 
 /// Returns the local path of a snapshot, downloading (and verifying) the
 /// remote copy if necessary.
-async fn ensure_local(state: &AppState, snap: &Snapshot) -> Result<PathBuf> {
+pub(crate) async fn ensure_local(state: &AppState, snap: &Snapshot) -> Result<PathBuf> {
     if let Some(ref local) = snap.local_path {
         let p = PathBuf::from(local);
         if p.exists() {
@@ -1975,7 +2442,7 @@ async fn upload_file_to_container(
 }
 
 /// A `Write` sink that forwards 256 KiB chunks to an async request body.
-struct ChunkWriter {
+pub(crate) struct ChunkWriter {
     tx: mpsc::Sender<std::result::Result<axum::body::Bytes, io::Error>>,
     buf: Vec<u8>,
 }
@@ -1983,7 +2450,7 @@ struct ChunkWriter {
 impl ChunkWriter {
     const CHUNK: usize = 256 * 1024;
 
-    fn new(tx: mpsc::Sender<std::result::Result<axum::body::Bytes, io::Error>>) -> Self {
+    pub(crate) fn new(tx: mpsc::Sender<std::result::Result<axum::body::Bytes, io::Error>>) -> Self {
         Self {
             tx,
             buf: Vec::with_capacity(Self::CHUNK),
@@ -2000,7 +2467,7 @@ impl ChunkWriter {
             .map_err(|_| io::Error::other("the container upload stopped"))
     }
 
-    fn finish(mut self) -> io::Result<()> {
+    pub(crate) fn finish(mut self) -> io::Result<()> {
         self.send_buf()
     }
 }
@@ -2202,6 +2669,8 @@ mod tests {
     use filetime::{FileTime, set_file_mtime};
     use tempfile::TempDir;
 
+    use std::collections::HashMap;
+
     use super::*;
 
     fn temp_dir() -> TempDir {
@@ -2336,99 +2805,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_dir_with_hardlinks_copies_new_files_and_hard_links_unchanged_files() {
-        let temp = temp_dir();
-        let src = temp.path().join("src");
-        let prev = temp.path().join("prev");
-        let dest = temp.path().join("dest");
-        fs::create_dir_all(src.join("nested"))
-            .unwrap_or_else(|err| panic!("failed to create src directories: {err}"));
-        fs::create_dir_all(prev.join("nested"))
-            .unwrap_or_else(|err| panic!("failed to create prev directories: {err}"));
-
-        fs::write(src.join("same.txt"), b"same")
-            .unwrap_or_else(|err| panic!("failed to write src same.txt: {err}"));
-        fs::write(src.join("nested").join("changed.txt"), b"new contents")
-            .unwrap_or_else(|err| panic!("failed to write src changed.txt: {err}"));
-        fs::write(prev.join("same.txt"), b"same")
-            .unwrap_or_else(|err| panic!("failed to write prev same.txt: {err}"));
-        fs::write(prev.join("nested").join("changed.txt"), b"old")
-            .unwrap_or_else(|err| panic!("failed to write prev changed.txt: {err}"));
-        let mtime = FileTime::from_unix_time(1_700_000_000, 0);
-        set_file_mtime(src.join("same.txt"), mtime)
-            .unwrap_or_else(|err| panic!("failed to set src same.txt mtime: {err}"));
-        set_file_mtime(prev.join("same.txt"), mtime)
-            .unwrap_or_else(|err| panic!("failed to set prev same.txt mtime: {err}"));
-
-        let (delta, total) = copy_dir_with_hardlinks(&src, &dest, Some(&prev))
-            .unwrap_or_else(|err| panic!("expected copy_dir_with_hardlinks to succeed: {err}"));
-
-        assert_eq!(
-            fs::read(dest.join("same.txt"))
-                .unwrap_or_else(|err| panic!("failed to read dest same.txt: {err}")),
-            b"same",
-            "copy_dir_with_hardlinks should copy file contents into the destination tree"
-        );
-        assert_eq!(
-            fs::read(dest.join("nested").join("changed.txt"))
-                .unwrap_or_else(|err| panic!("failed to read dest changed.txt: {err}")),
-            b"new contents",
-            "copy_dir_with_hardlinks should copy changed files from the source tree"
-        );
-        assert!(
-            delta >= 12,
-            "delta bytes should include newly copied file bytes, got {delta}"
-        );
-        assert!(
-            total >= delta,
-            "total bytes should be at least as large as delta bytes"
-        );
-
-        let prev_meta = fs::metadata(prev.join("same.txt"))
-            .unwrap_or_else(|err| panic!("failed to stat prev same.txt: {err}"));
-        let dest_meta = fs::metadata(dest.join("same.txt"))
-            .unwrap_or_else(|err| panic!("failed to stat dest same.txt: {err}"));
-        assert_eq!(
-            prev_meta.ino(),
-            dest_meta.ino(),
-            "unchanged files should be hard-linked from the previous snapshot when metadata matches"
-        );
-    }
-
-    #[tokio::test]
-    async fn copy_dir_recursive_copies_nested_directory_structure() {
-        let temp = temp_dir();
-        let src = temp.path().join("src");
-        let dest = temp.path().join("dest");
-        fs::create_dir_all(src.join("nested"))
-            .unwrap_or_else(|err| panic!("failed to create src directories: {err}"));
-        fs::write(src.join("root.txt"), b"root")
-            .unwrap_or_else(|err| panic!("failed to write root file: {err}"));
-        fs::write(src.join("nested").join("child.txt"), b"child")
-            .unwrap_or_else(|err| panic!("failed to write nested file: {err}"));
-
-        copy_dir_recursive(&src, &dest)
-            .await
-            .unwrap_or_else(|err| panic!("expected copy_dir_recursive to succeed: {err}"));
-
-        assert_eq!(
-            tokio::fs::read(dest.join("root.txt"))
-                .await
-                .unwrap_or_else(|err| panic!("failed to read copied root file: {err}")),
-            b"root",
-            "copy_dir_recursive should copy files at the root"
-        );
-        assert_eq!(
-            tokio::fs::read(dest.join("nested").join("child.txt"))
-                .await
-                .unwrap_or_else(|err| panic!("failed to read copied nested file: {err}")),
-            b"child",
-            "copy_dir_recursive should copy nested files recursively"
-        );
-    }
-
-    #[test]
-    fn copy_dir_with_hardlinks_skips_symlinks_out_of_the_volume() {
+    fn snapshot_copies_skip_symlinks_out_of_the_volume() {
         let temp = temp_dir();
         let src = temp.path().join("src");
         let dest = temp.path().join("dest");
@@ -2439,10 +2816,13 @@ mod tests {
         std::os::unix::fs::symlink(&secret, src.join("leak"))
             .unwrap_or_else(|err| panic!("symlink: {err}"));
 
-        copy_dir_with_hardlinks(&src, &dest, None)
+        snapshot_files::encrypt_tree(&src, &dest, None)
             .unwrap_or_else(|err| panic!("copy should succeed: {err}"));
 
-        assert!(dest.join("ok.txt").is_file());
+        assert_eq!(
+            snapshot_files::read_encrypted(&dest.join("ok.txt")).ok(),
+            Some(b"ok".to_vec())
+        );
         assert!(
             fs::symlink_metadata(dest.join("leak")).is_err(),
             "a symlink in a volume must not copy the host file it points at"
@@ -2450,7 +2830,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_dir_with_hardlinks_keeps_mtime_so_the_next_snapshot_dedupes() {
+    fn snapshot_copies_keep_mtime_so_the_next_snapshot_dedupes() {
         let temp = temp_dir();
         let src = temp.path().join("src");
         fs::create_dir_all(&src).unwrap_or_else(|err| panic!("mkdir: {err}"));
@@ -2462,17 +2842,20 @@ mod tests {
         .unwrap_or_else(|err| panic!("mtime: {err}"));
 
         let first = temp.path().join("first");
-        let (d1, _) = copy_dir_with_hardlinks(&src, &first, None)
+        let (d1, _) = snapshot_files::encrypt_tree(&src, &first, None)
             .unwrap_or_else(|err| panic!("first copy: {err}"));
         let second = temp.path().join("second");
-        let (d2, t2) = copy_dir_with_hardlinks(&src, &second, Some(&first))
+        let (d2, t2) = snapshot_files::encrypt_tree(&src, &second, Some(&first))
             .unwrap_or_else(|err| panic!("second copy: {err}"));
 
         assert_eq!(d1, 4096);
         assert_eq!((d2, t2), (0, 4096), "an unchanged file must be hard-linked");
+        let ino = |p: &Path| fs::metadata(p).map(|m| m.ino()).unwrap_or(0);
+        assert_eq!(ino(&first.join("big.bin")), ino(&second.join("big.bin")));
     }
 
     #[test]
+
     fn part_writer_cuts_parts_and_ends_only_on_finish() {
         let (tx, mut rx) = mpsc::channel::<storage::Part>(16);
         let mut writer = PartWriter::new(tx, 10);
@@ -2547,53 +2930,123 @@ mod tests {
         );
     }
 
-    fn cfg(enabled: bool, cron: &str) -> BackupConfig {
-        BackupConfig {
-            id: 1,
-            enabled: i64::from(enabled),
-            full_schedule_cron: cron.to_string(),
-            full_retention_count: 7,
-            pre_deploy_enabled: 1,
-            pre_deploy_retention_per_app: 10,
-            keep_local: 1,
-            storage_provider_id: None,
+    /// A migrated in-memory database; Docker is unreachable on purpose.
+    async fn test_state() -> AppState {
+        let db = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        crate::db::migrate(&db)
+            .await
+            .unwrap_or_else(|e| panic!("migrate: {e}"));
+        AppState {
+            db,
+            docker: bollard::Docker::connect_with_http(
+                "http://127.0.0.1:9",
+                1,
+                bollard::API_DEFAULT_VERSION,
+            )
+            .unwrap_or_else(|e| panic!("{e}")),
+            rate_limiter: crate::auth::RateLimiter::new(60, 10.0),
+            settings: std::sync::Arc::new(tokio::sync::RwLock::new(
+                tond_common::ServerSettings::default(),
+            )),
         }
+    }
+
+    fn at(s: &str) -> chrono::DateTime<Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .with_timezone(&Utc)
     }
 
     #[test]
     fn the_scheduler_plans_full_and_per_database_runs_in_order() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-03-01T10:30:00Z")
-            .unwrap_or_else(|e| panic!("{e}"))
-            .with_timezone(&Utc);
-        let dbs = vec![
-            ("shop".to_string(), "0 11 * * *".to_string()),
-            ("cache".to_string(), "*/15 * * * *".to_string()),
-            ("broken".to_string(), "not a cron".to_string()),
+        let now = at("2026-03-01T10:30:00Z");
+        let jobs = vec![
+            (ScheduledJob::Full, "0 3 * * *".to_string()),
+            (ScheduledJob::Database("shop".into()), "0 11 * * *".to_string()),
+            (ScheduledJob::Database("cache".into()), "*/15 * * * *".to_string()),
+            (ScheduledJob::Database("broken".into()), "not a cron".to_string()),
         ];
-        let plan = plan_schedules(&cfg(true, "0 3 * * *"), &dbs, now);
-        let jobs: Vec<(String, ScheduledJob)> = plan
+        // First sight: nothing runs, every job starts from now.
+        let plan = plan_due(&jobs, &HashMap::new(), now, now);
+        assert!(plan.due.is_empty());
+        assert_eq!(plan.init.len(), 3, "an invalid schedule is skipped");
+        assert_eq!(plan.next, Some(at("2026-03-01T10:45:00Z")), "soonest first");
+
+        let states: HashMap<String, (String, chrono::DateTime<Utc>)> = jobs[..3]
             .iter()
-            .map(|(t, j)| (t.format("%d %H:%M").to_string(), j.clone()))
+            .map(|(j, e)| (job_key(j), (e.clone(), now)))
             .collect();
+        let plan = plan_due(&jobs, &states, now, now);
+        assert!(plan.due.is_empty() && plan.init.is_empty());
+        assert_eq!(plan.next, Some(at("2026-03-01T10:45:00Z")));
+
+        // At 10:45 (server up all along) the cache backup is due, not a catch-up.
+        let later = at("2026-03-01T10:45:00Z");
+        let plan = plan_due(&jobs, &states, later, now);
         assert_eq!(
-            jobs,
-            vec![
-                (
-                    "01 10:45".to_string(),
-                    ScheduledJob::Database("cache".to_string())
-                ),
-                (
-                    "01 11:00".to_string(),
-                    ScheduledJob::Database("shop".to_string())
-                ),
-                ("02 03:00".to_string(), ScheduledJob::Full),
-            ],
-            "soonest first; an invalid schedule is skipped"
+            plan.due,
+            vec![DueJob {
+                job: ScheduledJob::Database("cache".into()),
+                slot: later,
+                catch_up: false,
+                missed: 1,
+            }]
         );
-        // Full snapshots off: only the database schedules remain.
-        let plan = plan_schedules(&cfg(false, "0 3 * * *"), &dbs[..1], now);
-        assert_eq!(plan.len(), 1);
-        assert!(plan_schedules(&cfg(false, "0 3 * * *"), &[], now).is_empty());
+    }
+
+    #[test]
+    fn backups_missed_while_down_run_once_as_a_catch_up() {
+        let jobs = vec![
+            (ScheduledJob::Full, "0 3 * * *".to_string()),
+            (ScheduledJob::Database("shop".into()), "0 * * * *".to_string()),
+        ];
+        // Last ran at 03:00 on the 1st; the server was down until the 4th 09:20.
+        let last = at("2026-03-01T03:00:00Z");
+        let states: HashMap<String, (String, chrono::DateTime<Utc>)> = jobs
+            .iter()
+            .map(|(j, e)| (job_key(j), (e.clone(), last)))
+            .collect();
+        let started = at("2026-03-04T09:20:00Z");
+        let plan = plan_due(&jobs, &states, started, started);
+        assert_eq!(plan.due.len(), 2, "one run per job, not one per missed slot");
+        assert_eq!(plan.due[0].job, ScheduledJob::Full);
+        assert_eq!(plan.due[0].slot, at("2026-03-04T03:00:00Z"));
+        assert!(plan.due[0].catch_up);
+        assert_eq!(plan.due[0].missed, 3);
+        assert_eq!(plan.due[1].slot, at("2026-03-04T09:00:00Z"));
+        assert_eq!(plan.due[1].missed, 78);
+
+        // A changed schedule starts over instead of catching up.
+        let mut changed = states.clone();
+        changed.insert("full".into(), ("0 4 * * *".into(), last));
+        let plan = plan_due(&jobs, &changed, started, started);
+        assert_eq!(plan.init, vec![("full".to_string(), "0 3 * * *".to_string())]);
+        assert!(plan.due.iter().all(|d| d.job != ScheduledJob::Full));
+    }
+
+    #[tokio::test]
+    async fn the_scheduler_state_forgets_schedules_that_were_turned_off() {
+        let state = test_state().await;
+        let now = at("2026-03-01T10:00:00Z");
+        set_last_slot(&state, "full", "0 3 * * *", now)
+            .await
+            .unwrap_or_else(|e| panic!("set: {e:#}"));
+        set_last_slot(&state, "database:gone", "0 * * * *", now)
+            .await
+            .unwrap_or_else(|e| panic!("set: {e:#}"));
+        let jobs = vec![(ScheduledJob::Full, "0 3 * * *".to_string())];
+        let states = schedule_states(&state, &jobs)
+            .await
+            .unwrap_or_else(|e| panic!("states: {e:#}"));
+        assert_eq!(states.len(), 1);
+        assert_eq!(states.get("full").map(|(_, t)| *t), Some(now));
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backup_schedule_state")
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or(0);
+        assert_eq!(left, 1);
     }
 
     fn snap(id: &str, trigger: &str) -> Snapshot {
@@ -2849,8 +3302,9 @@ mod tests {
 
         // A snapshot directory larger than one part, incompressible.
         let temp = temp_dir();
+        let plain = temp.path().join("plain");
         let staging = temp.path().join("snap");
-        fs::create_dir_all(staging.join("volumes/web")).unwrap_or_else(|e| panic!("{e}"));
+        fs::create_dir_all(plain.join("volumes/web")).unwrap_or_else(|e| panic!("{e}"));
         let mut state = 0x2545_F491_4F6C_DD1D_u64;
         let data: Vec<u8> = (0..(storage::PART_SIZE + 3 * 1024 * 1024))
             .map(|_| {
@@ -2860,19 +3314,22 @@ mod tests {
                 state as u8
             })
             .collect();
-        fs::write(staging.join("volumes/web/blob.bin"), &data).unwrap_or_else(|e| panic!("{e}"));
-        fs::write(staging.join("manifest.json"), b"{}").unwrap_or_else(|e| panic!("{e}"));
+        fs::write(plain.join("volumes/web/blob.bin"), &data).unwrap_or_else(|e| panic!("{e}"));
+        fs::write(plain.join("manifest.json"), b"{}").unwrap_or_else(|e| panic!("{e}"));
+        // A local snapshot: every file encrypted at rest.
+        snapshot_files::encrypt_tree(&plain, &staging, None)
+            .unwrap_or_else(|e| panic!("local copy: {e:#}"));
+        assert!(
+            fs::read(staging.join("volumes/web/blob.bin"))
+                .unwrap_or_default()
+                .starts_with(snapshot_archive::LOCAL_MAGIC)
+        );
 
         let (tx, rx) = mpsc::channel::<storage::Part>(1);
         let src = staging.clone();
         let writer = tokio::task::spawn_blocking(move || {
             let sink = PartWriter::new(tx, storage::PART_SIZE);
-            let (summary, sink) = snapshot_archive::write_archive(
-                &src,
-                sink,
-                &secret_key::current_secret(),
-                "snap-1",
-            )?;
+            let (summary, sink) = archive_snapshot_dir(&src, sink, "snap-1")?;
             sink.finish()?;
             Ok::<_, anyhow::Error>(summary)
         });
@@ -2914,10 +3371,11 @@ mod tests {
         unpack_verified(&download, &restored, "snap-1")
             .unwrap_or_else(|e| panic!("restore: {e:#}"));
         assert_eq!(
-            fs::read(restored.join("volumes/web/blob.bin"))
+            snapshot_files::read_encrypted(&restored.join("volumes/web/blob.bin"))
                 .ok()
                 .as_deref(),
-            Some(data.as_slice())
+            Some(data.as_slice()),
+            "the fetched copy is a local snapshot again, encrypted at rest"
         );
 
         // Tampered or wrong-snapshot archives restore nothing.
@@ -2934,6 +3392,12 @@ mod tests {
         fs::write(&download, &stored).unwrap_or_else(|e| panic!("{e}"));
         assert!(unpack_verified(&download, &target, "snap-2").is_err());
         assert!(!target.exists());
+    }
+
+    /// Verify, then extract an archive file into a local snapshot directory.
+    fn unpack_verified(archive: &Path, dest: &Path, id: &str) -> Result<()> {
+        verify_archive_file(archive, Some(id))?;
+        extract_archive_file(archive, dest, id)
     }
 
     #[tokio::test]

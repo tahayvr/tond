@@ -366,4 +366,10 @@ api_routes! {
     POST "/api/v1/snapshots/{id}/restore-app" => handlers::backups::restore_app;
     POST "/api/v1/snapshots/{id}/restore-database" => handlers::backups::restore_database;
     POST "/api/v1/snapshots/{id}/restore-new-database" => handlers::backups::restore_to_new_database;
+    GET "/api/v1/snapshots/remote" => handlers::backups::list_remote_snapshots;
+    POST "/api/v1/snapshots/remote/{id}/import" => handlers::backups::import_remote_snapshot;
+    POST "/api/v1/snapshots/import" => handlers::backups::import_snapshot_archive [layer axum::extract::DefaultBodyLimit::disable()];
+    GET "/api/v1/snapshots/{id}/archive" => handlers::backups::export_snapshot_archive;
+    GET "/api/v1/snapshots/{id}/manifest" => handlers::backups::get_snapshot_manifest;
+    POST "/api/v1/snapshots/{id}/upload" => handlers::backups::upload_snapshot;
 }

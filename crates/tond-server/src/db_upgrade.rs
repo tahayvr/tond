@@ -308,7 +308,10 @@ async fn prepare_new_version(
         .bind(&backup_id)
         .fetch_one(&state.db)
         .await?;
-    let dump_dir = PathBuf::from(snapshot_dir).join("databases").join(&db.name);
+    // The backup is encrypted at rest: its dump as plain files, removed when
+    // this returns.
+    let plain = backup::plain_database_files(&PathBuf::from(snapshot_dir), &db.name).await?;
+    let dump_dir = plain.path().to_path_buf();
 
     step(
         state,

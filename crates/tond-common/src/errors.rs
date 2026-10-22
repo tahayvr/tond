@@ -44,6 +44,7 @@ pub mod code {
     pub const APP_ALREADY_EXISTS: &str = "APP_ALREADY_EXISTS";
     pub const DEPLOY_IN_PROGRESS: &str = "DEPLOY_IN_PROGRESS";
     pub const INSUFFICIENT_MEMORY: &str = "INSUFFICIENT_MEMORY";
+    pub const SNAPSHOT_KEY_MISMATCH: &str = "SNAPSHOT_KEY_MISMATCH";
     pub const IDEMPOTENCY_KEY_REUSED: &str = "IDEMPOTENCY_KEY_REUSED";
     pub const IDEMPOTENCY_KEY_IN_USE: &str = "IDEMPOTENCY_KEY_IN_USE";
     pub const BUILD_FAILED: &str = "BUILD_FAILED";
@@ -325,6 +326,15 @@ pub const ERROR_CODES: &[ErrorCodeInfo] = &[
         ),
     ),
     info(
+        code::SNAPSHOT_KEY_MISMATCH,
+        409,
+        exit::CONFLICT,
+        "The snapshot was encrypted with a different TOND_SECRET_KEY than this server's.",
+        Some(
+            "Set TOND_SECRET_KEY in /opt/tond/data/tond.env to the key of the server that made the snapshot (or keep it as TOND_PREVIOUS_SECRET_KEY), restart tond-server, and try again.",
+        ),
+    ),
+    info(
         code::IDEMPOTENCY_KEY_REUSED,
         422,
         exit::CONFLICT,
@@ -466,6 +476,11 @@ pub enum TondError {
     #[error("{0}")]
     BuildFailed(String),
 
+    /// A snapshot (remote copy or export) can't be read with this server's
+    /// TOND_SECRET_KEY.
+    #[error("{0}")]
+    SnapshotKeyMismatch(String),
+
     /// The server can't serve the request right now (starting, stopping, a
     /// dependency down).
     #[error("{0}")]
@@ -520,6 +535,7 @@ impl TondError {
             TondError::DeployInProgress(_) => code::DEPLOY_IN_PROGRESS,
             TondError::InsufficientMemory(_) => code::INSUFFICIENT_MEMORY,
             TondError::BuildFailed(_) => code::BUILD_FAILED,
+            TondError::SnapshotKeyMismatch(_) => code::SNAPSHOT_KEY_MISMATCH,
             TondError::Unavailable(_) => code::SERVICE_UNAVAILABLE,
             TondError::Internal(_) => code::INTERNAL,
             TondError::PayloadTooLarge(_) => code::PAYLOAD_TOO_LARGE,
@@ -541,6 +557,7 @@ impl TondError {
             | TondError::DeployInProgress(m)
             | TondError::InsufficientMemory(m)
             | TondError::BuildFailed(m)
+            | TondError::SnapshotKeyMismatch(m)
             | TondError::Unavailable(m)
             | TondError::PayloadTooLarge(m) => m.clone(),
             TondError::InvalidField { message, .. } => message.clone(),
@@ -626,6 +643,7 @@ mod tests {
             TondError::DeployInProgress(String::new()),
             TondError::InsufficientMemory(String::new()),
             TondError::BuildFailed(String::new()),
+            TondError::SnapshotKeyMismatch(String::new()),
             TondError::Unavailable(String::new()),
             TondError::Internal(String::new()),
             TondError::PayloadTooLarge(String::new()),

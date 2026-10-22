@@ -49,6 +49,7 @@ use tond_common::{
     CronJobResponse, CronJobRun, DatabaseCredentialsResponse, DeployKeyResponse,
     DeploymentResponse, IntegrationResponse, ManagedDatabaseDetail, ManagedDatabaseResponse,
     PasswordLinkResponse, PreviewDeploymentResponse, ProjectPreviewResponse, ProjectResponse,
+    RemoteSnapshotResponse,
     ServerSettings, SnapshotResponse, StorageProviderResponse, TemplateCatalogResponse,
     TemplateDeployRequest, TemplateDeployResponse, TokenResponse, UpdateAppDomainRequest,
     UpdateCronJobRequest, UpdateSettingsRequest, UserResponse, WebhookConfigResponse,
@@ -1342,6 +1343,146 @@ impl TondClient {
 
     pub async fn get_backup_config(&self) -> Result<BackupConfigResponse> {
         self.call(Method::GET, "/snapshots/config", None).await
+    }
+
+    /// GET /api/v1/snapshots/remote — snapshots in a storage provider's bucket.
+    pub async fn list_remote_snapshots(
+        &self,
+        provider: Option<&str>,
+    ) -> Result<Vec<RemoteSnapshotResponse>> {
+        match provider {
+            Some(p) => {
+                self.list(&format!(
+                    "/snapshots/remote?provider_id={}",
+                    urlencoding::encode(p)
+                ))
+                .await
+            }
+            None => self.list("/snapshots/remote").await,
+        }
+    }
+
+    /// POST /api/v1/snapshots/remote/{id}/import — list a bucket's snapshot here.
+    pub async fn import_remote_snapshot(
+        &self,
+        id: &str,
+        provider: Option<&str>,
+    ) -> Result<SnapshotResponse> {
+        self.call(
+            Method::POST,
+            &format!("/snapshots/remote/{}/import", urlencoding::encode(id)),
+            Some(json!({ "provider_id": provider })),
+        )
+        .await
+    }
+
+    /// POST /api/v1/snapshots/{id}/upload — upload a snapshot to storage now.
+    pub async fn upload_snapshot_remote(
+        &self,
+        id: &str,
+        provider: Option<&str>,
+    ) -> Result<SnapshotResponse> {
+        self.call(
+            Method::POST,
+            &format!("/snapshots/{id}/upload"),
+            Some(json!({ "provider_id": provider })),
+        )
+        .await
+    }
+
+    /// GET /api/v1/snapshots/{id}/manifest — what a snapshot holds.
+    pub async fn snapshot_manifest(&self, id: &str) -> Result<Value> {
+        self.value(Method::GET, &format!("/snapshots/{id}/manifest"), None)
+            .await
+    }
+
+    /// A request that streams (no retries: a body or reply stream can't be
+    /// replayed). Non-success replies become the server's error.
+    async fn send_stream(&self, req: RequestBuilder) -> Result<reqwest::Response> {
+        self.probe()?;
+        let req = self.auth_header(req);
+        let resp = req.send().await.map_err(|e| {
+            CliError::unreachable(format!("The request to tond-server failed: {e}"))
+        })?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(resp);
+        }
+        let body = resp.text().await.unwrap_or_default();
+        parse_envelope::<Value>(status, &body)?;
+        Err(CliError::status_only(status.as_u16(), format!("The server answered HTTP {status}")).into())
+    }
+
+    /// GET /api/v1/snapshots/{id}/archive into `dest` (written next to it
+    /// first, renamed when complete). Returns (bytes, SHA-256 hex).
+    pub async fn download_snapshot_archive(&self, id: &str, dest: &Path) -> Result<(u64, String)> {
+        use sha2::Digest as _;
+        use tokio::io::AsyncWriteExt as _;
+        let resp = self
+            .send_stream(
+                self.client
+                    .get(self.url(&format!("/snapshots/{id}/archive"))),
+            )
+            .await?;
+        let partial = dest.with_extension("partial");
+        let mut file = tokio::fs::File::create(&partial)
+            .await
+            .with_context(|| format!("cannot write {}", partial.display()))?;
+        let mut hasher = sha2::Sha256::new();
+        let mut bytes = 0u64;
+        let mut stream = resp.bytes_stream();
+        let written: Result<()> = async {
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| {
+                    CliError::unreachable(format!("The download broke off: {e}"))
+                })?;
+                hasher.update(&chunk);
+                bytes += chunk.len() as u64;
+                file.write_all(&chunk).await?;
+            }
+            file.flush().await?;
+            file.sync_all().await?;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = written {
+            let _ = tokio::fs::remove_file(&partial).await;
+            return Err(e);
+        }
+        tokio::fs::rename(&partial, dest).await?;
+        Ok((bytes, hex::encode(hasher.finalize())))
+    }
+
+    /// POST /api/v1/snapshots/import with the archive at `path` streamed.
+    pub async fn upload_snapshot_archive(&self, path: &Path) -> Result<SnapshotResponse> {
+        use tokio::io::AsyncReadExt as _;
+        let file = tokio::fs::File::open(path)
+            .await
+            .with_context(|| format!("cannot read {}", path.display()))?;
+        let len = file.metadata().await?.len();
+        let stream = futures::stream::unfold(file, |mut file| async move {
+            let mut buf = vec![0u8; 256 * 1024];
+            match file.read(&mut buf).await {
+                Ok(0) => None,
+                Ok(n) => {
+                    buf.truncate(n);
+                    Some((Ok::<_, std::io::Error>(buf), file))
+                }
+                Err(e) => Some((Err(e), file)),
+            }
+        });
+        let req = self
+            .client
+            .post(self.url("/snapshots/import"))
+            .header(IDEMPOTENCY_HEADER, uuid::Uuid::new_v4().to_string())
+            .header("content-type", "application/octet-stream")
+            .header("content-length", len)
+            .body(reqwest::Body::wrap_stream(stream));
+        let resp = self.send_stream(req).await?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        parse_envelope(status, &body)?
+            .ok_or_else(|| CliError::invalid_response("No data returned").into())
     }
 
     pub async fn update_backup_config(&self, body: Value) -> Result<BackupConfigResponse> {

@@ -200,3 +200,38 @@ pub struct RestoreDatabaseResponse {
     /// Backup of the data as it was just before the restore (to undo it)
     pub pre_restore_snapshot_id: String,
 }
+
+/// One snapshot found in a storage provider's bucket (from its manifest),
+/// for restoring on this server — possibly a fresh one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RemoteSnapshotResponse {
+    pub id: String,
+    pub provider_id: String,
+    pub created_at: String,
+    pub tond_version: String,
+    /// Size of the encrypted archive
+    pub archive_bytes: i64,
+    /// This server's TOND_SECRET_KEY (or the previous one) opens it
+    pub readable: bool,
+    /// Null when not readable
+    pub name: Option<String>,
+    pub trigger: Option<String>,
+    /// "full" | "database:<name>"; null when not readable
+    pub scope: Option<String>,
+    /// Apps it holds volumes of (empty when not readable)
+    pub apps: Vec<String>,
+    /// Managed databases it holds (empty when not readable)
+    pub databases: Vec<String>,
+    /// Already in this server's snapshot list
+    pub imported: bool,
+}
+
+/// POST /api/v1/snapshots/remote/{id}/import and /snapshots/{id}/upload
+#[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RemoteProviderRequest {
+    /// Storage provider to use; default: the one in the backup settings
+    #[serde(default)]
+    pub provider_id: Option<String>,
+}

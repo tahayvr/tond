@@ -36,6 +36,7 @@ use crate::audit_log::{AuditEntry, record};
 use crate::{
     auth::{Authz, RateLimit, scope},
     backup::{self, SnapshotTrigger},
+    snapshot_remote,
     error::AppError,
     state::AppState,
 };
@@ -537,6 +538,213 @@ pub async fn restore_to_new_database(
             "message": format!("Restored {source} into the new database {name}. {source} was not changed."),
             "database": ManagedDatabaseResponse::from(db),
         }))),
+    ))
+}
+
+// ── Remote storage, exports and imports ───────────────────────────────────────
+
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct RemoteListQuery {
+    /// Storage provider to list; default: the one in the backup settings
+    pub provider_id: Option<String>,
+}
+
+/// GET /api/v1/snapshots/remote — the snapshots in a storage provider's
+/// bucket (from their manifests), including ones this server never took.
+pub async fn list_remote_snapshots(
+    _rate: RateLimit,
+    _auth: Authz<scope::SnapshotsRead>,
+    State(state): State<AppState>,
+    Query(query): Query<RemoteListQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let list = snapshot_remote::list_remote(&state, query.provider_id).await?;
+    Ok((StatusCode::OK, Json(ApiResponse::ok(list))))
+}
+
+/// POST /api/v1/snapshots/remote/{id}/import — add a snapshot from the
+/// bucket to this server's list, to restore it from there.
+pub async fn import_remote_snapshot(
+    _rate: RateLimit,
+    auth: Authz<scope::SnapshotsRestore>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<RemoteProviderRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let snap = snapshot_remote::import_remote(&state, req.provider_id, &id).await?;
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("snapshot_import")
+            .resource("snapshot", &snap.id, &snap.name)
+            .detail("from=storage"),
+    )
+    .await;
+    Ok((StatusCode::OK, Json(ApiResponse::ok(SnapshotResponse::from(snap)))))
+}
+
+/// POST /api/v1/snapshots/{id}/upload — upload a snapshot's encrypted
+/// archive (and manifest) to a storage provider now (`tond export --remote`).
+pub async fn upload_snapshot(
+    _rate: RateLimit,
+    auth: Authz<scope::SnapshotsCreate>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<RemoteProviderRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let provider = snapshot_remote::provider(&state, req.provider_id).await?;
+    let snap = backup::fetch_snapshot(&state, &id)
+        .await
+        .map_err(|e| AppError(TondError::NotFound(format!("{e:#}"))))?;
+    let dir = backup::ensure_local(&state, &snap)
+        .await
+        .map_err(|e| AppError(TondError::Internal(format!("{e:#}"))))?;
+    sqlx::query("UPDATE snapshots SET remote_status = 'uploading', remote_error = NULL WHERE id = ?")
+        .bind(&id)
+        .execute(&state.db)
+        .await?;
+    let worker = state.clone();
+    let (sid, sp) = (id.clone(), provider.id.clone());
+    crate::runtime::shutdown::spawn_tracked(async move {
+        backup::upload_snapshot(&worker, &sid, &dir, &sp, true).await;
+    });
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("snapshot_export")
+            .resource("snapshot", &snap.id, &snap.name)
+            .detail(format!("to=storage provider={}", provider.name)),
+    )
+    .await;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ApiResponse::ok(SnapshotResponse::from(
+            fetch_snapshot_row(&state, &id).await?,
+        ))),
+    ))
+}
+
+/// GET /api/v1/snapshots/{id}/manifest — what the snapshot holds (its
+/// manifest.json).
+pub async fn get_snapshot_manifest(
+    _rate: RateLimit,
+    _auth: Authz<scope::SnapshotsRead>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let snap = backup::fetch_snapshot(&state, &id)
+        .await
+        .map_err(|e| AppError(TondError::NotFound(format!("{e:#}"))))?;
+    let dir = backup::ensure_local(&state, &snap)
+        .await
+        .map_err(|e| AppError(TondError::Internal(format!("{e:#}"))))?;
+    let manifest = backup::read_manifest(&dir)
+        .await
+        .map_err(|e| AppError(TondError::Internal(format!("{e:#}"))))?;
+    Ok((StatusCode::OK, Json(ApiResponse::ok(manifest))))
+}
+
+/// GET /api/v1/snapshots/{id}/archive — the snapshot as one encrypted
+/// archive, streamed (`tond export`). Readable only with this server's
+/// TOND_SECRET_KEY.
+pub async fn export_snapshot_archive(
+    _rate: RateLimit,
+    auth: Authz<scope::SnapshotsRestore>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<axum::response::Response, AppError> {
+    let snap = backup::fetch_snapshot(&state, &id)
+        .await
+        .map_err(|e| AppError(TondError::NotFound(format!("{e:#}"))))?;
+    let dir = backup::ensure_local(&state, &snap)
+        .await
+        .map_err(|e| AppError(TondError::Internal(format!("{e:#}"))))?;
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("snapshot_export")
+            .resource("snapshot", &snap.id, &snap.name)
+            .detail("to=download"),
+    )
+    .await;
+
+    let (tx, rx) = mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(4);
+    let sid = id.clone();
+    tokio::task::spawn_blocking(move || {
+        let errors = tx.clone();
+        let result = backup::archive_snapshot_dir(&dir, backup::ChunkWriter::new(tx), &sid)
+            .and_then(|(_, writer)| writer.finish().map_err(Into::into));
+        if let Err(e) = result {
+            // Fail the body instead of ending it: a truncated export must
+            // not look complete.
+            tracing::warn!("Export of snapshot {sid} failed: {e:#}");
+            let _ = errors.blocking_send(Err(std::io::Error::other(format!("{e:#}"))));
+        }
+    });
+    let body = axum::body::Body::from_stream(ReceiverStream::new(rx));
+    Ok((
+        StatusCode::OK,
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/octet-stream".to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"tond-{id}.tondsnap\""),
+            ),
+        ],
+        body,
+    )
+        .into_response())
+}
+
+/// POST /api/v1/snapshots/import — import an exported archive (the request
+/// body, streamed to disk): verified with this server's TOND_SECRET_KEY,
+/// extracted into a local snapshot and listed (`tond import <file>`).
+pub async fn import_snapshot_archive(
+    _rate: RateLimit,
+    auth: Authz<scope::SnapshotsRestore>,
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+) -> Result<impl IntoResponse, AppError> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let dir = backup::snapshots_dir();
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| AppError(TondError::Internal(e.to_string())))?;
+    let upload = dir.join(format!(".import-{}.download", uuid::Uuid::new_v4()));
+    let received = async {
+        let mut file = tokio::fs::File::create(&upload).await?;
+        let mut stream = request.into_body().into_data_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(std::io::Error::other)?;
+            file.write_all(&chunk).await?;
+        }
+        file.flush().await?;
+        std::io::Result::Ok(())
+    }
+    .await;
+    let result = match received {
+        Ok(()) => snapshot_remote::import_archive_file(&state, &upload).await,
+        Err(e) => Err(AppError(TondError::InvalidInput(format!(
+            "The upload broke off: {e}"
+        )))),
+    };
+    let _ = tokio::fs::remove_file(&upload).await;
+    let snap = result?;
+    record(
+        &state.db,
+        &auth.audit_actor(),
+        AuditEntry::new("snapshot_import")
+            .resource("snapshot", &snap.id, &snap.name)
+            .detail("from=archive"),
+    )
+    .await;
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiResponse::ok(SnapshotResponse::from(snap))),
     ))
 }
 

@@ -1,23 +1,29 @@
-// snapshot_archive.rs — streaming, encrypted, authenticated snapshot archives
+// snapshot_archive.rs — streaming, encrypted, authenticated snapshot files
 //
-// A snapshot is uploaded to remote storage as one archive, built and read as
-// a stream so memory stays constant no matter how big the data is:
+// One encrypted stream format serves two kinds of file, told apart by their
+// magic and bound to their purpose through the key derivation:
 //
-//   directory ─tar─▶ gzip ─▶ chunked AES-256-GCM ─▶ SHA-256 ─▶ sink (S3 parts, file)
+//   - archives ("TONDSNP1"): a whole snapshot uploaded to remote storage or
+//     exported, built and read as a stream so memory stays constant:
+//       directory ─tar─▶ gzip ─▶ chunked AES-256-GCM ─▶ SHA-256 ─▶ sink
+//   - local files ("TONDLOC1"): every file of a local snapshot directory is
+//     encrypted on its own (no compression, so the size is a function of the
+//     plaintext size and hard-link deduplication still works).
 //
-// Format ("TONDSNP1"):
+// Format:
 //
-//   header  = magic "TONDSNP1" | version u8 (1) | chunk_size u32 BE
-//             | salt [16] | nonce_prefix [7] | id_len u16 BE | snapshot id
+//   header  = magic [8] | version u8 (1) | chunk_size u32 BE
+//             | salt [16] | nonce_prefix [7] | id_len u16 BE | id
 //   records = AES-256-GCM(chunk) || tag[16], one per `chunk_size` plaintext
 //             bytes; the last record may be shorter (or empty)
 //
-// - key: HKDF-SHA256(TOND_SECRET_KEY, salt, "tond snapshot archive v1"), so
-//   every archive has its own key and none is the stored-secrets key;
+// - key: HKDF-SHA256(TOND_SECRET_KEY, salt, info) where `info` names the
+//   purpose (`Kind::info`, from secret_key::Purpose), so every file has its
+//   own key, none is the stored-secrets key, and an archive can't be read
+//   as a local file or the other way round;
 // - nonce of record i: nonce_prefix || i (u32 BE) || last-flag (0/1), the
 //   STREAM construction: records can't be reordered, dropped or replayed, and
-//   a truncated archive fails because its new last record wasn't sealed as
-//   last;
+//   a truncated file fails because its new last record wasn't sealed as last;
 // - the whole header is each record's associated data, so the header (and
 //   the snapshot id it names) is authenticated too.
 //
@@ -29,7 +35,7 @@
 // tests/snapshot_stream_memory.rs can include it with its own allocator.
 
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -39,18 +45,53 @@ use hmac::{Hmac, KeyInit, Mac};
 use rand::Rng;
 use sha2::{Digest, Sha256};
 
-pub const MAGIC: &[u8; 8] = b"TONDSNP1";
+/// Magic of a snapshot archive (remote copies and exports).
+pub const ARCHIVE_MAGIC: &[u8; 8] = b"TONDSNP1";
+/// Magic of one encrypted file of a local snapshot directory.
+pub const LOCAL_MAGIC: &[u8; 8] = b"TONDLOC1";
 pub const VERSION: u8 = 1;
 /// Plaintext bytes per record.
 pub const CHUNK_SIZE: usize = 64 * 1024;
 const TAG_LEN: usize = 16;
 const SALT_LEN: usize = 16;
 const NONCE_PREFIX_LEN: usize = 7;
+const FIXED_HEADER_LEN: usize = 8 + 1 + 4 + SALT_LEN + NONCE_PREFIX_LEN + 2;
 const MAX_ID_LEN: usize = 256;
-const KEY_INFO: &[u8] = b"tond snapshot archive v1";
 /// gzip level: snapshot data is often already compressed; level 3 keeps CPU
 /// low on a small VPS while still shrinking text (SQL dumps, the database).
 const GZIP_LEVEL: u32 = 3;
+
+/// Which kind of encrypted file: its magic and the key-derivation info that
+/// binds it to its purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Kind<'a> {
+    pub magic: &'a [u8; 8],
+    pub info: &'a [u8],
+}
+
+/// Where `write_archive` reads the files of the snapshot directory from.
+#[derive(Debug, Clone, Copy)]
+pub enum Source<'a> {
+    /// Plain files (tests and tools; snapshots themselves are always encrypted)
+    #[allow(dead_code)]
+    Plain,
+    /// Local snapshot files encrypted as `kind`, readable with one of `secrets`
+    Encrypted {
+        kind: Kind<'a>,
+        secrets: &'a [&'a str],
+    },
+}
+
+/// How `extract_archive` writes the files it extracts.
+#[derive(Debug, Clone, Copy)]
+pub enum Target<'a> {
+    /// Plain files (tests and tools; snapshots themselves are always encrypted)
+    #[allow(dead_code)]
+    Plain,
+    /// Each file encrypted as `kind` with `secret`; owners, modes and
+    /// modification times come from the archive
+    Encrypted { kind: Kind<'a>, secret: &'a str },
+}
 
 /// What `write_archive` produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,16 +102,33 @@ pub struct ArchiveSummary {
     pub sha256: String,
 }
 
+/// None of the keys opens the file: it was made with another
+/// TOND_SECRET_KEY (or its first record was modified). Callers downcast to
+/// tell this apart from corruption later in the stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WrongKey;
+
+impl std::fmt::Display for WrongKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the snapshot can't be decrypted: it was made with a different \
+             TOND_SECRET_KEY, or it was modified",
+        )
+    }
+}
+
+impl std::error::Error for WrongKey {}
+
 // ── Key derivation ───────────────────────────────────────────────────────────
 
-fn derive_key(secret: &str, salt: &[u8]) -> [u8; 32] {
+fn derive_key(secret: &str, salt: &[u8], info: &[u8]) -> [u8; 32] {
     let mut extract =
         <Hmac<Sha256> as KeyInit>::new_from_slice(salt).expect("HMAC accepts any key length");
     extract.update(secret.as_bytes());
     let prk = extract.finalize().into_bytes();
     let mut expand =
         <Hmac<Sha256> as KeyInit>::new_from_slice(&prk).expect("HMAC accepts any key length");
-    expand.update(KEY_INFO);
+    expand.update(info);
     expand.update(&[1]);
     expand.finalize().into_bytes().into()
 }
@@ -104,9 +162,9 @@ impl Header {
         })
     }
 
-    fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(8 + 1 + 4 + SALT_LEN + NONCE_PREFIX_LEN + 2 + 64);
-        out.extend_from_slice(MAGIC);
+    fn encode(&self, magic: &[u8; 8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(FIXED_HEADER_LEN + self.snapshot_id.len());
+        out.extend_from_slice(magic);
         out.push(VERSION);
         out.extend_from_slice(&(self.chunk_size as u32).to_be_bytes());
         out.extend_from_slice(&self.salt);
@@ -117,24 +175,32 @@ impl Header {
     }
 
     /// Read and parse a header, returning it with its raw bytes (the AAD).
-    fn read<R: Read>(input: &mut R) -> Result<(Self, Vec<u8>)> {
-        let mut fixed = [0u8; 8 + 1 + 4 + SALT_LEN + NONCE_PREFIX_LEN + 2];
+    fn read<R: Read>(input: &mut R, magic: &[u8; 8]) -> Result<(Self, Vec<u8>)> {
+        let mut fixed = [0u8; FIXED_HEADER_LEN];
         input
             .read_exact(&mut fixed)
-            .context("not a Tond snapshot archive (too short)")?;
-        ensure!(
-            &fixed[..8] == MAGIC,
-            "not a Tond snapshot archive (bad magic)"
-        );
+            .context(
+                "not an encrypted Tond snapshot file (too short): snapshots taken before local \
+                 copies were encrypted can't be read; delete them",
+            )?;
+        if &fixed[..8] != magic {
+            if &fixed[..8] == ARCHIVE_MAGIC || &fixed[..8] == LOCAL_MAGIC {
+                bail!("this Tond snapshot file is of another kind (archive vs. local copy)");
+            }
+            bail!(
+                "not an encrypted Tond snapshot file (bad magic): snapshots taken before \
+                 local copies were encrypted can't be read; delete them"
+            );
+        }
         ensure!(
             fixed[8] == VERSION,
-            "unsupported snapshot archive version {}",
+            "unsupported snapshot file version {}",
             fixed[8]
         );
         let chunk_size = u32::from_be_bytes(fixed[9..13].try_into().expect("4 bytes")) as usize;
         ensure!(
             (1024..=16 * 1024 * 1024).contains(&chunk_size),
-            "invalid chunk size in snapshot archive"
+            "invalid chunk size in snapshot file"
         );
         let mut salt = [0u8; SALT_LEN];
         salt.copy_from_slice(&fixed[13..13 + SALT_LEN]);
@@ -145,16 +211,13 @@ impl Header {
                 .try_into()
                 .expect("2 bytes for the id length"),
         ) as usize;
-        ensure!(
-            id_len <= MAX_ID_LEN,
-            "invalid snapshot id in archive header"
-        );
+        ensure!(id_len <= MAX_ID_LEN, "invalid snapshot id in file header");
         let mut id = vec![0u8; id_len];
         input
             .read_exact(&mut id)
-            .context("snapshot archive header is truncated")?;
+            .context("snapshot file header is truncated")?;
         let snapshot_id =
-            String::from_utf8(id).context("snapshot id in archive header is not UTF-8")?;
+            String::from_utf8(id).context("snapshot id in file header is not UTF-8")?;
         let mut raw = fixed.to_vec();
         raw.extend_from_slice(snapshot_id.as_bytes());
         Ok((
@@ -177,10 +240,19 @@ fn nonce_for(prefix: &[u8; NONCE_PREFIX_LEN], counter: u32, last: bool) -> Nonce
     Nonce::assume_unique_for_key(nonce)
 }
 
-/// AES-256-GCM (aws-lc) under the archive key derived from `secret`.
-fn cipher_for(secret: &str, salt: &[u8]) -> LessSafeKey {
-    let key = derive_key(secret, salt);
+/// AES-256-GCM (aws-lc) under the key derived from `secret` for `info`.
+fn cipher_for(secret: &str, salt: &[u8], info: &[u8]) -> LessSafeKey {
+    let key = derive_key(secret, salt, info);
     LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &key).expect("a 32-byte AES-256 key"))
+}
+
+/// Size of a file of `kind` written by `EncryptWriter` for `plain` bytes of
+/// plaintext and an id of `id_len` bytes. Deterministic, so a snapshot can
+/// tell an unchanged file from its size and modification time alone.
+pub fn encrypted_len(plain: u64, id_len: usize) -> u64 {
+    let chunk = CHUNK_SIZE as u64;
+    let records = plain.div_ceil(chunk).max(1);
+    (FIXED_HEADER_LEN + id_len) as u64 + plain + records * TAG_LEN as u64
 }
 
 // ── Writing ──────────────────────────────────────────────────────────────────
@@ -205,8 +277,9 @@ impl<W: Write> Write for HashingWriter<W> {
     }
 }
 
-/// Encrypts a byte stream into records. `finish` seals the last record.
-struct EncryptWriter<W: Write> {
+/// Encrypts a byte stream into records. `finish` seals the last record; a
+/// writer dropped without `finish` leaves a file that fails to decrypt.
+pub struct EncryptWriter<W: Write> {
     inner: W,
     cipher: LessSafeKey,
     header: Vec<u8>,
@@ -217,13 +290,15 @@ struct EncryptWriter<W: Write> {
 }
 
 impl<W: Write> EncryptWriter<W> {
-    fn new(mut inner: W, secret: &str, snapshot_id: &str) -> Result<Self> {
-        let header = Header::new(snapshot_id)?;
-        let raw = header.encode();
+    /// Write the header of a new file of `kind` naming `id` and start
+    /// encrypting with a key derived from `secret`.
+    pub fn new(mut inner: W, secret: &str, kind: Kind<'_>, id: &str) -> Result<Self> {
+        let header = Header::new(id)?;
+        let raw = header.encode(kind.magic);
         inner.write_all(&raw)?;
         Ok(Self {
             inner,
-            cipher: cipher_for(secret, &header.salt),
+            cipher: cipher_for(secret, &header.salt, kind.info),
             header: raw,
             nonce_prefix: header.nonce_prefix,
             counter: 0,
@@ -244,11 +319,12 @@ impl<W: Write> EncryptWriter<W> {
         self.counter = self
             .counter
             .checked_add(1)
-            .ok_or_else(|| io::Error::other("snapshot archive is too large"))?;
+            .ok_or_else(|| io::Error::other("snapshot file is too large"))?;
         Ok(())
     }
 
-    fn finish(mut self) -> io::Result<W> {
+    /// Seal the last record and return the inner writer.
+    pub fn finish(mut self) -> io::Result<W> {
         self.seal(true)?;
         self.inner.flush()?;
         Ok(self.inner)
@@ -273,21 +349,52 @@ impl<W: Write> Write for EncryptWriter<W> {
     }
 }
 
+/// Encrypt everything `input` yields into a new file `dest` of `kind`
+/// (created or truncated; mode 0600 until the caller sets another). Returns
+/// the plaintext size. The file is complete only when this returns Ok.
+pub fn encrypt_to_file<R: Read>(
+    mut input: R,
+    dest: &Path,
+    secret: &str,
+    kind: Kind<'_>,
+) -> Result<u64> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = File::options()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(dest)
+        .with_context(|| format!("failed to create {}", dest.display()))?;
+    let mut writer = EncryptWriter::new(BufWriter::with_capacity(CHUNK_SIZE, file), secret, kind, "")?;
+    let n = io::copy(&mut input, &mut writer)
+        .with_context(|| format!("failed to encrypt into {}", dest.display()))?;
+    writer
+        .finish()?
+        .into_inner()
+        .map_err(|e| e.into_error())?;
+    Ok(n)
+}
+
 /// Archive `src_dir` (regular files and directories only; symlinks, devices
-/// and sockets are skipped) into `out`, encrypted with a key derived from
-/// `secret` and bound to `snapshot_id`.
+/// and sockets are skipped) into `out`, encrypted as `kind` with a key
+/// derived from `secret` and bound to `snapshot_id`. With `Source::Encrypted`
+/// the files of `src_dir` are local snapshot files, decrypted as they stream
+/// into the archive.
 pub fn write_archive<W: Write>(
     src_dir: &Path,
     out: W,
     secret: &str,
+    kind: Kind<'_>,
     snapshot_id: &str,
+    source: Source<'_>,
 ) -> Result<(ArchiveSummary, W)> {
     let hashing = HashingWriter {
         inner: out,
         hasher: Sha256::new(),
         bytes: 0,
     };
-    let encrypt = EncryptWriter::new(hashing, secret, snapshot_id)?;
+    let encrypt = EncryptWriter::new(hashing, secret, kind, snapshot_id)?;
     let gzip = GzEncoder::new(encrypt, Compression::new(GZIP_LEVEL));
     let mut tar = tar::Builder::new(gzip);
     tar.follow_symlinks(false);
@@ -312,8 +419,22 @@ pub fn write_archive<W: Write>(
         } else if file_type.is_file() {
             let mut file = File::open(entry.path())
                 .with_context(|| format!("failed to open {}", rel.display()))?;
-            tar.append_file(rel, &mut file)
-                .with_context(|| format!("failed to archive {}", rel.display()))?;
+            match source {
+                Source::Plain => tar
+                    .append_file(rel, &mut file)
+                    .with_context(|| format!("failed to archive {}", rel.display()))?,
+                Source::Encrypted { kind, secrets } => {
+                    let meta = file.metadata()?;
+                    let reader = DecryptReader::open(file, secrets, kind, None)
+                        .with_context(|| format!("failed to read {}", rel.display()))?;
+                    let plain = reader.plaintext_len(meta.len())?;
+                    let mut header = tar::Header::new_gnu();
+                    header.set_metadata_in_mode(&meta, tar::HeaderMode::Complete);
+                    header.set_size(plain);
+                    tar.append_data(&mut header, rel, reader)
+                        .with_context(|| format!("failed to archive {}", rel.display()))?;
+                }
+            }
         }
         // Anything else (symlinks, sockets, devices) is not snapshot data.
     }
@@ -346,15 +467,22 @@ pub struct DecryptReader<R: Read> {
     record: Vec<u8>,
     pos: usize,
     done: bool,
+    /// Index of the secret (in `open`'s list) that opened the file
+    key_index: usize,
 }
 
 impl<R: Read> DecryptReader<R> {
     /// Parse the header and pick the key: the first of `secrets` that
     /// authenticates the first record. `expected_id`, when given, must match
     /// the id in the (authenticated) header.
-    pub fn open(input: R, secrets: &[&str], expected_id: Option<&str>) -> Result<Self> {
+    pub fn open(
+        input: R,
+        secrets: &[&str],
+        kind: Kind<'_>,
+        expected_id: Option<&str>,
+    ) -> Result<Self> {
         let mut inner = BufReader::with_capacity(CHUNK_SIZE + TAG_LEN, input);
-        let (header, raw) = Header::read(&mut inner)?;
+        let (header, raw) = Header::read(&mut inner, kind.magic)?;
         if let Some(expected) = expected_id {
             ensure!(
                 header.snapshot_id == expected,
@@ -372,10 +500,11 @@ impl<R: Read> DecryptReader<R> {
             record: Vec::with_capacity(header.chunk_size + TAG_LEN),
             pos: 0,
             done: false,
+            key_index: 0,
         };
         let (ciphertext, last) = reader.read_record()?;
-        for secret in secrets {
-            let cipher = cipher_for(secret, &header.salt);
+        for (index, secret) in secrets.iter().enumerate() {
+            let cipher = cipher_for(secret, &header.salt, kind.info);
             let mut attempt = ciphertext.clone();
             if open_record(
                 &cipher,
@@ -391,13 +520,32 @@ impl<R: Read> DecryptReader<R> {
                 reader.record = attempt;
                 reader.counter = 1;
                 reader.done = last;
+                reader.key_index = index;
                 return Ok(reader);
             }
         }
-        bail!(
-            "the snapshot archive can't be decrypted: it was made with a different \
-             TOND_SECRET_KEY, or it was modified"
-        )
+        Err(WrongKey.into())
+    }
+
+    /// Which of the secrets given to `open` decrypts this file.
+    pub fn key_index(&self) -> usize {
+        self.key_index
+    }
+
+    /// The id in the (authenticated) header.
+    pub fn id(&self) -> String {
+        String::from_utf8_lossy(&self.header[FIXED_HEADER_LEN..]).into_owned()
+    }
+
+    /// The plaintext size of a file of `file_len` bytes with this header.
+    pub fn plaintext_len(&self, file_len: u64) -> Result<u64> {
+        let body = file_len
+            .checked_sub(self.header.len() as u64)
+            .context("the snapshot file is truncated")?;
+        let full = (self.chunk_size + TAG_LEN) as u64;
+        let records = body.div_ceil(full).max(1);
+        body.checked_sub(records * TAG_LEN as u64)
+            .context("the snapshot file is truncated")
     }
 
     /// The next raw record and whether it is the last one.
@@ -407,15 +555,15 @@ impl<R: Read> DecryptReader<R> {
         (&mut self.inner)
             .take(full as u64)
             .read_to_end(&mut record)
-            .context("failed to read the snapshot archive")?;
-        ensure!(record.len() >= TAG_LEN, "the snapshot archive is truncated");
+            .context("failed to read the snapshot file")?;
+        ensure!(record.len() >= TAG_LEN, "the snapshot file is truncated");
         let last = record.len() < full || self.inner.fill_buf()?.is_empty();
         Ok((record, last))
     }
 
     fn next_record(&mut self) -> Result<()> {
         let (mut record, last) = self.read_record()?;
-        let cipher = self.cipher.as_ref().context("archive key not selected")?;
+        let cipher = self.cipher.as_ref().context("file key not selected")?;
         open_record(
             cipher,
             &self.header,
@@ -427,7 +575,7 @@ impl<R: Read> DecryptReader<R> {
         self.counter = self
             .counter
             .checked_add(1)
-            .context("snapshot archive has too many records")?;
+            .context("snapshot file has too many records")?;
         self.record = record;
         self.pos = 0;
         self.done = last;
@@ -450,7 +598,7 @@ fn open_record(
         .open_in_place(nonce, Aad::from(header), record.as_mut_slice())
         .map_err(|_| {
             anyhow::anyhow!(
-                "the snapshot archive failed authentication at record {counter}: \
+                "the snapshot file failed authentication at record {counter}: \
                  it was modified or truncated"
             )
         })?;
@@ -478,11 +626,11 @@ impl<R: Read> Read for DecryptReader<R> {
 pub fn verify_archive<R: Read>(
     input: R,
     secrets: &[&str],
+    kind: Kind<'_>,
     expected_id: Option<&str>,
 ) -> Result<String> {
-    let mut reader = DecryptReader::open(input, secrets, expected_id)?;
-    let id = String::from_utf8_lossy(&reader.header[8 + 1 + 4 + SALT_LEN + NONCE_PREFIX_LEN + 2..])
-        .into_owned();
+    let mut reader = DecryptReader::open(input, secrets, kind, expected_id)?;
+    let id = reader.id();
     io::copy(&mut reader, &mut io::sink()).context("snapshot archive verification failed")?;
     Ok(id)
 }
@@ -495,10 +643,12 @@ pub fn verify_archive<R: Read>(
 pub fn extract_archive<R: Read>(
     input: R,
     secrets: &[&str],
+    kind: Kind<'_>,
     expected_id: Option<&str>,
     dest: &Path,
+    target: Target<'_>,
 ) -> Result<()> {
-    let reader = DecryptReader::open(input, secrets, expected_id)?;
+    let reader = DecryptReader::open(input, secrets, kind, expected_id)?;
     let mut archive = tar::Archive::new(GzDecoder::new(reader));
     archive.set_preserve_permissions(false);
     archive.set_unpack_xattrs(false);
@@ -508,25 +658,72 @@ pub fn extract_archive<R: Read>(
 
     for entry in archive.entries().context("failed to read the archive")? {
         let mut entry = entry.context("failed to read an archive entry")?;
-        let kind = entry.header().entry_type();
-        if !(kind.is_file() || kind.is_dir()) {
+        let kind_of_entry = entry.header().entry_type();
+        if !(kind_of_entry.is_file() || kind_of_entry.is_dir()) {
             bail!(
-                "refusing to restore: the archive contains a {kind:?} entry \
+                "refusing to restore: the archive contains a {kind_of_entry:?} entry \
                  (only files and directories are allowed)"
             );
         }
-        let path = entry.path().context("archive entry has an invalid path")?;
+        let path = entry
+            .path()
+            .context("archive entry has an invalid path")?
+            .into_owned();
         check_entry_path(&path)?;
         let shown = path.display().to_string();
-        let unpacked = entry
-            .unpack_in(dest)
-            .with_context(|| format!("failed to restore {shown}"))?;
-        ensure!(
-            unpacked,
-            "refusing to restore {shown}: it escapes the target"
-        );
+        match target {
+            Target::Plain => {
+                let unpacked = entry
+                    .unpack_in(dest)
+                    .with_context(|| format!("failed to restore {shown}"))?;
+                ensure!(
+                    unpacked,
+                    "refusing to restore {shown}: it escapes the target"
+                );
+            }
+            Target::Encrypted { kind, secret } => {
+                let out = dest.join(&path);
+                let header = entry.header().clone();
+                if kind_of_entry.is_dir() {
+                    std::fs::create_dir_all(&out)
+                        .with_context(|| format!("failed to restore {shown}"))?;
+                } else {
+                    if let Some(parent) = out.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    // A parent created as a symlink can't exist: only files
+                    // and directories are ever written, and paths can't climb.
+                    encrypt_to_file(&mut entry, &out, secret, kind)
+                        .with_context(|| format!("failed to restore {shown}"))?;
+                }
+                apply_metadata(&out, &header);
+            }
+        }
     }
     Ok(())
+}
+
+/// Owner, mode and modification time of a tar entry onto `path`
+/// (best-effort: only root can change owners).
+fn apply_metadata(path: &Path, header: &tar::Header) {
+    use std::os::unix::fs::PermissionsExt;
+    if let (Ok(uid), Ok(gid)) = (header.uid(), header.gid())
+        && let (Ok(uid), Ok(gid)) = (u32::try_from(uid), u32::try_from(gid))
+    {
+        let _ = std::os::unix::fs::lchown(path, Some(uid), Some(gid));
+    }
+    if let Ok(mode) = header.mode() {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o777));
+    }
+    if header.entry_type().is_file()
+        && let Ok(mtime) = header.mtime()
+    {
+        let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime);
+        let _ = File::options()
+            .write(true)
+            .open(path)
+            .and_then(|f| f.set_modified(time));
+    }
 }
 
 /// A tar entry path must be relative and must not climb out of the target.
@@ -554,6 +751,14 @@ mod tests {
     use super::*;
 
     const SECRET: &str = "test-secret-key";
+    const ARCHIVE: Kind<'static> = Kind {
+        magic: ARCHIVE_MAGIC,
+        info: b"test archive",
+    };
+    const LOCAL: Kind<'static> = Kind {
+        magic: LOCAL_MAGIC,
+        info: b"test local file",
+    };
 
     fn sample_dir() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
@@ -578,7 +783,7 @@ mod tests {
     }
 
     fn archive_of(dir: &Path, id: &str) -> Vec<u8> {
-        let (summary, bytes) = write_archive(dir, Vec::new(), SECRET, id)
+        let (summary, bytes) = write_archive(dir, Vec::new(), SECRET, ARCHIVE, id, Source::Plain)
             .unwrap_or_else(|e| panic!("write_archive: {e:#}"));
         assert_eq!(summary.bytes as usize, bytes.len());
         assert_eq!(summary.sha256, hex::encode(Sha256::digest(&bytes)));
@@ -596,11 +801,11 @@ mod tests {
             "file names must not be visible in the archive"
         );
 
-        verify_archive(Cursor::new(&archive), &[SECRET], Some("s1"))
+        verify_archive(Cursor::new(&archive), &[SECRET], ARCHIVE, Some("s1"))
             .unwrap_or_else(|e| panic!("verify: {e:#}"));
         let out = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
         let dest = out.path().join("restored");
-        extract_archive(Cursor::new(&archive), &[SECRET], Some("s1"), &dest)
+        extract_archive(Cursor::new(&archive), &[SECRET], ARCHIVE, Some("s1"), &dest, Target::Plain)
             .unwrap_or_else(|e| panic!("extract: {e:#}"));
         assert_eq!(
             std::fs::read(dest.join("volumes/web/data.bin")).ok(),
@@ -614,12 +819,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
         let mut sink = Vec::new();
         let mut w =
-            EncryptWriter::new(&mut sink, SECRET, "s").unwrap_or_else(|e| panic!("writer: {e:#}"));
+            EncryptWriter::new(&mut sink, SECRET, ARCHIVE, "s").unwrap_or_else(|e| panic!("writer: {e:#}"));
         w.write_all(&vec![7u8; CHUNK_SIZE * 2])
             .unwrap_or_else(|e| panic!("write: {e}"));
         w.finish().unwrap_or_else(|e| panic!("finish: {e}"));
         let mut plain = Vec::new();
-        DecryptReader::open(Cursor::new(&sink), &[SECRET], None)
+        DecryptReader::open(Cursor::new(&sink), &[SECRET], ARCHIVE, None)
             .unwrap_or_else(|e| panic!("open: {e:#}"))
             .read_to_end(&mut plain)
             .unwrap_or_else(|e| panic!("read: {e}"));
@@ -635,40 +840,40 @@ mod tests {
         let mut flipped = archive.clone();
         let mid = flipped.len() / 2;
         flipped[mid] ^= 1;
-        assert!(verify_archive(Cursor::new(&flipped), &[SECRET], None).is_err());
+        assert!(verify_archive(Cursor::new(&flipped), &[SECRET], ARCHIVE, None).is_err());
 
         // Drop the last record entirely (truncation at a record boundary)…
-        let header_len = Header::read(&mut Cursor::new(&archive))
+        let header_len = Header::read(&mut Cursor::new(&archive), ARCHIVE_MAGIC)
             .map(|(_, raw)| raw.len())
             .unwrap_or_else(|e| panic!("header: {e:#}"));
         let body = archive.len() - header_len;
         let records = body.div_ceil(CHUNK_SIZE + TAG_LEN);
         assert!(records >= 2, "sample must span several records");
         let cut = header_len + (records - 1) * (CHUNK_SIZE + TAG_LEN);
-        assert!(verify_archive(Cursor::new(&archive[..cut]), &[SECRET], None).is_err());
+        assert!(verify_archive(Cursor::new(&archive[..cut]), &[SECRET], ARCHIVE, None).is_err());
         // …or cut inside a record.
         assert!(
-            verify_archive(Cursor::new(&archive[..archive.len() - 5]), &[SECRET], None).is_err()
+            verify_archive(Cursor::new(&archive[..archive.len() - 5]), &[SECRET], ARCHIVE, None).is_err()
         );
 
-        assert!(verify_archive(Cursor::new(&archive), &["other-key"], None).is_err());
+        assert!(verify_archive(Cursor::new(&archive), &["other-key"], ARCHIVE, None).is_err());
         assert!(
-            verify_archive(Cursor::new(&archive), &["other-key", SECRET], None).is_ok(),
+            verify_archive(Cursor::new(&archive), &["other-key", SECRET], ARCHIVE, None).is_ok(),
             "the previous key is tried too (key rotation)"
         );
-        assert!(verify_archive(Cursor::new(&archive), &[SECRET], Some("s2")).is_err());
+        assert!(verify_archive(Cursor::new(&archive), &[SECRET], ARCHIVE, Some("s2")).is_err());
 
         // A header edited to claim another snapshot no longer authenticates.
         let mut renamed = archive.clone();
         let id_pos = header_len - 2;
         renamed[id_pos] = b'X';
-        assert!(verify_archive(Cursor::new(&renamed), &[SECRET], None).is_err());
+        assert!(verify_archive(Cursor::new(&renamed), &[SECRET], ARCHIVE, None).is_err());
     }
 
     /// Build an authentic archive around an arbitrary tar stream.
     fn seal_tar(tar_bytes: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
-        let enc = EncryptWriter::new(&mut out, SECRET, "evil")
+        let enc = EncryptWriter::new(&mut out, SECRET, ARCHIVE, "evil")
             .unwrap_or_else(|e| panic!("writer: {e:#}"));
         let mut gz = GzEncoder::new(enc, Compression::fast());
         gz.write_all(tar_bytes)
@@ -741,7 +946,7 @@ mod tests {
             let archive = seal_tar(&tar_bytes);
             let out = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
             let dest = out.path().join("restore");
-            let result = extract_archive(Cursor::new(&archive), &[SECRET], None, &dest);
+            let result = extract_archive(Cursor::new(&archive), &[SECRET], ARCHIVE, None, &dest, Target::Plain);
             assert!(result.is_err(), "{what} must be refused");
             assert!(
                 !out.path().join("escape.txt").exists(),
@@ -758,11 +963,121 @@ mod tests {
         let archive = archive_of(src.path(), "s1");
         let out = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
         let dest = out.path().join("restored");
-        extract_archive(Cursor::new(&archive), &[SECRET], None, &dest)
+        extract_archive(Cursor::new(&archive), &[SECRET], ARCHIVE, None, &dest, Target::Plain)
             .unwrap_or_else(|e| panic!("extract: {e:#}"));
         assert!(
             std::fs::symlink_metadata(dest.join("volumes/web/leak")).is_err(),
             "symlinks are not snapshot data and must not be archived"
         );
+    }
+
+    /// Encrypt every file of `src` into `dest` as local snapshot files.
+    fn encrypt_tree(src: &Path, dest: &Path) {
+        for entry in walkdir::WalkDir::new(src) {
+            let entry = entry.unwrap_or_else(|e| panic!("walk: {e}"));
+            let rel = entry
+                .path()
+                .strip_prefix(src)
+                .unwrap_or_else(|e| panic!("rel: {e}"));
+            let out = dest.join(rel);
+            if entry.file_type().is_dir() {
+                std::fs::create_dir_all(&out).unwrap_or_else(|e| panic!("mkdir: {e}"));
+            } else {
+                let file = File::open(entry.path()).unwrap_or_else(|e| panic!("open: {e}"));
+                encrypt_to_file(file, &out, SECRET, LOCAL)
+                    .unwrap_or_else(|e| panic!("encrypt: {e:#}"));
+            }
+        }
+    }
+
+    #[test]
+    fn local_file_size_is_a_function_of_the_plaintext_size() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        for size in [0, 1, CHUNK_SIZE - 1, CHUNK_SIZE, CHUNK_SIZE + 1, CHUNK_SIZE * 3] {
+            let out = dir.path().join(format!("f{size}"));
+            let n = encrypt_to_file(Cursor::new(vec![9u8; size]), &out, SECRET, LOCAL)
+                .unwrap_or_else(|e| panic!("encrypt: {e:#}"));
+            assert_eq!(n, size as u64);
+            let len = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+            assert_eq!(len, encrypted_len(size as u64, 0), "size {size}");
+            let reader = DecryptReader::open(
+                File::open(&out).unwrap_or_else(|e| panic!("open: {e}")),
+                &[SECRET],
+                LOCAL,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("open: {e:#}"));
+            assert_eq!(reader.plaintext_len(len).ok(), Some(size as u64));
+        }
+    }
+
+    #[test]
+    fn local_files_are_bound_to_their_kind_and_key() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let out = dir.path().join("f");
+        encrypt_to_file(Cursor::new(b"secret data".to_vec()), &out, SECRET, LOCAL)
+            .unwrap_or_else(|e| panic!("encrypt: {e:#}"));
+        let raw = std::fs::read(&out).unwrap_or_default();
+        assert!(!raw.windows(6).any(|w| w == b"secret"), "encrypted at rest");
+        let open = |secrets: &[&str], kind| {
+            DecryptReader::open(Cursor::new(raw.clone()), secrets, kind, None)
+        };
+        assert!(open(&[SECRET], LOCAL).is_ok());
+        assert!(open(&["other"], LOCAL).is_err());
+        assert!(open(&[SECRET], ARCHIVE).is_err(), "not an archive");
+        let other_purpose = Kind {
+            magic: LOCAL_MAGIC,
+            info: b"another purpose",
+        };
+        assert!(open(&[SECRET], other_purpose).is_err(), "bound to its purpose");
+        let rotated = open(&["old", SECRET], LOCAL).unwrap_or_else(|e| panic!("open: {e:#}"));
+        assert_eq!(rotated.key_index(), 1);
+
+        let err = DecryptReader::open(Cursor::new(b"plain text file, not encrypted at all".to_vec()), &[SECRET], LOCAL, None)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("before local copies were encrypted"), "{err}");
+    }
+
+    #[test]
+    fn encrypted_local_copies_round_trip_through_an_archive() {
+        let src = sample_dir();
+        let local = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        encrypt_tree(src.path(), local.path());
+
+        let source = Source::Encrypted {
+            kind: LOCAL,
+            secrets: &[SECRET],
+        };
+        let (_, archive) = write_archive(local.path(), Vec::new(), SECRET, ARCHIVE, "s1", source)
+            .unwrap_or_else(|e| panic!("write_archive: {e:#}"));
+
+        // Plain extraction gives back the original plaintext…
+        let out = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let plain = out.path().join("plain");
+        extract_archive(Cursor::new(&archive), &[SECRET], ARCHIVE, Some("s1"), &plain, Target::Plain)
+            .unwrap_or_else(|e| panic!("extract: {e:#}"));
+        assert_eq!(
+            std::fs::read(plain.join("volumes/web/data.bin")).ok(),
+            std::fs::read(src.path().join("volumes/web/data.bin")).ok()
+        );
+
+        // …and encrypted extraction writes local files that decrypt to it.
+        let enc = out.path().join("enc");
+        let target = Target::Encrypted {
+            kind: LOCAL,
+            secret: SECRET,
+        };
+        extract_archive(Cursor::new(&archive), &[SECRET], ARCHIVE, Some("s1"), &enc, target)
+            .unwrap_or_else(|e| panic!("extract: {e:#}"));
+        let raw = std::fs::read(enc.join("manifest.json")).unwrap_or_default();
+        assert!(raw.starts_with(LOCAL_MAGIC));
+        let mut text = String::new();
+        DecryptReader::open(Cursor::new(raw), &[SECRET], LOCAL, None)
+            .unwrap_or_else(|e| panic!("open: {e:#}"))
+            .read_to_string(&mut text)
+            .unwrap_or_else(|e| panic!("read: {e}"));
+        assert_eq!(text, "{\"id\":\"s1\"}");
     }
 }
