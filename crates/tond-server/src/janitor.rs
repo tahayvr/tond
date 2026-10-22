@@ -44,7 +44,10 @@
 // Every delete runs in batches of BATCH_SIZE rows with a short pause between
 // batches, so a single statement never holds SQLite's write lock for long
 // (tond-proxy shares the database file). Each batch selects its victims
-// through an index (see the retention indexes in 001_baseline.sql).
+// through an index (see the retention indexes in 001_baseline.sql). The
+// per-app and per-job rules are set-based: one statement reads every
+// parent's window and one batched DELETE trims them all, so a pass costs the
+// same number of statements with 1 app or 100.
 //
 // Retention values come from the `settings` table (keys below) with built-in
 // defaults. A value <= 0 disables that rule. After each pass the janitor runs
@@ -252,40 +255,31 @@ pub async fn run_once(db: &SqlitePool, policy: &RetentionPolicy) -> Result<Janit
     let mut report = JanitorReport::default();
     let now = Utc::now();
 
-    let app_ids: Vec<String> = sqlx::query_scalar("SELECT id FROM apps")
-        .fetch_all(db)
-        .await?;
-
     // ── deploy_logs ──
+    // One statement reads every app's window, one batched DELETE trims all
+    // apps (no per-app queries: the cost does not grow with the app count).
     let deploy_log_age_cutoff = (policy.deploy_log_days > 0)
         .then(|| (now - chrono::Duration::days(policy.deploy_log_days)).to_rfc3339());
-    for app_id in &app_ids {
-        let nth_start = nth_newest(
-            db,
-            "SELECT created_at FROM deployments WHERE app_id = ? ORDER BY created_at DESC LIMIT 1 OFFSET ?",
-            app_id,
-            policy.deploy_log_deployments,
-        )
-        .await?;
-        let latest_start: Option<String> =
-            sqlx::query_scalar("SELECT MAX(created_at) FROM deployments WHERE app_id = ?")
-                .bind(app_id)
-                .fetch_one(db)
-                .await?;
-        let Some(cutoff) = retention_cutoff(
-            nth_start.as_deref(),
-            latest_start.as_deref(),
-            deploy_log_age_cutoff.as_deref(),
-        ) else {
-            continue;
-        };
+    let starts = parent_starts(
+        db,
+        "SELECT a.id,
+            (SELECT created_at FROM deployments WHERE app_id = a.id
+             ORDER BY created_at DESC LIMIT 1 OFFSET ?),
+            (SELECT MAX(created_at) FROM deployments WHERE app_id = a.id)
+         FROM apps a",
+        policy.deploy_log_deployments,
+    )
+    .await?;
+    if let Some(cutoffs) = cutoffs_json(&starts, deploy_log_age_cutoff.as_deref()) {
         report.deploy_logs += delete_in_batches(|| {
             sqlx::query(
                 "DELETE FROM deploy_logs WHERE rowid IN (
-                    SELECT rowid FROM deploy_logs WHERE app_id = ? AND created_at < ? LIMIT ?)",
+                    SELECT l.rowid FROM json_each(?) AS c
+                    CROSS JOIN deploy_logs l
+                      ON l.app_id = c.value->>0 AND l.created_at < c.value->>1
+                    LIMIT ?)",
             )
-            .bind(app_id)
-            .bind(&cutoff)
+            .bind(&cutoffs)
             .bind(BATCH_SIZE)
             .execute(db)
         })
@@ -306,68 +300,60 @@ pub async fn run_once(db: &SqlitePool, policy: &RetentionPolicy) -> Result<Janit
     })
     .await?;
     if policy.deployments_per_app > 0 {
-        for app_id in &app_ids {
-            report.deployments += delete_in_batches(|| {
-                sqlx::query(
-                    "DELETE FROM deployments WHERE rowid IN (
-                        SELECT rowid FROM deployments
-                        WHERE app_id = ?1
-                          AND status NOT IN ('queued', 'running', 'pending')
-                          AND id NOT IN (
-                              SELECT id FROM deployments WHERE app_id = ?1
-                              ORDER BY created_at DESC LIMIT ?2)
-                          AND id NOT IN (
-                              SELECT id FROM deployments
-                              WHERE app_id = ?1 AND status = 'succeeded' AND image_tag IS NOT NULL
-                                AND image_pruned = 0
-                              ORDER BY created_at DESC LIMIT ?3)
-                        LIMIT ?4)",
-                )
-                .bind(app_id)
-                .bind(policy.deployments_per_app)
-                .bind(KEEP_ROLLBACK_IMAGES)
-                .bind(BATCH_SIZE)
-                .execute(db)
-            })
-            .await?;
-        }
+        // Per app: beyond the newest N, finished, and not one of the newest
+        // KEEP_ROLLBACK_IMAGES rollback candidates; every app in one statement.
+        report.deployments += delete_in_batches(|| {
+            sqlx::query(
+                "DELETE FROM deployments WHERE rowid IN (
+                    SELECT rid FROM (
+                        SELECT d.rid, d.status, d.rollback,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY d.app_id ORDER BY d.created_at DESC) AS n,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY d.app_id, d.rollback
+                                   ORDER BY d.created_at DESC) AS n_kind
+                        FROM (SELECT rowid AS rid, app_id, created_at, status,
+                                     (status = 'succeeded' AND image_tag IS NOT NULL
+                                      AND image_pruned = 0) AS rollback
+                              FROM deployments
+                              WHERE app_id IN (SELECT id FROM apps)) AS d)
+                    WHERE n > ?1
+                      AND status NOT IN ('queued', 'running', 'pending')
+                      AND NOT (rollback AND n_kind <= ?2)
+                    LIMIT ?3)",
+            )
+            .bind(policy.deployments_per_app)
+            .bind(KEEP_ROLLBACK_IMAGES)
+            .bind(BATCH_SIZE)
+            .execute(db)
+        })
+        .await?;
     }
 
     // ── cron_job_runs ──
     let cron_age_cutoff = (policy.cron_run_days > 0)
         .then(|| (now - chrono::Duration::days(policy.cron_run_days)).to_rfc3339());
-    let job_ids: Vec<String> = sqlx::query_scalar("SELECT id FROM cron_jobs")
-        .fetch_all(db)
-        .await?;
-    for job_id in &job_ids {
-        let nth_start = nth_newest(
-            db,
-            "SELECT started_at FROM cron_job_runs WHERE cron_job_id = ? ORDER BY started_at DESC LIMIT 1 OFFSET ?",
-            job_id,
-            policy.cron_runs_per_job,
-        )
-        .await?;
-        let latest_start: Option<String> =
-            sqlx::query_scalar("SELECT MAX(started_at) FROM cron_job_runs WHERE cron_job_id = ?")
-                .bind(job_id)
-                .fetch_one(db)
-                .await?;
-        let Some(cutoff) = retention_cutoff(
-            nth_start.as_deref(),
-            latest_start.as_deref(),
-            cron_age_cutoff.as_deref(),
-        ) else {
-            continue;
-        };
+    let starts = parent_starts(
+        db,
+        "SELECT j.id,
+            (SELECT started_at FROM cron_job_runs WHERE cron_job_id = j.id
+             ORDER BY started_at DESC LIMIT 1 OFFSET ?),
+            (SELECT MAX(started_at) FROM cron_job_runs WHERE cron_job_id = j.id)
+         FROM cron_jobs j",
+        policy.cron_runs_per_job,
+    )
+    .await?;
+    if let Some(cutoffs) = cutoffs_json(&starts, cron_age_cutoff.as_deref()) {
         report.cron_job_runs += delete_in_batches(|| {
             sqlx::query(
                 "DELETE FROM cron_job_runs WHERE rowid IN (
-                    SELECT rowid FROM cron_job_runs
-                    WHERE cron_job_id = ? AND started_at < ? AND status != 'running'
+                    SELECT r.rowid FROM json_each(?) AS c
+                    CROSS JOIN cron_job_runs r
+                      ON r.cron_job_id = c.value->>0 AND r.started_at < c.value->>1
+                    WHERE r.status != 'running'
                     LIMIT ?)",
             )
-            .bind(job_id)
-            .bind(&cutoff)
+            .bind(&cutoffs)
             .bind(BATCH_SIZE)
             .execute(db)
         })
@@ -521,23 +507,38 @@ pub async fn prune_preview_volumes(db: &SqlitePool, data_dir: &std::path::Path) 
     Ok(removed)
 }
 
-/// The timestamp of the `n`-th newest row (1-based) returned by `sql`, which
-/// must take `(key, offset)` binds. `None` when there are fewer than `n` rows
-/// or `n <= 0` (rule disabled).
-async fn nth_newest(
+/// Each parent's `(key, start of its N-th newest child, start of its newest
+/// child)` from `sql`, which binds the N-th offset once. The N-th start is
+/// None when `n` <= 0 (the count rule is off).
+async fn parent_starts(
     db: &SqlitePool,
     sql: &'static str,
-    key: &str,
     n: i64,
-) -> Result<Option<String>> {
-    if n <= 0 {
-        return Ok(None);
-    }
-    Ok(sqlx::query_scalar(sql)
-        .bind(key)
-        .bind(n - 1)
-        .fetch_optional(db)
-        .await?)
+) -> Result<Vec<(String, Option<String>, Option<String>)>> {
+    let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(sql)
+        .bind((n - 1).max(0))
+        .fetch_all(db)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(key, nth, latest)| (key, nth.filter(|_| n > 0), latest))
+        .collect())
+}
+
+/// `[[key, cutoff], …]` for the parents that have a cutoff (None when none
+/// does), as the batched DELETEs bind it.
+fn cutoffs_json(
+    starts: &[(String, Option<String>, Option<String>)],
+    age_cutoff: Option<&str>,
+) -> Option<String> {
+    let cutoffs: Vec<(&str, String)> = starts
+        .iter()
+        .filter_map(|(key, nth, latest)| {
+            retention_cutoff(nth.as_deref(), latest.as_deref(), age_cutoff)
+                .map(|cutoff| (key.as_str(), cutoff))
+        })
+        .collect();
+    (!cutoffs.is_empty()).then(|| serde_json::to_string(&cutoffs).unwrap_or_default())
 }
 
 /// Combine the count rule and the age rule into one "delete rows older than"
@@ -765,6 +766,51 @@ mod tests {
             ids(&db, "SELECT id FROM deployments ORDER BY id").await,
             vec!["new-0", "new-1", "new-2", "old-ok", "stuck"],
             "keeps last 3, the rollback image and the running row; drops old failures and orphans"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_app_rules_apply_to_each_app_separately_in_one_pass() {
+        let db = test_db().await;
+        // a1: five old failures, a log per deployment. a2: two recent ones
+        // (inside every window). a3: no deployments at all.
+        for app in ["a1", "a2", "a3"] {
+            seed_app(&db, app).await;
+        }
+        for i in 0..5 {
+            seed_deployment(
+                &db,
+                &format!("a1-{i}"),
+                "a1",
+                "failed",
+                None,
+                &ts(50 - i, 0),
+            )
+            .await;
+            seed_log(&db, &format!("a1-l{i}"), "a1", &ts(50 - i, 1)).await;
+        }
+        for i in 0..2 {
+            seed_deployment(&db, &format!("a2-{i}"), "a2", "failed", None, &ts(1, i)).await;
+            seed_log(&db, &format!("a2-l{i}"), "a2", &ts(1, i + 1)).await;
+        }
+        let policy = RetentionPolicy {
+            deploy_log_deployments: 2,
+            deploy_log_days: 0,
+            deployments_per_app: 2,
+            ..RetentionPolicy::default()
+        };
+        run_once(&db, &policy)
+            .await
+            .unwrap_or_else(|err| panic!("janitor pass: {err}"));
+        assert_eq!(
+            ids(&db, "SELECT id FROM deployments ORDER BY id").await,
+            vec!["a1-3", "a1-4", "a2-0", "a2-1"],
+            "each app keeps its own newest two"
+        );
+        assert_eq!(
+            ids(&db, "SELECT id FROM deploy_logs ORDER BY id").await,
+            vec!["a1-l3", "a1-l4", "a2-l0", "a2-l1"],
+            "each app keeps the logs of its own last two deployments"
         );
     }
 
