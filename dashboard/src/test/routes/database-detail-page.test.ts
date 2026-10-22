@@ -99,7 +99,8 @@ describe('databases/[id] credentials', () => {
 	it('changes the password and reports success', async () => {
 		api.updateDatabaseCredentials.mockResolvedValue({
 			database: { ...pg },
-			changed: ['db_password']
+			changed: ['db_password'],
+			apps_to_update: [{ id: 'app_1', name: 'web', keys: ['DATABASE_URL'] }]
 		});
 		const user = await openEnvironment(pg);
 
@@ -112,6 +113,12 @@ describe('databases/[id] credentials', () => {
 			db_password: 'new_password'
 		});
 		expect(await screen.findByText(/changed inside the database and saved/i)).toBeInTheDocument();
+		const apps = screen.getByRole('list', { name: 'Apps to update' });
+		expect(within(apps).getByRole('link', { name: 'web' })).toHaveAttribute(
+			'href',
+			'/apps/app_1?tab=settings'
+		);
+		expect(within(apps).getByText('(DATABASE_URL)')).toBeInTheDocument();
 	});
 
 	it('shows the server error in the dialog when the change fails', async () => {
@@ -155,11 +162,11 @@ describe('databases/[id] credentials', () => {
 		expect(await screen.findByText('plain-password-123')).toBeInTheDocument();
 	});
 
-	it('offers no password change for Redis', async () => {
+	it('offers a password change for Redis too, with its character rules', async () => {
 		await openEnvironment({ ...pg, db_type: 'redis', db_name: null });
 
-		expect(screen.queryByRole('button', { name: /^change /i })).not.toBeInTheDocument();
-		expect(screen.getByText(/can't be changed in place yet/i)).toBeInTheDocument();
+		expect(screen.getByRole('button', { name: /^change password/i })).toBeInTheDocument();
+		expect(screen.getByText(/Redis passwords can't contain spaces/i)).toBeInTheDocument();
 	});
 });
 

@@ -73,6 +73,13 @@ export const ALERT_KIND_META: Record<AlertKind, KindMeta> = {
 		comparison: 'below',
 		windowed: false
 	},
+	disk_auto_prune: {
+		label: 'Automatic disk cleanup',
+		scope: 'host',
+		unit: '%',
+		comparison: 'none',
+		windowed: false
+	},
 	cert_expiry: {
 		label: 'Certificate expiry',
 		scope: 'certificate',

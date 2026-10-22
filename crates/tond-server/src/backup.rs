@@ -94,6 +94,11 @@ pub enum SnapshotTrigger {
     ScheduledDatabase {
         db_name: String,
     },
+    /// Taken before an app moves to a newer template version
+    PreTemplateUpgrade {
+        app_name: String,
+        to_version: String,
+    },
     /// Taken before a major-version upgrade touches the database
     PreUpgradeDatabase {
         db_name: String,
@@ -108,7 +113,7 @@ impl SnapshotTrigger {
             Self::PreDeploy { .. } => "pre_deploy",
             Self::PreRestore { .. } | Self::PreRestoreDatabase { .. } => "pre_restore",
             Self::PreUpdate { .. } => "pre_update",
-            Self::PreUpgradeDatabase { .. } => "pre_upgrade",
+            Self::PreUpgradeDatabase { .. } | Self::PreTemplateUpgrade { .. } => "pre_upgrade",
         }
     }
 
@@ -118,7 +123,9 @@ impl SnapshotTrigger {
             | Self::Scheduled
             | Self::PreRestore { .. }
             | Self::PreUpdate { .. } => "full".to_string(),
-            Self::PreDeploy { app_name, .. } => format!("app:{}", app_name),
+            Self::PreDeploy { app_name, .. } | Self::PreTemplateUpgrade { app_name, .. } => {
+                format!("app:{}", app_name)
+            }
             Self::ManualDatabase { db_name }
             | Self::PreRestoreDatabase { db_name }
             | Self::ScheduledDatabase { db_name }
@@ -128,7 +135,9 @@ impl SnapshotTrigger {
 
     fn trigger_app(&self) -> Option<&str> {
         match self {
-            Self::PreDeploy { app_name, .. } => Some(app_name.as_str()),
+            Self::PreDeploy { app_name, .. } | Self::PreTemplateUpgrade { app_name, .. } => {
+                Some(app_name.as_str())
+            }
             _ => None,
         }
     }
@@ -175,6 +184,15 @@ impl SnapshotTrigger {
             Self::ScheduledDatabase { db_name } => {
                 format!(
                     "{db_name} scheduled {}",
+                    Utc::now().format("%Y-%m-%d %H:%M")
+                )
+            }
+            Self::PreTemplateUpgrade {
+                app_name,
+                to_version,
+            } => {
+                format!(
+                    "pre-upgrade {app_name} to {to_version} {}",
                     Utc::now().format("%Y-%m-%d %H:%M")
                 )
             }

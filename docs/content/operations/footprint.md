@@ -98,7 +98,7 @@ Everything Tond keeps lives in `/opt/tond`:
 
 The database grows with deploy logs, metrics and history, and is bounded by the retention rules. Settings → Data retention shows the database size and the largest tables. See [Retention](/operations/retention).
 
-Docker images are pruned after each successful deploy: Tond keeps the images of the three newest successful deployments per app (for rollback) plus the running one. The System page's Disk tab has a **Free up space** action that removes unused build cache and dangling images only.
+Docker images are pruned after each successful deploy: Tond keeps the images of the three newest successful deployments per app (for rollback) plus the running one. The System page's Disk tab has a **Free up space** action that removes unused build cache and dangling images only, and Tond does the same by itself when the disk is 85 % full (see [Disk full](/operations/troubleshooting#disk-full)).
 
 ### Journal
 

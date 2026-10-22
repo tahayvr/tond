@@ -5,6 +5,7 @@
 	import PageHeader from '$lib/components/nav/page-header.svelte';
 	import InlineError from '$lib/components/feedback/inline-error.svelte';
 	import SessionSettingsForm from '$lib/components/forms/session-settings-form.svelte';
+	import DiskCleanupSettingsForm from '$lib/components/forms/disk-cleanup-settings-form.svelte';
 	import HeartbeatSettings from '$lib/components/forms/HeartbeatSettings.svelte';
 	import RetentionSettingsForm from '$lib/components/forms/retention-settings-form.svelte';
 	import AuditShippingForm from '$lib/components/forms/audit-shipping-form.svelte';
@@ -99,6 +100,8 @@
 	/>
 
 	<SessionSettingsForm settings={data.settings} canEdit={can('settings:write')} />
+
+	<DiskCleanupSettingsForm settings={data.settings} canEdit={can('settings:write')} />
 
 	<RetentionSettingsForm canEdit={can('settings:write')} />
 

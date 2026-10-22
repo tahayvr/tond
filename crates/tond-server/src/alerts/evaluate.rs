@@ -48,6 +48,8 @@ pub struct Inputs {
     pub disk_forecast: Option<Forecast>,
     /// Apps whose uptime check is down.
     pub uptime_down: HashSet<String>,
+    /// The latest automatic disk cleanup: (unix seconds, disk percent after).
+    pub auto_prune: Option<(i64, f64)>,
 }
 
 /// Where live readings come from.
@@ -85,6 +87,13 @@ impl Source {
                 .filter(|s| s.disk_total > 0 && now - s.collected_at <= SAMPLE_MAX_AGE)
                 .map(|s| s.disk_percent()),
             Source::Fixed(i) => i.disk_percent,
+        }
+    }
+
+    fn auto_prune(&self) -> Option<(i64, f64)> {
+        match self {
+            Source::Live => crate::disk_pressure::last_run().map(|r| (r.at, r.after_percent)),
+            Source::Fixed(i) => i.auto_prune,
         }
     }
 
@@ -423,6 +432,13 @@ async fn observe(
                     let v = ctx.source.disk_percent(now);
                     (v, v.map(|v| holds(info, v, thr)))
                 }
+                "disk_auto_prune" => match ctx.source.auto_prune() {
+                    Some((at, after)) => (
+                        Some(after),
+                        Some(now - at < crate::disk_pressure::ALERT_HOLD_SECS),
+                    ),
+                    None => (None, Some(false)),
+                },
                 "disk_forecast" => match ctx.source.disk_forecast(ctx.db, now).await {
                     Forecast::Unknown => (None, None),
                     Forecast::NotFilling => (None, Some(false)),

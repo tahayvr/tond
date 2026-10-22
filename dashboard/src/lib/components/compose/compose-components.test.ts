@@ -9,6 +9,7 @@ import DeploymentServices from './deployment-services.svelte';
 
 const api = vi.hoisted(() => ({
 	listServices: vi.fn(),
+	removeParkedService: vi.fn(),
 	serviceAction: vi.fn(),
 	updateService: vi.fn(),
 	serviceLogs: vi.fn()
@@ -45,7 +46,8 @@ describe('ComposeServices', () => {
 			'admin',
 			'cache',
 			'db',
-			'migrate'
+			'migrate',
+			'search'
 		]);
 		const web = items[0];
 		expect(within(web).getByText('Running')).toBeInTheDocument();
@@ -57,7 +59,30 @@ describe('ComposeServices', () => {
 		expect(within(items[2]).getByText('Healthy')).toBeInTheDocument();
 		expect(within(items[2]).getByText('Internal only')).toBeInTheDocument();
 		expect(within(items[4]).getByText('Done')).toBeInTheDocument();
-		expect(screen.getByText('All 5 services running')).toBeInTheDocument();
+		expect(screen.getByText('All 5 services running · 1 parked')).toBeInTheDocument();
+	});
+
+	it('shows a parked service as kept but unrouted, and removes it after a confirmation', async () => {
+		const user = userEvent.setup();
+		api.removeParkedService.mockResolvedValue(services().filter((s) => !s.parked));
+		render(ComposeServices, { props: { app, canControl: true, canEdit: true, canReadLogs: true } });
+		const list = await screen.findByRole('list', { name: 'Services' });
+		const search = within(list).getAllByRole('listitem', { name: /./ })[5];
+		expect(within(search).getByText('Parked')).toBeInTheDocument();
+		expect(within(search).getByText(/Its domains\s+are kept but not routed/)).toBeInTheDocument();
+		expect(within(search).queryByRole('button', { name: /Domains/ })).not.toBeInTheDocument();
+		expect(within(search).queryByRole('button', { name: 'Logs' })).not.toBeInTheDocument();
+		await user.click(within(search).getByRole('button', { name: 'Remove' }));
+		expect(confirm.confirmAction).toHaveBeenCalledWith(
+			expect.objectContaining({
+				title: 'Remove search?',
+				details: expect.arrayContaining(['The domain search.shop.example.com'])
+			})
+		);
+		expect(api.removeParkedService).toHaveBeenCalledWith('app_compose', 'search');
+		await waitFor(() =>
+			expect(within(list).queryByRole('heading', { name: 'search' })).not.toBeInTheDocument()
+		);
 	});
 
 	it('restarts one service and confirms before stopping one', async () => {
@@ -93,7 +118,7 @@ describe('ComposeServices', () => {
 
 	it('summarises services on the overview', async () => {
 		render(ComposeServices, { props: { app, compact: true } });
-		expect(await screen.findByText('All 5 services running')).toBeInTheDocument();
+		expect(await screen.findByText('All 5 services running · 1 parked')).toBeInTheDocument();
 		expect(screen.getByRole('link', { name: 'Manage services' })).toHaveAttribute(
 			'href',
 			'/apps/app_compose?tab=services'

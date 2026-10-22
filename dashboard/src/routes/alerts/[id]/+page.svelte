@@ -265,7 +265,7 @@
 				<dd>{kindLabel(rule.kind)}</dd>
 				<dt class="text-muted-foreground">Where</dt>
 				<dd>
-					{#if rule.kind === 'disk_usage' || rule.kind === 'disk_forecast'}Server
+					{#if rule.kind === 'disk_usage' || rule.kind === 'disk_forecast' || rule.kind === 'disk_auto_prune'}Server
 					{:else if rule.kind === 'cert_expiry'}Every certificate
 					{:else if rule.kind === 'backup_failed'}Backups
 					{:else if rule.kind === 'cron_failed'}Every cron job

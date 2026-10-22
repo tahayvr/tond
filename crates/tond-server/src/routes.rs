@@ -114,6 +114,7 @@ api_routes! {
     // Docker Compose apps: services, per-service domains and ports, the file
     GET "/api/v1/apps/{id}/services" => handlers::compose::list_services;
     PUT "/api/v1/apps/{id}/services/{service}" => handlers::compose::update_service;
+    DELETE "/api/v1/apps/{id}/services/{service}" => handlers::compose::forget_service;
     GET "/api/v1/apps/{id}/services/{service}/logs" => handlers::compose::service_logs;
     POST "/api/v1/apps/{id}/services/{service}/{action}" => handlers::compose::service_action;
     PUT "/api/v1/apps/{id}/compose" => handlers::compose::update_compose;
@@ -177,6 +178,9 @@ api_routes! {
     PUT "/api/v1/settings/host-terminal" => handlers::terminal::set_host_terminal;
     GET "/api/v1/templates" => handlers::templates::list_templates;
     POST "/api/v1/templates/{id}/deploy" => handlers::templates::deploy_template;
+    GET "/api/v1/apps/{id}/template" => handlers::templates::get_app_template;
+    POST "/api/v1/apps/{id}/template/domain-env" => handlers::templates::sync_template_domain_env;
+    POST "/api/v1/apps/{id}/template/upgrade" => handlers::templates::upgrade_app_template;
     // Git integration — auto-deploy toggle, webhook secret, deploy keys, source
     PUT "/api/v1/apps/{id}/auto-deploy" => handlers::git::update_auto_deploy;
     GET "/api/v1/apps/{id}/webhook" => handlers::git::get_webhook_config;
