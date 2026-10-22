@@ -35,7 +35,7 @@ A token can never do more than the user who created it can do right now. List to
 The `tond` CLI ships in every release tarball, next to the server binaries. Linux on x86_64 and ARM64 is supported. Download the release that matches your server, check its checksum and install the binary:
 
 ```sh
-TOND_VERSION=v0.1.0   # the version your server runs
+TOND_VERSION=v0.2.0   # the version your server runs
 ARCH=x86_64           # or aarch64
 base="https://github.com/tahayvr/tond/releases/download/${TOND_VERSION}"
 curl -fsSLO "${base}/tond-linux-${ARCH}.tar.gz"
@@ -75,7 +75,7 @@ jobs:
 
       - name: Install the tond CLI
         env:
-          TOND_VERSION: v0.1.0
+          TOND_VERSION: v0.2.0
         run: |
           base="https://github.com/tahayvr/tond/releases/download/${TOND_VERSION}"
           curl -fsSLO "${base}/tond-linux-x86_64.tar.gz"
