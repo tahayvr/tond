@@ -926,7 +926,7 @@ if [[ -n "$PREVIEW" ]]; then
     # (the route above still answers).
     PREVIEW_SLUG=${PREVIEW_HOST%%-e2e-whoami.*}
     PREVIEW_SUBNET=$(docker network inspect -f '{{(index .IPAM.Config 0).Subnet}}' "tond-net-preview-${PREVIEW_SLUG}")
-    iptables -S TOND-EGRESS | grep -- "tond-egress:preview:${PREVIEW_SLUG} " | grep -- "-s ${PREVIEW_SUBNET}" \
+    iptables -S TOND-EGRESS | grep -- "tond-egress:preview:${PREVIEW_SLUG}\"" | grep -- "-s ${PREVIEW_SUBNET}" \
         | grep -q -- "-j REJECT" || fail "a preview must get no internet by default: $(iptables -S TOND-EGRESS)"
     iptables -S DOCKER-USER | grep -q -- "-j TOND-EGRESS" || fail "DOCKER-USER must jump to TOND-EGRESS"
     pass "the preview's network has no internet (TOND-EGRESS rejects ${PREVIEW_SUBNET})"
@@ -1409,11 +1409,11 @@ WHOAMI_SUBNET=$(docker network inspect -f '{{(index .IPAM.Config 0).Subnet}}' "$
 read -r code body < <(api_send PUT /api/v1/apps/e2e-whoami/egress '{"policy":"restricted","allowlist":["192.0.2.1:80"]}')
 [[ "$code" == 200 ]] && jq -e '.data.policy == "restricted" and .data.warning == null and .data.firewall_available' <<<"$body" > /dev/null \
     || fail "restricting e2e-whoami's egress must succeed and be enforced (got ${code}: ${body})"
-iptables -S TOND-EGRESS | grep -- "tond-egress:app:e2e-whoami " | grep -- "-s ${WHOAMI_IP}/32" | grep -- "-d 192.0.2.1/32" \
+iptables -S TOND-EGRESS | grep -- "tond-egress:app:e2e-whoami\"" | grep -- "-s ${WHOAMI_IP}/32" | grep -- "-d 192.0.2.1/32" \
     | grep -q -- "--dports 80 " || fail "the allowlist must be in TOND-EGRESS: $(iptables -S TOND-EGRESS)"
-iptables -S TOND-EGRESS | grep -- "tond-egress:app:e2e-whoami " | grep -q -- "-d ${WHOAMI_SUBNET} .*-j RETURN" \
+iptables -S TOND-EGRESS | grep -- "tond-egress:app:e2e-whoami\"" | grep -q -- "-d ${WHOAMI_SUBNET} .*-j RETURN" \
     || fail "the app's own network must stay reachable: $(iptables -S TOND-EGRESS)"
-iptables -S TOND-EGRESS | grep -- "tond-egress:app:e2e-whoami " | grep -q -- "--dport 53 .*-j RETURN" \
+iptables -S TOND-EGRESS | grep -- "tond-egress:app:e2e-whoami\"" | grep -q -- "--dport 53 .*-j RETURN" \
     || fail "DNS must stay allowed: $(iptables -S TOND-EGRESS)"
 [[ "$(egress_try 192.0.2.2)" == *refused* ]] || fail "a destination outside the allowlist must be refused"
 [[ "$(egress_try 192.0.2.1)" != *refused* ]] || fail "an allowlisted destination must not be refused"
@@ -1426,7 +1426,7 @@ read -r code body < <(api_send PUT /api/v1/apps/e2e-whoami/egress '{"policy":"no
 [[ "$(egress_try 192.0.2.1)" == *refused* ]] || fail "with egress none, every outside destination must be refused"
 read -r code body < <(api_send PUT /api/v1/apps/e2e-whoami/egress '{"policy":"open","allowlist":[]}')
 [[ "$code" == 200 ]] || fail "opening egress again must succeed (got ${code}: ${body})"
-! iptables -S TOND-EGRESS | grep -q -- "tond-egress:app:e2e-whoami " || fail "an open app must have no egress rules"
+! iptables -S TOND-EGRESS | grep -q -- "tond-egress:app:e2e-whoami\"" || fail "an open app must have no egress rules"
 read -r code body < <(api_send PUT /api/v1/apps/e2e-whoami/egress '{"policy":"restricted","allowlist":["*.example.com"]}')
 [[ "$code" == 400 ]] || fail "a wildcard in the egress allowlist must be refused (got ${code}: ${body})"
 pass "egress none refuses everything outside; open removes the rules; wildcards are refused"

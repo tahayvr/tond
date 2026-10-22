@@ -308,6 +308,9 @@ pub async fn load_chain(chain: &str, restore_input: &str) -> Result<()> {
     // The jump, first in DOCKER-USER (an empty chain is harmless).
     let jumps = crate::process::command("iptables")
         .args(["-w", "5", "-C", "DOCKER-USER", "-j", chain])
+        // "Bad rule" on stderr is the expected answer when the jump is missing.
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .await?;
     if !jumps.success() {
