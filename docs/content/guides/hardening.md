@@ -48,6 +48,8 @@ Even when on, it runs as an unprivileged user, but less surface is better. See [
 
 **Use separate domains.** Previews run pull-request code, and apps run your code. Serve them on registrable domains separate from the dashboard's, so they can never touch its cookies: set the **Apps Domain** and **Preview Domain** under **Settings** (or `tond settings set-apps-domain` and `tond settings set-preview-domain`). Tond refuses a preview domain on the dashboard's site and refuses previews without one. See [Domains and certificates](/concepts/domains) and [Previews](/concepts/previews).
 
+**Limit what apps can connect to.** An app that only talks to its database and one API doesn't need the whole internet. Under the app's **Settings → Network**, choose **Allowlist only** and list what it calls (`api.stripe.com:443`, a CIDR range), or **No internet**. Leave previews at **No internet** unless they need an outside service. See [Outbound connections](/security/isolation#outbound-connections).
+
 ## People
 
 **Turn on two-factor authentication for every admin.** Each user enables it under **Profile → Two-factor**. Tond doesn't force it, so check your admins have done it. The host terminal asks for the 2FA code on every session once it is on.
@@ -104,6 +106,7 @@ It exits with status 1 if the hash chain was tampered with. See [Audit log](/con
 - [ ] Remote encrypted snapshots on a schedule, with a **Backup failed** alert
 - [ ] Host terminal off, unless needed
 - [ ] Apps domain and preview domain separate from the dashboard's
+- [ ] Outbound connections limited for apps that don't need the internet; previews at **No internet**
 - [ ] 2FA on for every admin
 - [ ] Fewest possible admins; short dashboard sessions
 - [ ] Every token scoped, limited to its apps, and expiring

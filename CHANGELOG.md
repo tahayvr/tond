@@ -57,6 +57,10 @@ baseline, so install 0.2.0 fresh.
 - The host terminal is off by default and uses step-up auth with single-use
   tickets. Secrets are scrubbed from container logs. Git tokens stay out of
   URLs, logs and images.
+- Per-app egress policy (Settings → Network, `PUT /api/v1/apps/{id}/egress`):
+  open, an allowlist of hosts, CIDR ranges and ports, or no internet,
+  enforced in the server firewall (`TOND-EGRESS`). DNS and the app's own
+  networks always work. Previews get no internet by default.
 - Passwords are checked against the 10,000 most common passwords (SecLists),
   as well as Tond's own list, lowercased and with surrounding digits and
   symbols stripped.

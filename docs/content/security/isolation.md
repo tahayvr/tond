@@ -43,6 +43,31 @@ The installer also sets `icc: false` in `/etc/docker/daemon.json`, so containers
 
 See [Networks and database links](/concepts/networks).
 
+## Outbound connections
+
+By default an app can connect to anything on the internet. Each app has an egress policy, set under **Settings → Network** (admins, `settings:write`) or with `PUT /api/v1/apps/{id}/egress`:
+
+| Policy | The app may connect to |
+| --- | --- |
+| **Open** (default for apps) | Anything |
+| **Allowlist only** (`restricted`) | Only the listed IPv4 addresses, CIDR ranges and hostnames, each with optional ports: `api.stripe.com:443`, `203.0.113.0/24`, `198.51.100.7:5432,6432`, `0.0.0.0/0:443` |
+| **No internet** (`none`, default for previews) | Nothing outside the server |
+
+Whatever the policy, three things keep working: DNS (port 53, so names resolve through Docker's resolver), everything on the app's own Docker networks (its linked databases, the rest of its project, the other services of a compose stack), and replies to connections made *to* the app, such as traffic from `tond-proxy`.
+
+Previews have their own policy, **No internet** unless you change it. They run pull-request code, possibly from strangers, and outbound access is what turns such code into a problem for you: sending out whatever the preview can read, attacking other hosts, or sending spam from your server's address and getting it blocklisted. Most previews only need their own preview network. Set it to **Allowlist only** to give previews the app's list, or **Open**, per app. A project preview's apps share one network, so the strictest of their policies applies; when they're all allowlists, the lists are combined.
+
+How it's enforced: container traffic that leaves its bridge network passes Docker's `DOCKER-USER` chain, and `tond-server` keeps its own chain, `TOND-EGRESS`, jumped to from there (the same mechanism as the [database allowlist](/concepts/databases#allowed-addresses)). Each app's containers are matched by their address, and a preview by its network's subnet. The allowed destinations `RETURN` to Docker's rules, and everything else gets `REJECT` (a TCP reset), so a blocked connection fails at once instead of hanging. Every rule carries a comment such as `tond-egress:app:web`, so `iptables -S TOND-EGRESS` shows what applies to what. The rules live in the kernel: `tond-server` loads them at startup, right after a container starts, whenever a policy changes, and checks them again every 5 minutes while any exist.
+
+Limits to know about:
+
+- **Hostnames** are resolved (IPv4) when the rules load and every 5 minutes. A service that changes addresses in between is blocked until the next refresh, and a hostname behind a CDN shares its addresses with other sites. CIDR ranges are the reliable form; many providers publish theirs. Wildcards (`*.example.com`) can't be resolved and are refused.
+- **DNS is always allowed**, to any server, so a determined program can still smuggle small amounts of data out through DNS queries.
+- **The server itself** isn't covered: connections to the host's own addresses (SSH, `tond-proxy` on 80 and 443) don't pass `DOCKER-USER`.
+- **A fresh app container** runs for a moment before its address is known and its rules load. Previews don't have this gap: their network exists first, and the preview doesn't start if its rules can't be loaded.
+- **IPv4 only.** Tond's networks have no IPv6, so there is no IPv6 traffic to police.
+- **Servers without iptables** or the `DOCKER-USER` chain (nftables-only hosts, rootless Docker) can't enforce a policy. Tond refuses to save a non-open app policy there and says why; previews then run unrestricted, and the Network section warns about it.
+
 ## Volumes
 
 Users never choose host paths. They name a volume, and Tond maps it into a directory it owns:

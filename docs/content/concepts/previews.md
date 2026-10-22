@@ -74,6 +74,7 @@ A preview is built from the same source and build settings as the app. It then r
 | Environment | All app variables | Only the variables you share, plus preview overrides |
 | Volumes | `<data>/volumes/<app>/…` | Its own empty directories under `<data>/volumes/_preview/<slug>/` |
 | Network | Its project network or its own network | Its own preview network: no project members, no databases |
+| Internet | The app's [egress policy](/security/isolation#outbound-connections) (open by default) | **None** by default: DNS and its own preview network only |
 | Memory and CPU | App limits | The same limits as the app |
 | Builds | Build queue | Shares the same global build slots |
 
@@ -83,6 +84,8 @@ A preview is built from the same source and build settings as the app. It then r
 - add **preview overrides**: values that only preview containers see, such as a staging database URL.
 
 Preview overrides are encrypted like any other secret. Reading their values needs the `env:read-values` scope.
+
+**Internet.** Pull-request code gets no outbound connections by default, so it can't send out what it reads or misuse the server's address. If previews need an outside service, such as a staging database or an API, list it in the app's **Settings → Network** allowlist and set **Previews** to **Allowlist only**, or **Open**. A preview whose policy can't be loaded into the firewall doesn't start. See [Outbound connections](/security/isolation#outbound-connections).
 
 Docker Compose apps can't be previewed.
 

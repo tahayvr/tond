@@ -56,6 +56,10 @@ Moving an app into or out of a project moves its running container to the new ho
 
 Previews run pull-request code, so they never join a project network or a linked database's network. A preview can't reach production apps or databases. Point a preview at a staging database with a preview override instead. See [Previews](/concepts/previews).
 
+## Outbound connections
+
+Networks decide which containers an app can reach on the server. What it can reach on the internet is its egress policy: open by default, an allowlist of hosts and addresses, or none. An app's own networks always stay reachable under any policy. Previews get no internet by default. See [Outbound connections](/security/isolation#outbound-connections).
+
 ## Docker Compose apps
 
 A compose app runs on its own compose network (`<app>_default`), where its services reach each other by service name. Tond refuses compose files that join external networks or the default bridge. Compose apps can't be linked to managed databases.
