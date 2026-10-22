@@ -5,6 +5,10 @@
 //   POST /api/apps/{id}/admin-setup/dismiss
 //                                    hide the "create the admin account now"
 //                                    warning of a template app
+//   GET  /api/apps/{id}/template     an app's template: update available, upgrade
+//                                    notes, env values its domain change left stale
+//   POST /api/apps/{id}/template/domain-env  update those values (optionally redeploy)
+//   POST /api/apps/{id}/template/upgrade     apply the catalog's newer version
 //
 // A template deploy is one server-side step so every client gets the same
 // behaviour: inputs are checked and generated, the app is created as an inline
@@ -24,20 +28,26 @@ use axum::{
 };
 use tond_common::{
     AdminSetup, ApiResponse, App, AppResponse, CreateAppRequest, Scope, Template,
-    TemplateAdminSetup, TemplateCatalogResponse, TemplateContext, TemplateCredential,
-    TemplateDeployRequest, TemplateDeployResponse, TemplateHostMemory, TemplateResponse, TondError,
-    architecture_label, builtin_template, builtin_templates, host_architecture, resolve_inputs,
+    TemplateAdminSetup, TemplateAppStatus, TemplateCatalogResponse, TemplateContext,
+    TemplateCredential, TemplateDeployRequest, TemplateDeployResponse, TemplateDomainEnvRequest,
+    TemplateDomainEnvResponse, TemplateHostMemory, TemplateResponse, TemplateUpgradeResponse,
+    TondError, architecture_label, builtin_template, builtin_templates, domain_env_templates,
+    host_architecture, resolve_inputs, template_version_newer,
 };
 
+use super::fetch_app;
 use crate::{
     audit_log::write_audit_log,
     auth::{Authz, Principal, RateLimit, scope},
-    deploy, domains,
+    backup, deploy,
+    deploy::template_setup,
+    domains,
     error::AppError,
     handlers::{deploy_trigger, insert_app},
     metrics::host,
+    secrets,
     state::AppState,
-    volumes,
+    template_apps, volumes,
 };
 
 const MIB: u64 = 1024 * 1024;
@@ -304,6 +314,25 @@ async fn deploy_from_template(
         return Err(e);
     }
 
+    sqlx::query("UPDATE apps SET template_id = ? WHERE id = ?")
+        .bind(&template.manifest.id)
+        .bind(&app.id)
+        .execute(&state.db)
+        .await?;
+    // What upgrades and domain changes need later (template_apps.rs).
+    let domain_env = template_apps::DomainEnv {
+        keys: domain_env_templates(&template.manifest, &resolved.env, &ctx),
+        host: host.clone(),
+    };
+    template_apps::record(
+        &state.db,
+        &app.id,
+        Default::default(),
+        &template.compose,
+        &template.manifest.version,
+        &domain_env,
+    )
+    .await?;
     // A seeded admin is created on the first deploy before the app is
     // routed ('pending'); a first-visitor admin makes the app page warn.
     let admin_setup = match template.manifest.admin_setup() {
@@ -311,15 +340,11 @@ async fn deploy_from_template(
         TemplateAdminSetup::FirstVisitor => Some(AdminSetup::OPEN),
         TemplateAdminSetup::None => None,
     };
-    sqlx::query(
-        "UPDATE apps SET template_id = ?, template_version = ?, admin_setup = ? WHERE id = ?",
-    )
-    .bind(&template.manifest.id)
-    .bind(&template.manifest.version)
-    .bind(admin_setup)
-    .bind(&app.id)
-    .execute(&state.db)
-    .await?;
+    sqlx::query("UPDATE apps SET admin_setup = ? WHERE id = ?")
+        .bind(admin_setup)
+        .bind(&app.id)
+        .execute(&state.db)
+        .await?;
 
     let app_id = app.id.clone();
     let app_domain = app.domain.clone();
@@ -367,6 +392,386 @@ async fn deploy_from_template(
         setup_notes: template.manifest.setup_notes.clone(),
     };
     Ok(response)
+}
+
+// ── Apps deployed from a template: status, domain env, upgrade ──
+
+fn not_from_template(app: &App) -> AppError {
+    AppError(TondError::InvalidInput(format!(
+        "'{}' wasn't deployed from a template",
+        app.name
+    )))
+}
+
+/// Why a one-click upgrade of `app` to `template` is refused, if it is.
+fn upgrade_blocker(app: &App, tracking: &template_apps::Tracking) -> Option<String> {
+    if app.source_type != "compose" || app.source_url.is_some() {
+        return Some("The app no longer runs the template's pasted compose file.".to_string());
+    }
+    let content = app.compose_content.as_deref().unwrap_or_default();
+    match &tracking.compose_sha256 {
+        None => Some(
+            "Tond didn't record the compose file this app was deployed with, so it can't tell \
+             whether it was edited. Upgrade by hand with the upgrade notes."
+                .to_string(),
+        ),
+        Some(sha) if *sha != template_apps::compose_sha256(content) => Some(
+            "The compose file was edited after it was deployed from the template, and an \
+             upgrade would replace it. Apply the new version by hand with the upgrade notes, \
+             or undo your edits first."
+                .to_string(),
+        ),
+        Some(_) => None,
+    }
+}
+
+async fn template_status(state: &AppState, app: &App) -> Result<TemplateAppStatus, AppError> {
+    let template_id = app
+        .template_id
+        .clone()
+        .ok_or_else(|| not_from_template(app))?;
+    let template = builtin_template(&template_id).map_err(catalog_error)?;
+    let tracking = template_apps::load(&state.db, &app.id).await?;
+    let latest = template.as_ref().map(|t| t.manifest.version.clone());
+    let update_available = match (&latest, &app.template_version) {
+        (Some(latest), Some(current)) => template_version_newer(latest, current),
+        _ => false,
+    };
+    let (domain_env, domain_env_edited) = match (
+        &tracking.domain_env,
+        template_apps::current_host(state, app).await,
+    ) {
+        (Some(recorded), Some(host)) => {
+            let env = secrets::app_env(app)?;
+            template_apps::domain_env_changes(recorded, &env, &app.name, &host)
+        }
+        _ => (Vec::new(), Vec::new()),
+    };
+    Ok(TemplateAppStatus {
+        template_name: template.as_ref().map(|t| t.manifest.name.clone()),
+        upgrade_notes: template
+            .as_ref()
+            .and_then(|t| t.manifest.upgrade_notes.clone()),
+        upgrade_blocked: if update_available {
+            upgrade_blocker(app, &tracking)
+        } else {
+            None
+        },
+        template_id,
+        version: app.template_version.clone(),
+        latest_version: latest,
+        update_available,
+        domain_env,
+        domain_env_edited,
+    })
+}
+
+pub async fn get_app_template(
+    _rate: RateLimit,
+    _auth: Authz<scope::AppsRead>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let app = fetch_app(&state.db, &id).await?;
+    let status = template_status(&state, &app).await?;
+    Ok((StatusCode::OK, Json(ApiResponse::ok(status))))
+}
+
+/// Update the env values derived from the app's address to its current
+/// primary domain (only those still as Tond wrote them), optionally redeploying.
+pub async fn sync_template_domain_env(
+    _rate: RateLimit,
+    auth: Authz<scope::EnvWrite>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<TemplateDomainEnvRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    if req.redeploy {
+        auth.require_to(Scope::AppsDeploy, "deploy apps")?;
+    }
+    let app = fetch_app(&state.db, &id).await?;
+    if app.template_id.is_none() {
+        return Err(not_from_template(&app));
+    }
+    let host = template_apps::current_host(&state, &app)
+        .await
+        .ok_or_else(|| {
+            AppError(TondError::InvalidInput(format!(
+                "'{}' has no domain to take the values from",
+                app.name
+            )))
+        })?;
+
+    let tracking = template_apps::load(&state.db, &app.id).await?;
+    let mut tx = crate::db::begin_write(&state.db).await?;
+    let app = super::env::fetch_app_in_tx(&mut tx, &app.id).await?;
+    let Some(mut recorded) = tracking.domain_env.clone() else {
+        return Err(AppError(TondError::InvalidInput(format!(
+            "'{}' has no values derived from its domain",
+            app.name
+        ))));
+    };
+    let mut env = secrets::app_env(&app)?;
+    let (changes, _edited) = template_apps::domain_env_changes(&recorded, &env, &app.name, &host);
+    for change in &changes {
+        env.insert(change.key.clone(), change.proposed.clone());
+    }
+    recorded.host = host;
+    sqlx::query(
+        "UPDATE apps SET env_vars = ?, template_domain_env = ?, updated_at = datetime('now')
+         WHERE id = ?",
+    )
+    .bind(secrets::seal_app_env(&env)?)
+    .bind(serde_json::to_string(&recorded).unwrap_or_else(|_| "{}".into()))
+    .bind(&app.id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    crate::log_scrub::forget_app(&app.id);
+
+    let keys: Vec<&str> = changes.iter().map(|c| c.key.as_str()).collect();
+    write_audit_log(
+        &state.db,
+        Some(&app.id),
+        Some(&app.name),
+        "env_update",
+        &auth.audit_actor(),
+        Some(&format!("set={} (template domain values)", keys.join(","))),
+    )
+    .await;
+
+    let deployment_id = if req.redeploy && !changes.is_empty() {
+        let app = fetch_app(&state.db, &app.id).await?;
+        let (trigger, detail) = deploy_trigger(&auth);
+        let queued = deploy::start(&state, app, deploy::DeployRequest::source(trigger, detail))
+            .await
+            .map_err(|e| AppError(TondError::Internal(e.to_string())))?;
+        Some(queued.deployment_id)
+    } else {
+        None
+    };
+    Ok((
+        StatusCode::OK,
+        Json(ApiResponse::ok(TemplateDomainEnvResponse {
+            updated: changes,
+            deployment_id,
+        })),
+    ))
+}
+
+/// Move an app to the catalog's newer template version: snapshot its data,
+/// replace the compose file (refused if the user edited it), keep its env and
+/// generated secrets (new inputs are generated or defaulted), and deploy.
+pub async fn upgrade_app_template(
+    _rate: RateLimit,
+    auth: Authz<scope::AppsWrite>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let app = fetch_app(&state.db, &id).await?;
+    let response = upgrade_from_template(&state, &auth, app, &volumes::data_dir(), true).await?;
+    Ok((StatusCode::ACCEPTED, Json(ApiResponse::ok(response))))
+}
+
+async fn upgrade_from_template(
+    state: &AppState,
+    auth: &Principal,
+    app: App,
+    data_dir: &FsPath,
+    snapshot: bool,
+) -> Result<TemplateUpgradeResponse, AppError> {
+    // A compose file reaches the host (like editing one), and it deploys.
+    auth.require_to(Scope::SettingsWrite, "edit Docker Compose files")?;
+    auth.require_to(Scope::AppsDeploy, "deploy apps")?;
+    let template_id = app
+        .template_id
+        .clone()
+        .ok_or_else(|| not_from_template(&app))?;
+    let template = builtin_template(&template_id)
+        .map_err(catalog_error)?
+        .ok_or_else(|| {
+            AppError(TondError::NotFound(format!(
+                "The template {template_id} is no longer in the catalog"
+            )))
+        })?;
+    let to_version = template.manifest.version.clone();
+    let from_version = app.template_version.clone();
+    if !from_version
+        .as_deref()
+        .is_some_and(|v| template_version_newer(&to_version, v))
+    {
+        return Err(AppError(TondError::Conflict(format!(
+            "{} is already on the catalog's version ({to_version})",
+            app.name
+        ))));
+    }
+    let tracking = template_apps::load(&state.db, &app.id).await?;
+    if let Some(reason) = upgrade_blocker(&app, &tracking) {
+        return Err(AppError(
+            TondError::Conflict(reason).with_hint("See the template's upgrade notes."),
+        ));
+    }
+    check_architecture(&template, host_architecture())?;
+
+    // Keep every value the app has; fill inputs the new version added.
+    let host = template_apps::current_host(state, &app)
+        .await
+        .unwrap_or_else(|| format!("{}.localhost", app.name));
+    let ctx = TemplateContext::new(&app.name, &host);
+    let mut env = secrets::app_env(&app)?;
+    let missing_required: Vec<&str> = template
+        .manifest
+        .inputs
+        .iter()
+        .filter(|i| {
+            !env.contains_key(&i.key)
+                && i.value.is_none()
+                && i.generate.is_none()
+                && i.default.is_none()
+                && i.required
+        })
+        .map(|i| i.label.as_str())
+        .collect();
+    if !missing_required.is_empty() {
+        return Err(AppError(TondError::InvalidInput(format!(
+            "{to_version} needs values Tond can't make up: {}. Add them as environment \
+             variables first (see the upgrade notes), then upgrade.",
+            missing_required.join(", ")
+        ))));
+    }
+    let provided: BTreeMap<String, String> = template
+        .manifest
+        .inputs
+        .iter()
+        .filter(|i| i.value.is_none() && i.generate.is_none() && i.default.is_none())
+        .map(|i| (i.key.clone(), env.get(&i.key).cloned().unwrap_or_default()))
+        .collect();
+    let fresh = resolve_inputs(&template.manifest, &provided, &ctx).map_err(|e| {
+        AppError(TondError::InvalidInput(format!(
+            "{to_version} can't use the app's {}: {}",
+            e.key, e.message
+        )))
+    })?;
+    let mut added_env = Vec::new();
+    for (key, value) in &fresh.env {
+        if !env.contains_key(key) {
+            env.insert(key.clone(), value.clone());
+            added_env.push(key.clone());
+        }
+    }
+    let credentials: Vec<TemplateCredential> = fresh
+        .credentials
+        .into_iter()
+        .filter(|(key, _, _)| added_env.contains(key))
+        .map(|(key, label, value)| TemplateCredential { key, label, value })
+        .collect();
+    let domain_env = template_apps::DomainEnv {
+        keys: domain_env_templates(&template.manifest, &env, &ctx),
+        host,
+    };
+
+    // Nothing has changed yet: take the snapshot first, and stop if it fails.
+    let snapshot_id = if snapshot {
+        Some(
+            backup::create_snapshot(
+                state,
+                backup::SnapshotTrigger::PreTemplateUpgrade {
+                    app_name: app.name.clone(),
+                    to_version: to_version.clone(),
+                },
+                None,
+            )
+            .await
+            .map_err(|e| {
+                AppError(TondError::Internal(format!(
+                    "The snapshot before the upgrade failed, so nothing was changed: {e:#}"
+                )))
+            })?,
+        )
+    } else {
+        None
+    };
+
+    prepare_volumes(&template, data_dir, &app.name)?;
+    let mut tx = crate::db::begin_write(&state.db).await?;
+    sqlx::query(
+        "UPDATE apps SET compose_content = ?, env_vars = ?, updated_at = datetime('now')
+         WHERE id = ?",
+    )
+    .bind(&template.compose)
+    .bind(secrets::seal_app_env(&env)?)
+    .bind(&app.id)
+    .execute(&mut *tx)
+    .await?;
+    template_apps::record(
+        &mut *tx,
+        &app.id,
+        tracking.releases.clone(),
+        &template.compose,
+        &to_version,
+        &domain_env,
+    )
+    .await?;
+    // post_deploy steps the new version adds: run them on this deploy when
+    // Tond seeded the admin, else record them as done (a first visitor's
+    // admin may exist; it is never seeded a second time).
+    let done = template_setup::hooks_done(&mut *tx, &app.id).await?;
+    let new_steps = template_setup::outstanding(&template.manifest.post_deploy, &done);
+    if !new_steps.is_empty() {
+        match template_setup::upgrade_admin_setup(app.admin_setup.as_deref()) {
+            Some(status) => {
+                sqlx::query("UPDATE apps SET admin_setup = ? WHERE id = ?")
+                    .bind(status)
+                    .bind(&app.id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            None => {
+                let mut all = done.clone();
+                all.extend(
+                    new_steps
+                        .iter()
+                        .map(|h| template_setup::hook_fingerprint(h)),
+                );
+                template_setup::save_hooks_done(&mut *tx, &app.id, &all).await?;
+            }
+        }
+    }
+    tx.commit().await?;
+    crate::log_scrub::forget_app(&app.id);
+
+    let app = fetch_app(&state.db, &app.id).await?;
+    let (trigger, detail) = deploy_trigger(auth);
+    let queued = deploy::start(state, app.clone(), deploy::DeployRequest::source(trigger, detail))
+        .await
+        .map_err(|e| {
+            AppError(TondError::Internal(format!(
+                "The new compose file is saved but its deploy couldn't be queued ({e:#}); deploy the app to apply it"
+            )))
+        })?;
+    write_audit_log(
+        &state.db,
+        Some(&app.id),
+        Some(&app.name),
+        "template.upgrade",
+        &auth.audit_actor(),
+        Some(&format!(
+            "template={template_id} from={} to={to_version} added_env={} deployment={}",
+            from_version.as_deref().unwrap_or("unknown"),
+            added_env.join(","),
+            queued.deployment_id
+        )),
+    )
+    .await;
+    Ok(TemplateUpgradeResponse {
+        from_version,
+        to_version,
+        snapshot_id,
+        deployment_id: queued.deployment_id,
+        added_env,
+        credentials,
+        upgrade_notes: template.manifest.upgrade_notes.clone(),
+    })
 }
 
 /// POST /api/v1/apps/{id}/admin-setup/dismiss — the user has created (or
@@ -918,5 +1323,273 @@ mod tests {
             .err()
             .unwrap_or_else(|| panic!("an app's leftover data should be refused"));
         assert!(err.0.to_string().contains("earlier app named stats"));
+    }
+
+    async fn app_named(state: &AppState, name: &str) -> App {
+        sqlx::query_as("SELECT * FROM apps WHERE name = ?")
+            .bind(name)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[tokio::test]
+    async fn a_domain_change_offers_to_update_the_values_made_from_the_old_one() {
+        let state = test_state().await;
+        let dir = tmp();
+        deploy(&state, dir.path(), "linkding", deploy_request("links", &[]))
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.0));
+        let app = app_named(&state, "links").await;
+        let status = template_status(&state, &app)
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.0));
+        assert!(status.domain_env.is_empty(), "nothing changed yet");
+        assert!(!status.update_available);
+
+        // The primary domain moves; a hand-edited derived value is left alone.
+        sqlx::query(
+            "INSERT INTO app_domains (domain, app_id, kind) VALUES ('links.example.org', ?, 'primary')
+             ON CONFLICT(domain) DO NOTHING",
+        )
+        .bind(&app.id)
+        .execute(&state.db)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+        sqlx::query("UPDATE app_domains SET kind = 'alias' WHERE app_id = ? AND domain != 'links.example.org'")
+            .bind(&app.id)
+            .execute(&state.db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        sqlx::query("UPDATE apps SET domain = 'links.example.org' WHERE id = ?")
+            .bind(&app.id)
+            .execute(&state.db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let app = app_named(&state, "links").await;
+        let status = template_status(&state, &app)
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.0));
+        assert_eq!(
+            status.domain_env,
+            [tond_common::TemplateDomainEnvChange {
+                key: "TRUSTED_ORIGIN".into(),
+                current: "https://links.apps.example.com".into(),
+                proposed: "https://links.example.org".into(),
+            }]
+        );
+
+        let out = response_json(
+            sync_template_domain_env(
+                RateLimit,
+                Authz::unchecked(Principal::test_user(Role::Admin)),
+                State(state.clone()),
+                Path("links".to_string()),
+                Json(TemplateDomainEnvRequest { redeploy: false }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.0))
+            .into_response(),
+        )
+        .await;
+        assert_eq!(out["data"]["updated"][0]["key"], "TRUSTED_ORIGIN");
+        assert_eq!(out["data"]["deployment_id"], serde_json::Value::Null);
+        let app = app_named(&state, "links").await;
+        let env = secrets::app_env(&app).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            env.get("TRUSTED_ORIGIN").map(String::as_str),
+            Some("https://links.example.org")
+        );
+        let status = template_status(&state, &app)
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.0));
+        assert!(status.domain_env.is_empty(), "in sync again");
+    }
+
+    /// Make `name` look like an older install of its template whose
+    /// post_deploy steps never ran, with admin_setup `setup`.
+    async fn as_older_install(state: &AppState, name: &str, setup: Option<&str>) -> App {
+        let app = app_named(state, name).await;
+        sqlx::query(
+            "UPDATE apps SET template_version = '0.0.1', admin_setup = ?, template_hooks_done = '[]'
+             WHERE id = ?",
+        )
+        .bind(setup)
+        .bind(&app.id)
+        .execute(&state.db)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+        app_named(state, name).await
+    }
+
+    #[tokio::test]
+    async fn upgrades_run_added_post_deploy_steps_without_reseeding_a_visitors_admin() {
+        let state = test_state().await;
+        let dir = tmp();
+        let admin = Principal::test_user(Role::Admin);
+        for name in ["seeded", "claimed"] {
+            deploy(
+                &state,
+                dir.path(),
+                "forgejo",
+                deploy_request(name, &[("ADMIN_EMAIL", "me@example.com")]),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.0));
+        }
+        let steps = builtin_template("forgejo")
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("forgejo is in the catalog"))
+            .manifest
+            .post_deploy;
+        assert!(!steps.is_empty());
+
+        // Tond seeded the admin before: the steps the version adds run on the
+        // upgrade's deploy ('upgrade' keeps the app routed).
+        let app = as_older_install(&state, "seeded", Some("done")).await;
+        upgrade_from_template(&state, &admin, app.clone(), dir.path(), false)
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.0));
+        assert_eq!(
+            admin_setup_of(&state, "seeded").await.as_deref(),
+            Some("upgrade")
+        );
+        assert!(
+            template_setup::hooks_done(&state.db, &app.id)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"))
+                .is_empty(),
+            "not run yet: the deploy runs them"
+        );
+
+        // A first visitor created the admin: the steps are recorded as done
+        // and never run, so no second admin is seeded.
+        let app = as_older_install(&state, "claimed", Some("dismissed")).await;
+        upgrade_from_template(&state, &admin, app.clone(), dir.path(), false)
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.0));
+        assert_eq!(
+            admin_setup_of(&state, "claimed").await.as_deref(),
+            Some("dismissed")
+        );
+        let done = template_setup::hooks_done(&state.db, &app.id)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(template_setup::outstanding(&steps, &done).is_empty());
+    }
+
+    #[tokio::test]
+    async fn upgrades_keep_env_and_secrets_and_refuse_an_edited_compose_file() {
+        let state = test_state().await;
+        let dir = tmp();
+        deploy(&state, dir.path(), "linkding", deploy_request("links", &[]))
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.0));
+        let admin = Principal::test_user(Role::Admin);
+        let before = app_named(&state, "links").await;
+        let env_before = secrets::app_env(&before).unwrap_or_else(|e| panic!("{e}"));
+
+        // On the catalog's version: nothing to upgrade.
+        let err = upgrade_from_template(&state, &admin, before.clone(), dir.path(), false)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("already current"));
+        assert!(err.0.to_string().contains("already on"), "{}", err.0);
+
+        // An older install of the template, with a key the new version adds.
+        let mut env = env_before.clone();
+        env.remove("TRUSTED_ORIGIN");
+        let old_compose = format!(
+            "{}\n# older\n",
+            before.compose_content.clone().unwrap_or_default()
+        );
+        sqlx::query(
+            "UPDATE apps SET template_version = '0.0.1', compose_content = ?, env_vars = ? WHERE id = ?",
+        )
+        .bind(&old_compose)
+        .bind(secrets::seal_app_env(&env).unwrap_or_else(|e| panic!("{e}")))
+        .bind(&before.id)
+        .execute(&state.db)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+        let tracking = template_apps::load(&state.db, &before.id)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        template_apps::record(
+            &state.db,
+            &before.id,
+            tracking.releases,
+            &old_compose,
+            "0.0.1",
+            &tracking.domain_env.unwrap_or_default(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+        let app = app_named(&state, "links").await;
+        let status = template_status(&state, &app)
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.0));
+        assert!(status.update_available);
+        assert!(status.upgrade_notes.is_some());
+        assert_eq!(status.upgrade_blocked, None);
+
+        // Edited by hand: refused, with the reason.
+        sqlx::query("UPDATE apps SET compose_content = ? WHERE id = ?")
+            .bind(format!("{old_compose}# my edit\n"))
+            .bind(&app.id)
+            .execute(&state.db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let edited = app_named(&state, "links").await;
+        let status = template_status(&state, &edited)
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.0));
+        assert!(
+            status
+                .upgrade_blocked
+                .as_deref()
+                .is_some_and(|r| r.contains("edited"))
+        );
+        let err = upgrade_from_template(&state, &admin, edited, dir.path(), false)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("edited files aren't replaced"));
+        assert_eq!(err.0.status_code(), 409);
+
+        // Unedited: the new file, the old values, the new key filled in.
+        sqlx::query("UPDATE apps SET compose_content = ? WHERE id = ?")
+            .bind(&old_compose)
+            .bind(&app.id)
+            .execute(&state.db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let app = app_named(&state, "links").await;
+        let out = upgrade_from_template(&state, &admin, app, dir.path(), false)
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.0));
+        assert_eq!(out.from_version.as_deref(), Some("0.0.1"));
+        assert_eq!(out.added_env, ["TRUSTED_ORIGIN"]);
+        assert!(!out.deployment_id.is_empty());
+        let after = app_named(&state, "links").await;
+        assert_eq!(after.compose_content, before.compose_content);
+        assert_eq!(after.template_version, before.template_version);
+        let env_after = secrets::app_env(&after).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            env_after, env_before,
+            "every value kept, the missing one made again"
+        );
+
+        // A rollback to the older file puts the app back on that version.
+        let mut tx = crate::db::begin_write(&state.db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        template_apps::follow_restored_compose(&mut tx, &after.id, &old_compose)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        tx.commit().await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            app_named(&state, "links").await.template_version.as_deref(),
+            Some("0.0.1")
+        );
     }
 }

@@ -64,7 +64,9 @@ Passwords are encrypted at rest with `TOND_SECRET_KEY` (see [Environment and sec
 tond db credentials shop-db
 ```
 
-To change a password, use the database's page. Tond runs the change inside the engine (for example `ALTER ROLE` in PostgreSQL) with the current credentials, and saves the new password only once the engine accepts it. The database must be running. You can't rename the database or the user this way.
+To change a password, use the database's page. Tond runs the change inside the engine with the current credentials (`ALTER ROLE` in PostgreSQL, `ALTER USER` in MySQL and MariaDB, `changeUserPassword` in MongoDB, `ACL SETUSER` in Redis and KeyDB), and saves the new password only once the engine accepts it. The data is untouched and nothing restarts. For Redis and KeyDB, Tond also rewrites its generated ACL config, so a restart keeps the new password; their passwords can't contain spaces, quotes, backslashes or `#`. The database must be running. You can't rename the database or the user this way.
+
+Apps keep their own copy of the password, usually in a connection string in their environment variables. After a change, Tond lists the apps whose environment still contains the old password and which variables hold it: update those values, then redeploy each app.
 
 ## Connection strings
 

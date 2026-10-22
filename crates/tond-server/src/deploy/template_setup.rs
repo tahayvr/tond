@@ -21,6 +21,14 @@
 // the input values are redacted from it (db_exec::run), and the deploy log
 // scrubs the app's secrets too. A failure never fails the deploy: the app
 // is released and its page warns that the admin account is unclaimed.
+//
+// Each step that succeeded is remembered by fingerprint
+// (apps.template_hooks_done). A template upgrade (handlers/templates.rs)
+// whose new version adds steps sets admin_setup to 'upgrade' when Tond
+// seeded the admin: the next deploy runs only the steps not done yet, and
+// the app stays routed. When the admin came from a first visitor (or there
+// was none), the new steps are recorded as done without running, so an
+// account that exists is never seeded a second time.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -30,7 +38,7 @@ use tond_common::{AdminSetup, App, TemplatePostDeploy, builtin_template};
 
 use super::core::log_deploy;
 use crate::state::AppState;
-use crate::{compose, db_exec, secrets};
+use crate::{compose, db_exec, secrets, template_apps};
 
 /// Pause between attempts of a failing command.
 const RETRY: Duration = Duration::from_secs(3);
@@ -53,6 +61,74 @@ pub fn hook_cmd(hook: &TemplatePostDeploy, env: &BTreeMap<String, String>) -> Re
         cmd = cmd.env(key, value);
     }
     Ok(cmd)
+}
+
+/// A step's identity: SHA-256 (hex, like `template_apps::compose_sha256`) of
+/// what it runs. Its description and timeout don't count, so rewording a
+/// step never makes it run again.
+pub fn hook_fingerprint(hook: &TemplatePostDeploy) -> String {
+    let canonical = format!(
+        "{}\0{}\0{}\0{}",
+        hook.service,
+        hook.user.as_deref().unwrap_or(""),
+        hook.command.join("\u{1f}"),
+        hook.env.join(",")
+    );
+    template_apps::compose_sha256(&canonical)
+}
+
+/// Fingerprints of the steps an app has run (`apps.template_hooks_done`).
+pub async fn hooks_done<'e, E>(executor: E, app_id: &str) -> sqlx::Result<Vec<String>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let raw: Option<String> =
+        sqlx::query_scalar("SELECT template_hooks_done FROM apps WHERE id = ?")
+            .bind(app_id)
+            .fetch_optional(executor)
+            .await?;
+    Ok(raw
+        .and_then(|r| serde_json::from_str(&r).ok())
+        .unwrap_or_default())
+}
+
+/// Store the fingerprints of the steps an app has run.
+pub async fn save_hooks_done<'e, E>(executor: E, app_id: &str, done: &[String]) -> sqlx::Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query("UPDATE apps SET template_hooks_done = ? WHERE id = ?")
+        .bind(serde_json::to_string(done).unwrap_or_else(|_| "[]".into()))
+        .bind(app_id)
+        .execute(executor)
+        .await?;
+    Ok(())
+}
+
+/// The steps of `hooks` not in `done`, in order.
+pub fn outstanding<'a>(
+    hooks: &'a [TemplatePostDeploy],
+    done: &[String],
+) -> Vec<&'a TemplatePostDeploy> {
+    hooks
+        .iter()
+        .filter(|h| !done.contains(&hook_fingerprint(h)))
+        .collect()
+}
+
+/// What a template upgrade does about the new version's steps, given the
+/// app's admin_setup: `Some(status)` to run the outstanding ones on the next
+/// deploy, `None` to record them as done without running them (the admin
+/// came from a first visitor, or the app had none: it may exist already).
+pub fn upgrade_admin_setup(current: Option<&str>) -> Option<&'static str> {
+    match current {
+        // Not yet seeded: the first deploy still withholds the routes.
+        Some(AdminSetup::PENDING) => Some(AdminSetup::PENDING),
+        Some(AdminSetup::DONE | AdminSetup::FAILED | AdminSetup::UPGRADE) => {
+            Some(AdminSetup::UPGRADE)
+        }
+        _ => None,
+    }
 }
 
 /// The input values a step receives, to redact from its output.
@@ -85,7 +161,10 @@ pub(super) async fn run_pending(state: &AppState, app: &App, project: &str, trig
         .ok()
         .flatten()
         .flatten();
-    if status.as_deref() != Some(AdminSetup::PENDING) {
+    if !matches!(
+        status.as_deref(),
+        Some(AdminSetup::PENDING | AdminSetup::UPGRADE)
+    ) {
         return;
     }
     let log = |level: &'static str, message: String| async move {
@@ -95,7 +174,9 @@ pub(super) async fn run_pending(state: &AppState, app: &App, project: &str, trig
         Some(Ok(Some(t))) => t.manifest.post_deploy,
         _ => Vec::new(),
     };
-    if hooks.is_empty() {
+    let mut done = hooks_done(&state.db, &app.id).await.unwrap_or_default();
+    let todo: Vec<TemplatePostDeploy> = outstanding(&hooks, &done).into_iter().cloned().collect();
+    if todo.is_empty() {
         set_status(state, &app.id, AdminSetup::DONE, None).await;
         return;
     }
@@ -108,10 +189,12 @@ pub(super) async fn run_pending(state: &AppState, app: &App, project: &str, trig
             return;
         }
     };
-    for hook in &hooks {
+    for hook in &todo {
         log("info", format!("[{}] {}…", hook.service, hook.description)).await;
         match run_hook(state, project, hook, &env).await {
             Ok(()) => {
+                done.push(hook_fingerprint(hook));
+                let _ = save_hooks_done(&state.db, &app.id, &done).await;
                 log(
                     "info",
                     format!("[{}] {}: done", hook.service, hook.description),
@@ -177,6 +260,39 @@ async fn run_hook(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fingerprints_ignore_wording_and_find_only_new_steps() {
+        let a = hook();
+        let mut reworded = hook();
+        reworded.description = "Something else".into();
+        reworded.timeout_secs = Some(30);
+        assert_eq!(hook_fingerprint(&a), hook_fingerprint(&reworded));
+        assert_eq!(hook_fingerprint(&a).len(), 64);
+        let mut other = hook();
+        other.command.push("--force".into());
+        assert_ne!(hook_fingerprint(&a), hook_fingerprint(&other));
+
+        let hooks = vec![a.clone(), other.clone()];
+        let done = vec![hook_fingerprint(&a)];
+        assert_eq!(outstanding(&hooks, &done), vec![&other]);
+        assert!(outstanding(&hooks, &[hook_fingerprint(&a), hook_fingerprint(&other)]).is_empty());
+    }
+
+    #[test]
+    fn upgrades_run_new_steps_only_where_tond_seeded_the_admin() {
+        assert_eq!(upgrade_admin_setup(Some("done")), Some("upgrade"));
+        assert_eq!(upgrade_admin_setup(Some("failed")), Some("upgrade"));
+        assert_eq!(upgrade_admin_setup(Some("upgrade")), Some("upgrade"));
+        assert_eq!(upgrade_admin_setup(Some("pending")), Some("pending"));
+        for first_visitor in [Some("open"), Some("dismissed"), None] {
+            assert_eq!(
+                upgrade_admin_setup(first_visitor),
+                None,
+                "{first_visitor:?}: the admin may exist already"
+            );
+        }
+    }
 
     fn hook() -> TemplatePostDeploy {
         TemplatePostDeploy {

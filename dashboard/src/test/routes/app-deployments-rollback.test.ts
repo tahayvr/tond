@@ -112,6 +112,27 @@ describe('app deployments', () => {
 		expect(onRollback).toHaveBeenCalledWith('dep_prev');
 	});
 
+	it('lists the compose services a rollback would park, with their domains', async () => {
+		const user = userEvent.setup();
+		const withParks = deployments.map((d) =>
+			d.id === 'dep_prev'
+				? {
+						...d,
+						rollback_parks: [{ service: 'search', domains: ['search.example.com'] }]
+					}
+				: d
+		);
+		render(AppDeploymentsHarness, { props: { deployments: withParks, onRollback: vi.fn() } });
+		await user.click(within(rows()[1]).getByRole('button', { name: /roll back to this/i }));
+		const dialog = await screen.findByRole('dialog');
+		const note = within(dialog).getByRole('note');
+		expect(
+			within(note).getByText(/One service is not in\s+this deployment's compose file/)
+		).toBeInTheDocument();
+		expect(within(note).getByText('search')).toBeInTheDocument();
+		expect(within(note).getByText('search.example.com')).toBeInTheDocument();
+	});
+
 	it('disables the roll back button when nothing can be restored', () => {
 		render(AppDeploymentsHarness, {
 			props: { deployments: [deployments[0], deployments[3]], onRollback: vi.fn() }

@@ -199,6 +199,9 @@ pub fn entries() -> Vec<Doc> {
         e("PUT /api/v1/apps/{id}/services/{service}", "Publish a service's container port and route domains to it")
             .object("`{service, port_changed, redeploy_required, warnings}`")
             .about("Domains route at once when the service already publishes that port; a new published port is bound on the next deploy (`redeploy_required`)."),
+        e("DELETE /api/v1/apps/{id}/services/{service}", "Remove a parked service and its domains")
+            .returns::<Vec<ComposeServiceResponse>>()
+            .about("Only for a service a rollback parked (`parked: true`, no longer in the compose file). Its domains, and redirects to them, are deleted; the remaining services are returned."),
         e("GET /api/v1/apps/{id}/services/{service}/logs", "Recent log lines of one service (secrets masked)")
             .object("`{service, lines}`; `?tail=` (default 200, at most 2000)"),
         e("POST /api/v1/apps/{id}/services/{service}/{action}", "Restart, stop or start one service")
@@ -289,6 +292,17 @@ pub fn entries() -> Vec<Doc> {
             .returns::<TemplateDeployResponse>()
             .scopes(&["apps:deploy", "settings:write"])
             .about("Inputs left empty are generated or defaulted; `credentials` (first-login passwords) are returned only in this response. 409 INSUFFICIENT_MEMORY when the template needs more memory than is free, unless `allow_low_memory` is true."),
+        e("GET /api/v1/apps/{id}/template", "An app's template: update available, upgrade notes, stale domain values")
+            .returns::<TemplateAppStatus>()
+            .about("For apps deployed from a template. `domain_env` lists env values made from the app's address (`{app_url}`, `{app_host}`) that no longer match its primary domain; hand-edited ones are in `domain_env_edited` and never changed."),
+        e("POST /api/v1/apps/{id}/template/domain-env", "Update the env values made from the app's old domain")
+            .returns::<TemplateDomainEnvResponse>()
+            .about("Applies `domain_env` from GET …/template. `redeploy: true` (needs `apps:deploy`) also starts a deploy so the containers get the new values."),
+        e("POST /api/v1/apps/{id}/template/upgrade", "Move an app to the catalog's newer template version")
+            .accepted()
+            .returns::<TemplateUpgradeResponse>()
+            .scopes(&["apps:write", "apps:deploy", "settings:write"])
+            .about("Takes a snapshot of the app's data first (nothing changes if it fails), replaces the compose file with the new version's, keeps every env value and generated secret (inputs the new version adds are generated or defaulted; new credentials are returned once) and deploys. 409 when the compose file was edited since it was deployed, or the app is already current. Roll back with the normal deployment rollback."),
         // ── Registry credentials ──
         e("GET /api/v1/registry-credentials", "List container registry credentials").returns::<Vec<RegistryCredentialResponse>>(),
         e("POST /api/v1/registry-credentials", "Add a registry credential").created().returns::<RegistryCredentialResponse>(),
@@ -442,7 +456,7 @@ pub fn entries() -> Vec<Doc> {
         e("POST /api/v1/databases/{id}/upgrade/rollback", "Roll an upgrade back to the old version and data").message(),
         e("POST /api/v1/databases/{id}/upgrade/dismiss", "Clear a failed upgrade's state").null(),
         e("POST /api/v1/databases/{id}/backups", "Back up a database now").created().returns::<SnapshotResponse>(),
-        e("PATCH /api/v1/databases/{id}/credentials", "Change a database's credentials").object("`{database, changed}`"),
+        e("PATCH /api/v1/databases/{id}/credentials", "Change a database's password in place").object("`{database, changed, apps_to_update}`: `apps_to_update` lists `{id, name, keys}` of apps whose own environment still holds the old password"),
         e("GET /api/v1/databases/{id}/credentials", "Reveal a database's credentials").returns::<DatabaseCredentialsResponse>(),
         e("GET /api/v1/databases/{id}/access", "Which apps can reach a database").returns::<DatabaseAccessResponse>(),
         e("PUT /api/v1/databases/{id}/links/{app}", "Let an app reach a database").returns::<DatabaseAccessResponse>(),

@@ -984,6 +984,22 @@ wrong=$(docker exec -e REDISCLI_AUTH=wrong tond-db-e2e-redis redis-cli --no-auth
 jq -e --arg u "$REDIS_USER" --arg p "$REDIS_PASS" '.data.connection_string | contains($u + ":" + $p + "@")' <<<"$REDIS_CREDS" > /dev/null \
     || fail "the revealed Redis connection string must carry the credentials"
 pass "managed Redis requires auth (NOAUTH without, PONG with the ACL user); revealed connection string carries credentials"
+# The password changes in place (ACL SETUSER): the data stays, the old password
+# stops working, and a restart keeps the new one (Tond rewrote its ACL config).
+docker exec -e REDISCLI_AUTH="$REDIS_PASS" tond-db-e2e-redis redis-cli --no-auth-warning --user "$REDIS_USER" SET e2e-keep kept > /dev/null
+NEW_REDIS_PASS="e2eRedis$(date +%s)${RANDOM}"
+code=$(api_req PATCH /api/v1/databases/e2e-redis/credentials "{\"db_password\":\"${NEW_REDIS_PASS}\"}")
+[[ "$code" == 200 ]] && jq -e '.data.changed == ["db_password"] and (.data.apps_to_update | type == "array")' "$API_BODY" > /dev/null \
+    || fail "changing the Redis password should work in place, got ${code}: $(cat "$API_BODY")"
+old=$(docker exec -e REDISCLI_AUTH="$REDIS_PASS" tond-db-e2e-redis redis-cli --no-auth-warning --user "$REDIS_USER" PING 2>&1 || true)
+[[ "$old" != *PONG* ]] || fail "the old Redis password must stop working"
+docker restart tond-db-e2e-redis > /dev/null
+wait_for 60 "e2e-redis keeping its data and the new password across a restart" \
+    bash -c "docker exec -e REDISCLI_AUTH='${NEW_REDIS_PASS}' tond-db-e2e-redis redis-cli --no-auth-warning --user '${REDIS_USER}' GET e2e-keep | grep -qx kept"
+REDIS_PASS=$NEW_REDIS_PASS
+[[ "$(api /api/v1/databases/e2e-redis/credentials | jq -r '.data.db_password')" == "$REDIS_PASS" ]] \
+    || fail "the stored Redis password must be the new one"
+pass "Redis password changed in place: old one refused, data and new password survive a restart"
 
 step "Secrets at rest and write-only API secrets"
 # The database detail never carries the password; its connection string is masked.
@@ -1305,6 +1321,10 @@ code=$(api_req POST /api/v1/apps '{"name":"e2e-compose","source_type":"compose",
 [[ "$code" == 400 ]] && grep -q "privileged" "$API_BODY" && grep -q "network_mode: host" "$API_BODY" \
     || fail "a privileged compose file must be rejected with every problem listed, got ${code}: $(cat "$API_BODY")"
 pass "compose with privileged + network_mode: host → 400 listing both problems"
+code=$(api_req POST /api/v1/apps '{"name":"e2e-compose","source_type":"compose","container_port":80,"compose_content":"services:\n  web:\n    image: nginx:alpine\n    deploy:\n      replicas: 2\n    ports: [\"8080:80\"]\n"}')
+[[ "$code" == 400 ]] && grep -q "runs 2 replicas" "$API_BODY" \
+    || fail "replicas with a fixed host port must be refused with an explanation, got ${code}: $(cat "$API_BODY")"
+pass "compose replicas: 2 with a fixed host port → 400 explaining the clash"
 
 step "Network isolation (per-app networks, database links)"
 # Every app and database has its own Docker network (none is on the default
@@ -1420,6 +1440,11 @@ code=$(curl -s -o "$API_BODY" -w '%{http_code}' --unix-socket "$SOCK" \
 [[ "$code" == 400 ]] && grep -q "outside the project" "$API_BODY" \
     || fail "an archive with a symlink to /etc/shadow must be refused with 400, got ${code}: $(cat "$API_BODY")"
 pass "an archive linking outside the project is refused (400, says why)"
+[[ "$(api /api/v1/settings | jq -r '.data.auto_prune_disk_percent')" == 85 ]] \
+    || fail "automatic disk cleanup should default to 85 %"
+read -r code body < <(api_send PUT /api/v1/settings '{"auto_prune_disk_percent": 30}')
+[[ "$code" == 400 ]] || fail "a disk cleanup threshold below 50 % must be refused, got ${code}"
+pass "automatic disk cleanup defaults to 85 %; out-of-range thresholds are refused"
 read -r code body < <(api_send PUT /api/v1/settings '{"upload_max_bytes": 1048576}')
 [[ "$code" == 200 ]] || fail "setting a 1 MiB upload limit must succeed (got ${code}: ${body})"
 head -c 3145728 /dev/zero > "${UPLOAD_TMP}/zeros.bin"
@@ -1781,6 +1806,11 @@ docker inspect "$VAULT_CID" --format '{{range .Config.Env}}{{println .}}{{end}}'
     || fail "the generated token must be stored encrypted"
 [[ -d "${DATA_DIR}/volumes/e2e-vault/data" ]] || fail "the template's declared volume should be created"
 pass "inputs reach the container through the app env, never plaintext on disk; volume created"
+api /api/v1/apps/e2e-vault/template | jq -e '.data.template_id == "vaultwarden" and .data.update_available == false and .data.domain_env == []' > /dev/null \
+    || fail "a fresh template app is on the catalog's version with its domain values in sync: $(api /api/v1/apps/e2e-vault/template)"
+code=$(api_req POST /api/v1/apps/e2e-vault/template/upgrade '')
+[[ "$code" == 409 ]] || fail "upgrading an app already on the catalog's version must be 409, got ${code}: $(cat "$API_BODY")"
+pass "template status: on the catalog's version, domain values in sync; upgrade → 409"
 wait_for 90 "vaultwarden answering at https://${VAULT_DOMAIN}/alive" \
     bash -c "[[ \$(curl -sk -o /dev/null -w '%{http_code}' --resolve '${VAULT_DOMAIN}:443:${IP}' 'https://${VAULT_DOMAIN}/alive') == 200 ]]"
 pass "https://${VAULT_DOMAIN}/alive → 200 through the proxy"
@@ -1897,11 +1927,15 @@ pass "an unchanged service keeps its container across a redeploy"
 # Edit the file (web reads WHOAMI_NAME from the app's environment), redeploy,
 # then roll back to the first deployment: its compose file and images come back.
 STACK_FIRST=$(api /api/v1/apps/e2e-stack/deployments | jq -r '[.data[] | select(.status == "succeeded")][0].id')
-STACK_FILE_V2=$'services:\n  web:\n    image: traefik/whoami:v1.10\n    expose: ["80"]\n    environment: ["WHOAMI_NAME=${STACK_NAME}"]\n  cache:\n    image: redis:7-alpine\n    volumes: ["cache-data:/data"]\n    healthcheck:\n      test: ["CMD", "redis-cli", "ping"]\n      interval: 2s\n      timeout: 2s\n      retries: 15\nvolumes:\n  cache-data: {}\n'
+STACK_FILE_V2=$'services:\n  web:\n    image: traefik/whoami:v1.10\n    expose: ["80"]\n    environment: ["WHOAMI_NAME=${STACK_NAME}"]\n  extra:\n    image: traefik/whoami:v1.10\n    expose: ["80"]\n  cache:\n    image: redis:7-alpine\n    volumes: ["cache-data:/data"]\n    healthcheck:\n      test: ["CMD", "redis-cli", "ping"]\n      interval: 2s\n      timeout: 2s\n      retries: 15\nvolumes:\n  cache-data: {}\n'
 code=$(api_req PUT /api/v1/apps/e2e-stack/compose "$(jq -n --arg f "$STACK_FILE_V2" '{compose_content: $f}')")
 [[ "$code" == 200 ]] || fail "saving the compose file should work, got ${code}: $(cat "$API_BODY")"
 code=$(api_req PATCH /api/v1/apps/e2e-stack/env '{"set":{"STACK_NAME":"v2"},"unset":[]}')
 [[ "$code" == 200 ]] || fail "setting an app variable should work, got ${code}: $(cat "$API_BODY")"
+# The new "extra" service gets its own domain; the first deployment's file lacks it.
+EXTRA_DOMAIN="extra.${BASE}"
+code=$(api_req PUT /api/v1/apps/e2e-stack/services/extra "{\"published_port\":80,\"domains\":[\"${EXTRA_DOMAIN}\"]}")
+[[ "$code" == 200 ]] || fail "routing a domain to the extra service should work, got ${code}: $(cat "$API_BODY")"
 tond apps deploy e2e-stack > /dev/null
 wait_for 300 "a third compose deployment" \
     bash -c "curl -sf --unix-socket '$SOCK' http://localhost/api/v1/apps/e2e-stack/deployments | jq -e '[.data[] | select(.status == \"succeeded\")] | length >= 3'"
@@ -1909,6 +1943,11 @@ wait_for 60 "the edited web service" bash -c "curl -sk --resolve '${STACK_DOMAIN
 pass "an edited compose file redeploys; \${STACK_NAME} came from the app's environment (Name: v2)"
 api "/api/v1/apps/e2e-stack/deployments/${STACK_FIRST}" | jq -e '.data.services | length == 2 and all(.image | test("^tond-e2e-stack/"))' > /dev/null \
     || fail "a compose deployment should list its pinned service images"
+wait_for 60 "the extra service routed" bash -c "curl -sk --resolve '${EXTRA_DOMAIN}:443:${IP}' 'https://${EXTRA_DOMAIN}/' | grep -q Hostname:"
+api /api/v1/apps/e2e-stack/deployments | jq -e --arg id "$STACK_FIRST" --arg d "$EXTRA_DOMAIN" \
+    '.data[] | select(.id == $id) | .rollback_parks == [{service: "extra", domains: [$d]}]' > /dev/null \
+    || fail "the deployments list must say a rollback to the first deployment parks extra and its domain"
+pass "the rollback warning lists the service the older file lacks, with its domain"
 code=$(api_req POST /api/v1/apps/e2e-stack/rollback "{\"deployment_id\":\"${STACK_FIRST}\"}")
 [[ "$code" == 202 ]] || fail "compose rollback should be accepted, got ${code}: $(cat "$API_BODY")"
 wait_for 300 "compose rollback" \
@@ -1916,6 +1955,14 @@ wait_for 300 "compose rollback" \
 wait_for 60 "the restored web service" bash -c "! curl -sk --resolve '${STACK_DOMAIN}:443:${IP}' 'https://${STACK_DOMAIN}/' | grep -q 'Name: v2'"
 [[ "$(app_field e2e-stack compose_content)" != *WHOAMI_NAME* ]] || fail "rollback must restore the compose file too"
 pass "rollback restored the first deployment's compose file and images"
+stack_services | jq -e --arg d "$EXTRA_DOMAIN" \
+    '.data[] | select(.name == "extra") | .parked == true and .status == "parked" and .domains == [$d] and .published_port == 80 and .host_port == null' > /dev/null \
+    || fail "the rollback must park extra with its domain and port kept: $(stack_services)"
+wait_for 30 "${EXTRA_DOMAIN} unrouted" bash -c "[[ \$(curl -sk -o /dev/null -w '%{http_code}' --resolve '${EXTRA_DOMAIN}:443:${IP}' 'https://${EXTRA_DOMAIN}/') != 200 ]]"
+code=$(api_req DELETE /api/v1/apps/e2e-stack/services/extra '')
+[[ "$code" == 200 ]] && jq -e '[.data[] | .name] == ["web", "cache"]' "$API_BODY" > /dev/null \
+    || fail "removing the parked service should work, got ${code}: $(cat "$API_BODY")"
+pass "rollback parked extra (domain kept, unrouted); removing it deletes it"
 
 tond apps delete e2e-stack -y > /dev/null
 wait_for 30 "e2e-stack containers gone" bash -c "[[ -z \"\$(docker ps -aq --filter label=com.docker.compose.project=e2e-stack)\" ]]"

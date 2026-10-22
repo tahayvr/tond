@@ -171,6 +171,29 @@
 					</dd>
 				</dl>
 			{/if}
+			{#if confirmTarget?.rollback_parks?.length}
+				<div class="space-y-2 rounded-md border border-warn/50 bg-warn/10 p-3 text-sm" role="note">
+					<p class="font-medium">
+						{confirmTarget.rollback_parks.length === 1 ? 'One service is' : 'Some services are'} not in
+						this deployment's compose file
+					</p>
+					<p class="text-muted-foreground">
+						They stop, and their domains stop being routed. Tond keeps the domains and routes them
+						again when a later deploy brings the service back.
+					</p>
+					<ul class="space-y-1">
+						{#each confirmTarget.rollback_parks as park (park.service)}
+							<li class="min-w-0">
+								<span class="font-mono text-xs font-semibold">{park.service}</span>
+								{#if park.domains.length}
+									<span class="text-muted-foreground"> — </span>
+									<span class="font-mono text-xs break-all">{park.domains.join(', ')}</span>
+								{/if}
+							</li>
+						{/each}
+					</ul>
+				</div>
+			{/if}
 			<p class="text-sm text-muted-foreground">
 				Kept as they are now: environment variables, volumes and their data, the domain and resource
 				limits. Only the code and its dependencies go back.

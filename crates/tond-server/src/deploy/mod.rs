@@ -26,7 +26,7 @@ pub mod git;
 pub mod images;
 pub mod progress;
 pub mod queue;
-mod template_setup;
+pub mod template_setup;
 
 pub use build::{compose_project_name, compose_work_dir_for, validate_base_dir};
 pub use compose::{compose_path_in_repo, deployment_services};

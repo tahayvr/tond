@@ -1364,6 +1364,127 @@ pub struct TemplateDeployResponse {
     pub setup_notes: Option<String>,
 }
 
+// ── Apps deployed from a template: domain-derived env, upgrades ─────────────
+
+/// True when `s` refers to the app's address.
+fn mentions_host(s: &str) -> bool {
+    s.contains("{app_url}") || s.contains("{app_host}")
+}
+
+/// The env keys of a template deploy whose value comes from the app's
+/// address, with the placeholder text they were expanded from: fixed
+/// `value`s that mention `{app_url}`/`{app_host}`, and `default`s that do
+/// when the deploy kept the default (the resolved value is its expansion).
+pub fn domain_env_templates(
+    manifest: &TemplateManifest,
+    env: &BTreeMap<String, String>,
+    ctx: &TemplateContext,
+) -> BTreeMap<String, String> {
+    manifest
+        .inputs
+        .iter()
+        .filter_map(|input| {
+            let template = input.value.as_ref().or(input.default.as_ref())?;
+            let derived = mentions_host(template)
+                && (input.value.is_some() || env.get(&input.key) == Some(&ctx.expand(template)));
+            derived.then(|| (input.key.clone(), template.clone()))
+        })
+        .collect()
+}
+
+/// Whether template version `candidate` is newer than `current`: dotted
+/// parts compare numerically where both are numbers ("1.10" > "1.9"), a
+/// leading "v" is ignored, and a longer version wins a tie ("2.0.1" > "2.0").
+pub fn template_version_newer(candidate: &str, current: &str) -> bool {
+    fn parts(v: &str) -> Vec<&str> {
+        v.trim()
+            .trim_start_matches(['v', 'V'])
+            .split(['.', '-', '+'])
+            .collect()
+    }
+    let (a, b) = (parts(candidate), parts(current));
+    for (x, y) in a.iter().zip(b.iter()) {
+        let ord = match (x.parse::<u64>(), y.parse::<u64>()) {
+            (Ok(x), Ok(y)) => x.cmp(&y),
+            _ => x.cmp(y),
+        };
+        if ord != std::cmp::Ordering::Equal {
+            return ord == std::cmp::Ordering::Greater;
+        }
+    }
+    a.len() > b.len()
+}
+
+/// One env value derived from the app's address that no longer matches it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TemplateDomainEnvChange {
+    pub key: String,
+    /// The value the app has now.
+    pub current: String,
+    /// The value for the app's current primary domain.
+    pub proposed: String,
+}
+
+/// `GET /api/v1/apps/{id}/template`: where an app deployed from a template
+/// stands against the catalog.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TemplateAppStatus {
+    pub template_id: String,
+    pub template_name: Option<String>,
+    /// The template version the app runs.
+    pub version: Option<String>,
+    /// The catalog's version (None when the catalog no longer has it).
+    pub latest_version: Option<String>,
+    /// The catalog has a newer version.
+    pub update_available: bool,
+    /// The newer version's upgrade notes.
+    pub upgrade_notes: Option<String>,
+    /// Why a one-click upgrade isn't possible (for example, the compose file
+    /// was edited since it was deployed); None when it is.
+    pub upgrade_blocked: Option<String>,
+    /// Env values derived from the app's address (`{app_url}`, `{app_host}`)
+    /// that don't match its current primary domain.
+    pub domain_env: Vec<TemplateDomainEnvChange>,
+    /// Domain-derived keys left alone because their value was edited by hand.
+    pub domain_env_edited: Vec<String>,
+}
+
+/// `POST /api/v1/apps/{id}/template/domain-env`
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TemplateDomainEnvRequest {
+    /// Start a deploy afterwards so the containers get the new values.
+    #[serde(default)]
+    pub redeploy: bool,
+}
+
+/// `POST /api/v1/apps/{id}/template/domain-env` result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TemplateDomainEnvResponse {
+    pub updated: Vec<TemplateDomainEnvChange>,
+    /// The deploy started with `redeploy: true`.
+    pub deployment_id: Option<String>,
+}
+
+/// `POST /api/v1/apps/{id}/template/upgrade` result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TemplateUpgradeResponse {
+    pub from_version: Option<String>,
+    pub to_version: String,
+    /// The snapshot of the app's data taken before anything changed.
+    pub snapshot_id: Option<String>,
+    pub deployment_id: String,
+    /// Env vars the new version added (generated or defaulted).
+    pub added_env: Vec<String>,
+    /// New `credential` inputs, shown once.
+    pub credentials: Vec<TemplateCredential>,
+    pub upgrade_notes: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1435,6 +1556,28 @@ services:
     fn assert_err(manifest: &str, compose: &str, needle: &str) {
         let e = err(manifest, compose);
         assert!(e.contains(needle), "expected {needle:?} in {e:?}");
+    }
+
+    #[test]
+    fn template_versions_compare_by_number() {
+        assert!(template_version_newer("1.10", "1.9"));
+        assert!(template_version_newer("v2.0.1", "2.0"));
+        assert!(!template_version_newer("2.0", "2.0"));
+        assert!(!template_version_newer("1.9.9", "1.10"));
+        assert!(template_version_newer("2025.10", "2025.9.3"));
+    }
+
+    #[test]
+    fn domain_derived_env_keys_are_recorded_with_their_placeholder() {
+        let manifest: TemplateManifest = toml::from_str(MANIFEST).unwrap_or_else(|e| panic!("{e}"));
+        let ctx = TemplateContext::new("stats", "stats.example.com");
+        let given = BTreeMap::from([("ADMIN_EMAIL".to_string(), "a@example.com".to_string())]);
+        let resolved = resolve_inputs(&manifest, &given, &ctx).unwrap_or_else(|e| panic!("{e}"));
+        let derived = domain_env_templates(&manifest, &resolved.env, &ctx);
+        assert_eq!(
+            derived,
+            BTreeMap::from([("BASE_URL".to_string(), "{app_url}".to_string())])
+        );
     }
 
     #[test]
@@ -1623,6 +1766,7 @@ description = "Create the administrator account"
             }
         };
         for id in [
+            "forgejo",
             "gitea",
             "mattermost",
             "actual",

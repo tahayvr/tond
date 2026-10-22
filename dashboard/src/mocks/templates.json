@@ -554,15 +554,56 @@
         "owner": null
       }
     ],
-    "inputs": [],
-    "setup_notes": "Open the app right away: the install page is open to the first visitor. Keep the prefilled settings, create the administrator account at the bottom of the page and press Install.",
+    "inputs": [
+      {
+        "key": "ADMIN_USERNAME",
+        "label": "Administrator name",
+        "description": "Forgejo reserves some names, such as admin.",
+        "kind": "text",
+        "required": false,
+        "generated": false,
+        "default": "forgeadmin",
+        "credential": false
+      },
+      {
+        "key": "ADMIN_EMAIL",
+        "label": "Administrator email",
+        "description": null,
+        "kind": "email",
+        "required": true,
+        "generated": false,
+        "default": null,
+        "credential": false
+      },
+      {
+        "key": "ADMIN_PASSWORD",
+        "label": "Administrator password",
+        "description": null,
+        "kind": "password",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": true
+      },
+      {
+        "key": "SECRET_KEY",
+        "label": "Secret key",
+        "description": "Encrypts secrets in the database. Keep it if you move the data.",
+        "kind": "text",
+        "required": false,
+        "generated": true,
+        "default": null,
+        "credential": false
+      }
+    ],
+    "setup_notes": "Sign in with the administrator name and the password shown after deploy (also kept as ADMIN_PASSWORD on the Environment tab). There is no install page and public sign-up is off: add users under Site Administration.",
     "upgrade_notes": "The image follows Forgejo 15.x. For a new major, change the tag, snapshot the app first and read the release notes; the database is migrated on start.",
     "post_deploy_checks": [
-      "Finish the install page and create the administrator",
+      "Sign in as the administrator",
       "Push a test repository over HTTPS"
     ],
-    "admin_setup": "none",
-    "compose": "services:\n  forgejo:\n    image: codeberg.org/forgejo/forgejo:15\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"3000\"]\n    environment:\n      USER_UID: \"1000\"\n      USER_GID: \"1000\"\n      FORGEJO__database__DB_TYPE: sqlite3\n      FORGEJO__server__ROOT_URL: ${ROOT_URL}\n      FORGEJO__server__DOMAIN: ${DOMAIN}\n      FORGEJO__server__HTTP_PORT: \"3000\"\n      FORGEJO__server__DISABLE_SSH: \"true\"\n      FORGEJO__server__START_SSH_SERVER: \"false\"\n      FORGEJO__service__DISABLE_REGISTRATION: \"true\"\n    volumes:\n      - ./data:/data\n"
+    "admin_setup": "seeded",
+    "compose": "services:\n  forgejo:\n    image: codeberg.org/forgejo/forgejo:15\n    restart: unless-stopped\n    mem_limit: 512m\n    ports: [\"3000\"]\n    environment:\n      USER_UID: \"1000\"\n      USER_GID: \"1000\"\n      FORGEJO__database__DB_TYPE: sqlite3\n      FORGEJO__server__ROOT_URL: ${ROOT_URL}\n      FORGEJO__server__DOMAIN: ${DOMAIN}\n      FORGEJO__server__HTTP_PORT: \"3000\"\n      FORGEJO__server__DISABLE_SSH: \"true\"\n      FORGEJO__server__START_SSH_SERVER: \"false\"\n      FORGEJO__service__DISABLE_REGISTRATION: \"true\"\n      # No install page: Tond creates the administrator before the app is\n      # reachable (post_deploy in template.toml).\n      FORGEJO__security__INSTALL_LOCK: \"true\"\n      FORGEJO__security__SECRET_KEY: ${SECRET_KEY}\n    volumes:\n      - ./data:/data\n"
   },
   {
     "id": "freshrss",

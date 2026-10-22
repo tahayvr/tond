@@ -172,6 +172,8 @@ A full disk breaks builds, database writes and log collection. Look at **System 
 
 **Free up space** removes unused build cache and dangling images only. It shows exactly what it will remove before you confirm. Your apps' images (including the ones kept for rollback), containers, volumes and backups are never touched.
 
+Tond also cleans up by itself when the disk is at least 85 % full (**Settings → Disk cleanup**, setting `auto_prune_disk_percent`; 0 turns it off). It checks on every metrics sample, the fuller of the data filesystem and `/`. It first removes app images beyond the kept releases and dangling images, then, if the disk is still over the threshold, Docker's build cache. Volumes are never touched. A cleanup runs at most every 30 minutes, is recorded in **Activity** as `disk_auto_prune` with how much it freed, and fires the **Automatic disk cleanup** alert if you have a rule for it. If the disk stays full after a cleanup, your data is what fills it, not images.
+
 If that is not enough:
 
 - Lower the snapshot retention or turn off the local copy when you ship snapshots to S3 (see [Snapshots and backups](/concepts/backups)).

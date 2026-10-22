@@ -160,6 +160,15 @@ pub async fn update_settings(
         }
         pairs.push(("session_max_age_days", days.to_string()));
     }
+    if let Some(pct) = req.auto_prune_disk_percent {
+        if pct != 0 && !AUTO_PRUNE_DISK_PERCENT_RANGE.contains(&pct) {
+            return invalid(
+                "The automatic cleanup threshold must be between 50 and 99 percent, or 0 to turn it off."
+                    .to_string(),
+            );
+        }
+        pairs.push(("auto_prune_disk_percent", pct.to_string()));
+    }
 
     // Write-through: persist each changed key to the DB first so that
     // tond-proxy (separate process) picks it up on its next 5-second poll.
@@ -218,6 +227,9 @@ pub async fn update_settings(
                 }
                 "session_max_age_days" => {
                     s.session_max_age_days = value.parse().unwrap_or(s.session_max_age_days)
+                }
+                "auto_prune_disk_percent" => {
+                    s.auto_prune_disk_percent = value.parse().unwrap_or(s.auto_prune_disk_percent)
                 }
                 _ => {}
             }
@@ -448,6 +460,43 @@ mod tests {
             row.1.contains(data_dir.path().to_string_lossy().as_ref()),
             "helper should respect the supplied data dir for key_path"
         );
+    }
+
+    #[tokio::test]
+    async fn auto_prune_threshold_is_validated_and_cached() {
+        let (state, _data_dir) = test_state().await;
+        assert_eq!(
+            state.settings.read().await.auto_prune_disk_percent,
+            85,
+            "on by default"
+        );
+        let set = |pct: i64| {
+            let state = state.clone();
+            async move {
+                update_settings(
+                    RateLimit,
+                    Authz::unchecked(Principal::test_user(Role::Admin)),
+                    State(state),
+                    Json(UpdateSettingsRequest {
+                        auto_prune_disk_percent: Some(pct),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .into_response()
+                .status()
+            }
+        };
+        assert_eq!(set(30).await, StatusCode::BAD_REQUEST);
+        assert_eq!(set(100).await, StatusCode::BAD_REQUEST);
+        assert_eq!(set(90).await, StatusCode::OK);
+        assert_eq!(state.settings.read().await.auto_prune_disk_percent, 90);
+        assert_eq!(
+            stored(&state, "auto_prune_disk_percent").await.as_deref(),
+            Some("90")
+        );
+        assert_eq!(set(0).await, StatusCode::OK, "0 turns it off");
+        assert_eq!(state.settings.read().await.auto_prune_disk_percent, 0);
     }
 
     #[tokio::test]

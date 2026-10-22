@@ -76,7 +76,7 @@ Previews run code from pull requests, possibly from strangers. They are served o
 
 Many self-hosted apps give the admin account to whoever opens them first (an install page, or "the first account becomes the admin"), or ship a fixed default login. Once such an app is on a public domain, a scanner can reach it before you do. Templates close this where the app allows it:
 
-- **Pre-seeded**: Gitea, Mattermost, Actual Budget, Audiobookshelf, Umami and Mealie. Tond creates the admin (or replaces the default password) with a generated password while the app is running but before `tond-proxy` routes its domain, so nobody can reach it first. The password is shown once after the deploy and kept, encrypted, in the app's environment.
+- **Pre-seeded**: Forgejo, Gitea, Mattermost, Actual Budget, Audiobookshelf, Umami and Mealie. Tond creates the admin (or replaces the default password) with a generated password while the app is running but before `tond-proxy` routes its domain, so nobody can reach it first. The password is shown once after the deploy and kept, encrypted, in the app's environment.
 - **Warned**: Ghost, Uptime Kuma, Memos, Wiki.js, Docmost and Twenty have no documented way to create the admin from outside. Their app page warns "Open the app now and create the admin account; anyone who reaches it first can" until you dismiss it.
 
 If pre-seeding fails, the deploy still finishes and the app page shows the same warning with the reason. See [Templates](/guides/templates#admin-accounts).

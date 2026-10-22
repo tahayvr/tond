@@ -20,6 +20,13 @@ pub struct ComposeServiceSpec {
     /// The service defines a healthcheck
     #[serde(default)]
     pub has_healthcheck: bool,
+    /// Replicas the file asks for (`deploy.replicas` or `scale`; 1 when unset)
+    #[serde(default = "one_replica")]
+    pub replicas: u32,
+}
+
+fn one_replica() -> u32 {
+    1
 }
 
 /// `GET /api/apps/{id}/services` item: one compose service with what Docker
@@ -50,8 +57,17 @@ pub struct ComposeServiceResponse {
     #[serde(default)]
     pub domains: Vec<String>,
     /// "pending" | "running" | "restarting" | "paused" | "created" | "exited"
-    /// | "dead" | "missing"
+    /// | "dead" | "missing" | "parked"
     pub status: String,
+    /// Replicas the file asks for (1 when unset)
+    #[serde(default = "one_replica")]
+    pub replicas: u32,
+    /// The service is no longer in the compose file (for example after a
+    /// rollback to an older file): it does not run and its domains are not
+    /// routed, but they are kept and come back when the file declares the
+    /// service again.
+    #[serde(default)]
+    pub parked: bool,
     /// "healthy" | "unhealthy" | "starting"; None without a healthcheck
     #[serde(default)]
     pub health: Option<String>,

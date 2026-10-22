@@ -67,7 +67,7 @@ baseline, so install 0.2.0 fresh.
 - A public database's port is closed to every address while a major-version
   upgrade copies its data, and reopens afterwards, including after a crash.
 - Templates that would let the first visitor claim the admin account now
-  create the admin with generated credentials (Gitea, Mattermost, Actual,
+  create the admin with generated credentials (Forgejo, Gitea, Mattermost, Actual,
   Audiobookshelf; Umami's and Mealie's default logins are replaced). Templates
   where that isn't possible show a warning on the app's page until it is
   dismissed.
@@ -86,9 +86,21 @@ baseline, so install 0.2.0 fresh.
 - Compose apps: build, pin and roll back each service; route domains per
   service; resolve `${VAR}` from the app's environment; snapshot and restore
   named volumes; keep routes up while a deploy runs.
+- A compose rollback to a file that lacks a service parks the service instead
+  of deleting it: its domains and published port are kept, unrouted, and come
+  back when a later deploy declares it again. The rollback dialog lists what it
+  would park first.
+- A compose service with more than one replica can't use a fixed host port or
+  have a domain; Tond refuses it with an explanation instead of failing
+  half-way through the deploy.
 - A one-click catalog of compose templates (Gotify, Audiobookshelf, listmonk,
   Stirling-PDF and more). The catalog shows memory estimates and refuses
   templates that have no image for the server's CPU.
+- Template apps show **Update available** with the new version's upgrade notes
+  and upgrade in one click (snapshot first, env and generated secrets kept;
+  refused when you edited the compose file). After a primary-domain change,
+  Tond offers to update the env values the template made from the old address
+  and redeploy.
 - Several domains per app, with aliases and redirects. Wildcard certificates
   through DNS-01 (Cloudflare, Hetzner DNS, DigitalOcean, Route 53), uploaded
   certificates, and a separate apps domain for automatic hostnames.
@@ -102,6 +114,9 @@ baseline, so install 0.2.0 fresh.
 - Scheduled per-database backups, restore into a new database, versions and
   variants, upgrades, an IP allowlist and TLS. Managed Redis and KeyDB require
   auth.
+- Passwords change in place for every engine, Redis and KeyDB included
+  (`ACL SETUSER`), without touching the data. Tond then lists the apps whose
+  environment still holds the old password.
 - **Breaking**: snapshots are streamed as encrypted, authenticated archives.
   Pre-deploy snapshots can be turned off, and retention never deletes the
   newest snapshot.
@@ -114,6 +129,9 @@ baseline, so install 0.2.0 fresh.
   snooze and quiet hours. Every alert rule notifies someone.
 - Uptime probes, heartbeat monitors, host history, Docker disk usage, and an
   events feed for each app.
+- Automatic disk cleanup: when the disk is 85 % full (configurable, or off),
+  Tond removes unused images beyond the kept releases and then the build
+  cache, never volumes. Each cleanup is audit-logged and can raise an alert.
 - JSON logs. An authenticated `/metrics` endpoint. Retention settings for logs,
   deployments, runs, audit entries, metrics and sessions.
 - Tond measures itself: process stats, background-loop health, and idle

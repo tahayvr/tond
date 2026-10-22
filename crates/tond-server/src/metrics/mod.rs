@@ -675,6 +675,8 @@ impl Collector {
         if let Err(e) = self.host_history.record(&state.db, &snapshot).await {
             tracing::warn!("metrics: cannot store host history: {}", e);
         }
+        // Over the disk threshold: prune unused images and build cache.
+        crate::disk_pressure::check(state, &snapshot).await;
         if at >= self.next_df {
             self.next_df = at + docker_host::DF_EVERY;
             let docker = state.docker.clone();

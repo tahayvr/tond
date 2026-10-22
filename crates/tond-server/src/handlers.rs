@@ -596,12 +596,13 @@ async fn apply_compose_plan(
                 builds: false,
                 ports: Vec::new(),
                 has_healthcheck: false,
+                replicas: 1,
             })
             .collect()
     } else {
         specs.to_vec()
     };
-    crate::compose::sync_specs(&state.db, &app.id, &specs).await?;
+    crate::compose::sync_specs(&state.db, &app.id, &specs, crate::compose::Gone::Delete).await?;
     let Some((service, port)) = web else {
         return Ok(());
     };

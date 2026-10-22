@@ -51,6 +51,20 @@ pub struct ServerSettings {
     /// (settings key `session_max_age_days`).
     #[serde(default = "default_session_max_age_days")]
     pub session_max_age_days: i64,
+    /// Tond prunes unused images (beyond the kept releases) and then the build
+    /// cache when the disk is at least this full, in percent; 0 = off
+    /// (settings key `auto_prune_disk_percent`). Volumes are never touched.
+    #[serde(default = "default_auto_prune_disk_percent")]
+    pub auto_prune_disk_percent: i64,
+}
+
+/// Default disk threshold for automatic image pruning.
+pub const DEFAULT_AUTO_PRUNE_DISK_PERCENT: i64 = 85;
+/// Accepted thresholds for `auto_prune_disk_percent` (0 turns it off).
+pub const AUTO_PRUNE_DISK_PERCENT_RANGE: std::ops::RangeInclusive<i64> = 50..=99;
+
+fn default_auto_prune_disk_percent() -> i64 {
+    DEFAULT_AUTO_PRUNE_DISK_PERCENT
 }
 
 /// Default idle timeout for dashboard sessions.
@@ -80,6 +94,7 @@ impl Default for ServerSettings {
             upload_max_bytes: DEFAULT_UPLOAD_MAX_BYTES,
             session_idle_timeout_hours: DEFAULT_SESSION_IDLE_HOURS,
             session_max_age_days: DEFAULT_SESSION_MAX_AGE_DAYS,
+            auto_prune_disk_percent: DEFAULT_AUTO_PRUNE_DISK_PERCENT,
         }
     }
 }
@@ -107,6 +122,8 @@ pub struct UpdateSettingsRequest {
     pub session_idle_timeout_hours: Option<i64>,
     #[serde(default)]
     pub session_max_age_days: Option<i64>,
+    #[serde(default)]
+    pub auto_prune_disk_percent: Option<i64>,
 }
 
 // ── Retention ──

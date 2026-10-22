@@ -78,10 +78,35 @@ export const MOCK_COMPOSE_APP: App = {
 };
 
 /**
+ * An app deployed from the linkding template, one version behind the catalog,
+ * whose primary domain moved after the deploy (its TRUSTED_ORIGIN still names
+ * the old address).
+ */
+export const MOCK_TEMPLATE_APP: App = {
+	...MOCK_COMPOSE_APP,
+	id: 'app_links',
+	name: 'links',
+	domain: 'links.example.com',
+	container_port: 9090,
+	health_check_path: '/health',
+	compose_content: 'services:\n  linkding:\n    image: sissbruecker/linkding:1.46.0\n',
+	template_id: 'linkding',
+	template_version: '1.46'
+};
+
+/** What the template derived from the app's address, per app (mock state seed). */
+export const MOCK_TEMPLATE_DOMAIN_ENV: Record<
+	string,
+	{ host: string; keys: Record<string, string> }
+> = {
+	app_links: { host: 'links.apps.example.com', keys: { TRUSTED_ORIGIN: '{app_url}' } }
+};
+
+/**
  * A template app whose first visitor creates the admin account (Memos): its
  * page shows the "create the admin account now" warning.
  */
-export const MOCK_TEMPLATE_APP: App = {
+export const MOCK_ADMIN_TEMPLATE_APP: App = {
 	...MOCK_COMPOSE_APP,
 	id: 'app_template',
 	name: 'notes',
@@ -203,6 +228,26 @@ export const MOCK_COMPOSE_SERVICES: Record<string, ComposeService[]> = {
 			image_digest: 'ghcr.io/acme/shop-web@sha256:1f4c2a9be07d3c55aa0021c1',
 			cpu: null,
 			mem: null
+		},
+		{
+			name: 'search',
+			image: 'getmeili/meilisearch:v1.8',
+			builds: false,
+			ports: [7700],
+			has_healthcheck: false,
+			published_port: 7700,
+			host_port: null,
+			redeploy_required: false,
+			domains: ['search.shop.example.com'],
+			status: 'parked',
+			parked: true,
+			health: null,
+			exit_code: null,
+			container_id: null,
+			running_image: null,
+			image_digest: null,
+			cpu: null,
+			mem: null
 		}
 	]
 };
@@ -313,7 +358,8 @@ export const MOCK_COMPOSE_DEPLOYMENTS: Record<string, Deployment[]> = {
 			is_current: false,
 			rollback_available: true,
 			rollback_unavailable_reason: null,
-			services: mockReleaseServices('5d2b8e1f0a93')
+			services: mockReleaseServices('5d2b8e1f0a93'),
+			rollback_parks: [{ service: 'admin', domains: ['admin.shop.example.com'] }]
 		}
 	]
 };

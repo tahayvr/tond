@@ -343,3 +343,87 @@ async fn compose_apps_refuse_the_single_domain_endpoint_and_others_have_no_servi
         err.0
     );
 }
+
+#[tokio::test]
+async fn replicated_and_parked_services_cant_be_published_and_parked_ones_can_be_removed() {
+    let state = test_state().await;
+    create(&state, "shop", None).await;
+    let app = fetch_app(&state.db, "shop")
+        .await
+        .unwrap_or_else(|e| panic!("{}", e.0));
+    // The cache runs 3 replicas: a domain would need one host port per replica.
+    sqlx::query("UPDATE compose_services SET replicas = 3 WHERE name = 'cache'")
+        .execute(&state.db)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let err = update(&state, "shop", "cache", Some(6379), &["c.example.com"])
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("replicas can't share a published port"));
+    assert!(err.0.to_string().contains("3 replicas"), "{}", err.0);
+
+    // A rollback to a file without the cache parks it, domains kept.
+    sqlx::query("UPDATE compose_services SET replicas = 1 WHERE name = 'cache'")
+        .execute(&state.db)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    update(&state, "shop", "cache", Some(6379), &["c.example.com"])
+        .await
+        .unwrap_or_else(|e| panic!("{}", e.0));
+    let only_web = compose::service_specs("services:\n  web:\n    image: nginx\n")
+        .unwrap_or_else(|e| panic!("{e}"));
+    compose::sync_specs(&state.db, &app.id, &only_web, compose::Gone::Park)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let services = services_response(&state, &app, false)
+        .await
+        .unwrap_or_else(|e| panic!("{}", e.0));
+    let cache = services
+        .iter()
+        .find(|s| s.name == "cache")
+        .unwrap_or_else(|| panic!("parked cache listed"));
+    assert!(cache.parked);
+    assert_eq!(cache.status, "parked");
+    assert_eq!(cache.domains, ["c.example.com"]);
+    let err = update(&state, "shop", "cache", Some(6379), &["d.example.com"])
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("a parked service isn't published"));
+    assert!(
+        err.0
+            .to_string()
+            .contains("not in the current compose file")
+    );
+
+    let forget = |service: &str| {
+        forget_service(
+            RateLimit,
+            admin(),
+            State(state.clone()),
+            Path(("shop".to_string(), service.to_string())),
+        )
+    };
+    let err = forget("web")
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("web is in the file"));
+    assert!(
+        err.0.to_string().contains("in the compose file"),
+        "{}",
+        err.0
+    );
+    let out = body(
+        forget("cache")
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.0))
+            .into_response(),
+    )
+    .await;
+    assert_eq!(out["data"].as_array().map(Vec::len), Some(1));
+    let left: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM app_domains WHERE domain = 'c.example.com'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(left, 0);
+}

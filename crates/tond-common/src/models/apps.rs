@@ -174,6 +174,9 @@ impl AdminSetup {
     pub const FAILED: &'static str = "failed";
     pub const OPEN: &'static str = "open";
     pub const DISMISSED: &'static str = "dismissed";
+    /// A template upgrade added post_deploy steps for an app whose admin
+    /// Tond seeded: run them on the next deploy, keeping the app routed.
+    pub const UPGRADE: &'static str = "upgrade";
 
     /// Whether the app page warns that the admin account is unclaimed.
     pub fn warns(value: Option<&str>) -> bool {
